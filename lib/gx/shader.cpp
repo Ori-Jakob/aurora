@@ -564,6 +564,27 @@ static inline std::string vtx_attr(const ShaderConfig& config, GXAttr attr) {
   UNLIKELY FATAL("unhandled vtx attr {}", underlying(attr));
 }
 
+static inline bool has_nbt_normals(const ShaderConfig& config) {
+  return config.attrs[GX_VA_NRM].attrType != GX_NONE && config.attrs[GX_VA_NRM].cnt == 9;
+}
+
+static inline std::string vtx_nbt_attr(const ShaderConfig& config, u32 nbtIndex) {
+  if (!has_nbt_normals(config)) {
+    return nbtIndex == 0 ? vtx_attr(config, GX_VA_NRM) : "vec3f(0.0, 0.0, 0.0)"s;
+  }
+
+  switch (nbtIndex) {
+  case 0:
+    return "in_nrm"s;
+  case 1:
+    return "in_binrm"s;
+  case 2:
+    return "in_tangent"s;
+  default:
+    UNLIKELY FATAL("invalid NBT index {}", nbtIndex);
+  }
+}
+
 constexpr std::array<std::string_view, GX_CC_ZERO + 1> TevColorArgNames{
     "CPREV"sv, "APREV"sv, "C0"sv,   "A0"sv,   "C1"sv,  "A1"sv,   "C2"sv,    "A2"sv,
     "TEXC"sv,  "TEXA"sv,  "RASC"sv, "RASA"sv, "ONE"sv, "HALF"sv, "KONST"sv, "ZERO"sv,
@@ -649,7 +670,11 @@ auto attr_load(const ShaderConfig& config, GXAttr attr, std::string_view vidx) -
     return posLoad;
   }
   case GX_VA_NRM:
-    // TODO check for NBT/NBT3
+    if (mapping.cnt == 9) {
+      auto normalMapping = mapping;
+      normalMapping.cnt = 3;
+      return fetch_attr(normalMapping, buf, offs, le);
+    }
     return fetch_attr(mapping, buf, offs, le);
   case GX_VA_CLR0:
   case GX_VA_CLR1:
@@ -671,6 +696,30 @@ auto attr_load(const ShaderConfig& config, GXAttr attr, std::string_view vidx) -
   default:
     Log.fatal("attr_load: Unimplemented {}", attr);
   }
+}
+
+auto attr_load_nbt_component(const ShaderConfig& config, u32 nbtIndex, std::string_view vidx) -> std::string {
+  CHECK(nbtIndex < 3, "invalid NBT component {}", nbtIndex);
+  auto mapping = config.attrs[GX_VA_NRM];
+  CHECK(mapping.cnt == 9, "NBT component requested without NBT vertex data");
+  auto buf = "vbuf"sv;
+  auto offs = fmt::format("ubuf.vtx_start + {} * {}u + {}u", vidx, config.vtxStride, mapping.offset);
+  auto le = false; // Vertex buffer is always big endian (for now)
+  if (mapping.attrType == GX_INDEX8) {
+    offs = fmt::format("ubuf.array_start[{}] + raw_fetch_u8_1(&{}, {}) * {}u", GX_VA_NRM - GX_VA_POS, buf, offs,
+                       mapping.stride);
+    buf = "abuf"sv;
+    le = mapping.le;
+  } else if (mapping.attrType == GX_INDEX16) {
+    offs = fmt::format("ubuf.array_start[{}] + raw_fetch_u16_1(&{}, {}, {}) * {}u", GX_VA_NRM - GX_VA_POS, buf, offs,
+                       le, mapping.stride);
+    buf = "abuf"sv;
+    le = mapping.le;
+  }
+
+  mapping.cnt = 3;
+  const u32 vectorOffset = nbtIndex * 3 * comp_type_size(GX_VA_NRM, static_cast<GXCompType>(mapping.compType));
+  return fetch_attr(mapping, buf, fmt::format("({} + {}u)", offs, vectorOffset), le);
 }
 
 auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 i, bool alpha) -> std::string {
@@ -843,6 +892,9 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
   std::string vtxXfrAttrsPre;
   std::string vtxXfrAttrs;
   size_t vtxOutIdx = 0;
+  const bool pbrHasNormalMap =
+      (config.pbrFlags & (PbrMaterialEnabled | PbrMaterialHasNormal)) == (PbrMaterialEnabled | PbrMaterialHasNormal);
+  const bool usePbrNbtNormals = pbrHasNormalMap && has_nbt_normals(config);
 
   // Load points for line/point expansion
   std::string_view vidxAttr = "vidx"sv;
@@ -894,7 +946,13 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
     }
     // in_pnmtxidx and in_pos written above for line mode
     if ((attr != GX_VA_PNMTXIDX && attr != GX_VA_POS) || config.lineMode == 0) {
-      vtxXfrAttrsPre += fmt::format("\n    let {} = {};", vtx_attr(config, attr), attr_load(config, attr, vidxAttr));
+      if (attr == GX_VA_NRM && has_nbt_normals(config)) {
+        vtxXfrAttrsPre += fmt::format("\n    let in_nrm = {};", attr_load_nbt_component(config, 0, vidxAttr));
+        vtxXfrAttrsPre += fmt::format("\n    let in_binrm = {};", attr_load_nbt_component(config, 1, vidxAttr));
+        vtxXfrAttrsPre += fmt::format("\n    let in_tangent = {};", attr_load_nbt_component(config, 2, vidxAttr));
+      } else {
+        vtxXfrAttrsPre += fmt::format("\n    let {} = {};", vtx_attr(config, attr), attr_load(config, attr, vidxAttr));
+      }
     }
   }
 
@@ -940,11 +998,25 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
       "\n    let nrm_tmp = vec4f({}, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
       "\n    let mv_nrm = select(nrm_tmp, normalize(nrm_tmp), dot(nrm_tmp, nrm_tmp) > 1e-10);",
       vtx_attr(config, GX_VA_NRM));
+  if (usePbrNbtNormals) {
+    vtxXfrAttrsPre += fmt::format(
+        "\n    let binrm_tmp = vec4f({}, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
+        "\n    let mv_binrm = select(binrm_tmp, normalize(binrm_tmp), dot(binrm_tmp, binrm_tmp) > 1e-10);"
+        "\n    let tangent_tmp = vec4f({}, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
+        "\n    let mv_tangent = select(tangent_tmp, normalize(tangent_tmp), dot(tangent_tmp, tangent_tmp) > 1e-10);",
+        vtx_nbt_attr(config, 1), vtx_nbt_attr(config, 2));
+  }
   if ((config.pbrFlags & PbrMaterialEnabled) != 0 && !(info.lightingEnabled && UsePerPixelLighting)) {
     vtxOutAttrs += fmt::format("\n    @location({}) mv_pos: vec3f,", vtxOutIdx++);
     vtxOutAttrs += fmt::format("\n    @location({}) mv_nrm: vec3f,", vtxOutIdx++);
     vtxXfrAttrs += "\n    out.mv_pos = mv_pos;";
     vtxXfrAttrs += "\n    out.mv_nrm = mv_nrm.xyz;";
+    if (usePbrNbtNormals) {
+      vtxOutAttrs += fmt::format("\n    @location({}) mv_binrm: vec3f,", vtxOutIdx++);
+      vtxOutAttrs += fmt::format("\n    @location({}) mv_tangent: vec3f,", vtxOutIdx++);
+      vtxXfrAttrs += "\n    out.mv_binrm = mv_binrm.xyz;";
+      vtxXfrAttrs += "\n    out.mv_tangent = mv_tangent.xyz;";
+    }
   }
   if constexpr (EnableNormalVisualization) {
     vtxOutAttrs += fmt::format("\n    @location({}) nrm: vec3f,", vtxOutIdx++);
@@ -1090,7 +1162,11 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
     } else if (tcg.src == GX_TG_POS) {
       vtxXfrAttrs += fmt::format("\n    var tc{} = vec4f({}, 1.0);", i, vtx_attr(config, GX_VA_POS));
     } else if (tcg.src == GX_TG_NRM) {
-      vtxXfrAttrs += fmt::format("\n    var tc{} = vec4f({}, 1.0);", i, vtx_attr(config, GX_VA_NRM));
+      vtxXfrAttrs += fmt::format("\n    var tc{} = vec4f({}, 1.0);", i, vtx_nbt_attr(config, 0));
+    } else if (tcg.src == GX_TG_BINRM) {
+      vtxXfrAttrs += fmt::format("\n    var tc{} = vec4f({}, 1.0);", i, vtx_nbt_attr(config, 1));
+    } else if (tcg.src == GX_TG_TANGENT) {
+      vtxXfrAttrs += fmt::format("\n    var tc{} = vec4f({}, 1.0);", i, vtx_nbt_attr(config, 2));
     } else
       UNLIKELY FATAL("unhandled tcg src {}", underlying(tcg.src));
     if (tcg.type == GX_TG_MTX2x4 || tcg.type == GX_TG_MTX3x4) {
@@ -1465,27 +1541,42 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
           pbrMapBias);
     }
     if (hasPbrNormal) {
-      fragmentFn += fmt::format(R"""(
+      if (!usePbrNbtNormals) {
+        fragmentFn += R"""(
     // Derivatives must be in uniform control flow (WGSL uniformity requirement)
     let pbr_dp1 = dpdx(in.mv_pos);
     let pbr_dp2 = dpdy(in.mv_pos);
     let pbr_duv1 = dpdx(pbr_uv);
-    let pbr_duv2 = dpdy(pbr_uv);
+    let pbr_duv2 = dpdy(pbr_uv);)""";
+      }
+      fragmentFn += fmt::format(R"""(
     let pbr_normal_raw = textureSampleBias(pbr_normal, pbr_normal_samp, pbr_uv, {}).xyz * 2.0 - vec3f(1.0);
     let pbr_normal_scaled = vec3f(
       pbr_normal_raw.x * ubuf.pbr_normal_params.x,
       pbr_normal_raw.y * ubuf.pbr_normal_params.x * ubuf.pbr_normal_params.y,
       pbr_normal_raw.z);
     if (dot(pbr_normal_scaled, pbr_normal_scaled) > 1e-8) {{
-      let pbr_normal_sample = normalize(pbr_normal_scaled);
+      let pbr_normal_sample = normalize(pbr_normal_scaled);)""",
+                                pbrMapBias);
+      if (usePbrNbtNormals) {
+        fragmentFn += R"""(
+      let pbr_tangent_ortho = in.mv_tangent - pbr_n * dot(pbr_n, in.mv_tangent);
+      let pbr_binormal_ortho = in.mv_binrm - pbr_n * dot(pbr_n, in.mv_binrm);
+      if (dot(pbr_tangent_ortho, pbr_tangent_ortho) > 1e-8 && dot(pbr_binormal_ortho, pbr_binormal_ortho) > 1e-8) {
+        let pbr_T = normalize(pbr_tangent_ortho);
+        let pbr_B = normalize(pbr_binormal_ortho) * ubuf.pbr_normal_params.z;
+        pbr_n = normalize(mat3x3f(pbr_T, pbr_B, pbr_n) * pbr_normal_sample);
+      })""";
+      } else {
+        fragmentFn += R"""(
       // Build TBN from screen-space derivatives to transform tangent-space normals to MV space
       let pbr_det = pbr_duv1.x * pbr_duv2.y - pbr_duv1.y * pbr_duv2.x;
       let pbr_r = 1.0 / (pbr_det + 1e-7);
       let pbr_T = normalize((pbr_dp1 * pbr_duv2.y - pbr_dp2 * pbr_duv1.y) * pbr_r);
       let pbr_B = normalize(cross(pbr_n, pbr_T)) * sign(pbr_det + 1e-7) * ubuf.pbr_normal_params.z;
-      pbr_n = normalize(mat3x3f(pbr_T, pbr_B, pbr_n) * pbr_normal_sample);
-    }})""",
-                                pbrMapBias);
+      pbr_n = normalize(mat3x3f(pbr_T, pbr_B, pbr_n) * pbr_normal_sample);)""";
+      }
+      fragmentFn += "\n    }";
     }
     fragmentFn += R"""(
     let pbr_ambient_up = clamp(pbr_n.y, -1.0, 1.0);
@@ -1622,8 +1713,34 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
     if ((config.pbrFlags & PbrMaterialHasConstantEmissive) != 0) {
       fragmentFn += "\n    pbr_rgb += ubuf.pbr_material_emissive.rgb * ubuf.pbr_material_emissive.a;";
     }
-    fragmentFn +=
-        "\n    prev = vec4f(clamp(pbr_rgb, vec3f(0.0), vec3f(1.0)), pbr_albedo.a * prev.a);";
+    fragmentFn += R"""(
+    let pbr_debug_mode = i32(ubuf.pbr_scales.z + 0.5);
+    if (pbr_debug_mode == 1) {
+      pbr_rgb = pbr_albedo.rgb;
+    } else if (pbr_debug_mode == 2) {
+      pbr_rgb = vec3f(pbr_roughness);
+    } else if (pbr_debug_mode == 3) {
+      pbr_rgb = vec3f(pbr_metallic);
+    } else if (pbr_debug_mode == 4) {
+      pbr_rgb = vec3f(pbr_ao);
+    } else if (pbr_debug_mode == 5) {
+      pbr_rgb = vec3f(pbr_specular);
+    } else if (pbr_debug_mode == 6) {
+      pbr_rgb = pbr_n * 0.5 + vec3f(0.5);
+    } else if (pbr_debug_mode == 7) {
+      pbr_rgb = pbr_env_light;
+    } else if (pbr_debug_mode == 8) {
+      pbr_rgb = pbr_direct_diffuse;
+    } else if (pbr_debug_mode == 9) {
+      pbr_rgb = pbr_direct_specular;
+    } else if (pbr_debug_mode == 10) {
+      pbr_rgb = pbr_indirect_diffuse;
+    } else if (pbr_debug_mode == 11) {
+      pbr_rgb = pbr_indirect_specular;
+    })""";
+    const std::string pbrAlpha = usePrevAlbedo ? "pbr_albedo.a"s : "pbr_albedo.a * prev.a"s;
+    fragmentFn += fmt::format(
+        "\n    prev = vec4f(clamp(pbr_rgb, vec3f(0.0), vec3f(1.0)), {});", pbrAlpha);
   }
   if (info.usesFog) {
     uniformPre +=
@@ -1634,6 +1751,8 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
         "    b: f32,\n"
         "    c: f32,\n"
         "    pad: f32,\n"
+        "    override_color: vec4f,\n"
+        "    override_params: vec4f,\n"
         "}";
     uniBufAttrs += "\n    fog: Fog,";
 
@@ -1665,7 +1784,12 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
           "\n    var fogZ = exp2(-8.0 * fogF * fogF);";
       break;
     }
-    fragmentFn += "\n    prev = vec4f(mix(prev.rgb, ubuf.fog.color.rgb, clamp(fogZ, 0.0, 1.0)), prev.a);";
+    fragmentFn +=
+        "\n    let fog_override_enabled = ubuf.fog.override_params.x > 0.5;"
+        "\n    let fog_override_color = ubuf.fog.override_color.rgb * max(ubuf.fog.override_params.y, 0.0);"
+        "\n    let fog_color = select(ubuf.fog.color.rgb, fog_override_color, fog_override_enabled);"
+        "\n    let fog_opacity = select(1.0, clamp(ubuf.fog.override_params.z, 0.0, 1.0), fog_override_enabled);"
+        "\n    prev = vec4f(mix(prev.rgb, fog_color, clamp(fogZ, 0.0, 1.0) * fog_opacity), prev.a);";
   }
   if (info.usedIndTexMtxs.any()) {
     uniBufAttrs += "\n    ind_mtx: array<mat2x4f, 3>,";
@@ -1684,7 +1808,7 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
   }
   if ((config.pbrFlags & PbrMaterialEnabled) != 0) {
     uniBufAttrs += "\n    pbr_params: vec4f,";        // x=ambient, y=ambient_specular, z=fill_intensity
-    uniBufAttrs += "\n    pbr_scales: vec4f,";        // x=diffuse_scale, y=specular_scale
+    uniBufAttrs += "\n    pbr_scales: vec4f,";        // x=diffuse_scale, y=specular_scale, z=debug_mode
     uniBufAttrs += "\n    pbr_normal_params: vec4f,"; // x=strength, y=normal_y_sign, z=handedness_sign
     uniBufAttrs += "\n    pbr_ambient_gradient: vec4f,"; // x=sky, y=ground, z=horizon, w=environment_tint
     uniBufAttrs += "\n    pbr_ibl_params: vec4f,"; // x=enabled, y=diffuse_strength, z=specular_strength, w=max_mip

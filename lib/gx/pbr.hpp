@@ -9,7 +9,7 @@ namespace aurora::gx {
 extern bool enablePbrMaterialOverride;
 extern bool pbrMaterialOverrideActive;
 extern Vec4<float> pbrParams;           // x=ambient, y=ambient_specular, z=fill_intensity, w=unused
-extern Vec4<float> pbrScales;           // x=diffuse_scale, y=specular_scale, z/w=unused
+extern Vec4<float> pbrScales;           // x=diffuse_scale, y=specular_scale, z=debug_mode, w=unused
 extern Vec4<float> pbrNormalParams;     // x=strength, y=normal_y_sign, z=handedness_sign, w=unused
 extern Vec4<float> pbrAmbientGradient;  // x=sky, y=ground, z=horizon, w=environment_tint
 extern Vec4<float> pbrIblParams;        // x=enabled, y=diffuse_strength, z=specular_strength, w=max_prefilter_mip
@@ -34,5 +34,15 @@ void add_pbr_empty_bind_group_entries(std::array<wgpu::BindGroupEntry, TextureBi
 void bind_pbr_texture_entries(std::array<WGPUBindGroupEntry, TextureBindGroupEntryCount>& textureEntries,
                               const ShaderInfo& info, const wgpu::TextureView& emptyTextureView,
                               const wgpu::Sampler& emptySampler) noexcept;
+bool pbr_probe_capture_requested() noexcept;
+uint32_t pbr_probe_cube_size() noexcept;
+uint32_t pbr_probe_capture_face() noexcept;
+void begin_pbr_probe_capture() noexcept;
+void finish_pbr_probe_capture() noexcept;
+const wgpu::TextureView& pbr_probe_capture_color_view(uint32_t face) noexcept;
+const wgpu::TextureView& pbr_probe_capture_face_view(uint32_t face) noexcept;
+const wgpu::TextureView& pbr_probe_capture_depth_view() noexcept;
+void run_pbr_probe_filter(const wgpu::CommandEncoder& cmd) noexcept;
+void patch_pbr_probe_uniform(uint8_t* uniformData, const ProbeUniformPatchInfo& patch, uint32_t face) noexcept;
 
 } // namespace aurora::gx

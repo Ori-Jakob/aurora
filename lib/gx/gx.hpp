@@ -107,6 +107,7 @@ enum PbrMaterialFlags : u32 {
   PbrMaterialUsePrevAlbedo = 1u << 8,
   PbrMaterialHasConstantEmissive = 1u << 9,
   PbrMaterialPrevAlbedoIsLit = 1u << 10,
+  PbrMaterialUseGlobalMaps = 1u << 11,
 };
 
 extern wgpu::BindGroup g_emptyTextureBindGroup;
@@ -309,8 +310,10 @@ struct Fog {
   float b = 0.5f;
   float c = 0.f;
   float pad = FLT_MAX;
+  Vec4<float> overrideColor{1.f, 1.f, 1.f, 1.f};
+  Vec4<float> overrideParams{0.f, 1.f, 1.f, 0.f}; // x=enabled, y=exposure, z=opacity
 };
-static_assert(sizeof(Fog) == 32);
+static_assert(sizeof(Fog) == 64);
 struct AttrArray {
   const void* data;
   u32 size;
@@ -424,8 +427,18 @@ struct GXState {
   void clearVtxSizeCache() { lastVtxFmt = GX_MAX_VTXFMT; }
 };
 extern GXState g_gxState;
+extern Vec4<float> fogOverrideColor;
+extern Vec4<float> fogOverrideParams;
 struct ShaderConfig;
 struct ShaderInfo;
+struct ProbeUniformPatchInfo {
+  u32 projectionOffset = 0;
+  u32 pnMtxOffset = 0;
+  u32 nrmMtxOffset = 0;
+  u32 uniformSize = 0;
+  bool eligible = false;
+  bool usesPbrMaterial = false;
+};
 
 void initialize() noexcept;
 void shutdown() noexcept;

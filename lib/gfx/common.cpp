@@ -5,6 +5,7 @@
 #include "../internal.hpp"
 #include "../webgpu/gpu.hpp"
 #include "../gx/pipeline.hpp"
+#include "../gx/pbr.hpp"
 #include "pipeline_cache.hpp"
 #include "tex_copy_conv.hpp"
 #include "tex_palette_conv.hpp"
@@ -147,7 +148,9 @@ struct RenderPass {
   std::vector<tex_palette_conv::ConvRequest> paletteConvs;
 };
 static std::vector<RenderPass> g_renderPasses;
+static std::vector<RenderPass> g_probeRenderPasses;
 static u32 g_currentRenderPass = UINT32_MAX;
+static bool g_pbrProbeCaptureEnabled = true;
 static bool g_inOffscreen = false;
 static std::optional<RenderPass> g_suspendedEfbPass;
 static Viewport g_suspendedEfbViewport;
@@ -213,6 +216,9 @@ gx::DrawData* get_last_draw_command() {
 }
 
 static void push_draw_command(ShaderDrawCommand data) {
+  if (!g_pbrProbeCaptureEnabled && data.type == ShaderType::GX) {
+    data.gx.probeUniformPatch.eligible = false;
+  }
   push_command(CommandType::Draw, Command::Data{.draw = data});
   ++g_stats.drawCallCount;
 }
@@ -601,6 +607,7 @@ void shutdown() {
   g_storageBuffer = {};
   g_stagingBuffers.fill({});
   g_renderPasses.clear();
+  g_probeRenderPasses.clear();
   g_currentRenderPass = UINT32_MAX;
   g_offscreenCache.clear();
   g_offscreenColor = {};
@@ -672,6 +679,7 @@ bool begin_frame() {
   g_stats.drawCallCount = 0;
   g_stats.mergedDrawCallCount = 0;
   g_suspendedEfbPass.reset();
+  g_probeRenderPasses.clear();
 
   g_renderPasses.emplace_back();
   set_efb_targets(g_renderPasses[0]);
@@ -687,9 +695,12 @@ bool begin_frame() {
   return true;
 }
 
+static void append_pbr_probe_capture_passes();
+
 void end_frame(const wgpu::CommandEncoder& cmd) {
   ZoneScoped;
   ASSERT(!g_inOffscreen, "end_frame called while offscreen rendering is active");
+  append_pbr_probe_capture_passes();
   g_uniforms.append_zeroes(gx::MaxUniformSize); // Pad the end of the buffer
   uint64_t bufferOffset = 0;
   const auto writeBuffer = [&](ByteBuffer& buf, wgpu::Buffer& out, uint64_t size, std::string_view label) {
@@ -739,6 +750,83 @@ void end_frame(const wgpu::CommandEncoder& cmd) {
 
 uint32_t current_frame() noexcept { return g_frameIndex; }
 
+static Range clone_probe_uniform(const gx::DrawData& draw, uint32_t face) {
+  auto [buf, range] = map_uniform(draw.uniformRange.size);
+  std::memcpy(buf.data(), g_uniforms.data() + draw.uniformRange.offset, draw.uniformRange.size);
+  gx::patch_pbr_probe_uniform(buf.data(), draw.probeUniformPatch, face);
+  return range;
+}
+
+static void append_pbr_probe_capture_passes() {
+  if (!gx::pbr_probe_capture_requested() || g_renderPasses.empty()) {
+    return;
+  }
+
+  std::vector<const gx::DrawData*> probeDraws;
+  bool pbrMaterialVisible = false;
+  for (const auto& renderPass : g_renderPasses) {
+    if (renderPass.msaaSamples != webgpu::g_graphicsConfig.msaaSamples ||
+        renderPass.targetSize.width != webgpu::g_frameBuffer.size.width ||
+        renderPass.targetSize.height != webgpu::g_frameBuffer.size.height) {
+      continue;
+    }
+    for (const auto& cmd : renderPass.commands) {
+      if (cmd.type == CommandType::Draw && cmd.data.draw.type == ShaderType::GX &&
+          cmd.data.draw.gx.probeUniformPatch.eligible) {
+        probeDraws.push_back(&cmd.data.draw.gx);
+        pbrMaterialVisible = pbrMaterialVisible || cmd.data.draw.gx.probeUniformPatch.usesPbrMaterial;
+      }
+    }
+  }
+  if (probeDraws.empty() || !pbrMaterialVisible) {
+    return;
+  }
+
+  gx::begin_pbr_probe_capture();
+  const uint32_t size = gx::pbr_probe_cube_size();
+  const uint32_t face = gx::pbr_probe_capture_face();
+  RenderPass probePass{
+      .colorView = gx::pbr_probe_capture_color_view(face),
+      .resolveView = webgpu::g_graphicsConfig.msaaSamples > 1 ? gx::pbr_probe_capture_face_view(face) : nullptr,
+      .depthView = gx::pbr_probe_capture_depth_view(),
+      .targetSize = {size, size, 1},
+      .msaaSamples = webgpu::g_graphicsConfig.msaaSamples,
+      .clearColorValue = gx::g_gxState.clearColor,
+      .clearDepthValue = gx::clear_depth_value(),
+      .clearColor = true,
+      .clearDepth = true,
+  };
+  probePass.commands.push_back({
+      .type = CommandType::SetViewport,
+      .data =
+          {
+              .setViewport =
+                  {
+                      .left = 0.0f,
+                      .top = 0.0f,
+                      .width = static_cast<float>(size),
+                      .height = static_cast<float>(size),
+                      .znear = 0.0f,
+                      .zfar = 1.0f,
+                  },
+          },
+  });
+  probePass.commands.push_back({
+      .type = CommandType::SetScissor,
+      .data = {.setScissor = {0, 0, static_cast<int32_t>(size), static_cast<int32_t>(size)}},
+  });
+  for (const auto* draw : probeDraws) {
+    auto probeDraw = *draw;
+    probeDraw.uniformRange = clone_probe_uniform(*draw, face);
+    probePass.commands.push_back({
+        .type = CommandType::Draw,
+        .data = {.draw = ShaderDrawCommand{.type = ShaderType::GX, .gx = probeDraw}},
+    });
+  }
+  g_probeRenderPasses.emplace_back(std::move(probePass));
+  gx::finish_pbr_probe_capture();
+}
+
 static void expire_cached_bind_groups() {
   if (g_cachedBindGroups.empty() || g_frameIndex == UINT32_MAX || g_frameIndex % BindGroupCacheSweepPeriod != 0) {
     return;
@@ -752,6 +840,8 @@ static void expire_cached_bind_groups() {
     }
   }
 }
+
+static void render_pass_commands(const wgpu::RenderPassEncoder& pass, const RenderPass& renderPass);
 
 void render(wgpu::CommandEncoder& cmd) {
   ZoneScoped;
@@ -845,7 +935,45 @@ void render(wgpu::CommandEncoder& cmd) {
       }
     }
   }
+
+  for (u32 i = 0; i < g_probeRenderPasses.size(); ++i) {
+    const auto& passInfo = g_probeRenderPasses[i];
+    const std::array attachments{
+        wgpu::RenderPassColorAttachment{
+            .view = passInfo.colorView,
+            .resolveTarget = passInfo.resolveView,
+            .loadOp = passInfo.clearColor ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
+            .storeOp = wgpu::StoreOp::Store,
+            .clearValue =
+                {
+                    .r = passInfo.clearColorValue.x(),
+                    .g = passInfo.clearColorValue.y(),
+                    .b = passInfo.clearColorValue.z(),
+                    .a = passInfo.clearColorValue.w(),
+                },
+        },
+    };
+    const wgpu::RenderPassDepthStencilAttachment depthStencilAttachment{
+        .view = passInfo.depthView,
+        .depthLoadOp = passInfo.clearDepth ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
+        .depthStoreOp = wgpu::StoreOp::Store,
+        .depthClearValue = passInfo.clearDepthValue,
+    };
+    const auto label = fmt::format("PBR probe capture face {}", i);
+    const wgpu::RenderPassDescriptor renderPassDescriptor{
+        .label = label.c_str(),
+        .colorAttachmentCount = attachments.size(),
+        .colorAttachments = attachments.data(),
+        .depthStencilAttachment = &depthStencilAttachment,
+    };
+    auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
+    render_pass_commands(pass, passInfo);
+    pass.End();
+  }
+  gx::run_pbr_probe_filter(cmd);
+
   g_renderPasses.clear();
+  g_probeRenderPasses.clear();
   expire_cached_bind_groups();
 
 #if defined(AURORA_GFX_DEBUG_GROUPS)
@@ -864,7 +992,7 @@ void render(wgpu::CommandEncoder& cmd) {
 
 void after_submit() noexcept { depth_peek::after_submit(); }
 
-void render_pass(const wgpu::RenderPassEncoder& pass, u32 idx) {
+static void render_pass_commands(const wgpu::RenderPassEncoder& pass, const RenderPass& renderPass) {
   g_currentPipeline = UINTPTR_MAX;
 #ifdef AURORA_GFX_DEBUG_GROUPS
   std::vector<std::string> lastDebugGroupStack;
@@ -874,7 +1002,7 @@ void render_pass(const wgpu::RenderPassEncoder& pass, u32 idx) {
   pass.SetBindGroup(0, g_staticBindGroup);
   pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
 
-  for (const auto& cmd : g_renderPasses[idx].commands) {
+  for (const auto& cmd : renderPass.commands) {
 #ifdef AURORA_GFX_DEBUG_GROUPS
     {
       size_t firstDiff = lastDebugGroupStack.size();
@@ -902,7 +1030,7 @@ void render_pass(const wgpu::RenderPassEncoder& pass, u32 idx) {
     } break;
     case CommandType::SetScissor: {
       const auto& sc = cmd.data.setScissor;
-      const auto& size = g_renderPasses[idx].targetSize;
+      const auto& size = renderPass.targetSize;
       const auto x = std::clamp(static_cast<uint32_t>(sc.x), 0u, size.width);
       const auto y = std::clamp(static_cast<uint32_t>(sc.y), 0u, size.height);
       const auto w = std::clamp(static_cast<uint32_t>(sc.width), 0u, size.width - x);
@@ -913,7 +1041,7 @@ void render_pass(const wgpu::RenderPassEncoder& pass, u32 idx) {
       const auto& draw = cmd.data.draw;
       switch (draw.type) {
       case ShaderType::Clear:
-        clear::render(draw.clear, pass, g_renderPasses[idx].targetSize);
+        clear::render(draw.clear, pass, renderPass.targetSize);
         break;
       case ShaderType::GX:
         gx::render(draw.gx, pass);
@@ -934,6 +1062,8 @@ void render_pass(const wgpu::RenderPassEncoder& pass, u32 idx) {
   }
 #endif
 }
+
+void render_pass(const wgpu::RenderPassEncoder& pass, u32 idx) { render_pass_commands(pass, g_renderPasses[idx]); }
 
 bool bind_pipeline(PipelineRef ref, const wgpu::RenderPassEncoder& pass) {
   if (ref == g_currentPipeline) {
@@ -1084,3 +1214,5 @@ void pop_debug_group() {
 }
 
 const AuroraStats* aurora_get_stats() { return &aurora::gfx::g_stats; }
+
+void aurora_set_pbr_probe_capture_enabled(bool enabled) { aurora::gfx::g_pbrProbeCaptureEnabled = enabled; }

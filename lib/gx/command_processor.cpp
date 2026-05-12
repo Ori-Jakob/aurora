@@ -1183,6 +1183,9 @@ static void handle_cp(u8 addr, u32 value, bool bigEndian) {
       vf.attrs[GX_VA_POS].type = static_cast<GXCompType>(bp_get(value, 3, 1));
       vf.attrs[GX_VA_POS].frac = static_cast<u8>(bp_get(value, 5, 4));
       vf.attrs[GX_VA_NRM].cnt = static_cast<GXCompCnt>(bp_get(value, 1, 9));
+      if (vf.attrs[GX_VA_NRM].cnt == GX_NRM_NBT && bp_get(value, 1, 31) != 0) {
+        vf.attrs[GX_VA_NRM].cnt = GX_NRM_NBT3;
+      }
       vf.attrs[GX_VA_NRM].type = static_cast<GXCompType>(bp_get(value, 3, 10));
       if (vf.attrs[GX_VA_NRM].type == GX_U8 || vf.attrs[GX_VA_NRM].type == GX_S8) {
         vf.attrs[GX_VA_NRM].frac = 6;
@@ -1632,6 +1635,7 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
   resolve_sampled_textures(info);
   const auto bindGroups = build_bind_groups(info);
   const auto pipeline = gfx::pipeline_ref(config);
+  const auto probeUniformPatch = probe_uniform_patch_info(info, g_gxState.projType == GX_PERSPECTIVE);
 
   uint32_t instanceCount = 1;
   if (prim == GX_LINES) {
@@ -1650,6 +1654,7 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
       .indexCount = numIndices,
       .instanceCount = instanceCount,
       .bindGroups = bindGroups,
+      .probeUniformPatch = probeUniformPatch,
       .dstAlpha = g_gxState.dstAlpha,
   });
 }

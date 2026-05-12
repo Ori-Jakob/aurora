@@ -467,7 +467,12 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
   }
   if (info.usesFog) {
     const auto& state = g_gxState.fog;
-    Fog fog{.color = state.color, .a = state.a, .b = state.b, .c = state.c};
+    Fog fog{.color = state.color,
+            .a = state.a,
+            .b = state.b,
+            .c = state.c,
+            .overrideColor = fogOverrideColor,
+            .overrideParams = fogOverrideParams};
     buf.append(fog);
   }
   if (info.usedIndTexMtxs.any()) {
@@ -497,5 +502,32 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
   }
   g_gxState.stateDirty = false;
   return range;
+}
+
+ProbeUniformPatchInfo probe_uniform_patch_info(const ShaderInfo& info, bool projectionIsPerspective) noexcept {
+  u32 offset = 0;
+  offset += 4;  // vtx_start
+  offset += 4;  // current_pnmtx
+  offset += 16; // render/logical viewport dimensions
+  offset += 8;  // padding
+  offset += sizeof(u32) * MaxIndexAttr;
+  if (info.lineMode != 0) {
+    offset += 16;
+  }
+
+  const u32 projectionOffset = offset;
+  offset += sizeof(Mat4x4<float>);
+  const u32 pnMtxOffset = offset;
+  offset += sizeof(Mat3x4<float>) * (MaxPnMtx + MaxTexMtx);
+  const u32 nrmMtxOffset = offset;
+
+  return {
+      .projectionOffset = projectionOffset,
+      .pnMtxOffset = pnMtxOffset,
+      .nrmMtxOffset = nrmMtxOffset,
+      .uniformSize = info.uniformSize,
+      .eligible = projectionIsPerspective,
+      .usesPbrMaterial = (info.pbrFlags & PbrMaterialEnabled) != 0,
+  };
 }
 } // namespace aurora::gx

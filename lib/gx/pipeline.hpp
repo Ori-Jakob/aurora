@@ -13,6 +13,7 @@ struct DrawData {
   uint32_t indexCount;
   uint32_t instanceCount;
   GXBindGroups bindGroups;
+  ProbeUniformPatchInfo probeUniformPatch;
   uint32_t dstAlpha;
 };
 

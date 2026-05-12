@@ -1,5 +1,7 @@
 #include "gx.hpp"
 
+#include <aurora/gfx.h>
+
 #include "pipeline.hpp"
 #include "../dolphin/vi/vi_internal.hpp"
 #include "../webgpu/gpu.hpp"
@@ -31,6 +33,8 @@ using webgpu::g_graphicsConfig;
 using webgpu::g_queue;
 
 GXState g_gxState{};
+Vec4<float> fogOverrideColor{1.f, 1.f, 1.f, 1.f};
+Vec4<float> fogOverrideParams{0.f, 1.f, 1.f, 0.f};
 
 static wgpu::Sampler sEmptySampler;
 static wgpu::Texture sEmptyTexture;
@@ -683,6 +687,9 @@ u8 comp_cnt_count(GXAttr attr, GXCompCnt cnt) noexcept {
     switch (cnt) {
     case GX_NRM_XYZ:
       return 3;
+    case GX_NRM_NBT:
+    case GX_NRM_NBT3:
+      return 9;
     default:
       break;
     }
@@ -945,6 +952,29 @@ void shutdown() noexcept {
   clear_copy_texture_cache();
 }
 } // namespace aurora::gx
+
+void aurora_set_fog_override(bool enabled, float exposure, float opacity, float color_r, float color_g, float color_b) {
+  const aurora::Vec4<float> newColor{
+      std::clamp(color_r, 0.0f, 1.0f),
+      std::clamp(color_g, 0.0f, 1.0f),
+      std::clamp(color_b, 0.0f, 1.0f),
+      1.0f,
+  };
+  const aurora::Vec4<float> newParams{
+      enabled ? 1.0f : 0.0f,
+      std::clamp(exposure, 0.0f, 8.0f),
+      std::clamp(opacity, 0.0f, 1.0f),
+      0.0f,
+  };
+
+  if (aurora::gx::fogOverrideColor == newColor && aurora::gx::fogOverrideParams == newParams) {
+    return;
+  }
+
+  aurora::gx::fogOverrideColor = newColor;
+  aurora::gx::fogOverrideParams = newParams;
+  aurora::gx::g_gxState.stateDirty = true;
+}
 
 static wgpu::AddressMode wgpu_address_mode(GXTexWrapMode mode) {
   switch (mode) {
