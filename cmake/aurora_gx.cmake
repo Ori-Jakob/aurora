@@ -12,6 +12,7 @@ add_library(aurora_gx STATIC
         lib/gx/command_processor.cpp
         lib/gx/fifo.cpp
         lib/gx/gx.cpp
+        lib/gx/pbr.cpp
         lib/gx/pipeline.cpp
         lib/gx/shader.cpp
         lib/gx/shader_info.cpp

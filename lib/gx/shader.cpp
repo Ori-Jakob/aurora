@@ -940,6 +940,12 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
       "\n    let nrm_tmp = vec4f({}, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
       "\n    let mv_nrm = select(nrm_tmp, normalize(nrm_tmp), dot(nrm_tmp, nrm_tmp) > 1e-10);",
       vtx_attr(config, GX_VA_NRM));
+  if ((config.pbrFlags & PbrMaterialEnabled) != 0 && !(info.lightingEnabled && UsePerPixelLighting)) {
+    vtxOutAttrs += fmt::format("\n    @location({}) mv_pos: vec3f,", vtxOutIdx++);
+    vtxOutAttrs += fmt::format("\n    @location({}) mv_nrm: vec3f,", vtxOutIdx++);
+    vtxXfrAttrs += "\n    out.mv_pos = mv_pos;";
+    vtxXfrAttrs += "\n    out.mv_nrm = mv_nrm.xyz;";
+  }
   if constexpr (EnableNormalVisualization) {
     vtxOutAttrs += fmt::format("\n    @location({}) nrm: vec3f,", vtxOutIdx++);
     vtxXfrAttrsPre += "\n    out.nrm = mv_nrm;";
@@ -1365,6 +1371,260 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
   }
   if (info.usesPTTexMtx.any())
     uniBufAttrs += fmt::format("\n    postmtx: array<mat3x4f, {}>,", MaxPTTexMtx);
+  if ((config.pbrFlags & PbrMaterialEnabled) != 0) {
+    const u32 texMap = config.pbrTexMapId;
+    const u32 texCoord = config.pbrTexCoordId;
+    const bool usePrevAlbedo = (config.pbrFlags & PbrMaterialUsePrevAlbedo) != 0;
+    const bool prevAlbedoIsLit = (config.pbrFlags & PbrMaterialPrevAlbedoIsLit) != 0;
+    const bool hasPbrRmaos = (config.pbrFlags & PbrMaterialHasRmaos) != 0;
+    const bool hasPbrRoughness = (config.pbrFlags & PbrMaterialHasRoughness) != 0;
+    const bool hasPbrMetallic = (config.pbrFlags & PbrMaterialHasMetallic) != 0;
+    const bool hasPbrAo = (config.pbrFlags & PbrMaterialHasAo) != 0;
+    const bool hasPbrSpecular = (config.pbrFlags & PbrMaterialHasSpecular) != 0;
+    const bool hasPbrNormal = (config.pbrFlags & PbrMaterialHasNormal) != 0;
+    const bool hasPbrEmissive = (config.pbrFlags & PbrMaterialHasEmissive) != 0;
+    const bool hasPbrMaterialMap = hasPbrRmaos || hasPbrRoughness || hasPbrMetallic || hasPbrAo || hasPbrSpecular ||
+                                   hasPbrNormal || hasPbrEmissive;
+    const bool needsPbrUv = !usePrevAlbedo || hasPbrMaterialMap;
+    const bool hasPbrTexCoord = texCoord < MaxTexCoord;
+    const std::string pbrMapBias = usePrevAlbedo ? "0.0"s : fmt::format("ubuf.tex{}_size_bias.z", texMap);
+    const auto pbrChannelId = static_cast<GXChannelID>(config.pbrChannelId);
+    const bool hasPbrChannel = pbrChannelId != GX_COLOR_NULL && pbrChannelId != GX_COLOR_ZERO &&
+                               !is_alpha_bump_channel(pbrChannelId);
+    const u32 pbrChannel = hasPbrChannel ? color_channel(pbrChannelId) : 0;
+    const auto& pbrChannelConfig = config.colorChannels[pbrChannel];
+    const bool useGxPbrLights = hasPbrChannel && pbrChannelConfig.lightingEnabled && info.lightingEnabled;
+    const std::string pbrLightColor =
+        hasPbrChannel ? fmt::format("clamp(rast{}.rgb, vec3f(0.0), vec3f(1.0))", pbrChannel) : "vec3f(1.0)";
+    fragmentFn += fmt::format(R"""(
+    // Experimental PBR material override
+    var pbr_roughness = clamp(ubuf.pbr_material_factors.x, 0.04, 1.0);
+    var pbr_metallic = clamp(ubuf.pbr_material_factors.y, 0.0, 1.0);
+    var pbr_ao = clamp(ubuf.pbr_material_factors.z, 0.0, 1.0);
+    var pbr_specular = clamp(ubuf.pbr_material_factors.w, 0.0, 1.0);
+    let pbr_gx_light = {0};
+    let pbr_gx_luma = max(dot(pbr_gx_light, vec3f(0.2126, 0.7152, 0.0722)), 1e-3);
+    let pbr_gx_tint = clamp(pbr_gx_light / pbr_gx_luma, vec3f(0.25), vec3f(2.0));
+    let pbr_gx_strength = max(pbr_gx_luma, 0.65);
+    let pbr_env_light = pbr_gx_tint * pbr_gx_strength;
+    var pbr_n = normalize(in.mv_nrm);)""",
+                              pbrLightColor);
+    if (needsPbrUv) {
+      if (hasPbrTexCoord) {
+        fragmentFn += fmt::format("\n    let pbr_uv = tex{0}_uv;", texCoord);
+      } else {
+        fragmentFn += "\n    let pbr_uv = in.mv_pos.xz * 0.025;";
+      }
+    }
+    if (usePrevAlbedo) {
+      if (prevAlbedoIsLit) {
+        fragmentFn += R"""(
+    let pbr_prev_lit_albedo = clamp(prev.rgb, vec3f(0.0), vec3f(1.0));
+    let pbr_prev_unlit_albedo = clamp(pbr_prev_lit_albedo / max(pbr_env_light, vec3f(0.25)), vec3f(0.0), vec3f(1.0));
+    let pbr_albedo = vec4f(pbr_prev_unlit_albedo, clamp(prev.a, 0.0, 1.0));)""";
+      } else {
+        fragmentFn +=
+            "\n    let pbr_albedo = vec4f(clamp(prev.rgb, vec3f(0.0), vec3f(1.0)), clamp(prev.a, 0.0, 1.0));";
+      }
+    } else {
+      fragmentFn += fmt::format(R"""(
+    let pbr_albedo = textureSampleBias(tex{0}, tex{0}_samp, pbr_uv, ubuf.tex{0}_size_bias.z);)""",
+                                texMap);
+    }
+    if (hasPbrRmaos) {
+      fragmentFn += fmt::format(R"""(
+    let pbr_rmaos_sample = textureSampleBias(pbr_rmaos, pbr_rmaos_samp, pbr_uv, {});
+    pbr_roughness = clamp(pbr_rmaos_sample.r, 0.04, 1.0);
+    pbr_metallic = clamp(pbr_rmaos_sample.g, 0.0, 1.0);
+    pbr_ao = clamp(pbr_rmaos_sample.b, 0.0, 1.0);
+    pbr_specular = clamp(pbr_rmaos_sample.a, 0.0, 1.0);)""",
+                                pbrMapBias);
+    }
+    if (hasPbrRoughness) {
+      fragmentFn += fmt::format(
+          "\n    pbr_roughness = clamp(textureSampleBias(pbr_roughness_map, pbr_roughness_map_samp, pbr_uv, "
+          "{}).r, 0.04, 1.0);",
+          pbrMapBias);
+    }
+    if (hasPbrMetallic) {
+      fragmentFn += fmt::format(
+          "\n    pbr_metallic = clamp(textureSampleBias(pbr_metallic_map, pbr_metallic_map_samp, pbr_uv, "
+          "{}).r, 0.0, 1.0);",
+          pbrMapBias);
+    }
+    if (hasPbrAo) {
+      fragmentFn += fmt::format(
+          "\n    pbr_ao = clamp(textureSampleBias(pbr_ao_map, pbr_ao_map_samp, pbr_uv, {}).r, "
+          "0.0, 1.0);",
+          pbrMapBias);
+    }
+    if (hasPbrSpecular) {
+      fragmentFn += fmt::format(
+          "\n    pbr_specular = clamp(textureSampleBias(pbr_specular_map, pbr_specular_map_samp, pbr_uv, "
+          "{}).r, 0.0, 1.0);",
+          pbrMapBias);
+    }
+    if (hasPbrNormal) {
+      fragmentFn += fmt::format(R"""(
+    // Derivatives must be in uniform control flow (WGSL uniformity requirement)
+    let pbr_dp1 = dpdx(in.mv_pos);
+    let pbr_dp2 = dpdy(in.mv_pos);
+    let pbr_duv1 = dpdx(pbr_uv);
+    let pbr_duv2 = dpdy(pbr_uv);
+    let pbr_normal_raw = textureSampleBias(pbr_normal, pbr_normal_samp, pbr_uv, {}).xyz * 2.0 - vec3f(1.0);
+    let pbr_normal_scaled = vec3f(
+      pbr_normal_raw.x * ubuf.pbr_normal_params.x,
+      pbr_normal_raw.y * ubuf.pbr_normal_params.x * ubuf.pbr_normal_params.y,
+      pbr_normal_raw.z);
+    if (dot(pbr_normal_scaled, pbr_normal_scaled) > 1e-8) {{
+      let pbr_normal_sample = normalize(pbr_normal_scaled);
+      // Build TBN from screen-space derivatives to transform tangent-space normals to MV space
+      let pbr_det = pbr_duv1.x * pbr_duv2.y - pbr_duv1.y * pbr_duv2.x;
+      let pbr_r = 1.0 / (pbr_det + 1e-7);
+      let pbr_T = normalize((pbr_dp1 * pbr_duv2.y - pbr_dp2 * pbr_duv1.y) * pbr_r);
+      let pbr_B = normalize(cross(pbr_n, pbr_T)) * sign(pbr_det + 1e-7) * ubuf.pbr_normal_params.z;
+      pbr_n = normalize(mat3x3f(pbr_T, pbr_B, pbr_n) * pbr_normal_sample);
+    }})""",
+                                pbrMapBias);
+    }
+    fragmentFn += R"""(
+    let pbr_ambient_up = clamp(pbr_n.y, -1.0, 1.0);
+    let pbr_ambient_sky_weight = smoothstep(0.0, 1.0, max(pbr_ambient_up, 0.0));
+    let pbr_ambient_ground_weight = smoothstep(0.0, 1.0, max(-pbr_ambient_up, 0.0));
+    let pbr_ambient_horizon_weight = max(1.0 - max(pbr_ambient_sky_weight, pbr_ambient_ground_weight), 0.0);
+    let pbr_ambient_scale =
+        pbr_ambient_sky_weight * ubuf.pbr_ambient_gradient.x +
+        pbr_ambient_ground_weight * ubuf.pbr_ambient_gradient.y +
+        pbr_ambient_horizon_weight * ubuf.pbr_ambient_gradient.z;
+    let pbr_env_tint = mix(vec3f(1.0), pbr_env_light, vec3f(clamp(ubuf.pbr_ambient_gradient.w, 0.0, 1.0)));
+    let pbr_ambient_light = pbr_env_tint * max(pbr_ambient_scale, 0.0);
+    let pbr_v = normalize(-in.mv_pos);
+    let pbr_ndotv = max(dot(pbr_n, pbr_v), 1e-4);
+    let pbr_f0 = mix(vec3f(0.04), pbr_albedo.rgb, vec3f(pbr_metallic));
+    let pbr_ambient_fresnel = pbr_f0 + (vec3f(1.0) - pbr_f0) * pow(1.0 - pbr_ndotv, 5.0);
+    // Lambertian diffuse (Fresnel energy conservation, metallic suppression)
+    let pbr_kd = (vec3f(1.0) - pbr_ambient_fresnel) * (1.0 - pbr_metallic);
+    let pbr_diffuse_color = pbr_kd * pbr_albedo.rgb * pbr_ao;
+    var pbr_direct_diffuse = vec3f(0.0);
+    var pbr_direct_specular = vec3f(0.0);
+)""";
+    if (useGxPbrLights) {
+      std::string pbrLightAttn;
+      if (pbrChannelConfig.attnFn == GX_AF_NONE) {
+        pbrLightAttn = "      pbr_light_attn = 1.0;"s;
+      } else if (pbrChannelConfig.attnFn == GX_AF_SPOT) {
+        pbrLightAttn = R"""(
+      let pbr_cosine = max(0.0, dot(pbr_l, pbr_light.dir));
+      let pbr_cos_attn = dot(pbr_light.cos_att, vec3f(1.0, pbr_cosine, pbr_cosine * pbr_cosine));
+      let pbr_dist_attn = dot(pbr_light.dist_att, vec3f(1.0, pbr_dist, pbr_dist2));
+      pbr_light_attn = max(0.0, pbr_cos_attn / max(pbr_dist_attn, 1e-7));)""";
+      } else if (pbrChannelConfig.attnFn == GX_AF_SPEC) {
+        const std::string distAttn =
+            pbrChannelConfig.diffFn != GX_DF_NONE
+                ? "max(0.0, dot(normalize(pbr_light.dist_att), vec3f(1.0, pbr_light_attn, pbr_light_attn * pbr_light_attn)))"
+                : "max(0.0, dot(pbr_light.dist_att, vec3f(1.0, pbr_light_attn, pbr_light_attn * pbr_light_attn)))";
+        pbrLightAttn = fmt::format(R"""(
+      pbr_light_attn = select(0.0, max(0.0, dot(pbr_n, pbr_light.dir)), dot(pbr_n, pbr_l) >= 0.0);
+      let pbr_cos_attn = dot(pbr_light.cos_att, vec3f(1.0, pbr_light_attn, pbr_light_attn * pbr_light_attn));
+      let pbr_dist_attn = {};
+      pbr_light_attn = max(0.0, pbr_cos_attn / max(pbr_dist_attn, 1e-7));)""",
+                                      distAttn);
+      } else {
+        FATAL("invalid PBR light attenuation function {}", underlying(pbrChannelConfig.attnFn));
+      }
+
+      std::string_view pbrNdotlExpr;
+      if (pbrChannelConfig.diffFn == GX_DF_NONE) {
+        pbrNdotlExpr = "1.0"sv;
+      } else if (pbrChannelConfig.diffFn == GX_DF_SIGN || pbrChannelConfig.diffFn == GX_DF_CLAMP) {
+        pbrNdotlExpr = "max(dot(pbr_n, pbr_l), 0.0)"sv;
+      } else {
+        FATAL("invalid PBR diffuse function {}", underlying(pbrChannelConfig.diffFn));
+      }
+
+      fragmentFn += fmt::format(R"""(
+    for (var i = 0u; i < {}u; i++) {{
+      if ((ubuf.lightState{} & (1u << i)) == 0u) {{ continue; }}
+      let pbr_light = ubuf.lights[i];
+      var pbr_l = pbr_light.pos - in.mv_pos;
+      let pbr_dist2 = dot(pbr_l, pbr_l);
+      let pbr_dist = sqrt(pbr_dist2);
+      pbr_l = pbr_l / max(pbr_dist, 1e-7);
+      var pbr_light_attn: f32;
+{}
+      let pbr_ndotl = {};
+      let pbr_h = normalize(pbr_l + pbr_v);
+      let pbr_ndoth = max(dot(pbr_n, pbr_h), 0.0);
+      let pbr_vdoth = max(dot(pbr_v, pbr_h), 0.0);
+      let pbr_fresnel = pbr_f0 + (vec3f(1.0) - pbr_f0) * pow(1.0 - pbr_vdoth, 5.0);
+      let pbr_a2 = pbr_roughness * pbr_roughness * pbr_roughness * pbr_roughness;
+      let pbr_denom_d = pbr_ndoth * pbr_ndoth * (pbr_a2 - 1.0) + 1.0;
+      let pbr_D = pbr_a2 / (3.14159265 * pbr_denom_d * pbr_denom_d + 1e-7);
+      let pbr_k = (pbr_roughness + 1.0) * (pbr_roughness + 1.0) * 0.125;
+      let pbr_G = (pbr_ndotl / (pbr_ndotl * (1.0 - pbr_k) + pbr_k)) *
+                  (pbr_ndotv / (pbr_ndotv * (1.0 - pbr_k) + pbr_k));
+      let pbr_spec = pbr_D * pbr_G * pbr_fresnel * pbr_specular / (4.0 * pbr_ndotl * pbr_ndotv + 0.001);
+      let pbr_light_rgb = max(pbr_light.color.rgb * pbr_light_attn, vec3f(0.0));
+      pbr_direct_diffuse += pbr_diffuse_color * pbr_ndotl * pbr_light_rgb * ubuf.pbr_scales.x;
+      pbr_direct_specular += pbr_spec * pbr_ndotl * pbr_light_rgb * ubuf.pbr_scales.y;
+    }})""",
+                                    GX::MaxLights, pbrChannel, pbrLightAttn, pbrNdotlExpr);
+    } else {
+      fragmentFn += R"""(
+    let pbr_l = normalize(vec3f(-0.45, 0.65, 0.62));
+    let pbr_h = normalize(pbr_l + pbr_v);
+    let pbr_ndotl = max(dot(pbr_n, pbr_l), 0.0);
+    let pbr_ndoth = max(dot(pbr_n, pbr_h), 0.0);
+    let pbr_vdoth = max(dot(pbr_v, pbr_h), 0.0);
+    let pbr_fresnel = pbr_f0 + (vec3f(1.0) - pbr_f0) * pow(1.0 - pbr_vdoth, 5.0);
+    let pbr_a2 = pbr_roughness * pbr_roughness * pbr_roughness * pbr_roughness;
+    let pbr_denom_d = pbr_ndoth * pbr_ndoth * (pbr_a2 - 1.0) + 1.0;
+    let pbr_D = pbr_a2 / (3.14159265 * pbr_denom_d * pbr_denom_d + 1e-7);
+    let pbr_k = (pbr_roughness + 1.0) * (pbr_roughness + 1.0) * 0.125;
+    let pbr_G = (pbr_ndotl / (pbr_ndotl * (1.0 - pbr_k) + pbr_k)) *
+                (pbr_ndotv / (pbr_ndotv * (1.0 - pbr_k) + pbr_k));
+    let pbr_spec = pbr_D * pbr_G * pbr_fresnel * pbr_specular / (4.0 * pbr_ndotl * pbr_ndotv + 0.001);
+    pbr_direct_diffuse = pbr_diffuse_color * pbr_ndotl * pbr_env_light * ubuf.pbr_scales.x;
+    pbr_direct_specular = pbr_spec * pbr_ndotl * pbr_env_light * ubuf.pbr_scales.y;
+)""";
+    }
+    fragmentFn += R"""(
+    // Fill light (configurable secondary directional light for ambient bounce approximation)
+    let pbr_fill_ndotl = max(dot(pbr_n, ubuf.pbr_fill_dir.xyz), 0.0);
+    // Ambient specular lifts metals and smooth surfaces in shadow
+    let pbr_ambient_spec = pbr_ambient_fresnel * ubuf.pbr_params.y;
+    // Use raw albedo*ao as base so ambient/fill work for metallic materials (kd=0 for metals)
+    let pbr_base = pbr_albedo.rgb * pbr_ao;
+    let pbr_ibl_diffuse_env = textureSample(pbr_ibl_irradiance, pbr_ibl_irradiance_samp, pbr_n).rgb * pbr_env_tint;
+    let pbr_reflection = normalize(reflect(-pbr_v, pbr_n));
+    let pbr_ibl_spec_env = textureSampleLevel(
+        pbr_ibl_prefilter, pbr_ibl_prefilter_samp, pbr_reflection, pbr_roughness * ubuf.pbr_ibl_params.w).rgb *
+        pbr_env_tint;
+    let pbr_brdf = textureSample(pbr_ibl_brdf_lut, pbr_ibl_brdf_lut_samp, vec2f(pbr_ndotv, pbr_roughness)).rg;
+    let pbr_ibl_diffuse = pbr_diffuse_color * pbr_ibl_diffuse_env * ubuf.pbr_params.x * ubuf.pbr_ibl_params.y;
+    let pbr_ibl_specular = pbr_ibl_spec_env * (pbr_f0 * pbr_brdf.x + vec3f(pbr_brdf.y)) *
+                           pbr_specular * ubuf.pbr_params.y * ubuf.pbr_ibl_params.z;
+    let pbr_use_ibl = ubuf.pbr_ibl_params.x > 0.5;
+    let pbr_indirect_diffuse = select(pbr_base * ubuf.pbr_params.x * pbr_ambient_light, pbr_ibl_diffuse, pbr_use_ibl);
+    let pbr_indirect_specular = select(pbr_ambient_spec * pbr_ambient_light, pbr_ibl_specular, pbr_use_ibl);
+    var pbr_rgb = pbr_indirect_diffuse                                           // indirect diffuse
+                + pbr_indirect_specular                                          // indirect specular
+                + pbr_base * pbr_fill_ndotl * ubuf.pbr_params.z * pbr_env_light  // fill light (all materials)
+                + pbr_direct_diffuse                                             // main light diffuse
+                + pbr_direct_specular;                                           // main light specular
+)""";
+    if (hasPbrEmissive) {
+      fragmentFn += fmt::format(
+          "\n    pbr_rgb += textureSampleBias(pbr_emissive, pbr_emissive_samp, pbr_uv, "
+          "{}).rgb;",
+          pbrMapBias);
+    }
+    if ((config.pbrFlags & PbrMaterialHasConstantEmissive) != 0) {
+      fragmentFn += "\n    pbr_rgb += ubuf.pbr_material_emissive.rgb * ubuf.pbr_material_emissive.a;";
+    }
+    fragmentFn +=
+        "\n    prev = vec4f(clamp(pbr_rgb, vec3f(0.0), vec3f(1.0)), pbr_albedo.a * prev.a);";
+  }
   if (info.usesFog) {
     uniformPre +=
         "\n"
@@ -1420,7 +1680,90 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
         "var tex{0}: texture_2d<f32>;\n"
         "@group(2) @binding({2})\n"
         "var tex{0}_samp: sampler;",
-        i, i * 2, i * 2 + 1);
+        i, i * TextureBindingsPerMap, i * TextureBindingsPerMap + 1);
+  }
+  if ((config.pbrFlags & PbrMaterialEnabled) != 0) {
+    uniBufAttrs += "\n    pbr_params: vec4f,";        // x=ambient, y=ambient_specular, z=fill_intensity
+    uniBufAttrs += "\n    pbr_scales: vec4f,";        // x=diffuse_scale, y=specular_scale
+    uniBufAttrs += "\n    pbr_normal_params: vec4f,"; // x=strength, y=normal_y_sign, z=handedness_sign
+    uniBufAttrs += "\n    pbr_ambient_gradient: vec4f,"; // x=sky, y=ground, z=horizon, w=environment_tint
+    uniBufAttrs += "\n    pbr_ibl_params: vec4f,"; // x=enabled, y=diffuse_strength, z=specular_strength, w=max_mip
+    uniBufAttrs += "\n    pbr_fill_dir: vec4f,";      // xyz=fill light direction (view space)
+    uniBufAttrs += "\n    pbr_material_factors: vec4f,"; // x=roughness, y=metallic, z=ao, w=specular
+    uniBufAttrs += "\n    pbr_material_emissive: vec4f,"; // rgb=color, a=strength
+    const u32 texMap = config.pbrTexMapId;
+    texBindings += fmt::format(
+        "\n@group(2) @binding({0})\n"
+        "var pbr_ibl_irradiance: texture_cube<f32>;\n"
+        "@group(2) @binding({1})\n"
+        "var pbr_ibl_irradiance_samp: sampler;"
+        "\n@group(2) @binding({2})\n"
+        "var pbr_ibl_prefilter: texture_cube<f32>;\n"
+        "@group(2) @binding({3})\n"
+        "var pbr_ibl_prefilter_samp: sampler;"
+        "\n@group(2) @binding({4})\n"
+        "var pbr_ibl_brdf_lut: texture_2d<f32>;\n"
+        "@group(2) @binding({5})\n"
+        "var pbr_ibl_brdf_lut_samp: sampler;",
+        pbr_ibl_irradiance_texture_binding(texMap), pbr_ibl_irradiance_sampler_binding(texMap),
+        pbr_ibl_prefilter_texture_binding(texMap), pbr_ibl_prefilter_sampler_binding(texMap),
+        pbr_ibl_brdf_lut_texture_binding(texMap), pbr_ibl_brdf_lut_sampler_binding(texMap));
+    if ((config.pbrFlags & PbrMaterialHasRmaos) != 0) {
+      texBindings += fmt::format(
+          "\n@group(2) @binding({0})\n"
+          "var pbr_rmaos: texture_2d<f32>;\n"
+          "@group(2) @binding({1})\n"
+          "var pbr_rmaos_samp: sampler;",
+          pbr_rmaos_texture_binding(texMap), pbr_rmaos_sampler_binding(texMap));
+    }
+    if ((config.pbrFlags & PbrMaterialHasRoughness) != 0) {
+      texBindings += fmt::format(
+          "\n@group(2) @binding({0})\n"
+          "var pbr_roughness_map: texture_2d<f32>;\n"
+          "@group(2) @binding({1})\n"
+          "var pbr_roughness_map_samp: sampler;",
+          pbr_roughness_texture_binding(texMap), pbr_roughness_sampler_binding(texMap));
+    }
+    if ((config.pbrFlags & PbrMaterialHasMetallic) != 0) {
+      texBindings += fmt::format(
+          "\n@group(2) @binding({0})\n"
+          "var pbr_metallic_map: texture_2d<f32>;\n"
+          "@group(2) @binding({1})\n"
+          "var pbr_metallic_map_samp: sampler;",
+          pbr_metallic_texture_binding(texMap), pbr_metallic_sampler_binding(texMap));
+    }
+    if ((config.pbrFlags & PbrMaterialHasAo) != 0) {
+      texBindings += fmt::format(
+          "\n@group(2) @binding({0})\n"
+          "var pbr_ao_map: texture_2d<f32>;\n"
+          "@group(2) @binding({1})\n"
+          "var pbr_ao_map_samp: sampler;",
+          pbr_ao_texture_binding(texMap), pbr_ao_sampler_binding(texMap));
+    }
+    if ((config.pbrFlags & PbrMaterialHasSpecular) != 0) {
+      texBindings += fmt::format(
+          "\n@group(2) @binding({0})\n"
+          "var pbr_specular_map: texture_2d<f32>;\n"
+          "@group(2) @binding({1})\n"
+          "var pbr_specular_map_samp: sampler;",
+          pbr_specular_texture_binding(texMap), pbr_specular_sampler_binding(texMap));
+    }
+    if ((config.pbrFlags & PbrMaterialHasNormal) != 0) {
+      texBindings += fmt::format(
+          "\n@group(2) @binding({0})\n"
+          "var pbr_normal: texture_2d<f32>;\n"
+          "@group(2) @binding({1})\n"
+          "var pbr_normal_samp: sampler;",
+          pbr_normal_texture_binding(texMap), pbr_normal_sampler_binding(texMap));
+    }
+    if ((config.pbrFlags & PbrMaterialHasEmissive) != 0) {
+      texBindings += fmt::format(
+          "\n@group(2) @binding({0})\n"
+          "var pbr_emissive: texture_2d<f32>;\n"
+          "@group(2) @binding({1})\n"
+          "var pbr_emissive_samp: sampler;",
+          pbr_emissive_texture_binding(texMap), pbr_emissive_sampler_binding(texMap));
+    }
   }
   fragmentFn += "\n    prev = tev_overflow_vec4f(prev);";
   if (config.alphaCompare) {

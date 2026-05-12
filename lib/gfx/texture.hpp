@@ -35,6 +35,13 @@ struct TextureRef {
   uint32_t mipCount;
   u32 gxFormat;
   bool hasArbitraryMips = false;
+  std::shared_ptr<TextureRef> pbrRmaos;
+  std::shared_ptr<TextureRef> pbrRoughness;
+  std::shared_ptr<TextureRef> pbrMetallic;
+  std::shared_ptr<TextureRef> pbrAo;
+  std::shared_ptr<TextureRef> pbrSpecular;
+  std::shared_ptr<TextureRef> pbrNormal;
+  std::shared_ptr<TextureRef> pbrEmissive;
 
   TextureRef(wgpu::Texture texture, wgpu::TextureView sampleTextureView, wgpu::TextureView attachmentTextureView,
              wgpu::Extent3D size, wgpu::TextureFormat format, uint32_t mipCount, u32 gxFormat)

@@ -6,6 +6,7 @@
 #include "gx.hpp"
 #include "gx_fmt.hpp"
 #include "pipeline.hpp"
+#include "pbr.hpp"
 #include "shader_info.hpp"
 #include "../internal.hpp"
 
@@ -1624,7 +1625,10 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
 
   PipelineConfig config{};
   populate_pipeline_config(config, prim, fmt);
-  const auto info = build_shader_info(config.shaderConfig);
+  auto info = build_shader_info(config.shaderConfig);
+  resolve_sampled_textures(info);
+  configure_pbr_material_override(config.shaderConfig, info);
+  info = build_shader_info(config.shaderConfig);
   resolve_sampled_textures(info);
   const auto bindGroups = build_bind_groups(info);
   const auto pipeline = gfx::pipeline_ref(config);

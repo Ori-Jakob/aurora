@@ -485,9 +485,17 @@ bool initialize(AuroraBackend auroraBackend) {
                                                                             : supportedLimits.maxTextureDimension3D,
         .maxTextureArrayLayers = supportedLimits.maxTextureArrayLayers == 0 ? WGPU_LIMIT_U32_UNDEFINED
                                                                             : supportedLimits.maxTextureArrayLayers,
+        .maxBindingsPerBindGroup = supportedLimits.maxBindingsPerBindGroup == 0 ? WGPU_LIMIT_U32_UNDEFINED
+                                                                                : supportedLimits.maxBindingsPerBindGroup,
         .maxDynamicStorageBuffersPerPipelineLayout = supportedLimits.maxDynamicStorageBuffersPerPipelineLayout == 0
                                                          ? WGPU_LIMIT_U32_UNDEFINED
                                                          : supportedLimits.maxDynamicStorageBuffersPerPipelineLayout,
+        .maxSampledTexturesPerShaderStage = supportedLimits.maxSampledTexturesPerShaderStage == 0
+                                                ? WGPU_LIMIT_U32_UNDEFINED
+                                                : supportedLimits.maxSampledTexturesPerShaderStage,
+        .maxSamplersPerShaderStage = supportedLimits.maxSamplersPerShaderStage == 0
+                                         ? WGPU_LIMIT_U32_UNDEFINED
+                                         : supportedLimits.maxSamplersPerShaderStage,
         .maxStorageBuffersPerShaderStage = supportedLimits.maxStorageBuffersPerShaderStage == 0
                                                ? WGPU_LIMIT_U32_UNDEFINED
                                                : supportedLimits.maxStorageBuffersPerShaderStage,
@@ -502,13 +510,18 @@ bool initialize(AuroraBackend auroraBackend) {
         "\n  maxTextureDimension2D: {}"
         "\n  maxTextureDimension3D: {}"
         "\n  maxTextureArrayLayers: {}"
+        "\n  maxBindingsPerBindGroup: {}"
         "\n  maxDynamicStorageBuffersPerPipelineLayout: {}"
+        "\n  maxSampledTexturesPerShaderStage: {}"
+        "\n  maxSamplersPerShaderStage: {}"
         "\n  maxStorageBuffersPerShaderStage: {}"
         "\n  minUniformBufferOffsetAlignment: {}"
         "\n  minStorageBufferOffsetAlignment: {}",
         requiredLimits.maxTextureDimension1D, requiredLimits.maxTextureDimension2D,
         requiredLimits.maxTextureDimension3D, requiredLimits.maxTextureArrayLayers,
-        requiredLimits.maxDynamicStorageBuffersPerPipelineLayout, requiredLimits.maxStorageBuffersPerShaderStage,
+        requiredLimits.maxBindingsPerBindGroup, requiredLimits.maxDynamicStorageBuffersPerPipelineLayout,
+        requiredLimits.maxSampledTexturesPerShaderStage, requiredLimits.maxSamplersPerShaderStage,
+        requiredLimits.maxStorageBuffersPerShaderStage,
         requiredLimits.minUniformBufferOffsetAlignment, requiredLimits.minStorageBufferOffsetAlignment);
     std::vector<wgpu::FeatureName> requiredFeatures;
     wgpu::SupportedFeatures supportedFeatures;

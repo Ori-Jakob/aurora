@@ -1,5 +1,7 @@
 #include "shader_info.hpp"
 
+#include "pbr.hpp"
+
 #include <cmath>
 
 #include <tracy/Tracy.hpp>
@@ -186,6 +188,28 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     info.lineMode = config.lineMode;
   }
 
+  info.pbrFlags = config.pbrFlags;
+  info.pbrTexMapId = config.pbrTexMapId;
+  info.pbrTexCoordId = config.pbrTexCoordId;
+  info.pbrChannelId = config.pbrChannelId;
+  if ((info.pbrFlags & PbrMaterialEnabled) != 0) {
+    const bool usePrevAlbedo = (info.pbrFlags & PbrMaterialUsePrevAlbedo) != 0;
+    const bool hasMaterialMap =
+        (info.pbrFlags &
+         (PbrMaterialHasRmaos | PbrMaterialHasRoughness | PbrMaterialHasMetallic | PbrMaterialHasAo |
+          PbrMaterialHasSpecular | PbrMaterialHasNormal | PbrMaterialHasEmissive)) != 0;
+    if (!usePrevAlbedo && info.pbrTexMapId < MaxTextures) {
+      info.sampledTextures.set(info.pbrTexMapId);
+    }
+    if ((!usePrevAlbedo || hasMaterialMap) && info.pbrTexCoordId < MaxTexCoord) {
+      info.sampledTexCoords.set(info.pbrTexCoordId);
+    }
+    const auto pbrChannelId = static_cast<GXChannelID>(info.pbrChannelId);
+    if (pbrChannelId != GX_COLOR_NULL && pbrChannelId != GX_COLOR_ZERO && !is_alpha_bump_channel(pbrChannelId)) {
+      info.sampledColorChannels.set(color_channel(pbrChannelId));
+    }
+  }
+
   for (int attr = 0; attr < config.attrs.size(); attr++) {
     const auto attrType = config.attrs[attr].attrType;
     if ((attr == GX_VA_PNMTXIDX || (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX)) && attrType == GX_DIRECT) {
@@ -307,6 +331,9 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     info.uniformSize += MaxIndTexMtxs * sizeof(Mat2x4<float>);
   }
   info.uniformSize += info.sampledTextures.count() * sizeof(Vec4<float>);
+  if ((info.pbrFlags & PbrMaterialEnabled) != 0) {
+    info.uniformSize += 8 * sizeof(Vec4<float>);
+  }
   info.uniformSize = gfx::align_uniform(info.uniformSize);
   if (info.uniformSize > MaxUniformSize) {
     Log.fatal("Uniform size exceeds maximum: {} > {}", info.uniformSize, MaxUniformSize);
@@ -457,6 +484,16 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
     const auto& tex = get_texture(static_cast<GXTexMapID>(i));
     // CHECK(tex, "unbound texture {}", i);
     buf.append(texture_size_bias(tex));
+  }
+  if ((info.pbrFlags & PbrMaterialEnabled) != 0) {
+    buf.append(pbrParams);
+    buf.append(pbrScales);
+    buf.append(pbrNormalParams);
+    buf.append(pbrAmbientGradient);
+    buf.append(pbrIblParams);
+    buf.append(pbrFillDir);
+    buf.append(pbrMaterialFactors);
+    buf.append(pbrMaterialEmissive);
   }
   g_gxState.stateDirty = false;
   return range;

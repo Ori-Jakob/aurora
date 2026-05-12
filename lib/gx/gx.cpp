@@ -10,20 +10,25 @@
 #include "../gfx/texture_convert.hpp"
 #include "../gfx/texture_replacement.hpp"
 #include "gx_fmt.hpp"
+#include "pbr.hpp"
 
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 #include <tracy/Tracy.hpp>
 
 #include <cfloat>
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <mutex>
-#include <optional>
+#include <string>
 
 static aurora::Module Log("aurora::gx");
 
 namespace aurora::gx {
 using webgpu::g_device;
 using webgpu::g_graphicsConfig;
+using webgpu::g_queue;
 
 GXState g_gxState{};
 
@@ -808,19 +813,19 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
   ZoneScoped;
 
-  if (!info.sampledTextures.any() && !info.sampledIndTextures.any()) {
+  if (!info.sampledTextures.any() && !info.sampledIndTextures.any() && (info.pbrFlags & PbrMaterialEnabled) == 0) {
     // Don't bother re-binding anything
     return {};
   }
 
   // Using C WGPU types instead of C++ wrappers to avoid destructor overhead
-  std::array<WGPUBindGroupEntry, MaxTextures * 2> textureEntries{};
+  std::array<WGPUBindGroupEntry, TextureBindGroupEntryCount> textureEntries{};
   for (u32 i = 0; i < MaxTextures; ++i) {
     const auto& tex = g_gxState.textures[i];
-    WGPUBindGroupEntry& textureEntry = textureEntries[i * 2];
-    WGPUBindGroupEntry& samplerEntry = textureEntries[i * 2 + 1];
-    textureEntry.binding = i * 2;
-    samplerEntry.binding = i * 2 + 1;
+    WGPUBindGroupEntry& textureEntry = textureEntries[i * TextureBindingsPerMap];
+    WGPUBindGroupEntry& samplerEntry = textureEntries[i * TextureBindingsPerMap + 1];
+    textureEntry.binding = i * TextureBindingsPerMap;
+    samplerEntry.binding = i * TextureBindingsPerMap + 1;
     if (tex && (info.sampledTextures[i] || info.sampledIndTextures[i])) {
       textureEntry.textureView = tex.ref->sampleTextureView.Get();
       samplerEntry.sampler = gfx::sampler_ref(tex.get_descriptor()).Get();
@@ -828,7 +833,10 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
       textureEntry.textureView = sEmptyTextureView.Get();
       samplerEntry.sampler = sEmptySampler.Get();
     }
+
   }
+  bind_pbr_texture_entries(textureEntries, info, sEmptyTextureView, sEmptySampler);
+
   const WGPUBindGroupDescriptor textureBindGroupDescriptor{
       .label = {"GX Texture Bind Group", WGPU_STRLEN},
       .layout = sTextureBindGroupLayout.Get(),
@@ -842,10 +850,10 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
 
 void initialize() noexcept {
   {
-    std::array<wgpu::BindGroupLayoutEntry, MaxTextures * 2> textureEntries;
+    std::array<wgpu::BindGroupLayoutEntry, TextureBindGroupEntryCount> textureEntries{};
     for (u32 i = 0; i < MaxTextures; ++i) {
-      textureEntries[i * 2] = {
-          .binding = i * 2,
+      textureEntries[i * TextureBindingsPerMap] = {
+          .binding = i * TextureBindingsPerMap,
           .visibility = wgpu::ShaderStage::Fragment,
           .texture =
               {
@@ -853,12 +861,13 @@ void initialize() noexcept {
                   .viewDimension = wgpu::TextureViewDimension::e2D,
               },
       };
-      textureEntries[i * 2 + 1] = {
-          .binding = i * 2 + 1,
+      textureEntries[i * TextureBindingsPerMap + 1] = {
+          .binding = i * TextureBindingsPerMap + 1,
           .visibility = wgpu::ShaderStage::Fragment,
           .sampler = {.type = wgpu::SamplerBindingType::Filtering},
       };
     }
+    add_pbr_texture_layout_entries(textureEntries);
     const wgpu::BindGroupLayoutDescriptor descriptor{
         .label = "GX Texture Bind Group Layout",
         .entryCount = textureEntries.size(),
@@ -880,18 +889,20 @@ void initialize() noexcept {
     sEmptyTexture = g_device.CreateTexture(&descriptor);
     sEmptyTextureView = sEmptyTexture.CreateView();
   }
+  initialize_pbr_resources();
   {
-    std::array<wgpu::BindGroupEntry, MaxTextures * 2> entries;
+    std::array<wgpu::BindGroupEntry, TextureBindGroupEntryCount> entries{};
     for (u32 i = 0; i < MaxTextures; ++i) {
-      entries[i * 2] = {
-          .binding = i * 2,
+      entries[i * TextureBindingsPerMap] = {
+          .binding = i * TextureBindingsPerMap,
           .textureView = sEmptyTextureView,
       };
-      entries[i * 2 + 1] = {
-          .binding = i * 2 + 1,
+      entries[i * TextureBindingsPerMap + 1] = {
+          .binding = i * TextureBindingsPerMap + 1,
           .sampler = sEmptySampler,
       };
     }
+    add_pbr_empty_bind_group_entries(entries, sEmptyTextureView, sEmptySampler);
     const wgpu::BindGroupDescriptor desc{
         .label = "GX Empty Texture Bind Group",
         .layout = sTextureBindGroupLayout,

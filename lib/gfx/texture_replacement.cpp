@@ -16,9 +16,11 @@
 #include <charconv>
 #include <cstring>
 #include <filesystem>
+#include <initializer_list>
 #include <list>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 
 #include "../fs_helper.hpp"
@@ -61,9 +63,23 @@ struct CachedReplacement {
   std::list<RuntimeTextureKey>::iterator lruIt;
 };
 
-absl::flat_hash_map<RuntimeTextureKey, std::filesystem::path> s_replacementIndex;
+struct ReplacementPaths {
+  std::filesystem::path base;
+  std::filesystem::path rmaos;
+  std::filesystem::path roughness;
+  std::filesystem::path metallic;
+  std::filesystem::path ao;
+  std::filesystem::path specular;
+  std::filesystem::path normal;
+  std::filesystem::path emissive;
+};
+
+absl::flat_hash_map<RuntimeTextureKey, ReplacementPaths> s_replacementIndex;
 absl::flat_hash_map<RuntimeTextureKey, CachedReplacement> s_replacementCache;
+absl::flat_hash_map<std::string, std::filesystem::path> s_namedPbrTextureIndex;
+absl::flat_hash_map<std::string, gfx::TextureHandle> s_namedPbrTextureCache;
 absl::flat_hash_set<RuntimeTextureKey> s_failedKeys;
+absl::flat_hash_set<std::string> s_failedNamedPbrTextures;
 absl::flat_hash_set<RuntimeTextureKey> s_reportedMisses;
 absl::flat_hash_map<const GXTlutObj*, TlutMetadata> s_pendingTluts;
 std::array<TlutMetadata, MaxTluts> s_loadedTluts{};
@@ -113,6 +129,62 @@ bool is_sidecar_mip(std::string_view stem) noexcept {
   }
 
   return stem.substr(i - tag.size(), tag.size()) == tag;
+}
+
+bool ends_with_ascii_ci(std::string_view text, std::string_view suffix) noexcept {
+  if (text.size() < suffix.size()) {
+    return false;
+  }
+  return iequals_ascii(text.substr(text.size() - suffix.size()), suffix);
+}
+
+bool is_pbr_sidecar(std::string_view stem) noexcept {
+  return ends_with_ascii_ci(stem, "_rmaos") || ends_with_ascii_ci(stem, "_roughness") ||
+         ends_with_ascii_ci(stem, "_rough") || ends_with_ascii_ci(stem, "_metallic") ||
+         ends_with_ascii_ci(stem, "_metal") || ends_with_ascii_ci(stem, "_ao") ||
+         ends_with_ascii_ci(stem, "_specular") || ends_with_ascii_ci(stem, "_spec") ||
+         ends_with_ascii_ci(stem, "_normal") || ends_with_ascii_ci(stem, "_n") ||
+         ends_with_ascii_ci(stem, "_emissive") || ends_with_ascii_ci(stem, "_e");
+}
+
+std::string to_lower_ascii(std::string_view text) {
+  std::string out{text};
+  for (char& ch : out) {
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  }
+  return out;
+}
+
+std::optional<std::filesystem::path> find_sibling_sidecar(
+    const std::filesystem::path& base, std::initializer_list<std::string_view> suffixes) noexcept {
+  std::error_code ec;
+  const auto parent = base.parent_path();
+  const auto stem = base.stem().string();
+  const auto extension = base.extension().string();
+
+  for (const std::string_view suffix : suffixes) {
+    auto candidate = parent / fmt::format("{}{}{}", stem, suffix, extension);
+    if (std::filesystem::is_regular_file(candidate, ec)) {
+      return candidate;
+    }
+  }
+
+  for (std::filesystem::directory_iterator it(parent, std::filesystem::directory_options::skip_permission_denied, ec);
+       !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+    if (!it->is_regular_file(ec)) {
+      continue;
+    }
+
+    const auto filename = it->path().filename().string();
+    for (const std::string_view suffix : suffixes) {
+      const auto wanted = fmt::format("{}{}{}", stem, suffix, extension);
+      if (iequals_ascii(filename, wanted)) {
+        return it->path();
+      }
+    }
+  }
+
+  return std::nullopt;
 }
 
 std::optional<uint64_t> parse_hex(std::string_view text) noexcept {
@@ -488,6 +560,11 @@ void build_index() noexcept {
     return;
   }
 
+  // Single recursive scan: index PBR sidecars by (parent, lowercase_stem) for O(1) matching,
+  // avoiding per-texture directory re-scans in find_sibling_sidecar.
+  absl::flat_hash_map<std::pair<std::string, std::string>, std::filesystem::path> sidecarIndex;
+  std::vector<std::pair<RuntimeTextureKey, std::filesystem::path>> baseTextures;
+
   std::error_code ec;
   for (std::filesystem::recursive_directory_iterator it(s_replacementRoot,
                                                         std::filesystem::directory_options::skip_permission_denied |
@@ -511,7 +588,16 @@ void build_index() noexcept {
       continue;
     }
 
-    if (is_sidecar_mip(path.stem().string())) {
+    const auto stem = path.stem().string();
+
+    if (is_sidecar_mip(stem)) {
+      continue;
+    }
+
+    if (is_pbr_sidecar(stem)) {
+      s_namedPbrTextureIndex.try_emplace(to_lower_ascii(path.filename().string()), path);
+      s_namedPbrTextureIndex.try_emplace(to_lower_ascii(stem), path);
+      sidecarIndex.try_emplace(std::pair{path.parent_path().string(), to_lower_ascii(stem)}, path);
       continue;
     }
 
@@ -520,11 +606,37 @@ void build_index() noexcept {
       continue;
     }
 
-    s_replacementIndex.try_emplace(*parsed, path);
+    baseTextures.emplace_back(*parsed, path);
+  }
+
+  for (auto& [key, basePath] : baseTextures) {
+    const auto parentStr = basePath.parent_path().string();
+    const auto stemLower = to_lower_ascii(basePath.stem().string());
+
+    const auto findSidecar = [&](std::initializer_list<std::string_view> suffixes) -> std::filesystem::path {
+      for (const std::string_view suffix : suffixes) {
+        if (const auto sit = sidecarIndex.find(std::pair{parentStr, stemLower + std::string(suffix)});
+            sit != sidecarIndex.end()) {
+          return sit->second;
+        }
+      }
+      return {};
+    };
+
+    ReplacementPaths replacement{.base = basePath};
+    replacement.rmaos = findSidecar({"_rmaos"});
+    replacement.roughness = findSidecar({"_roughness", "_rough"});
+    replacement.metallic = findSidecar({"_metallic", "_metal"});
+    replacement.ao = findSidecar({"_ao"});
+    replacement.specular = findSidecar({"_specular", "_spec"});
+    replacement.normal = findSidecar({"_normal", "_n"});
+    replacement.emissive = findSidecar({"_emissive", "_e"});
+
+    s_replacementIndex.try_emplace(key, std::move(replacement));
   }
 }
 
-const std::filesystem::path* find_replacement_path(const RuntimeTextureKey& key) noexcept {
+const ReplacementPaths* find_replacement_paths(const RuntimeTextureKey& key) noexcept {
   if (const auto it = s_replacementIndex.find(key); it != s_replacementIndex.end()) {
     return &it->second;
   }
@@ -556,14 +668,17 @@ const gfx::TextureHandle* find_cached_replacement(const RuntimeTextureKey& key) 
   return &cached->second.handle;
 }
 
-gfx::TextureHandle load_replacement_texture(const RuntimeTextureKey& key, const std::filesystem::path& path) noexcept {
-  const auto replacement = load_replacement(path, key.hasMips);
+gfx::TextureHandle load_texture_file(const RuntimeTextureKey& key, const std::filesystem::path& path, bool hasMips,
+                                     std::string_view labelPrefix, bool reportFailure) noexcept {
+  const auto replacement = load_replacement(path, hasMips);
   if (!replacement.has_value()) {
-    s_failedKeys.insert(key);
+    if (reportFailure) {
+      s_failedKeys.insert(key);
+    }
     return {};
   }
 
-  const auto label = fmt::format("TextureReplacement {}", format_replacement_filename(key));
+  const auto label = fmt::format("{} {}", labelPrefix, fs_path_to_string(path.filename().string()));
   const wgpu::Extent3D size{
       .width = replacement->width,
       .height = replacement->height,
@@ -593,9 +708,90 @@ gfx::TextureHandle load_replacement_texture(const RuntimeTextureKey& key, const 
   return handle;
 }
 
+gfx::TextureHandle load_named_texture_file(const std::filesystem::path& path) noexcept {
+  const auto replacement = load_replacement(path, false);
+  if (!replacement.has_value()) {
+    Log.warn("texture_replacement: failed to load named PBR texture {}", fs_path_to_string(path.string()));
+    return {};
+  }
+
+  const auto label = fmt::format("TextureReplacement Named PBR {}", fs_path_to_string(path.filename().string()));
+  const wgpu::Extent3D size{
+      .width = replacement->width,
+      .height = replacement->height,
+      .depthOrArrayLayers = 1,
+  };
+  const wgpu::TextureDescriptor textureDescriptor{
+      .label = label.c_str(),
+      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
+      .dimension = wgpu::TextureDimension::e2D,
+      .size = size,
+      .format = replacement->format,
+      .mipLevelCount = replacement->mips,
+      .sampleCount = 1,
+  };
+  auto texture = g_device.CreateTexture(&textureDescriptor);
+  const auto viewLabel = fmt::format("{} view", label);
+  const wgpu::TextureViewDescriptor textureViewDescriptor{
+      .label = viewLabel.c_str(),
+      .format = replacement->format,
+      .dimension = wgpu::TextureViewDimension::e2D,
+      .mipLevelCount = replacement->mips,
+  };
+  auto textureView = texture.CreateView(&textureViewDescriptor);
+  auto handle = std::make_shared<gfx::TextureRef>(std::move(texture), std::move(textureView), wgpu::TextureView{}, size,
+                                                  replacement->format, replacement->mips, gfx::InvalidTextureFormat);
+  gfx::write_texture(*handle, replacement->data);
+  return handle;
+}
+
+gfx::TextureHandle load_replacement_texture(const RuntimeTextureKey& key, const ReplacementPaths& paths) noexcept {
+  auto handle = load_texture_file(key, paths.base, key.hasMips, "TextureReplacement", true);
+  if (!handle) {
+    return {};
+  }
+
+  if (!paths.rmaos.empty()) {
+    handle->pbrRmaos = load_texture_file(key, paths.rmaos, false, "TextureReplacement RMAOS", false);
+  }
+  if (!paths.roughness.empty()) {
+    handle->pbrRoughness = load_texture_file(key, paths.roughness, false, "TextureReplacement Roughness", false);
+  }
+  if (!paths.metallic.empty()) {
+    handle->pbrMetallic = load_texture_file(key, paths.metallic, false, "TextureReplacement Metallic", false);
+  }
+  if (!paths.ao.empty()) {
+    handle->pbrAo = load_texture_file(key, paths.ao, false, "TextureReplacement AO", false);
+  }
+  if (!paths.specular.empty()) {
+    handle->pbrSpecular = load_texture_file(key, paths.specular, false, "TextureReplacement Specular", false);
+  }
+  if (!paths.normal.empty()) {
+    handle->pbrNormal = load_texture_file(key, paths.normal, false, "TextureReplacement Normal", false);
+  }
+  if (!paths.emissive.empty()) {
+    handle->pbrEmissive = load_texture_file(key, paths.emissive, false, "TextureReplacement Emissive", false);
+  }
+
+  return handle;
+}
+
+uint64_t calc_texture_handle_bytes(const gfx::TextureHandle& handle) noexcept {
+  if (!handle) {
+    return 0;
+  }
+
+  return calc_texture_size(handle->format, handle->size.width, handle->size.height, handle->mipCount);
+}
+
 void cache_replacement(const RuntimeTextureKey& key, const gfx::TextureHandle& handle) noexcept {
-  const uint64_t replacementBytes =
-      calc_texture_size(handle->format, handle->size.width, handle->size.height, handle->mipCount);
+  const uint64_t replacementBytes = calc_texture_handle_bytes(handle) + calc_texture_handle_bytes(handle->pbrRmaos) +
+                                    calc_texture_handle_bytes(handle->pbrRoughness) +
+                                    calc_texture_handle_bytes(handle->pbrMetallic) +
+                                    calc_texture_handle_bytes(handle->pbrAo) +
+                                    calc_texture_handle_bytes(handle->pbrSpecular) +
+                                    calc_texture_handle_bytes(handle->pbrNormal) +
+                                    calc_texture_handle_bytes(handle->pbrEmissive);
   s_replacementLru.push_front(key);
   s_replacementCache.emplace(
       key, CachedReplacement{.handle = handle, .bytes = replacementBytes, .lruIt = s_replacementLru.begin()});
@@ -654,7 +850,10 @@ void initialize() noexcept { build_index(); }
 void shutdown() noexcept {
   s_replacementIndex.clear();
   s_replacementCache.clear();
+  s_namedPbrTextureIndex.clear();
+  s_namedPbrTextureCache.clear();
   s_failedKeys.clear();
+  s_failedNamedPbrTextures.clear();
   s_reportedMisses.clear();
   s_pendingTluts.clear();
   for (auto& tlut : s_loadedTluts) {
@@ -717,6 +916,42 @@ bool try_bind_replacement(GXTexObj_& obj, GXTexMapID id) noexcept {
   return true;
 }
 
+std::optional<TextureHandle> find_named_pbr_texture(std::string_view name) noexcept {
+  if (!g_config.allowTextureReplacements || name.empty()) {
+    return std::nullopt;
+  }
+
+  auto key = to_lower_ascii(std::filesystem::path{std::string{name}}.filename().string());
+  if (key.empty()) {
+    return std::nullopt;
+  }
+
+  auto pathIt = s_namedPbrTextureIndex.find(key);
+  if (pathIt == s_namedPbrTextureIndex.end() && !ends_with_ascii_ci(key, ".dds")) {
+    pathIt = s_namedPbrTextureIndex.find(key + ".dds");
+  }
+  if (pathIt == s_namedPbrTextureIndex.end()) {
+    return std::nullopt;
+  }
+
+  key = pathIt->first;
+  if (const auto cached = s_namedPbrTextureCache.find(key); cached != s_namedPbrTextureCache.end()) {
+    return cached->second;
+  }
+  if (s_failedNamedPbrTextures.contains(key)) {
+    return std::nullopt;
+  }
+
+  auto handle = load_named_texture_file(pathIt->second);
+  if (!handle) {
+    s_failedNamedPbrTextures.insert(key);
+    return std::nullopt;
+  }
+
+  s_namedPbrTextureCache.emplace(key, handle);
+  return handle;
+}
+
 std::optional<TextureHandle> find_replacement(const GXTexObj_& obj) noexcept {
   ZoneScoped;
 
@@ -725,8 +960,8 @@ std::optional<TextureHandle> find_replacement(const GXTexObj_& obj) noexcept {
   }
 
   const RuntimeTextureKey key = build_runtime_key(obj);
-  const auto* path = find_replacement_path(key);
-  if (path == nullptr) {
+  const auto* paths = find_replacement_paths(key);
+  if (paths == nullptr) {
     report_missing_key(key, obj);
     return std::nullopt;
   }
@@ -739,7 +974,7 @@ std::optional<TextureHandle> find_replacement(const GXTexObj_& obj) noexcept {
     return std::nullopt;
   }
 
-  auto handle = load_replacement_texture(key, *path);
+  auto handle = load_replacement_texture(key, *paths);
   if (!handle) {
     return std::nullopt;
   }

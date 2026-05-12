@@ -67,6 +67,47 @@ constexpr u32 MaxVtxFmt = GX_MAX_VTXFMT;
 constexpr u32 MaxPnMtx = (GX_PNMTX9 / 3) + 1;
 constexpr u32 MaxIndexAttr = 12; // VA_POS -> VA_TEX7
 constexpr u32 MaxUniformSize = 3840;
+constexpr u32 TextureBindingsPerMap = 2;
+constexpr u32 PbrMaterialBindingsPerMap = 20;
+constexpr u32 TextureBindGroupEntryCount = MaxTextures * TextureBindingsPerMap + PbrMaterialBindingsPerMap;
+
+constexpr u32 pbr_rmaos_texture_binding(u32 texMap) noexcept {
+  (void)texMap;
+  return MaxTextures * TextureBindingsPerMap;
+}
+constexpr u32 pbr_rmaos_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 1; }
+constexpr u32 pbr_roughness_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 2; }
+constexpr u32 pbr_roughness_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 3; }
+constexpr u32 pbr_metallic_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 4; }
+constexpr u32 pbr_metallic_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 5; }
+constexpr u32 pbr_ao_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 6; }
+constexpr u32 pbr_ao_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 7; }
+constexpr u32 pbr_specular_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 8; }
+constexpr u32 pbr_specular_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 9; }
+constexpr u32 pbr_normal_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 10; }
+constexpr u32 pbr_normal_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 11; }
+constexpr u32 pbr_emissive_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 12; }
+constexpr u32 pbr_emissive_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 13; }
+constexpr u32 pbr_ibl_irradiance_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 14; }
+constexpr u32 pbr_ibl_irradiance_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 15; }
+constexpr u32 pbr_ibl_prefilter_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 16; }
+constexpr u32 pbr_ibl_prefilter_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 17; }
+constexpr u32 pbr_ibl_brdf_lut_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 18; }
+constexpr u32 pbr_ibl_brdf_lut_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 19; }
+
+enum PbrMaterialFlags : u32 {
+  PbrMaterialEnabled = 1u << 0,
+  PbrMaterialHasRmaos = 1u << 1,
+  PbrMaterialHasRoughness = 1u << 2,
+  PbrMaterialHasMetallic = 1u << 3,
+  PbrMaterialHasAo = 1u << 4,
+  PbrMaterialHasSpecular = 1u << 5,
+  PbrMaterialHasNormal = 1u << 6,
+  PbrMaterialHasEmissive = 1u << 7,
+  PbrMaterialUsePrevAlbedo = 1u << 8,
+  PbrMaterialHasConstantEmissive = 1u << 9,
+  PbrMaterialPrevAlbedoIsLit = 1u << 10,
+};
 
 extern wgpu::BindGroup g_emptyTextureBindGroup;
 
@@ -383,6 +424,7 @@ struct GXState {
   void clearVtxSizeCache() { lastVtxFmt = GX_MAX_VTXFMT; }
 };
 extern GXState g_gxState;
+struct ShaderConfig;
 struct ShaderInfo;
 
 void initialize() noexcept;
@@ -441,6 +483,10 @@ struct ShaderConfig {
   u8 lineMode : 2 = 0; // 1 = GX_LINES, 2 = GX_LINESTRIP, 3 = GX_POINTS
   u8 pad1 : 6 = 0;
   u8 pad2 = 0;
+  u32 pbrFlags = 0;
+  u32 pbrTexMapId = GX_TEXMAP_NULL;
+  u32 pbrTexCoordId = GX_TEXCOORD_NULL;
+  u32 pbrChannelId = GX_COLOR_NULL;
   std::array<AttrConfig, MaxVtxAttr> attrs;
   std::array<TevSwap, MaxTevSwap> tevSwapTable;
   std::array<TevStage, MaxTevStages> tevStages;
@@ -473,6 +519,10 @@ struct ShaderInfo {
   std::bitset<MaxIndStages> usedIndStages;
   std::bitset<MaxTextures> sampledIndTextures;
   std::bitset<MaxIndTexMtxs> usedIndTexMtxs;
+  u32 pbrFlags = 0;
+  u32 pbrTexMapId = GX_TEXMAP_NULL;
+  u32 pbrTexCoordId = GX_TEXCOORD_NULL;
+  u32 pbrChannelId = GX_COLOR_NULL;
   u32 uniformSize = 0;
   bool usesFog : 1 = false;
   bool lightingEnabled : 1 = false;
