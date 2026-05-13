@@ -13,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <initializer_list>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -31,10 +32,24 @@ Vec4<float> pbrParams{0.30f, 0.04f, 0.20f, 0.0f};
 Vec4<float> pbrScales{1.0f, 1.0f, static_cast<float>(AURORA_PBR_DEBUG_OFF), 0.0f};
 Vec4<float> pbrNormalParams{1.0f, 1.0f, 1.0f, 0.0f};
 Vec4<float> pbrAmbientGradient{1.15f, 0.45f, 0.80f, 1.0f};
+Vec4<float> pbrIndirectOcclusion{0.35f, 0.45f, 0.60f, 0.0f};
+Vec4<float> pbrDynamicGiParams{0.0f, 0.15f, 0.35f, 0.35f};
 Vec4<float> pbrIblParams{1.0f, 1.0f, 1.0f, 5.0f};
+Vec4<float> pbrIblBlendParams{1.0f, 5.0f, 0.0f, 0.0f};
 Vec4<float> pbrFillDir{0.39f, -0.44f, -0.81f, 0.0f};
 Vec4<float> pbrMaterialFactors{0.5f, 0.0f, 1.0f, 0.5f};
 Vec4<float> pbrMaterialEmissive{0.0f, 0.0f, 0.0f, 0.0f};
+bool pbrEnhancedLightsEnabled = false;
+bool pbrEnhancedLightsDebugEnabled = false;
+AuroraPbrEnhancedLightFalloff pbrEnhancedLightFalloff = AURORA_PBR_ENHANCED_LIGHT_FALLOFF_LEGACY_RADIUS;
+u32 pbrEnhancedLightMaxCount = 4;
+u32 pbrEnhancedLightCount = 0;
+u32 pbrSubmittedSceneLightCount = 0;
+bool pbrSceneLightsApiBacked = false;
+float pbrEnhancedLightIntensityScale = 1.0f;
+u32 pbrEnhancedLightStorageOffset = 0;
+u32 pbrEnhancedLightStorageSize = 0;
+std::array<PbrEnhancedLight, PbrMaxEnhancedLights> pbrEnhancedLights{};
 gfx::TextureHandle pbrMaterialRmaos;
 gfx::TextureHandle pbrMaterialRoughness;
 gfx::TextureHandle pbrMaterialMetallic;
@@ -49,16 +64,20 @@ constexpr u32 PbrPrefilterCubeSize = 64;
 constexpr u32 PbrPrefilterMipCount = 6;
 constexpr u32 PbrRuntimeProbeCubeSize = 32;
 constexpr u32 PbrRuntimeProbePrefilterMipCount = 6;
-constexpr u32 PbrProbeCaptureFramesPerFace = 6;
-constexpr u32 PbrProbePeriodicRefreshFrames = 180;
+constexpr u32 PbrProbeCaptureFramesPerFace = 12;
+constexpr u32 PbrProbePeriodicRefreshFrames = 900;
 constexpr float PbrProbeDirtyDistance = 48.0f;
 constexpr float PbrProbeDirtyRotationSum = 0.08f;
 constexpr u32 PbrBrdfLutSize = 128;
+constexpr u32 PbrShadowMapMinSize = 256;
+constexpr u32 PbrShadowMapMaxSize = 4096;
+constexpr u32 PbrShadowMapDefaultSize = 1024;
 constexpr float PbrPi = 3.14159265358979323846f;
 constexpr std::array<std::string_view, 6> PbrCubeFaceNames{"px", "nx", "py", "ny", "pz", "nz"};
 constexpr u32 PbrProbeIrradianceFilterPassCount = 6;
 constexpr u32 PbrProbePrefilterPassCount = 6 * PbrRuntimeProbePrefilterMipCount;
 constexpr u32 PbrProbeFilterPassCount = PbrProbeIrradianceFilterPassCount + PbrProbePrefilterPassCount;
+constexpr u32 PbrProbeCacheSlotCount = 4;
 
 wgpu::Sampler sPbrMaterialSampler;
 wgpu::Sampler sPbrIblSampler;
@@ -75,6 +94,29 @@ struct PbrIblTextureSet {
   bool available = false;
 };
 
+struct PbrProbeTargetViews {
+  std::array<wgpu::TextureView, 6> irradianceFaceViews;
+  std::array<std::array<wgpu::TextureView, 6>, PbrRuntimeProbePrefilterMipCount> prefilterFaceViews;
+};
+
+struct PbrProbeCamera {
+  Mat3x4<float> sourceView;
+  Mat3x4<float> sourceInvView;
+  Mat4x4<float> projection;
+  std::array<Mat3x4<float>, 6> viewFromSource;
+  std::array<Mat3x4<float>, 6> normalFromSource;
+  bool valid = false;
+};
+
+struct PbrProbeCacheSlot {
+  PbrIblTextureSet ibl;
+  PbrProbeTargetViews targetViews;
+  PbrProbeCamera camera;
+  std::string sceneKey;
+  u32 lastUsedSerial = 0;
+  bool resourcesReady = false;
+};
+
 PbrIblTextureSet sFallbackPbrIbl;
 PbrIblTextureSet sAuthoredPbrIbl;
 PbrIblTextureSet sProbePbrIbl;
@@ -88,8 +130,7 @@ int sAuthoredPbrIblRoom = -1;
 bool sAuthoredPbrIblGlobalLoaded = false;
 bool sAuthoredPbrIblStageLoaded = false;
 bool sAuthoredPbrIblRoomLoaded = false;
-std::array<wgpu::TextureView, 6> sProbeIrradianceFaceViews;
-std::array<std::array<wgpu::TextureView, 6>, PbrRuntimeProbePrefilterMipCount> sProbePrefilterFaceViews;
+PbrProbeTargetViews sProbeTargetViews;
 std::array<wgpu::TextureView, 6> sProbeCaptureFaceViews;
 wgpu::Texture sProbeCaptureMsaaColorTexture;
 wgpu::TextureView sProbeCaptureMsaaColorView;
@@ -107,21 +148,45 @@ u32 sProbeCaptureDelayFrames = 0;
 bool sProbeCaptureResourcesReady = false;
 bool sProbeFilterPending = false;
 
-struct PbrProbeCamera {
-  Mat3x4<float> sourceView;
-  Mat3x4<float> sourceInvView;
-  Mat4x4<float> projection;
-  std::array<Mat3x4<float>, 6> viewFromSource;
-  std::array<Mat3x4<float>, 6> normalFromSource;
-  bool valid = false;
-};
-
 PbrProbeCamera sProbeCamera;
 PbrProbeCamera sProbeCaptureCamera;
 PbrProbeCamera sProbeLastCompletedCamera;
 u32 sProbeFramesSinceRefresh = PbrProbePeriodicRefreshFrames;
 bool sProbeRefreshPending = true;
 bool sProbeAutoRefresh = false;
+bool sProbeLocalGi = false;
+bool sProbeSceneStale = false;
+bool sProbeCacheEnabled = true;
+bool sProbeCacheLastHit = false;
+bool sProbeNearestCacheEnabled = true;
+bool sProbeNearestCacheActive = false;
+float sProbeNearestCacheDistance = 0.0f;
+float sProbeNearestCacheMaxDistance = 6000.0f;
+bool sProbeSpatialBlendEnabled = true;
+bool sProbeSpatialBlendActive = false;
+float sProbeSpatialBlendFactor = 1.0f;
+float sProbeSpatialBlendDistance = 0.0f;
+float sProbeSpatialBlendMaxDistance = 8000.0f;
+bool sProbeBlendEnabled = true;
+PbrIblTextureSet* sPbrIblBlendFrom = nullptr;
+PbrIblTextureSet* sPbrIblSpatialFrom = nullptr;
+u32 sProbeBlendFrames = 45;
+u32 sProbeBlendFrame = 45;
+float sProbeBlendFactor = 1.0f;
+bool sProbeReplayPbrVisible = false;
+u32 sProbeReplayDrawCount = 0;
+u32 sProbeCacheSerial = 1;
+std::array<PbrProbeCacheSlot, PbrProbeCacheSlotCount> sProbeCacheSlots;
+PbrProbeCacheSlot* sActiveProbeCacheSlot = nullptr;
+PbrProbeCacheSlot* sSpatialProbeCacheSlot = nullptr;
+PbrProbeCacheSlot* sProbeCaptureCacheSlot = nullptr;
+PbrProbeCacheSlot* sProbeFilterCacheSlot = nullptr;
+u32 sPbrShadowMapSize = PbrShadowMapDefaultSize;
+float sPbrShadowMapStrength = 1.0f;
+float sPbrShadowMapBias = 0.002f;
+bool sPbrShadowMapEnabled = false;
+bool sPbrShadowMapAvailable = false;
+AuroraPbrShadowLightRequest sPbrShadowLightRequest{};
 
 struct PbrProbeFilterParams {
   u32 face = 0;
@@ -151,6 +216,17 @@ PbrVec3 pbr_normalize(PbrVec3 v) noexcept {
 
 PbrVec3 pbr_cross(PbrVec3 a, PbrVec3 b) noexcept {
   return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+
+PbrVec3 pbr_probe_eye(const PbrProbeCamera& camera) noexcept {
+  return {camera.sourceInvView.m0[3], camera.sourceInvView.m1[3], camera.sourceInvView.m2[3]};
+}
+
+float pbr_distance_sq(PbrVec3 a, PbrVec3 b) noexcept {
+  const float dx = a.x - b.x;
+  const float dy = a.y - b.y;
+  const float dz = a.z - b.z;
+  return dx * dx + dy * dy + dz * dz;
 }
 
 float pbr_mtx(const Mat3x4<float>& mtx, u32 row, u32 col) noexcept {
@@ -687,7 +763,8 @@ void create_probe_capture_target(PbrIblTextureSet& set, std::array<wgpu::Texture
   set.available = false;
 }
 
-void create_processed_probe_target(PbrIblTextureSet& set, wgpu::TextureFormat colorFormat) noexcept {
+void create_processed_probe_target(PbrIblTextureSet& set, PbrProbeTargetViews& targetViews,
+                                   wgpu::TextureFormat colorFormat) noexcept {
   const wgpu::TextureDescriptor irradianceDesc{
       .label = "PBR runtime probe irradiance cube",
       .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
@@ -706,7 +783,7 @@ void create_processed_probe_target(PbrIblTextureSet& set, wgpu::TextureFormat co
       .arrayLayerCount = 6,
   };
   set.irradianceCubeView = set.irradianceCubeTexture.CreateView(&irradianceViewDesc);
-  for (u32 face = 0; face < sProbeIrradianceFaceViews.size(); ++face) {
+  for (u32 face = 0; face < targetViews.irradianceFaceViews.size(); ++face) {
     const wgpu::TextureViewDescriptor faceViewDesc{
         .label = "PBR runtime probe irradiance face view",
         .format = colorFormat,
@@ -716,7 +793,7 @@ void create_processed_probe_target(PbrIblTextureSet& set, wgpu::TextureFormat co
         .baseArrayLayer = face,
         .arrayLayerCount = 1,
     };
-    sProbeIrradianceFaceViews[face] = set.irradianceCubeTexture.CreateView(&faceViewDesc);
+    targetViews.irradianceFaceViews[face] = set.irradianceCubeTexture.CreateView(&faceViewDesc);
   }
 
   const wgpu::TextureDescriptor prefilterDesc{
@@ -737,8 +814,8 @@ void create_processed_probe_target(PbrIblTextureSet& set, wgpu::TextureFormat co
       .arrayLayerCount = 6,
   };
   set.prefilterCubeView = set.prefilterCubeTexture.CreateView(&prefilterViewDesc);
-  for (u32 mip = 0; mip < sProbePrefilterFaceViews.size(); ++mip) {
-    for (u32 face = 0; face < sProbePrefilterFaceViews[mip].size(); ++face) {
+  for (u32 mip = 0; mip < targetViews.prefilterFaceViews.size(); ++mip) {
+    for (u32 face = 0; face < targetViews.prefilterFaceViews[mip].size(); ++face) {
       const wgpu::TextureViewDescriptor faceViewDesc{
           .label = "PBR runtime probe prefiltered specular face view",
           .format = colorFormat,
@@ -748,7 +825,7 @@ void create_processed_probe_target(PbrIblTextureSet& set, wgpu::TextureFormat co
           .baseArrayLayer = face,
           .arrayLayerCount = 1,
       };
-      sProbePrefilterFaceViews[mip][face] = set.prefilterCubeTexture.CreateView(&faceViewDesc);
+      targetViews.prefilterFaceViews[mip][face] = set.prefilterCubeTexture.CreateView(&faceViewDesc);
     }
   }
 
@@ -1025,7 +1102,15 @@ void ensure_probe_capture_resources() noexcept {
     return;
   }
 
-  create_processed_probe_target(sProbePbrIbl, colorFormat);
+  create_processed_probe_target(sProbePbrIbl, sProbeTargetViews, colorFormat);
+  for (auto& slot : sProbeCacheSlots) {
+    create_processed_probe_target(slot.ibl, slot.targetViews, colorFormat);
+    slot.resourcesReady = true;
+    slot.ibl.available = false;
+    slot.sceneKey.clear();
+    slot.camera.valid = false;
+    slot.lastUsedSerial = 0;
+  }
   create_probe_capture_target(sProbeCapturePbrIbl, sProbeCaptureFaceViews, colorFormat);
   sProbeFilterPipeline = create_probe_filter_pipeline(colorFormat);
   create_probe_filter_bind_groups();
@@ -1068,6 +1153,10 @@ void ensure_probe_capture_resources() noexcept {
   sProbeRefreshPending = true;
   sProbeCaptureCamera.valid = false;
   sProbeLastCompletedCamera.valid = false;
+  sActiveProbeCacheSlot = nullptr;
+  sProbeCaptureCacheSlot = nullptr;
+  sProbeFilterCacheSlot = nullptr;
+  sProbeCacheLastHit = false;
   sProbeCaptureResourcesReady = true;
   select_active_pbr_ibl_set();
 }
@@ -1091,10 +1180,90 @@ bool load_authored_pbr_ibl_from_directory(const std::filesystem::path& dir, PbrI
   return loadedAny;
 }
 
+PbrIblTextureSet* active_probe_ibl_set() noexcept;
+
 PbrIblTextureSet& active_pbr_ibl_set() noexcept { return sActivePbrIbl != nullptr ? *sActivePbrIbl : sFallbackPbrIbl; }
 
+bool pbr_transition_blend_active() noexcept {
+  return sPbrIblBlendFrom != nullptr && sPbrIblBlendFrom->available && sProbeBlendFactor < 1.0f;
+}
+
+bool pbr_spatial_blend_active() noexcept {
+  return sPbrIblSpatialFrom != nullptr && sPbrIblSpatialFrom->available && sProbeSpatialBlendFactor < 0.999f;
+}
+
+PbrIblTextureSet& active_pbr_ibl_blend_from_set() noexcept {
+  if (pbr_transition_blend_active()) {
+    return *sPbrIblBlendFrom;
+  }
+  if (pbr_spatial_blend_active()) {
+    return *sPbrIblSpatialFrom;
+  }
+  return active_pbr_ibl_set();
+}
+
+void update_pbr_ibl_blend_uniform() noexcept {
+  const auto& blendFrom = active_pbr_ibl_blend_from_set();
+  const float maxMip = static_cast<float>(std::max<u32>(blendFrom.prefilterMipCount, 1) - 1);
+  const float blendFactor = pbr_transition_blend_active() ? sProbeBlendFactor
+                                                          : (pbr_spatial_blend_active() ? sProbeSpatialBlendFactor
+                                                                                        : 1.0f);
+  pbrIblBlendParams = {blendFactor, maxMip, 0.0f, 0.0f};
+}
+
+void clear_pbr_probe_spatial_blend() noexcept {
+  sPbrIblSpatialFrom = nullptr;
+  sSpatialProbeCacheSlot = nullptr;
+  sProbeSpatialBlendActive = false;
+  sProbeSpatialBlendFactor = 1.0f;
+  sProbeSpatialBlendDistance = 0.0f;
+  update_pbr_ibl_blend_uniform();
+}
+
+void clear_pbr_ibl_blend() noexcept {
+  sPbrIblBlendFrom = nullptr;
+  sProbeBlendFrame = sProbeBlendFrames;
+  sProbeBlendFactor = 1.0f;
+  update_pbr_ibl_blend_uniform();
+  g_gxState.stateDirty = true;
+}
+
+void start_pbr_ibl_blend(PbrIblTextureSet* from) noexcept {
+  if (!sProbeBlendEnabled || sProbeBlendFrames == 0 || from == nullptr || !from->available || from == sActivePbrIbl) {
+    clear_pbr_ibl_blend();
+    return;
+  }
+
+  sPbrIblBlendFrom = from;
+  sProbeBlendFrame = 0;
+  sProbeBlendFactor = 0.0f;
+  update_pbr_ibl_blend_uniform();
+  g_gxState.stateDirty = true;
+}
+
+void advance_pbr_ibl_blend() noexcept {
+  if (sPbrIblBlendFrom == nullptr || sProbeBlendFactor >= 1.0f) {
+    return;
+  }
+
+  if (!sProbeBlendEnabled || sProbeBlendFrames == 0 || !sPbrIblBlendFrom->available) {
+    clear_pbr_ibl_blend();
+    return;
+  }
+
+  sProbeBlendFrame = std::min(sProbeBlendFrame + 1, sProbeBlendFrames);
+  sProbeBlendFactor = static_cast<float>(sProbeBlendFrame) / static_cast<float>(std::max<u32>(sProbeBlendFrames, 1));
+  if (sProbeBlendFactor >= 1.0f) {
+    clear_pbr_ibl_blend();
+    return;
+  }
+
+  update_pbr_ibl_blend_uniform();
+  g_gxState.stateDirty = true;
+}
+
 AuroraPbrIblSource active_pbr_ibl_source() noexcept {
-  if (sActivePbrIbl == &sProbePbrIbl) {
+  if (sActivePbrIbl == active_probe_ibl_set()) {
     return AURORA_PBR_IBL_SOURCE_PROBE;
   }
   if (sActivePbrIbl == &sAuthoredPbrIbl) {
@@ -1111,12 +1280,186 @@ void copy_status_string(char (&dst)[N], std::string_view value) noexcept {
   dst[len] = '\0';
 }
 
+PbrIblTextureSet* active_probe_ibl_set() noexcept {
+  if (sActiveProbeCacheSlot != nullptr && sActiveProbeCacheSlot->ibl.available) {
+    return &sActiveProbeCacheSlot->ibl;
+  }
+  return sProbePbrIbl.available ? &sProbePbrIbl : nullptr;
+}
+
+PbrProbeCacheSlot* find_probe_cache_slot(std::string_view sceneKey) noexcept {
+  if (sceneKey.empty()) {
+    return nullptr;
+  }
+  for (auto& slot : sProbeCacheSlots) {
+    if (slot.resourcesReady && slot.ibl.available && slot.sceneKey == sceneKey) {
+      return &slot;
+    }
+  }
+  return nullptr;
+}
+
+std::string_view pbr_scene_stage(std::string_view sceneKey) noexcept {
+  const size_t separator = sceneKey.find(':');
+  if (separator == std::string_view::npos) {
+    return sceneKey;
+  }
+  return sceneKey.substr(0, separator);
+}
+
+PbrProbeCacheSlot* find_nearest_probe_cache_slot(std::string_view sceneKey, const PbrProbeCacheSlot* excluded,
+                                                 float maxDistance, float* distanceOut) noexcept {
+  if (sceneKey.empty() || !sProbeCamera.valid) {
+    return nullptr;
+  }
+
+  const std::string_view stage = pbr_scene_stage(sceneKey);
+  if (stage.empty()) {
+    return nullptr;
+  }
+
+  PbrProbeCacheSlot* nearest = nullptr;
+  float nearestDistanceSq = std::numeric_limits<float>::max();
+  const PbrVec3 cameraEye = pbr_probe_eye(sProbeCamera);
+  for (auto& slot : sProbeCacheSlots) {
+    if (&slot == excluded || !slot.resourcesReady || !slot.ibl.available || !slot.camera.valid ||
+        slot.sceneKey == sceneKey ||
+        pbr_scene_stage(slot.sceneKey) != stage) {
+      continue;
+    }
+
+    const float distanceSq = pbr_distance_sq(cameraEye, pbr_probe_eye(slot.camera));
+    if (distanceSq < nearestDistanceSq) {
+      nearestDistanceSq = distanceSq;
+      nearest = &slot;
+    }
+  }
+
+  if (nearest == nullptr) {
+    return nullptr;
+  }
+
+  const float distance = std::sqrt(nearestDistanceSq);
+  if (maxDistance > 0.0f && distance > maxDistance) {
+    return nullptr;
+  }
+
+  if (distanceOut != nullptr) {
+    *distanceOut = distance;
+  }
+  return nearest;
+}
+
+PbrProbeCacheSlot* find_nearest_probe_cache_slot(std::string_view sceneKey) noexcept {
+  if (!sProbeNearestCacheEnabled) {
+    return nullptr;
+  }
+  return find_nearest_probe_cache_slot(sceneKey, nullptr, sProbeNearestCacheMaxDistance, &sProbeNearestCacheDistance);
+}
+
+bool activate_nearest_probe_cache_slot(std::string_view sceneKey, PbrIblTextureSet* previousIbl, bool blend) noexcept {
+  auto* nearest = find_nearest_probe_cache_slot(sceneKey);
+  if (nearest == nullptr) {
+    return false;
+  }
+
+  sActiveProbeCacheSlot = nearest;
+  nearest->lastUsedSerial = ++sProbeCacheSerial;
+  sProbeLastCompletedCamera = nearest->camera;
+  sProbeSceneStale = true;
+  sProbeNearestCacheActive = true;
+  select_active_pbr_ibl_set();
+  if (blend) {
+    start_pbr_ibl_blend(previousIbl);
+  }
+  return true;
+}
+
+void update_pbr_probe_spatial_blend() noexcept {
+  if (!sProbeSpatialBlendEnabled || !sProbeCacheEnabled || sRequestedPbrIblSource != AURORA_PBR_IBL_SOURCE_PROBE ||
+      !sProbeCamera.valid || sActiveProbeCacheSlot == nullptr || !sActiveProbeCacheSlot->ibl.available ||
+      !sActiveProbeCacheSlot->camera.valid) {
+    clear_pbr_probe_spatial_blend();
+    return;
+  }
+
+  float nearestDistance = 0.0f;
+  auto* nearest = find_nearest_probe_cache_slot(sActivePbrIblSceneKey, sActiveProbeCacheSlot,
+                                                sProbeSpatialBlendMaxDistance, &nearestDistance);
+  if (nearest == nullptr) {
+    clear_pbr_probe_spatial_blend();
+    return;
+  }
+
+  const PbrVec3 cameraEye = pbr_probe_eye(sProbeCamera);
+  const float activeDistance = std::sqrt(pbr_distance_sq(cameraEye, pbr_probe_eye(sActiveProbeCacheSlot->camera)));
+  constexpr float MinProbeDistance = 128.0f;
+  const float activeWeightDistance = std::max(activeDistance, MinProbeDistance);
+  const float nearestWeightDistance = std::max(nearestDistance, MinProbeDistance);
+  const float activeWeight = 1.0f / (activeWeightDistance * activeWeightDistance);
+  const float nearestWeight = 1.0f / (nearestWeightDistance * nearestWeightDistance);
+  const float totalWeight = activeWeight + nearestWeight;
+  const float activeFactor = totalWeight > 0.0f ? activeWeight / totalWeight : 1.0f;
+  const bool meaningfulBlend = activeFactor < 0.95f;
+  if (!meaningfulBlend) {
+    clear_pbr_probe_spatial_blend();
+    return;
+  }
+
+  const bool slotChanged = nearest != sSpatialProbeCacheSlot;
+  sSpatialProbeCacheSlot = nearest;
+  sPbrIblSpatialFrom = &nearest->ibl;
+  sProbeSpatialBlendActive = true;
+  sProbeSpatialBlendFactor = std::clamp(activeFactor, 0.0f, 1.0f);
+  sProbeSpatialBlendDistance = nearestDistance;
+  nearest->lastUsedSerial = ++sProbeCacheSerial;
+  update_pbr_ibl_blend_uniform();
+  if (slotChanged) {
+    g_gxState.stateDirty = true;
+  }
+}
+
+PbrProbeCacheSlot* select_probe_cache_slot_for_capture(std::string_view sceneKey) noexcept {
+  if (!sProbeCacheEnabled || sceneKey.empty()) {
+    return nullptr;
+  }
+
+  if (auto* existing = find_probe_cache_slot(sceneKey); existing != nullptr) {
+    return existing;
+  }
+
+  PbrProbeCacheSlot* oldest = nullptr;
+  for (auto& slot : sProbeCacheSlots) {
+    if (!slot.resourcesReady) {
+      continue;
+    }
+    if (!slot.ibl.available) {
+      return &slot;
+    }
+    if (oldest == nullptr || slot.lastUsedSerial < oldest->lastUsedSerial) {
+      oldest = &slot;
+    }
+  }
+
+  return oldest;
+}
+
+u32 used_probe_cache_slot_count() noexcept {
+  u32 count = 0;
+  for (const auto& slot : sProbeCacheSlots) {
+    if (slot.resourcesReady && slot.ibl.available) {
+      ++count;
+    }
+  }
+  return count;
+}
+
 void select_active_pbr_ibl_set() noexcept {
   PbrIblTextureSet* selected = &sFallbackPbrIbl;
   switch (sRequestedPbrIblSource) {
   case AURORA_PBR_IBL_SOURCE_PROBE:
-    if (sProbePbrIbl.available) {
-      selected = &sProbePbrIbl;
+    if (auto* probe = active_probe_ibl_set(); probe != nullptr) {
+      selected = probe;
     }
     break;
   case AURORA_PBR_IBL_SOURCE_AUTHORED:
@@ -1130,7 +1473,11 @@ void select_active_pbr_ibl_set() noexcept {
   }
 
   sActivePbrIbl = selected;
+  if (sRequestedPbrIblSource != AURORA_PBR_IBL_SOURCE_PROBE || selected != active_probe_ibl_set()) {
+    clear_pbr_probe_spatial_blend();
+  }
   pbr_update_ibl_max_mip(*sActivePbrIbl);
+  update_pbr_ibl_blend_uniform();
   g_gxState.stateDirty = true;
 }
 
@@ -1219,6 +1566,7 @@ void clear_pbr_material_maps() {
   pbrMaterialNormal.reset();
   pbrMaterialEmissiveMap.reset();
 }
+
 } // namespace pbr_internal
 
 using namespace pbr_internal;
@@ -1285,7 +1633,6 @@ void add_pbr_texture_layout_entries(
         .sampler = {.type = wgpu::SamplerBindingType::Filtering},
     };
   };
-
   addPbrTextureLayout(pbr_rmaos_texture_binding(0), pbr_rmaos_sampler_binding(0));
   addPbrTextureLayout(pbr_roughness_texture_binding(0), pbr_roughness_sampler_binding(0));
   addPbrTextureLayout(pbr_metallic_texture_binding(0), pbr_metallic_sampler_binding(0));
@@ -1298,6 +1645,10 @@ void add_pbr_texture_layout_entries(
   addPbrTextureLayout(pbr_ibl_prefilter_texture_binding(0), pbr_ibl_prefilter_sampler_binding(0),
                       wgpu::TextureViewDimension::Cube);
   addPbrTextureLayout(pbr_ibl_brdf_lut_texture_binding(0), pbr_ibl_brdf_lut_sampler_binding(0));
+  addPbrTextureLayout(pbr_ibl_blend_irradiance_texture_binding(0), pbr_ibl_blend_irradiance_sampler_binding(0),
+                      wgpu::TextureViewDimension::Cube);
+  addPbrTextureLayout(pbr_ibl_blend_prefilter_texture_binding(0), pbr_ibl_blend_prefilter_sampler_binding(0),
+                      wgpu::TextureViewDimension::Cube);
 }
 
 void add_pbr_empty_bind_group_entries(std::array<wgpu::BindGroupEntry, TextureBindGroupEntryCount>& entries,
@@ -1345,6 +1696,23 @@ void add_pbr_empty_bind_group_entries(std::array<wgpu::BindGroupEntry, TextureBi
   entries[pbr_ibl_brdf_lut_sampler_binding(0)] = {
       .binding = pbr_ibl_brdf_lut_sampler_binding(0),
       .sampler = sPbrBrdfLutSampler,
+  };
+  const auto& blendFrom = active_pbr_ibl_blend_from_set();
+  entries[pbr_ibl_blend_irradiance_texture_binding(0)] = {
+      .binding = pbr_ibl_blend_irradiance_texture_binding(0),
+      .textureView = blendFrom.irradianceCubeView,
+  };
+  entries[pbr_ibl_blend_irradiance_sampler_binding(0)] = {
+      .binding = pbr_ibl_blend_irradiance_sampler_binding(0),
+      .sampler = sPbrIblSampler,
+  };
+  entries[pbr_ibl_blend_prefilter_texture_binding(0)] = {
+      .binding = pbr_ibl_blend_prefilter_texture_binding(0),
+      .textureView = blendFrom.prefilterCubeView,
+  };
+  entries[pbr_ibl_blend_prefilter_sampler_binding(0)] = {
+      .binding = pbr_ibl_blend_prefilter_sampler_binding(0),
+      .sampler = sPbrIblSampler,
   };
 }
 
@@ -1419,19 +1787,27 @@ void bind_pbr_texture_entries(std::array<WGPUBindGroupEntry, TextureBindGroupEnt
                    pbrTex != nullptr && *pbrTex ? pbrTex->ref->pbrEmissive : nullptr, pbrTex);
   }
   const auto& ibl = active_pbr_ibl_set();
+  const auto& blendFrom = active_pbr_ibl_blend_from_set();
   bindPbrView(pbr_ibl_irradiance_texture_binding(0), pbr_ibl_irradiance_sampler_binding(0),
               ibl.irradianceCubeView, sPbrIblSampler);
   bindPbrView(pbr_ibl_prefilter_texture_binding(0), pbr_ibl_prefilter_sampler_binding(0), ibl.prefilterCubeView,
               sPbrIblSampler);
   bindPbrView(pbr_ibl_brdf_lut_texture_binding(0), pbr_ibl_brdf_lut_sampler_binding(0), ibl.brdfLutView,
               sPbrBrdfLutSampler);
+  bindPbrView(pbr_ibl_blend_irradiance_texture_binding(0), pbr_ibl_blend_irradiance_sampler_binding(0),
+              blendFrom.irradianceCubeView, sPbrIblSampler);
+  bindPbrView(pbr_ibl_blend_prefilter_texture_binding(0), pbr_ibl_blend_prefilter_sampler_binding(0),
+              blendFrom.prefilterCubeView, sPbrIblSampler);
 }
 
 bool pbr_probe_capture_requested() noexcept {
   using namespace pbr_internal;
+  advance_pbr_ibl_blend();
   if (!enablePbrMaterialOverride || pbrIblParams.x() <= 0.0f ||
       sRequestedPbrIblSource != AURORA_PBR_IBL_SOURCE_PROBE || !sProbeCamera.valid) {
     sProbeCaptureDelayFrames = 0;
+    sProbeReplayDrawCount = 0;
+    sProbeReplayPbrVisible = false;
     return false;
   }
 
@@ -1440,17 +1816,25 @@ bool pbr_probe_capture_requested() noexcept {
     return false;
   }
 
-  if (sProbeCaptureFace != 0 || !sProbePbrIbl.available || sProbeRefreshPending) {
-    return true;
+  if (sProbeCaptureFace != 0 || active_probe_ibl_set() == nullptr || sProbeRefreshPending) {
+    ensure_probe_capture_resources();
+    return sProbeCaptureResourcesReady;
   }
 
   if (sProbeAutoRefresh && sProbeFramesSinceRefresh >= PbrProbePeriodicRefreshFrames) {
     sProbeRefreshPending = true;
-    return true;
+    ensure_probe_capture_resources();
+    return sProbeCaptureResourcesReady;
   }
 
   ++sProbeFramesSinceRefresh;
   return false;
+}
+
+void set_pbr_probe_replay_status(uint32_t eligible_draws, bool pbr_material_visible) noexcept {
+  using namespace pbr_internal;
+  sProbeReplayDrawCount = eligible_draws;
+  sProbeReplayPbrVisible = pbr_material_visible;
 }
 
 uint32_t pbr_probe_cube_size() noexcept { return pbr_internal::PbrRuntimeProbeCubeSize; }
@@ -1462,6 +1846,10 @@ void begin_pbr_probe_capture() noexcept {
   ensure_probe_capture_resources();
   if (sProbeCaptureFace == 0) {
     sProbeCaptureCamera = sProbeCamera;
+    sProbeCaptureCacheSlot = select_probe_cache_slot_for_capture(sActivePbrIblSceneKey);
+    if (sProbeCaptureCacheSlot != nullptr) {
+      sProbeCaptureCacheSlot->sceneKey = sActivePbrIblSceneKey;
+    }
     sProbeRefreshPending = false;
   }
 }
@@ -1478,13 +1866,31 @@ void finish_pbr_probe_capture() noexcept {
     return;
   }
 
-  sProbePbrIbl.available = true;
+  PbrIblTextureSet* previousIbl = sActivePbrIbl;
+  PbrIblTextureSet* completedProbe = &sProbePbrIbl;
+  if (sProbeCaptureCacheSlot != nullptr) {
+    completedProbe = &sProbeCaptureCacheSlot->ibl;
+    sProbeCaptureCacheSlot->camera = sProbeCaptureCamera;
+    sProbeCaptureCacheSlot->lastUsedSerial = ++sProbeCacheSerial;
+    sActiveProbeCacheSlot = sProbeCaptureCacheSlot;
+  } else {
+    sActiveProbeCacheSlot = nullptr;
+  }
+
+  completedProbe->available = true;
+  sProbeSceneStale = false;
+  sProbeNearestCacheActive = false;
+  sProbeNearestCacheDistance = 0.0f;
   sProbeFilterPending = true;
+  sProbeFilterCacheSlot = sProbeCaptureCacheSlot;
+  sProbeCaptureCacheSlot = nullptr;
   sProbeFramesSinceRefresh = 0;
-  sProbeRefreshPending = pbr_probe_camera_changed(sProbeCaptureCamera, sProbeCamera);
+  sProbeRefreshPending = false;
   sProbeLastCompletedCamera = sProbeCaptureCamera;
   sProbeCaptureCamera.valid = false;
   select_active_pbr_ibl_set();
+  update_pbr_probe_spatial_blend();
+  start_pbr_ibl_blend(previousIbl);
 }
 
 const wgpu::TextureView& pbr_probe_capture_face_view(uint32_t face) noexcept {
@@ -1505,6 +1911,7 @@ void run_pbr_probe_filter(const wgpu::CommandEncoder& cmd) noexcept {
   if (!sProbeFilterPending || !sProbeCaptureResourcesReady || !sProbeFilterPipeline) {
     return;
   }
+  const auto& targetViews = sProbeFilterCacheSlot != nullptr ? sProbeFilterCacheSlot->targetViews : sProbeTargetViews;
 
   const auto runPass = [&](u32 passIndex, const wgpu::TextureView& targetView, u32 size, std::string_view label) {
     const std::array attachments{
@@ -1530,18 +1937,19 @@ void run_pbr_probe_filter(const wgpu::CommandEncoder& cmd) noexcept {
   };
 
   for (u32 face = 0; face < 6; ++face) {
-    runPass(face, sProbeIrradianceFaceViews[face], PbrIrradianceCubeSize, "PBR probe irradiance filter");
+    runPass(face, targetViews.irradianceFaceViews[face], PbrIrradianceCubeSize, "PBR probe irradiance filter");
   }
 
   for (u32 mip = 0; mip < PbrRuntimeProbePrefilterMipCount; ++mip) {
     const u32 size = std::max(PbrRuntimeProbeCubeSize >> mip, 1u);
     for (u32 face = 0; face < 6; ++face) {
       const u32 passIndex = PbrProbeIrradianceFilterPassCount + mip * 6 + face;
-      runPass(passIndex, sProbePrefilterFaceViews[mip][face], size, "PBR probe prefilter");
+      runPass(passIndex, targetViews.prefilterFaceViews[mip][face], size, "PBR probe prefilter");
     }
   }
 
   sProbeFilterPending = false;
+  sProbeFilterCacheSlot = nullptr;
   select_active_pbr_ibl_set();
 }
 
@@ -1696,6 +2104,25 @@ void configure_pbr_material_override(ShaderConfig& config, const ShaderInfo& inf
 }
 } // namespace aurora::gx
 
+namespace {
+
+void upload_pbr_enhanced_light_storage() {
+  using namespace aurora::gx;
+
+  if (pbrEnhancedLightCount > 0) {
+    const auto range =
+        aurora::gfx::push_storage(reinterpret_cast<const uint8_t*>(pbrEnhancedLights.data()),
+                                  pbrEnhancedLightCount * sizeof(PbrEnhancedLight));
+    pbrEnhancedLightStorageOffset = range.offset;
+    pbrEnhancedLightStorageSize = pbrEnhancedLightCount * sizeof(PbrEnhancedLight);
+  } else {
+    pbrEnhancedLightStorageOffset = 0;
+    pbrEnhancedLightStorageSize = 0;
+  }
+}
+
+} // namespace
+
 void aurora_enable_pbr(bool enabled) {
   aurora::gx::enablePbrMaterialOverride = enabled;
   aurora::gx::g_gxState.stateDirty = true;
@@ -1716,7 +2143,7 @@ void aurora_set_pbr_material_params(float diffuse_scale, float specular_scale) {
 void aurora_set_pbr_debug_mode(AuroraPbrDebugMode mode) {
   const int clampedMode =
       std::clamp(static_cast<int>(mode), static_cast<int>(AURORA_PBR_DEBUG_OFF),
-                 static_cast<int>(AURORA_PBR_DEBUG_IBL_SPECULAR));
+                 static_cast<int>(AURORA_PBR_DEBUG_DYNAMIC_GI));
   aurora::gx::pbrScales = {aurora::gx::pbrScales.x(), aurora::gx::pbrScales.y(), static_cast<float>(clampedMode),
                            0.0f};
   aurora::gx::g_gxState.stateDirty = true;
@@ -1730,6 +2157,19 @@ void aurora_set_pbr_normal_params(float strength, bool flip_y, bool invert_hande
 
 void aurora_set_pbr_ambient_gradient_params(float sky, float ground, float horizon, float environment_tint) {
   aurora::gx::pbrAmbientGradient = {sky, ground, horizon, environment_tint};
+  aurora::gx::g_gxState.stateDirty = true;
+}
+
+void aurora_set_pbr_indirect_occlusion_params(float strength, float horizon, float specular) {
+  aurora::gx::pbrIndirectOcclusion = {std::clamp(strength, 0.0f, 1.0f), std::clamp(horizon, 0.0f, 1.0f),
+                                      std::clamp(specular, 0.0f, 1.0f), 0.0f};
+  aurora::gx::g_gxState.stateDirty = true;
+}
+
+void aurora_set_pbr_dynamic_gi_params(bool enabled, float strength, float normal_wrap, float albedo_influence) {
+  aurora::gx::pbrDynamicGiParams = {enabled ? 1.0f : 0.0f, std::max(strength, 0.0f),
+                                    std::clamp(normal_wrap, 0.0f, 1.0f),
+                                    std::clamp(albedo_influence, 0.0f, 1.0f)};
   aurora::gx::g_gxState.stateDirty = true;
 }
 
@@ -1752,9 +2192,112 @@ void aurora_set_pbr_ibl_source(AuroraPbrIblSource source) {
   }
 
   aurora::gx::pbr_internal::select_active_pbr_ibl_set();
+  aurora::gx::pbr_internal::clear_pbr_ibl_blend();
 }
 
-bool aurora_pbr_probe_ibl_available() { return aurora::gx::pbr_internal::sProbePbrIbl.available; }
+void aurora_set_pbr_enhanced_lighting(bool enabled, AuroraPbrEnhancedLightFalloff falloff, uint32_t max_light_count,
+                                      float intensity_scale, bool debug_enabled) {
+  using namespace aurora::gx;
+
+  pbrEnhancedLightsEnabled = enabled;
+  pbrEnhancedLightsDebugEnabled = debug_enabled;
+  pbrEnhancedLightFalloff = falloff == AURORA_PBR_ENHANCED_LIGHT_FALLOFF_INVERSE_SQUARE
+                                ? AURORA_PBR_ENHANCED_LIGHT_FALLOFF_INVERSE_SQUARE
+                                : AURORA_PBR_ENHANCED_LIGHT_FALLOFF_LEGACY_RADIUS;
+  pbrEnhancedLightMaxCount = std::clamp<u32>(max_light_count, 1, PbrMaxEnhancedLights);
+  pbrEnhancedLightIntensityScale = std::max(intensity_scale, 0.0f);
+  if (!enabled) {
+    pbrEnhancedLightCount = 0;
+    pbrSubmittedSceneLightCount = 0;
+    pbrSceneLightsApiBacked = false;
+    upload_pbr_enhanced_light_storage();
+  } else if (pbrEnhancedLightCount > pbrEnhancedLightMaxCount) {
+    pbrEnhancedLightCount = pbrEnhancedLightMaxCount;
+    upload_pbr_enhanced_light_storage();
+  }
+  g_gxState.stateDirty = true;
+}
+
+void aurora_set_pbr_enhanced_lights(const AuroraPbrEnhancedLight* lights, uint32_t light_count) {
+  using namespace aurora::gx;
+
+  pbrSceneLightsApiBacked = false;
+  pbrSubmittedSceneLightCount = lights != nullptr ? light_count : 0;
+  pbrEnhancedLightCount = lights != nullptr && pbrEnhancedLightsEnabled
+                              ? std::min<u32>(light_count, std::min(pbrEnhancedLightMaxCount, PbrMaxEnhancedLights))
+                              : 0;
+  for (u32 i = 0; i < PbrMaxEnhancedLights; ++i) {
+    if (i < pbrEnhancedLightCount) {
+      const auto& light = lights[i];
+      pbrEnhancedLights[i].posRadius = {light.position[0], light.position[1], light.position[2],
+                                        std::max(light.radius, 1.0f)};
+      pbrEnhancedLights[i].colorIntensity = {std::max(light.color[0], 0.0f), std::max(light.color[1], 0.0f),
+                                             std::max(light.color[2], 0.0f), std::max(light.intensity, 0.0f)};
+    } else {
+      pbrEnhancedLights[i] = {};
+    }
+  }
+  upload_pbr_enhanced_light_storage();
+  g_gxState.stateDirty = true;
+}
+
+void aurora_set_scene_lights(const AuroraSceneLight* lights, uint32_t light_count) {
+  using namespace aurora::gx;
+
+  pbrSceneLightsApiBacked = true;
+  pbrSubmittedSceneLightCount = lights != nullptr ? light_count : 0;
+  pbrEnhancedLightCount = lights != nullptr && pbrEnhancedLightsEnabled
+                              ? std::min<u32>(light_count, std::min(pbrEnhancedLightMaxCount, PbrMaxEnhancedLights))
+                              : 0;
+  for (u32 i = 0; i < PbrMaxEnhancedLights; ++i) {
+    if (i < pbrEnhancedLightCount) {
+      const auto& light = lights[i];
+      pbrEnhancedLights[i].posRadius = {light.position[0], light.position[1], light.position[2],
+                                        std::max(light.radius, 1.0f)};
+      pbrEnhancedLights[i].colorIntensity = {std::max(light.color[0], 0.0f), std::max(light.color[1], 0.0f),
+                                             std::max(light.color[2], 0.0f), std::max(light.intensity, 0.0f)};
+    } else {
+      pbrEnhancedLights[i] = {};
+    }
+  }
+  upload_pbr_enhanced_light_storage();
+  g_gxState.stateDirty = true;
+}
+
+const AuroraPbrEnhancedLightingStatus* aurora_get_pbr_enhanced_lighting_status() {
+  using namespace aurora::gx;
+
+  static AuroraPbrEnhancedLightingStatus status{};
+  status = {};
+  status.enabled = pbrEnhancedLightsEnabled;
+  status.debugEnabled = pbrEnhancedLightsDebugEnabled;
+  status.lightCount = pbrEnhancedLightCount;
+  status.maxLightCount = pbrEnhancedLightMaxCount;
+  status.submittedSceneLightCount = pbrSubmittedSceneLightCount;
+  status.sceneLightApiBacked = pbrSceneLightsApiBacked;
+  status.storageBacked = pbrEnhancedLightStorageSize > 0;
+  status.storageByteSize = pbrEnhancedLightStorageSize;
+  status.falloff = pbrEnhancedLightFalloff;
+  status.intensityScale = pbrEnhancedLightIntensityScale;
+  status.dynamicGiEnabled = pbrDynamicGiParams.x() > 0.5f;
+  status.dynamicGiStrength = pbrDynamicGiParams.y();
+  status.dynamicGiNormalWrap = pbrDynamicGiParams.z();
+  status.dynamicGiAlbedoInfluence = pbrDynamicGiParams.w();
+  if (pbrEnhancedLightCount > 0) {
+    const auto& light = pbrEnhancedLights[0];
+    status.strongestLight.position[0] = light.posRadius.x();
+    status.strongestLight.position[1] = light.posRadius.y();
+    status.strongestLight.position[2] = light.posRadius.z();
+    status.strongestLight.radius = light.posRadius.w();
+    status.strongestLight.color[0] = light.colorIntensity.x();
+    status.strongestLight.color[1] = light.colorIntensity.y();
+    status.strongestLight.color[2] = light.colorIntensity.z();
+    status.strongestLight.intensity = light.colorIntensity.w();
+  }
+  return &status;
+}
+
+bool aurora_pbr_probe_ibl_available() { return aurora::gx::pbr_internal::active_probe_ibl_set() != nullptr; }
 
 const AuroraPbrIblStatus* aurora_get_pbr_ibl_status() {
   using namespace aurora::gx;
@@ -1768,19 +2311,40 @@ const AuroraPbrIblStatus* aurora_get_pbr_ibl_status() {
   status.activeSource = active_pbr_ibl_source();
   status.fallbackAvailable = sFallbackPbrIbl.available;
   status.authoredAvailable = sAuthoredPbrIbl.available;
-  status.probeAvailable = sProbePbrIbl.available;
+  status.probeAvailable = active_probe_ibl_set() != nullptr;
   status.probeCameraValid = sProbeCamera.valid;
   status.probeCaptureResourcesReady = sProbeCaptureResourcesReady;
   status.probeCaptureInProgress = sProbeCaptureCamera.valid || sProbeCaptureFace != 0;
   status.probeRefreshPending = sProbeRefreshPending;
   status.probeFilterPending = sProbeFilterPending;
   status.probeAutoRefresh = sProbeAutoRefresh;
+  status.probeLocalGi = sProbeLocalGi;
+  status.probeSceneStale = sProbeSceneStale;
+  status.probeCacheEnabled = sProbeCacheEnabled;
+  status.probeCacheHit = sProbeCacheLastHit;
+  status.probeNearestCacheEnabled = sProbeNearestCacheEnabled;
+  status.probeNearestCacheActive = sProbeNearestCacheActive;
+  status.probeSpatialBlendEnabled = sProbeSpatialBlendEnabled;
+  status.probeSpatialBlendActive = pbr_spatial_blend_active();
+  status.probeBlendEnabled = sProbeBlendEnabled;
+  status.probeBlendActive = pbr_transition_blend_active();
+  status.probeReplayPbrVisible = sProbeReplayPbrVisible;
   status.probeCaptureFace = sProbeCaptureFace;
   status.probeCaptureDelayFrames = sProbeCaptureDelayFrames;
   status.probeFramesSinceRefresh = sProbeFramesSinceRefresh;
+  status.probeReplayDraws = sProbeReplayDrawCount;
   status.probeCubeSize = PbrRuntimeProbeCubeSize;
   status.probeIrradianceSize = PbrIrradianceCubeSize;
   status.probePrefilterMipCount = PbrRuntimeProbePrefilterMipCount;
+  status.probeCacheSlots = PbrProbeCacheSlotCount;
+  status.probeCacheUsedSlots = used_probe_cache_slot_count();
+  status.probeBlendFrames = sProbeBlendFrames;
+  status.probeBlendFactor = sProbeBlendFactor;
+  status.probeNearestCacheDistance = sProbeNearestCacheDistance;
+  status.probeNearestCacheMaxDistance = sProbeNearestCacheMaxDistance;
+  status.probeSpatialBlendFactor = sProbeSpatialBlendFactor;
+  status.probeSpatialBlendDistance = sProbeSpatialBlendDistance;
+  status.probeSpatialBlendMaxDistance = sProbeSpatialBlendMaxDistance;
   status.activePrefilterMipCount = active_pbr_ibl_set().prefilterMipCount;
   status.authoredGlobalLoaded = sAuthoredPbrIblGlobalLoaded;
   status.authoredStageLoaded = sAuthoredPbrIblStageLoaded;
@@ -1789,13 +2353,136 @@ const AuroraPbrIblStatus* aurora_get_pbr_ibl_status() {
   copy_status_string(status.authoredRoot, sAuthoredPbrIblRootPath);
   copy_status_string(status.authoredStage, sAuthoredPbrIblStage);
   copy_status_string(status.authoredSceneKey, sActivePbrIblSceneKey);
+  if (sActiveProbeCacheSlot != nullptr && sActiveProbeCacheSlot->ibl.available) {
+    copy_status_string(status.activeProbeSceneKey, sActiveProbeCacheSlot->sceneKey);
+  } else if (active_probe_ibl_set() != nullptr) {
+    copy_status_string(status.activeProbeSceneKey, sActivePbrIblSceneKey);
+  }
+  if (sSpatialProbeCacheSlot != nullptr && sSpatialProbeCacheSlot->ibl.available) {
+    copy_status_string(status.spatialProbeSceneKey, sSpatialProbeCacheSlot->sceneKey);
+  }
+  return &status;
+}
+
+void aurora_set_pbr_shadow_map_params(bool enabled, uint32_t size, float strength, float bias) {
+  using namespace aurora::gx;
+  using namespace aurora::gx::pbr_internal;
+
+  const u32 clampedSize = std::clamp<u32>(size, PbrShadowMapMinSize, PbrShadowMapMaxSize);
+  if (sPbrShadowMapSize != clampedSize) {
+    sPbrShadowMapSize = clampedSize;
+    sPbrShadowMapAvailable = false;
+  }
+
+  sPbrShadowMapEnabled = enabled;
+  sPbrShadowMapStrength = std::clamp(strength, 0.0f, 1.0f);
+  sPbrShadowMapBias = std::clamp(bias, 0.0f, 0.05f);
+  g_gxState.stateDirty = true;
+}
+
+void aurora_set_pbr_shadow_light_request(const AuroraPbrShadowLightRequest* request) {
+  using namespace aurora::gx;
+  using namespace aurora::gx::pbr_internal;
+
+  sPbrShadowLightRequest = request != nullptr ? *request : AuroraPbrShadowLightRequest{};
+  sPbrShadowLightRequest.valid = request != nullptr && request->valid;
+  g_gxState.stateDirty = true;
+}
+
+void aurora_set_pbr_shadow_map_matrix(const float* light_view_projection_4x4) {
+  (void)light_view_projection_4x4;
+}
+
+const AuroraPbrShadowMapStatus* aurora_get_pbr_shadow_map_status() {
+  using namespace aurora::gx::pbr_internal;
+
+  static AuroraPbrShadowMapStatus status{};
+  status = {};
+  status.enabled = sPbrShadowMapEnabled;
+  status.resourcesReady = false;
+  status.mapAvailable = sPbrShadowMapAvailable;
+  status.lightRequestValid = sPbrShadowLightRequest.valid;
+  status.size = sPbrShadowMapSize;
+  status.strength = sPbrShadowMapStrength;
+  status.bias = sPbrShadowMapBias;
+  status.lightRequest = sPbrShadowLightRequest;
   return &status;
 }
 
 void aurora_set_pbr_probe_auto_refresh(bool enabled) {
   aurora::gx::pbr_internal::sProbeAutoRefresh = enabled;
-  if (enabled && !aurora::gx::pbr_internal::sProbePbrIbl.available) {
+  if (enabled && aurora::gx::pbr_internal::active_probe_ibl_set() == nullptr) {
     aurora::gx::pbr_internal::sProbeRefreshPending = true;
+  }
+}
+
+void aurora_set_pbr_local_probe_gi(bool enabled) {
+  aurora::gx::pbr_internal::sProbeLocalGi = enabled;
+  if (!enabled) {
+    aurora::gx::pbr_internal::sProbeSceneStale = false;
+  }
+}
+
+void aurora_set_pbr_probe_cache(bool enabled) {
+  using namespace aurora::gx;
+  using namespace aurora::gx::pbr_internal;
+
+  sProbeCacheEnabled = enabled;
+  if (!enabled) {
+    sActiveProbeCacheSlot = nullptr;
+    sProbeCaptureCacheSlot = nullptr;
+    sProbeFilterCacheSlot = nullptr;
+    sProbeCacheLastHit = false;
+    sProbeNearestCacheActive = false;
+    sProbeNearestCacheDistance = 0.0f;
+    clear_pbr_probe_spatial_blend();
+    sProbeSceneStale = false;
+  }
+  select_active_pbr_ibl_set();
+  clear_pbr_ibl_blend();
+}
+
+void aurora_set_pbr_probe_nearest_cache(bool enabled, float max_distance) {
+  using namespace aurora::gx;
+  using namespace aurora::gx::pbr_internal;
+
+  sProbeNearestCacheEnabled = enabled;
+  sProbeNearestCacheMaxDistance = std::max(max_distance, 0.0f);
+  if (!enabled && sProbeNearestCacheActive) {
+    sActiveProbeCacheSlot = nullptr;
+    sProbeNearestCacheActive = false;
+    sProbeNearestCacheDistance = 0.0f;
+    select_active_pbr_ibl_set();
+    clear_pbr_ibl_blend();
+  } else {
+    g_gxState.stateDirty = true;
+  }
+}
+
+void aurora_set_pbr_probe_spatial_blending(bool enabled, float max_distance) {
+  using namespace aurora::gx;
+  using namespace aurora::gx::pbr_internal;
+  sProbeSpatialBlendEnabled = enabled;
+  sProbeSpatialBlendMaxDistance = std::max(max_distance, 0.0f);
+  if (!enabled) {
+    clear_pbr_probe_spatial_blend();
+  } else {
+    update_pbr_probe_spatial_blend();
+  }
+  g_gxState.stateDirty = true;
+}
+
+void aurora_set_pbr_probe_blending(bool enabled, uint32_t frames) {
+  using namespace aurora::gx;
+  using namespace aurora::gx::pbr_internal;
+
+  sProbeBlendEnabled = enabled;
+  sProbeBlendFrames = std::clamp<u32>(frames, 1, 600);
+  if (!enabled) {
+    clear_pbr_ibl_blend();
+  } else {
+    update_pbr_ibl_blend_uniform();
+    g_gxState.stateDirty = true;
   }
 }
 
@@ -1814,24 +2501,28 @@ void aurora_set_pbr_probe_camera_matrices(const float* source_view_3x4, const fl
   camera.valid = source_view_3x4 != nullptr && source_inv_view_3x4 != nullptr && projection_4x4 != nullptr;
   if (camera.valid) {
     aurora::gx::pbr_internal::pbr_update_probe_face_matrices();
-    if (!aurora::gx::pbr_internal::sProbePbrIbl.available) {
+    if (aurora::gx::pbr_internal::active_probe_ibl_set() == nullptr) {
       aurora::gx::pbr_internal::sProbeRefreshPending = true;
-    } else if (aurora::gx::pbr_internal::sProbeAutoRefresh) {
-      if (aurora::gx::pbr_internal::sProbeCaptureFace != 0 &&
-          aurora::gx::pbr_internal::sProbeCaptureCamera.valid) {
-        aurora::gx::pbr_internal::sProbeRefreshPending =
-            aurora::gx::pbr_internal::sProbeRefreshPending ||
-            aurora::gx::pbr_internal::pbr_probe_camera_changed(aurora::gx::pbr_internal::sProbeCaptureCamera, camera);
-      } else if (aurora::gx::pbr_internal::pbr_probe_camera_changed(
-                     aurora::gx::pbr_internal::sProbeLastCompletedCamera, camera)) {
-        aurora::gx::pbr_internal::sProbeRefreshPending = true;
+    }
+    if (aurora::gx::pbr_internal::sProbeRefreshPending &&
+        (aurora::gx::pbr_internal::sActiveProbeCacheSlot == nullptr ||
+         aurora::gx::pbr_internal::sActiveProbeCacheSlot->sceneKey !=
+             aurora::gx::pbr_internal::sActivePbrIblSceneKey)) {
+      auto* nearest =
+          aurora::gx::pbr_internal::find_nearest_probe_cache_slot(aurora::gx::pbr_internal::sActivePbrIblSceneKey);
+      if (nearest != nullptr && nearest != aurora::gx::pbr_internal::sActiveProbeCacheSlot) {
+        auto* previousIbl = aurora::gx::pbr_internal::sActivePbrIbl;
+        aurora::gx::pbr_internal::activate_nearest_probe_cache_slot(
+            aurora::gx::pbr_internal::sActivePbrIblSceneKey, previousIbl, true);
       }
     }
+    aurora::gx::pbr_internal::update_pbr_probe_spatial_blend();
   }
 }
 
 void aurora_set_pbr_ibl_scene(const char* stage_name, int room_no) {
   const auto root = aurora::gx::pbr_internal::pbr_ibl_root_path();
+  auto* previousIbl = aurora::gx::pbr_internal::sActivePbrIbl;
   std::string stage = stage_name != nullptr ? stage_name : "";
   if (!stage.empty() && !aurora::gx::pbr_internal::pbr_is_safe_scene_component(stage)) {
     stage.clear();
@@ -1872,15 +2563,44 @@ void aurora_set_pbr_ibl_scene(const char* stage_name, int room_no) {
   }
 
   aurora::gx::pbr_internal::sAuthoredPbrIbl.available = loaded;
-  aurora::gx::pbr_internal::sProbePbrIbl.available = false;
+  auto* cachedProbe = aurora::gx::pbr_internal::sProbeCacheEnabled
+                          ? aurora::gx::pbr_internal::find_probe_cache_slot(key)
+                          : nullptr;
+  bool nearestProbeSelected = false;
+  aurora::gx::pbr_internal::sProbeCacheLastHit = cachedProbe != nullptr;
+  aurora::gx::pbr_internal::sProbeNearestCacheActive = false;
+  aurora::gx::pbr_internal::sProbeNearestCacheDistance = 0.0f;
+  if (cachedProbe != nullptr) {
+    aurora::gx::pbr_internal::sActiveProbeCacheSlot = cachedProbe;
+    cachedProbe->lastUsedSerial = ++aurora::gx::pbr_internal::sProbeCacheSerial;
+    aurora::gx::pbr_internal::sProbeLastCompletedCamera = cachedProbe->camera;
+    aurora::gx::pbr_internal::sProbeSceneStale = false;
+  } else if (aurora::gx::pbr_internal::sProbeCacheEnabled &&
+             aurora::gx::pbr_internal::activate_nearest_probe_cache_slot(key, previousIbl, false)) {
+    nearestProbeSelected = true;
+  } else if (aurora::gx::pbr_internal::sProbeLocalGi) {
+    aurora::gx::pbr_internal::sProbeSceneStale = aurora::gx::pbr_internal::active_probe_ibl_set() != nullptr;
+  } else {
+    aurora::gx::pbr_internal::sProbePbrIbl.available = false;
+    aurora::gx::pbr_internal::sActiveProbeCacheSlot = nullptr;
+    aurora::gx::pbr_internal::sProbeSceneStale = false;
+  }
   aurora::gx::pbr_internal::sProbeCaptureFace = 0;
   aurora::gx::pbr_internal::sProbeCaptureDelayFrames = 0;
-  aurora::gx::pbr_internal::sProbeLastCompletedCamera.valid = false;
+  if (cachedProbe == nullptr && !nearestProbeSelected) {
+    aurora::gx::pbr_internal::sProbeLastCompletedCamera.valid = false;
+  }
   aurora::gx::pbr_internal::sProbeRefreshPending = true;
   if (loaded) {
     PbrLog.info("Loaded authored PBR IBL set for stage '{}' room {}", stage, room_no);
   }
   aurora::gx::pbr_internal::select_active_pbr_ibl_set();
+  aurora::gx::pbr_internal::update_pbr_probe_spatial_blend();
+  if (cachedProbe != nullptr || nearestProbeSelected) {
+    aurora::gx::pbr_internal::start_pbr_ibl_blend(previousIbl);
+  } else {
+    aurora::gx::pbr_internal::clear_pbr_ibl_blend();
+  }
 }
 
 void aurora_set_pbr_fill_dir(float x, float y, float z) {

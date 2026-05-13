@@ -519,7 +519,7 @@ void initialize() {
         // Storage data buffer
         wgpu::BindGroupLayoutEntry{
             .binding = 1,
-            .visibility = wgpu::ShaderStage::Vertex,
+            .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
             .buffer =
                 wgpu::BufferBindingLayout{
                     .type = wgpu::BufferBindingType::ReadOnlyStorage,
@@ -758,7 +758,11 @@ static Range clone_probe_uniform(const gx::DrawData& draw, uint32_t face) {
 }
 
 static void append_pbr_probe_capture_passes() {
-  if (!gx::pbr_probe_capture_requested() || g_renderPasses.empty()) {
+  const bool captureRequested = gx::pbr_probe_capture_requested();
+  if (!captureRequested || g_renderPasses.empty()) {
+    if (captureRequested) {
+      gx::set_pbr_probe_replay_status(0, false);
+    }
     return;
   }
 
@@ -778,6 +782,7 @@ static void append_pbr_probe_capture_passes() {
       }
     }
   }
+  gx::set_pbr_probe_replay_status(static_cast<uint32_t>(probeDraws.size()), pbrMaterialVisible);
   if (probeDraws.empty() || !pbrMaterialVisible) {
     return;
   }

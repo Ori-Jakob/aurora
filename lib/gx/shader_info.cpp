@@ -332,7 +332,7 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
   }
   info.uniformSize += info.sampledTextures.count() * sizeof(Vec4<float>);
   if ((info.pbrFlags & PbrMaterialEnabled) != 0) {
-    info.uniformSize += 8 * sizeof(Vec4<float>);
+    info.uniformSize += 12 * sizeof(Vec4<float>);
   }
   info.uniformSize = gfx::align_uniform(info.uniformSize);
   if (info.uniformSize > MaxUniformSize) {
@@ -491,14 +491,36 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
     buf.append(texture_size_bias(tex));
   }
   if ((info.pbrFlags & PbrMaterialEnabled) != 0) {
-    buf.append(pbrParams);
-    buf.append(pbrScales);
-    buf.append(pbrNormalParams);
+    auto packedPbrParams = pbrParams;
+    packedPbrParams.w() = pbrDynamicGiParams.x();
+    auto packedPbrScales = pbrScales;
+    packedPbrScales.w() = pbrDynamicGiParams.y();
+    auto packedPbrNormalParams = pbrNormalParams;
+    packedPbrNormalParams.w() = pbrDynamicGiParams.z();
+    auto packedPbrIndirectOcclusion = pbrIndirectOcclusion;
+    packedPbrIndirectOcclusion.w() = pbrDynamicGiParams.w();
+    buf.append(packedPbrParams);
+    buf.append(packedPbrScales);
+    buf.append(packedPbrNormalParams);
     buf.append(pbrAmbientGradient);
+    buf.append(packedPbrIndirectOcclusion);
     buf.append(pbrIblParams);
+    buf.append(pbrIblBlendParams);
     buf.append(pbrFillDir);
     buf.append(pbrMaterialFactors);
     buf.append(pbrMaterialEmissive);
+    buf.append(Vec4<float>{
+        pbrEnhancedLightsEnabled ? 1.0f : 0.0f,
+        static_cast<float>(pbrEnhancedLightCount),
+        pbrEnhancedLightFalloff == AURORA_PBR_ENHANCED_LIGHT_FALLOFF_INVERSE_SQUARE ? 1.0f : 0.0f,
+        pbrEnhancedLightIntensityScale,
+    });
+    buf.append(Vec4<float>{
+        static_cast<float>(pbrEnhancedLightStorageOffset),
+        static_cast<float>(pbrEnhancedLightStorageSize),
+        static_cast<float>(sizeof(PbrEnhancedLight)),
+        0.0f,
+    });
   }
   g_gxState.stateDirty = false;
   return range;

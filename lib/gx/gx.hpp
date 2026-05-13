@@ -66,9 +66,9 @@ constexpr u32 MaxIndTexMtxs = 3;
 constexpr u32 MaxVtxFmt = GX_MAX_VTXFMT;
 constexpr u32 MaxPnMtx = (GX_PNMTX9 / 3) + 1;
 constexpr u32 MaxIndexAttr = 12; // VA_POS -> VA_TEX7
-constexpr u32 MaxUniformSize = 3840;
+constexpr u32 MaxUniformSize = 4096;
 constexpr u32 TextureBindingsPerMap = 2;
-constexpr u32 PbrMaterialBindingsPerMap = 20;
+constexpr u32 PbrMaterialBindingsPerMap = 24;
 constexpr u32 TextureBindGroupEntryCount = MaxTextures * TextureBindingsPerMap + PbrMaterialBindingsPerMap;
 
 constexpr u32 pbr_rmaos_texture_binding(u32 texMap) noexcept {
@@ -94,6 +94,18 @@ constexpr u32 pbr_ibl_prefilter_texture_binding(u32 texMap) noexcept { return pb
 constexpr u32 pbr_ibl_prefilter_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 17; }
 constexpr u32 pbr_ibl_brdf_lut_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 18; }
 constexpr u32 pbr_ibl_brdf_lut_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 19; }
+constexpr u32 pbr_ibl_blend_irradiance_texture_binding(u32 texMap) noexcept {
+  return pbr_rmaos_texture_binding(texMap) + 20;
+}
+constexpr u32 pbr_ibl_blend_irradiance_sampler_binding(u32 texMap) noexcept {
+  return pbr_rmaos_texture_binding(texMap) + 21;
+}
+constexpr u32 pbr_ibl_blend_prefilter_texture_binding(u32 texMap) noexcept {
+  return pbr_rmaos_texture_binding(texMap) + 22;
+}
+constexpr u32 pbr_ibl_blend_prefilter_sampler_binding(u32 texMap) noexcept {
+  return pbr_rmaos_texture_binding(texMap) + 23;
+}
 
 enum PbrMaterialFlags : u32 {
   PbrMaterialEnabled = 1u << 0,

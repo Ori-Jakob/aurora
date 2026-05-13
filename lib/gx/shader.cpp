@@ -4,6 +4,7 @@
 #include "../webgpu/gpu.hpp"
 #include "gx.hpp"
 #include "gx_fmt.hpp"
+#include "pbr.hpp"
 #include "shader_info.hpp"
 
 #include <dolphin/gx/GXEnum.h>
@@ -1598,6 +1599,56 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
     let pbr_diffuse_color = pbr_kd * pbr_albedo.rgb * pbr_ao;
     var pbr_direct_diffuse = vec3f(0.0);
     var pbr_direct_specular = vec3f(0.0);
+    var pbr_dynamic_gi = vec3f(0.0);
+    let pbr_dynamic_gi_enabled = ubuf.pbr_params.w > 0.5;
+    let pbr_dynamic_gi_strength = max(ubuf.pbr_scales.w, 0.0);
+    let pbr_dynamic_gi_wrap = clamp(ubuf.pbr_normal_params.w, 0.0, 1.0);
+    let pbr_dynamic_gi_albedo = clamp(ubuf.pbr_indirect_occlusion.w, 0.0, 1.0);
+    let pbr_dynamic_gi_bounce_color = mix(vec3f(1.0), pbr_albedo.rgb, vec3f(pbr_dynamic_gi_albedo));
+    let pbr_enhanced_stride = max(u32(ubuf.pbr_enhanced_storage.z + 0.5), 32u);
+    let pbr_enhanced_count = min(u32(ubuf.pbr_enhanced_params.y + 0.5),
+                                 u32(ubuf.pbr_enhanced_storage.y / f32(pbr_enhanced_stride)));
+    let pbr_enhanced_base = u32(ubuf.pbr_enhanced_storage.x + 0.5);
+    let pbr_use_enhanced_lights = ubuf.pbr_enhanced_params.x > 0.5 && pbr_enhanced_count > 0u;
+    if (pbr_use_enhanced_lights) {
+      let pbr_use_inverse_square = ubuf.pbr_enhanced_params.z > 0.5;
+      for (var i = 0u; i < pbr_enhanced_count; i++) {
+        let pbr_light = pbr_load_enhanced_light(pbr_enhanced_base + i * pbr_enhanced_stride);
+        var pbr_l = pbr_light.pos_radius.xyz - in.mv_pos;
+        let pbr_dist2 = dot(pbr_l, pbr_l);
+        let pbr_dist = sqrt(pbr_dist2);
+        pbr_l = pbr_l / max(pbr_dist, 1e-7);
+        let pbr_radius = max(pbr_light.pos_radius.w, 1.0);
+        let pbr_range = max(1.0 - pbr_dist / pbr_radius, 0.0);
+        let pbr_range_fade = pbr_range * pbr_range;
+        let pbr_inverse_square = pbr_range_fade / max(pbr_dist2 / (pbr_radius * pbr_radius), 0.01);
+        let pbr_light_attn = select(pbr_range_fade, pbr_inverse_square, pbr_use_inverse_square);
+        let pbr_ndotl = max(dot(pbr_n, pbr_l), 0.0);
+        let pbr_h = normalize(pbr_l + pbr_v);
+        let pbr_ndoth = max(dot(pbr_n, pbr_h), 0.0);
+        let pbr_vdoth = max(dot(pbr_v, pbr_h), 0.0);
+        let pbr_fresnel = pbr_f0 + (vec3f(1.0) - pbr_f0) * pow(1.0 - pbr_vdoth, 5.0);
+        let pbr_a2 = pbr_roughness * pbr_roughness * pbr_roughness * pbr_roughness;
+        let pbr_denom_d = pbr_ndoth * pbr_ndoth * (pbr_a2 - 1.0) + 1.0;
+        let pbr_D = pbr_a2 / (3.14159265 * pbr_denom_d * pbr_denom_d + 1e-7);
+        let pbr_k = (pbr_roughness + 1.0) * (pbr_roughness + 1.0) * 0.125;
+        let pbr_G = (pbr_ndotl / (pbr_ndotl * (1.0 - pbr_k) + pbr_k)) *
+                    (pbr_ndotv / (pbr_ndotv * (1.0 - pbr_k) + pbr_k));
+        let pbr_spec = pbr_D * pbr_G * pbr_fresnel * pbr_specular / (4.0 * pbr_ndotl * pbr_ndotv + 0.001);
+        let pbr_light_rgb =
+          max(pbr_light.color_intensity.rgb * pbr_light.color_intensity.a * pbr_light_attn *
+              ubuf.pbr_enhanced_params.w, vec3f(0.0));
+        pbr_direct_diffuse += pbr_diffuse_color * pbr_ndotl * pbr_light_rgb * ubuf.pbr_scales.x;
+        pbr_direct_specular += pbr_spec * pbr_ndotl * pbr_light_rgb * ubuf.pbr_scales.y;
+        let pbr_gi_back_lobe = max(dot(pbr_n, -pbr_l), 0.0);
+        let pbr_gi_wrap_lobe = clamp(dot(pbr_n, pbr_l) * 0.5 + 0.5, 0.0, 1.0);
+        let pbr_gi_lobe = mix(pbr_gi_back_lobe, pbr_gi_wrap_lobe, pbr_dynamic_gi_wrap);
+        pbr_dynamic_gi += select(vec3f(0.0),
+                                 pbr_diffuse_color * pbr_dynamic_gi_bounce_color * pbr_light_rgb *
+                                     pbr_gi_lobe * pbr_dynamic_gi_strength,
+                                 pbr_dynamic_gi_enabled);
+      }
+    } else
 )""";
     if (useGxPbrLights) {
       std::string pbrLightAttn;
@@ -1633,7 +1684,7 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
         FATAL("invalid PBR diffuse function {}", underlying(pbrChannelConfig.diffFn));
       }
 
-      fragmentFn += fmt::format(R"""(
+      fragmentFn += fmt::format(R"""( {{
     for (var i = 0u; i < {}u; i++) {{
       if ((ubuf.lightState{} & (1u << i)) == 0u) {{ continue; }}
       let pbr_light = ubuf.lights[i];
@@ -1658,10 +1709,18 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
       let pbr_light_rgb = max(pbr_light.color.rgb * pbr_light_attn, vec3f(0.0));
       pbr_direct_diffuse += pbr_diffuse_color * pbr_ndotl * pbr_light_rgb * ubuf.pbr_scales.x;
       pbr_direct_specular += pbr_spec * pbr_ndotl * pbr_light_rgb * ubuf.pbr_scales.y;
+      let pbr_gi_back_lobe = max(dot(pbr_n, -pbr_l), 0.0);
+      let pbr_gi_wrap_lobe = clamp(dot(pbr_n, pbr_l) * 0.5 + 0.5, 0.0, 1.0);
+      let pbr_gi_lobe = mix(pbr_gi_back_lobe, pbr_gi_wrap_lobe, pbr_dynamic_gi_wrap);
+      pbr_dynamic_gi += select(vec3f(0.0),
+                               pbr_diffuse_color * pbr_dynamic_gi_bounce_color * pbr_light_rgb *
+                                   pbr_gi_lobe * pbr_dynamic_gi_strength,
+                               pbr_dynamic_gi_enabled);
+    }}
     }})""",
                                     GX::MaxLights, pbrChannel, pbrLightAttn, pbrNdotlExpr);
     } else {
-      fragmentFn += R"""(
+      fragmentFn += R"""( {
     let pbr_l = normalize(vec3f(-0.45, 0.65, 0.62));
     let pbr_h = normalize(pbr_l + pbr_v);
     let pbr_ndotl = max(dot(pbr_n, pbr_l), 0.0);
@@ -1675,8 +1734,17 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
     let pbr_G = (pbr_ndotl / (pbr_ndotl * (1.0 - pbr_k) + pbr_k)) *
                 (pbr_ndotv / (pbr_ndotv * (1.0 - pbr_k) + pbr_k));
     let pbr_spec = pbr_D * pbr_G * pbr_fresnel * pbr_specular / (4.0 * pbr_ndotl * pbr_ndotv + 0.001);
-    pbr_direct_diffuse = pbr_diffuse_color * pbr_ndotl * pbr_env_light * ubuf.pbr_scales.x;
-    pbr_direct_specular = pbr_spec * pbr_ndotl * pbr_env_light * ubuf.pbr_scales.y;
+    let pbr_light_rgb = pbr_env_light;
+    pbr_direct_diffuse = pbr_diffuse_color * pbr_ndotl * pbr_light_rgb * ubuf.pbr_scales.x;
+    pbr_direct_specular = pbr_spec * pbr_ndotl * pbr_light_rgb * ubuf.pbr_scales.y;
+    let pbr_gi_back_lobe = max(dot(pbr_n, -pbr_l), 0.0);
+    let pbr_gi_wrap_lobe = clamp(dot(pbr_n, pbr_l) * 0.5 + 0.5, 0.0, 1.0);
+    let pbr_gi_lobe = mix(pbr_gi_back_lobe, pbr_gi_wrap_lobe, pbr_dynamic_gi_wrap);
+    pbr_dynamic_gi += select(vec3f(0.0),
+                             pbr_diffuse_color * pbr_dynamic_gi_bounce_color * pbr_light_rgb *
+                                 pbr_gi_lobe * pbr_dynamic_gi_strength,
+                             pbr_dynamic_gi_enabled);
+    }
 )""";
     }
     fragmentFn += R"""(
@@ -1686,21 +1754,43 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
     let pbr_ambient_spec = pbr_ambient_fresnel * ubuf.pbr_params.y;
     // Use raw albedo*ao as base so ambient/fill work for metallic materials (kd=0 for metals)
     let pbr_base = pbr_albedo.rgb * pbr_ao;
-    let pbr_ibl_diffuse_env = textureSample(pbr_ibl_irradiance, pbr_ibl_irradiance_samp, pbr_n).rgb * pbr_env_tint;
+    let pbr_indirect_occlusion_strength = clamp(ubuf.pbr_indirect_occlusion.x, 0.0, 1.0);
+    let pbr_indirect_horizon_strength = clamp(ubuf.pbr_indirect_occlusion.y, 0.0, 1.0);
+    let pbr_indirect_specular_strength = clamp(ubuf.pbr_indirect_occlusion.z, 0.0, 1.0);
+    let pbr_down_facing = smoothstep(0.0, 1.0, max(-pbr_ambient_up, 0.0));
+    let pbr_material_indirect_occlusion = mix(1.0, pbr_ao, pbr_indirect_occlusion_strength);
+    let pbr_horizon_indirect_occlusion = mix(1.0, 1.0 - 0.5 * pbr_down_facing, pbr_indirect_horizon_strength);
+    let pbr_indirect_occlusion = clamp(pbr_material_indirect_occlusion * pbr_horizon_indirect_occlusion, 0.0, 1.0);
+    let pbr_indirect_specular_occlusion = mix(1.0, pbr_indirect_occlusion, pbr_indirect_specular_strength);
+    let pbr_ibl_blend_factor = clamp(ubuf.pbr_ibl_blend_params.x, 0.0, 1.0);
+    let pbr_ibl_diffuse_env_active = textureSample(pbr_ibl_irradiance, pbr_ibl_irradiance_samp, pbr_n).rgb;
+    let pbr_ibl_diffuse_env_from =
+        textureSample(pbr_ibl_blend_irradiance, pbr_ibl_blend_irradiance_samp, pbr_n).rgb;
+    let pbr_ibl_diffuse_env = mix(pbr_ibl_diffuse_env_from, pbr_ibl_diffuse_env_active, vec3f(pbr_ibl_blend_factor)) *
+                              pbr_env_tint;
     let pbr_reflection = normalize(reflect(-pbr_v, pbr_n));
-    let pbr_ibl_spec_env = textureSampleLevel(
-        pbr_ibl_prefilter, pbr_ibl_prefilter_samp, pbr_reflection, pbr_roughness * ubuf.pbr_ibl_params.w).rgb *
-        pbr_env_tint;
+    let pbr_ibl_spec_env_active = textureSampleLevel(
+        pbr_ibl_prefilter, pbr_ibl_prefilter_samp, pbr_reflection, pbr_roughness * ubuf.pbr_ibl_params.w).rgb;
+    let pbr_ibl_spec_env_from = textureSampleLevel(
+        pbr_ibl_blend_prefilter, pbr_ibl_blend_prefilter_samp, pbr_reflection,
+        pbr_roughness * ubuf.pbr_ibl_blend_params.y).rgb;
+    let pbr_ibl_spec_env =
+        mix(pbr_ibl_spec_env_from, pbr_ibl_spec_env_active, vec3f(pbr_ibl_blend_factor)) * pbr_env_tint;
     let pbr_brdf = textureSample(pbr_ibl_brdf_lut, pbr_ibl_brdf_lut_samp, vec2f(pbr_ndotv, pbr_roughness)).rg;
     let pbr_ibl_diffuse = pbr_diffuse_color * pbr_ibl_diffuse_env * ubuf.pbr_params.x * ubuf.pbr_ibl_params.y;
     let pbr_ibl_specular = pbr_ibl_spec_env * (pbr_f0 * pbr_brdf.x + vec3f(pbr_brdf.y)) *
                            pbr_specular * ubuf.pbr_params.y * ubuf.pbr_ibl_params.z;
     let pbr_use_ibl = ubuf.pbr_ibl_params.x > 0.5;
-    let pbr_indirect_diffuse = select(pbr_base * ubuf.pbr_params.x * pbr_ambient_light, pbr_ibl_diffuse, pbr_use_ibl);
-    let pbr_indirect_specular = select(pbr_ambient_spec * pbr_ambient_light, pbr_ibl_specular, pbr_use_ibl);
+    let pbr_indirect_diffuse =
+        (select(pbr_base * ubuf.pbr_params.x * pbr_ambient_light, pbr_ibl_diffuse, pbr_use_ibl) + pbr_dynamic_gi) *
+        pbr_indirect_occlusion;
+    let pbr_indirect_specular =
+        select(pbr_ambient_spec * pbr_ambient_light, pbr_ibl_specular, pbr_use_ibl) *
+        pbr_indirect_specular_occlusion;
     var pbr_rgb = pbr_indirect_diffuse                                           // indirect diffuse
                 + pbr_indirect_specular                                          // indirect specular
-                + pbr_base * pbr_fill_ndotl * ubuf.pbr_params.z * pbr_env_light  // fill light (all materials)
+                + pbr_base * pbr_fill_ndotl * ubuf.pbr_params.z * pbr_env_light *
+                      pbr_indirect_occlusion                                      // fill light (all materials)
                 + pbr_direct_diffuse                                             // main light diffuse
                 + pbr_direct_specular;                                           // main light specular
 )""";
@@ -1737,6 +1827,10 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
       pbr_rgb = pbr_indirect_diffuse;
     } else if (pbr_debug_mode == 11) {
       pbr_rgb = pbr_indirect_specular;
+    } else if (pbr_debug_mode == 12) {
+      pbr_rgb = vec3f(pbr_indirect_occlusion);
+    } else if (pbr_debug_mode == 13) {
+      pbr_rgb = pbr_dynamic_gi * pbr_indirect_occlusion;
     })""";
     const std::string pbrAlpha = usePrevAlbedo ? "pbr_albedo.a"s : "pbr_albedo.a * prev.a"s;
     fragmentFn += fmt::format(
@@ -1807,14 +1901,30 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
         i, i * TextureBindingsPerMap, i * TextureBindingsPerMap + 1);
   }
   if ((config.pbrFlags & PbrMaterialEnabled) != 0) {
-    uniBufAttrs += "\n    pbr_params: vec4f,";        // x=ambient, y=ambient_specular, z=fill_intensity
-    uniBufAttrs += "\n    pbr_scales: vec4f,";        // x=diffuse_scale, y=specular_scale, z=debug_mode
-    uniBufAttrs += "\n    pbr_normal_params: vec4f,"; // x=strength, y=normal_y_sign, z=handedness_sign
+    uniformPre +=
+        "\n"
+        "struct PbrEnhancedLight {\n"
+        "    pos_radius: vec4f,\n"
+        "    color_intensity: vec4f,\n"
+        "};\n"
+        "fn pbr_load_enhanced_light(byte_off: u32) -> PbrEnhancedLight {\n"
+        "    return PbrEnhancedLight(\n"
+        "        raw_fetch_f32_4(&abuf, byte_off, true),\n"
+        "        raw_fetch_f32_4(&abuf, byte_off + 16u, true)\n"
+        "    );\n"
+        "}";
+    uniBufAttrs += "\n    pbr_params: vec4f,";        // x=ambient, y=ambient_specular, z=fill_intensity, w=dynamic_gi_enabled
+    uniBufAttrs += "\n    pbr_scales: vec4f,";        // x=diffuse_scale, y=specular_scale, z=debug_mode, w=dynamic_gi_strength
+    uniBufAttrs += "\n    pbr_normal_params: vec4f,"; // x=strength, y=normal_y_sign, z=handedness_sign, w=dynamic_gi_wrap
     uniBufAttrs += "\n    pbr_ambient_gradient: vec4f,"; // x=sky, y=ground, z=horizon, w=environment_tint
+    uniBufAttrs += "\n    pbr_indirect_occlusion: vec4f,"; // x=strength, y=horizon, z=specular, w=dynamic_gi_albedo
     uniBufAttrs += "\n    pbr_ibl_params: vec4f,"; // x=enabled, y=diffuse_strength, z=specular_strength, w=max_mip
+    uniBufAttrs += "\n    pbr_ibl_blend_params: vec4f,"; // x=blend_to_active, y=blend_from_max_mip
     uniBufAttrs += "\n    pbr_fill_dir: vec4f,";      // xyz=fill light direction (view space)
     uniBufAttrs += "\n    pbr_material_factors: vec4f,"; // x=roughness, y=metallic, z=ao, w=specular
     uniBufAttrs += "\n    pbr_material_emissive: vec4f,"; // rgb=color, a=strength
+    uniBufAttrs += "\n    pbr_enhanced_params: vec4f,"; // x=enabled, y=count, z=inverse_square, w=intensity
+    uniBufAttrs += "\n    pbr_enhanced_storage: vec4f,"; // x=byte offset, y=byte size, z=stride
     const u32 texMap = config.pbrTexMapId;
     texBindings += fmt::format(
         "\n@group(2) @binding({0})\n"
@@ -1828,10 +1938,20 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
         "\n@group(2) @binding({4})\n"
         "var pbr_ibl_brdf_lut: texture_2d<f32>;\n"
         "@group(2) @binding({5})\n"
-        "var pbr_ibl_brdf_lut_samp: sampler;",
+        "var pbr_ibl_brdf_lut_samp: sampler;"
+        "\n@group(2) @binding({6})\n"
+        "var pbr_ibl_blend_irradiance: texture_cube<f32>;\n"
+        "@group(2) @binding({7})\n"
+        "var pbr_ibl_blend_irradiance_samp: sampler;"
+        "\n@group(2) @binding({8})\n"
+        "var pbr_ibl_blend_prefilter: texture_cube<f32>;\n"
+        "@group(2) @binding({9})\n"
+        "var pbr_ibl_blend_prefilter_samp: sampler;",
         pbr_ibl_irradiance_texture_binding(texMap), pbr_ibl_irradiance_sampler_binding(texMap),
         pbr_ibl_prefilter_texture_binding(texMap), pbr_ibl_prefilter_sampler_binding(texMap),
-        pbr_ibl_brdf_lut_texture_binding(texMap), pbr_ibl_brdf_lut_sampler_binding(texMap));
+        pbr_ibl_brdf_lut_texture_binding(texMap), pbr_ibl_brdf_lut_sampler_binding(texMap),
+        pbr_ibl_blend_irradiance_texture_binding(texMap), pbr_ibl_blend_irradiance_sampler_binding(texMap),
+        pbr_ibl_blend_prefilter_texture_binding(texMap), pbr_ibl_blend_prefilter_sampler_binding(texMap));
     if ((config.pbrFlags & PbrMaterialHasRmaos) != 0) {
       texBindings += fmt::format(
           "\n@group(2) @binding({0})\n"
