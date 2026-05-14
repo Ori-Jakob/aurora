@@ -72,6 +72,14 @@ constexpr u32 PbrBrdfLutSize = 128;
 constexpr u32 PbrShadowMapMinSize = 256;
 constexpr u32 PbrShadowMapMaxSize = 4096;
 constexpr u32 PbrShadowMapDefaultSize = 1024;
+constexpr u32 PbrShadowAtlasSlotCount = 4;
+constexpr u32 PbrShadowRequestMaxCount = PbrShadowAtlasSlotCount;
+constexpr float PbrShadowSourceRefreshDistance = 64.0f;
+constexpr float PbrShadowTargetRefreshDistance = 512.0f;
+constexpr float PbrShadowRadiusRefreshDistance = 128.0f;
+constexpr float PbrShadowLocalProjectionFade = 0.10f;
+constexpr float PbrShadowDirectionalProjectionFade = 0.02f;
+constexpr u32 PbrShadowFailedCaptureRetryFrames = 30;
 constexpr float PbrPi = 3.14159265358979323846f;
 constexpr std::array<std::string_view, 6> PbrCubeFaceNames{"px", "nx", "py", "ny", "pz", "nz"};
 constexpr u32 PbrProbeIrradianceFilterPassCount = 6;
@@ -187,6 +195,38 @@ float sPbrShadowMapBias = 0.002f;
 bool sPbrShadowMapEnabled = false;
 bool sPbrShadowMapAvailable = false;
 AuroraPbrShadowLightRequest sPbrShadowLightRequest{};
+std::array<AuroraPbrShadowLightRequest, PbrShadowRequestMaxCount> sPbrShadowLightRequests{};
+u32 sPbrShadowLightRequestCount = 0;
+wgpu::Texture sPbrShadowMapTexture;
+wgpu::TextureView sPbrShadowMapView;
+std::array<wgpu::TextureView, PbrShadowAtlasSlotCount> sPbrShadowMapSlotViews;
+wgpu::Sampler sPbrShadowMapSampler;
+wgpu::Texture sPbrShadowFallbackTexture;
+wgpu::TextureView sPbrShadowFallbackView;
+wgpu::TextureFormat sPbrShadowMapDepthFormat = wgpu::TextureFormat::Undefined;
+wgpu::TextureFormat sPbrShadowFallbackDepthFormat = wgpu::TextureFormat::Undefined;
+u32 sPbrShadowMapResourceSize = 0;
+u32 sPbrShadowMapDrawCount = 0;
+std::array<u32, PbrShadowAtlasSlotCount> sPbrShadowMapSlotDrawCounts{};
+u32 sPbrShadowMapCapturedSlotCount = 0;
+u32 sPbrShadowMapCapturedSlotMask = 0;
+bool sPbrShadowMapResourcesReady = false;
+bool sPbrShadowMapMatrixValid = false;
+bool sPbrShadowCasterPassReady = false;
+bool sPbrShadowReceiverSamplingReady = false;
+bool sPbrShadowMapRefreshPending = false;
+u32 sPbrShadowMapMaxActiveSlots = 2;
+u32 sPbrShadowMapSlotsPerFrame = 1;
+u32 sPbrShadowMapPendingSlotMask = 0;
+u32 sPbrShadowFailedCaptureFrames = 0;
+std::array<float, 16> sPbrShadowLightViewProjection{};
+Mat3x4<float> sPbrShadowViewFromWorld{};
+Mat4x4<float> sPbrShadowProjection{};
+std::array<Mat3x4<float>, PbrShadowAtlasSlotCount> sPbrShadowSlotViewFromWorld{};
+std::array<Mat4x4<float>, PbrShadowAtlasSlotCount> sPbrShadowSlotProjection{};
+u32 sPbrShadowDescriptorStorageFrame = UINT32_MAX;
+u32 sPbrShadowDescriptorStorageOffset = 0;
+u32 sPbrShadowDescriptorStorageSize = 0;
 
 struct PbrProbeFilterParams {
   u32 face = 0;
@@ -205,7 +245,21 @@ struct PbrVec3 {
   float z = 0.0f;
 };
 
+struct PbrShadowDescriptor {
+  Vec4<float> viewFromSource0{};
+  Vec4<float> viewFromSource1{};
+  Vec4<float> viewFromSource2{};
+  Vec4<float> projection0{};
+  Vec4<float> projection1{};
+  Vec4<float> projection2{};
+  Vec4<float> projection3{};
+  Vec4<float> params{};
+};
+static_assert(sizeof(PbrShadowDescriptor) == 128);
+
 float pbr_saturate(float v) noexcept { return std::clamp(v, 0.0f, 1.0f); }
+
+bool pbr_finite(float v) noexcept { return std::isfinite(v); }
 
 float pbr_dot(PbrVec3 a, PbrVec3 b) noexcept { return a.x * b.x + a.y * b.y + a.z * b.z; }
 
@@ -227,6 +281,382 @@ float pbr_distance_sq(PbrVec3 a, PbrVec3 b) noexcept {
   const float dy = a.y - b.y;
   const float dz = a.z - b.z;
   return dx * dx + dy * dy + dz * dz;
+}
+
+PbrVec3 pbr_vec3_from_array(const float (&values)[3]) noexcept { return {values[0], values[1], values[2]}; }
+
+float pbr_length(PbrVec3 v) noexcept { return std::sqrt(std::max(pbr_dot(v, v), 0.0f)); }
+
+void pbr_set_shadow_identity_matrix() noexcept {
+  sPbrShadowLightViewProjection = {
+      1.0f, 0.0f, 0.0f, 0.0f,
+      0.0f, 1.0f, 0.0f, 0.0f,
+      0.0f, 0.0f, 1.0f, 0.0f,
+      0.0f, 0.0f, 0.0f, 1.0f,
+  };
+  sPbrShadowViewFromWorld = {
+      {1.0f, 0.0f, 0.0f, 0.0f},
+      {0.0f, 1.0f, 0.0f, 0.0f},
+      {0.0f, 0.0f, 1.0f, 0.0f},
+  };
+  sPbrShadowProjection = Mat4x4_Identity;
+  for (u32 slot = 0; slot < PbrShadowAtlasSlotCount; ++slot) {
+    sPbrShadowSlotViewFromWorld[slot] = sPbrShadowViewFromWorld;
+    sPbrShadowSlotProjection[slot] = sPbrShadowProjection;
+  }
+  sPbrShadowDescriptorStorageFrame = UINT32_MAX;
+}
+
+std::array<float, 16> pbr_mul_row_major_mtx4(const std::array<float, 16>& lhs,
+                                             const std::array<float, 16>& rhs) noexcept {
+  std::array<float, 16> out{};
+  for (u32 row = 0; row < 4; ++row) {
+    for (u32 col = 0; col < 4; ++col) {
+      out[row * 4 + col] = lhs[row * 4 + 0] * rhs[0 * 4 + col] +
+                           lhs[row * 4 + 1] * rhs[1 * 4 + col] +
+                           lhs[row * 4 + 2] * rhs[2 * 4 + col] +
+                           lhs[row * 4 + 3] * rhs[3 * 4 + col];
+    }
+  }
+  return out;
+}
+
+bool pbr_shadow_request_finite(const AuroraPbrShadowLightRequest& request) noexcept {
+  for (float value : request.position) {
+    if (!pbr_finite(value)) {
+      return false;
+    }
+  }
+  for (float value : request.target) {
+    if (!pbr_finite(value)) {
+      return false;
+    }
+  }
+  return pbr_finite(request.radius);
+}
+
+bool pbr_shadow_request_same_light(const AuroraPbrShadowLightRequest& lhs,
+                                   const AuroraPbrShadowLightRequest& rhs) noexcept {
+  return lhs.valid && rhs.valid && lhs.stableId == rhs.stableId && lhs.source == rhs.source &&
+         lhs.sourceIndex == rhs.sourceIndex && lhs.shadowType == rhs.shadowType;
+}
+
+u32 pbr_shadow_active_slot_limit() noexcept {
+  return std::clamp<u32>(sPbrShadowMapMaxActiveSlots, 1u, PbrShadowAtlasSlotCount);
+}
+
+u32 pbr_shadow_slot_mask(u32 slotCount) noexcept {
+  slotCount = std::min(slotCount, PbrShadowAtlasSlotCount);
+  return slotCount == 0 ? 0 : ((1u << slotCount) - 1u);
+}
+
+u32 pbr_shadow_active_slot_count() noexcept {
+  return std::min({sPbrShadowLightRequestCount, PbrShadowAtlasSlotCount, pbr_shadow_active_slot_limit()});
+}
+
+u32 pbr_shadow_active_slot_mask() noexcept {
+  return pbr_shadow_slot_mask(pbr_shadow_active_slot_count());
+}
+
+u32 pbr_count_bits(u32 value) noexcept {
+  u32 count = 0;
+  while (value != 0) {
+    count += value & 1u;
+    value >>= 1u;
+  }
+  return count;
+}
+
+const AuroraPbrShadowLightRequest* pbr_active_shadow_request() noexcept {
+  const u32 slotCount = pbr_shadow_active_slot_count();
+  for (u32 i = 0; i < slotCount; ++i) {
+    const AuroraPbrShadowLightRequest& request = sPbrShadowLightRequests[i];
+    if (request.valid && request.shadowType != AURORA_PBR_SHADOW_TYPE_NONE &&
+        request.shadowType != AURORA_PBR_SHADOW_TYPE_POINT && pbr_shadow_request_finite(request)) {
+      return &request;
+    }
+  }
+  return nullptr;
+}
+
+bool pbr_scene_light_matches_shadow_request(const AuroraSceneLight& light) noexcept {
+  return sPbrShadowLightRequest.valid && light.stableId == sPbrShadowLightRequest.stableId &&
+         light.source == sPbrShadowLightRequest.source && light.sourceIndex == sPbrShadowLightRequest.sourceIndex;
+}
+
+Vec4<float> pbr_scene_light_shadow_params(const AuroraSceneLight& light) noexcept {
+  if (!sPbrShadowMapAvailable || sPbrShadowMapCapturedSlotMask == 0) {
+    return {};
+  }
+  const u32 slotCount = pbr_shadow_active_slot_count();
+  for (u32 i = 0; i < slotCount; ++i) {
+    const AuroraPbrShadowLightRequest& request = sPbrShadowLightRequests[i];
+    if (!request.valid || request.shadowType == AURORA_PBR_SHADOW_TYPE_NONE ||
+        request.shadowType == AURORA_PBR_SHADOW_TYPE_POINT || request.atlasSlot >= PbrShadowAtlasSlotCount) {
+      continue;
+    }
+    if ((sPbrShadowMapCapturedSlotMask & (1u << request.atlasSlot)) == 0) {
+      continue;
+    }
+    if (light.stableId == request.stableId && light.source == request.source &&
+        light.sourceIndex == request.sourceIndex) {
+      return {1.0f, static_cast<float>(request.atlasSlot), 0.0f, 0.0f};
+    }
+  }
+  return {};
+}
+
+float pbr_shadow_vec3_distance_sq(const float* a, const float* b) noexcept {
+  const float dx = a[0] - b[0];
+  const float dy = a[1] - b[1];
+  const float dz = a[2] - b[2];
+  return dx * dx + dy * dy + dz * dz;
+}
+
+bool pbr_shadow_request_needs_refresh(const AuroraPbrShadowLightRequest& request) noexcept {
+  if (!sPbrShadowLightRequest.valid) {
+    return true;
+  }
+  if (request.stableId != sPbrShadowLightRequest.stableId || request.source != sPbrShadowLightRequest.source ||
+      request.sourceIndex != sPbrShadowLightRequest.sourceIndex ||
+      request.shadowType != sPbrShadowLightRequest.shadowType) {
+    return true;
+  }
+
+  const float sourceThresholdSq = PbrShadowSourceRefreshDistance * PbrShadowSourceRefreshDistance;
+  const float targetThresholdSq = PbrShadowTargetRefreshDistance * PbrShadowTargetRefreshDistance;
+  if (pbr_shadow_vec3_distance_sq(request.position, sPbrShadowLightRequest.position) > sourceThresholdSq ||
+      pbr_shadow_vec3_distance_sq(request.target, sPbrShadowLightRequest.target) > targetThresholdSq) {
+    return true;
+  }
+
+  return std::abs(request.radius - sPbrShadowLightRequest.radius) > PbrShadowRadiusRefreshDistance;
+}
+
+bool pbr_shadow_request_needs_refresh(const AuroraPbrShadowLightRequest& request,
+                                      const AuroraPbrShadowLightRequest& cached) noexcept {
+  if (!cached.valid) {
+    return true;
+  }
+  if (request.stableId != cached.stableId || request.source != cached.source ||
+      request.sourceIndex != cached.sourceIndex || request.shadowType != cached.shadowType) {
+    return true;
+  }
+
+  const float sourceThresholdSq = PbrShadowSourceRefreshDistance * PbrShadowSourceRefreshDistance;
+  const float targetThresholdSq = PbrShadowTargetRefreshDistance * PbrShadowTargetRefreshDistance;
+  if (pbr_shadow_vec3_distance_sq(request.position, cached.position) > sourceThresholdSq ||
+      pbr_shadow_vec3_distance_sq(request.target, cached.target) > targetThresholdSq) {
+    return true;
+  }
+
+  return std::abs(request.radius - cached.radius) > PbrShadowRadiusRefreshDistance;
+}
+
+bool pbr_shadow_request_list_needs_refresh(
+    const std::array<AuroraPbrShadowLightRequest, PbrShadowRequestMaxCount>& requests, u32 requestCount) noexcept {
+  const u32 activeRequestCount = std::min(requestCount, pbr_shadow_active_slot_limit());
+  if (activeRequestCount != pbr_shadow_active_slot_count()) {
+    return true;
+  }
+  for (u32 i = 0; i < activeRequestCount && i < PbrShadowRequestMaxCount; ++i) {
+    if (pbr_shadow_request_needs_refresh(requests[i], sPbrShadowLightRequests[i])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool ensure_pbr_shadow_sampler() noexcept {
+  if (sPbrShadowMapSampler) {
+    return true;
+  }
+  if (!g_device) {
+    return false;
+  }
+
+  const wgpu::SamplerDescriptor samplerDesc{
+      .label = "PBR shadow map comparison sampler",
+      .addressModeU = wgpu::AddressMode::ClampToEdge,
+      .addressModeV = wgpu::AddressMode::ClampToEdge,
+      .addressModeW = wgpu::AddressMode::ClampToEdge,
+      .magFilter = wgpu::FilterMode::Linear,
+      .minFilter = wgpu::FilterMode::Linear,
+      .mipmapFilter = wgpu::MipmapFilterMode::Nearest,
+      .lodMinClamp = 0.0f,
+      .lodMaxClamp = 1.0f,
+      .compare = UseReversedZ ? wgpu::CompareFunction::GreaterEqual : wgpu::CompareFunction::LessEqual,
+      .maxAnisotropy = 1,
+  };
+  sPbrShadowMapSampler = g_device.CreateSampler(&samplerDesc);
+  return static_cast<bool>(sPbrShadowMapSampler);
+}
+
+bool ensure_pbr_shadow_fallback_resources() noexcept {
+  if (!g_device) {
+    return false;
+  }
+
+  const auto depthFormat = webgpu::g_graphicsConfig.depthFormat;
+  if (depthFormat == wgpu::TextureFormat::Undefined) {
+    return false;
+  }
+
+  if (sPbrShadowFallbackView && sPbrShadowFallbackDepthFormat == depthFormat && ensure_pbr_shadow_sampler()) {
+    return true;
+  }
+
+  const wgpu::TextureDescriptor depthDesc{
+      .label = "PBR fallback shadow depth texture",
+      .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+      .dimension = wgpu::TextureDimension::e2D,
+      .size = {.width = 1, .height = 1, .depthOrArrayLayers = 1},
+      .format = depthFormat,
+      .mipLevelCount = 1,
+      .sampleCount = 1,
+  };
+  sPbrShadowFallbackTexture = g_device.CreateTexture(&depthDesc);
+  const wgpu::TextureViewDescriptor viewDesc{
+      .label = "PBR fallback shadow depth view",
+      .format = depthFormat,
+      .dimension = wgpu::TextureViewDimension::e2D,
+      .mipLevelCount = 1,
+      .arrayLayerCount = 1,
+  };
+  sPbrShadowFallbackView = sPbrShadowFallbackTexture.CreateView(&viewDesc);
+  sPbrShadowFallbackDepthFormat = depthFormat;
+  return static_cast<bool>(sPbrShadowFallbackView) && ensure_pbr_shadow_sampler();
+}
+
+bool pbr_build_shadow_matrix_from_request(const AuroraPbrShadowLightRequest& request) noexcept {
+  if (!request.valid || !pbr_shadow_request_finite(request)) {
+    pbr_set_shadow_identity_matrix();
+    sPbrShadowMapMatrixValid = false;
+    return false;
+  }
+
+  const PbrVec3 eye = pbr_vec3_from_array(request.position);
+  const PbrVec3 target = pbr_vec3_from_array(request.target);
+  PbrVec3 forward{target.x - eye.x, target.y - eye.y, target.z - eye.z};
+  const float lightDistance = pbr_length(forward);
+  if (lightDistance < 0.001f) {
+    forward = {0.0f, -1.0f, 0.0f};
+  }
+
+  PbrVec3 up{0.0f, 1.0f, 0.0f};
+  const PbrVec3 normalizedForward = pbr_normalize(forward);
+  if (std::abs(pbr_dot(normalizedForward, up)) > 0.95f) {
+    up = {0.0f, 0.0f, 1.0f};
+  }
+
+  const PbrVec3 f = normalizedForward;
+  const PbrVec3 s = pbr_normalize(pbr_cross(f, up));
+  const PbrVec3 u = pbr_cross(s, f);
+  sPbrShadowViewFromWorld = {
+      {s.x, s.y, s.z, -pbr_dot(s, eye)},
+      {u.x, u.y, u.z, -pbr_dot(u, eye)},
+      {-f.x, -f.y, -f.z, pbr_dot(f, eye)},
+  };
+  const std::array<float, 16> view{
+      s.x, s.y, s.z, -pbr_dot(s, eye),
+      u.x, u.y, u.z, -pbr_dot(u, eye),
+      -f.x, -f.y, -f.z, pbr_dot(f, eye),
+      0.0f, 0.0f, 0.0f, 1.0f,
+  };
+
+  const float requestedRadius = pbr_finite(request.radius) ? std::max(request.radius, 1.0f) : 1.0f;
+  const float halfExtent = std::clamp(requestedRadius * 0.65f, 512.0f, 30000.0f);
+  const float nearPlane = 1.0f;
+  const float farPlane = std::clamp(std::max(lightDistance + requestedRadius, requestedRadius * 2.0f), 1024.0f,
+                                    60000.0f);
+  sPbrShadowProjection = {};
+  sPbrShadowProjection.m0[0] = 1.0f / halfExtent;
+  sPbrShadowProjection.m1[1] = 1.0f / halfExtent;
+  sPbrShadowProjection.m2[2] = 1.0f / (nearPlane - farPlane);
+  sPbrShadowProjection.m2[3] = nearPlane / (nearPlane - farPlane);
+  sPbrShadowProjection.m3[3] = 1.0f;
+  const std::array<float, 16> projection{
+      1.0f / halfExtent, 0.0f, 0.0f, 0.0f,
+      0.0f, 1.0f / halfExtent, 0.0f, 0.0f,
+      0.0f, 0.0f, 1.0f / (nearPlane - farPlane), nearPlane / (nearPlane - farPlane),
+      0.0f, 0.0f, 0.0f, 1.0f,
+  };
+
+  sPbrShadowLightViewProjection = pbr_mul_row_major_mtx4(projection, view);
+  if (request.atlasSlot < PbrShadowAtlasSlotCount) {
+    sPbrShadowSlotViewFromWorld[request.atlasSlot] = sPbrShadowViewFromWorld;
+    sPbrShadowSlotProjection[request.atlasSlot] = sPbrShadowProjection;
+  }
+  sPbrShadowMapMatrixValid = true;
+  sPbrShadowDescriptorStorageFrame = UINT32_MAX;
+  return true;
+}
+
+bool ensure_pbr_shadow_map_resources() noexcept {
+  if (!sPbrShadowMapEnabled || !g_device) {
+    if (!sPbrShadowMapEnabled) {
+      sPbrShadowMapResourcesReady = false;
+    }
+    return false;
+  }
+
+  const auto depthFormat = webgpu::g_graphicsConfig.depthFormat;
+  if (depthFormat == wgpu::TextureFormat::Undefined) {
+    sPbrShadowMapResourcesReady = false;
+    return false;
+  }
+
+  ensure_pbr_shadow_sampler();
+
+  bool slotViewsReady = true;
+  for (const auto& view : sPbrShadowMapSlotViews) {
+    slotViewsReady = slotViewsReady && static_cast<bool>(view);
+  }
+  if (sPbrShadowMapResourcesReady && sPbrShadowMapResourceSize == sPbrShadowMapSize &&
+      sPbrShadowMapDepthFormat == depthFormat && sPbrShadowMapTexture && sPbrShadowMapView &&
+      sPbrShadowMapSampler && slotViewsReady) {
+    return true;
+  }
+
+  const wgpu::TextureDescriptor depthDesc{
+      .label = "PBR shadow map depth texture",
+      .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+      .dimension = wgpu::TextureDimension::e2D,
+      .size = {.width = sPbrShadowMapSize, .height = sPbrShadowMapSize,
+               .depthOrArrayLayers = PbrShadowAtlasSlotCount},
+      .format = depthFormat,
+      .mipLevelCount = 1,
+      .sampleCount = 1,
+  };
+  sPbrShadowMapTexture = g_device.CreateTexture(&depthDesc);
+  for (u32 slot = 0; slot < PbrShadowAtlasSlotCount; ++slot) {
+    const wgpu::TextureViewDescriptor depthViewDesc{
+        .label = "PBR shadow map depth slot view",
+        .format = depthFormat,
+        .dimension = wgpu::TextureViewDimension::e2D,
+        .baseMipLevel = 0,
+        .mipLevelCount = 1,
+        .baseArrayLayer = slot,
+        .arrayLayerCount = 1,
+    };
+    sPbrShadowMapSlotViews[slot] = sPbrShadowMapTexture.CreateView(&depthViewDesc);
+  }
+  sPbrShadowMapView = sPbrShadowMapSlotViews[0];
+
+  sPbrShadowMapDepthFormat = depthFormat;
+  sPbrShadowMapResourceSize = sPbrShadowMapSize;
+  slotViewsReady = true;
+  for (const auto& view : sPbrShadowMapSlotViews) {
+    slotViewsReady = slotViewsReady && static_cast<bool>(view);
+  }
+  sPbrShadowMapResourcesReady = sPbrShadowMapTexture && sPbrShadowMapView && sPbrShadowMapSampler && slotViewsReady;
+  sPbrShadowMapAvailable = false;
+  sPbrShadowMapDrawCount = 0;
+  sPbrShadowMapSlotDrawCounts = {};
+  sPbrShadowMapCapturedSlotCount = 0;
+  sPbrShadowMapCapturedSlotMask = 0;
+  sPbrShadowMapPendingSlotMask = pbr_shadow_active_slot_mask();
+  return sPbrShadowMapResourcesReady;
 }
 
 float pbr_mtx(const Mat3x4<float>& mtx, u32 row, u32 col) noexcept {
@@ -1608,6 +2038,8 @@ void initialize_pbr_resources() noexcept {
       .mipmapFilter = wgpu::MipmapFilterMode::Undefined,
   };
   sPbrBrdfLutSampler = gfx::sampler_ref(brdfSamplerDesc);
+  pbr_set_shadow_identity_matrix();
+  ensure_pbr_shadow_fallback_resources();
 
   load_fallback_pbr_ibl_textures(sFallbackPbrIbl);
   sActivePbrIbl = &sFallbackPbrIbl;
@@ -1616,7 +2048,7 @@ void initialize_pbr_resources() noexcept {
 
 void add_pbr_texture_layout_entries(
     std::array<wgpu::BindGroupLayoutEntry, TextureBindGroupEntryCount>& textureEntries) noexcept {
-  const auto addPbrTextureLayout = [&](u32 textureBinding, u32 samplerBinding,
+  const auto addPbrTextureLayout = [&](u32 textureBinding,
                                        wgpu::TextureViewDimension viewDimension = wgpu::TextureViewDimension::e2D) {
     textureEntries[textureBinding] = {
         .binding = textureBinding,
@@ -1627,134 +2059,145 @@ void add_pbr_texture_layout_entries(
                 .viewDimension = viewDimension,
             },
     };
+  };
+  const auto addPbrSamplerLayout = [&](u32 samplerBinding) {
     textureEntries[samplerBinding] = {
         .binding = samplerBinding,
         .visibility = wgpu::ShaderStage::Fragment,
         .sampler = {.type = wgpu::SamplerBindingType::Filtering},
     };
   };
-  addPbrTextureLayout(pbr_rmaos_texture_binding(0), pbr_rmaos_sampler_binding(0));
-  addPbrTextureLayout(pbr_roughness_texture_binding(0), pbr_roughness_sampler_binding(0));
-  addPbrTextureLayout(pbr_metallic_texture_binding(0), pbr_metallic_sampler_binding(0));
-  addPbrTextureLayout(pbr_ao_texture_binding(0), pbr_ao_sampler_binding(0));
-  addPbrTextureLayout(pbr_specular_texture_binding(0), pbr_specular_sampler_binding(0));
-  addPbrTextureLayout(pbr_normal_texture_binding(0), pbr_normal_sampler_binding(0));
-  addPbrTextureLayout(pbr_emissive_texture_binding(0), pbr_emissive_sampler_binding(0));
-  addPbrTextureLayout(pbr_ibl_irradiance_texture_binding(0), pbr_ibl_irradiance_sampler_binding(0),
-                      wgpu::TextureViewDimension::Cube);
-  addPbrTextureLayout(pbr_ibl_prefilter_texture_binding(0), pbr_ibl_prefilter_sampler_binding(0),
-                      wgpu::TextureViewDimension::Cube);
-  addPbrTextureLayout(pbr_ibl_brdf_lut_texture_binding(0), pbr_ibl_brdf_lut_sampler_binding(0));
-  addPbrTextureLayout(pbr_ibl_blend_irradiance_texture_binding(0), pbr_ibl_blend_irradiance_sampler_binding(0),
-                      wgpu::TextureViewDimension::Cube);
-  addPbrTextureLayout(pbr_ibl_blend_prefilter_texture_binding(0), pbr_ibl_blend_prefilter_sampler_binding(0),
-                      wgpu::TextureViewDimension::Cube);
+  const auto addPbrShadowTextureLayout = [&](u32 textureBinding) {
+    textureEntries[textureBinding] = {
+        .binding = textureBinding,
+        .visibility = wgpu::ShaderStage::Fragment,
+        .texture =
+            {
+                .sampleType = wgpu::TextureSampleType::Depth,
+                .viewDimension = wgpu::TextureViewDimension::e2D,
+            },
+    };
+  };
+  const auto addPbrShadowSamplerLayout = [&](u32 samplerBinding) {
+    textureEntries[samplerBinding] = {
+        .binding = samplerBinding,
+        .visibility = wgpu::ShaderStage::Fragment,
+      .sampler = {.type = wgpu::SamplerBindingType::Comparison},
+    };
+  };
+  addPbrTextureLayout(pbr_rmaos_texture_binding(0));
+  addPbrTextureLayout(pbr_roughness_texture_binding(0));
+  addPbrTextureLayout(pbr_metallic_texture_binding(0));
+  addPbrTextureLayout(pbr_ao_texture_binding(0));
+  addPbrTextureLayout(pbr_specular_texture_binding(0));
+  addPbrTextureLayout(pbr_normal_texture_binding(0));
+  addPbrTextureLayout(pbr_emissive_texture_binding(0));
+  addPbrSamplerLayout(pbr_material_sampler_binding(0));
+  addPbrTextureLayout(pbr_ibl_irradiance_texture_binding(0), wgpu::TextureViewDimension::Cube);
+  addPbrTextureLayout(pbr_ibl_prefilter_texture_binding(0), wgpu::TextureViewDimension::Cube);
+  addPbrTextureLayout(pbr_ibl_brdf_lut_texture_binding(0));
+  addPbrTextureLayout(pbr_ibl_blend_irradiance_texture_binding(0), wgpu::TextureViewDimension::Cube);
+  addPbrTextureLayout(pbr_ibl_blend_prefilter_texture_binding(0), wgpu::TextureViewDimension::Cube);
+  addPbrSamplerLayout(pbr_ibl_sampler_binding(0));
+  for (u32 slot = 0; slot < PbrShadowAtlasSlotCount; ++slot) {
+    addPbrShadowTextureLayout(pbr_shadow_texture_binding(0, slot));
+  }
+  addPbrShadowSamplerLayout(pbr_shadow_sampler_binding(0));
 }
 
 void add_pbr_empty_bind_group_entries(std::array<wgpu::BindGroupEntry, TextureBindGroupEntryCount>& entries,
                                       const wgpu::TextureView& emptyTextureView,
                                       const wgpu::Sampler& emptySampler) noexcept {
-  const auto addPbrEmptyBinding = [&](u32 textureBinding, u32 samplerBinding) {
+  const auto addPbrEmptyTexture = [&](u32 textureBinding) {
     entries[textureBinding] = {
         .binding = textureBinding,
         .textureView = emptyTextureView,
     };
-    entries[samplerBinding] = {
-        .binding = samplerBinding,
-        .sampler = emptySampler,
-    };
   };
 
-  addPbrEmptyBinding(pbr_rmaos_texture_binding(0), pbr_rmaos_sampler_binding(0));
-  addPbrEmptyBinding(pbr_roughness_texture_binding(0), pbr_roughness_sampler_binding(0));
-  addPbrEmptyBinding(pbr_metallic_texture_binding(0), pbr_metallic_sampler_binding(0));
-  addPbrEmptyBinding(pbr_ao_texture_binding(0), pbr_ao_sampler_binding(0));
-  addPbrEmptyBinding(pbr_specular_texture_binding(0), pbr_specular_sampler_binding(0));
-  addPbrEmptyBinding(pbr_normal_texture_binding(0), pbr_normal_sampler_binding(0));
-  addPbrEmptyBinding(pbr_emissive_texture_binding(0), pbr_emissive_sampler_binding(0));
+  addPbrEmptyTexture(pbr_rmaos_texture_binding(0));
+  addPbrEmptyTexture(pbr_roughness_texture_binding(0));
+  addPbrEmptyTexture(pbr_metallic_texture_binding(0));
+  addPbrEmptyTexture(pbr_ao_texture_binding(0));
+  addPbrEmptyTexture(pbr_specular_texture_binding(0));
+  addPbrEmptyTexture(pbr_normal_texture_binding(0));
+  addPbrEmptyTexture(pbr_emissive_texture_binding(0));
+  entries[pbr_material_sampler_binding(0)] = {
+      .binding = pbr_material_sampler_binding(0),
+      .sampler = emptySampler,
+  };
   const auto& ibl = active_pbr_ibl_set();
   entries[pbr_ibl_irradiance_texture_binding(0)] = {
       .binding = pbr_ibl_irradiance_texture_binding(0),
       .textureView = ibl.irradianceCubeView,
   };
-  entries[pbr_ibl_irradiance_sampler_binding(0)] = {
-      .binding = pbr_ibl_irradiance_sampler_binding(0),
-      .sampler = sPbrIblSampler,
-  };
   entries[pbr_ibl_prefilter_texture_binding(0)] = {
       .binding = pbr_ibl_prefilter_texture_binding(0),
       .textureView = ibl.prefilterCubeView,
   };
-  entries[pbr_ibl_prefilter_sampler_binding(0)] = {
-      .binding = pbr_ibl_prefilter_sampler_binding(0),
-      .sampler = sPbrIblSampler,
-  };
   entries[pbr_ibl_brdf_lut_texture_binding(0)] = {
       .binding = pbr_ibl_brdf_lut_texture_binding(0),
       .textureView = ibl.brdfLutView,
-  };
-  entries[pbr_ibl_brdf_lut_sampler_binding(0)] = {
-      .binding = pbr_ibl_brdf_lut_sampler_binding(0),
-      .sampler = sPbrBrdfLutSampler,
   };
   const auto& blendFrom = active_pbr_ibl_blend_from_set();
   entries[pbr_ibl_blend_irradiance_texture_binding(0)] = {
       .binding = pbr_ibl_blend_irradiance_texture_binding(0),
       .textureView = blendFrom.irradianceCubeView,
   };
-  entries[pbr_ibl_blend_irradiance_sampler_binding(0)] = {
-      .binding = pbr_ibl_blend_irradiance_sampler_binding(0),
-      .sampler = sPbrIblSampler,
-  };
   entries[pbr_ibl_blend_prefilter_texture_binding(0)] = {
       .binding = pbr_ibl_blend_prefilter_texture_binding(0),
       .textureView = blendFrom.prefilterCubeView,
   };
-  entries[pbr_ibl_blend_prefilter_sampler_binding(0)] = {
-      .binding = pbr_ibl_blend_prefilter_sampler_binding(0),
+  entries[pbr_ibl_sampler_binding(0)] = {
+      .binding = pbr_ibl_sampler_binding(0),
       .sampler = sPbrIblSampler,
+  };
+  ensure_pbr_shadow_fallback_resources();
+  for (u32 slot = 0; slot < PbrShadowAtlasSlotCount; ++slot) {
+    entries[pbr_shadow_texture_binding(0, slot)] = {
+        .binding = pbr_shadow_texture_binding(0, slot),
+        .textureView = sPbrShadowFallbackView,
+    };
+  }
+  entries[pbr_shadow_sampler_binding(0)] = {
+      .binding = pbr_shadow_sampler_binding(0),
+      .sampler = sPbrShadowMapSampler,
   };
 }
 
 void bind_pbr_texture_entries(std::array<WGPUBindGroupEntry, TextureBindGroupEntryCount>& textureEntries,
                               const ShaderInfo& info, const wgpu::TextureView& emptyTextureView,
-                              const wgpu::Sampler& emptySampler) noexcept {
-  const auto bindPbrTexture = [&](u32 textureBinding, u32 samplerBinding, const gfx::TextureHandle& handle,
-                                  const gfx::TextureBind* samplerSource) {
+                              const wgpu::Sampler& emptySampler, bool bindShadowReceivers) noexcept {
+  (void)emptySampler;
+  const auto bindPbrTexture = [&](u32 textureBinding, const gfx::TextureHandle& handle) {
     WGPUBindGroupEntry& pbrTextureEntry = textureEntries[textureBinding];
-    WGPUBindGroupEntry& pbrSamplerEntry = textureEntries[samplerBinding];
     pbrTextureEntry.binding = textureBinding;
-    pbrSamplerEntry.binding = samplerBinding;
-    if (handle && samplerSource != nullptr && *samplerSource) {
-      pbrTextureEntry.textureView = handle->sampleTextureView.Get();
-      pbrSamplerEntry.sampler = gfx::sampler_ref(samplerSource->get_descriptor()).Get();
-    } else {
-      pbrTextureEntry.textureView = emptyTextureView.Get();
-      pbrSamplerEntry.sampler = emptySampler.Get();
-    }
-  };
-  const auto bindPbrView = [&](u32 textureBinding, u32 samplerBinding, const wgpu::TextureView& textureView,
-                               const wgpu::Sampler& sampler) {
-    WGPUBindGroupEntry& pbrTextureEntry = textureEntries[textureBinding];
-    WGPUBindGroupEntry& pbrSamplerEntry = textureEntries[samplerBinding];
-    pbrTextureEntry.binding = textureBinding;
-    pbrSamplerEntry.binding = samplerBinding;
-    pbrTextureEntry.textureView = textureView.Get();
-    pbrSamplerEntry.sampler = sampler.Get();
-  };
-  const auto bindPbrStandaloneTexture = [&](u32 textureBinding, u32 samplerBinding, const gfx::TextureHandle& handle) {
-    WGPUBindGroupEntry& pbrTextureEntry = textureEntries[textureBinding];
-    WGPUBindGroupEntry& pbrSamplerEntry = textureEntries[samplerBinding];
-    pbrTextureEntry.binding = textureBinding;
-    pbrSamplerEntry.binding = samplerBinding;
     if (handle) {
       pbrTextureEntry.textureView = handle->sampleTextureView.Get();
-      pbrSamplerEntry.sampler = sPbrMaterialSampler.Get();
     } else {
       pbrTextureEntry.textureView = emptyTextureView.Get();
-      pbrSamplerEntry.sampler = emptySampler.Get();
     }
   };
+  const auto bindPbrView = [&](u32 textureBinding, const wgpu::TextureView& textureView) {
+    WGPUBindGroupEntry& pbrTextureEntry = textureEntries[textureBinding];
+    pbrTextureEntry.binding = textureBinding;
+    pbrTextureEntry.textureView = textureView.Get();
+  };
+  const auto bindPbrStandaloneTexture = [&](u32 textureBinding, const gfx::TextureHandle& handle) {
+    WGPUBindGroupEntry& pbrTextureEntry = textureEntries[textureBinding];
+    pbrTextureEntry.binding = textureBinding;
+    if (handle) {
+      pbrTextureEntry.textureView = handle->sampleTextureView.Get();
+    } else {
+      pbrTextureEntry.textureView = emptyTextureView.Get();
+    }
+  };
+  WGPUBindGroupEntry& materialSamplerEntry = textureEntries[pbr_material_sampler_binding(0)];
+  materialSamplerEntry.binding = pbr_material_sampler_binding(0);
+  materialSamplerEntry.sampler = sPbrMaterialSampler.Get();
+  WGPUBindGroupEntry& iblSamplerEntry = textureEntries[pbr_ibl_sampler_binding(0)];
+  iblSamplerEntry.binding = pbr_ibl_sampler_binding(0);
+  iblSamplerEntry.sampler = sPbrIblSampler.Get();
 
   const gfx::TextureBind* pbrTex = nullptr;
   if ((info.pbrFlags & PbrMaterialEnabled) != 0 && info.pbrTexMapId < MaxTextures) {
@@ -1762,42 +2205,45 @@ void bind_pbr_texture_entries(std::array<WGPUBindGroupEntry, TextureBindGroupEnt
   }
   const bool useGlobalMaps = (info.pbrFlags & PbrMaterialUseGlobalMaps) != 0;
   if (useGlobalMaps) {
-    bindPbrStandaloneTexture(pbr_rmaos_texture_binding(0), pbr_rmaos_sampler_binding(0), pbrMaterialRmaos);
-    bindPbrStandaloneTexture(pbr_roughness_texture_binding(0), pbr_roughness_sampler_binding(0), pbrMaterialRoughness);
-    bindPbrStandaloneTexture(pbr_metallic_texture_binding(0), pbr_metallic_sampler_binding(0), pbrMaterialMetallic);
-    bindPbrStandaloneTexture(pbr_ao_texture_binding(0), pbr_ao_sampler_binding(0), pbrMaterialAo);
-    bindPbrStandaloneTexture(pbr_specular_texture_binding(0), pbr_specular_sampler_binding(0), pbrMaterialSpecular);
-    bindPbrStandaloneTexture(pbr_normal_texture_binding(0), pbr_normal_sampler_binding(0), pbrMaterialNormal);
-    bindPbrStandaloneTexture(pbr_emissive_texture_binding(0), pbr_emissive_sampler_binding(0),
-                             pbrMaterialEmissiveMap);
+    bindPbrStandaloneTexture(pbr_rmaos_texture_binding(0), pbrMaterialRmaos);
+    bindPbrStandaloneTexture(pbr_roughness_texture_binding(0), pbrMaterialRoughness);
+    bindPbrStandaloneTexture(pbr_metallic_texture_binding(0), pbrMaterialMetallic);
+    bindPbrStandaloneTexture(pbr_ao_texture_binding(0), pbrMaterialAo);
+    bindPbrStandaloneTexture(pbr_specular_texture_binding(0), pbrMaterialSpecular);
+    bindPbrStandaloneTexture(pbr_normal_texture_binding(0), pbrMaterialNormal);
+    bindPbrStandaloneTexture(pbr_emissive_texture_binding(0), pbrMaterialEmissiveMap);
   } else {
-    bindPbrTexture(pbr_rmaos_texture_binding(0), pbr_rmaos_sampler_binding(0),
-                   pbrTex != nullptr && *pbrTex ? pbrTex->ref->pbrRmaos : nullptr, pbrTex);
-    bindPbrTexture(pbr_roughness_texture_binding(0), pbr_roughness_sampler_binding(0),
-                   pbrTex != nullptr && *pbrTex ? pbrTex->ref->pbrRoughness : nullptr, pbrTex);
-    bindPbrTexture(pbr_metallic_texture_binding(0), pbr_metallic_sampler_binding(0),
-                   pbrTex != nullptr && *pbrTex ? pbrTex->ref->pbrMetallic : nullptr, pbrTex);
-    bindPbrTexture(pbr_ao_texture_binding(0), pbr_ao_sampler_binding(0),
-                   pbrTex != nullptr && *pbrTex ? pbrTex->ref->pbrAo : nullptr, pbrTex);
-    bindPbrTexture(pbr_specular_texture_binding(0), pbr_specular_sampler_binding(0),
-                   pbrTex != nullptr && *pbrTex ? pbrTex->ref->pbrSpecular : nullptr, pbrTex);
-    bindPbrTexture(pbr_normal_texture_binding(0), pbr_normal_sampler_binding(0),
-                   pbrTex != nullptr && *pbrTex ? pbrTex->ref->pbrNormal : nullptr, pbrTex);
-    bindPbrTexture(pbr_emissive_texture_binding(0), pbr_emissive_sampler_binding(0),
-                   pbrTex != nullptr && *pbrTex ? pbrTex->ref->pbrEmissive : nullptr, pbrTex);
+    bindPbrTexture(pbr_rmaos_texture_binding(0), pbrTex != nullptr && *pbrTex ? pbrTex->ref->pbrRmaos : nullptr);
+    bindPbrTexture(pbr_roughness_texture_binding(0),
+                   pbrTex != nullptr && *pbrTex ? pbrTex->ref->pbrRoughness : nullptr);
+    bindPbrTexture(pbr_metallic_texture_binding(0),
+                   pbrTex != nullptr && *pbrTex ? pbrTex->ref->pbrMetallic : nullptr);
+    bindPbrTexture(pbr_ao_texture_binding(0), pbrTex != nullptr && *pbrTex ? pbrTex->ref->pbrAo : nullptr);
+    bindPbrTexture(pbr_specular_texture_binding(0),
+                   pbrTex != nullptr && *pbrTex ? pbrTex->ref->pbrSpecular : nullptr);
+    bindPbrTexture(pbr_normal_texture_binding(0), pbrTex != nullptr && *pbrTex ? pbrTex->ref->pbrNormal : nullptr);
+    bindPbrTexture(pbr_emissive_texture_binding(0),
+                   pbrTex != nullptr && *pbrTex ? pbrTex->ref->pbrEmissive : nullptr);
   }
   const auto& ibl = active_pbr_ibl_set();
   const auto& blendFrom = active_pbr_ibl_blend_from_set();
-  bindPbrView(pbr_ibl_irradiance_texture_binding(0), pbr_ibl_irradiance_sampler_binding(0),
-              ibl.irradianceCubeView, sPbrIblSampler);
-  bindPbrView(pbr_ibl_prefilter_texture_binding(0), pbr_ibl_prefilter_sampler_binding(0), ibl.prefilterCubeView,
-              sPbrIblSampler);
-  bindPbrView(pbr_ibl_brdf_lut_texture_binding(0), pbr_ibl_brdf_lut_sampler_binding(0), ibl.brdfLutView,
-              sPbrBrdfLutSampler);
-  bindPbrView(pbr_ibl_blend_irradiance_texture_binding(0), pbr_ibl_blend_irradiance_sampler_binding(0),
-              blendFrom.irradianceCubeView, sPbrIblSampler);
-  bindPbrView(pbr_ibl_blend_prefilter_texture_binding(0), pbr_ibl_blend_prefilter_sampler_binding(0),
-              blendFrom.prefilterCubeView, sPbrIblSampler);
+  bindPbrView(pbr_ibl_irradiance_texture_binding(0), ibl.irradianceCubeView);
+  bindPbrView(pbr_ibl_prefilter_texture_binding(0), ibl.prefilterCubeView);
+  bindPbrView(pbr_ibl_brdf_lut_texture_binding(0), ibl.brdfLutView);
+  bindPbrView(pbr_ibl_blend_irradiance_texture_binding(0), blendFrom.irradianceCubeView);
+  bindPbrView(pbr_ibl_blend_prefilter_texture_binding(0), blendFrom.prefilterCubeView);
+  if (!bindShadowReceivers) {
+    ensure_pbr_shadow_fallback_resources();
+  }
+  for (u32 slot = 0; slot < PbrShadowAtlasSlotCount; ++slot) {
+    WGPUBindGroupEntry& pbrShadowEntry = textureEntries[pbr_shadow_texture_binding(0, slot)];
+    pbrShadowEntry.binding = pbr_shadow_texture_binding(0, slot);
+    pbrShadowEntry.textureView =
+        (bindShadowReceivers ? pbr_shadow_receiver_view(slot) : sPbrShadowFallbackView).Get();
+  }
+  WGPUBindGroupEntry& pbrShadowSamplerEntry = textureEntries[pbr_shadow_sampler_binding(0)];
+  pbrShadowSamplerEntry.binding = pbr_shadow_sampler_binding(0);
+  pbrShadowSamplerEntry.sampler = pbr_shadow_receiver_sampler().Get();
 }
 
 bool pbr_probe_capture_requested() noexcept {
@@ -1981,6 +2427,297 @@ void patch_pbr_probe_uniform(uint8_t* uniformData, const ProbeUniformPatchInfo& 
   for (u32 i = 0; i < MaxPnMtx; ++i) {
     nrmMtx[i] = pbr_mul_linear(probeCamera.normalFromSource[face], nrmMtx[i]);
   }
+}
+
+bool pbr_shadow_map_capture_requested() noexcept {
+  using namespace pbr_internal;
+  return sPbrShadowMapRefreshPending && sPbrShadowMapEnabled && sPbrShadowLightRequest.valid &&
+         sPbrShadowMapMatrixValid && sProbeCamera.valid && sPbrShadowMapPendingSlotMask != 0 &&
+         ensure_pbr_shadow_map_resources();
+}
+
+uint32_t pbr_shadow_map_capture_slot_count() noexcept {
+  using namespace pbr_internal;
+  if (!pbr_shadow_map_capture_requested()) {
+    return 0;
+  }
+  return pbr_shadow_active_slot_count();
+}
+
+uint32_t pbr_shadow_map_capture_slots_per_frame() noexcept {
+  using namespace pbr_internal;
+  return std::clamp<u32>(sPbrShadowMapSlotsPerFrame, 1u, PbrShadowAtlasSlotCount);
+}
+
+bool pbr_shadow_map_capture_slot_requested(uint32_t slot) noexcept {
+  using namespace pbr_internal;
+  return slot < PbrShadowAtlasSlotCount && (sPbrShadowMapPendingSlotMask & (1u << slot)) != 0;
+}
+
+uint32_t pbr_shadow_map_size() noexcept { return pbr_internal::sPbrShadowMapSize; }
+
+const wgpu::TextureView& pbr_shadow_map_depth_view() noexcept {
+  pbr_internal::ensure_pbr_shadow_map_resources();
+  return pbr_internal::sPbrShadowMapView;
+}
+
+const wgpu::TextureView& pbr_shadow_map_depth_slot_view(uint32_t slot) noexcept {
+  using namespace pbr_internal;
+  ensure_pbr_shadow_map_resources();
+  if (slot < PbrShadowAtlasSlotCount && sPbrShadowMapSlotViews[slot]) {
+    return sPbrShadowMapSlotViews[slot];
+  }
+  return sPbrShadowMapView;
+}
+
+bool begin_pbr_shadow_map_capture_slot(uint32_t slot) noexcept {
+  using namespace pbr_internal;
+  sPbrShadowCasterPassReady = true;
+  if (!pbr_shadow_map_capture_requested() || !pbr_shadow_map_capture_slot_requested(slot) ||
+      slot >= pbr_shadow_active_slot_count() ||
+      slot >= PbrShadowAtlasSlotCount) {
+    return false;
+  }
+  const AuroraPbrShadowLightRequest& request = sPbrShadowLightRequests[slot];
+  if (!request.valid || request.shadowType == AURORA_PBR_SHADOW_TYPE_POINT) {
+    return false;
+  }
+
+  sPbrShadowLightRequest = request;
+  sPbrShadowLightRequest.atlasSlot = slot;
+  return pbr_build_shadow_matrix_from_request(sPbrShadowLightRequest);
+}
+
+void begin_pbr_shadow_map_capture() noexcept {
+  begin_pbr_shadow_map_capture_slot(0);
+}
+
+void finish_pbr_shadow_map_capture(uint32_t drawCount, uint32_t capturedSlotCount, uint32_t capturedSlotMask) noexcept {
+  using namespace pbr_internal;
+  const bool previousAvailable = sPbrShadowMapAvailable;
+  const u32 previousDrawCount = sPbrShadowMapDrawCount;
+  sPbrShadowMapDrawCount = drawCount;
+  if (drawCount == 0 || capturedSlotCount == 0 || capturedSlotMask == 0) {
+    sPbrShadowMapAvailable = false;
+    sPbrShadowMapCapturedSlotCount = 0;
+    sPbrShadowMapCapturedSlotMask = 0;
+    sPbrShadowMapSlotDrawCounts = {};
+    sPbrShadowMapPendingSlotMask = 0;
+    sPbrShadowMapRefreshPending = false;
+    sPbrShadowFailedCaptureFrames = 0;
+    if (previousAvailable != sPbrShadowMapAvailable || previousDrawCount != sPbrShadowMapDrawCount) {
+      g_gxState.stateDirty = true;
+    }
+    return;
+  }
+
+  const u32 activeMask = pbr_shadow_active_slot_mask();
+  const u32 perCapturedSlotDrawCount = capturedSlotCount == 0 ? 0 : drawCount / capturedSlotCount;
+  for (u32 slot = 0; slot < PbrShadowAtlasSlotCount; ++slot) {
+    const u32 slotBit = 1u << slot;
+    if ((activeMask & slotBit) == 0) {
+      sPbrShadowMapSlotDrawCounts[slot] = 0;
+    } else if ((capturedSlotMask & slotBit) != 0) {
+      sPbrShadowMapSlotDrawCounts[slot] = perCapturedSlotDrawCount;
+    }
+  }
+  sPbrShadowMapCapturedSlotMask = (sPbrShadowMapCapturedSlotMask | capturedSlotMask) & activeMask;
+  sPbrShadowMapCapturedSlotCount = pbr_count_bits(sPbrShadowMapCapturedSlotMask);
+  sPbrShadowMapPendingSlotMask &= ~capturedSlotMask;
+  sPbrShadowMapPendingSlotMask &= activeMask;
+  if (const auto* activeRequest = pbr_active_shadow_request()) {
+    sPbrShadowLightRequest = *activeRequest;
+    pbr_build_shadow_matrix_from_request(sPbrShadowLightRequest);
+  }
+  sPbrShadowMapAvailable = sPbrShadowMapEnabled && sPbrShadowMapResourcesReady && sPbrShadowMapMatrixValid &&
+                            sPbrShadowLightRequest.valid && sPbrShadowMapCapturedSlotMask != 0;
+  sPbrShadowMapRefreshPending = sPbrShadowMapPendingSlotMask != 0;
+  sPbrShadowFailedCaptureFrames = 0;
+  if (previousAvailable != sPbrShadowMapAvailable || previousDrawCount != sPbrShadowMapDrawCount) {
+    g_gxState.stateDirty = true;
+  }
+}
+
+void finish_pbr_shadow_map_capture(uint32_t drawCount, uint32_t capturedSlotCount) noexcept {
+  const uint32_t capturedSlotMask =
+      capturedSlotCount >= pbr_internal::PbrShadowAtlasSlotCount
+          ? ((1u << pbr_internal::PbrShadowAtlasSlotCount) - 1u)
+          : ((1u << capturedSlotCount) - 1u);
+  finish_pbr_shadow_map_capture(drawCount, capturedSlotCount, capturedSlotMask);
+}
+
+void finish_pbr_shadow_map_capture(uint32_t drawCount) noexcept {
+  finish_pbr_shadow_map_capture(drawCount, drawCount > 0 ? 1u : 0u);
+}
+
+void patch_pbr_shadow_uniform(uint8_t* uniformData, const ProbeUniformPatchInfo& patch) noexcept {
+  using namespace pbr_internal;
+  if (uniformData == nullptr || !patch.eligible || !sPbrShadowMapMatrixValid || !sProbeCamera.valid) {
+    return;
+  }
+  if (patch.projectionOffset + sizeof(Mat4x4<float>) > patch.uniformSize ||
+      patch.pnMtxOffset + sizeof(Mat3x4<float>) * (MaxPnMtx + MaxTexMtx) > patch.uniformSize ||
+      patch.nrmMtxOffset + sizeof(Mat3x4<float>) * MaxPnMtx > patch.uniformSize) {
+    return;
+  }
+
+  auto* viewport = reinterpret_cast<float*>(uniformData + 8);
+  const float size = static_cast<float>(sPbrShadowMapSize);
+  viewport[0] = size;
+  viewport[1] = size;
+  viewport[2] = size;
+  viewport[3] = size;
+  std::memcpy(uniformData + patch.projectionOffset, &sPbrShadowProjection, sizeof(sPbrShadowProjection));
+
+  const Mat3x4<float> shadowViewFromSource = pbr_mul_affine(sPbrShadowViewFromWorld, sProbeCamera.sourceInvView);
+  auto* posMtx = reinterpret_cast<Mat3x4<float>*>(uniformData + patch.pnMtxOffset);
+  for (u32 i = 0; i < MaxPnMtx; ++i) {
+    posMtx[i] = pbr_mul_affine(shadowViewFromSource, posMtx[i]);
+  }
+
+  auto* nrmMtx = reinterpret_cast<Mat3x4<float>*>(uniformData + patch.nrmMtxOffset);
+  for (u32 i = 0; i < MaxPnMtx; ++i) {
+    nrmMtx[i] = pbr_mul_linear(shadowViewFromSource, nrmMtx[i]);
+  }
+}
+
+Vec4<float> pbr_shadow_params() noexcept {
+  using namespace pbr_internal;
+  const bool receiverReady = ensure_pbr_shadow_fallback_resources();
+  sPbrShadowReceiverSamplingReady = receiverReady;
+  const bool enabled = receiverReady && sPbrShadowMapEnabled && sPbrShadowMapAvailable && sPbrShadowMapResourcesReady &&
+                       sPbrShadowMapMatrixValid && sPbrShadowLightRequest.valid && sProbeCamera.valid &&
+                       sPbrShadowMapCapturedSlotMask != 0;
+  return {
+      enabled ? 1.0f : 0.0f,
+      sPbrShadowMapStrength,
+      UseReversedZ ? sPbrShadowMapBias : -sPbrShadowMapBias,
+      static_cast<float>(std::max(sPbrShadowMapSize, 1u)),
+  };
+}
+
+Vec4<float> pbr_shadow_storage_params() noexcept {
+  using namespace pbr_internal;
+
+  const u32 slotCount = pbr_shadow_active_slot_count();
+  if (!sPbrShadowMapEnabled || !sProbeCamera.valid || slotCount == 0) {
+    sPbrShadowDescriptorStorageOffset = 0;
+    sPbrShadowDescriptorStorageSize = 0;
+    return {};
+  }
+
+  const u32 frame = gfx::current_frame();
+  if (sPbrShadowDescriptorStorageFrame != frame || sPbrShadowDescriptorStorageSize == 0) {
+    std::array<PbrShadowDescriptor, PbrShadowAtlasSlotCount> descriptors{};
+    const Mat3x4<float> identityView{
+        {1.0f, 0.0f, 0.0f, 0.0f},
+        {0.0f, 1.0f, 0.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f, 0.0f},
+    };
+
+    for (u32 slot = 0; slot < slotCount; ++slot) {
+      const bool slotCaptured = (sPbrShadowMapCapturedSlotMask & (1u << slot)) != 0;
+      const bool requestValid =
+          slot < sPbrShadowLightRequestCount && sPbrShadowLightRequests[slot].valid &&
+          sPbrShadowLightRequests[slot].shadowType != AURORA_PBR_SHADOW_TYPE_NONE &&
+          sPbrShadowLightRequests[slot].shadowType != AURORA_PBR_SHADOW_TYPE_POINT;
+      const Mat3x4<float> viewFromSource =
+          sProbeCamera.valid ? pbr_mul_affine(sPbrShadowSlotViewFromWorld[slot], sProbeCamera.sourceInvView)
+                             : identityView;
+      const Mat4x4<float>& projection = sPbrShadowSlotProjection[slot];
+
+      auto& descriptor = descriptors[slot];
+      descriptor.viewFromSource0 = {viewFromSource.m0[0], viewFromSource.m0[1], viewFromSource.m0[2],
+                                    viewFromSource.m0[3]};
+      descriptor.viewFromSource1 = {viewFromSource.m1[0], viewFromSource.m1[1], viewFromSource.m1[2],
+                                    viewFromSource.m1[3]};
+      descriptor.viewFromSource2 = {viewFromSource.m2[0], viewFromSource.m2[1], viewFromSource.m2[2],
+                                    viewFromSource.m2[3]};
+      descriptor.projection0 = {projection.m0[0], projection.m0[1], projection.m0[2], projection.m0[3]};
+      descriptor.projection1 = {projection.m1[0], projection.m1[1], projection.m1[2], projection.m1[3]};
+      descriptor.projection2 = {projection.m2[0], projection.m2[1], projection.m2[2], projection.m2[3]};
+      descriptor.projection3 = {projection.m3[0], projection.m3[1], projection.m3[2], projection.m3[3]};
+      const bool localProjected =
+          requestValid && sPbrShadowLightRequests[slot].shadowType == AURORA_PBR_SHADOW_TYPE_LOCAL_PROJECTED;
+      const float projectionFade = localProjected ? PbrShadowLocalProjectionFade : PbrShadowDirectionalProjectionFade;
+      descriptor.params = {requestValid && slotCaptured ? 1.0f : 0.0f, static_cast<float>(slot), projectionFade,
+                           static_cast<float>(requestValid ? sPbrShadowLightRequests[slot].shadowType
+                                                           : AURORA_PBR_SHADOW_TYPE_NONE)};
+    }
+
+    const u32 byteSize = slotCount * static_cast<u32>(sizeof(PbrShadowDescriptor));
+    const auto range = gfx::push_storage(reinterpret_cast<const uint8_t*>(descriptors.data()), byteSize);
+    sPbrShadowDescriptorStorageFrame = frame;
+    sPbrShadowDescriptorStorageOffset = range.offset;
+    sPbrShadowDescriptorStorageSize = byteSize;
+  }
+
+  return {
+      static_cast<float>(sPbrShadowDescriptorStorageOffset),
+      static_cast<float>(sPbrShadowDescriptorStorageSize),
+      static_cast<float>(sizeof(PbrShadowDescriptor)),
+      static_cast<float>(slotCount),
+  };
+}
+
+Mat3x4<float> pbr_shadow_view_from_source() noexcept {
+  using namespace pbr_internal;
+  if (!sPbrShadowMapMatrixValid || !sProbeCamera.valid) {
+    return {
+        {1.0f, 0.0f, 0.0f, 0.0f},
+        {0.0f, 1.0f, 0.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f, 0.0f},
+    };
+  }
+  return pbr_mul_affine(sPbrShadowViewFromWorld, sProbeCamera.sourceInvView);
+}
+
+Mat4x4<float> pbr_shadow_projection() noexcept { return pbr_internal::sPbrShadowProjection; }
+
+std::array<Mat3x4<float>, 4> pbr_shadow_view_from_source_slots() noexcept {
+  using namespace pbr_internal;
+  std::array<Mat3x4<float>, 4> slots{};
+  const Mat3x4<float> identity{
+      {1.0f, 0.0f, 0.0f, 0.0f},
+      {0.0f, 1.0f, 0.0f, 0.0f},
+      {0.0f, 0.0f, 1.0f, 0.0f},
+  };
+  for (u32 slot = 0; slot < slots.size(); ++slot) {
+    slots[slot] = sProbeCamera.valid ? pbr_mul_affine(sPbrShadowSlotViewFromWorld[slot], sProbeCamera.sourceInvView)
+                                     : identity;
+  }
+  return slots;
+}
+
+std::array<Mat4x4<float>, 4> pbr_shadow_projection_slots() noexcept {
+  std::array<Mat4x4<float>, 4> slots{};
+  for (u32 slot = 0; slot < slots.size(); ++slot) {
+    slots[slot] = pbr_internal::sPbrShadowSlotProjection[slot];
+  }
+  return slots;
+}
+
+const wgpu::TextureView& pbr_shadow_receiver_view(uint32_t slot) noexcept {
+  using namespace pbr_internal;
+  ensure_pbr_shadow_fallback_resources();
+  if (sPbrShadowMapAvailable && sPbrShadowMapResourcesReady && slot < PbrShadowAtlasSlotCount &&
+      sPbrShadowMapSlotViews[slot]) {
+    return sPbrShadowMapSlotViews[slot];
+  }
+  return sPbrShadowFallbackView;
+}
+
+const wgpu::TextureView& pbr_shadow_receiver_view() noexcept {
+  using namespace pbr_internal;
+  const u32 slot = sPbrShadowLightRequest.valid ? std::min(sPbrShadowLightRequest.atlasSlot, PbrShadowAtlasSlotCount - 1)
+                                                : 0;
+  return pbr_shadow_receiver_view(slot);
+}
+
+const wgpu::Sampler& pbr_shadow_receiver_sampler() noexcept {
+  using namespace pbr_internal;
+  ensure_pbr_shadow_fallback_resources();
+  return sPbrShadowMapSampler;
 }
 
 void configure_pbr_material_override(ShaderConfig& config, const ShaderInfo& info) noexcept {
@@ -2233,6 +2970,8 @@ void aurora_set_pbr_enhanced_lights(const AuroraPbrEnhancedLight* lights, uint32
                                         std::max(light.radius, 1.0f)};
       pbrEnhancedLights[i].colorIntensity = {std::max(light.color[0], 0.0f), std::max(light.color[1], 0.0f),
                                              std::max(light.color[2], 0.0f), std::max(light.intensity, 0.0f)};
+      pbrEnhancedLights[i].dirType = {0.0f, 0.0f, 0.0f, static_cast<float>(AURORA_SCENE_LIGHT_POINT)};
+      pbrEnhancedLights[i].shadowParams = {};
     } else {
       pbrEnhancedLights[i] = {};
     }
@@ -2256,6 +2995,9 @@ void aurora_set_scene_lights(const AuroraSceneLight* lights, uint32_t light_coun
                                         std::max(light.radius, 1.0f)};
       pbrEnhancedLights[i].colorIntensity = {std::max(light.color[0], 0.0f), std::max(light.color[1], 0.0f),
                                              std::max(light.color[2], 0.0f), std::max(light.intensity, 0.0f)};
+      pbrEnhancedLights[i].dirType = {light.direction[0], light.direction[1], light.direction[2],
+                                      static_cast<float>(light.type)};
+      pbrEnhancedLights[i].shadowParams = pbr_internal::pbr_scene_light_shadow_params(light);
     } else {
       pbrEnhancedLights[i] = {};
     }
@@ -2371,12 +3113,69 @@ void aurora_set_pbr_shadow_map_params(bool enabled, uint32_t size, float strengt
   const u32 clampedSize = std::clamp<u32>(size, PbrShadowMapMinSize, PbrShadowMapMaxSize);
   if (sPbrShadowMapSize != clampedSize) {
     sPbrShadowMapSize = clampedSize;
+    sPbrShadowMapResourcesReady = false;
+    sPbrShadowMapTexture = {};
+    sPbrShadowMapView = {};
+    sPbrShadowMapSlotViews = {};
     sPbrShadowMapAvailable = false;
+    sPbrShadowMapDrawCount = 0;
+    sPbrShadowMapSlotDrawCounts = {};
+    sPbrShadowMapCapturedSlotCount = 0;
+    sPbrShadowMapCapturedSlotMask = 0;
+    sPbrShadowMapPendingSlotMask = pbr_shadow_active_slot_mask();
+    sPbrShadowMapRefreshPending = true;
+    sPbrShadowFailedCaptureFrames = 0;
   }
 
+  const bool wasEnabled = sPbrShadowMapEnabled;
   sPbrShadowMapEnabled = enabled;
+  if (!enabled) {
+    sPbrShadowMapAvailable = false;
+    sPbrShadowMapDrawCount = 0;
+    sPbrShadowMapSlotDrawCounts = {};
+    sPbrShadowMapCapturedSlotCount = 0;
+    sPbrShadowMapCapturedSlotMask = 0;
+    sPbrShadowMapPendingSlotMask = 0;
+    sPbrShadowMapRefreshPending = false;
+    sPbrShadowFailedCaptureFrames = 0;
+  } else if (!wasEnabled) {
+    sPbrShadowMapPendingSlotMask = pbr_shadow_active_slot_mask();
+    sPbrShadowMapRefreshPending = true;
+    sPbrShadowFailedCaptureFrames = 0;
+  }
   sPbrShadowMapStrength = std::clamp(strength, 0.0f, 1.0f);
   sPbrShadowMapBias = std::clamp(bias, 0.0f, 0.05f);
+  ensure_pbr_shadow_map_resources();
+  g_gxState.stateDirty = true;
+}
+
+void aurora_set_pbr_shadow_map_budget(uint32_t max_active_maps, uint32_t maps_per_frame) {
+  using namespace aurora::gx;
+  using namespace aurora::gx::pbr_internal;
+
+  const u32 clampedMaxActive = std::clamp<u32>(max_active_maps, 1u, PbrShadowAtlasSlotCount);
+  const u32 clampedPerFrame = std::clamp<u32>(maps_per_frame, 1u, PbrShadowAtlasSlotCount);
+  if (sPbrShadowMapMaxActiveSlots == clampedMaxActive && sPbrShadowMapSlotsPerFrame == clampedPerFrame) {
+    return;
+  }
+
+  sPbrShadowMapMaxActiveSlots = clampedMaxActive;
+  sPbrShadowMapSlotsPerFrame = clampedPerFrame;
+  if (sPbrShadowLightRequestCount > clampedMaxActive) {
+    sPbrShadowLightRequestCount = clampedMaxActive;
+  }
+
+  const u32 activeMask = pbr_shadow_active_slot_mask();
+  sPbrShadowMapCapturedSlotMask &= activeMask;
+  sPbrShadowMapCapturedSlotCount = pbr_count_bits(sPbrShadowMapCapturedSlotMask);
+  if (sPbrShadowMapEnabled && sPbrShadowLightRequestCount > 0) {
+    sPbrShadowMapPendingSlotMask = activeMask & ~sPbrShadowMapCapturedSlotMask;
+    sPbrShadowMapRefreshPending = sPbrShadowMapPendingSlotMask != 0;
+  } else {
+    sPbrShadowMapPendingSlotMask = 0;
+    sPbrShadowMapRefreshPending = false;
+  }
+  sPbrShadowDescriptorStorageFrame = UINT32_MAX;
   g_gxState.stateDirty = true;
 }
 
@@ -2384,29 +3183,222 @@ void aurora_set_pbr_shadow_light_request(const AuroraPbrShadowLightRequest* requ
   using namespace aurora::gx;
   using namespace aurora::gx::pbr_internal;
 
-  sPbrShadowLightRequest = request != nullptr ? *request : AuroraPbrShadowLightRequest{};
-  sPbrShadowLightRequest.valid = request != nullptr && request->valid;
+  if (request == nullptr || !request->valid || !pbr_shadow_request_finite(*request)) {
+    sPbrShadowLightRequestCount = 0;
+    sPbrShadowLightRequests = {};
+    if (sPbrShadowLightRequest.valid || sPbrShadowMapAvailable || sPbrShadowMapRefreshPending ||
+        sPbrShadowMapDrawCount != 0 || sPbrShadowMapCapturedSlotCount != 0 || sPbrShadowMapCapturedSlotMask != 0) {
+      sPbrShadowLightRequest = {};
+      sPbrShadowMapAvailable = false;
+      sPbrShadowMapDrawCount = 0;
+      sPbrShadowMapSlotDrawCounts = {};
+      sPbrShadowMapCapturedSlotCount = 0;
+      sPbrShadowMapCapturedSlotMask = 0;
+      sPbrShadowMapPendingSlotMask = 0;
+      sPbrShadowMapRefreshPending = false;
+      sPbrShadowFailedCaptureFrames = 0;
+      pbr_set_shadow_identity_matrix();
+      g_gxState.stateDirty = true;
+    }
+    return;
+  }
+
+  if (!pbr_shadow_request_needs_refresh(*request)) {
+    if (!sPbrShadowMapAvailable && !sPbrShadowMapRefreshPending) {
+      ++sPbrShadowFailedCaptureFrames;
+      if (sPbrShadowFailedCaptureFrames >= PbrShadowFailedCaptureRetryFrames) {
+        sPbrShadowFailedCaptureFrames = 0;
+        sPbrShadowMapPendingSlotMask = pbr_shadow_active_slot_mask();
+        sPbrShadowMapRefreshPending = true;
+      }
+    }
+    return;
+  }
+
+  sPbrShadowLightRequest = *request;
+  sPbrShadowLightRequest.valid = true;
+  sPbrShadowLightRequest.atlasSlot = 0;
+  sPbrShadowLightRequestCount = 1;
+  sPbrShadowLightRequests = {};
+  sPbrShadowLightRequests[0] = sPbrShadowLightRequest;
+  sPbrShadowMapAvailable = false;
+  sPbrShadowMapRefreshPending = true;
+  sPbrShadowMapCapturedSlotCount = 0;
+  sPbrShadowMapCapturedSlotMask = 0;
+  sPbrShadowMapSlotDrawCounts = {};
+  sPbrShadowMapPendingSlotMask = 1u;
+  sPbrShadowFailedCaptureFrames = 0;
+  pbr_build_shadow_matrix_from_request(sPbrShadowLightRequest);
+  g_gxState.stateDirty = true;
+}
+
+void aurora_set_pbr_shadow_light_requests(const AuroraPbrShadowLightRequest* requests, uint32_t request_count) {
+  using namespace aurora::gx;
+  using namespace aurora::gx::pbr_internal;
+
+  std::array<AuroraPbrShadowLightRequest, PbrShadowRequestMaxCount> incomingRequests{};
+  std::array<bool, PbrShadowRequestMaxCount> incomingUsed{};
+  u32 incomingCount = 0;
+  const u32 requestLimit = pbr_shadow_active_slot_limit();
+  if (requests != nullptr) {
+    for (u32 i = 0; i < request_count && incomingCount < PbrShadowRequestMaxCount && incomingCount < requestLimit; ++i) {
+      AuroraPbrShadowLightRequest request = requests[i];
+      if (!request.valid || !pbr_shadow_request_finite(request) ||
+          request.shadowType == AURORA_PBR_SHADOW_TYPE_NONE) {
+        continue;
+      }
+
+      request.atlasSlot = incomingCount;
+      incomingRequests[incomingCount++] = request;
+    }
+  }
+
+  std::array<AuroraPbrShadowLightRequest, PbrShadowRequestMaxCount> validRequests{};
+  u32 validCount = 0;
+  const auto appendRequest = [&](AuroraPbrShadowLightRequest request) {
+    if (validCount >= requestLimit || validCount >= PbrShadowRequestMaxCount) {
+      return false;
+    }
+    request.atlasSlot = validCount;
+    validRequests[validCount++] = request;
+    return true;
+  };
+
+  const u32 previousCount = pbr_shadow_active_slot_count();
+  for (u32 previousSlot = 0; previousSlot < previousCount && validCount < requestLimit; ++previousSlot) {
+    const AuroraPbrShadowLightRequest& previousRequest = sPbrShadowLightRequests[previousSlot];
+    if (!previousRequest.valid) {
+      continue;
+    }
+    for (u32 incomingSlot = 0; incomingSlot < incomingCount; ++incomingSlot) {
+      if (incomingUsed[incomingSlot]) {
+        continue;
+      }
+      if (!pbr_shadow_request_same_light(previousRequest, incomingRequests[incomingSlot])) {
+        continue;
+      }
+      incomingUsed[incomingSlot] = appendRequest(incomingRequests[incomingSlot]);
+      break;
+    }
+  }
+
+  for (u32 incomingSlot = 0; incomingSlot < incomingCount && validCount < requestLimit; ++incomingSlot) {
+    if (incomingUsed[incomingSlot]) {
+      continue;
+    }
+    appendRequest(incomingRequests[incomingSlot]);
+  }
+
+  const bool needsRefresh = pbr_shadow_request_list_needs_refresh(validRequests, validCount);
+  sPbrShadowLightRequests = validRequests;
+  sPbrShadowLightRequestCount = validCount;
+
+  const AuroraPbrShadowLightRequest* activeRequest = pbr_active_shadow_request();
+  if (activeRequest == nullptr) {
+    aurora_set_pbr_shadow_light_request(nullptr);
+    return;
+  }
+
+  if (!needsRefresh) {
+    if (!sPbrShadowMapAvailable && !sPbrShadowMapRefreshPending) {
+      ++sPbrShadowFailedCaptureFrames;
+      if (sPbrShadowFailedCaptureFrames >= PbrShadowFailedCaptureRetryFrames) {
+        sPbrShadowFailedCaptureFrames = 0;
+        sPbrShadowMapPendingSlotMask = pbr_shadow_active_slot_mask();
+        sPbrShadowMapRefreshPending = true;
+      }
+    }
+    return;
+  }
+
+  const AuroraPbrShadowLightRequest activeRequestCopy = *activeRequest;
+  for (u32 i = 0; i < validCount; ++i) {
+    pbr_build_shadow_matrix_from_request(sPbrShadowLightRequests[i]);
+  }
+  sPbrShadowLightRequest = activeRequestCopy;
+  sPbrShadowMapAvailable = false;
+  sPbrShadowMapRefreshPending = true;
+  sPbrShadowMapCapturedSlotCount = 0;
+  sPbrShadowMapCapturedSlotMask = 0;
+  sPbrShadowMapSlotDrawCounts = {};
+  sPbrShadowMapPendingSlotMask = pbr_shadow_slot_mask(validCount);
+  sPbrShadowFailedCaptureFrames = 0;
+  pbr_build_shadow_matrix_from_request(sPbrShadowLightRequest);
   g_gxState.stateDirty = true;
 }
 
 void aurora_set_pbr_shadow_map_matrix(const float* light_view_projection_4x4) {
-  (void)light_view_projection_4x4;
+  using namespace aurora::gx;
+  using namespace aurora::gx::pbr_internal;
+
+  if (light_view_projection_4x4 == nullptr) {
+    pbr_build_shadow_matrix_from_request(sPbrShadowLightRequest);
+    return;
+  }
+
+  bool finite = true;
+  for (u32 i = 0; i < sPbrShadowLightViewProjection.size(); ++i) {
+    const float value = light_view_projection_4x4[i];
+    sPbrShadowLightViewProjection[i] = value;
+    finite = finite && pbr_finite(value);
+  }
+  sPbrShadowMapMatrixValid = finite;
+  if (!finite) {
+    pbr_set_shadow_identity_matrix();
+  }
+  g_gxState.stateDirty = true;
 }
 
 const AuroraPbrShadowMapStatus* aurora_get_pbr_shadow_map_status() {
   using namespace aurora::gx::pbr_internal;
 
   static AuroraPbrShadowMapStatus status{};
+  ensure_pbr_shadow_map_resources();
   status = {};
   status.enabled = sPbrShadowMapEnabled;
-  status.resourcesReady = false;
+  status.resourcesReady = sPbrShadowMapResourcesReady;
   status.mapAvailable = sPbrShadowMapAvailable;
   status.lightRequestValid = sPbrShadowLightRequest.valid;
+  status.matrixValid = sPbrShadowMapMatrixValid;
+  status.casterPassReady = sPbrShadowMapEnabled && sPbrShadowCasterPassReady;
+  status.receiverSamplingReady = sPbrShadowMapEnabled && sPbrShadowReceiverSamplingReady;
+  status.refreshPending = sPbrShadowMapRefreshPending;
   status.size = sPbrShadowMapSize;
+  status.drawCount = sPbrShadowMapDrawCount;
+  status.requestCount = sPbrShadowLightRequestCount;
+  status.requestMask = pbr_shadow_slot_mask(sPbrShadowLightRequestCount);
+  status.atlasSlotCount = PbrShadowAtlasSlotCount;
+  status.maxActiveSlots = sPbrShadowMapMaxActiveSlots;
+  status.slotsPerFrame = sPbrShadowMapSlotsPerFrame;
+  status.activeAtlasSlot = sPbrShadowLightRequest.valid ? sPbrShadowLightRequest.atlasSlot : 0;
+  status.activeShadowType = sPbrShadowLightRequest.valid ? sPbrShadowLightRequest.shadowType
+                                                         : AURORA_PBR_SHADOW_TYPE_NONE;
+  status.capturedSlotCount = sPbrShadowMapCapturedSlotCount;
+  status.capturedSlotMask = sPbrShadowMapCapturedSlotMask;
+  status.pendingSlotMask = sPbrShadowMapPendingSlotMask;
+  std::memcpy(status.slotDrawCounts, sPbrShadowMapSlotDrawCounts.data(), sizeof(status.slotDrawCounts));
   status.strength = sPbrShadowMapStrength;
   status.bias = sPbrShadowMapBias;
+  std::memcpy(status.lightViewProjection, sPbrShadowLightViewProjection.data(),
+              sizeof(status.lightViewProjection));
   status.lightRequest = sPbrShadowLightRequest;
+  std::memcpy(status.requests, sPbrShadowLightRequests.data(), sizeof(status.requests));
   return &status;
+}
+
+void aurora_request_pbr_shadow_map_refresh() {
+  using namespace aurora::gx;
+  using namespace aurora::gx::pbr_internal;
+
+  if (!sPbrShadowMapEnabled || sPbrShadowLightRequestCount == 0) {
+    return;
+  }
+
+  const u32 activeMask = pbr_shadow_active_slot_mask();
+  sPbrShadowMapPendingSlotMask = activeMask;
+  sPbrShadowMapRefreshPending = sPbrShadowMapPendingSlotMask != 0;
+  sPbrShadowFailedCaptureFrames = 0;
+  g_gxState.stateDirty = true;
 }
 
 void aurora_set_pbr_probe_auto_refresh(bool enabled) {

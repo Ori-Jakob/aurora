@@ -148,6 +148,7 @@ struct RenderPass {
   std::vector<tex_palette_conv::ConvRequest> paletteConvs;
 };
 static std::vector<RenderPass> g_renderPasses;
+static std::vector<RenderPass> g_shadowRenderPasses;
 static std::vector<RenderPass> g_probeRenderPasses;
 static u32 g_currentRenderPass = UINT32_MAX;
 static bool g_pbrProbeCaptureEnabled = true;
@@ -695,11 +696,13 @@ bool begin_frame() {
   return true;
 }
 
+static void append_pbr_shadow_capture_pass();
 static void append_pbr_probe_capture_passes();
 
 void end_frame(const wgpu::CommandEncoder& cmd) {
   ZoneScoped;
   ASSERT(!g_inOffscreen, "end_frame called while offscreen rendering is active");
+  append_pbr_shadow_capture_pass();
   append_pbr_probe_capture_passes();
   g_uniforms.append_zeroes(gx::MaxUniformSize); // Pad the end of the buffer
   uint64_t bufferOffset = 0;
@@ -755,6 +758,107 @@ static Range clone_probe_uniform(const gx::DrawData& draw, uint32_t face) {
   std::memcpy(buf.data(), g_uniforms.data() + draw.uniformRange.offset, draw.uniformRange.size);
   gx::patch_pbr_probe_uniform(buf.data(), draw.probeUniformPatch, face);
   return range;
+}
+
+static Range clone_shadow_uniform(const gx::DrawData& draw) {
+  auto [buf, range] = map_uniform(draw.uniformRange.size);
+  std::memcpy(buf.data(), g_uniforms.data() + draw.uniformRange.offset, draw.uniformRange.size);
+  gx::patch_pbr_shadow_uniform(buf.data(), draw.probeUniformPatch);
+  return range;
+}
+
+static void append_pbr_shadow_capture_pass() {
+  const bool captureRequested = gx::pbr_shadow_map_capture_requested();
+  if (!captureRequested || g_renderPasses.empty()) {
+    if (captureRequested) {
+      gx::finish_pbr_shadow_map_capture(0, 0);
+    }
+    return;
+  }
+
+  const uint32_t slotCount = gx::pbr_shadow_map_capture_slot_count();
+  if (slotCount == 0) {
+    gx::finish_pbr_shadow_map_capture(0, 0);
+    return;
+  }
+
+  std::vector<const gx::DrawData*> shadowDraws;
+  for (const auto& renderPass : g_renderPasses) {
+    if (renderPass.msaaSamples != webgpu::g_graphicsConfig.msaaSamples ||
+        renderPass.targetSize.width != webgpu::g_frameBuffer.size.width ||
+        renderPass.targetSize.height != webgpu::g_frameBuffer.size.height) {
+      continue;
+    }
+    for (const auto& cmd : renderPass.commands) {
+      if (cmd.type == CommandType::Draw && cmd.data.draw.type == ShaderType::GX && cmd.data.draw.gx.shadowCaster &&
+          cmd.data.draw.gx.shadowPipeline != 0 && cmd.data.draw.gx.probeUniformPatch.eligible) {
+        shadowDraws.push_back(&cmd.data.draw.gx);
+      }
+    }
+  }
+
+  if (shadowDraws.empty()) {
+    gx::finish_pbr_shadow_map_capture(0, 0);
+    return;
+  }
+
+  const uint32_t size = gx::pbr_shadow_map_size();
+  const uint32_t slotBudget = gx::pbr_shadow_map_capture_slots_per_frame();
+  uint32_t capturedSlotCount = 0;
+  uint32_t capturedSlotMask = 0;
+  uint32_t drawCount = 0;
+  for (uint32_t slot = 0; slot < slotCount && capturedSlotCount < slotBudget; ++slot) {
+    if (!gx::pbr_shadow_map_capture_slot_requested(slot)) {
+      continue;
+    }
+    if (!gx::begin_pbr_shadow_map_capture_slot(slot)) {
+      continue;
+    }
+
+    RenderPass shadowPass{
+        .depthView = gx::pbr_shadow_map_depth_slot_view(slot),
+        .targetSize = {size, size, 1},
+        .msaaSamples = 1,
+        .clearDepthValue = gx::clear_depth_value(),
+        .clearColor = false,
+        .clearDepth = true,
+    };
+    shadowPass.commands.push_back({
+        .type = CommandType::SetViewport,
+        .data =
+            {
+                .setViewport =
+                    {
+                        .left = 0.0f,
+                        .top = 0.0f,
+                        .width = static_cast<float>(size),
+                        .height = static_cast<float>(size),
+                        .znear = 0.0f,
+                        .zfar = 1.0f,
+                    },
+            },
+    });
+    shadowPass.commands.push_back({
+        .type = CommandType::SetScissor,
+        .data = {.setScissor = {0, 0, static_cast<int32_t>(size), static_cast<int32_t>(size)}},
+    });
+    for (const auto* draw : shadowDraws) {
+      auto shadowDraw = *draw;
+      shadowDraw.pipeline = shadowDraw.shadowPipeline;
+      shadowDraw.uniformRange = clone_shadow_uniform(*draw);
+      shadowDraw.bindGroups.textureBindGroup = draw->bindGroups.shadowTextureBindGroup;
+      shadowPass.commands.push_back({
+          .type = CommandType::Draw,
+          .data = {.draw = ShaderDrawCommand{.type = ShaderType::GX, .gx = shadowDraw}},
+      });
+    }
+
+    drawCount += static_cast<uint32_t>(shadowDraws.size());
+    ++capturedSlotCount;
+    capturedSlotMask |= 1u << slot;
+    g_shadowRenderPasses.emplace_back(std::move(shadowPass));
+  }
+  gx::finish_pbr_shadow_map_capture(drawCount, capturedSlotCount, capturedSlotMask);
 }
 
 static void append_pbr_probe_capture_passes() {
@@ -850,6 +954,29 @@ static void render_pass_commands(const wgpu::RenderPassEncoder& pass, const Rend
 
 void render(wgpu::CommandEncoder& cmd) {
   ZoneScoped;
+  for (u32 i = 0; i < g_shadowRenderPasses.size(); ++i) {
+    const auto& passInfo = g_shadowRenderPasses[i];
+    const wgpu::RenderPassDepthStencilAttachment depthStencilAttachment{
+        .view = passInfo.depthView,
+        .depthLoadOp = passInfo.clearDepth ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
+        .depthStoreOp = wgpu::StoreOp::Store,
+        .depthClearValue = passInfo.clearDepthValue,
+    };
+    const auto label = fmt::format("PBR shadow map capture slot {}", i);
+    const wgpu::RenderPassDescriptor renderPassDescriptor{
+        .label = label.c_str(),
+        .colorAttachmentCount = 0,
+        .colorAttachments = nullptr,
+        .depthStencilAttachment = &depthStencilAttachment,
+    };
+    auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
+    pass.PushDebugGroup(label.c_str());
+    pass.InsertDebugMarker(label.c_str());
+    render_pass_commands(pass, passInfo);
+    pass.PopDebugGroup();
+    pass.End();
+  }
+
   for (u32 i = 0; i < g_renderPasses.size(); ++i) {
     const auto& passInfo = g_renderPasses[i];
     for (const auto& conv : passInfo.paletteConvs) {
@@ -978,6 +1105,7 @@ void render(wgpu::CommandEncoder& cmd) {
   gx::run_pbr_probe_filter(cmd);
 
   g_renderPasses.clear();
+  g_shadowRenderPasses.clear();
   g_probeRenderPasses.clear();
   expire_cached_bind_groups();
 

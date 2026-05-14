@@ -896,6 +896,9 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
   const bool pbrHasNormalMap =
       (config.pbrFlags & (PbrMaterialEnabled | PbrMaterialHasNormal)) == (PbrMaterialEnabled | PbrMaterialHasNormal);
   const bool usePbrNbtNormals = pbrHasNormalMap && has_nbt_normals(config);
+  const bool usesPbrMaterial = (config.pbrFlags & PbrMaterialEnabled) != 0;
+  const bool useModernGxSupplement = !usesPbrMaterial && config.lineMode == 0 && info.lightingEnabled;
+  const bool usesModernLightingInputs = usesPbrMaterial || useModernGxSupplement;
 
   // Load points for line/point expansion
   std::string_view vidxAttr = "vidx"sv;
@@ -1007,7 +1010,7 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
         "\n    let mv_tangent = select(tangent_tmp, normalize(tangent_tmp), dot(tangent_tmp, tangent_tmp) > 1e-10);",
         vtx_nbt_attr(config, 1), vtx_nbt_attr(config, 2));
   }
-  if ((config.pbrFlags & PbrMaterialEnabled) != 0 && !(info.lightingEnabled && UsePerPixelLighting)) {
+  if (usesModernLightingInputs && !(info.lightingEnabled && UsePerPixelLighting)) {
     vtxOutAttrs += fmt::format("\n    @location({}) mv_pos: vec3f,", vtxOutIdx++);
     vtxOutAttrs += fmt::format("\n    @location({}) mv_nrm: vec3f,", vtxOutIdx++);
     vtxXfrAttrs += "\n    out.mv_pos = mv_pos;";
@@ -1510,7 +1513,7 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
     }
     if (hasPbrRmaos) {
       fragmentFn += fmt::format(R"""(
-    let pbr_rmaos_sample = textureSampleBias(pbr_rmaos, pbr_rmaos_samp, pbr_uv, {});
+    let pbr_rmaos_sample = textureSampleBias(pbr_rmaos, pbr_material_samp, pbr_uv, {});
     pbr_roughness = clamp(pbr_rmaos_sample.r, 0.04, 1.0);
     pbr_metallic = clamp(pbr_rmaos_sample.g, 0.0, 1.0);
     pbr_ao = clamp(pbr_rmaos_sample.b, 0.0, 1.0);
@@ -1519,25 +1522,25 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
     }
     if (hasPbrRoughness) {
       fragmentFn += fmt::format(
-          "\n    pbr_roughness = clamp(textureSampleBias(pbr_roughness_map, pbr_roughness_map_samp, pbr_uv, "
+          "\n    pbr_roughness = clamp(textureSampleBias(pbr_roughness_map, pbr_material_samp, pbr_uv, "
           "{}).r, 0.04, 1.0);",
           pbrMapBias);
     }
     if (hasPbrMetallic) {
       fragmentFn += fmt::format(
-          "\n    pbr_metallic = clamp(textureSampleBias(pbr_metallic_map, pbr_metallic_map_samp, pbr_uv, "
+          "\n    pbr_metallic = clamp(textureSampleBias(pbr_metallic_map, pbr_material_samp, pbr_uv, "
           "{}).r, 0.0, 1.0);",
           pbrMapBias);
     }
     if (hasPbrAo) {
       fragmentFn += fmt::format(
-          "\n    pbr_ao = clamp(textureSampleBias(pbr_ao_map, pbr_ao_map_samp, pbr_uv, {}).r, "
+          "\n    pbr_ao = clamp(textureSampleBias(pbr_ao_map, pbr_material_samp, pbr_uv, {}).r, "
           "0.0, 1.0);",
           pbrMapBias);
     }
     if (hasPbrSpecular) {
       fragmentFn += fmt::format(
-          "\n    pbr_specular = clamp(textureSampleBias(pbr_specular_map, pbr_specular_map_samp, pbr_uv, "
+          "\n    pbr_specular = clamp(textureSampleBias(pbr_specular_map, pbr_material_samp, pbr_uv, "
           "{}).r, 0.0, 1.0);",
           pbrMapBias);
     }
@@ -1551,7 +1554,7 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
     let pbr_duv2 = dpdy(pbr_uv);)""";
       }
       fragmentFn += fmt::format(R"""(
-    let pbr_normal_raw = textureSampleBias(pbr_normal, pbr_normal_samp, pbr_uv, {}).xyz * 2.0 - vec3f(1.0);
+    let pbr_normal_raw = textureSampleBias(pbr_normal, pbr_material_samp, pbr_uv, {}).xyz * 2.0 - vec3f(1.0);
     let pbr_normal_scaled = vec3f(
       pbr_normal_raw.x * ubuf.pbr_normal_params.x,
       pbr_normal_raw.y * ubuf.pbr_normal_params.x * ubuf.pbr_normal_params.y,
@@ -1605,7 +1608,9 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
     let pbr_dynamic_gi_wrap = clamp(ubuf.pbr_normal_params.w, 0.0, 1.0);
     let pbr_dynamic_gi_albedo = clamp(ubuf.pbr_indirect_occlusion.w, 0.0, 1.0);
     let pbr_dynamic_gi_bounce_color = mix(vec3f(1.0), pbr_albedo.rgb, vec3f(pbr_dynamic_gi_albedo));
-    let pbr_enhanced_stride = max(u32(ubuf.pbr_enhanced_storage.z + 0.5), 32u);
+    var pbr_shadow_visibility = pbr_sample_shadow_visibility(in.mv_pos, 0.0);
+    let pbr_direct_shadow = mix(1.0, pbr_shadow_visibility, clamp(ubuf.pbr_shadow_params.y, 0.0, 1.0));
+    let pbr_enhanced_stride = max(u32(ubuf.pbr_enhanced_storage.z + 0.5), 64u);
     let pbr_enhanced_count = min(u32(ubuf.pbr_enhanced_params.y + 0.5),
                                  u32(ubuf.pbr_enhanced_storage.y / f32(pbr_enhanced_stride)));
     let pbr_enhanced_base = u32(ubuf.pbr_enhanced_storage.x + 0.5);
@@ -1613,16 +1618,21 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
     if (pbr_use_enhanced_lights) {
       let pbr_use_inverse_square = ubuf.pbr_enhanced_params.z > 0.5;
       for (var i = 0u; i < pbr_enhanced_count; i++) {
-        let pbr_light = pbr_load_enhanced_light(pbr_enhanced_base + i * pbr_enhanced_stride);
-        var pbr_l = pbr_light.pos_radius.xyz - in.mv_pos;
-        let pbr_dist2 = dot(pbr_l, pbr_l);
+      let pbr_light = pbr_load_enhanced_light(pbr_enhanced_base + i * pbr_enhanced_stride);
+        let pbr_point_vec = pbr_light.pos_radius.xyz - in.mv_pos;
+        let pbr_dist2 = dot(pbr_point_vec, pbr_point_vec);
         let pbr_dist = sqrt(pbr_dist2);
-        pbr_l = pbr_l / max(pbr_dist, 1e-7);
+        let pbr_point_l = pbr_point_vec / max(pbr_dist, 1e-7);
+        let pbr_dir_len = length(pbr_light.dir_type.xyz);
+        let pbr_dir_l = pbr_light.dir_type.xyz / max(pbr_dir_len, 1e-7);
+        let pbr_is_directional = pbr_light.dir_type.w > 0.5;
+        let pbr_l = select(pbr_point_l, pbr_dir_l, pbr_is_directional);
         let pbr_radius = max(pbr_light.pos_radius.w, 1.0);
         let pbr_range = max(1.0 - pbr_dist / pbr_radius, 0.0);
         let pbr_range_fade = pbr_range * pbr_range;
-        let pbr_inverse_square = pbr_range_fade / max(pbr_dist2 / (pbr_radius * pbr_radius), 0.01);
-        let pbr_light_attn = select(pbr_range_fade, pbr_inverse_square, pbr_use_inverse_square);
+        let pbr_inverse_square = pbr_range_fade / max(pbr_dist2 / (pbr_radius * pbr_radius), 0.25);
+        let pbr_point_attn = select(pbr_range_fade, pbr_inverse_square, pbr_use_inverse_square);
+        let pbr_light_attn = select(pbr_point_attn, 1.0, pbr_is_directional);
         let pbr_ndotl = max(dot(pbr_n, pbr_l), 0.0);
         let pbr_h = normalize(pbr_l + pbr_v);
         let pbr_ndoth = max(dot(pbr_n, pbr_h), 0.0);
@@ -1638,8 +1648,14 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
         let pbr_light_rgb =
           max(pbr_light.color_intensity.rgb * pbr_light.color_intensity.a * pbr_light_attn *
               ubuf.pbr_enhanced_params.w, vec3f(0.0));
-        pbr_direct_diffuse += pbr_diffuse_color * pbr_ndotl * pbr_light_rgb * ubuf.pbr_scales.x;
-        pbr_direct_specular += pbr_spec * pbr_ndotl * pbr_light_rgb * ubuf.pbr_scales.y;
+        let pbr_light_shadow_visibility =
+          select(1.0, pbr_sample_shadow_visibility(in.mv_pos, pbr_light.shadow_params.y),
+                 pbr_light.shadow_params.x > 0.5);
+        let pbr_light_shadow =
+          mix(1.0, pbr_light_shadow_visibility, clamp(ubuf.pbr_shadow_params.y, 0.0, 1.0));
+        pbr_direct_diffuse +=
+          pbr_diffuse_color * 0.318309886 * pbr_ndotl * pbr_light_rgb * ubuf.pbr_scales.x * pbr_light_shadow;
+        pbr_direct_specular += pbr_spec * pbr_ndotl * pbr_light_rgb * ubuf.pbr_scales.y * pbr_light_shadow;
         let pbr_gi_back_lobe = max(dot(pbr_n, -pbr_l), 0.0);
         let pbr_gi_wrap_lobe = clamp(dot(pbr_n, pbr_l) * 0.5 + 0.5, 0.0, 1.0);
         let pbr_gi_lobe = mix(pbr_gi_back_lobe, pbr_gi_wrap_lobe, pbr_dynamic_gi_wrap);
@@ -1707,7 +1723,7 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
                   (pbr_ndotv / (pbr_ndotv * (1.0 - pbr_k) + pbr_k));
       let pbr_spec = pbr_D * pbr_G * pbr_fresnel * pbr_specular / (4.0 * pbr_ndotl * pbr_ndotv + 0.001);
       let pbr_light_rgb = max(pbr_light.color.rgb * pbr_light_attn, vec3f(0.0));
-      pbr_direct_diffuse += pbr_diffuse_color * pbr_ndotl * pbr_light_rgb * ubuf.pbr_scales.x;
+      pbr_direct_diffuse += pbr_diffuse_color * 0.318309886 * pbr_ndotl * pbr_light_rgb * ubuf.pbr_scales.x;
       pbr_direct_specular += pbr_spec * pbr_ndotl * pbr_light_rgb * ubuf.pbr_scales.y;
       let pbr_gi_back_lobe = max(dot(pbr_n, -pbr_l), 0.0);
       let pbr_gi_wrap_lobe = clamp(dot(pbr_n, pbr_l) * 0.5 + 0.5, 0.0, 1.0);
@@ -1735,7 +1751,7 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
                 (pbr_ndotv / (pbr_ndotv * (1.0 - pbr_k) + pbr_k));
     let pbr_spec = pbr_D * pbr_G * pbr_fresnel * pbr_specular / (4.0 * pbr_ndotl * pbr_ndotv + 0.001);
     let pbr_light_rgb = pbr_env_light;
-    pbr_direct_diffuse = pbr_diffuse_color * pbr_ndotl * pbr_light_rgb * ubuf.pbr_scales.x;
+    pbr_direct_diffuse = pbr_diffuse_color * 0.318309886 * pbr_ndotl * pbr_light_rgb * ubuf.pbr_scales.x;
     pbr_direct_specular = pbr_spec * pbr_ndotl * pbr_light_rgb * ubuf.pbr_scales.y;
     let pbr_gi_back_lobe = max(dot(pbr_n, -pbr_l), 0.0);
     let pbr_gi_wrap_lobe = clamp(dot(pbr_n, pbr_l) * 0.5 + 0.5, 0.0, 1.0);
@@ -1748,6 +1764,10 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
 )""";
     }
     fragmentFn += R"""(
+    if (!pbr_use_enhanced_lights) {
+      pbr_direct_diffuse *= pbr_direct_shadow;
+      pbr_direct_specular *= pbr_direct_shadow;
+    }
     // Fill light (configurable secondary directional light for ambient bounce approximation)
     let pbr_fill_ndotl = max(dot(pbr_n, ubuf.pbr_fill_dir.xyz), 0.0);
     // Ambient specular lifts metals and smooth surfaces in shadow
@@ -1763,20 +1783,20 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
     let pbr_indirect_occlusion = clamp(pbr_material_indirect_occlusion * pbr_horizon_indirect_occlusion, 0.0, 1.0);
     let pbr_indirect_specular_occlusion = mix(1.0, pbr_indirect_occlusion, pbr_indirect_specular_strength);
     let pbr_ibl_blend_factor = clamp(ubuf.pbr_ibl_blend_params.x, 0.0, 1.0);
-    let pbr_ibl_diffuse_env_active = textureSample(pbr_ibl_irradiance, pbr_ibl_irradiance_samp, pbr_n).rgb;
+    let pbr_ibl_diffuse_env_active = textureSample(pbr_ibl_irradiance, pbr_ibl_samp, pbr_n).rgb;
     let pbr_ibl_diffuse_env_from =
-        textureSample(pbr_ibl_blend_irradiance, pbr_ibl_blend_irradiance_samp, pbr_n).rgb;
+        textureSample(pbr_ibl_blend_irradiance, pbr_ibl_samp, pbr_n).rgb;
     let pbr_ibl_diffuse_env = mix(pbr_ibl_diffuse_env_from, pbr_ibl_diffuse_env_active, vec3f(pbr_ibl_blend_factor)) *
                               pbr_env_tint;
     let pbr_reflection = normalize(reflect(-pbr_v, pbr_n));
     let pbr_ibl_spec_env_active = textureSampleLevel(
-        pbr_ibl_prefilter, pbr_ibl_prefilter_samp, pbr_reflection, pbr_roughness * ubuf.pbr_ibl_params.w).rgb;
+        pbr_ibl_prefilter, pbr_ibl_samp, pbr_reflection, pbr_roughness * ubuf.pbr_ibl_params.w).rgb;
     let pbr_ibl_spec_env_from = textureSampleLevel(
-        pbr_ibl_blend_prefilter, pbr_ibl_blend_prefilter_samp, pbr_reflection,
+        pbr_ibl_blend_prefilter, pbr_ibl_samp, pbr_reflection,
         pbr_roughness * ubuf.pbr_ibl_blend_params.y).rgb;
     let pbr_ibl_spec_env =
         mix(pbr_ibl_spec_env_from, pbr_ibl_spec_env_active, vec3f(pbr_ibl_blend_factor)) * pbr_env_tint;
-    let pbr_brdf = textureSample(pbr_ibl_brdf_lut, pbr_ibl_brdf_lut_samp, vec2f(pbr_ndotv, pbr_roughness)).rg;
+    let pbr_brdf = textureSample(pbr_ibl_brdf_lut, pbr_ibl_samp, vec2f(pbr_ndotv, pbr_roughness)).rg;
     let pbr_ibl_diffuse = pbr_diffuse_color * pbr_ibl_diffuse_env * ubuf.pbr_params.x * ubuf.pbr_ibl_params.y;
     let pbr_ibl_specular = pbr_ibl_spec_env * (pbr_f0 * pbr_brdf.x + vec3f(pbr_brdf.y)) *
                            pbr_specular * ubuf.pbr_params.y * ubuf.pbr_ibl_params.z;
@@ -1796,7 +1816,7 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
 )""";
     if (hasPbrEmissive) {
       fragmentFn += fmt::format(
-          "\n    pbr_rgb += textureSampleBias(pbr_emissive, pbr_emissive_samp, pbr_uv, "
+          "\n    pbr_rgb += textureSampleBias(pbr_emissive, pbr_material_samp, pbr_uv, "
           "{}).rgb;",
           pbrMapBias);
     }
@@ -1831,10 +1851,67 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
       pbr_rgb = vec3f(pbr_indirect_occlusion);
     } else if (pbr_debug_mode == 13) {
       pbr_rgb = pbr_dynamic_gi * pbr_indirect_occlusion;
+    } else if (pbr_debug_mode == 14) {
+      pbr_rgb = vec3f(pbr_shadow_visibility);
     })""";
     const std::string pbrAlpha = usePrevAlbedo ? "pbr_albedo.a"s : "pbr_albedo.a * prev.a"s;
     fragmentFn += fmt::format(
         "\n    prev = vec4f(clamp(pbr_rgb, vec3f(0.0), vec3f(1.0)), {});", pbrAlpha);
+  }
+  if (useModernGxSupplement) {
+    fragmentFn += R"""(
+    var gx_modern_shadow_visibility = pbr_sample_shadow_visibility(in.mv_pos, 0.0);
+    let gx_modern_shadow = mix(1.0, gx_modern_shadow_visibility, clamp(ubuf.pbr_shadow_params.y, 0.0, 1.0));
+    var gx_modern_light_accum = vec3f(0.0);
+    var gx_modern_shadow_weight = 0.0;
+    var gx_modern_receiver_shadow_sample = gx_modern_shadow;
+    let gx_modern_stride = max(u32(ubuf.pbr_enhanced_storage.z + 0.5), 64u);
+    let gx_modern_count = min(u32(ubuf.pbr_enhanced_params.y + 0.5),
+                              u32(ubuf.pbr_enhanced_storage.y / f32(gx_modern_stride)));
+    let gx_modern_base = u32(ubuf.pbr_enhanced_storage.x + 0.5);
+    if (ubuf.pbr_enhanced_params.x > 0.5 && gx_modern_count > 0u) {
+      let gx_modern_n = normalize(in.mv_nrm);
+      let gx_modern_use_inverse_square = ubuf.pbr_enhanced_params.z > 0.5;
+      for (var i = 0u; i < gx_modern_count; i++) {
+        let gx_modern_light = pbr_load_enhanced_light(gx_modern_base + i * gx_modern_stride);
+        let gx_modern_point_vec = gx_modern_light.pos_radius.xyz - in.mv_pos;
+        let gx_modern_dist2 = dot(gx_modern_point_vec, gx_modern_point_vec);
+        let gx_modern_dist = sqrt(gx_modern_dist2);
+        let gx_modern_point_l = gx_modern_point_vec / max(gx_modern_dist, 1e-7);
+        let gx_modern_dir_len = length(gx_modern_light.dir_type.xyz);
+        let gx_modern_dir_l = gx_modern_light.dir_type.xyz / max(gx_modern_dir_len, 1e-7);
+        let gx_modern_is_directional = gx_modern_light.dir_type.w > 0.5;
+        let gx_modern_l = select(gx_modern_point_l, gx_modern_dir_l, gx_modern_is_directional);
+        let gx_modern_radius = max(gx_modern_light.pos_radius.w, 1.0);
+        let gx_modern_range = max(1.0 - gx_modern_dist / gx_modern_radius, 0.0);
+        let gx_modern_range_fade = gx_modern_range * gx_modern_range;
+        let gx_modern_inverse_square =
+          gx_modern_range_fade / max(gx_modern_dist2 / (gx_modern_radius * gx_modern_radius), 0.25);
+        let gx_modern_point_attn =
+          select(gx_modern_range_fade, gx_modern_inverse_square, gx_modern_use_inverse_square);
+        let gx_modern_attn = select(gx_modern_point_attn, 1.0, gx_modern_is_directional);
+        let gx_modern_ndotl = max(dot(gx_modern_n, gx_modern_l), 0.0);
+        let gx_modern_light_shadow_visibility =
+          select(1.0, pbr_sample_shadow_visibility(in.mv_pos, gx_modern_light.shadow_params.y),
+                 gx_modern_light.shadow_params.x > 0.5);
+        let gx_modern_light_shadow_factor =
+          mix(1.0, gx_modern_light_shadow_visibility, clamp(ubuf.pbr_shadow_params.y, 0.0, 1.0));
+        let gx_modern_light_shadow =
+          mix(1.0, gx_modern_light_shadow_factor, clamp(gx_modern_light.shadow_params.x, 0.0, 1.0));
+        gx_modern_receiver_shadow_sample = min(gx_modern_receiver_shadow_sample, gx_modern_light_shadow_factor);
+        gx_modern_shadow_weight = max(
+          gx_modern_shadow_weight,
+          clamp(gx_modern_light.shadow_params.x, 0.0, 1.0) * gx_modern_attn * smoothstep(0.05, 0.35, gx_modern_ndotl));
+        gx_modern_light_accum +=
+          max(gx_modern_light.color_intensity.rgb * gx_modern_light.color_intensity.a * gx_modern_attn *
+              gx_modern_ndotl * gx_modern_light_shadow * ubuf.pbr_enhanced_params.w, vec3f(0.0));
+      }
+    }
+    let gx_modern_receiver_shadow =
+      mix(1.0, gx_modern_receiver_shadow_sample, clamp(gx_modern_shadow_weight * 0.55, 0.0, 1.0));
+    let gx_modern_lit = prev.rgb * gx_modern_receiver_shadow + prev.rgb * gx_modern_light_accum * 0.25;
+    prev = vec4f(clamp(gx_modern_lit, vec3f(0.0), vec3f(1.0)), prev.a);
+)""";
   }
   if (info.usesFog) {
     uniformPre +=
@@ -1900,19 +1977,132 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
         "var tex{0}_samp: sampler;",
         i, i * TextureBindingsPerMap, i * TextureBindingsPerMap + 1);
   }
-  if ((config.pbrFlags & PbrMaterialEnabled) != 0) {
+  if (usesModernLightingInputs) {
     uniformPre +=
         "\n"
         "struct PbrEnhancedLight {\n"
         "    pos_radius: vec4f,\n"
         "    color_intensity: vec4f,\n"
+        "    dir_type: vec4f,\n"
+        "    shadow_params: vec4f,\n"
         "};\n"
         "fn pbr_load_enhanced_light(byte_off: u32) -> PbrEnhancedLight {\n"
         "    return PbrEnhancedLight(\n"
         "        raw_fetch_f32_4(&abuf, byte_off, true),\n"
-        "        raw_fetch_f32_4(&abuf, byte_off + 16u, true)\n"
+        "        raw_fetch_f32_4(&abuf, byte_off + 16u, true),\n"
+        "        raw_fetch_f32_4(&abuf, byte_off + 32u, true),\n"
+        "        raw_fetch_f32_4(&abuf, byte_off + 48u, true)\n"
         "    );\n"
+        "}\n"
+        "fn pbr_sample_shadow_visibility(mv_pos: vec3f, slot_value: f32) -> f32 {\n"
+        "    if (ubuf.pbr_shadow_params.x <= 0.5) { return 1.0; }\n"
+        "    if (ubuf.pbr_shadow_storage.y <= 0.5) { return 1.0; }\n"
+        "    let shadow_slot = clamp(u32(slot_value + 0.5), 0u, 3u);\n"
+        "    let shadow_stride = max(u32(ubuf.pbr_shadow_storage.z + 0.5), 128u);\n"
+        "    let shadow_size = u32(ubuf.pbr_shadow_storage.y + 0.5);\n"
+        "    let shadow_count = min(u32(ubuf.pbr_shadow_storage.w + 0.5), shadow_size / shadow_stride);\n"
+        "    if (shadow_slot >= shadow_count) { return 1.0; }\n"
+        "    let shadow_base = u32(ubuf.pbr_shadow_storage.x + 0.5) + shadow_slot * shadow_stride;\n"
+        "    let shadow_view = mat3x4f(\n"
+        "        raw_fetch_f32_4(&abuf, shadow_base + 0u, true),\n"
+        "        raw_fetch_f32_4(&abuf, shadow_base + 16u, true),\n"
+        "        raw_fetch_f32_4(&abuf, shadow_base + 32u, true));\n"
+        "    let shadow_proj = mat4x4f(\n"
+        "        raw_fetch_f32_4(&abuf, shadow_base + 48u, true),\n"
+        "        raw_fetch_f32_4(&abuf, shadow_base + 64u, true),\n"
+        "        raw_fetch_f32_4(&abuf, shadow_base + 80u, true),\n"
+        "        raw_fetch_f32_4(&abuf, shadow_base + 96u, true));\n"
+        "    let shadow_descriptor_params = raw_fetch_f32_4(&abuf, shadow_base + 112u, true);\n"
+        "    if (shadow_descriptor_params.x <= 0.5) { return 1.0; }\n"
+        "    let shadow_mv = vec4f(mv_pos, 1.0) * shadow_view;\n"
+        "    var shadow_clip = vec4f(shadow_mv, 1.0) * shadow_proj;\n";
+    if constexpr (UseReversedZ) {
+      uniformPre += "    shadow_clip.z = -shadow_clip.z;\n";
+    } else {
+      uniformPre += "    shadow_clip.z += shadow_clip.w;\n";
+    }
+    uniformPre +=
+        "    let shadow_ndc = shadow_clip.xyz / max(shadow_clip.w, 1e-7);\n"
+        "    let shadow_uv = vec2f(shadow_ndc.x * 0.5 + 0.5, 0.5 - shadow_ndc.y * 0.5);\n"
+        "    let shadow_in_bounds =\n"
+        "        shadow_uv.x >= 0.0 && shadow_uv.x <= 1.0 &&\n"
+        "        shadow_uv.y >= 0.0 && shadow_uv.y <= 1.0 &&\n"
+        "        shadow_ndc.z >= 0.0 && shadow_ndc.z <= 1.0;\n"
+        "    let shadow_depth = clamp(shadow_ndc.z + ubuf.pbr_shadow_params.z, 0.0, 1.0);\n"
+        "    let shadow_texel = 1.0 / max(ubuf.pbr_shadow_params.w, 1.0);\n"
+        "    let shadow_edge_margin = clamp(max(shadow_descriptor_params.z, shadow_texel * 2.0), shadow_texel, 0.45);\n"
+        "    let shadow_depth_margin = min(shadow_edge_margin * 0.5, 0.08);\n"
+        "    let shadow_edge_distance = min(min(shadow_uv.x, 1.0 - shadow_uv.x), min(shadow_uv.y, 1.0 - shadow_uv.y));\n"
+        "    let shadow_depth_distance = min(shadow_ndc.z, 1.0 - shadow_ndc.z);\n"
+        "    let shadow_edge_fade = min(smoothstep(0.0, shadow_edge_margin, shadow_edge_distance),\n"
+        "                               smoothstep(0.0, shadow_depth_margin, shadow_depth_distance));\n"
+        "    let shadow_offset = vec2f(shadow_texel, shadow_texel);\n"
+        "    var shadow_sample = 0.0;\n"
+        "    if (shadow_slot == 1u) {\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map1, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f(-1.0, -1.0), shadow_depth) * 0.0625;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map1, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f( 0.0, -1.0), shadow_depth) * 0.125;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map1, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f( 1.0, -1.0), shadow_depth) * 0.0625;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map1, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f(-1.0,  0.0), shadow_depth) * 0.125;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map1, pbr_shadow_samp, shadow_uv, shadow_depth) * 0.25;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map1, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f( 1.0,  0.0), shadow_depth) * 0.125;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map1, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f(-1.0,  1.0), shadow_depth) * 0.0625;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map1, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f( 0.0,  1.0), shadow_depth) * 0.125;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map1, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f( 1.0,  1.0), shadow_depth) * 0.0625;\n"
+        "    } else if (shadow_slot == 2u) {\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map2, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f(-1.0, -1.0), shadow_depth) * 0.0625;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map2, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f( 0.0, -1.0), shadow_depth) * 0.125;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map2, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f( 1.0, -1.0), shadow_depth) * 0.0625;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map2, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f(-1.0,  0.0), shadow_depth) * 0.125;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map2, pbr_shadow_samp, shadow_uv, shadow_depth) * 0.25;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map2, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f( 1.0,  0.0), shadow_depth) * 0.125;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map2, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f(-1.0,  1.0), shadow_depth) * 0.0625;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map2, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f( 0.0,  1.0), shadow_depth) * 0.125;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map2, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f( 1.0,  1.0), shadow_depth) * 0.0625;\n"
+        "    } else if (shadow_slot == 3u) {\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map3, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f(-1.0, -1.0), shadow_depth) * 0.0625;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map3, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f( 0.0, -1.0), shadow_depth) * 0.125;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map3, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f( 1.0, -1.0), shadow_depth) * 0.0625;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map3, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f(-1.0,  0.0), shadow_depth) * 0.125;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map3, pbr_shadow_samp, shadow_uv, shadow_depth) * 0.25;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map3, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f( 1.0,  0.0), shadow_depth) * 0.125;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map3, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f(-1.0,  1.0), shadow_depth) * 0.0625;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map3, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f( 0.0,  1.0), shadow_depth) * 0.125;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map3, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f( 1.0,  1.0), shadow_depth) * 0.0625;\n"
+        "    } else {\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map0, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f(-1.0, -1.0), shadow_depth) * 0.0625;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map0, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f( 0.0, -1.0), shadow_depth) * 0.125;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map0, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f( 1.0, -1.0), shadow_depth) * 0.0625;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map0, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f(-1.0,  0.0), shadow_depth) * 0.125;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map0, pbr_shadow_samp, shadow_uv, shadow_depth) * 0.25;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map0, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f( 1.0,  0.0), shadow_depth) * 0.125;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map0, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f(-1.0,  1.0), shadow_depth) * 0.0625;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map0, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f( 0.0,  1.0), shadow_depth) * 0.125;\n"
+        "        shadow_sample += textureSampleCompare(pbr_shadow_map0, pbr_shadow_samp, shadow_uv + shadow_offset * vec2f( 1.0,  1.0), shadow_depth) * 0.0625;\n"
+        "    }\n"
+        "    let shadow_receiver_weight = select(0.0, shadow_edge_fade, shadow_in_bounds);\n"
+        "    return mix(1.0, shadow_sample, shadow_receiver_weight);\n"
         "}";
+  }
+  if (useModernGxSupplement) {
+    uniBufAttrs += "\n    pbr_enhanced_params: vec4f,"; // x=enabled, y=count, z=inverse_square, w=intensity
+    uniBufAttrs += "\n    pbr_enhanced_storage: vec4f,"; // x=byte offset, y=byte size, z=stride
+    uniBufAttrs += "\n    pbr_shadow_params: vec4f,"; // x=enabled, y=strength, z=signed bias, w=map size
+    uniBufAttrs += "\n    pbr_shadow_storage: vec4f,"; // x=byte offset, y=byte size, z=stride, w=count
+    texBindings += fmt::format(
+        "\n@group(2) @binding({0})\n"
+        "var pbr_shadow_map0: texture_depth_2d;\n"
+        "@group(2) @binding({1})\n"
+        "var pbr_shadow_map1: texture_depth_2d;\n"
+        "@group(2) @binding({2})\n"
+        "var pbr_shadow_map2: texture_depth_2d;\n"
+        "@group(2) @binding({3})\n"
+        "var pbr_shadow_map3: texture_depth_2d;\n"
+        "@group(2) @binding({4})\n"
+        "var pbr_shadow_samp: sampler_comparison;",
+        pbr_shadow_texture_binding(0, 0), pbr_shadow_texture_binding(0, 1),
+        pbr_shadow_texture_binding(0, 2), pbr_shadow_texture_binding(0, 3), pbr_shadow_sampler_binding(0));
+  }
+  if ((config.pbrFlags & PbrMaterialEnabled) != 0) {
     uniBufAttrs += "\n    pbr_params: vec4f,";        // x=ambient, y=ambient_specular, z=fill_intensity, w=dynamic_gi_enabled
     uniBufAttrs += "\n    pbr_scales: vec4f,";        // x=diffuse_scale, y=specular_scale, z=debug_mode, w=dynamic_gi_strength
     uniBufAttrs += "\n    pbr_normal_params: vec4f,"; // x=strength, y=normal_y_sign, z=handedness_sign, w=dynamic_gi_wrap
@@ -1925,88 +2115,82 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
     uniBufAttrs += "\n    pbr_material_emissive: vec4f,"; // rgb=color, a=strength
     uniBufAttrs += "\n    pbr_enhanced_params: vec4f,"; // x=enabled, y=count, z=inverse_square, w=intensity
     uniBufAttrs += "\n    pbr_enhanced_storage: vec4f,"; // x=byte offset, y=byte size, z=stride
+    uniBufAttrs += "\n    pbr_shadow_params: vec4f,"; // x=enabled, y=strength, z=signed bias, w=map size
+    uniBufAttrs += "\n    pbr_shadow_storage: vec4f,"; // x=byte offset, y=byte size, z=stride, w=count
     const u32 texMap = config.pbrTexMapId;
     texBindings += fmt::format(
         "\n@group(2) @binding({0})\n"
         "var pbr_ibl_irradiance: texture_cube<f32>;\n"
         "@group(2) @binding({1})\n"
-        "var pbr_ibl_irradiance_samp: sampler;"
-        "\n@group(2) @binding({2})\n"
         "var pbr_ibl_prefilter: texture_cube<f32>;\n"
-        "@group(2) @binding({3})\n"
-        "var pbr_ibl_prefilter_samp: sampler;"
-        "\n@group(2) @binding({4})\n"
+        "\n@group(2) @binding({2})\n"
         "var pbr_ibl_brdf_lut: texture_2d<f32>;\n"
-        "@group(2) @binding({5})\n"
-        "var pbr_ibl_brdf_lut_samp: sampler;"
-        "\n@group(2) @binding({6})\n"
+        "@group(2) @binding({3})\n"
         "var pbr_ibl_blend_irradiance: texture_cube<f32>;\n"
-        "@group(2) @binding({7})\n"
-        "var pbr_ibl_blend_irradiance_samp: sampler;"
-        "\n@group(2) @binding({8})\n"
+        "\n@group(2) @binding({4})\n"
         "var pbr_ibl_blend_prefilter: texture_cube<f32>;\n"
+        "@group(2) @binding({5})\n"
+        "var pbr_ibl_samp: sampler;"
+        "\n@group(2) @binding({6})\n"
+        "var pbr_material_samp: sampler;"
+        "@group(2) @binding({7})\n"
+        "var pbr_shadow_map0: texture_depth_2d;\n"
+        "@group(2) @binding({8})\n"
+        "var pbr_shadow_map1: texture_depth_2d;\n"
         "@group(2) @binding({9})\n"
-        "var pbr_ibl_blend_prefilter_samp: sampler;",
-        pbr_ibl_irradiance_texture_binding(texMap), pbr_ibl_irradiance_sampler_binding(texMap),
-        pbr_ibl_prefilter_texture_binding(texMap), pbr_ibl_prefilter_sampler_binding(texMap),
-        pbr_ibl_brdf_lut_texture_binding(texMap), pbr_ibl_brdf_lut_sampler_binding(texMap),
-        pbr_ibl_blend_irradiance_texture_binding(texMap), pbr_ibl_blend_irradiance_sampler_binding(texMap),
-        pbr_ibl_blend_prefilter_texture_binding(texMap), pbr_ibl_blend_prefilter_sampler_binding(texMap));
+        "var pbr_shadow_map2: texture_depth_2d;\n"
+        "@group(2) @binding({10})\n"
+        "var pbr_shadow_map3: texture_depth_2d;\n"
+        "@group(2) @binding({11})\n"
+        "var pbr_shadow_samp: sampler_comparison;",
+        pbr_ibl_irradiance_texture_binding(texMap), pbr_ibl_prefilter_texture_binding(texMap),
+        pbr_ibl_brdf_lut_texture_binding(texMap), pbr_ibl_blend_irradiance_texture_binding(texMap),
+        pbr_ibl_blend_prefilter_texture_binding(texMap), pbr_ibl_sampler_binding(texMap),
+        pbr_material_sampler_binding(texMap),
+        pbr_shadow_texture_binding(texMap, 0), pbr_shadow_texture_binding(texMap, 1),
+        pbr_shadow_texture_binding(texMap, 2), pbr_shadow_texture_binding(texMap, 3),
+        pbr_shadow_sampler_binding(texMap));
     if ((config.pbrFlags & PbrMaterialHasRmaos) != 0) {
       texBindings += fmt::format(
           "\n@group(2) @binding({0})\n"
-          "var pbr_rmaos: texture_2d<f32>;\n"
-          "@group(2) @binding({1})\n"
-          "var pbr_rmaos_samp: sampler;",
-          pbr_rmaos_texture_binding(texMap), pbr_rmaos_sampler_binding(texMap));
+          "var pbr_rmaos: texture_2d<f32>;",
+          pbr_rmaos_texture_binding(texMap));
     }
     if ((config.pbrFlags & PbrMaterialHasRoughness) != 0) {
       texBindings += fmt::format(
           "\n@group(2) @binding({0})\n"
-          "var pbr_roughness_map: texture_2d<f32>;\n"
-          "@group(2) @binding({1})\n"
-          "var pbr_roughness_map_samp: sampler;",
-          pbr_roughness_texture_binding(texMap), pbr_roughness_sampler_binding(texMap));
+          "var pbr_roughness_map: texture_2d<f32>;",
+          pbr_roughness_texture_binding(texMap));
     }
     if ((config.pbrFlags & PbrMaterialHasMetallic) != 0) {
       texBindings += fmt::format(
           "\n@group(2) @binding({0})\n"
-          "var pbr_metallic_map: texture_2d<f32>;\n"
-          "@group(2) @binding({1})\n"
-          "var pbr_metallic_map_samp: sampler;",
-          pbr_metallic_texture_binding(texMap), pbr_metallic_sampler_binding(texMap));
+          "var pbr_metallic_map: texture_2d<f32>;",
+          pbr_metallic_texture_binding(texMap));
     }
     if ((config.pbrFlags & PbrMaterialHasAo) != 0) {
       texBindings += fmt::format(
           "\n@group(2) @binding({0})\n"
-          "var pbr_ao_map: texture_2d<f32>;\n"
-          "@group(2) @binding({1})\n"
-          "var pbr_ao_map_samp: sampler;",
-          pbr_ao_texture_binding(texMap), pbr_ao_sampler_binding(texMap));
+          "var pbr_ao_map: texture_2d<f32>;",
+          pbr_ao_texture_binding(texMap));
     }
     if ((config.pbrFlags & PbrMaterialHasSpecular) != 0) {
       texBindings += fmt::format(
           "\n@group(2) @binding({0})\n"
-          "var pbr_specular_map: texture_2d<f32>;\n"
-          "@group(2) @binding({1})\n"
-          "var pbr_specular_map_samp: sampler;",
-          pbr_specular_texture_binding(texMap), pbr_specular_sampler_binding(texMap));
+          "var pbr_specular_map: texture_2d<f32>;",
+          pbr_specular_texture_binding(texMap));
     }
     if ((config.pbrFlags & PbrMaterialHasNormal) != 0) {
       texBindings += fmt::format(
           "\n@group(2) @binding({0})\n"
-          "var pbr_normal: texture_2d<f32>;\n"
-          "@group(2) @binding({1})\n"
-          "var pbr_normal_samp: sampler;",
-          pbr_normal_texture_binding(texMap), pbr_normal_sampler_binding(texMap));
+          "var pbr_normal: texture_2d<f32>;",
+          pbr_normal_texture_binding(texMap));
     }
     if ((config.pbrFlags & PbrMaterialHasEmissive) != 0) {
       texBindings += fmt::format(
           "\n@group(2) @binding({0})\n"
-          "var pbr_emissive: texture_2d<f32>;\n"
-          "@group(2) @binding({1})\n"
-          "var pbr_emissive_samp: sampler;",
-          pbr_emissive_texture_binding(texMap), pbr_emissive_sampler_binding(texMap));
+          "var pbr_emissive: texture_2d<f32>;",
+          pbr_emissive_texture_binding(texMap));
     }
   }
   fragmentFn += "\n    prev = tev_overflow_vec4f(prev);";
@@ -2041,6 +2225,11 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
   if constexpr (EnableNormalVisualization) {
     fragmentFn += "\n    prev = vec4f(in.nrm, prev.a);";
   }
+
+  const char* fragmentSignature =
+      config.depthOnly ? "@fragment\nfn fs_main(in: VertexOutput)" :
+                         "@fragment\nfn fs_main(in: VertexOutput) -> @location(0) vec4f";
+  const char* fragmentReturn = config.depthOnly ? "" : "\n    return prev;";
 
   const auto shaderSource = fmt::format(R"""(
 fn bswap32(v: u32, le: bool) -> u32 {{
@@ -2387,13 +2576,11 @@ fn vs_main(
     return out;
 }}
 
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4f {{{6}{5}
-    return prev;
+{9} {{{6}{5}{10}
 }}
 )""",
                                         uniBufAttrs, texBindings, vtxOutAttrs, vtxInAttrs, vtxXfrAttrs, fragmentFn,
-                                        fragmentFnPre, vtxXfrAttrsPre, uniformPre);
+                                        fragmentFnPre, vtxXfrAttrsPre, uniformPre, fragmentSignature, fragmentReturn);
   if (EnableDebugPrints) {
     Log.info("Generated shader: {}", shaderSource);
   }

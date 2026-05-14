@@ -63,7 +63,11 @@ typedef enum {
   AURORA_SCENE_LIGHT_SOURCE_GAME_POINT = 1,
   AURORA_SCENE_LIGHT_SOURCE_GAME_EFFECT = 2,
   AURORA_SCENE_LIGHT_SOURCE_AUTHORED = 3,
+  AURORA_SCENE_LIGHT_SOURCE_GAME_ENVIRONMENT = 4,
 } AuroraSceneLightSource;
+enum {
+  AURORA_SCENE_LIGHT_FLAG_FIRE = 1u << 0,
+};
 typedef struct {
   float position[3];
   float radius;
@@ -157,6 +161,8 @@ typedef struct {
   bool valid;
   uint32_t source;
   uint32_t sourceIndex;
+  uint32_t shadowType;
+  uint32_t atlasSlot;
   uint64_t stableId;
   float position[3];
   float target[3];
@@ -165,15 +171,39 @@ typedef struct {
   float score;
   float priority;
 } AuroraPbrShadowLightRequest;
+typedef enum {
+  AURORA_PBR_SHADOW_TYPE_NONE = 0,
+  AURORA_PBR_SHADOW_TYPE_LOCAL_PROJECTED = 1,
+  AURORA_PBR_SHADOW_TYPE_DIRECTIONAL = 2,
+  AURORA_PBR_SHADOW_TYPE_POINT = 3,
+} AuroraPbrShadowType;
 typedef struct {
   bool enabled;
   bool resourcesReady;
   bool mapAvailable;
   bool lightRequestValid;
+  bool matrixValid;
+  bool casterPassReady;
+  bool receiverSamplingReady;
+  bool refreshPending;
   uint32_t size;
+  uint32_t drawCount;
+  uint32_t requestCount;
+  uint32_t requestMask;
+  uint32_t atlasSlotCount;
+  uint32_t maxActiveSlots;
+  uint32_t slotsPerFrame;
+  uint32_t activeAtlasSlot;
+  uint32_t activeShadowType;
+  uint32_t capturedSlotCount;
+  uint32_t capturedSlotMask;
+  uint32_t pendingSlotMask;
+  uint32_t slotDrawCounts[4];
   float strength;
   float bias;
+  float lightViewProjection[16];
   AuroraPbrShadowLightRequest lightRequest;
+  AuroraPbrShadowLightRequest requests[4];
 } AuroraPbrShadowMapStatus;
 typedef enum {
   AURORA_PBR_DEBUG_OFF = 0,
@@ -190,6 +220,7 @@ typedef enum {
   AURORA_PBR_DEBUG_IBL_SPECULAR = 11,
   AURORA_PBR_DEBUG_INDIRECT_OCCLUSION = 12,
   AURORA_PBR_DEBUG_DYNAMIC_GI = 13,
+  AURORA_PBR_DEBUG_SHADOW_VISIBILITY = 14,
 } AuroraPbrDebugMode;
 void aurora_set_pbr_ibl_source(AuroraPbrIblSource source);
 void aurora_set_pbr_debug_mode(AuroraPbrDebugMode mode);
@@ -201,9 +232,12 @@ const AuroraPbrEnhancedLightingStatus* aurora_get_pbr_enhanced_lighting_status()
 bool aurora_pbr_probe_ibl_available();
 const AuroraPbrIblStatus* aurora_get_pbr_ibl_status();
 void aurora_set_pbr_shadow_map_params(bool enabled, uint32_t size, float strength, float bias);
+void aurora_set_pbr_shadow_map_budget(uint32_t max_active_maps, uint32_t maps_per_frame);
 void aurora_set_pbr_shadow_light_request(const AuroraPbrShadowLightRequest* request);
+void aurora_set_pbr_shadow_light_requests(const AuroraPbrShadowLightRequest* requests, uint32_t request_count);
 void aurora_set_pbr_shadow_map_matrix(const float* light_view_projection_4x4);
 const AuroraPbrShadowMapStatus* aurora_get_pbr_shadow_map_status();
+void aurora_request_pbr_shadow_map_refresh();
 void aurora_set_pbr_probe_auto_refresh(bool enabled);
 void aurora_set_pbr_local_probe_gi(bool enabled);
 void aurora_set_pbr_probe_cache(bool enabled);

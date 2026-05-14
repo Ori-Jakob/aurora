@@ -14,10 +14,12 @@ struct DrawData {
   uint32_t instanceCount;
   GXBindGroups bindGroups;
   ProbeUniformPatchInfo probeUniformPatch;
+  gfx::PipelineRef shadowPipeline;
+  bool shadowCaster;
   uint32_t dstAlpha;
 };
 
-constexpr uint32_t GXPipelineConfigVersion = 23;
+constexpr uint32_t GXPipelineConfigVersion = 25;
 struct PipelineConfig {
   uint32_t version = GXPipelineConfigVersion;
   uint32_t msaaSamples = 1;
@@ -28,6 +30,7 @@ struct PipelineConfig {
   GXBlendFactor blendFacSrc, blendFacDst;
   GXLogicOp blendOp;
   uint32_t dstAlpha;
+  uint32_t depthOnly;
   bool depthCompare, depthUpdate, alphaUpdate, colorUpdate;
 };
 static_assert(std::has_unique_object_representations_v<PipelineConfig>);

@@ -68,44 +68,51 @@ constexpr u32 MaxPnMtx = (GX_PNMTX9 / 3) + 1;
 constexpr u32 MaxIndexAttr = 12; // VA_POS -> VA_TEX7
 constexpr u32 MaxUniformSize = 4096;
 constexpr u32 TextureBindingsPerMap = 2;
-constexpr u32 PbrMaterialBindingsPerMap = 24;
+constexpr u32 PbrMaterialBindingsPerMap = 19;
 constexpr u32 TextureBindGroupEntryCount = MaxTextures * TextureBindingsPerMap + PbrMaterialBindingsPerMap;
 
 constexpr u32 pbr_rmaos_texture_binding(u32 texMap) noexcept {
   (void)texMap;
   return MaxTextures * TextureBindingsPerMap;
 }
-constexpr u32 pbr_rmaos_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 1; }
-constexpr u32 pbr_roughness_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 2; }
-constexpr u32 pbr_roughness_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 3; }
-constexpr u32 pbr_metallic_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 4; }
-constexpr u32 pbr_metallic_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 5; }
-constexpr u32 pbr_ao_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 6; }
-constexpr u32 pbr_ao_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 7; }
-constexpr u32 pbr_specular_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 8; }
-constexpr u32 pbr_specular_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 9; }
-constexpr u32 pbr_normal_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 10; }
-constexpr u32 pbr_normal_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 11; }
-constexpr u32 pbr_emissive_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 12; }
-constexpr u32 pbr_emissive_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 13; }
-constexpr u32 pbr_ibl_irradiance_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 14; }
-constexpr u32 pbr_ibl_irradiance_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 15; }
-constexpr u32 pbr_ibl_prefilter_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 16; }
-constexpr u32 pbr_ibl_prefilter_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 17; }
-constexpr u32 pbr_ibl_brdf_lut_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 18; }
-constexpr u32 pbr_ibl_brdf_lut_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 19; }
+constexpr u32 pbr_roughness_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 1; }
+constexpr u32 pbr_metallic_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 2; }
+constexpr u32 pbr_ao_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 3; }
+constexpr u32 pbr_specular_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 4; }
+constexpr u32 pbr_normal_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 5; }
+constexpr u32 pbr_emissive_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 6; }
+constexpr u32 pbr_material_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 7; }
+constexpr u32 pbr_rmaos_sampler_binding(u32 texMap) noexcept { return pbr_material_sampler_binding(texMap); }
+constexpr u32 pbr_roughness_sampler_binding(u32 texMap) noexcept { return pbr_material_sampler_binding(texMap); }
+constexpr u32 pbr_metallic_sampler_binding(u32 texMap) noexcept { return pbr_material_sampler_binding(texMap); }
+constexpr u32 pbr_ao_sampler_binding(u32 texMap) noexcept { return pbr_material_sampler_binding(texMap); }
+constexpr u32 pbr_specular_sampler_binding(u32 texMap) noexcept { return pbr_material_sampler_binding(texMap); }
+constexpr u32 pbr_normal_sampler_binding(u32 texMap) noexcept { return pbr_material_sampler_binding(texMap); }
+constexpr u32 pbr_emissive_sampler_binding(u32 texMap) noexcept { return pbr_material_sampler_binding(texMap); }
+constexpr u32 pbr_ibl_irradiance_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 8; }
+constexpr u32 pbr_ibl_prefilter_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 9; }
+constexpr u32 pbr_ibl_brdf_lut_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 10; }
 constexpr u32 pbr_ibl_blend_irradiance_texture_binding(u32 texMap) noexcept {
-  return pbr_rmaos_texture_binding(texMap) + 20;
-}
-constexpr u32 pbr_ibl_blend_irradiance_sampler_binding(u32 texMap) noexcept {
-  return pbr_rmaos_texture_binding(texMap) + 21;
+  return pbr_rmaos_texture_binding(texMap) + 11;
 }
 constexpr u32 pbr_ibl_blend_prefilter_texture_binding(u32 texMap) noexcept {
-  return pbr_rmaos_texture_binding(texMap) + 22;
+  return pbr_rmaos_texture_binding(texMap) + 12;
+}
+constexpr u32 pbr_ibl_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 13; }
+constexpr u32 pbr_ibl_irradiance_sampler_binding(u32 texMap) noexcept { return pbr_ibl_sampler_binding(texMap); }
+constexpr u32 pbr_ibl_prefilter_sampler_binding(u32 texMap) noexcept { return pbr_ibl_sampler_binding(texMap); }
+constexpr u32 pbr_ibl_brdf_lut_sampler_binding(u32 texMap) noexcept { return pbr_ibl_sampler_binding(texMap); }
+constexpr u32 pbr_ibl_blend_irradiance_sampler_binding(u32 texMap) noexcept {
+  return pbr_ibl_sampler_binding(texMap);
 }
 constexpr u32 pbr_ibl_blend_prefilter_sampler_binding(u32 texMap) noexcept {
-  return pbr_rmaos_texture_binding(texMap) + 23;
+  return pbr_ibl_sampler_binding(texMap);
 }
+constexpr u32 pbr_shadow_texture_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 14; }
+constexpr u32 pbr_shadow_texture_binding(u32 texMap, u32 slot) noexcept {
+  return pbr_shadow_texture_binding(texMap) + slot;
+}
+constexpr u32 pbr_shadow_sampler_binding(u32 texMap) noexcept { return pbr_rmaos_texture_binding(texMap) + 18; }
 
 enum PbrMaterialFlags : u32 {
   PbrMaterialEnabled = 1u << 0,
@@ -506,7 +513,8 @@ struct ShaderConfig {
   u8 fogType = GX_FOG_NONE;
   u8 vtxStride = 0;
   u8 lineMode : 2 = 0; // 1 = GX_LINES, 2 = GX_LINESTRIP, 3 = GX_POINTS
-  u8 pad1 : 6 = 0;
+  u8 depthOnly : 1 = 0;
+  u8 pad1 : 5 = 0;
   u8 pad2 = 0;
   u32 pbrFlags = 0;
   u32 pbrTexMapId = GX_TEXMAP_NULL;
@@ -530,6 +538,7 @@ struct PipelineConfig;
 
 struct GXBindGroups {
   gfx::BindGroupRef textureBindGroup;
+  gfx::BindGroupRef shadowTextureBindGroup;
 };
 // Output info from shader generation
 struct ShaderInfo {

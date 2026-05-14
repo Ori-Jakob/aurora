@@ -596,8 +596,8 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu:
   const wgpu::FragmentState fragmentState{
       .module = shader,
       .entryPoint = "fs_main",
-      .targetCount = colorTargets.size(),
-      .targets = colorTargets.data(),
+      .targetCount = config.depthOnly ? 0u : static_cast<uint32_t>(colorTargets.size()),
+      .targets = config.depthOnly ? nullptr : colorTargets.data(),
   };
   const wgpu::RenderPipelineDescriptor descriptor{
       .label = label,
@@ -615,7 +615,7 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu:
           wgpu::MultisampleState{
               .count = config.msaaSamples,
           },
-      .fragment = &fragmentState,
+      .fragment = config.depthOnly && !config.shaderConfig.alphaCompare ? nullptr : &fragmentState,
   };
   return g_device.CreateRenderPipeline(&descriptor);
 }
@@ -850,8 +850,17 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
       .entryCount = textureEntries.size(),
       .entries = textureEntries.data(),
   };
+  auto shadowTextureEntries = textureEntries;
+  bind_pbr_texture_entries(shadowTextureEntries, info, sEmptyTextureView, sEmptySampler, false);
+  const WGPUBindGroupDescriptor shadowTextureBindGroupDescriptor{
+      .label = {"GX Shadow Texture Bind Group", WGPU_STRLEN},
+      .layout = sTextureBindGroupLayout.Get(),
+      .entryCount = shadowTextureEntries.size(),
+      .entries = shadowTextureEntries.data(),
+  };
   return {
       .textureBindGroup = gfx::bind_group_ref(textureBindGroupDescriptor),
+      .shadowTextureBindGroup = gfx::bind_group_ref(shadowTextureBindGroupDescriptor),
   };
 }
 

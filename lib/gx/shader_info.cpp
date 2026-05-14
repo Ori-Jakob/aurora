@@ -331,8 +331,12 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     info.uniformSize += MaxIndTexMtxs * sizeof(Mat2x4<float>);
   }
   info.uniformSize += info.sampledTextures.count() * sizeof(Vec4<float>);
-  if ((info.pbrFlags & PbrMaterialEnabled) != 0) {
-    info.uniformSize += 12 * sizeof(Vec4<float>);
+  const bool usesPbrMaterial = (info.pbrFlags & PbrMaterialEnabled) != 0;
+  const bool usesModernGxSupplement = !usesPbrMaterial && info.lineMode == 0 && info.lightingEnabled;
+  if (usesPbrMaterial) {
+    info.uniformSize += 14 * sizeof(Vec4<float>);
+  } else if (usesModernGxSupplement) {
+    info.uniformSize += 4 * sizeof(Vec4<float>);
   }
   info.uniformSize = gfx::align_uniform(info.uniformSize);
   if (info.uniformSize > MaxUniformSize) {
@@ -490,7 +494,9 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
     // CHECK(tex, "unbound texture {}", i);
     buf.append(texture_size_bias(tex));
   }
-  if ((info.pbrFlags & PbrMaterialEnabled) != 0) {
+  const bool usesPbrMaterial = (info.pbrFlags & PbrMaterialEnabled) != 0;
+  const bool usesModernGxSupplement = !usesPbrMaterial && info.lineMode == 0 && info.lightingEnabled;
+  if (usesPbrMaterial) {
     auto packedPbrParams = pbrParams;
     packedPbrParams.w() = pbrDynamicGiParams.x();
     auto packedPbrScales = pbrScales;
@@ -521,6 +527,23 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
         static_cast<float>(sizeof(PbrEnhancedLight)),
         0.0f,
     });
+    buf.append(pbr_shadow_params());
+    buf.append(pbr_shadow_storage_params());
+  } else if (usesModernGxSupplement) {
+    buf.append(Vec4<float>{
+        pbrEnhancedLightsEnabled ? 1.0f : 0.0f,
+        static_cast<float>(pbrEnhancedLightCount),
+        pbrEnhancedLightFalloff == AURORA_PBR_ENHANCED_LIGHT_FALLOFF_INVERSE_SQUARE ? 1.0f : 0.0f,
+        pbrEnhancedLightIntensityScale,
+    });
+    buf.append(Vec4<float>{
+        static_cast<float>(pbrEnhancedLightStorageOffset),
+        static_cast<float>(pbrEnhancedLightStorageSize),
+        static_cast<float>(sizeof(PbrEnhancedLight)),
+        0.0f,
+    });
+    buf.append(pbr_shadow_params());
+    buf.append(pbr_shadow_storage_params());
   }
   g_gxState.stateDirty = false;
   return range;

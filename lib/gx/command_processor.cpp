@@ -1636,6 +1636,18 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
   const auto bindGroups = build_bind_groups(info);
   const auto pipeline = gfx::pipeline_ref(config);
   const auto probeUniformPatch = probe_uniform_patch_info(info, g_gxState.projType == GX_PERSPECTIVE);
+  PipelineConfig shadowConfig = config;
+  shadowConfig.msaaSamples = 1;
+  shadowConfig.depthCompare = true;
+  shadowConfig.depthUpdate = true;
+  shadowConfig.alphaUpdate = false;
+  shadowConfig.colorUpdate = false;
+  shadowConfig.depthOnly = 1;
+  shadowConfig.shaderConfig.depthOnly = 1;
+  shadowConfig.dstAlpha = UINT32_MAX;
+  const bool shadowCaster = probeUniformPatch.eligible && config.shaderConfig.lineMode == 0 &&
+                            config.depthCompare && config.depthUpdate;
+  const auto shadowPipeline = shadowCaster ? gfx::pipeline_ref(shadowConfig) : gfx::PipelineRef{};
 
   uint32_t instanceCount = 1;
   if (prim == GX_LINES) {
@@ -1655,6 +1667,8 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
       .instanceCount = instanceCount,
       .bindGroups = bindGroups,
       .probeUniformPatch = probeUniformPatch,
+      .shadowPipeline = shadowPipeline,
+      .shadowCaster = shadowCaster,
       .dstAlpha = g_gxState.dstAlpha,
   });
 }
