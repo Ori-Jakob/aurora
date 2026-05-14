@@ -76,7 +76,8 @@ typedef void (*AuroraImGuiInitCallback)(const AuroraWindowSize* size);
 
 typedef struct {
   const char* appName;
-  const char* configPath;
+  const char* userPath;
+  const char* cachePath;
   AuroraBackend desiredBackend;
   uint32_t msaa;
   uint16_t maxTextureAnisotropy;
@@ -113,7 +114,8 @@ typedef struct {
 
 typedef struct {
   AuroraBackend backend;
-  const char* configPath;
+  const char* userPath;
+  const char* cachePath;
   SDL_Window* window;
   AuroraWindowSize windowSize;
 } AuroraInfo;

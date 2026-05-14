@@ -45,11 +45,11 @@ std::array<PortPreference, PAD_MAX_CONTROLLERS> g_portPreferences;
 bool g_portPreferencesLoaded = false;
 
 std::string port_preferences_path() {
-  if (g_config.configPath == nullptr) {
+  if (g_config.userPath == nullptr) {
     return {};
   }
 
-  std::string path{g_config.configPath};
+  std::string path{g_config.userPath};
   if (!path.empty() && path.back() != '/' && path.back() != '\\') {
     path += '/';
   }
@@ -196,8 +196,8 @@ void save_port_preferences() {
     return;
   }
 
-  if (!SDL_CreateDirectory(g_config.configPath)) {
-    Log.warn("Failed to create controller port preference directory '{}': {}", g_config.configPath, SDL_GetError());
+  if (!SDL_CreateDirectory(g_config.userPath)) {
+    Log.warn("Failed to create controller port preference directory '{}': {}", g_config.userPath, SDL_GetError());
     return;
   }
 
@@ -368,7 +368,11 @@ SDL_JoystickID add_controller(SDL_JoystickID which) noexcept {
       SDL_CloseGamepad(ctrl);
       return -1;
     }
-    controller.m_isGameCube = SDL_GetGamepadType(ctrl) == SDL_GAMEPAD_TYPE_GAMECUBE;
+    controller.m_isGameCube = controller.m_vid == 0x057E && controller.m_vid == 0x0337;
+    if (controller.m_isGameCube ||
+        (SDL_GetGamepadType(ctrl) == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO && controller.m_pid == 0x2073)) {
+      controller.m_deadZones.emulateTriggers = false;
+    }
     const auto props = SDL_GetGamepadProperties(ctrl);
     controller.m_hasRumble = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, true);
     controller.m_hasRgbLed = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RGB_LED_BOOLEAN, false);

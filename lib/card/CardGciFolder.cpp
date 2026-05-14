@@ -103,14 +103,16 @@ ECardResult CardGciFolder::createFile(const char* filename, size_t size, FileHan
   gciFileHeader->m_blockCount = neededBlocks;
   gciFileHeader->m_firstBlock = m_bat.allocateBlocks(neededBlocks, maxBlocks);
 
-  m_files.push_back({*gciFileHeader, fileSize, reinterpret_cast<const char8_t*>(gciFilename.c_str()), false}); // push non-endian swapped header first
-
-  handleOut = FileHandle(m_files.size() - 1, 0);
-
   // write big endian header for dolphin compat
   gciFileHeader->swapEndian();
   FileIO file(m_folderPath / gciFilename, true);
-  file.fileWrite(fileBuf.data(), fileBuf.size(), 0);
+  if (!file || !file.fileWrite(fileBuf.data(), fileBuf.size(), 0)) {
+    return ECardResult::IOERROR;
+  }
+
+  gciFileHeader->swapEndian();
+  m_files.push_back({*gciFileHeader, fileSize, reinterpret_cast<const char8_t*>(gciFilename.c_str()), false}); // push non-endian swapped header first
+  handleOut = FileHandle(m_files.size() - 1, 0);
 
   return ECardResult::READY;
 }
@@ -340,25 +342,67 @@ void CardGciFolder::commit() {
 bool CardGciFolder::open(const std::filesystem::path& filepath) {
   m_folderPath = filepath;
 
-  if (!std::filesystem::exists(filepath) || !std::filesystem::is_directory(filepath))
+  std::error_code ec;
+  if (!std::filesystem::exists(filepath, ec) || !std::filesystem::is_directory(filepath, ec)) {
+    if (ec) {
+      Log.warn("Failed to inspect GCI folder '{}': {}", fs_path_to_string(filepath), ec.message());
+    }
     return false;
+  }
 
-  for (const auto& dir : std::filesystem::directory_iterator(filepath)) {
-    if (!dir.is_regular_file()) {
+  std::filesystem::directory_iterator it(
+      filepath, std::filesystem::directory_options::skip_permission_denied, ec);
+  if (ec) {
+    Log.warn("Failed to enumerate GCI folder '{}': {}", fs_path_to_string(filepath), ec.message());
+    return false;
+  }
+
+  const std::filesystem::directory_iterator end;
+  while (it != end) {
+    const auto path = it->path();
+    const auto status = it->status(ec);
+    if (ec) {
+      Log.warn("Failed to inspect GCI folder entry '{}': {}", fs_path_to_string(path), ec.message());
+      return false;
+    }
+    if (!std::filesystem::is_regular_file(status)) {
+      it.increment(ec);
+      if (ec) {
+        Log.warn("Failed to continue enumerating GCI folder '{}': {}", fs_path_to_string(filepath), ec.message());
+        return false;
+      }
       continue;
     }
-    auto path = dir.path();
 
-    if (path.extension() != ".gci")
+    if (path.extension() != ".gci") {
+      it.increment(ec);
+      if (ec) {
+        Log.warn("Failed to continue enumerating GCI folder '{}': {}", fs_path_to_string(filepath), ec.message());
+        return false;
+      }
       continue;
+    }
 
     FileIO file(path);
+    if (!file) {
+      Log.warn("Failed to open GCI file '{}'", fs_path_to_string(path));
+      return false;
+    }
 
     File fileData;
-    file.fileRead((void*)&fileData, sizeof(File), 0);
+    if (!file.fileRead(&fileData, sizeof(File), 0)) {
+      Log.warn("Failed to read GCI file '{}'", fs_path_to_string(path));
+      return false;
+    }
     fileData.swapEndian();
 
     m_files.push_back({fileData, file.fileSize(), path.filename().u8string(), false});
+
+    it.increment(ec);
+    if (ec) {
+      Log.warn("Failed to continue enumerating GCI folder '{}': {}", fs_path_to_string(filepath), ec.message());
+      return false;
+    }
   }
 
   return true;

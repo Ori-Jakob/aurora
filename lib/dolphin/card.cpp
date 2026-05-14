@@ -174,8 +174,8 @@ void CARDInit(const char* game, const char* maker) {
   }
 
   std::filesystem::path cardWorkingDir;
-  if (aurora::g_config.configPath != nullptr)
-    cardWorkingDir = reinterpret_cast<const char8_t*>(aurora::g_config.configPath);
+  if (aurora::g_config.userPath != nullptr)
+    cardWorkingDir = reinterpret_cast<const char8_t*>(aurora::g_config.userPath);
   else
     cardWorkingDir = std::filesystem::current_path();
 
@@ -189,10 +189,14 @@ void CARDInit(const char* game, const char* maker) {
 
     const auto& curPath = cardPaths[i];
 
-    if (std::filesystem::exists(curPath)) {
-      CardChannels[i]->open(curPath);
+    std::error_code ec;
+    if (std::filesystem::exists(curPath, ec) && CardChannels[i]->open(curPath)) {
       loadedCard = true;
       Log.info("Loaded GC Card Image: {}", fs_path_to_string(curPath));
+    } else if (ec) {
+      Log.warn("Failed to inspect GC Card path '{}': {}", fs_path_to_string(curPath), ec.message());
+    } else if (std::filesystem::exists(curPath, ec)) {
+      Log.warn("Failed to load GC Card Image: {}", fs_path_to_string(curPath));
     }
   }
 

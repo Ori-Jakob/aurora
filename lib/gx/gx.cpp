@@ -170,9 +170,15 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
   if (const auto replacement = gfx::texture_replacement::find_replacement(obj); replacement.has_value()) {
     handle = *replacement;
   } else {
+#if DEBUG
+    const auto name = gfx::texture_replacement::build_texture_replacement_name(obj);
+    const auto nameStr = name.c_str();
+#else
+    const auto nameStr = "GX Static Texture";
+#endif
     handle =
         gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),
-                                   {static_cast<const uint8_t*>(obj.data), UINT32_MAX}, false, "GX Static Texture");
+                                   {static_cast<const uint8_t*>(obj.data), UINT32_MAX}, false, nameStr);
   }
   if (!obj.no_cache()) {
     store_cached_texture(obj, handle);

@@ -19,6 +19,7 @@
 #include <SDL3/SDL_filesystem.h>
 #include <magic_enum.hpp>
 
+#include "system_info.hpp"
 #include "tracy/Tracy.hpp"
 
 namespace aurora {
@@ -72,15 +73,21 @@ bool g_initialFrame = false;
 AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexcept {
   g_config = config;
   Log.info("Aurora initializing");
+  log_system_information();
   if (g_config.appName == nullptr) {
     g_config.appName = "Aurora";
   } else {
     g_config.appName = strdup(g_config.appName);
   }
-  if (g_config.configPath == nullptr) {
-    g_config.configPath = SDL_GetPrefPath(nullptr, g_config.appName);
+  if (g_config.userPath == nullptr) {
+    g_config.userPath = SDL_GetPrefPath(nullptr, g_config.appName);
   } else {
-    g_config.configPath = strdup(g_config.configPath);
+    g_config.userPath = strdup(g_config.userPath);
+  }
+  if (g_config.cachePath == nullptr) {
+    g_config.cachePath = SDL_GetPrefPath(nullptr, g_config.appName);
+  } else {
+    g_config.cachePath = strdup(g_config.cachePath);
   }
   if (g_config.msaa == 0) {
     g_config.msaa = 1;
@@ -157,7 +164,8 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
   g_config.desiredBackend = selectedBackend;
   return {
       .backend = selectedBackend,
-      .configPath = g_config.configPath,
+      .userPath = g_config.userPath,
+      .cachePath = g_config.cachePath,
       .window = window::get_sdl_window(),
       .windowSize = size,
   };

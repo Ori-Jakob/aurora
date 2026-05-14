@@ -2,6 +2,19 @@ include(FetchContent)
 
 # Don't build tests for third party dependencies
 set(BUILD_TESTING OFF CACHE INTERNAL "Build tests")
+set(SKIP_INSTALL_ALL ON)
+if (NOT DEFINED BUILD_SHARED_LIBS)
+  set(_USE_SHARED ON)
+else ()
+  set(_USE_SHARED OFF)
+endif ()
+
+function(aurora_find_package_global)
+  set(_PREV_FIND_PACKAGE_TARGETS_GLOBAL ${CMAKE_FIND_PACKAGE_TARGETS_GLOBAL})
+  set(CMAKE_FIND_PACKAGE_TARGETS_GLOBAL ON)
+  find_package(${ARGV})
+  set(CMAKE_FIND_PACKAGE_TARGETS_GLOBAL ${_PREV_FIND_PACKAGE_TARGETS_GLOBAL})
+endfunction()
 
 if (AURORA_ENABLE_GX)
   include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/AuroraDawnProvider.cmake)
@@ -10,7 +23,7 @@ endif ()
 # Abseil is needed for core libraries. It normally comes via Dawn's vendor build.
 # Otherwise prefer a system package and only fetch it as a last resort.
 if (NOT TARGET absl::flat_hash_map OR NOT TARGET absl::btree)
-  find_package(absl CONFIG QUIET GLOBAL)
+  aurora_find_package_global(absl CONFIG QUIET GLOBAL)
 endif ()
 
 if (TARGET absl::flat_hash_map AND TARGET absl::btree)
@@ -77,7 +90,67 @@ else ()
 endif ()
 
 if (AURORA_ENABLE_GX)
-  find_package(Freetype QUIET)
+  if (NOT TARGET ZLIB::ZLIB)
+    aurora_find_package_global(ZLIB QUIET)
+  endif ()
+  if (NOT TARGET ZLIB::ZLIB)
+    message(STATUS "aurora: Fetching zlib")
+    set(ZLIB_BUILD_SHARED ${_USE_SHARED} CACHE BOOL "Enable building zlib shared library" FORCE)
+    set(ZLIB_BUILD_TESTING OFF CACHE BOOL "Enable Zlib Examples as tests" FORCE)
+    set(ZLIB_INSTALL OFF CACHE BOOL "Enable installation of zlib" FORCE)
+    FetchContent_Declare(
+      ZLIB
+      URL https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz
+      URL_HASH SHA256=bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+      EXCLUDE_FROM_ALL
+    )
+    FetchContent_MakeAvailable(ZLIB)
+    if (NOT TARGET ZLIB::ZLIB)
+      message(FATAL_ERROR "Failed to make zlib available")
+    endif ()
+    # libpng calls find_package(ZLIB) even when zlib was already provided by FetchContent.
+    file(WRITE "${CMAKE_FIND_PACKAGE_REDIRECTS_DIR}/ZLIBConfig.cmake"
+      "set(ZLIB_FOUND TRUE)\n"
+      "set(ZLIB_INCLUDE_DIR \"${zlib_SOURCE_DIR}\")\n"
+      "set(ZLIB_INCLUDE_DIRS \"${zlib_BINARY_DIR};${zlib_SOURCE_DIR}\")\n"
+    )
+  endif ()
+
+  if (NOT TARGET PNG::PNG)
+    if (TARGET png_shared AND _USE_SHARED)
+      add_library(PNG::PNG ALIAS png_shared)
+    elseif (TARGET png_static)
+      add_library(PNG::PNG ALIAS png_static)
+    else ()
+      aurora_find_package_global(PNG QUIET)
+    endif ()
+  endif ()
+  if (NOT TARGET PNG::PNG)
+    message(STATUS "aurora: Fetching libpng")
+    set(PNG_SHARED ${_USE_SHARED} CACHE BOOL "Build libpng as a shared library" FORCE)
+    set(PNG_TESTS OFF CACHE BOOL "Build the libpng tests" FORCE)
+    set(PNG_TOOLS OFF CACHE BOOL "Build the libpng tools" FORCE)
+    FetchContent_Declare(
+      PNG
+      URL https://github.com/pnggroup/libpng/archive/refs/tags/v1.6.58.tar.gz
+      URL_HASH SHA256=A9D4DF463D36A6E5F9C29BD6F4967312D17E996C1854F3511F833924EB1993CF
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+      EXCLUDE_FROM_ALL
+    )
+    FetchContent_MakeAvailable(PNG)
+    if (TARGET png_shared AND _USE_SHARED)
+      add_library(PNG::PNG ALIAS png_shared)
+    elseif (TARGET png_static)
+      add_library(PNG::PNG ALIAS png_static)
+    else ()
+      message(FATAL_ERROR "Failed to make libpng available")
+    endif ()
+  else ()
+    message(STATUS "aurora: Using existing libpng")
+  endif ()
+
+  aurora_find_package_global(Freetype QUIET)
   if (NOT TARGET Freetype::Freetype)
     message(STATUS "aurora: Fetching Freetype")
     set(FT_DISABLE_BROTLI ON CACHE BOOL "" FORCE)
@@ -175,30 +248,22 @@ if (AURORA_ENABLE_GX)
     endif ()
   endif ()
 
-  if(AURORA_ENABLE_RMLUI AND NOT TARGET RmlUi)
+  if (AURORA_ENABLE_RMLUI AND NOT TARGET RmlUi)
     message(STATUS "aurora: Fetching RmlUi")
     FetchContent_Declare(rmlui
-            URL https://github.com/mikke89/RmlUi/archive/f9b8c9e2935d5df2c7dff2c190d3968e99b0c3dc.tar.gz
-            URL_HASH SHA256=42b830abc2509a8c07cf02ba3313505de3a4642725654f489402022d8fefdd79
-            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-            EXCLUDE_FROM_ALL
+      URL https://github.com/mikke89/RmlUi/archive/f9b8c9e2935d5df2c7dff2c190d3968e99b0c3dc.tar.gz
+      URL_HASH SHA256=42b830abc2509a8c07cf02ba3313505de3a4642725654f489402022d8fefdd79
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+      EXCLUDE_FROM_ALL
     )
     FetchContent_MakeAvailable(rmlui)
 
-    add_library(rmlui_backends STATIC
-            ${rmlui_SOURCE_DIR}/Backends/RmlUi_Platform_SDL.cpp
-    )
+    add_library(rmlui_backends STATIC ${rmlui_SOURCE_DIR}/Backends/RmlUi_Platform_SDL.cpp)
     # TODO: maybe dont hardcode this to SDL3?
     target_compile_definitions(rmlui_backends PUBLIC RMLUI_SDL_VERSION_MAJOR=3)
-
-    target_include_directories(rmlui_backends PUBLIC
-            ${rmlui_SOURCE_DIR}/Backends
-    )
-
+    target_include_directories(rmlui_backends PUBLIC ${rmlui_SOURCE_DIR}/Backends)
     target_link_libraries(rmlui_backends PRIVATE rmlui ${AURORA_SDL3_TARGET})
-
   endif ()
-
 endif ()
 
 if (NOT TARGET TracyClient)
@@ -212,6 +277,7 @@ if (NOT TARGET TracyClient)
           URL https://github.com/wolfpld/tracy/archive/a64b9a20294d59421a2f57aeca3c6383d8c48169.tar.gz
           URL_HASH SHA256=24d342b5127d7f659dc3cf94f24347b348cc736f25b17a691fd7f69541937658
           DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+          EXCLUDE_FROM_ALL
   )
   FetchContent_MakeAvailable(tracy)
 

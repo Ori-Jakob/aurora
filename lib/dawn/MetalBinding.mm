@@ -6,15 +6,13 @@
 #ifndef __MAC_15_0
 @interface MTLLogStateDescriptor : NSObject
 @end
-@interface MTLLogState : NSObject
-@end
-#endif
-
 @implementation MTLLogStateDescriptor
 @end
-
+@interface MTLLogState : NSObject
+@end
 @implementation MTLLogState
 @end
+#endif
 
 #include <SDL3/SDL_metal.h>
 
