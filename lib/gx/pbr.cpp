@@ -911,10 +911,10 @@ std::vector<uint8_t> pbr_generate_brdf_lut() {
 }
 
 std::filesystem::path pbr_ibl_root_path() {
-  if (g_config.configPath == nullptr) {
+  if (g_config.userPath == nullptr) {
     return {};
   }
-  return std::filesystem::path{reinterpret_cast<const char8_t*>(g_config.configPath)} / "texture_replacements" /
+  return std::filesystem::path{reinterpret_cast<const char8_t*>(g_config.userPath)} / "texture_replacements" /
          "pbr_ibl";
 }
 
