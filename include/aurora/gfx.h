@@ -33,6 +33,9 @@ const AuroraStats* aurora_get_stats();
 
 void aurora_enable_vsync(bool enabled);
 void aurora_set_fog_override(bool enabled, float exposure, float opacity, float color_r, float color_g, float color_b);
+void aurora_refresh_texture_replacements();
+void aurora_set_texture_replacement_auto_refresh(bool enabled);
+bool aurora_texture_replacement_auto_refresh_enabled();
 void aurora_enable_pbr(bool enabled);
 bool aurora_pbr_enabled();
 void aurora_set_pbr_light_params(float ambient, float ambient_specular, float fill_intensity);

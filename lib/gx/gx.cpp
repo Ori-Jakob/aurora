@@ -378,6 +378,16 @@ void clear_copy_texture_cache() noexcept {
   }
 }
 
+void clear_texture_cache() noexcept {
+  s_textureObjectCaches.clear();
+  s_tlutObjectCaches.clear();
+  clear_copy_texture_cache();
+  for (auto& item : g_gxState.textures) {
+    item = {};
+  }
+  g_gxState.stateDirty = true;
+}
+
 void evict_copy_texture(const void* dest) noexcept {
   g_gxState.copyTextures.erase(dest);
   for (auto it = g_gxState.copyTextureCache.begin(); it != g_gxState.copyTextureCache.end();) {

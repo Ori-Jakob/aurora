@@ -679,6 +679,10 @@ bool begin_frame() {
 
   g_stats.drawCallCount = 0;
   g_stats.mergedDrawCallCount = 0;
+  if (texture_replacement::update_auto_refresh(g_frameIndex)) {
+    gx::clear_texture_cache();
+    clear_caches();
+  }
   g_suspendedEfbPass.reset();
   g_probeRenderPasses.clear();
 
@@ -1347,5 +1351,19 @@ void pop_debug_group() {
 }
 
 const AuroraStats* aurora_get_stats() { return &aurora::gfx::g_stats; }
+
+void aurora_refresh_texture_replacements() {
+  aurora::gfx::texture_replacement::refresh();
+  aurora::gx::clear_texture_cache();
+  aurora::gfx::clear_caches();
+}
+
+void aurora_set_texture_replacement_auto_refresh(bool enabled) {
+  aurora::gfx::texture_replacement::set_auto_refresh(enabled);
+}
+
+bool aurora_texture_replacement_auto_refresh_enabled() {
+  return aurora::gfx::texture_replacement::auto_refresh_enabled();
+}
 
 void aurora_set_pbr_probe_capture_enabled(bool enabled) { aurora::gfx::g_pbrProbeCaptureEnabled = enabled; }

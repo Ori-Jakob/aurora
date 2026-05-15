@@ -17,6 +17,7 @@
 #include <cstring>
 #include <filesystem>
 #include <initializer_list>
+#include <iterator>
 #include <list>
 #include <memory>
 #include <optional>
@@ -80,10 +81,19 @@ struct ReplacementPaths {
   std::filesystem::path emissive;
 };
 
+struct DirectorySignature {
+  uint64_t hash = 0;
+  uint32_t fileCount = 0;
+  bool valid = false;
+
+  bool operator==(const DirectorySignature& rhs) const = default;
+};
+
 absl::flat_hash_map<RuntimeTextureKey, ReplacementPaths> s_replacementIndex;
 absl::flat_hash_map<RuntimeTextureKey, CachedReplacement> s_replacementCache;
 absl::flat_hash_map<std::string, std::filesystem::path> s_namedPbrTextureIndex;
 absl::flat_hash_map<std::string, gfx::TextureHandle> s_namedPbrTextureCache;
+absl::flat_hash_map<std::string, gfx::TextureHandle> s_debugPreviewTextureCache;
 absl::flat_hash_set<RuntimeTextureKey> s_failedKeys;
 absl::flat_hash_set<std::string> s_failedNamedPbrTextures;
 absl::flat_hash_set<RuntimeTextureKey> s_reportedMisses;
@@ -93,7 +103,11 @@ std::list<RuntimeTextureKey> s_replacementLru;
 std::filesystem::path s_replacementRoot;
 std::filesystem::path s_dumpRoot;
 uint64_t s_replacementCacheBytes = 0;
+DirectorySignature s_lastDirectorySignature;
+uint32_t s_lastAutoRefreshFrame = UINT32_MAX;
+bool s_autoRefreshEnabled = false;
 constexpr uint64_t kReplacementCacheBudgetBytes = 4294967296; // 4GB, reasonable for modern hardware?
+constexpr uint32_t kAutoRefreshPollFrames = 30;
 constexpr uint64_t kReplacementWildcardTextureHash = 0xFFFFFFFFFFFFFFFFull;
 constexpr uint64_t kReplacementWildcardTlutHash = 0xFFFFFFFFFFFFFFFEull;
 
@@ -153,12 +167,84 @@ bool is_pbr_sidecar(std::string_view stem) noexcept {
          ends_with_ascii_ci(stem, "_emissive") || ends_with_ascii_ci(stem, "_e");
 }
 
+bool is_supported_replacement_extension(const std::filesystem::path& path) noexcept {
+  const auto extension = fs_path_to_string(path.extension());
+  return iequals_ascii(extension, ".dds") || iequals_ascii(extension, ".png");
+}
+
 std::string to_lower_ascii(std::string_view text) {
   std::string out{text};
   for (char& ch : out) {
     ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
   }
   return out;
+}
+
+void mix_signature_value(uint64_t& hash, uint64_t value) noexcept {
+  hash ^= value + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+}
+
+DirectorySignature compute_directory_signature() noexcept {
+  DirectorySignature signature{.hash = 0xcbf29ce484222325ull, .fileCount = 0, .valid = false};
+  if (s_replacementRoot.empty()) {
+    return signature;
+  }
+
+  std::error_code ec;
+  if (!std::filesystem::is_directory(s_replacementRoot, ec)) {
+    return signature;
+  }
+
+  signature.valid = true;
+  for (std::filesystem::recursive_directory_iterator it(
+           s_replacementRoot,
+           std::filesystem::directory_options::skip_permission_denied |
+               std::filesystem::directory_options::follow_directory_symlink,
+           ec);
+       !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+    if (!it->is_regular_file(ec)) {
+      continue;
+    }
+
+    const auto& path = it->path();
+    if (is_relative_to(path, s_dumpRoot) || !is_supported_replacement_extension(path)) {
+      continue;
+    }
+
+    const auto pathString = fs_path_to_string(path.lexically_relative(s_replacementRoot));
+    const uint64_t pathHash = XXH64(pathString.data(), pathString.size(), 0);
+    const uint64_t fileSize = std::filesystem::file_size(path, ec);
+    if (ec) {
+      ec.clear();
+      continue;
+    }
+    const auto writeTime = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+      ec.clear();
+      continue;
+    }
+    const uint64_t writeTicks = static_cast<uint64_t>(writeTime.time_since_epoch().count());
+
+    mix_signature_value(signature.hash, pathHash);
+    mix_signature_value(signature.hash, fileSize);
+    mix_signature_value(signature.hash, writeTicks);
+    ++signature.fileCount;
+  }
+
+  return signature;
+}
+
+void clear_replacement_index_and_caches() noexcept {
+  s_replacementIndex.clear();
+  s_replacementCache.clear();
+  s_namedPbrTextureIndex.clear();
+  s_namedPbrTextureCache.clear();
+  s_debugPreviewTextureCache.clear();
+  s_failedKeys.clear();
+  s_failedNamedPbrTextures.clear();
+  s_reportedMisses.clear();
+  s_replacementLru.clear();
+  s_replacementCacheBytes = 0;
 }
 
 std::optional<std::filesystem::path> find_sibling_sidecar(
@@ -459,7 +545,7 @@ std::optional<ParsedReplacementFilename> parse_replacement_filename(std::string_
 }
 
 static std::optional<ConvertedTexture> load_texture_file(const std::filesystem::path& path) {
-  if (path.extension() == ".png") {
+  if (iequals_ascii(fs_path_to_string(path.extension()), ".png")) {
     return png::load_png_file(path);
   } else {
     return dds::load_dds_file(path);
@@ -612,7 +698,7 @@ void build_index() noexcept {
       continue;
     }
 
-    if (!iequals_ascii(fs_path_to_string(path.extension()), ".dds") && !iequals_ascii(fs_path_to_string(path.extension()), ".png")) {
+    if (!is_supported_replacement_extension(path)) {
       continue;
     }
 
@@ -698,6 +784,57 @@ const gfx::TextureHandle* find_cached_replacement(const RuntimeTextureKey& key) 
   return &cached->second.handle;
 }
 
+std::string texture_format_name(wgpu::TextureFormat format) {
+  switch (format) {
+  case wgpu::TextureFormat::RGBA8Unorm:
+    return "RGBA8Unorm";
+  case wgpu::TextureFormat::BGRA8Unorm:
+    return "BGRA8Unorm";
+  case wgpu::TextureFormat::BC1RGBAUnorm:
+    return "BC1RGBAUnorm";
+  case wgpu::TextureFormat::BC3RGBAUnorm:
+    return "BC3RGBAUnorm";
+  case wgpu::TextureFormat::BC5RGUnorm:
+    return "BC5RGUnorm";
+  case wgpu::TextureFormat::BC7RGBAUnorm:
+    return "BC7RGBAUnorm";
+  case wgpu::TextureFormat::Undefined:
+    return "Undefined";
+  default:
+    return fmt::format("TextureFormat({})", static_cast<uint32_t>(format));
+  }
+}
+
+gfx::TextureHandle upload_converted_texture(const ConvertedTexture& replacement, std::string_view label) noexcept {
+  const wgpu::Extent3D size{
+      .width = replacement.width,
+      .height = replacement.height,
+      .depthOrArrayLayers = 1,
+  };
+  const wgpu::TextureDescriptor textureDescriptor{
+      .label = label.data(),
+      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
+      .dimension = wgpu::TextureDimension::e2D,
+      .size = size,
+      .format = replacement.format,
+      .mipLevelCount = replacement.mips,
+      .sampleCount = 1,
+  };
+  auto texture = g_device.CreateTexture(&textureDescriptor);
+  const auto viewLabel = fmt::format("{} view", label);
+  const wgpu::TextureViewDescriptor textureViewDescriptor{
+      .label = viewLabel.c_str(),
+      .format = replacement.format,
+      .dimension = wgpu::TextureViewDimension::e2D,
+      .mipLevelCount = replacement.mips,
+  };
+  auto textureView = texture.CreateView(&textureViewDescriptor);
+  auto handle = std::make_shared<gfx::TextureRef>(std::move(texture), std::move(textureView), wgpu::TextureView{}, size,
+                                                  replacement.format, replacement.mips, gfx::InvalidTextureFormat);
+  gfx::write_texture(*handle, replacement.data);
+  return handle;
+}
+
 gfx::TextureHandle load_texture_file(const RuntimeTextureKey& key, const std::filesystem::path& path, bool hasMips,
                                      std::string_view labelPrefix, bool reportFailure) noexcept {
   const auto replacement = load_replacement(path, hasMips);
@@ -709,33 +846,7 @@ gfx::TextureHandle load_texture_file(const RuntimeTextureKey& key, const std::fi
   }
 
   const auto label = fmt::format("{} {}", labelPrefix, fs_path_to_string(path.filename().string()));
-  const wgpu::Extent3D size{
-      .width = replacement->width,
-      .height = replacement->height,
-      .depthOrArrayLayers = 1,
-  };
-  const wgpu::TextureDescriptor textureDescriptor{
-      .label = label.c_str(),
-      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
-      .dimension = wgpu::TextureDimension::e2D,
-      .size = size,
-      .format = replacement->format,
-      .mipLevelCount = replacement->mips,
-      .sampleCount = 1,
-  };
-  auto texture = g_device.CreateTexture(&textureDescriptor);
-  const auto viewLabel = fmt::format("{} view", label);
-  const wgpu::TextureViewDescriptor textureViewDescriptor{
-      .label = viewLabel.c_str(),
-      .format = replacement->format,
-      .dimension = wgpu::TextureViewDimension::e2D,
-      .mipLevelCount = replacement->mips,
-  };
-  auto textureView = texture.CreateView(&textureViewDescriptor);
-  auto handle = std::make_shared<gfx::TextureRef>(std::move(texture), std::move(textureView), wgpu::TextureView{}, size,
-                                                  replacement->format, replacement->mips, gfx::InvalidTextureFormat);
-  gfx::write_texture(*handle, replacement->data);
-  return handle;
+  return upload_converted_texture(*replacement, label);
 }
 
 gfx::TextureHandle load_named_texture_file(const std::filesystem::path& path) noexcept {
@@ -746,33 +857,7 @@ gfx::TextureHandle load_named_texture_file(const std::filesystem::path& path) no
   }
 
   const auto label = fmt::format("TextureReplacement Named PBR {}", fs_path_to_string(path.filename().string()));
-  const wgpu::Extent3D size{
-      .width = replacement->width,
-      .height = replacement->height,
-      .depthOrArrayLayers = 1,
-  };
-  const wgpu::TextureDescriptor textureDescriptor{
-      .label = label.c_str(),
-      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
-      .dimension = wgpu::TextureDimension::e2D,
-      .size = size,
-      .format = replacement->format,
-      .mipLevelCount = replacement->mips,
-      .sampleCount = 1,
-  };
-  auto texture = g_device.CreateTexture(&textureDescriptor);
-  const auto viewLabel = fmt::format("{} view", label);
-  const wgpu::TextureViewDescriptor textureViewDescriptor{
-      .label = viewLabel.c_str(),
-      .format = replacement->format,
-      .dimension = wgpu::TextureViewDimension::e2D,
-      .mipLevelCount = replacement->mips,
-  };
-  auto textureView = texture.CreateView(&textureViewDescriptor);
-  auto handle = std::make_shared<gfx::TextureRef>(std::move(texture), std::move(textureView), wgpu::TextureView{}, size,
-                                                  replacement->format, replacement->mips, gfx::InvalidTextureFormat);
-  gfx::write_texture(*handle, replacement->data);
-  return handle;
+  return upload_converted_texture(*replacement, label);
 }
 
 gfx::TextureHandle load_replacement_texture(const RuntimeTextureKey& key, const ReplacementPaths& paths) noexcept {
@@ -877,13 +962,302 @@ bool report_missing_key(const RuntimeTextureKey& key, const GXTexObj_& obj) noex
   return true;
 }
 
-void initialize() noexcept { build_index(); }
+constexpr size_t debug_map_slot_index(DebugMapSlot slot) noexcept { return static_cast<size_t>(slot); }
+
+std::filesystem::path debug_make_relative_path(const std::filesystem::path& path) {
+  if (!s_replacementRoot.empty() && is_relative_to(path, s_replacementRoot)) {
+    return path.lexically_relative(s_replacementRoot);
+  }
+  return path;
+}
+
+std::filesystem::path debug_directory_for_path(const std::filesystem::path& path) {
+  const auto relative = debug_make_relative_path(path.parent_path());
+  return relative.empty() ? std::filesystem::path{"."} : relative;
+}
+
+std::string debug_path_key(const std::filesystem::path& path) {
+  return to_lower_ascii(fs_path_to_string(path.lexically_normal()));
+}
+
+bool debug_has_any_pbr_map(const ReplacementPaths& paths) noexcept {
+  return !paths.rmaos.empty() || !paths.roughness.empty() || !paths.metallic.empty() || !paths.ao.empty() ||
+         !paths.specular.empty() || !paths.normal.empty() || !paths.emissive.empty();
+}
+
+void debug_set_map(DebugMaterialInfo& info, DebugMapSlot slot, const std::filesystem::path& path) {
+  info.maps[debug_map_slot_index(slot)] = path;
+}
+
+void debug_add_attached_sidecar_paths(absl::flat_hash_set<std::string>& out) {
+  const auto add = [&](const std::filesystem::path& path) {
+    if (!path.empty()) {
+      out.insert(debug_path_key(path));
+    }
+  };
+
+  for (const auto& [key, paths] : s_replacementIndex) {
+    (void)key;
+    add(paths.rmaos);
+    add(paths.roughness);
+    add(paths.metallic);
+    add(paths.ao);
+    add(paths.specular);
+    add(paths.normal);
+    add(paths.emissive);
+  }
+}
+
+std::optional<std::pair<std::string, DebugMapSlot>> debug_split_sidecar_stem(std::string_view stem) {
+  constexpr std::array<std::pair<std::string_view, DebugMapSlot>, 12> suffixes{{
+      {"_roughness", DebugMapSlot::Roughness},
+      {"_metallic", DebugMapSlot::Metallic},
+      {"_specular", DebugMapSlot::Specular},
+      {"_emissive", DebugMapSlot::Emissive},
+      {"_rmaos", DebugMapSlot::Rmaos},
+      {"_rough", DebugMapSlot::Roughness},
+      {"_metal", DebugMapSlot::Metallic},
+      {"_normal", DebugMapSlot::Normal},
+      {"_spec", DebugMapSlot::Specular},
+      {"_ao", DebugMapSlot::Ao},
+      {"_n", DebugMapSlot::Normal},
+      {"_e", DebugMapSlot::Emissive},
+  }};
+
+  for (const auto& [suffix, slot] : suffixes) {
+    if (ends_with_ascii_ci(stem, suffix)) {
+      return std::pair{std::string{stem.substr(0, stem.size() - suffix.size())}, slot};
+    }
+  }
+  return std::nullopt;
+}
+
+std::vector<DebugMaterialInfo> debug_collect_named_pbr_materials(
+    const absl::flat_hash_set<std::string>& attachedSidecars) {
+  absl::flat_hash_set<std::string> uniquePaths;
+  absl::flat_hash_map<std::string, DebugMaterialInfo> groups;
+
+  for (const auto& [name, path] : s_namedPbrTextureIndex) {
+    (void)name;
+    const auto pathKey = debug_path_key(path);
+    if (!uniquePaths.insert(pathKey).second || attachedSidecars.contains(pathKey)) {
+      continue;
+    }
+
+    const auto split = debug_split_sidecar_stem(to_lower_ascii(path.stem().string()));
+    if (!split.has_value() || split->first.empty()) {
+      continue;
+    }
+
+    const std::string groupKey = fmt::format("{}|{}", debug_path_key(path.parent_path()), split->first);
+    auto [it, inserted] = groups.try_emplace(groupKey);
+    if (inserted) {
+      auto& info = it->second;
+      info.kind = DebugMaterialKind::NamedPbr;
+      info.name = split->first;
+      info.directory = debug_directory_for_path(path);
+    }
+    debug_set_map(it->second, split->second, path);
+  }
+
+  std::vector<DebugMaterialInfo> out;
+  out.reserve(groups.size());
+  for (auto& [key, info] : groups) {
+    (void)key;
+    out.push_back(std::move(info));
+  }
+  return out;
+}
+
+uint32_t debug_unique_named_pbr_texture_count() {
+  absl::flat_hash_set<std::string> uniquePaths;
+  for (const auto& [name, path] : s_namedPbrTextureIndex) {
+    (void)name;
+    uniquePaths.insert(debug_path_key(path));
+  }
+  return static_cast<uint32_t>(uniquePaths.size());
+}
+
+std::vector<DebugMaterialInfo> debug_collect_materials() {
+  std::vector<DebugMaterialInfo> out;
+  out.reserve(s_replacementIndex.size());
+
+  for (const auto& [key, paths] : s_replacementIndex) {
+    DebugMaterialInfo info;
+    info.kind = DebugMaterialKind::Replacement;
+    info.name = fs_path_to_string(paths.base.filename());
+    info.directory = debug_directory_for_path(paths.base);
+    debug_set_map(info, DebugMapSlot::Base, paths.base);
+    debug_set_map(info, DebugMapSlot::Rmaos, paths.rmaos);
+    debug_set_map(info, DebugMapSlot::Roughness, paths.roughness);
+    debug_set_map(info, DebugMapSlot::Metallic, paths.metallic);
+    debug_set_map(info, DebugMapSlot::Ao, paths.ao);
+    debug_set_map(info, DebugMapSlot::Specular, paths.specular);
+    debug_set_map(info, DebugMapSlot::Normal, paths.normal);
+    debug_set_map(info, DebugMapSlot::Emissive, paths.emissive);
+    info.textureHash = key.textureHash;
+    info.tlutHash = key.tlutHash;
+    info.width = key.width;
+    info.height = key.height;
+    info.format = key.format;
+    info.hasTlut = key.hasTlut;
+    info.hasMips = paths.hasMips;
+    info.cached = s_replacementCache.contains(key);
+    info.failed = s_failedKeys.contains(key);
+    info.reportedMissing = s_reportedMisses.contains(key);
+    info.textureHashWildcard = key.textureHash == kReplacementWildcardTextureHash;
+    info.tlutHashWildcard = key.tlutHash == kReplacementWildcardTlutHash;
+    out.push_back(std::move(info));
+  }
+
+  absl::flat_hash_set<std::string> attachedSidecars;
+  debug_add_attached_sidecar_paths(attachedSidecars);
+  auto namedMaterials = debug_collect_named_pbr_materials(attachedSidecars);
+  out.insert(out.end(), std::make_move_iterator(namedMaterials.begin()), std::make_move_iterator(namedMaterials.end()));
+
+  std::sort(out.begin(), out.end(), [](const DebugMaterialInfo& lhs, const DebugMaterialInfo& rhs) {
+    const auto lhsDir = fs_path_to_string(lhs.directory);
+    const auto rhsDir = fs_path_to_string(rhs.directory);
+    if (lhsDir != rhsDir) {
+      return lhsDir < rhsDir;
+    }
+    if (lhs.name != rhs.name) {
+      return lhs.name < rhs.name;
+    }
+    return static_cast<uint8_t>(lhs.kind) < static_cast<uint8_t>(rhs.kind);
+  });
+  return out;
+}
+
+DebugInventoryStats debug_inventory_stats() {
+  DebugInventoryStats stats;
+  stats.replacementRoot = s_replacementRoot;
+  stats.dumpRoot = s_dumpRoot;
+  stats.indexedReplacementCount = static_cast<uint32_t>(s_replacementIndex.size());
+  stats.cachedReplacementCount = static_cast<uint32_t>(s_replacementCache.size());
+  stats.failedReplacementCount = static_cast<uint32_t>(s_failedKeys.size());
+  stats.reportedMissingCount = static_cast<uint32_t>(s_reportedMisses.size());
+  stats.cachedReplacementBytes = s_replacementCacheBytes;
+  stats.autoRefreshEnabled = s_autoRefreshEnabled;
+  stats.directorySignatureValid = s_lastDirectorySignature.valid;
+  stats.watchedFileCount = s_lastDirectorySignature.fileCount;
+  stats.namedPbrTextureCount = debug_unique_named_pbr_texture_count();
+
+  for (const auto& [key, paths] : s_replacementIndex) {
+    (void)key;
+    if (debug_has_any_pbr_map(paths)) {
+      ++stats.pbrReplacementCount;
+    }
+  }
+
+  absl::flat_hash_set<std::string> attachedSidecars;
+  debug_add_attached_sidecar_paths(attachedSidecars);
+  stats.namedPbrMaterialCount = static_cast<uint32_t>(debug_collect_named_pbr_materials(attachedSidecars).size());
+  return stats;
+}
+
+DebugTexturePreview debug_load_texture_preview(const std::filesystem::path& path) {
+  DebugTexturePreview preview;
+  if (path.empty()) {
+    preview.error = "No texture path";
+    return preview;
+  }
+  if (!is_supported_replacement_extension(path)) {
+    preview.error = "Unsupported texture extension";
+    return preview;
+  }
+
+  const std::string cacheKey = debug_path_key(path);
+  if (const auto it = s_debugPreviewTextureCache.find(cacheKey); it != s_debugPreviewTextureCache.end() && it->second) {
+    const auto& handle = it->second;
+    preview.width = handle->size.width;
+    preview.height = handle->size.height;
+    preview.mipCount = handle->mipCount;
+    preview.byteSize = calc_texture_size(handle->format, handle->size.width, handle->size.height, handle->mipCount);
+    preview.formatName = texture_format_name(handle->format);
+    preview.textureId = reinterpret_cast<ImTextureID>(handle->sampleTextureView.Get());
+    return preview;
+  }
+
+  const auto converted = load_replacement(path, false);
+  if (!converted.has_value()) {
+    preview.error = "Failed to load texture";
+    return preview;
+  }
+
+  const auto label = fmt::format("TextureReplacement Debug {}", fs_path_to_string(path.filename()));
+  preview.width = converted->width;
+  preview.height = converted->height;
+  preview.mipCount = converted->mips;
+  preview.byteSize = calc_texture_size(converted->format, converted->width, converted->height, converted->mips);
+  preview.formatName = texture_format_name(converted->format);
+  auto texture = upload_converted_texture(*converted, label);
+  if (!texture) {
+    preview.error = "Failed to upload texture preview";
+    return preview;
+  }
+  preview.textureId = reinterpret_cast<ImTextureID>(texture->sampleTextureView.Get());
+  s_debugPreviewTextureCache[cacheKey] = std::move(texture);
+  return preview;
+}
+
+void debug_clear_preview_cache() { s_debugPreviewTextureCache.clear(); }
+
+void initialize() noexcept {
+  build_index();
+  s_lastDirectorySignature = compute_directory_signature();
+  s_lastAutoRefreshFrame = UINT32_MAX;
+}
+
+void refresh() noexcept {
+  if (!g_config.allowTextureReplacements) {
+    clear_replacement_index_and_caches();
+    s_lastDirectorySignature = {};
+    return;
+  }
+
+  clear_replacement_index_and_caches();
+  build_index();
+  s_lastDirectorySignature = compute_directory_signature();
+  Log.info("Refreshed texture replacements");
+}
+
+void set_auto_refresh(bool enabled) noexcept { s_autoRefreshEnabled = enabled; }
+
+bool auto_refresh_enabled() noexcept { return s_autoRefreshEnabled; }
+
+bool update_auto_refresh(uint32_t frame) noexcept {
+  if (!s_autoRefreshEnabled || !g_config.allowTextureReplacements) {
+    return false;
+  }
+
+  if (s_lastAutoRefreshFrame != UINT32_MAX && frame - s_lastAutoRefreshFrame < kAutoRefreshPollFrames) {
+    return false;
+  }
+  s_lastAutoRefreshFrame = frame;
+
+  const DirectorySignature currentSignature = compute_directory_signature();
+  if (!currentSignature.valid) {
+    return false;
+  }
+  if (!s_lastDirectorySignature.valid) {
+    s_lastDirectorySignature = currentSignature;
+    return false;
+  }
+  if (currentSignature == s_lastDirectorySignature) {
+    return false;
+  }
+
+  refresh();
+  return true;
+}
 
 void shutdown() noexcept {
   s_replacementIndex.clear();
   s_replacementCache.clear();
   s_namedPbrTextureIndex.clear();
   s_namedPbrTextureCache.clear();
+  s_debugPreviewTextureCache.clear();
   s_failedKeys.clear();
   s_failedNamedPbrTextures.clear();
   s_reportedMisses.clear();
@@ -893,6 +1267,8 @@ void shutdown() noexcept {
   }
   s_replacementLru.clear();
   s_replacementCacheBytes = 0;
+  s_lastDirectorySignature = {};
+  s_lastAutoRefreshFrame = UINT32_MAX;
   s_replacementRoot.clear();
   s_dumpRoot.clear();
 }
@@ -959,8 +1335,15 @@ std::optional<TextureHandle> find_named_pbr_texture(std::string_view name) noexc
   }
 
   auto pathIt = s_namedPbrTextureIndex.find(key);
-  if (pathIt == s_namedPbrTextureIndex.end() && !ends_with_ascii_ci(key, ".dds")) {
-    pathIt = s_namedPbrTextureIndex.find(key + ".dds");
+  if (pathIt == s_namedPbrTextureIndex.end() &&
+      (ends_with_ascii_ci(key, ".dds") || ends_with_ascii_ci(key, ".png"))) {
+    pathIt = s_namedPbrTextureIndex.find(key.substr(0, key.size() - 4));
+  }
+  if (pathIt == s_namedPbrTextureIndex.end() && !ends_with_ascii_ci(key, ".dds") &&
+      !ends_with_ascii_ci(key, ".png")) {
+    if (pathIt = s_namedPbrTextureIndex.find(key + ".dds"); pathIt == s_namedPbrTextureIndex.end()) {
+      pathIt = s_namedPbrTextureIndex.find(key + ".png");
+    }
   }
   if (pathIt == s_namedPbrTextureIndex.end()) {
     return std::nullopt;
