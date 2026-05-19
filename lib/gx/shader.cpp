@@ -5,6 +5,7 @@
 #include "gx.hpp"
 #include "gx_fmt.hpp"
 #include "shader_info.hpp"
+#include "stochastic_sampling.hpp"
 
 #include <dolphin/gx/GXEnum.h>
 
@@ -1359,9 +1360,8 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
       // No indirect texturing
       uvIn = fmt::format("tex{0}_uv", underlying(stage.texCoordId));
     }
-    fragmentFnPre +=
-        fmt::format("\n    var sampled{0} = textureSampleBias(tex{1}, tex{1}_samp, {2}, ubuf.tex{1}_size_bias.z);", i,
-                    underlying(stage.texMapId), uvIn);
+    fragmentFnPre += fmt::format("\n    var sampled{0} = {1};", i,
+                                  sampled_texture_expr(underlying(stage.texMapId), uvIn));
   }
   if (info.usesPTTexMtx.any())
     uniBufAttrs += fmt::format("\n    postmtx: array<mat3x4f, {}>,", MaxPTTexMtx);
@@ -1415,6 +1415,7 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
       continue;
     }
     uniBufAttrs += fmt::format("\n    tex{}_size_bias: vec4f,", i);
+    uniBufAttrs += fmt::format("\n    tex{}_stochastic_params: vec4f,", i);
     texBindings += fmt::format(
         "\n@group(2) @binding({1})\n"
         "var tex{0}: texture_2d<f32>;\n"
@@ -1454,6 +1455,7 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
   if constexpr (EnableNormalVisualization) {
     fragmentFn += "\n    prev = vec4f(in.nrm, prev.a);";
   }
+  uniformPre += stochastic_sampling_wgsl();
 
   const auto shaderSource = fmt::format(R"""(
 fn bswap32(v: u32, le: bool) -> u32 {{

@@ -2,6 +2,7 @@
 
 #include <cmath>
 
+#include "../gfx/texture_sampling.hpp"
 #include <tracy/Tracy.hpp>
 
 namespace aurora::gx {
@@ -12,17 +13,6 @@ namespace {
 Module Log("aurora::gx");
 
 bool is_alpha_bump_channel(GXChannelID id) { return id == GX_ALPHA_BUMP || id == GX_ALPHA_BUMPN; }
-
-Vec4<float> texture_size_bias(const gfx::TextureBind& tex) {
-  auto width = static_cast<float>(tex.texObj.width());
-  auto height = static_cast<float>(tex.texObj.height());
-  const auto vpBias =
-      enableLodBias && tex.ref && tex.ref->hasArbitraryMips
-          ? log2(std::min(g_gxState.renderViewport.width / std::max(g_gxState.logicalViewport.width, 1.f),
-                          g_gxState.renderViewport.height / std::max(g_gxState.logicalViewport.height, 1.f)))
-          : 0.f;
-  return {width, height, tex.texObj.lod_bias() + vpBias, 0.0f};
-}
 
 void color_arg_reg_info(GXTevColorArg arg, const TevStage& stage, ShaderInfo& info) {
   switch (arg) {
@@ -306,7 +296,7 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
   if (info.usedIndTexMtxs.any()) {
     info.uniformSize += MaxIndTexMtxs * sizeof(Mat2x4<float>);
   }
-  info.uniformSize += info.sampledTextures.count() * sizeof(Vec4<float>);
+  info.uniformSize += info.sampledTextures.count() * sizeof(Vec4<float>) * 2;
   info.uniformSize = gfx::align_uniform(info.uniformSize);
   if (info.uniformSize > MaxUniformSize) {
     Log.fatal("Uniform size exceeds maximum: {} > {}", info.uniformSize, MaxUniformSize);
@@ -456,7 +446,8 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
     }
     const auto& tex = get_texture(static_cast<GXTexMapID>(i));
     // CHECK(tex, "unbound texture {}", i);
-    buf.append(texture_size_bias(tex));
+    buf.append(gfx::texture_size_bias_sampling_params(tex));
+    buf.append(gfx::texture_stochastic_sampling_params(tex));
   }
   g_gxState.stateDirty = false;
   return range;

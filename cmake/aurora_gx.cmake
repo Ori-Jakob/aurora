@@ -15,6 +15,7 @@ add_library(aurora_gx STATIC
         lib/gx/gx.cpp
         lib/gx/pipeline.cpp
         lib/gx/shader.cpp
+        lib/gx/stochastic_sampling.cpp
         lib/gx/shader_info.cpp
         lib/dolphin/gx/GXBump.cpp
         lib/dolphin/gx/GXCull.cpp
