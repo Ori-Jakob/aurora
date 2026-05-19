@@ -841,21 +841,28 @@ ReplacementIndexEntry* replacement_entry_at(uint32_t index, const RuntimeTexture
   return &it->second;
 }
 
-std::optional<AuroraTextureReplacementEntryInfo> replacement_entry_info(uint32_t index) noexcept {
+AuroraTextureReplacementEntryInfo make_entry_info(const RuntimeTextureKey& key) noexcept {
+  return {
+      .original_width = key.width,
+      .original_height = key.height,
+      .original_format = key.format,
+      .has_tlut = key.hasTlut ? GX_TRUE : GX_FALSE,
+  };
+}
+
+std::optional<AuroraTextureReplacementEntryInfo> replacement_entry_info(uint32_t index, bool loadReplacement) noexcept {
   const RuntimeTextureKey* key = nullptr;
   auto* entry = replacement_entry_at(index, &key);
   if (entry == nullptr || key == nullptr) {
     return std::nullopt;
   }
 
-  if (!entry->loadedDebugInfo) {
-    entry->debugInfo = {
-        .original_width = key->width,
-        .original_height = key->height,
-        .original_format = key->format,
-        .has_tlut = key->hasTlut ? GX_TRUE : GX_FALSE,
-    };
+  if (!loadReplacement && !entry->loadedDebugInfo) {
+    return make_entry_info(*key);
+  }
 
+  if (!entry->loadedDebugInfo) {
+    entry->debugInfo = make_entry_info(*key);
     const auto replacement = load_replacement(*entry);
     if (replacement.has_value()) {
       entry->debugInfo.replacement_width = replacement->width;
@@ -943,7 +950,22 @@ GXBool AuroraGetTextureReplacementEntryInfo(u32 index, AuroraTextureReplacementE
     return GX_FALSE;
   }
 
-  const auto info = aurora::gfx::texture_replacement::replacement_entry_info(index);
+  const auto info = aurora::gfx::texture_replacement::replacement_entry_info(index, false);
+  if (!info.has_value()) {
+    *out_info = {};
+    return GX_FALSE;
+  }
+
+  *out_info = *info;
+  return GX_TRUE;
+}
+
+GXBool AuroraLoadTextureReplacementEntryInfo(u32 index, AuroraTextureReplacementEntryInfo* out_info) {
+  if (out_info == nullptr) {
+    return GX_FALSE;
+  }
+
+  const auto info = aurora::gfx::texture_replacement::replacement_entry_info(index, true);
   if (!info.has_value()) {
     *out_info = {};
     return GX_FALSE;

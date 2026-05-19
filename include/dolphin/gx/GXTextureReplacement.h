@@ -25,6 +25,7 @@ u32 AuroraGetTexObjTextureReplacementName(const GXTexObj* obj, char* out, u32 ou
 u32 AuroraGetTextureReplacementRootPath(char* out, u32 out_size);
 u32 AuroraGetTextureReplacementEntryCount(void);
 GXBool AuroraGetTextureReplacementEntryInfo(u32 index, AuroraTextureReplacementEntryInfo* out_info);
+GXBool AuroraLoadTextureReplacementEntryInfo(u32 index, AuroraTextureReplacementEntryInfo* out_info);
 u32 AuroraGetTextureReplacementEntryName(u32 index, char* out, u32 out_size);
 u32 AuroraGetTextureReplacementEntryPath(u32 index, char* out, u32 out_size);
 
