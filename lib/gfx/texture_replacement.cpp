@@ -21,6 +21,8 @@
 #include <optional>
 #include <string_view>
 
+#include <dolphin/gx/GXTextureReplacement.h>
+
 #include "png_io.hpp"
 #include "../fs_helper.hpp"
 
@@ -784,9 +786,69 @@ std::optional<TextureHandle> find_replacement(const GXTexObj_& obj) noexcept {
   return handle;
 }
 
+std::optional<std::filesystem::path> find_replacement_file(const GXTexObj_& obj) noexcept {
+  if (!g_config.allowTextureReplacements) {
+    return std::nullopt;
+  }
+
+  const RuntimeTextureKey key = build_runtime_key(obj);
+  const auto* path = find_replacement_path(key);
+  if (path == nullptr) {
+    return std::nullopt;
+  }
+  return path->path;
+}
+
 std::string build_texture_replacement_name(const GXTexObj_& obj) noexcept {
   const RuntimeTextureKey key = build_runtime_key(obj);
   return format_replacement_filename(key);
 }
 
 } // namespace aurora::gfx::texture_replacement
+
+namespace {
+u32 copy_result_string(std::string_view value, char* out, u32 outSize) noexcept {
+  if (out != nullptr && outSize > 0) {
+    const size_t copySize = std::min(value.size(), static_cast<size_t>(outSize - 1));
+    std::memcpy(out, value.data(), copySize);
+    out[copySize] = '\0';
+  }
+  return static_cast<u32>(value.size());
+}
+} // namespace
+
+extern "C" {
+u32 AuroraGetTexObjTextureReplacementPath(const GXTexObj* obj_, char* out, u32 out_size) {
+  if (obj_ == nullptr) {
+    if (out != nullptr && out_size > 0) {
+      out[0] = '\0';
+    }
+    return 0;
+  }
+
+  const auto* obj = reinterpret_cast<const GXTexObj_*>(obj_);
+  const auto path = aurora::gfx::texture_replacement::find_replacement_file(*obj);
+  if (!path.has_value()) {
+    if (out != nullptr && out_size > 0) {
+      out[0] = '\0';
+    }
+    return 0;
+  }
+
+  const std::string pathString = fs_path_to_string(*path);
+  return copy_result_string(pathString, out, out_size);
+}
+
+u32 AuroraGetTexObjTextureReplacementName(const GXTexObj* obj_, char* out, u32 out_size) {
+  if (obj_ == nullptr) {
+    if (out != nullptr && out_size > 0) {
+      out[0] = '\0';
+    }
+    return 0;
+  }
+
+  const auto* obj = reinterpret_cast<const GXTexObj_*>(obj_);
+  const std::string name = aurora::gfx::texture_replacement::build_texture_replacement_name(*obj);
+  return copy_result_string(name, out, out_size);
+}
+}
