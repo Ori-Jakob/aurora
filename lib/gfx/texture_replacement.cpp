@@ -20,6 +20,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 #include <dolphin/gx/GXTextureReplacement.h>
 
@@ -64,9 +65,12 @@ struct CachedReplacement {
 
 struct ReplacementIndexEntry {
   std::filesystem::path path;
+  bool loadedDebugInfo = false;
+  AuroraTextureReplacementEntryInfo debugInfo{};
 };
 
 absl::flat_hash_map<RuntimeTextureKey, ReplacementIndexEntry> s_replacementIndex;
+std::vector<RuntimeTextureKey> s_replacementIndexOrder;
 absl::flat_hash_map<RuntimeTextureKey, CachedReplacement> s_replacementCache;
 absl::flat_hash_set<RuntimeTextureKey> s_failedKeys;
 absl::flat_hash_set<RuntimeTextureKey> s_reportedMisses;
@@ -565,8 +569,21 @@ void build_index() noexcept {
       continue;
     }
 
-    s_replacementIndex.try_emplace(*parsed, path);
+    const auto [_, inserted] = s_replacementIndex.try_emplace(*parsed, ReplacementIndexEntry{.path = path});
+    if (inserted) {
+      s_replacementIndexOrder.push_back(*parsed);
+    }
   }
+
+  std::sort(s_replacementIndexOrder.begin(), s_replacementIndexOrder.end(),
+            [](const RuntimeTextureKey& lhs, const RuntimeTextureKey& rhs) {
+              const auto lhsIt = s_replacementIndex.find(lhs);
+              const auto rhsIt = s_replacementIndex.find(rhs);
+              if (lhsIt == s_replacementIndex.end() || rhsIt == s_replacementIndex.end()) {
+                return format_replacement_filename(lhs) < format_replacement_filename(rhs);
+              }
+              return fs_path_to_string(lhsIt->second.path) < fs_path_to_string(rhsIt->second.path);
+            });
 
   Log.info("Indexed {} texture replacements", s_replacementIndex.size());
 }
@@ -692,6 +709,7 @@ bool report_missing_key(const RuntimeTextureKey& key, const GXTexObj_& obj) noex
 
 void clear_replacement_runtime_state() noexcept {
   s_replacementIndex.clear();
+  s_replacementIndexOrder.clear();
   s_replacementCache.clear();
   s_failedKeys.clear();
   s_reportedMisses.clear();
@@ -804,6 +822,65 @@ std::string build_texture_replacement_name(const GXTexObj_& obj) noexcept {
   return format_replacement_filename(key);
 }
 
+uint32_t replacement_entry_count() noexcept { return static_cast<uint32_t>(s_replacementIndexOrder.size()); }
+
+ReplacementIndexEntry* replacement_entry_at(uint32_t index, const RuntimeTextureKey** outKey = nullptr) noexcept {
+  if (index >= s_replacementIndexOrder.size()) {
+    return nullptr;
+  }
+
+  const auto& key = s_replacementIndexOrder[index];
+  if (outKey != nullptr) {
+    *outKey = &key;
+  }
+
+  const auto it = s_replacementIndex.find(key);
+  if (it == s_replacementIndex.end()) {
+    return nullptr;
+  }
+  return &it->second;
+}
+
+std::optional<AuroraTextureReplacementEntryInfo> replacement_entry_info(uint32_t index) noexcept {
+  const RuntimeTextureKey* key = nullptr;
+  auto* entry = replacement_entry_at(index, &key);
+  if (entry == nullptr || key == nullptr) {
+    return std::nullopt;
+  }
+
+  if (!entry->loadedDebugInfo) {
+    entry->debugInfo = {
+        .original_width = key->width,
+        .original_height = key->height,
+        .original_format = key->format,
+        .has_tlut = key->hasTlut ? GX_TRUE : GX_FALSE,
+    };
+
+    const auto replacement = load_replacement(*entry);
+    if (replacement.has_value()) {
+      entry->debugInfo.replacement_width = replacement->width;
+      entry->debugInfo.replacement_height = replacement->height;
+      entry->debugInfo.replacement_mips = replacement->mips;
+      entry->debugInfo.has_replacement_info = GX_TRUE;
+      entry->debugInfo.has_arbitrary_mips = replacement->hasArbitraryMips ? GX_TRUE : GX_FALSE;
+    }
+
+    entry->loadedDebugInfo = true;
+  }
+
+  return entry->debugInfo;
+}
+
+std::optional<std::filesystem::path> replacement_entry_path(uint32_t index) noexcept {
+  auto* entry = replacement_entry_at(index);
+  if (entry == nullptr) {
+    return std::nullopt;
+  }
+  return entry->path;
+}
+
+const std::filesystem::path& replacement_root() noexcept { return s_replacementRoot; }
+
 } // namespace aurora::gfx::texture_replacement
 
 namespace {
@@ -850,5 +927,55 @@ u32 AuroraGetTexObjTextureReplacementName(const GXTexObj* obj_, char* out, u32 o
   const auto* obj = reinterpret_cast<const GXTexObj_*>(obj_);
   const std::string name = aurora::gfx::texture_replacement::build_texture_replacement_name(*obj);
   return copy_result_string(name, out, out_size);
+}
+
+u32 AuroraGetTextureReplacementRootPath(char* out, u32 out_size) {
+  const std::string pathString = fs_path_to_string(aurora::gfx::texture_replacement::replacement_root());
+  return copy_result_string(pathString, out, out_size);
+}
+
+u32 AuroraGetTextureReplacementEntryCount(void) {
+  return aurora::gfx::texture_replacement::replacement_entry_count();
+}
+
+GXBool AuroraGetTextureReplacementEntryInfo(u32 index, AuroraTextureReplacementEntryInfo* out_info) {
+  if (out_info == nullptr) {
+    return GX_FALSE;
+  }
+
+  const auto info = aurora::gfx::texture_replacement::replacement_entry_info(index);
+  if (!info.has_value()) {
+    *out_info = {};
+    return GX_FALSE;
+  }
+
+  *out_info = *info;
+  return GX_TRUE;
+}
+
+u32 AuroraGetTextureReplacementEntryName(u32 index, char* out, u32 out_size) {
+  const auto path = aurora::gfx::texture_replacement::replacement_entry_path(index);
+  if (!path.has_value()) {
+    if (out != nullptr && out_size > 0) {
+      out[0] = '\0';
+    }
+    return 0;
+  }
+
+  const std::string name = fs_path_to_string(path->filename());
+  return copy_result_string(name, out, out_size);
+}
+
+u32 AuroraGetTextureReplacementEntryPath(u32 index, char* out, u32 out_size) {
+  const auto path = aurora::gfx::texture_replacement::replacement_entry_path(index);
+  if (!path.has_value()) {
+    if (out != nullptr && out_size > 0) {
+      out[0] = '\0';
+    }
+    return 0;
+  }
+
+  const std::string pathString = fs_path_to_string(*path);
+  return copy_result_string(pathString, out, out_size);
 }
 }
