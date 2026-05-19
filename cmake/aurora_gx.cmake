@@ -9,6 +9,7 @@ add_library(aurora_gx STATIC
         lib/gfx/texture.cpp
         lib/gfx/texture_convert.cpp
         lib/gfx/texture_replacement.cpp
+        lib/gfx/texture_sampling.cpp
         lib/gx/command_processor.cpp
         lib/gx/fifo.cpp
         lib/gx/gx.cpp

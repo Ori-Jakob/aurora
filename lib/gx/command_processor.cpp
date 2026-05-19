@@ -1,6 +1,7 @@
 #include "command_processor.hpp"
 
 #include "../gfx/common.hpp"
+#include "../gfx/texture_sampling.hpp"
 #include "../gfx/texture_replacement.hpp"
 #include "dolphin/gx/GXAurora.h"
 #include "gx.hpp"
@@ -1736,17 +1737,12 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     pos += 4;
     slot.tlut = static_cast<GXTlut>(read_u32(data + pos, bigEndian));
     pos += 4;
-    if (data[pos] != 0) {
-      slot.flags |= 1u;
-    } else {
-      slot.flags &= ~1u;
-    }
+    slot.flags = data[pos] & ~gfx::TextureFlagNoCache;
     pos += 1;
     slot.texObjId = read_u32(data + pos, bigEndian);
     pos += 4;
     slot.texDataVersion = read_u32(data + pos, bigEndian);
     pos += 4;
-    slot.set_no_cache(false); // Reset no-cache flag
     g_gxState.stateDirty = true;
   } else if (subCmd == GX_LOAD_AURORA_TLUT) {
     CHECK(pos + 23 <= size, "GX_LOAD_AURORA_TLUT read overrun");

@@ -2,6 +2,7 @@
 #include "__gx.h"
 
 #include "../../gfx/texture.hpp"
+#include "../../gfx/texture_sampling.hpp"
 #include "../../gfx/texture_replacement.hpp"
 #include "dolphin/gx/GXAurora.h"
 
@@ -86,7 +87,7 @@ void emit_loaded_texobj_metadata(const GXTexObj_& obj, GXTexMapID id) {
   GX_WRITE_U32(obj.height());
   GX_WRITE_U32(obj.format());
   GX_WRITE_U32(static_cast<u32>(obj.tlut));
-  GX_WRITE_U8(static_cast<u8>(obj.has_mips()));
+  GX_WRITE_U8(obj.flags & ~aurora::gfx::TextureFlagNoCache);
   GX_WRITE_U32(obj.texObjId);
   GX_WRITE_U32(obj.texDataVersion);
 }

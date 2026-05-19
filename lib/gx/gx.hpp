@@ -387,6 +387,7 @@ struct ShaderInfo;
 
 void initialize() noexcept;
 void shutdown() noexcept;
+extern bool enableLodBias;
 void clear_static_texture_cache() noexcept;
 void clear_copy_texture_cache() noexcept;
 void evict_copy_texture(const void* dest) noexcept;

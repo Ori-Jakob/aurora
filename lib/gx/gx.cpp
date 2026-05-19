@@ -9,6 +9,7 @@
 #include "../gfx/texture.hpp"
 #include "../gfx/texture_convert.hpp"
 #include "../gfx/texture_replacement.hpp"
+#include "../gfx/texture_sampling.hpp"
 #include "gx_fmt.hpp"
 
 #include <absl/container/flat_hash_map.h>
@@ -332,6 +333,7 @@ void set_render_scissor(const gfx::ClipRect& scissor) noexcept {
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept { return g_gxState.textures[static_cast<size_t>(id)]; }
 
 void evict_texture_object(u32 texObjId) noexcept {
+  gfx::erase_stochastic_sampling_params_override(texObjId);
   if (const auto it = s_textureObjectCaches.find(texObjId); it != s_textureObjectCaches.end()) {
     clear_texture_dependency(texObjId, it->second.tlutObjId);
     s_textureObjectCaches.erase(it);
@@ -398,7 +400,7 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
     GXTexObj_ obj = g_gxState.loadedTextures[i];
     auto& textureBind = g_gxState.textures[i];
     if (obj.texObjId != 0 && obj.texObjId == textureBind.texObj.texObjId &&
-        obj.texDataVersion == textureBind.texObj.texDataVersion) {
+        obj.texDataVersion == textureBind.texObj.texDataVersion && obj.flags == textureBind.texObj.flags) {
       // Texture bind unchanged
       continue;
     }
