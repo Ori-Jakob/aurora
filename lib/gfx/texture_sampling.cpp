@@ -23,6 +23,25 @@ Vec4<float> clamp_sampling_params(float cellScale, float jitter, float blendWidt
       0.0f,
   };
 }
+
+float viewport_lod_bias() noexcept {
+  const float scaleX = gx::g_gxState.renderViewport.width / std::max(gx::g_gxState.logicalViewport.width, 1.f);
+  const float scaleY = gx::g_gxState.renderViewport.height / std::max(gx::g_gxState.logicalViewport.height, 1.f);
+  return log2(std::max(std::min(scaleX, scaleY), 0.001f));
+}
+
+float replacement_texture_lod_bias(const TextureBind& tex) noexcept {
+  if (!tex.ref || !tex.ref->isReplacement) {
+    return 0.f;
+  }
+
+  const float originalWidth = static_cast<float>(std::max(tex.texObj.width(), 1u));
+  const float originalHeight = static_cast<float>(std::max(tex.texObj.height(), 1u));
+  const float replacementScaleX = static_cast<float>(tex.ref->size.width) / originalWidth;
+  const float replacementScaleY = static_cast<float>(tex.ref->size.height) / originalHeight;
+  // Hardware LOD already sees the larger replacement dimensions, so subtract that scale from viewport compensation.
+  return log2(std::max(std::min(replacementScaleX, replacementScaleY), 0.001f));
+}
 }
 
 bool stochastic_sampling_enabled() noexcept { return s_stochasticSamplingEnabled; }
@@ -88,9 +107,8 @@ Vec4<float> texture_size_bias_sampling_params(const TextureBind& tex) noexcept {
   auto width = static_cast<float>(tex.texObj.width());
   auto height = static_cast<float>(tex.texObj.height());
   const auto vpBias =
-      gx::enableLodBias && tex.ref && tex.ref->hasArbitraryMips
-          ? log2(std::min(gx::g_gxState.renderViewport.width / std::max(gx::g_gxState.logicalViewport.width, 1.f),
-                          gx::g_gxState.renderViewport.height / std::max(gx::g_gxState.logicalViewport.height, 1.f)))
+      gx::enableLodBias && gx::enableArbitraryMips && tex.ref && tex.ref->hasArbitraryMips
+          ? viewport_lod_bias() - replacement_texture_lod_bias(tex)
           : 0.f;
   const float stochasticFlag = s_stochasticSamplingEnabled && uses_stochastic_sampling(tex.texObj) ? 1.0f : 0.0f;
   return {width, height, tex.texObj.lod_bias() + vpBias, stochasticFlag};

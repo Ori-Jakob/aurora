@@ -7,6 +7,7 @@
 
 namespace aurora::gx {
 // TODO: remove, just for testing
+bool enableArbitraryMips = true;
 bool enableLodBias = true;
 
 namespace {

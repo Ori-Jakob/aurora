@@ -1007,6 +1007,11 @@ wgpu::SamplerDescriptor aurora::gfx::TextureBind::get_descriptor() const noexcep
     minLod = 0.f;
     maxLod = 0.f;
   }
+  if (ref && ref->hasArbitraryMips && !gx::enableArbitraryMips) {
+    // Debug escape hatch for comparing manually authored mip chains against the base texture.
+    minLod = 0.f;
+    maxLod = 0.f;
+  }
   return {
       .label = "Generated Filtering Sampler",
       .addressModeU = wgpu_address_mode(texObj.wrap_s()),
