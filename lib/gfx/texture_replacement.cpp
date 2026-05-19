@@ -491,6 +491,7 @@ std::optional<ConvertedTexture> load_replacement(const ReplacementIndexEntry& en
       .height = base->height,
       .mips = mips,
       .data = std::move(blob),
+      .hasArbitraryMips = true,
   };
 }
 
@@ -654,6 +655,7 @@ gfx::TextureHandle load_replacement_texture(const RuntimeTextureKey& key, const 
   auto handle = std::make_shared<gfx::TextureRef>(std::move(texture), std::move(textureView), wgpu::TextureView{}, size,
                                                   replacement->format, replacement->mips, gfx::InvalidTextureFormat);
   handle->isReplacement = true;
+  handle->hasArbitraryMips = replacement->hasArbitraryMips;
   gfx::write_texture(*handle, replacement->data);
   return handle;
 }
