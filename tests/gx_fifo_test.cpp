@@ -1304,6 +1304,24 @@ TEST_F(GXFifoTest, LoadTexObjPcFormat_PreservesFullFormatMetadata) {
   EXPECT_EQ(slot.raw_format(), static_cast<u32>(GX_TF_RGBA8));
 }
 
+TEST_F(GXFifoTest, TexImage0BpWrite_ClearsExtendedTextureMetadata) {
+  auto& slot = gxState().loadedTextures[GX_TEXMAP0];
+  slot.mWidth = 1024;
+  slot.mHeight = 1024;
+  slot.mFormat = GX_TF_BC1_PC;
+
+  const u32 image0 = (0x88u << 24) | (7u << 0) | (15u << 10) | (static_cast<u32>(GX_TF_RGBA8) << 20);
+  aurora::gx::fifo::write_u8(0x61);
+  aurora::gx::fifo::write_u32(image0);
+  auto bytes = capture_fifo();
+
+  decode_fifo(bytes);
+
+  EXPECT_EQ(slot.width(), 8u);
+  EXPECT_EQ(slot.height(), 16u);
+  EXPECT_EQ(slot.format(), GX_TF_RGBA8);
+}
+
 TEST_F(GXFifoTest, TexObjRawDimensions_WrapAtTenBitBoundary) {
   auto& slot = gxState().loadedTextures[GX_TEXMAP0];
   slot.image0 = (0x3FFu << 0) | (0x3FFu << 10);
@@ -2831,6 +2849,29 @@ TEST_F(GXFifoTest, IndTexMtx0_Isolation) {
   EXPECT_NEAR(g_gxState.indTexMtxs[1].mtx.m0.x, -1.0f, tol);
   EXPECT_NEAR(g_gxState.indTexMtxs[1].mtx.m1.y, -1.0f, tol);
   EXPECT_EQ(g_gxState.indTexMtxs[1].scaleExp, -2);
+}
+
+TEST_F(GXFifoTest, TevIndTile_UsesTileSizeAndSpacing) {
+  GXSetTevIndTile(GX_TEVSTAGE0, GX_INDTEXSTAGE0, 16, 32, 16, 8, GX_ITF_4, GX_ITM_0, GX_ITB_NONE, GX_ITBA_OFF);
+  auto bytes = capture_fifo();
+
+  reset_gx_state();
+  decode_fifo(bytes);
+
+  const auto& stage = g_gxState.tevStages[0];
+  EXPECT_EQ(stage.indTexStage, GX_INDTEXSTAGE0);
+  EXPECT_EQ(stage.indTexFormat, GX_ITF_4);
+  EXPECT_EQ(stage.indTexMtxId, GX_ITM_0);
+  EXPECT_EQ(stage.indTexWrapS, GX_ITW_16);
+  EXPECT_EQ(stage.indTexWrapT, GX_ITW_32);
+  EXPECT_TRUE(stage.indTexUseOrigLOD);
+  EXPECT_FALSE(stage.indTexAddPrev);
+
+  const auto& mtx = g_gxState.indTexMtxs[0];
+  const float tol = 1.0f / 1024.0f;
+  EXPECT_NEAR(mtx.mtx.m0.x, 16.0f / 1024.0f, tol);
+  EXPECT_NEAR(mtx.mtx.m1.y, 8.0f / 1024.0f, tol);
+  EXPECT_EQ(mtx.scaleExp, 10);
 }
 
 // ============================================================================

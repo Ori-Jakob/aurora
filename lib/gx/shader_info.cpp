@@ -244,6 +244,18 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     }
   }
 
+  // Emboss bump needs its source texcoord generated and a light enabled
+  for (int i = 0; i < info.sampledTexCoords.size(); ++i) {
+    if (!info.sampledTexCoords.test(i)) {
+      continue;
+    }
+    const auto& tcg = config.tcgs[i];
+    if (tcg.type >= GX_TG_BUMP0 && tcg.type <= GX_TG_BUMP7) {
+      info.sampledTexCoords.set(tcg.embossSrc);
+      info.lightingEnabled = true;
+    }
+  }
+
   info.uniformSize += info.loadsTevReg.count() * sizeof(Vec4<float>);
   for (int i = 0; i < info.sampledColorChannels.size(); ++i) {
     if (info.sampledColorChannels.test(i)) {
@@ -293,6 +305,7 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     info.usesFog = true;
     info.uniformSize += sizeof(Fog);
   }
+  info.uniformSize += MaxTexCoord * sizeof(Vec4<float>);
   if (info.usedIndTexMtxs.any()) {
     info.uniformSize += MaxIndTexMtxs * sizeof(Mat2x4<float>);
   }
@@ -345,7 +358,10 @@ static u32 line_texcoord_mask() noexcept {
 gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRanges& ranges) noexcept {
   ZoneScoped;
 
-  auto [buf, range] = gfx::map_uniform(info.uniformSize);
+  static ByteBuffer buf;
+  buf.clear();
+  buf.reserve_extra(info.uniformSize);
+
   buf.append(vtxStart);
   buf.append(g_gxState.currentPnMtx);
   buf.append<f32>(g_gxState.renderViewport.width);
@@ -433,6 +449,10 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
     Fog fog{.color = state.color, .a = state.a, .b = state.b, .c = state.c};
     buf.append(fog);
   }
+  for (const auto& scale : g_gxState.texCoordScales) {
+    buf.append(
+        Vec4{static_cast<f32>(scale.scaleS) + 1.0f, static_cast<f32>(scale.scaleT) + 1.0f, 0.0f, 0.0f});
+  }
   if (info.usedIndTexMtxs.any()) {
     for (int i = 0; i < MaxIndTexMtxs; ++i) {
       const auto& mtx = g_gxState.indTexMtxs[i];
@@ -450,6 +470,6 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
     buf.append(gfx::texture_stochastic_sampling_params(tex));
   }
   g_gxState.stateDirty = false;
-  return range;
+  return gfx::push_uniform(buf.data(), buf.size());
 }
 } // namespace aurora::gx

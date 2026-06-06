@@ -83,6 +83,7 @@ typedef struct {
   const char* appName;
   const char* userPath;
   const char* cachePath;
+  const char* resourcesPath;
   AuroraBackend desiredBackend;
   uint32_t msaa;
   uint16_t maxTextureAnisotropy;
@@ -90,8 +91,8 @@ typedef struct {
   bool startFullscreen;
   bool allowJoystickBackgroundEvents;
   bool pauseOnFocusLost;
-  bool allowTextureReplacements;
   bool allowTextureDumps;
+  bool allowCpuAdapter;
   int32_t windowPosX;
   int32_t windowPosY;
   uint32_t windowWidth;

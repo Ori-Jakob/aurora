@@ -51,8 +51,9 @@ extern wgpu::RenderPipeline g_CopyPipeline;
 extern wgpu::BindGroup g_CopyBindGroup;
 extern wgpu::Instance g_instance;
 extern bool g_bcTexturesSupported;
+extern bool g_textureComponentSwizzleSupported;
 
-bool initialize(AuroraBackend backend);
+bool initialize(AuroraBackend backend, bool allowCpu);
 void shutdown();
 void release_surface() noexcept;
 bool refresh_surface(bool recreate = true);

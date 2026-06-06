@@ -14,6 +14,7 @@
 #include <webgpu/webgpu_cpp.h>
 
 #include "../gfx/common.hpp"
+#include "../gfx/render_worker.hpp"
 #include "../internal.hpp"
 #include "../window.hpp"
 
@@ -56,6 +57,7 @@ wgpu::Instance g_instance;
 static wgpu::AdapterInfo g_adapterInfo;
 static wgpu::SurfaceCapabilities g_surfaceCapabilities;
 bool g_bcTexturesSupported;
+bool g_textureComponentSwizzleSupported;
 
 namespace {
 
@@ -593,6 +595,7 @@ const TextureWithSampler& resample_present_source(const wgpu::CommandEncoder& en
       .frameWidth = static_cast<float>(width),
       .frameHeight = static_cast<float>(height),
   };
+  ASSERT(gfx::render_worker::is_worker_thread(), "Present resample queue write must run on the render worker");
   g_queue.WriteBuffer(g_ResampleUniformBuffer, 0, &uniform, sizeof(uniform));
 
   const std::array bindGroupEntries{
@@ -684,7 +687,7 @@ static bool create_surface() {
   return true;
 }
 
-bool initialize(AuroraBackend auroraBackend) {
+bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   if (!g_instance) {
     Log.info("Creating WebGPU instance");
     const std::array requiredInstanceFeatures{
@@ -744,16 +747,22 @@ bool initialize(AuroraBackend auroraBackend) {
     }
   }
   g_adapter.GetInfo(&g_adapterInfo);
-  g_backendType = g_adapterInfo.backendType;
-  const auto backendName = magic_enum::enum_name(g_backendType);
   auto adapterName = g_adapterInfo.device;
   if (adapterName.IsUndefined()) {
     adapterName = wgpu::StringView("Unknown");
+  }
+  if (!allowCpu && g_adapterInfo.adapterType == wgpu::AdapterType::CPU) {
+    Log.warn("Ignoring CPU adapter: {}", adapterName);
+    g_adapterInfo = {};
+    g_adapter = {};
+    return false;
   }
   auto description = g_adapterInfo.description;
   if (description.IsUndefined()) {
     description = wgpu::StringView("Unknown");
   }
+  g_backendType = g_adapterInfo.backendType;
+  const auto backendName = magic_enum::enum_name(g_backendType);
   Log.info("Graphics adapter information\n  API: {}\n  Device: {} ({})\n  Driver: {}", backendName, adapterName,
            magic_enum::enum_name(g_adapterInfo.adapterType), description);
 
@@ -796,12 +805,19 @@ bool initialize(AuroraBackend auroraBackend) {
         requiredLimits.maxDynamicStorageBuffersPerPipelineLayout, requiredLimits.maxStorageBuffersPerShaderStage,
         requiredLimits.minUniformBufferOffsetAlignment, requiredLimits.minStorageBufferOffsetAlignment);
     std::vector<wgpu::FeatureName> requiredFeatures;
+    g_bcTexturesSupported = false;
+    g_textureComponentSwizzleSupported = false;
     wgpu::SupportedFeatures supportedFeatures;
     g_adapter.GetFeatures(&supportedFeatures);
     for (size_t i = 0; i < supportedFeatures.featureCount; ++i) {
       const auto feature = supportedFeatures.features[i];
-      if (feature == wgpu::FeatureName::TextureCompressionBC) {
-        g_bcTexturesSupported = true;
+      if (feature == wgpu::FeatureName::TextureCompressionBC ||
+          feature == wgpu::FeatureName::TextureComponentSwizzle) {
+        if (feature == wgpu::FeatureName::TextureCompressionBC) {
+          g_bcTexturesSupported = true;
+        } else if (feature == wgpu::FeatureName::TextureComponentSwizzle) {
+          g_textureComponentSwizzleSupported = true;
+        }
         requiredFeatures.push_back(feature);
       }
     }
@@ -832,7 +848,7 @@ bool initialize(AuroraBackend auroraBackend) {
       "enable_immediate_error_handling",
         /* clang-format on */
     };
-    const wgpu::DawnTogglesDescriptor togglesDescriptor({
+    wgpu::DawnTogglesDescriptor togglesDescriptor({
         .nextInChain = &cacheDescriptor,
         .enabledToggleCount = enableToggles.size(),
         .enabledToggles = enableToggles.data(),
@@ -934,6 +950,7 @@ bool initialize(AuroraBackend auroraBackend) {
 }
 
 void shutdown() {
+  gfx::gpu_synchronize();
   g_CopyBindGroupLayout = {};
   g_CopyPipeline = {};
   g_CopyBindGroup = {};
@@ -954,6 +971,7 @@ void shutdown() {
 }
 
 void release_surface() noexcept {
+  gfx::gpu_synchronize();
   if (g_surface) {
     g_surface.Unconfigure();
   }
@@ -961,6 +979,7 @@ void release_surface() noexcept {
 }
 
 bool refresh_surface(bool recreate) {
+  gfx::gpu_synchronize();
   if (!g_instance || !g_device) {
     return false;
   }
@@ -989,6 +1008,7 @@ bool refresh_surface(bool recreate) {
 }
 
 void resize_swapchain(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height, bool force) {
+  gfx::gpu_synchronize();
   if (!g_surface || !g_device || width == 0 || height == 0 || native_height == 0 || native_width == 0) {
     return;
   }
