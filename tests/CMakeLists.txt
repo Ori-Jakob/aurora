@@ -248,6 +248,33 @@ if (AURORA_ENABLE_GX)
   aurora_copy_runtime_dlls(gfx_recording_tests)
   gtest_discover_tests(gfx_recording_tests)
 
+  add_library(gx_shader_corpus_lib STATIC
+    gx_shader_corpus.cpp
+  )
+  target_include_directories(gx_shader_corpus_lib PUBLIC
+    ../include
+    ../lib
+  )
+  target_compile_definitions(gx_shader_corpus_lib PUBLIC AURORA TARGET_PC=1)
+  target_link_libraries(gx_shader_corpus_lib PUBLIC
+    aurora::gx
+    aurora::vi
+    absl::flat_hash_map
+  )
+
+  add_executable(gx_shader_corpus gx_shader_corpus_tool.cpp)
+  target_link_libraries(gx_shader_corpus PRIVATE gx_shader_corpus_lib)
+  aurora_copy_runtime_dlls(gx_shader_corpus)
+
+  add_executable(gx_shader_golden_tests gx_shader_golden_test.cpp)
+  target_compile_definitions(gx_shader_golden_tests PRIVATE
+    AURORA_GX_SHADER_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/shaders/gx_shader_golden.txt"
+    AURORA_GX_SHADER_GOLDEN_OUT="${CMAKE_CURRENT_BINARY_DIR}/gx_shader_golden_out"
+  )
+  target_link_libraries(gx_shader_golden_tests PRIVATE gx_shader_corpus_lib gtest gtest_main)
+  aurora_copy_runtime_dlls(gx_shader_golden_tests)
+  gtest_discover_tests(gx_shader_golden_tests)
+
   add_executable(feature_profile_tests
     feature_profile_test.cpp
     ../lib/webgpu/feature_profile.cpp
