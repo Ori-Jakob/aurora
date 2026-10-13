@@ -17,6 +17,7 @@
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
 #endif
+#include "../trace/capture.hpp"
 #include "../window.hpp"
 
 #include <array>
@@ -974,6 +975,7 @@ bool push_custom_draw(DrawTypeId type, const void* payload, size_t payloadSize) 
     return false;
   }
 
+  trace::detail::note_untraceable("push_custom_draw");
   gx::fifo::drain();
 
   if (!g_recorder.active() || g_recorder.currentRenderPass == UINT32_MAX) {
@@ -1018,6 +1020,7 @@ bool create_pass(uint32_t width, uint32_t height) {
     return false;
   }
 
+  trace::detail::note_untraceable("create_pass");
   gx::fifo::drain();
 
   if (!g_recorder.active() || g_recorder.currentRenderPass == UINT32_MAX) {
@@ -1035,6 +1038,7 @@ bool create_pass(uint32_t width, uint32_t height) {
 
 bool resolve_pass(const ResolveDesc& desc, ResolvedTargets& out) {
   out = {};
+  trace::detail::note_untraceable("resolve_pass");
   gx::fifo::drain();
 
   if (!g_recorder.active() || g_recorder.currentRenderPass == UINT32_MAX) {
@@ -1112,6 +1116,7 @@ bool push_encoder_task(EncoderTaskId type, const void* payload, size_t payloadSi
     return false;
   }
 
+  trace::detail::note_untraceable("push_encoder_task");
   gx::fifo::drain();
 
   if (!g_recorder.active() || g_recorder.currentRenderPass == UINT32_MAX) {

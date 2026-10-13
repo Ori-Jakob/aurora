@@ -438,6 +438,8 @@ void update() noexcept;
 void set_viewport_policy(AuroraViewportPolicy policy) noexcept;
 void clear_static_texture_cache() noexcept;
 void clear_copy_texture_cache() noexcept;
+// Trace capture starts from empty caches so every source it needs is read and observed; FIFO must be drained.
+void reset_texture_caches() noexcept;
 void evict_copy_texture(const void* dest) noexcept;
 void evict_texture_object(u32 texObjId) noexcept;
 void evict_tlut_object(u32 tlutObjId) noexcept;

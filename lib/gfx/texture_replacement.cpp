@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
@@ -133,6 +134,7 @@ struct ReplacementKeyHash {
 };
 
 std::mutex s_registryMutex;
+std::atomic_bool s_bypass{false};
 absl::flat_hash_map<ReplacementKey, std::vector<ReplacementEntry>, ReplacementKeyHash> s_entriesByKey;
 absl::flat_hash_map<ReplacementKey, SelectedCache, ReplacementKeyHash> s_cacheByKey;
 absl::flat_hash_set<uint64_t> s_failedIds;
@@ -1829,6 +1831,9 @@ std::optional<ReplacementResult> find_source_replacement_locked(const GXTexObj_&
 
 std::optional<ReplacementResult> find_pointer_replacement(const GXTexObj_& obj) noexcept {
   ZoneScoped;
+  if (s_bypass.load(std::memory_order_relaxed)) {
+    return std::nullopt;
+  }
   if (obj.data == nullptr) {
     return std::nullopt;
   }
@@ -1844,6 +1849,9 @@ std::optional<ReplacementResult> find_pointer_replacement(const GXTexObj_& obj) 
 std::optional<ReplacementResult> find_source_replacement(const GXTexObj_& obj,
                                                          const TextureSourceKey& sourceKey) noexcept {
   ZoneScoped;
+  if (s_bypass.load(std::memory_order_relaxed)) {
+    return std::nullopt;
+  }
   std::lock_guard lk(s_registryMutex);
   if (s_sourceEntryCount == 0 && !g_config.allowTextureDumps) {
     return std::nullopt;
@@ -1852,9 +1860,14 @@ std::optional<ReplacementResult> find_source_replacement(const GXTexObj_& obj,
 }
 
 bool should_build_source_key() noexcept {
+  if (s_bypass.load(std::memory_order_relaxed)) {
+    return false;
+  }
   std::lock_guard lk(s_registryMutex);
   return s_sourceEntryCount != 0 || g_config.allowTextureDumps;
 }
+
+void set_bypass(bool bypass) noexcept { s_bypass.store(bypass, std::memory_order_relaxed); }
 
 bool has_replacement(const GXTexObj_& obj) noexcept {
   std::lock_guard lk(s_registryMutex);

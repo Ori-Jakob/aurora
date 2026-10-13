@@ -99,6 +99,15 @@ void publish() noexcept;
 using DrawDoneCallback = void (*)();
 DrawDoneCallback set_draw_done_callback(DrawDoneCallback callback) noexcept;
 
+struct ProcessObserver {
+  void (*processed)(void* userData, const uint8_t* data, uint32_t size) noexcept = nullptr;
+  void* userData = nullptr;
+};
+// Swapped only while the FIFO is drained, like guest_memory::set_hooks.
+void set_process_observer(const ProcessObserver* observer) noexcept;
+// Trace capture needs guest memory frozen while published commands decode.
+void set_synchronous_publish(bool synchronous) noexcept;
+
 // Display list recording
 void begin_display_list(uint8_t* buf, uint32_t size);
 uint32_t end_display_list();

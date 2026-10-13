@@ -45,6 +45,23 @@ add_library(aurora_gx STATIC
         lib/dolphin/gx/GXAurora.cpp
         lib/gfx/png_io.cpp
         lib/gfx/png_io.hpp
+        lib/trace/address_map.cpp
+        lib/trace/address_map.hpp
+        lib/trace/capture.cpp
+        lib/trace/capture.hpp
+        lib/trace/capture_session.cpp
+        lib/trace/capture_session.hpp
+        lib/trace/fifo_encoder.hpp
+        lib/trace/snapshot_store.cpp
+        lib/trace/snapshot_store.hpp
+        lib/trace/state_preamble.cpp
+        lib/trace/state_preamble.hpp
+        lib/trace/trace_format.cpp
+        lib/trace/trace_format.hpp
+        lib/trace/trace_reader.cpp
+        lib/trace/trace_reader.hpp
+        lib/trace/trace_writer.cpp
+        lib/trace/trace_writer.hpp
 )
 add_library(aurora::gx ALIAS aurora_gx)
 set_target_properties(aurora_gx PROPERTIES FOLDER "aurora")
@@ -52,6 +69,10 @@ set_target_properties(aurora_gx PROPERTIES FOLDER "aurora")
 target_link_libraries(aurora_gx PUBLIC aurora::core dawn::webgpu_dawn xxHash::xxhash)
 target_link_libraries(aurora_gx PRIVATE absl::btree absl::flat_hash_map sqlite3 Tracy::TracyClient PNG::PNG)
 target_compile_definitions(aurora_gx PRIVATE WEBGPU_DAWN)
+if (TARGET zstd::libzstd)
+    target_compile_definitions(aurora_gx PRIVATE AURORA_TRACE_ZSTD)
+    target_link_libraries(aurora_gx PRIVATE zstd::libzstd)
+endif ()
 
 if (AURORA_ENABLE_RMLUI)
     target_sources(aurora_gx PRIVATE

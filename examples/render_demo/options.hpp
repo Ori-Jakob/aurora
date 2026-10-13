@@ -16,6 +16,9 @@ struct Options {
   uint32_t width = 1280;
   uint32_t height = 960;
   std::string dataDir;
+  std::string tracePath;
+  uint32_t traceStart = 2;
+  uint32_t traceFrames = 4;
   bool failOnError = false;
   bool help = false;
 };

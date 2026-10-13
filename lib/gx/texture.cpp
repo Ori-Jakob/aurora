@@ -819,6 +819,17 @@ void clear_copy_texture_cache() noexcept {
 
 void clear_static_texture_cache() noexcept { s_pendingCacheClears.fetch_add(1, std::memory_order_release); }
 
+void reset_texture_caches() noexcept {
+  clear_copy_texture_cache();
+  s_textureObjectCaches.clear();
+  s_tlutObjectCaches.clear();
+  s_replacementUsers.clear();
+  s_sourceKeyCache.clear();
+  s_contentCache.clear();
+  update_cache_stats();
+  texture::invalidate_bindings();
+}
+
 void evict_copy_texture(const void* dest) noexcept {
   g_gxState.copyTextures.erase(dest);
   s_copyCache.erase_if([&](const auto& key) { return key.dest == dest; });

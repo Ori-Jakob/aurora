@@ -1172,6 +1172,10 @@ void handle_xf(u16 addr, std::span<const u8> data) noexcept {
 
     // Viewport mapping depends on the current render target
     if (reg == 0x1A && count - i >= 6) {
+      // Trace capture re-emits the raw block because the decoded viewport does not re-encode bit-exactly
+      for (u32 w = 0; w < 6; ++w) {
+        g_gxState.xfRegCache[0x1A + w] = read_bits<u32>(wordData + w * 4);
+      }
       xf_load_viewport(wordData);
       i += 5;
       continue;

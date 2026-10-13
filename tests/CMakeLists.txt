@@ -122,6 +122,16 @@ if (AURORA_ENABLE_GX)
     ../lib/gx/attr_fmt.cpp
     ../lib/gx/dl.cpp
     gx_dl_test.cpp
+    # Trace capture
+    gx_trace_test.cpp
+    ../lib/io.cpp
+    ../lib/trace/address_map.cpp
+    ../lib/trace/capture_session.cpp
+    ../lib/trace/snapshot_store.cpp
+    ../lib/trace/state_preamble.cpp
+    ../lib/trace/trace_format.cpp
+    ../lib/trace/trace_reader.cpp
+    ../lib/trace/trace_writer.cpp
   )
 
   target_include_directories(gx_fifo_tests PRIVATE
@@ -143,6 +153,10 @@ if (AURORA_ENABLE_GX)
     Tracy::TracyClient
     ${AURORA_SDL3_TARGET}
   )
+  if (TARGET zstd::libzstd)
+    target_compile_definitions(gx_fifo_tests PRIVATE AURORA_TRACE_ZSTD)
+    target_link_libraries(gx_fifo_tests PRIVATE zstd::libzstd)
+  endif ()
 
   gtest_discover_tests(gx_fifo_tests)
 
@@ -232,6 +246,7 @@ if (AURORA_ENABLE_GX)
   add_executable(gfx_recording_tests
     gfx_recording_test.cpp
     render_target_layout_test.cpp
+    trace_capture_test.cpp
   )
   target_include_directories(gfx_recording_tests PRIVATE
     ../include
@@ -283,6 +298,36 @@ if (AURORA_ENABLE_GX)
   target_compile_definitions(feature_profile_tests PRIVATE AURORA TARGET_PC=1)
   target_link_libraries(feature_profile_tests PRIVATE gtest gtest_main dawn::dawncpp_headers)
   gtest_discover_tests(feature_profile_tests)
+
+  add_executable(trace_tests
+    trace_format_test.cpp
+    trace_store_test.cpp
+    os_test_globals.cpp
+    ../lib/io.cpp
+    ../lib/logging.cpp
+    ../lib/trace/address_map.cpp
+    ../lib/trace/capture_session.cpp
+    ../lib/trace/snapshot_store.cpp
+    ../lib/trace/trace_format.cpp
+    ../lib/trace/trace_reader.cpp
+    ../lib/trace/trace_writer.cpp
+  )
+  target_include_directories(trace_tests PRIVATE ../include ../lib)
+  target_compile_definitions(trace_tests PRIVATE AURORA TARGET_PC=1)
+  target_link_libraries(trace_tests PRIVATE
+    gtest
+    gtest_main
+    fmt::fmt
+    xxHash::xxhash
+    absl::flat_hash_map
+    ${AURORA_SDL3_TARGET}
+  )
+  if (TARGET zstd::libzstd)
+    target_compile_definitions(trace_tests PRIVATE AURORA_TRACE_ZSTD)
+    target_link_libraries(trace_tests PRIVATE zstd::libzstd)
+  endif ()
+  aurora_copy_runtime_dlls(trace_tests)
+  gtest_discover_tests(trace_tests)
 endif () # AURORA_ENABLE_GX
 
 if (TARGET render_demo)

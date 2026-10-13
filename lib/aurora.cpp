@@ -11,6 +11,7 @@
 #include "gx/gx.hpp"
 #include "gx/texture.hpp"
 #include "imgui.hpp"
+#include "trace/capture.hpp"
 #include "webgpu/gpu.hpp"
 #include "webgpu/gpu_prof.hpp"
 #include <webgpu/webgpu_cpp.h>
@@ -208,6 +209,7 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
 
 void shutdown() noexcept {
 #ifdef AURORA_ENABLE_GX
+  trace::detail::shutdown();
   gx::fifo::shutdown();
   gfx::render_worker::synchronize();
 #ifdef AURORA_ENABLE_RMLUI
@@ -257,6 +259,7 @@ bool begin_frame() noexcept {
     return false;
   }
   gx::fifo::begin_frame();
+  trace::detail::on_frame_begin();
 #endif
   return true;
 }
@@ -265,6 +268,7 @@ void end_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
   gx::fifo::drain();
+  trace::detail::on_frame_end();
   gx::fifo::end_frame();
   gx::texture::end_frame();
   gfx::finish();

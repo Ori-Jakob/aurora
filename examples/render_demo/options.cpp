@@ -90,6 +90,31 @@ bool apply_data_dir(Options& options, std::string_view value) {
   return true;
 }
 
+bool apply_trace(Options& options, std::string_view value) {
+  if (value.empty()) {
+    return false;
+  }
+  options.tracePath = value;
+  return true;
+}
+
+bool apply_trace_start(Options& options, std::string_view value) {
+  const auto start = parse_u32(value);
+  if (start) {
+    options.traceStart = *start;
+  }
+  return start.has_value();
+}
+
+bool apply_trace_frames(Options& options, std::string_view value) {
+  const auto frames = parse_u32(value);
+  if (!frames || *frames == 0) {
+    return false;
+  }
+  options.traceFrames = *frames;
+  return true;
+}
+
 bool apply_fail_on_error(Options& options, std::string_view) {
   options.failOnError = true;
   return true;
@@ -106,13 +131,16 @@ struct Flag {
   bool (*apply)(Options& options, std::string_view value);
 };
 
-constexpr std::array<Flag, 9> Flags{{
+constexpr std::array<Flag, 12> Flags{{
     {"--frames", true, apply_frames},
     {"--timeout", true, apply_timeout},
     {"--backend", true, apply_backend},
     {"--profile", true, apply_profile},
     {"--size", true, apply_size},
     {"--data-dir", true, apply_data_dir},
+    {"--trace", true, apply_trace},
+    {"--trace-start", true, apply_trace_start},
+    {"--trace-frames", true, apply_trace_frames},
     {"--fail-on-error", false, apply_fail_on_error},
     {"-h", false, apply_help},
     {"--help", false, apply_help},
@@ -182,6 +210,11 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
       return std::nullopt;
     }
   }
+  if (!options.tracePath.empty() && options.frames != 0 &&
+      options.frames < static_cast<uint64_t>(options.traceStart) + options.traceFrames) {
+    error = "--frames must cover the trace window";
+    return std::nullopt;
+  }
   return options;
 }
 
@@ -194,6 +227,9 @@ std::string_view usage() noexcept {
          "  --profile NAME      full, compat, metal or metal32 (defaults to AURORA_FEATURE_PROFILE)\n"
          "  --size WxH          window size\n"
          "  --data-dir PATH     user and cache directory\n"
+         "  --trace PATH        capture a GX trace to PATH\n"
+         "  --trace-start N     first frame to capture (default 2)\n"
+         "  --trace-frames N    number of frames to capture (default 4)\n"
          "  --fail-on-error     exit with code 3 if any error is logged\n"
          "  -h, --help          show this message\n";
 }

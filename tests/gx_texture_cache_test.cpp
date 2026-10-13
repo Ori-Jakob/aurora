@@ -712,5 +712,37 @@ TEST_F(GxTextureCacheTest, DynamicPaletteReadsTlutButNotCopyDestination) {
   EXPECT_EQ(sGuestReads[0].size, 512u);
   EXPECT_EQ(count_reads(guest_memory::Kind::Texture), 0u);
 }
+
+TEST_F(GxTextureCacheTest, ResetTextureCachesRereadsObjectAndTlutSources) {
+  std::array<uint8_t, 16> pixels{};
+  std::array<uint8_t, 512> palette{};
+  copy_texture(palette.data(), 4, 4, GX_TF_I8);
+  g_gxState.loadedTextures[0] = make_texture(pixels.data(), 1);
+  g_gxState.loadedTextures[1] = make_texture(palette.data(), 2, GX_TF_C8, 4, 4);
+  g_gxState.loadedTextures[1].tlut = GX_TLUT0;
+  g_gxState.loadedTluts[0] = make_tlut(palette.data(), 1, 256);
+  ShaderInfo info{};
+  info.sampledTextures.set(0);
+  info.sampledTextures.set(1);
+
+  ScopedGuestHooks hooks{false};
+  resolve_sampled_textures(info);
+  ASSERT_FALSE(sGuestReads.empty());
+
+  sGuestReads.clear();
+  texture::invalidate_bindings();
+  resolve_sampled_textures(info);
+  EXPECT_TRUE(sGuestReads.empty());
+
+  reset_texture_caches();
+  resolve_sampled_textures(info);
+  const auto has_read = [](guest_memory::Kind kind, const void* data, size_t size) {
+    return std::any_of(sGuestReads.begin(), sGuestReads.end(), [&](const GuestRead& read) {
+      return read.kind == kind && read.address == address_of(data) && read.size == size;
+    });
+  };
+  EXPECT_TRUE(has_read(guest_memory::Kind::Texture, pixels.data(), pixels.size()));
+  EXPECT_TRUE(has_read(guest_memory::Kind::Tlut, palette.data(), palette.size()));
+}
 } // namespace
 } // namespace aurora::gx

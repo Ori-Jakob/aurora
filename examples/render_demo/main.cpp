@@ -3,6 +3,7 @@
 
 #include <aurora/aurora.h>
 #include <aurora/event.h>
+#include <aurora/trace.hpp>
 #include <dolphin/gx.h>
 #include <SDL3/SDL_stdinc.h>
 
@@ -25,6 +26,7 @@ enum ExitCode : int {
   ExitLoggedError = 3,
   ExitBackendMismatch = 4,
   ExitSceneInit = 5,
+  ExitTraceFailed = 6,
 };
 
 std::atomic_uint32_t g_errorCount = 0;
@@ -118,6 +120,7 @@ int main(int argc, char* argv[]) {
   bool exiting = false;
   bool paused = false;
   bool timedOut = false;
+  bool traceRequested = false;
   while (!exiting) {
     const AuroraEvent* event = aurora_update();
     while (event != nullptr && event->type != AURORA_NONE) {
@@ -140,6 +143,17 @@ int main(int argc, char* argv[]) {
       timedOut = true;
       break;
     }
+    if (!options.tracePath.empty() && !traceRequested && frame == options.traceStart) {
+      traceRequested = true;
+      if (!aurora::trace::start_capture(
+              {.path = options.tracePath, .frameCount = options.traceFrames, .label = "render_demo"})) {
+        const auto status = aurora::trace::capture_status();
+        render_demo::shutdown_scene();
+        aurora_shutdown();
+        std::fprintf(stderr, "render_demo: failed to start trace capture: %s\n", status.error.c_str());
+        return ExitTraceFailed;
+      }
+    }
     if (exiting || paused || !aurora_begin_frame()) {
       continue;
     }
@@ -153,6 +167,7 @@ int main(int argc, char* argv[]) {
 
   render_demo::shutdown_scene();
   aurora_shutdown();
+  const auto traceStatus = aurora::trace::capture_status();
 
   const auto elapsed =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
@@ -162,6 +177,11 @@ int main(int argc, char* argv[]) {
               backend.data(), static_cast<long long>(elapsed), errors);
   if (timedOut) {
     return ExitTimeout;
+  }
+  if (!options.tracePath.empty() && traceStatus.state != aurora::trace::CaptureState::Finished) {
+    std::fprintf(stderr, "render_demo: trace capture did not finish: %s\n",
+                 traceStatus.error.empty() ? "the capture window was never reached" : traceStatus.error.c_str());
+    return ExitTraceFailed;
   }
   if (options.failOnError && errors != 0) {
     return ExitLoggedError;

@@ -108,13 +108,18 @@ TEST(RenderDemoOptions, Defaults) {
   EXPECT_EQ(options->width, 1280u);
   EXPECT_EQ(options->height, 960u);
   EXPECT_TRUE(options->dataDir.empty());
+  EXPECT_TRUE(options->tracePath.empty());
+  EXPECT_EQ(options->traceStart, 2u);
+  EXPECT_EQ(options->traceFrames, 4u);
   EXPECT_FALSE(options->failOnError);
   EXPECT_FALSE(options->help);
 }
 
 TEST(RenderDemoOptions, ParsesEveryFlag) {
-  const auto options = parse({"--frames", "120", "--timeout", "60", "--backend", "null", "--profile", "metal32",
-                              "--size", "800x600", "--data-dir", "smoke/out", "--fail-on-error", "--help"});
+  const auto options = parse(
+      {"--frames",      "120",    "--timeout",      "60",         "--backend",       "null",    "--profile",
+       "metal32",       "--size", "800x600",        "--data-dir", "smoke/out",       "--trace", "out/demo.gxtrace",
+       "--trace-start", "10",     "--trace-frames", "20",         "--fail-on-error", "--help"});
   ASSERT_TRUE(options);
   EXPECT_EQ(options->frames, 120u);
   EXPECT_EQ(options->timeoutSeconds, 60u);
@@ -123,6 +128,9 @@ TEST(RenderDemoOptions, ParsesEveryFlag) {
   EXPECT_EQ(options->width, 800u);
   EXPECT_EQ(options->height, 600u);
   EXPECT_EQ(options->dataDir, "smoke/out");
+  EXPECT_EQ(options->tracePath, "out/demo.gxtrace");
+  EXPECT_EQ(options->traceStart, 10u);
+  EXPECT_EQ(options->traceFrames, 20u);
   EXPECT_TRUE(options->failOnError);
   EXPECT_TRUE(options->help);
 
@@ -150,6 +158,18 @@ TEST(RenderDemoOptions, RejectsInvalidInput) {
   EXPECT_FALSE(parse({"--size", "10"}));
   EXPECT_FALSE(parse({"--size", "0x10"}));
   EXPECT_FALSE(parse({"--bogus"}));
+  EXPECT_FALSE(parse({"--trace-frames", "0"}));
+  EXPECT_FALSE(parse({"--trace", ""}));
+  EXPECT_FALSE(parse({"--trace-start", "x"}));
+}
+
+TEST(RenderDemoOptions, TraceWindowMustFitFrames) {
+  EXPECT_FALSE(parse({"--frames", "5", "--trace", "t.gxtrace"}));
+  EXPECT_FALSE(parse({"--frames", "29", "--trace", "t.gxtrace", "--trace-start", "10", "--trace-frames", "20"}));
+  EXPECT_TRUE(parse({"--frames", "30", "--trace", "t.gxtrace", "--trace-start", "10", "--trace-frames", "20"}));
+  EXPECT_TRUE(parse({"--frames", "0", "--trace", "t.gxtrace", "--trace-start", "10", "--trace-frames", "20"}));
+  EXPECT_TRUE(parse({"--frames", "5", "--trace-start", "10"}));
+  EXPECT_TRUE(parse({"--frames", "6", "--trace", "t.gxtrace"}));
 }
 
 TEST(RenderDemoOptions, ProfileNamesMatchAurora) {

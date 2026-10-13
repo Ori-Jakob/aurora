@@ -36,6 +36,8 @@ std::mutex sBufferMutex;
 std::atomic<uint32_t> sWorkerWake{0};
 thread::Thread sWorkerThread;
 std::atomic<DrawDoneCallback> sDrawDoneCallback{nullptr};
+std::atomic<const ProcessObserver*> sProcessObserver{nullptr};
+bool sSynchronousPublish = false;
 
 void dispatch_draw_done() noexcept {
   if (const auto callback = sDrawDoneCallback.load(std::memory_order_acquire); callback != nullptr) {
@@ -46,6 +48,14 @@ void dispatch_draw_done() noexcept {
 void wake_worker() noexcept {
   sWorkerWake.fetch_add(1, std::memory_order_release);
   sWorkerWake.notify_all();
+}
+
+void wait_for_processed(uint64_t target) noexcept {
+  uint64_t processed = sProcessed.load(std::memory_order_acquire);
+  while (processed < target) {
+    sProcessed.wait(processed, std::memory_order_acquire);
+    processed = sProcessed.load(std::memory_order_acquire);
+  }
 }
 
 void process_to(uint64_t target, std::memory_order order) noexcept {
@@ -60,6 +70,8 @@ void process_to(uint64_t target, std::memory_order order) noexcept {
       const auto start = static_cast<uint32_t>(processed - sStreamBase);
       const auto size = static_cast<uint32_t>(target - processed);
       result = process(detail::sBufferData + start, size);
+      if (const auto* observer = sProcessObserver.load(std::memory_order_acquire); observer != nullptr)
+        UNLIKELY { observer->processed(observer->userData, detail::sBufferData + start, result.bytesProcessed); }
     }
     AURORA_ASSERT(result.bytesProcessed > 0 && result.bytesProcessed <= target - processed,
                   "FIFO processor made invalid progress: processed {} of {} remaining bytes", result.bytesProcessed,
@@ -180,6 +192,8 @@ void publish() noexcept {
     sPublished.store(target, std::memory_order_release);
     if (kProcessingMode == ProcessingMode::Thread) {
       wake_worker();
+      if (sSynchronousPublish)
+        UNLIKELY { wait_for_processed(target); }
     } else {
       process_to(target, std::memory_order_relaxed);
     }
@@ -189,6 +203,12 @@ void publish() noexcept {
 DrawDoneCallback set_draw_done_callback(DrawDoneCallback callback) noexcept {
   return sDrawDoneCallback.exchange(callback, std::memory_order_acq_rel);
 }
+
+void set_process_observer(const ProcessObserver* observer) noexcept {
+  sProcessObserver.store(observer, std::memory_order_release);
+}
+
+void set_synchronous_publish(bool synchronous) noexcept { sSynchronousPublish = synchronous; }
 
 void finish_draw() noexcept {
   if (!sFrameActive || kProcessingMode == ProcessingMode::Drain || detail::sInDisplayList) {
@@ -248,14 +268,7 @@ void drain() {
   case ProcessingMode::Thread: {
     sPublished.store(target, std::memory_order_release);
     wake_worker();
-
-    uint64_t processed = sProcessed.load(std::memory_order_acquire);
-    if (processed < target) {
-      do {
-        sProcessed.wait(processed, std::memory_order_acquire);
-        processed = sProcessed.load(std::memory_order_acquire);
-      } while (processed < target);
-    }
+    wait_for_processed(target);
     break;
   }
   }
