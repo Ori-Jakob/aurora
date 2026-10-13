@@ -1,12 +1,15 @@
 #include "gx/texture.hpp"
+#include "gx/guest_memory.hpp"
 #include "gfx/lru_cache.hpp"
 
 #include <aurora/texture.hpp>
 #include <gtest/gtest.h>
 #include <xxhash.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace aurora::gx::testing {
@@ -602,6 +605,112 @@ TEST_F(GxTextureCacheTest, ShutdownRestoresContentCacheBudgetAndAccounting) {
   texture::resolve_static_texture(obj);
   EXPECT_EQ(texture_stats().contentCacheBytes, 64);
   EXPECT_EQ(texture_stats().contentCacheEntries, 1);
+}
+
+struct GuestRead {
+  guest_memory::Kind kind;
+  uint64_t address;
+  size_t size;
+};
+std::vector<GuestRead> sGuestReads;
+std::vector<std::vector<uint8_t>> sResolvedBlocks;
+
+void observe_guest_read(void*, guest_memory::Kind kind, uint64_t address, std::span<const uint8_t> bytes) noexcept {
+  sGuestReads.push_back({kind, address, bytes.size()});
+}
+
+// Fills each read with a byte derived from its address so identical guest buffers resolve to different content.
+std::span<const uint8_t> resolve_by_address(void*, guest_memory::Kind, uint64_t address, size_t size) noexcept {
+  auto& block = sResolvedBlocks.emplace_back(size, static_cast<uint8_t>(address >> 4));
+  return {block.data(), block.size()};
+}
+
+class ScopedGuestHooks {
+public:
+  explicit ScopedGuestHooks(bool resolve) {
+    sGuestReads.clear();
+    sResolvedBlocks.clear();
+    mHooks.observe = observe_guest_read;
+    mHooks.resolve = resolve ? resolve_by_address : nullptr;
+    guest_memory::set_hooks(&mHooks);
+  }
+  ~ScopedGuestHooks() { guest_memory::set_hooks(nullptr); }
+
+private:
+  guest_memory::Hooks mHooks;
+};
+
+uint64_t address_of(const void* ptr) { return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ptr)); }
+
+size_t count_reads(guest_memory::Kind kind) {
+  return static_cast<size_t>(std::count_if(sGuestReads.begin(), sGuestReads.end(),
+                                           [kind](const GuestRead& read) { return read.kind == kind; }));
+}
+
+TEST_F(GxTextureCacheTest, GuestTextureReadsAreObservedOnlyOnMiss) {
+  std::array<uint8_t, 16> pixels{};
+  const auto obj = make_texture(pixels.data(), 1);
+  ScopedGuestHooks hooks{false};
+
+  texture::resolve_static_texture(obj);
+  ASSERT_EQ(sGuestReads.size(), 2u);
+  for (const auto& read : sGuestReads) {
+    EXPECT_EQ(read.kind, guest_memory::Kind::Texture);
+    EXPECT_EQ(read.address, address_of(pixels.data()));
+    EXPECT_EQ(read.size, 16u);
+  }
+
+  sGuestReads.clear();
+  texture::resolve_static_texture(obj);
+  EXPECT_TRUE(sGuestReads.empty());
+}
+
+TEST_F(GxTextureCacheTest, ResolverBytesDriveTextureContentIdentity) {
+  alignas(32) std::array<uint8_t, 32> first{};
+  alignas(32) std::array<uint8_t, 32> second{};
+  ScopedGuestHooks hooks{true};
+
+  texture::resolve_static_texture(make_texture(first.data(), 1));
+  texture::resolve_static_texture(make_texture(second.data(), 2));
+
+  EXPECT_EQ(testing::texture_allocations(), 2);
+}
+
+TEST_F(GxTextureCacheTest, PaletteReadsObserveTextureAndTlut) {
+  std::array<uint8_t, 32> indices{};
+  std::array<uint8_t, 32> palette{};
+  ScopedGuestHooks hooks{false};
+
+  texture::resolve_static_palette_texture(make_texture(indices.data(), 1, GX_TF_C4, 4, 4),
+                                          make_tlut(palette.data(), 1));
+
+  EXPECT_EQ(count_reads(guest_memory::Kind::Texture), 2u);
+  EXPECT_EQ(count_reads(guest_memory::Kind::Tlut), 2u);
+  for (const auto& read : sGuestReads) {
+    if (read.kind == guest_memory::Kind::Tlut) {
+      EXPECT_EQ(read.address, address_of(palette.data()));
+      EXPECT_EQ(read.size, 32u);
+    }
+  }
+}
+
+TEST_F(GxTextureCacheTest, DynamicPaletteReadsTlutButNotCopyDestination) {
+  std::array<uint8_t, 512> palette{};
+  copy_texture(palette.data(), 4, 4, GX_TF_I8);
+  g_gxState.loadedTextures[0] = make_texture(palette.data(), 1, GX_TF_C8, 4, 4);
+  g_gxState.loadedTextures[0].tlut = GX_TLUT0;
+  g_gxState.loadedTluts[0] = make_tlut(palette.data(), 1, 256);
+  ShaderInfo info{};
+  info.sampledTextures.set(0);
+
+  ScopedGuestHooks hooks{false};
+  resolve_sampled_textures(info);
+
+  ASSERT_EQ(sGuestReads.size(), 1u);
+  EXPECT_EQ(sGuestReads[0].kind, guest_memory::Kind::Tlut);
+  EXPECT_EQ(sGuestReads[0].address, address_of(palette.data()));
+  EXPECT_EQ(sGuestReads[0].size, 512u);
+  EXPECT_EQ(count_reads(guest_memory::Kind::Texture), 0u);
 }
 } // namespace
 } // namespace aurora::gx

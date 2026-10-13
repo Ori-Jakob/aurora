@@ -6,6 +6,7 @@
 
 #include "gx_test_common.hpp"
 #include "__gx.h"
+#include "gx/guest_memory.hpp"
 #include "gx/regs.hpp"
 
 #include <algorithm>
@@ -2192,6 +2193,109 @@ TEST_F(GXFifoTest, LoadPosMtxIndx_DecodesBigEndianArray) {
   for (size_t i = 0; i < values.size(); ++i) {
     EXPECT_FLOAT_EQ(reinterpret_cast<const f32*>(&decoded)[i], values[i]);
   }
+}
+
+namespace {
+struct GuestRead {
+  aurora::gx::guest_memory::Kind kind;
+  uint64_t address;
+  size_t size;
+};
+std::vector<GuestRead> sGuestReads;
+std::vector<u8> sGuestBytes;
+
+void observe_guest_read(void*, aurora::gx::guest_memory::Kind kind, uint64_t address,
+                        std::span<const uint8_t> bytes) noexcept {
+  sGuestReads.push_back({kind, address, bytes.size()});
+}
+
+std::span<const uint8_t> resolve_guest_read(void*, aurora::gx::guest_memory::Kind, uint64_t, size_t size) noexcept {
+  return {sGuestBytes.data(), size};
+}
+
+class ScopedGuestHooks {
+public:
+  explicit ScopedGuestHooks(bool resolve) {
+    sGuestReads.clear();
+    mHooks.observe = observe_guest_read;
+    mHooks.resolve = resolve ? resolve_guest_read : nullptr;
+    aurora::gx::guest_memory::set_hooks(&mHooks);
+  }
+  ~ScopedGuestHooks() { aurora::gx::guest_memory::set_hooks(nullptr); }
+
+private:
+  aurora::gx::guest_memory::Hooks mHooks;
+};
+
+uint64_t address_of(const void* ptr) { return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ptr)); }
+} // namespace
+
+TEST_F(GXFifoTest, GuestMemory_ReadWithoutHooksReturnsSourceRange) {
+  const std::array<u8, 16> data{};
+  const auto bytes = aurora::gx::guest_memory::read(aurora::gx::guest_memory::Kind::Texture, data.data(), 16);
+  EXPECT_EQ(bytes.data(), data.data());
+  EXPECT_EQ(bytes.size(), 16u);
+  EXPECT_TRUE(aurora::gx::guest_memory::read(aurora::gx::guest_memory::Kind::Texture, nullptr, 0).empty());
+}
+
+TEST_F(GXFifoTest, GuestMemory_IndexedLoadReadsThroughResolver) {
+  const std::array<f32, 12> values{
+      1.0f, 2.0f, 3.0f, 10.0f, 4.0f, 5.0f, 6.0f, 20.0f, 7.0f, 8.0f, 9.0f, 30.0f,
+  };
+  sGuestBytes.assign(sizeof(values), 0);
+  for (size_t i = 0; i < values.size(); ++i) {
+    const u32 bits = std::bit_cast<u32>(values[i]);
+    sGuestBytes[i * 4] = static_cast<u8>(bits >> 24);
+    sGuestBytes[i * 4 + 1] = static_cast<u8>(bits >> 16);
+    sGuestBytes[i * 4 + 2] = static_cast<u8>(bits >> 8);
+    sGuestBytes[i * 4 + 3] = static_cast<u8>(bits);
+  }
+  // The array the game points at is zeroed; only the resolver knows the real contents.
+  std::array<u8, sizeof(values)> source{};
+
+  GXSetArray(GX_POS_MTX_ARRAY, source.data(), source.size(), source.size(), false);
+  GXLoadPosMtxIndx(0, GX_PNMTX0);
+  auto bytes = capture_fifo();
+
+  reset_gx_state();
+  {
+    ScopedGuestHooks hooks{true};
+    decode_fifo(bytes);
+    ASSERT_EQ(sGuestReads.size(), 1u);
+    EXPECT_EQ(sGuestReads[0].kind, aurora::gx::guest_memory::Kind::IndexedLoad);
+    EXPECT_EQ(sGuestReads[0].address, address_of(source.data()));
+    EXPECT_EQ(sGuestReads[0].size, 48u);
+  }
+
+  const auto& decoded = g_gxState.pnMtx[0].pos;
+  for (size_t i = 0; i < values.size(); ++i) {
+    EXPECT_FLOAT_EQ(reinterpret_cast<const f32*>(&decoded)[i], values[i]);
+  }
+}
+
+TEST_F(GXFifoTest, GuestMemory_IndexedArrayUploadIsObserved) {
+  std::array<f32, 9> positions{0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f, 0.f};
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  GXSetArray(GX_VA_POS, positions.data(), sizeof(positions), 12, false);
+  const auto state = flush_and_capture();
+
+  GXBegin(GX_TRIANGLES, GX_VTXFMT0, 3);
+  GXPosition1x8(0);
+  GXPosition1x8(1);
+  GXPosition1x8(2);
+  GXEnd();
+  const auto draw = capture_fifo();
+
+  reset_gx_state();
+  ScopedGuestHooks hooks{false};
+  decode_fifo(state);
+  decode_fifo(draw);
+  ASSERT_EQ(sGuestReads.size(), 1u);
+  EXPECT_EQ(sGuestReads[0].kind, aurora::gx::guest_memory::Kind::VertexArray);
+  EXPECT_EQ(sGuestReads[0].address, address_of(positions.data()));
+  EXPECT_EQ(sGuestReads[0].size, sizeof(positions));
 }
 
 TEST_F(GXFifoTest, LoadIdentity_RecognizesBothTextureMatrixSizes) {

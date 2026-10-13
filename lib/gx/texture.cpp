@@ -6,6 +6,7 @@
 #include "../gfx/tex_palette_conv.hpp"
 #include "../gfx/texture_convert.hpp"
 #include "../gfx/texture_replacement.hpp"
+#include "guest_memory.hpp"
 #include "shader_info.hpp"
 
 #include <absl/container/flat_hash_map.h>
@@ -271,10 +272,11 @@ TextureKeys hash_texture_source(const GXTexObj_& obj, const GXTlutObj_* tlut, bo
   ZoneScoped;
   const size_t textureBytes = texture::texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count());
   CHECK(obj.has_data() && textureBytes != 0, "invalid texture source for content hash");
+  const auto textureData = guest_memory::read(guest_memory::Kind::Texture, obj.data, textureBytes);
 
   TextureKeys keys;
   keys.contentKey = {
-      .textureHash = XXH3_128bits(obj.data, textureBytes),
+      .textureHash = XXH3_128bits(textureData.data(), textureData.size()),
       .width = obj.width(),
       .height = obj.height(),
       .format = obj.format(),
@@ -296,14 +298,13 @@ TextureKeys hash_texture_source(const GXTexObj_& obj, const GXTlutObj_* tlut, bo
   if (buildSourceKey) {
     const size_t baseBytes = texture::texture_source_size(obj.format(), obj.width(), obj.height(), 1);
     keys.sourceKey = aurora::texture::TextureSourceKey{
-        .textureHash = XXH64(obj.data, baseBytes, 0),
+        .textureHash = XXH64(textureData.data(), baseBytes, 0),
         .width = obj.width(),
         .height = obj.height(),
         .format = obj.format(),
         .hasTlut = is_palette_format(obj.format()),
     };
 
-    const auto* textureData = static_cast<const uint8_t*>(obj.data);
     switch (obj.format()) {
     case GX_TF_C4:
       for (size_t i = 0; i < baseBytes; ++i) {
@@ -322,7 +323,7 @@ TextureKeys hash_texture_source(const GXTexObj_& obj, const GXTlutObj_* tlut, bo
     case GX_TF_C14X2:
       for (size_t i = 0; i + sizeof(uint16_t) <= baseBytes; i += sizeof(uint16_t)) {
         uint16_t value = 0;
-        std::memcpy(&value, textureData + i, sizeof(value));
+        std::memcpy(&value, textureData.data() + i, sizeof(value));
         const uint32_t index = bswap(value) & 0x3fff;
         minTlutIndex = std::min(minTlutIndex, index);
         maxTlutIndex = std::max(maxTlutIndex, index);
@@ -342,7 +343,8 @@ TextureKeys hash_texture_source(const GXTexObj_& obj, const GXTlutObj_* tlut, bo
   if (tlut != nullptr) {
     const size_t tlutBytes = texture::tlut_source_size(tlut->numEntries);
     CHECK(tlut->data != nullptr && tlutBytes != 0, "invalid TLUT source for content hash");
-    keys.contentKey.tlutHash = XXH3_128bits(tlut->data, tlutBytes);
+    const auto tlutData = guest_memory::read(guest_memory::Kind::Tlut, tlut->data, tlutBytes);
+    keys.contentKey.tlutHash = XXH3_128bits(tlutData.data(), tlutData.size());
     keys.contentKey.tlutFormat = static_cast<u32>(tlut->format);
     keys.contentKey.tlutEntries = tlut->numEntries;
     s_stats.hashedBytes += tlutBytes;
@@ -351,8 +353,7 @@ TextureKeys hash_texture_source(const GXTexObj_& obj, const GXTlutObj_* tlut, bo
       const size_t tlutOffset = static_cast<size_t>(minTlutIndex) * sizeof(uint16_t);
       const size_t referencedBytes = static_cast<size_t>(maxTlutIndex + 1 - minTlutIndex) * sizeof(uint16_t);
       if (tlutOffset + referencedBytes <= tlutBytes) {
-        const auto* tlutData = static_cast<const uint8_t*>(tlut->data);
-        keys.sourceKey->tlutHash = XXH64(tlutData + tlutOffset, referencedBytes, 0);
+        keys.sourceKey->tlutHash = XXH64(tlutData.data() + tlutOffset, referencedBytes, 0);
       }
     }
   }
@@ -378,8 +379,9 @@ gfx::TextureHandle get_tlut_texture(const GXTlutObj_& tlut) {
   }
 
   const size_t sourceBytes = texture::tlut_source_size(tlut.numEntries);
+  const auto source = guest_memory::read(guest_memory::Kind::Tlut, tlut.data, sourceBytes);
   const auto handle = gfx::new_static_texture_2d(tlut.numEntries, 1, 1, gfx::tlut_texture_format(tlut.format),
-                                                 {static_cast<const u8*>(tlut.data), sourceBytes}, true, "Loaded TLUT");
+                                                 {source.data(), source.size()}, true, "Loaded TLUT");
   if (tlut.tlutObjId != 0) {
     auto& cache = s_tlutObjectCaches[tlut.tlutObjId];
     cache.tlutTexture.handle = handle;
@@ -642,8 +644,9 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
       const auto nameStr = "GX Static Texture";
 #endif
       const size_t sourceBytes = texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count());
+      const auto source = guest_memory::read(guest_memory::Kind::Texture, obj.data, sourceBytes);
       handle = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),
-                                          {static_cast<const uint8_t*>(obj.data), sourceBytes}, false, nameStr);
+                                          {source.data(), source.size()}, false, nameStr);
       ++s_stats.misses;
       s_stats.uploadBytes += texture_handle_size(handle);
       cache_content_texture(std::move(keys->contentKey), handle);
@@ -690,9 +693,11 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
     if (!handle) {
       const size_t textureBytes = texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count());
       const size_t tlutBytes = tlut_source_size(tlut.numEntries);
+      const auto textureData = guest_memory::read(guest_memory::Kind::Texture, obj.data, textureBytes);
+      const auto tlutData = guest_memory::read(guest_memory::Kind::Tlut, tlut.data, tlutBytes);
       auto converted = gfx::convert_texture_palette(obj.format(), obj.width(), obj.height(), obj.mip_count(),
-                                                    {static_cast<const u8*>(obj.data), textureBytes}, tlut.format,
-                                                    tlut.numEntries, {static_cast<const u8*>(tlut.data), tlutBytes});
+                                                    {textureData.data(), textureData.size()}, tlut.format,
+                                                    tlut.numEntries, {tlutData.data(), tlutData.size()});
       if (converted.data.empty()) {
         return {};
       }

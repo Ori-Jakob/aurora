@@ -5,6 +5,7 @@
 #include "../internal.hpp"
 #include "dolphin/gd/GDGeometry.h"
 #include "dolphin/gx/GXAurora.h"
+#include "guest_memory.hpp"
 #include "gx.hpp"
 #include "pipeline.hpp"
 #include "regs.hpp"
@@ -269,8 +270,9 @@ ProcessResult process(const u8* data, u32 size) noexcept {
       AURORA_ASSERT(srcOffset <= array.size && srcSize <= array.size - srcOffset,
                     "indexed XF load outside array {}: offset={}, size={}, array size={}", arrayType, srcOffset,
                     srcSize, array.size);
-      auto const* srcData = static_cast<const u8*>(array.data) + srcOffset;
-      if (!copy_xf_data(dstAddr, srcData, len, array.le ? std::endian::little : std::endian::big)) {
+      const auto srcData =
+          guest_memory::read(guest_memory::Kind::IndexedLoad, static_cast<const u8*>(array.data) + srcOffset, srcSize);
+      if (!copy_xf_data(dstAddr, srcData.data(), len, array.le ? std::endian::little : std::endian::big)) {
 #ifndef NDEBUG
         Log.debug("Unimplemented indexed XF load (opcode 0x{:02X}, dstAddr=%04x)", opcode, dstAddr);
 #endif
@@ -394,7 +396,8 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     }
     auto& array = state.arrays[i];
     if (array.cachedRange.size == 0) {
-      array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(array.data), array.size);
+      const auto bytes = guest_memory::read(guest_memory::Kind::VertexArray, array.data, array.size);
+      array.cachedRange = gfx::push_storage(bytes.data(), bytes.size());
     }
     immediates.arrayStart[i - GX_VA_POS] = array.cachedRange.offset;
   }

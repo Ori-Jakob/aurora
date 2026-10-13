@@ -1,6 +1,7 @@
 #include "texture_replacement.hpp"
 
 #include "../io.hpp"
+#include "../gx/guest_memory.hpp"
 #include "../gx/gx.hpp"
 #include "../gx/texture.hpp"
 #include "../internal.hpp"
@@ -1189,9 +1190,11 @@ find_replacement_for_key_locked(const ReplacementKey& key) noexcept {
 }
 
 bool dump_editable_texture_dds(const TextureSourceKey& key, const GXTexObj_& obj) noexcept {
-  const ArrayRef texData{static_cast<const uint8_t*>(obj.data), UINT32_MAX};
   const uint32_t texWidth = obj.width();
   const uint32_t texHeight = obj.height();
+  const auto texBytes = gx::guest_memory::read(gx::guest_memory::Kind::Texture, obj.data,
+                                               gx::texture::texture_source_size(obj.format(), texWidth, texHeight, 1));
+  const ArrayRef texData{texBytes.data(), texBytes.size()};
 
   gfx::ConvertedTexture pixels;
   if (gx::is_palette_format(obj.format())) {
@@ -1199,8 +1202,10 @@ bool dump_editable_texture_dds(const TextureSourceKey& key, const GXTexObj_& obj
     if (tlut == nullptr) {
       return false;
     }
+    const auto tlutBytes = gx::guest_memory::read(gx::guest_memory::Kind::Tlut, tlut->data,
+                                                  gx::texture::tlut_source_size(tlut->numEntries));
     pixels = gfx::convert_texture_palette(obj.format(), texWidth, texHeight, 1, texData, tlut->format, tlut->numEntries,
-                                          tlut_bytes(*tlut));
+                                          {tlutBytes.data(), tlutBytes.size()});
   } else {
     pixels = gfx::convert_texture(obj.format(), texWidth, texHeight, 1, texData);
   }
@@ -1688,6 +1693,7 @@ void reload_replacement_directory(const std::filesystem::path& root, Replacement
   group = load_replacement_directory(root, options);
 }
 
+// Game-thread read of the caller's own memory; not a renderer input, so it bypasses guest_memory.
 bool has_replacement(const GXTexObj* obj, const GXTlutObj* tlut) {
   const auto* obj_ = reinterpret_cast<const GXTexObj_*>(obj);
   if (tlut != nullptr) {
