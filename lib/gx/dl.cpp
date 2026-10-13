@@ -225,7 +225,19 @@ std::optional<Command> Reader::next() {
     if (start + 3 > mSize) {
       return fail("Aurora subcommand overrun");
     }
-    if (read_bits<u16>(mData + start + 1) != GX_AURORA_DRAW_INDEXED) {
+    const u16 subCmd = read_bits<u16>(mData + start + 1);
+    if (subCmd >= GX_AURORA_HINT_FIRST && subCmd <= GX_AURORA_HINT_LAST) {
+      if (mSize - start < GX_AURORA_HINT_HEADER_SIZE) {
+        return fail("Aurora hint header overrun");
+      }
+      const u32 payloadSize = read_bits<u32>(mData + start + 3);
+      // Subtraction form keeps start + size from wrapping inside passthrough.
+      if (payloadSize > mSize - start - GX_AURORA_HINT_HEADER_SIZE) {
+        return fail("Aurora hint payload overrun");
+      }
+      return passthrough(GX_AURORA_HINT_HEADER_SIZE + payloadSize);
+    }
+    if (subCmd != GX_AURORA_DRAW_INDEXED) {
       return fail("unsupported Aurora subcommand");
     }
     if (start + 10 > mSize) {

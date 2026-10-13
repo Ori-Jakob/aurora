@@ -109,6 +109,9 @@ constexpr u8 CP_CMD_LOAD_BP_REG = GX_LOAD_BP_REG & GX_OPCODE_MASK;
 constexpr u8 CP_OPCODE_MASK = GX_OPCODE_MASK;
 constexpr u8 CP_VAT_MASK = GX_VAT_MASK;
 
+static_assert(GX_AURORA_DRAW_INDEXED < GX_AURORA_HINT_FIRST && GX2_SET_POLYGON_OFFSET > GX_AURORA_HINT_LAST,
+              "length-prefixed aurora hints must not overlap legacy subcommands");
+
 struct FogRangeLutKey {
   std::array<u16, 10> rangeK;
   f32 rangeCenter;
@@ -553,6 +556,14 @@ static void handle_draw(u8 cmd, ByteReader& reader) noexcept {
   draw_prim(prim, fmt, reader.read<u16>(), reader);
 }
 
+static void skip_aurora_hint(u16 subCmd, ByteReader& reader) noexcept {
+  const u32 payloadSize = reader.read<u32>();
+  AURORA_ASSERT(payloadSize <= reader.remaining(),
+                "GX_AURORA hint {:04X}: {}-byte payload overruns the command buffer ({} bytes left)", subCmd,
+                payloadSize, reader.remaining());
+  reader.skip(payloadSize);
+}
+
 void handle_aurora(ByteReader& reader) noexcept {
   ZoneScoped;
   const u16 subCmd = reader.read<u16>();
@@ -756,6 +767,8 @@ void handle_aurora(ByteReader& reader) noexcept {
   } else if (subCmd == GX_AURORA_DEBUG_MARKER_INSERT) {
     auto label = reader.read_string();
     gfx::insert_debug_marker(std::move(label));
+  } else if (subCmd >= GX_AURORA_HINT_FIRST && subCmd <= GX_AURORA_HINT_LAST) {
+    skip_aurora_hint(subCmd, reader);
   }
 
   else {

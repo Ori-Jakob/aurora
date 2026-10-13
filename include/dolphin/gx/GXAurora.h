@@ -96,6 +96,15 @@ extern "C" {
  */
 #define GX_AURORA_DRAW_INDEXED 0x0041
 
+// IDs in this range carry a big-endian u32 payload size so decoders can skip ones they don't know.
+#define GX_AURORA_HINT_CORE_FIRST 0x0050
+#define GX_AURORA_HINT_CORE_LAST 0x00FF
+#define GX_AURORA_HINT_MODULE_FIRST 0x0100
+#define GX_AURORA_HINT_MODULE_LAST 0x01FF
+#define GX_AURORA_HINT_FIRST GX_AURORA_HINT_CORE_FIRST
+#define GX_AURORA_HINT_LAST GX_AURORA_HINT_MODULE_LAST
+#define GX_AURORA_HINT_HEADER_SIZE 7
+
 #define GX2_SET_POLYGON_OFFSET 0x1000
 
 

@@ -313,6 +313,124 @@ TEST_F(GXFifoTest, DisplayListCallPublishesAtCompleteBoundary) {
 }
 
 // ============================================================================
+// Length-prefixed aurora hints (0x0050-0x01FF)
+// ============================================================================
+
+namespace {
+constexpr std::array<u8, 5> kFakeBpWrite{GX_LOAD_BP_REG, 0x42, 0xAA, 0xBB, 0xCC};
+constexpr std::array<u8, 5> kRealBpWrite{GX_LOAD_BP_REG, 0x41, 0x12, 0x34, 0x56};
+} // namespace
+
+static void write_raw(const std::array<u8, 5>& bytes) {
+  aurora::gx::fifo::write_data(bytes.data(), static_cast<u32>(bytes.size()));
+}
+
+TEST_F(GXFifoTest, AuroraHint_EncodesSubcommandSizeAndPayload) {
+  const std::array<u8, 3> payload{0xDE, 0xAD, 0x01};
+  GX_WRITE_AURORA_HINT(0x0123, payload.data(), payload.size());
+  GX_WRITE_AURORA_HINT(0x0050, nullptr, 0);
+  const auto bytes = capture_fifo();
+
+  const std::vector<u8> expected{0x50, 0x01, 0x23, 0x00, 0x00, 0x00, 0x03, 0xDE, 0xAD,
+                                 0x01, 0x50, 0x00, 0x50, 0x00, 0x00, 0x00, 0x00};
+  EXPECT_EQ(bytes, expected);
+}
+
+TEST_F(GXFifoTest, AuroraHint_CoreBlockSkippedByLength) {
+  for (const u16 id : {u16{0x0050}, u16{0x0051}, u16{0x00FF}}) {
+    reset_gx_state();
+    GX_WRITE_AURORA_HINT(id, kFakeBpWrite.data(), kFakeBpWrite.size());
+    write_raw(kRealBpWrite);
+    decode_fifo(capture_fifo());
+    EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41123456u) << "hint " << id;
+    EXPECT_NE(g_gxState.bpRegCache[0x42], 0x42AABBCCu) << "hint " << id;
+  }
+}
+
+TEST_F(GXFifoTest, AuroraHint_ModuleBlockSkippedByLength) {
+  for (const u16 id : {u16{0x0100}, u16{0x0123}, u16{0x01FF}}) {
+    reset_gx_state();
+    GX_WRITE_AURORA_HINT(id, kFakeBpWrite.data(), kFakeBpWrite.size());
+    write_raw(kRealBpWrite);
+    decode_fifo(capture_fifo());
+    EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41123456u) << "hint " << id;
+    EXPECT_NE(g_gxState.bpRegCache[0x42], 0x42AABBCCu) << "hint " << id;
+  }
+}
+
+TEST_F(GXFifoTest, AuroraHint_ZeroLengthPayloadSkipped) {
+  GX_WRITE_AURORA_HINT(0x0105, nullptr, 0);
+  write_raw(kRealBpWrite);
+  decode_fifo(capture_fifo());
+  EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41123456u);
+}
+
+TEST_F(GXFifoTest, AuroraHint_PayloadLookingLikeCommandsSkipped) {
+  // A viewport-render header followed by a DRAWDONE: decoding either would change state or stop processing early.
+  const std::array<u8, 8> payload{GX_AURORA, 0x00, 0x01, GX_LOAD_BP_REG, 0x45, 0x00, 0x00, 0x02};
+  const auto viewportBefore = g_gxState.renderViewport;
+  GX_WRITE_AURORA_HINT(0x0110, payload.data(), payload.size());
+  write_raw(kRealBpWrite);
+  decode_fifo(capture_fifo());
+  EXPECT_FLOAT_EQ(g_gxState.renderViewport.left, viewportBefore.left);
+  EXPECT_FLOAT_EQ(g_gxState.renderViewport.width, viewportBefore.width);
+  EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41123456u);
+}
+
+TEST_F(GXFifoTest, AuroraHint_SkipLeavesDrawStateClean) {
+  const std::array<u8, 4> payload{1, 2, 3, 4};
+  GX_WRITE_AURORA_HINT(0x0101, payload.data(), payload.size());
+  const auto bytes = capture_fifo();
+  g_gxState.dirty = 0;
+  aurora::gfx::g_testDrawCount = 0;
+  decode_fifo(bytes);
+  EXPECT_EQ(g_gxState.dirty, 0);
+  EXPECT_EQ(aurora::gfx::g_testDrawCount, 0u);
+}
+
+TEST_F(GXFifoTest, AuroraHint_LargePayloadThroughThreadedFifo) {
+  // Larger than the FIFO's initial capacity so the buffer has to grow mid-hint.
+  const std::vector<u8> payload(70000, 0x61);
+
+  aurora::gx::fifo::init();
+  aurora::gx::fifo::begin_frame();
+  GX_WRITE_AURORA_HINT(0x0120, payload.data(), static_cast<u32>(payload.size()));
+  write_raw(kRealBpWrite);
+  aurora::gx::fifo::publish();
+  aurora::gx::fifo::drain();
+  aurora::gx::fifo::end_frame();
+  aurora::gx::fifo::shutdown();
+
+  EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41123456u);
+}
+
+TEST_F(GXFifoTest, AuroraHint_SkippedInsideDisplayList) {
+  alignas(32) std::array<u8, 64> storage{};
+
+  aurora::gx::fifo::init();
+  aurora::gx::fifo::begin_frame();
+  GXBeginDisplayList(storage.data(), static_cast<u32>(storage.size()));
+  GX_WRITE_AURORA_HINT(0x0050, kFakeBpWrite.data(), kFakeBpWrite.size());
+  GX_WRITE_AURORA_HINT(0x01FF, kFakeBpWrite.data(), kFakeBpWrite.size());
+  GX_WRITE_RAS_REG(0x41123456);
+  const u32 size = GXEndDisplayList();
+  EXPECT_EQ(size, 32u);
+  EXPECT_EQ(storage[0], GX_AURORA);
+
+  GXCallDisplayList(storage.data(), size);
+  aurora::gx::fifo::drain();
+  aurora::gx::fifo::end_frame();
+  aurora::gx::fifo::shutdown();
+  EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41123456u);
+  EXPECT_NE(g_gxState.bpRegCache[0x42], 0x42AABBCCu);
+
+  reset_gx_state();
+  aurora::gx::fifo::process(storage.data(), size);
+  EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41123456u);
+  EXPECT_NE(g_gxState.bpRegCache[0x42], 0x42AABBCCu);
+}
+
+// ============================================================================
 // BP registers (direct FIFO writes, no dirty state flush needed)
 // ============================================================================
 

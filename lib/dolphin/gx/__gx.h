@@ -77,6 +77,21 @@
     GX_WRITE_U16(cmd);           \
   } while (0)
 
+#define GX_WRITE_AURORA_HINT_HEADER(cmd, payloadSize)                                                                  \
+  do {                                                                                                                 \
+    GX_WRITE_AURORA(cmd);                                                                                              \
+    GX_WRITE_U32(payloadSize);                                                                                         \
+  } while (0)
+
+#define GX_WRITE_AURORA_HINT(cmd, payload, payloadSize)                                                                \
+  do {                                                                                                                 \
+    const u32 hintSize_ = (payloadSize);                                                                               \
+    GX_WRITE_AURORA_HINT_HEADER(cmd, hintSize_);                                                                       \
+    if (hintSize_ != 0) {                                                                                              \
+      GX_WRITE_DATA(payload, hintSize_);                                                                               \
+    }                                                                                                                  \
+  } while (0)
+
 #define GX_WRITE_CP_REG(addr, value)  \
   do {                                \
   GX_WRITE_U8(GX_LOAD_CP_REG);        \

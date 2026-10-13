@@ -33,6 +33,18 @@ void be16(std::vector<u8>& out, u16 value) {
   out.push_back(value & 0xFF);
 }
 
+void be32(std::vector<u8>& out, u32 value) {
+  be16(out, value >> 16);
+  be16(out, value & 0xFFFF);
+}
+
+void hint_cmd(std::vector<u8>& out, u16 subCmd, std::initializer_list<u8> payload) {
+  out.push_back(GX_AURORA);
+  be16(out, subCmd);
+  be32(out, static_cast<u32>(payload.size()));
+  out.insert(out.end(), payload);
+}
+
 void draw_cmd(std::vector<u8>& out, u8 opcode, u16 vtxCount, std::initializer_list<u8> vertices) {
   out.push_back(opcode);
   be16(out, vtxCount);
@@ -117,6 +129,55 @@ TEST(GXDlReader, FailsOnUnknownOpcode) {
 TEST(GXDlReader, FailsOnDrawOverrun) {
   std::vector<u8> dl;
   draw_cmd(dl, op(GX_TRIANGLESTRIP, GX_VTXFMT0), 100, {0, 0, 1, 1});
+  Reader reader{dl.data(), static_cast<u32>(dl.size()), kPosClrDesc};
+  EXPECT_FALSE(reader.next().has_value());
+  EXPECT_TRUE(reader.failed());
+}
+
+TEST(GXDlReader, PassesThroughLengthPrefixedHints) {
+  std::vector<u8> dl;
+  hint_cmd(dl, 0x0050, {1, 2, 3});
+  draw_cmd(dl, op(GX_TRIANGLESTRIP, GX_VTXFMT0), 4, {0, 0, 1, 1, 2, 2, 3, 3});
+  hint_cmd(dl, 0x01FF, {});
+
+  Reader reader{dl.data(), static_cast<u32>(dl.size()), kPosClrDesc};
+  auto cmd = reader.next();
+  ASSERT_TRUE(cmd.has_value());
+  EXPECT_EQ(cmd->kind, Command::Kind::Passthrough);
+  EXPECT_EQ(cmd->size, 10u);
+  EXPECT_EQ(cmd->data, dl.data());
+
+  cmd = reader.next();
+  ASSERT_TRUE(cmd.has_value());
+  EXPECT_EQ(cmd->kind, Command::Kind::Draw);
+
+  cmd = reader.next();
+  ASSERT_TRUE(cmd.has_value());
+  EXPECT_EQ(cmd->kind, Command::Kind::Passthrough);
+  EXPECT_EQ(cmd->size, 7u);
+
+  EXPECT_FALSE(reader.next().has_value());
+  EXPECT_FALSE(reader.failed());
+}
+
+TEST(GXDlReader, FailsOnHintPayloadOverrun) {
+  std::vector<u8> dl{GX_AURORA, 0x01, 0x00};
+  be32(dl, 16);
+  dl.insert(dl.end(), {1, 2, 3, 4});
+  Reader reader{dl.data(), static_cast<u32>(dl.size()), kPosClrDesc};
+  EXPECT_FALSE(reader.next().has_value());
+  EXPECT_TRUE(reader.failed());
+}
+
+TEST(GXDlReader, FailsOnTruncatedHintHeader) {
+  const std::vector<u8> dl{GX_AURORA, 0x01, 0x00, 0x00, 0x00};
+  Reader reader{dl.data(), static_cast<u32>(dl.size()), kPosClrDesc};
+  EXPECT_FALSE(reader.next().has_value());
+  EXPECT_TRUE(reader.failed());
+}
+
+TEST(GXDlReader, RejectsLegacySubcommandsOtherThanDrawIndexed) {
+  const std::vector<u8> dl{GX_AURORA, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
   Reader reader{dl.data(), static_cast<u32>(dl.size()), kPosClrDesc};
   EXPECT_FALSE(reader.next().has_value());
   EXPECT_TRUE(reader.failed());
@@ -237,6 +298,26 @@ TEST(GXDlOptimize, StateCommandIsBarrier) {
   EXPECT_FALSE(reader.failed());
 }
 
+TEST(GXDlOptimize, HintIsBarrierAndCopiedVerbatim) {
+  std::vector<u8> dl;
+  draw_cmd(dl, op(GX_TRIANGLESTRIP, GX_VTXFMT0), 3, {0, 0, 1, 1, 2, 2});
+  std::vector<u8> hint;
+  hint_cmd(hint, 0x0105, {0x00, 0x02});
+  dl.insert(dl.end(), hint.begin(), hint.end());
+  draw_cmd(dl, op(GX_TRIANGLESTRIP, GX_VTXFMT0), 3, {3, 3, 4, 4, 5, 5});
+
+  const auto result = optimize(dl.data(), static_cast<u32>(dl.size()), kPosClrDesc);
+  ASSERT_TRUE(result.has_value());
+  const auto& out = *result;
+
+  const u32 drawSize = 10 + 3 * 2 + 3 * 2;
+  ASSERT_EQ(out.size(), drawSize * 2 + hint.size());
+  EXPECT_EQ(out[0], GX_AURORA);
+  EXPECT_EQ((out[1] << 8 | out[2]), GX_AURORA_DRAW_INDEXED);
+  EXPECT_EQ(std::memcmp(out.data() + drawSize, hint.data(), hint.size()), 0);
+  EXPECT_EQ(out[drawSize + hint.size()], GX_AURORA);
+}
+
 TEST(GXDlOptimize, FailsOnDirectAttrWithoutFmt) {
   const GXVtxDescList desc[] = {
       {GX_VA_POS, GX_DIRECT},
@@ -302,6 +383,23 @@ TEST_F(GXFifoTest, DrawIndexed_RoundTripThroughProcessor) {
   EXPECT_EQ(aurora::gfx::g_testLastDraw.vtxCount, 8u);
   EXPECT_EQ(aurora::gfx::g_testLastDraw.indexCount, 12u);
   EXPECT_EQ(aurora::gfx::g_testLastDraw.instanceCount, 1u);
+}
+
+TEST_F(GXFifoTest, OptimizedDisplayListWithHintsRoundTripsThroughProcessor) {
+  std::vector<u8> dl;
+  draw_cmd(dl, op(GX_TRIANGLESTRIP, GX_VTXFMT0), 4, {0, 0, 1, 1, 2, 2, 3, 3});
+  hint_cmd(dl, 0x0101, {0xAA, 0xBB, 0xCC, 0xDD});
+  draw_cmd(dl, op(GX_TRIANGLEFAN, GX_VTXFMT0), 4, {4, 4, 5, 5, 6, 6, 7, 7});
+
+  const auto result = optimize(dl.data(), static_cast<u32>(dl.size()), kPosClrDesc);
+  ASSERT_TRUE(result.has_value());
+
+  gxState().vtxDesc[GX_VA_POS] = GX_INDEX8;
+  gxState().vtxDesc[GX_VA_CLR0] = GX_INDEX8;
+
+  aurora::gfx::g_testDrawCount = 0;
+  decode_fifo(*result);
+  EXPECT_EQ(aurora::gfx::g_testDrawCount, 2u);
 }
 
 TEST_F(GXFifoTest, BeginIndexed_RoundTripsThroughProcessor) {
