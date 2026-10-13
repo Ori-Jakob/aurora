@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "grassTypes": { "lawn": { "densityPerM2": 1200, "clump": { "size": 0.8 } } },
+  "materials": { "tex1_16x16_000000000000a001_14": { "normalFlipY": true, "stochastic": { "scale": 2.0 } } }
+}

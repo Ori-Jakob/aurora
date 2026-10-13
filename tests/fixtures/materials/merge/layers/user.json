@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "materials": {
+    "tex1_16x16_000000000000a001_14": { "flags": [], "roughness": 0.65, "grass": { "useGroundAlbedo": false } },
+    "tex1_32x32_000000000000b101_14": { "fakeShadow": { "gate": "cloud" } }
+  }
+}

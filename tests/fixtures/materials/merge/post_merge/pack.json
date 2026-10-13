@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "materials": {
+    "tex1_16x16_000000000000a002_14": { "class": "ground/grass", "grass": { "type": "meadow", "density": 0.5 } },
+    "tex1_16x16_000000000000a003_14": { "class": "ground/rock", "displacement": { "tess": true } }
+  }
+}

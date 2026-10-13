@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aurora.invalid/schemas/texture-materials/1/materials.layer1.schema.json",
+  "title": "aurora texture material manifest, version 1, shipped game layer",
+  "allOf": [
+    { "$ref": "materials.schema.json" },
+    { "properties": { "materials": { "additionalProperties": { "$ref": "#/$defs/layer1Material" } } } }
+  ],
+  "$defs": {
+    "layer1Material": {
+      "propertyNames": {
+        "x-c1-rule": "LAYER1-FORBIDDEN-MEMBER",
+        "enum": ["flags", "class", "vertexColor", "stochastic", "grass", "displacement", "fakeShadow", "_source"]
+      },
+      "properties": {
+        "fakeShadow": { "x-c1-rule": "LAYER1-FAKESHADOW-INCOMPLETE", "required": ["neutral", "gate", "scope"] },
+        "_source": {
+          "x-c1-rule": "LAYER1-SOURCE", "maxLength": 256,
+          "pattern": "^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*(:[A-Za-z0-9_.-]+)?( (mat|blend|texmap|room|stage):[A-Za-z0-9_.,-]+)*$"
+        }
+      }
+    }
+  }
+}

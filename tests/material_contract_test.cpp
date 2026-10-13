@@ -1,0 +1,495 @@
+#include "material_contract_check.hpp"
+
+#include "gfx/dds_io.hpp"
+
+#include <fmt/format.h>
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <filesystem>
+#include <ostream>
+#include <set>
+#include <string>
+#include <vector>
+
+namespace aurora::test::c1 {
+void PrintTo(const MergeWarning& warning, std::ostream* os) {
+  *os << "{" << warning.file << ", " << warning.rule << ", " << warning.pointer << "}";
+}
+
+namespace {
+constexpr std::string_view BaseSchema = "materials.schema.json";
+constexpr std::string_view Layer1Schema = "materials.layer1.schema.json";
+constexpr std::string_view Draft202012 = "https://json-schema.org/draft/2020-12/schema";
+
+std::string text_of(const Json& object, std::string_view key) {
+  const Json* value = object.find(key);
+  return value != nullptr && value->type == Json::Type::String ? value->text : std::string{};
+}
+
+int64_t int_of(const Json& object, std::string_view key, int64_t fallback = 0) {
+  const Json* value = object.find(key);
+  return value != nullptr && value->type == Json::Type::Number ? static_cast<int64_t>(value->number) : fallback;
+}
+
+bool bool_of(const Json& object, std::string_view key) {
+  const Json* value = object.find(key);
+  return value != nullptr && value->type == Json::Type::Bool && value->boolean;
+}
+
+const std::vector<Json>& array_of(const Json& object, std::string_view key) {
+  static const std::vector<Json> Empty;
+  const Json* value = object.find(key);
+  return value != nullptr && value->type == Json::Type::Array ? value->items : Empty;
+}
+
+std::string describe(const std::vector<Violation>& violations) {
+  std::string out;
+  for (const Violation& violation : violations) {
+    out += fmt::format("\n  {} at '{}': {}", violation.rule, violation.pointer, violation.detail);
+  }
+  return out;
+}
+
+std::string join(const std::vector<std::string>& values) {
+  std::string out;
+  for (const std::string& value : values) {
+    out += out.empty() ? value : ", " + value;
+  }
+  return out;
+}
+
+std::string dump(const Json& value) {
+  switch (value.type) {
+  case Json::Type::Null:
+    return "null";
+  case Json::Type::Bool:
+    return value.boolean ? "true" : "false";
+  case Json::Type::Number:
+    return fmt::format("{}", value.number);
+  case Json::Type::String:
+    return fmt::format("\"{}\"", value.text);
+  case Json::Type::Array: {
+    std::string out = "[";
+    for (size_t i = 0; i < value.items.size(); ++i) {
+      out += (i == 0 ? "" : ", ") + dump(value.items[i]);
+    }
+    return out + "]";
+  }
+  case Json::Type::Object: {
+    std::string out = "{";
+    for (size_t i = 0; i < value.items.size(); ++i) {
+      out += fmt::format("{}\"{}\": {}", i == 0 ? "" : ", ", value.keys[i], dump(value.items[i]));
+    }
+    return out + "}";
+  }
+  }
+  return {};
+}
+
+void collect_rule_annotations(const Json& value, std::vector<std::string>& out) {
+  for (size_t i = 0; i < value.items.size(); ++i) {
+    if (value.type == Json::Type::Object && value.keys[i] == "x-c1-rule") {
+      out.push_back(value.items[i].text);
+    }
+    collect_rule_annotations(value.items[i], out);
+  }
+}
+
+bool is_known_rule(std::string_view rule) {
+  const auto rules = known_rules();
+  return std::find(rules.begin(), rules.end(), rule) != rules.end();
+}
+
+std::string_view kind_name(NameKind kind) {
+  switch (kind) {
+  case NameKind::Base:
+    return "base";
+  case NameKind::BaseMip:
+    return "base-mip";
+  case NameKind::Companion:
+    return "companion";
+  case NameKind::CompanionMip:
+    return "companion-mip";
+  case NameKind::Ignored:
+    return "ignored";
+  case NameKind::Rejected:
+    return "rejected";
+  }
+  return {};
+}
+
+class MaterialContractTest : public ::testing::Test {
+protected:
+  static void SetUpTestSuite() {
+    s_root = std::filesystem::path{AURORA_TEST_FIXTURES_DIR} / "materials";
+    s_schemas.dir = s_root;
+    const JsonParse parsed = parse_json(read_text(s_root / "index.json"));
+    ASSERT_TRUE(parsed.value.has_value()) << parsed.error.detail;
+    s_index = *parsed.value;
+  }
+
+  static std::string read_text(const std::filesystem::path& path) {
+    const auto bytes = read_file(path);
+    return bytes ? std::string{bytes->begin(), bytes->end()} : std::string{};
+  }
+
+  static Json load_json(const std::string& relative) {
+    const JsonParse parsed = parse_json(read_text(s_root / relative));
+    EXPECT_TRUE(parsed.value.has_value()) << relative << ": " << parsed.error.detail;
+    return parsed.value.value_or(Json{});
+  }
+
+  static std::vector<DdsFile> load_dds_files() {
+    std::vector<DdsFile> files;
+    for (const auto& entry : std::filesystem::directory_iterator{s_root / "dds"}) {
+      auto bytes = read_file(entry.path());
+      EXPECT_TRUE(bytes.has_value()) << entry.path().string();
+      files.push_back({entry.path().filename().string(), bytes.value_or(std::vector<uint8_t>{})});
+    }
+    return files;
+  }
+
+  static const std::vector<Json>& index_array(std::string_view key) { return array_of(s_index, key); }
+
+  static inline std::filesystem::path s_root;
+  static inline Json s_index;
+  static inline SchemaSet s_schemas;
+};
+
+TEST_F(MaterialContractTest, SchemasLoadWithSupportedKeywordsOnly) {
+  for (const std::string_view file : {BaseSchema, Layer1Schema}) {
+    SCOPED_TRACE(file);
+    const JsonParse parsed = parse_json(read_text(s_root / std::string{file}));
+    ASSERT_TRUE(parsed.value.has_value()) << parsed.error.detail;
+    EXPECT_EQ(text_of(*parsed.value, "$schema"), Draft202012);
+    const auto unsupported = unsupported_schema_keywords(s_schemas, file);
+    EXPECT_TRUE(unsupported.empty()) << join(unsupported);
+    std::vector<std::string> rules;
+    collect_rule_annotations(*parsed.value, rules);
+    EXPECT_FALSE(rules.empty());
+    for (const std::string& rule : rules) {
+      EXPECT_TRUE(is_known_rule(rule)) << rule;
+    }
+  }
+}
+
+TEST_F(MaterialContractTest, IndexCoversEveryFixtureFile) {
+  std::set<std::string> referenced;
+  for (const Json& entry : index_array("manifests")) {
+    referenced.insert(text_of(entry, "file"));
+  }
+  for (const Json& entry : index_array("merges")) {
+    const std::string dir = text_of(entry, "dir");
+    for (const Json& file : array_of(entry, "files")) {
+      referenced.insert(dir + "/" + text_of(file, "file"));
+    }
+    referenced.insert(dir + "/" + text_of(entry, "result"));
+  }
+  for (const Json& entry : index_array("lookups")) {
+    referenced.insert(text_of(entry, "manifest"));
+  }
+  for (const Json& entry : index_array("dds")) {
+    referenced.insert("dds/" + text_of(entry, "file"));
+  }
+  ASSERT_FALSE(referenced.empty());
+  for (const std::string& path : referenced) {
+    EXPECT_TRUE(std::filesystem::is_regular_file(s_root / path)) << path;
+  }
+
+  const std::set<std::string> exempt{"materials.schema.json", "materials.layer1.schema.json", "index.json",
+                                     "gen_dds_fixtures.py", ".gitattributes"};
+  for (const auto& entry : std::filesystem::recursive_directory_iterator{s_root}) {
+    if (!entry.is_regular_file()) {
+      continue;
+    }
+    const std::string relative = entry.path().lexically_relative(s_root).generic_string();
+    if (!exempt.contains(relative)) {
+      EXPECT_TRUE(referenced.contains(relative)) << relative;
+    }
+  }
+}
+
+TEST_F(MaterialContractTest, IndexRulesAreKnownAndCovered) {
+  std::set<std::string> used;
+  const auto add = [&](const Json& entry) {
+    if (std::string rule = text_of(entry, "rule"); !rule.empty()) {
+      used.insert(std::move(rule));
+    }
+  };
+  for (const Json& entry : index_array("manifests")) {
+    add(entry);
+  }
+  for (const Json& entry : index_array("merges")) {
+    for (const Json& warning : array_of(entry, "warnings")) {
+      add(warning);
+    }
+  }
+  for (const Json& entry : index_array("names")) {
+    add(entry);
+  }
+  for (const Json& entry : index_array("dds")) {
+    add(entry);
+  }
+  for (const std::string& rule : used) {
+    EXPECT_TRUE(is_known_rule(rule)) << rule;
+  }
+
+  std::set<std::string> expected;
+  for (const std::string_view rule : known_rules()) {
+    // Every schema "not" carries a more specific rule, so nothing can raise the generic one.
+    if (rule != "MANIFEST-NOT") {
+      expected.emplace(rule);
+    }
+  }
+  EXPECT_EQ(used, expected);
+}
+
+TEST_F(MaterialContractTest, ManifestFixturesMatchExpectedVerdicts) {
+  ASSERT_FALSE(index_array("manifests").empty());
+  for (const Json& entry : index_array("manifests")) {
+    const std::string file = text_of(entry, "file");
+    const auto layer = static_cast<int>(int_of(entry, "layer"));
+    SCOPED_TRACE(fmt::format("{} at layer {}", file, layer));
+    const auto violations = check_manifest(s_schemas, read_text(s_root / file), layer);
+    if (text_of(entry, "expect") == "valid") {
+      EXPECT_TRUE(violations.empty()) << describe(violations);
+      continue;
+    }
+    EXPECT_EQ(violations.size(), 1u) << describe(violations);
+    if (!violations.empty()) {
+      EXPECT_EQ(violations.front().rule, text_of(entry, "rule"));
+      EXPECT_EQ(violations.front().pointer, text_of(entry, "pointer"));
+    }
+  }
+}
+
+TEST_F(MaterialContractTest, ManifestKeysRoundTripThroughReplacementParser) {
+  std::set<std::string> files;
+  for (const Json& entry : index_array("manifests")) {
+    if (text_of(entry, "expect") == "valid") {
+      files.insert(text_of(entry, "file"));
+    }
+  }
+  for (const Json& entry : index_array("merges")) {
+    files.insert(text_of(entry, "dir") + "/" + text_of(entry, "result"));
+  }
+
+  size_t checked = 0;
+  for (const std::string& file : files) {
+    SCOPED_TRACE(file);
+    const Json manifest = load_json(file);
+    std::vector<std::string> keys;
+    if (const Json* materials = manifest.find("materials"); materials != nullptr) {
+      keys = materials->keys;
+    }
+    if (const Json* types = manifest.find("grassTypes"); types != nullptr) {
+      for (const Json& type : types->items) {
+        if (std::string colorFrom = text_of(type, "colorFrom"); !colorFrom.empty()) {
+          keys.push_back(std::move(colorFrom));
+        }
+      }
+    }
+    for (const std::string& key : keys) {
+      SCOPED_TRACE(key);
+      const auto parsed = texture::parse_replacement_filename(key + ".dds");
+      EXPECT_TRUE(parsed.has_value());
+      if (!parsed) {
+        continue;
+      }
+      EXPECT_NE(parsed->textureHash, texture::kWildcardTextureHash);
+      EXPECT_EQ(canonical_key(*parsed), key);
+      ++checked;
+    }
+  }
+  EXPECT_GT(checked, 0u);
+}
+
+TEST_F(MaterialContractTest, MergeFixturesProduceExpectedResult) {
+  ASSERT_FALSE(index_array("merges").empty());
+  for (const Json& entry : index_array("merges")) {
+    SCOPED_TRACE(text_of(entry, "name"));
+    const std::string dir = text_of(entry, "dir");
+    std::vector<LayerFile> files;
+    for (const Json& file : array_of(entry, "files")) {
+      const std::string name = text_of(file, "file");
+      files.push_back({name, static_cast<int>(int_of(file, "layer")), static_cast<int32_t>(int_of(file, "priority")),
+                       read_text(s_root / dir / name)});
+    }
+    const MergeResult result = merge_layers(s_schemas, files, bool_of(entry, "replacements"));
+    EXPECT_TRUE(json_equal(result.manifest, load_json(dir + "/" + text_of(entry, "result")))) << dump(result.manifest);
+
+    std::vector<MergeWarning> expected;
+    for (const Json& warning : array_of(entry, "warnings")) {
+      expected.push_back({text_of(warning, "file"), text_of(warning, "rule"), text_of(warning, "pointer")});
+    }
+    std::vector<MergeWarning> warnings = result.warnings;
+    std::sort(warnings.begin(), warnings.end());
+    std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(warnings, expected);
+  }
+}
+
+TEST_F(MaterialContractTest, MergeResultsAreStable) {
+  std::set<std::string> results;
+  for (const Json& entry : index_array("merges")) {
+    results.insert(text_of(entry, "dir") + "/" + text_of(entry, "result"));
+  }
+  ASSERT_FALSE(results.empty());
+  for (const std::string& file : results) {
+    SCOPED_TRACE(file);
+    const std::string text = read_text(s_root / file);
+    const auto violations = check_manifest(s_schemas, text, 2);
+    EXPECT_TRUE(violations.empty()) << describe(violations);
+
+    const LayerFile single{file, 4, 0, text};
+    const MergeResult result = merge_layers(s_schemas, std::span<const LayerFile>{&single, 1}, true);
+    EXPECT_TRUE(result.warnings.empty());
+    EXPECT_TRUE(json_equal(result.manifest, load_json(file))) << dump(result.manifest);
+  }
+}
+
+TEST_F(MaterialContractTest, LookupsResolveMostSpecificKey) {
+  ASSERT_FALSE(index_array("lookups").empty());
+  for (const Json& entry : index_array("lookups")) {
+    const std::string query = text_of(entry, "query");
+    SCOPED_TRACE(query);
+    const auto resolved = lookup_material(load_json(text_of(entry, "manifest")), query);
+    const Json* expected = entry.find("resolved");
+    ASSERT_NE(expected, nullptr);
+    if (expected->type == Json::Type::Null) {
+      EXPECT_FALSE(resolved.has_value()) << resolved.value_or("");
+    } else {
+      EXPECT_EQ(resolved.value_or("<none>"), expected->text);
+    }
+  }
+}
+
+TEST_F(MaterialContractTest, NameFixturesClassify) {
+  ASSERT_FALSE(index_array("names").empty());
+  for (const Json& entry : index_array("names")) {
+    const std::string name = text_of(entry, "name");
+    SCOPED_TRACE(name);
+    const NameInfo info = classify_name(name);
+    EXPECT_EQ(kind_name(info.kind), text_of(entry, "kind"));
+    EXPECT_EQ(info.key, text_of(entry, "key"));
+    EXPECT_EQ(info.role, text_of(entry, "role"));
+    EXPECT_EQ(info.mip, static_cast<uint32_t>(int_of(entry, "mip")));
+    EXPECT_EQ(info.rule, text_of(entry, "rule"));
+    EXPECT_EQ(texture::parse_replacement_filename(name).has_value(), bool_of(entry, "legacyParse"));
+  }
+}
+
+TEST_F(MaterialContractTest, CompanionFilesAreInvisibleToLegacyScan) {
+  size_t companions = 0;
+  for (const auto& entry : std::filesystem::directory_iterator{s_root / "dds"}) {
+    const std::string name = entry.path().filename().string();
+    const NameKind kind = classify_name(name).kind;
+    if (kind != NameKind::Companion && kind != NameKind::CompanionMip) {
+      continue;
+    }
+    ++companions;
+    EXPECT_FALSE(texture::parse_replacement_filename(name).has_value()) << name;
+  }
+  EXPECT_GT(companions, 0u);
+}
+
+TEST_F(MaterialContractTest, DdsHeadersMatchIndex) {
+  ASSERT_FALSE(index_array("dds").empty());
+  for (const Json& entry : index_array("dds")) {
+    const std::string file = text_of(entry, "file");
+    SCOPED_TRACE(file);
+    const auto bytes = read_file(s_root / "dds" / file);
+    ASSERT_TRUE(bytes.has_value());
+    Violation error;
+    const auto header = read_dds_header(*bytes, &error);
+    if (const std::string defect = text_of(entry, "defect"); !defect.empty()) {
+      EXPECT_FALSE(header.has_value());
+      EXPECT_EQ(error.rule, defect == "truncate" ? "DDS-SIZE" : "DDS-HEADER");
+      continue;
+    }
+    ASSERT_TRUE(header.has_value()) << error.detail;
+    const std::string style = text_of(entry, "header");
+    const DdsStyle expectedStyle = style == "gz2" ? DdsStyle::Gz2 : style == "ati2" ? DdsStyle::FourCC : DdsStyle::Dx10;
+    EXPECT_EQ(header->style, expectedStyle);
+    EXPECT_EQ(header->code, static_cast<uint32_t>(int_of(entry, "dxgi", 83)));
+    EXPECT_EQ(header->width, static_cast<uint32_t>(int_of(entry, "width")));
+    EXPECT_EQ(header->height, static_cast<uint32_t>(int_of(entry, "height")));
+    EXPECT_EQ(header->mips, static_cast<uint32_t>(int_of(entry, "mips")));
+    EXPECT_EQ(bytes->size(), header->dataOffset + header->dataSize);
+  }
+}
+
+TEST_F(MaterialContractTest, DdsIoParsesSupportedFormats) {
+  ASSERT_FALSE(index_array("dds").empty());
+  for (const Json& entry : index_array("dds")) {
+    const std::string file = text_of(entry, "file");
+    SCOPED_TRACE(file);
+    const auto bytes = read_file(s_root / "dds" / file);
+    ASSERT_TRUE(bytes.has_value());
+    const auto converted = gfx::dds::parse_dds_bytes({bytes->data(), bytes->size()});
+    EXPECT_EQ(converted.has_value(), text_of(entry, "ddsIo") == "parse");
+    if (!converted) {
+      continue;
+    }
+    EXPECT_EQ(converted->width, static_cast<uint32_t>(int_of(entry, "width")));
+    EXPECT_EQ(converted->height, static_cast<uint32_t>(int_of(entry, "height")));
+    EXPECT_EQ(converted->mips, static_cast<uint32_t>(int_of(entry, "mips")));
+    const int64_t code = int_of(entry, "dxgi", 83);
+    if (code == 98) {
+      EXPECT_EQ(converted->format, wgpu::TextureFormat::BC7RGBAUnorm);
+    } else if (code == 83) {
+      EXPECT_EQ(converted->format, wgpu::TextureFormat::BC5RGUnorm);
+    } else {
+      ADD_FAILURE() << "parsed unexpected DXGI format " << code;
+    }
+  }
+}
+
+TEST_F(MaterialContractTest, DdsCompanionRulesMatchIndex) {
+  const auto verdicts = check_dds_files(load_dds_files());
+  EXPECT_EQ(verdicts.size(), index_array("dds").size());
+  for (const Json& entry : index_array("dds")) {
+    const std::string file = text_of(entry, "file");
+    SCOPED_TRACE(file);
+    const auto it = verdicts.find(file);
+    ASSERT_TRUE(it != verdicts.end());
+    EXPECT_EQ(it->second.verdict, text_of(entry, "expect"));
+    EXPECT_EQ(it->second.rule, text_of(entry, "rule"));
+    EXPECT_EQ(it->second.chain, text_of(entry, "chain"));
+  }
+}
+
+TEST_F(MaterialContractTest, ClampedChainMirrorsPackLayout) {
+  const std::string stem = "tex1_16x16_000000000000c001_14";
+  const auto verdicts = check_dds_files(load_dds_files());
+  const auto check_chain = [&](std::string_view role, const std::vector<uint32_t>& expected) {
+    SCOPED_TRACE(role.empty() ? std::string_view{"base"} : role);
+    const std::string suffix = role.empty() ? std::string{".dds"} : fmt::format(".{}.dds", role);
+    std::vector<std::string> names{stem + suffix};
+    while (std::filesystem::is_regular_file(s_root / "dds" / fmt::format("{}_mip{}{}", stem, names.size(), suffix))) {
+      names.push_back(fmt::format("{}_mip{}{}", stem, names.size(), suffix));
+    }
+    std::vector<uint32_t> sizes;
+    for (const std::string& name : names) {
+      const auto bytes = read_file(s_root / "dds" / name);
+      ASSERT_TRUE(bytes.has_value()) << name;
+      const auto header = read_dds_header(*bytes, nullptr);
+      ASSERT_TRUE(header.has_value()) << name;
+      EXPECT_EQ(header->height, header->width) << name;
+      sizes.push_back(header->width);
+    }
+    EXPECT_EQ(sizes, expected);
+    ASSERT_GE(names.size(), 2u);
+    for (size_t i = names.size() - 2; i < names.size(); ++i) {
+      const auto it = verdicts.find(names[i]);
+      ASSERT_TRUE(it != verdicts.end()) << names[i];
+      EXPECT_EQ(it->second.chain, "clamped") << names[i];
+    }
+  };
+  // GZ2 packs stop downscaling at the 16x16 native size, so their tails repeat it.
+  check_chain({}, {64, 32, 16, 16, 16});
+  check_chain("mat", {32, 16, 16, 16});
+}
+} // namespace
+} // namespace aurora::test::c1

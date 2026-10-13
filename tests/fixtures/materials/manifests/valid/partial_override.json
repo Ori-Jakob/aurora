@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "grassTypes": { "lawn": { "densityPerM2": 1500 } },
+  "materials": {
+    "tex1_16x16_000000000000a001_14": {
+      "grass": { "density": 0.2 },
+      "fakeShadow": { "gate": "ao" },
+      "displacement": { "tess": false },
+      "maps": { "nrm": "user/field01.nrm.dds" }
+    }
+  }
+}

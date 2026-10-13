@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "grassTypes": {
+    "lawn": {
+      "height": [0.12, 0.2],
+      "width": [0.004, 0.008],
+      "densityPerM2": 900,
+      "tilt": 0.2,
+      "bend": 0.3,
+      "clump": { "size": 0.6, "heightVariance": 0.3, "lean": 0.2 },
+      "rootColor": "#2f4a1c",
+      "tipColor": "#7da04a",
+      "dryTipColor": "#b8a55e",
+      "translucency": 0.4,
+      "roughness": 0.55,
+      "specular": 0.4,
+      "lodVerts": [15, 7, 3],
+      "flags": ["CAST_SHELL"]
+    }
+  },
+  "materials": {
+    "tex1_16x16_000000000000a001_14": {
+      "flags": ["stochastic"],
+      "class": "ground/grass",
+      "vertexColor": "tint",
+      "stochastic": { "scale": 1.0 },
+      "grass": { "type": "lawn", "densitySource": "vtxAlpha" },
+      "displacement": { "amplitude": 0 },
+      "_source": "stage01/room00/model.bdl:field01 mat:m00"
+    },
+    "tex1_32x32_000000000000b101_14": {
+      "class": "fake_shadow",
+      "fakeShadow": { "neutral": "white", "gate": "light", "scope": ["TERRAIN"] },
+      "_source": "stage02/room01/model.bdl:shadow02 mat:m16 blend:ZERO,SRCCLR"
+    },
+    "tex1_16x16_000000000000d001_$_9": { "class": "ground/dirt" }
+  }
+}

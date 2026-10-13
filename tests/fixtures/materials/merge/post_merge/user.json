@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "grassTypes": { "reed": { "height": [0.5, 0.9] } },
+  "materials": {
+    "tex1_32x32_000000000000b102_14": { "fakeShadow": { "scope": ["DECAL"] } },
+    "tex1_16x16_000000000000a004_14": { "class": "water/edge", "grass": { "type": "reed" } }
+  }
+}

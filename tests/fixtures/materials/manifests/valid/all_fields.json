@@ -1,0 +1,68 @@
+{
+  "$schema": "../../materials.schema.json",
+  "version": 1,
+  "grassTypes": {
+    "meadow": {
+      "height": [0.3, 0.6],
+      "width": [0.006, 0.012],
+      "densityPerM2": 400,
+      "tilt": 0.35,
+      "bend": 0.5,
+      "clump": { "size": 1.2, "heightVariance": 0.4, "colorVariance": 0.2, "lean": 0.3 },
+      "rootColor": "#33521f",
+      "tipColor": "#8fb35a",
+      "dryTipColor": "#c2b06a",
+      "colorFrom": "tex1_16x16_000000000000a001_14",
+      "translucency": 0.5,
+      "roughness": 0.5,
+      "specular": 0.35,
+      "lodVerts": [15, 7, 3],
+      "flags": ["CAST_SHELL", "CAST_FULL", "AQUATIC"]
+    }
+  },
+  "materials": {
+    "tex1_16x16_000000000000a001_14": {
+      "flags": ["stochastic", "noPbr", "cutout", "unlit"],
+      "class": "ground/grass",
+      "vertexColor": "tint",
+      "roughness": 0.8,
+      "metalness": 0.0,
+      "heightScale": 0.02,
+      "normalStrength": 1.25,
+      "normalFlipY": false,
+      "stochastic": { "contrast": 0.6, "rotation": 1.0, "scale": 1.5, "exponent": 7 },
+      "maps": {
+        "albedo": "tex1_16x16_000000000000a001_14.albedo.dds",
+        "delight": "tex1_16x16_000000000000a001_14.delight.dds",
+        "nrm": "maps/ground/field01.nrm.dds",
+        "orm": "maps/ground/field01.orm.dds",
+        "emit": "maps/ground/field01.emit.dds",
+        "grassmask": "maps/ground/field01.grassmask.dds",
+        "mat": "legacy/tex1_16x16_000000000000a001_14.mat.dds"
+      },
+      "grass": {
+        "type": "meadow",
+        "density": 0.75,
+        "densitySource": "vtxAlpha",
+        "heightScale": 1.2,
+        "maxSlopeDeg": 40,
+        "aquatic": false,
+        "allowInterior": false,
+        "useGroundAlbedo": true
+      },
+      "displacement": { "amplitude": 4, "center": 1, "tess": true, "heightBlend": "orm" },
+      "fakeShadow": { "neutral": "white", "gate": "light", "scope": ["TERRAIN", "STATIC"] },
+      "_source": "stage01/room00/model.bdl:field01",
+      "_provenance": {
+        "albedo": {
+          "tool": "pbrbake",
+          "version": "0.1.0",
+          "inputs": ["tex1_16x16_000000000000a001_14.dds"],
+          "license": "CC0-1.0",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "nrm": { "tool": "pbrbake", "version": "0.1.0" }
+      }
+    }
+  }
+}

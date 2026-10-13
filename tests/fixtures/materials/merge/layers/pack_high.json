@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "materials": {
+    "tex1_16x16_000000000000a001_14": {
+      "roughness": 0.7,
+      "maps": { "nrm": "hd/field01.nrm.dds", "orm": "hd/field01.orm.dds" }
+    },
+    "tex1_16x16_000000000000d001_000000000000d0f1_9": { "class": "ground/sand", "roughness": 0.9 }
+  }
+}

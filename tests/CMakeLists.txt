@@ -191,6 +191,25 @@ if (AURORA_ENABLE_GX)
   aurora_copy_runtime_dlls(texture_replacement_streaming_tests)
   gtest_discover_tests(texture_replacement_streaming_tests)
 
+  add_executable(material_contract_tests
+    material_contract_test.cpp
+    material_contract_check.cpp
+  )
+  target_include_directories(material_contract_tests PRIVATE
+    ../include
+    ../lib
+  )
+  target_compile_definitions(material_contract_tests PRIVATE AURORA TARGET_PC=1
+    AURORA_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+  target_link_libraries(material_contract_tests PRIVATE
+    aurora::gx
+    aurora::vi
+    gtest
+    gtest_main
+  )
+  aurora_copy_runtime_dlls(material_contract_tests)
+  gtest_discover_tests(material_contract_tests)
+
   add_executable(render_worker_tests
     render_worker_test.cpp
     thread_test.cpp

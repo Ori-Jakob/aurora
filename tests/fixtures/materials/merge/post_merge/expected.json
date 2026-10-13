@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "grassTypes": {
+    "lawn": {
+      "height": [0.1, 0.2],
+      "width": [0.004, 0.008],
+      "densityPerM2": 800,
+      "rootColor": "#2f4a1c",
+      "tipColor": "#7da04a"
+    }
+  },
+  "materials": {
+    "tex1_16x16_000000000000a001_14": { "grass": { "type": "lawn" } },
+    "tex1_16x16_000000000000a002_14": { "class": "ground/grass" },
+    "tex1_16x16_000000000000a003_14": { "class": "ground/rock" },
+    "tex1_32x32_000000000000b102_14": {},
+    "tex1_16x16_000000000000a004_14": { "class": "water/edge" }
+  }
+}

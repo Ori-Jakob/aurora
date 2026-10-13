@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "grassTypes": {
+    "reed": {
+      "height": [0.8, 1.4],
+      "width": [0.008, 0.016],
+      "densityPerM2": 60,
+      "rootColor": "#3d4a2a",
+      "tipColor": "#a3a86b",
+      "flags": ["AQUATIC"]
+    }
+  },
+  "materials": {
+    "tex1_16x16_000000000000a011_14": {
+      "vertexColor": "bakedLight",
+      "grass": { "type": "reed", "densitySource": "constant" },
+      "displacement": { "heightBlend": "vertexAlpha" },
+      "fakeShadow": {
+        "neutral": "clear",
+        "gate": "cloud",
+        "scope": ["STATIC", "DYNAMIC", "SKINNED", "TERRAIN", "FOLIAGE", "WATER", "SKY"]
+      }
+    },
+    "tex1_16x16_000000000000a012_14": {
+      "vertexColor": "ignore",
+      "grass": { "densitySource": "vtxAlphaInv" },
+      "displacement": { "heightBlend": "first" },
+      "fakeShadow": {
+        "neutral": "skip",
+        "gate": "ao",
+        "scope": ["PARTICLE", "DECAL", "UI", "PLAYER", "EMISSIVE", "OVERLAY"]
+      }
+    },
+    "tex1_16x16_000000000000a013_14": { "grass": { "densitySource": "tev" }, "displacement": { "heightBlend": "max" } }
+  }
+}

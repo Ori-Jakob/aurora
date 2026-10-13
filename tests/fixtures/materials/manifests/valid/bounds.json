@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "grassTypes": {
+    "edge_a": {
+      "height": [4, 4],
+      "width": [0.001, 0.001],
+      "densityPerM2": 10000,
+      "tilt": 0,
+      "bend": 1,
+      "lodVerts": [31],
+      "clump": { "size": 16 }
+    },
+    "edge_b": { "height": [0.001, 4], "lodVerts": [31, 21, 9, 3] }
+  },
+  "materials": {
+    "tex1_1x1_0000000000000001_0": { "roughness": 0, "metalness": 1, "heightScale": 0, "normalStrength": 0 },
+    "tex1_9999x9999_0000000000000002_14": { "roughness": 1, "metalness": 0, "heightScale": 1, "normalStrength": 4 },
+    "tex1_8x8_0000000000000003_1": { "stochastic": { "contrast": 0, "rotation": 0, "scale": 16, "exponent": 1 } },
+    "tex1_8x8_0000000000000004_2": { "stochastic": { "contrast": 1, "rotation": 1, "scale": 0.001, "exponent": 32 } },
+    "tex1_8x8_0000000000000005_3": { "grass": { "density": 0, "heightScale": 4, "maxSlopeDeg": 0 } },
+    "tex1_8x8_0000000000000006_4": { "grass": { "density": 1, "heightScale": 0.01, "maxSlopeDeg": 90 } },
+    "tex1_8x8_0000000000000007_5": { "displacement": { "amplitude": 0, "center": 0 } },
+    "tex1_8x8_0000000000000008_6": { "displacement": { "amplitude": 64, "center": 1 } },
+    "tex1_8x8_0000000000000009_0000000000000001_8": {},
+    "tex1_8x8_000000000000000a_0000000000000001_9": {},
+    "tex1_8x8_000000000000000b_0000000000000001_10": {},
+    "tex1_8x8_000000000000000c_65": {},
+    "tex1_8x8_000000000000000d_67": {},
+    "tex1_8x8_000000000000000e_70": {},
+    "tex1_8x8_000000000000000f_78": {}
+  }
+}
