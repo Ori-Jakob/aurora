@@ -1,0 +1,28 @@
+#pragma once
+
+#include <aurora/aurora.h>
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <string_view>
+
+namespace render_demo {
+struct Options {
+  AuroraBackend backend = BACKEND_AUTO;
+  AuroraFeatureProfile profile = FEATURE_PROFILE_AUTO;
+  uint32_t frames = 0;
+  uint32_t timeoutSeconds = 0;
+  uint32_t width = 1280;
+  uint32_t height = 960;
+  std::string dataDir;
+  bool failOnError = false;
+  bool help = false;
+};
+
+std::optional<AuroraBackend> parse_backend(std::string_view name) noexcept;
+std::optional<AuroraFeatureProfile> parse_profile(std::string_view name) noexcept;
+std::string_view backend_name(AuroraBackend backend) noexcept;
+std::optional<Options> parse_options(int argc, const char* const* argv, const char* envBackend, std::string& error);
+std::string_view usage() noexcept;
+} // namespace render_demo

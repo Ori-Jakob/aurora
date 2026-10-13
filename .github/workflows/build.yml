@@ -37,7 +37,7 @@ jobs:
             libxi-dev libxss-dev libxtst-dev libxkbcommon-dev libdrm-dev libgbm-dev \
             libgl1-mesa-dev libgles2-mesa-dev libegl1-mesa-dev libdbus-1-dev libibus-1.0-dev \
             libudev-dev libthai-dev libpipewire-0.3-dev libwayland-dev libdecor-0-dev \
-            liburing-dev
+            liburing-dev xvfb
 
       - name: Install dependencies (macOS)
         if: ${{ matrix.os == 'macos-latest' }}
@@ -60,4 +60,16 @@ jobs:
         run: cmake --build build
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure -LE smoke
+
+      - name: Render demo smoke (Linux)
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        timeout-minutes: 10
+        env:
+          SDL_VIDEO_DRIVER: x11
+        run: xvfb-run -a -s "-screen 0 1280x1024x24" ctest --test-dir build --output-on-failure -L smoke
+
+      - name: Render demo smoke
+        if: ${{ matrix.os != 'ubuntu-latest' }}
+        timeout-minutes: 10
+        run: ctest --test-dir build --output-on-failure -L smoke

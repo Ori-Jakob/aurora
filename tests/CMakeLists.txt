@@ -239,6 +239,28 @@ if (AURORA_ENABLE_GX)
   gtest_discover_tests(feature_profile_tests)
 endif () # AURORA_ENABLE_GX
 
+if (TARGET render_demo)
+  add_executable(render_demo_tests
+    render_demo_test.cpp
+    ../examples/render_demo/options.cpp
+    ../examples/render_demo/procedural.cpp
+  )
+  target_include_directories(render_demo_tests PRIVATE ../include ../examples/render_demo)
+  target_compile_definitions(render_demo_tests PRIVATE AURORA TARGET_PC=1)
+  target_link_libraries(render_demo_tests PRIVATE gtest gtest_main)
+  gtest_discover_tests(render_demo_tests)
+
+  add_test(NAME render_demo_usage COMMAND $<TARGET_FILE:render_demo> --help)
+  add_test(NAME render_demo_rejects_bad_args COMMAND $<TARGET_FILE:render_demo> --frames abc)
+  set_tests_properties(render_demo_rejects_bad_args PROPERTIES WILL_FAIL TRUE)
+  foreach (_profile IN ITEMS full compat metal metal32)
+    add_test(NAME render_demo_smoke_${_profile}
+      COMMAND $<TARGET_FILE:render_demo> --backend null --profile ${_profile} --frames 120 --timeout 60
+              --fail-on-error --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_smoke/${_profile})
+    set_tests_properties(render_demo_smoke_${_profile} PROPERTIES LABELS smoke TIMEOUT 180)
+  endforeach ()
+endif ()
+
 # DVD API tests
 if (TARGET aurora::dvd)
   add_executable(dvd_tests
