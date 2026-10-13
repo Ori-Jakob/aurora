@@ -228,6 +228,15 @@ if (AURORA_ENABLE_GX)
   )
   aurora_copy_runtime_dlls(gfx_recording_tests)
   gtest_discover_tests(gfx_recording_tests)
+
+  add_executable(feature_profile_tests
+    feature_profile_test.cpp
+    ../lib/webgpu/feature_profile.cpp
+  )
+  target_include_directories(feature_profile_tests PRIVATE ../include ../lib)
+  target_compile_definitions(feature_profile_tests PRIVATE AURORA TARGET_PC=1)
+  target_link_libraries(feature_profile_tests PRIVATE gtest gtest_main dawn::dawncpp_headers)
+  gtest_discover_tests(feature_profile_tests)
 endif () # AURORA_ENABLE_GX
 
 # DVD API tests

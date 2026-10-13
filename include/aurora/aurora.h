@@ -37,6 +37,14 @@ typedef enum {
   LOG_FATAL,
 } AuroraLogLevel;
 
+typedef enum {
+  FEATURE_PROFILE_AUTO,
+  FEATURE_PROFILE_FULL,
+  FEATURE_PROFILE_COMPAT,
+  FEATURE_PROFILE_METAL,
+  FEATURE_PROFILE_METAL32,
+} AuroraFeatureProfile;
+
 typedef struct {
   int32_t x;
   int32_t y;
@@ -116,6 +124,9 @@ typedef struct {
    * This can be set to 0 to disable allocating this region.
    */
   uint32_t mem2Size;
+
+  // AUTO reads AURORA_FEATURE_PROFILE; other values restrict the device to exercise fallback paths
+  AuroraFeatureProfile featureProfile;
 } AuroraConfig;
 
 typedef struct {

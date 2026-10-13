@@ -16,6 +16,7 @@
 #include <aurora/gfx.h>
 #include <magic_enum.hpp>
 #include <webgpu/webgpu_cpp.h>
+#include <SDL3/SDL_stdinc.h>
 
 #include "../gx/gx.hpp"
 #include "../gfx/frame.hpp"
@@ -23,6 +24,7 @@
 #include "../gfx/render_worker.hpp"
 #include "../internal.hpp"
 #include "../window.hpp"
+#include "feature_profile.hpp"
 #include "gpu_prof.hpp"
 
 #ifdef WEBGPU_DAWN
@@ -63,6 +65,7 @@ bool g_dualSourceBlendingSupported = false;
 bool g_bcTexturesSupported = false;
 bool g_astcTexturesSupported = false;
 bool g_textureComponentSwizzleSupported = false;
+AuroraFeatureProfile g_featureProfile = FEATURE_PROFILE_FULL;
 static std::atomic_bool g_initialized = false;
 static std::atomic_bool g_vsyncEnabled = true;
 
@@ -85,6 +88,35 @@ AuroraLogLevel wgpu_log_level(wgpu::LoggingType type) {
 
 void wgpu_log(wgpu::LoggingType type, wgpu::StringView message) {
   Log.report(wgpu_log_level(type), "WebGPU message: {}", message);
+}
+
+void log_feature_profile(const ResolvedFeatureProfile& resolved, const wgpu::SupportedFeatures& adapterFeatures,
+                         const wgpu::Limits& adapterLimits) {
+  if (resolved.profile == FEATURE_PROFILE_FULL && resolved.source == FeatureProfileSource::Default) {
+    Log.info("Feature profile: full");
+    return;
+  }
+  wgpu::Limits deviceLimits{};
+  g_device.GetLimits(&deviceLimits);
+  std::string maskedList;
+  for (const auto& masked : feature_profile_masked_features(resolved.profile)) {
+    const auto begin = adapterFeatures.features;
+    const auto end = begin + adapterFeatures.featureCount;
+    const bool adapterHas = std::find(begin, end, masked.feature) != end;
+    maskedList += fmt::format("\n    {} (adapter: {})", masked.name, adapterHas ? "yes" : "no");
+  }
+  const uint32_t budget = feature_profile_color_budget(resolved.profile);
+  Log.info(
+      "Feature profile: {} (source: {})"
+      "\n  Core features: {}"
+      "\n  Validation: {}"
+      "\n  Masked features:{}"
+      "\n  maxColorAttachmentBytesPerSample: adapter {}, cap {}, device {}",
+      feature_profile_name(resolved.profile), feature_profile_source_name(resolved.source),
+      g_device.HasFeature(wgpu::FeatureName::CoreFeaturesAndLimits) ? "enabled" : "disabled (compatibility validation)",
+      feature_profile_forces_validation(resolved.profile) ? "forced on" : "build default",
+      maskedList.empty() ? " none" : maskedList, adapterLimits.maxColorAttachmentBytesPerSample,
+      budget == 0 ? std::string{"none"} : std::to_string(budget), deviceLimits.maxColorAttachmentBytesPerSample);
 }
 
 struct ResampleUniformBlock {
@@ -879,6 +911,13 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   Log.info("Graphics adapter information\n  API: {}\n  Device: {} ({})\n  Driver: {}", backendName, adapterName,
            magic_enum::enum_name(g_adapterInfo.adapterType), description);
 
+  const char* profileEnv = SDL_getenv(FeatureProfileEnvVar);
+  const auto resolvedProfile = resolve_feature_profile(g_config.featureProfile, profileEnv);
+  if (resolvedProfile.source == FeatureProfileSource::InvalidEnvironment) {
+    Log.warn("Ignoring {}={}; expected full, compat, metal or metal32", FeatureProfileEnvVar, profileEnv);
+  }
+  g_featureProfile = resolvedProfile.profile;
+
   {
     wgpu::Limits supportedLimits{};
     g_adapter.GetLimits(&supportedLimits);
@@ -886,7 +925,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         .maxStorageBuffersInVertexStage = 2,
         .maxStorageBuffersInFragmentStage = 2,
     }};
-    const wgpu::Limits requiredLimits{
+    wgpu::Limits requiredLimits{
         .nextInChain = &compatibilityModeLimits,
         // Use "best" supported limits
         .maxTextureDimension1D = supportedLimits.maxTextureDimension1D == 0 ? WGPU_LIMIT_U32_UNDEFINED
@@ -904,6 +943,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
             supportedLimits.minStorageBufferOffsetAlignment < 16 ? 16 : supportedLimits.minStorageBufferOffsetAlignment,
         .maxImmediateSize = sizeof(gx::DrawImmediateData),
     };
+    clamp_limits_to_feature_profile(g_featureProfile, requiredLimits);
     Log.info(
         "Using limits:"
         "\n  maxTextureDimension1D: {}"
@@ -928,6 +968,9 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     g_adapter.GetFeatures(&supportedFeatures);
     for (size_t i = 0; i < supportedFeatures.featureCount; ++i) {
       const auto feature = supportedFeatures.features[i];
+      if (!feature_profile_allows(g_featureProfile, feature)) {
+        continue;
+      }
       if (feature == wgpu::FeatureName::CoreFeaturesAndLimits || feature == wgpu::FeatureName::TextureCompressionBC ||
           feature == wgpu::FeatureName::TextureCompressionASTC ||
           feature == wgpu::FeatureName::TextureComponentSwizzle || feature == wgpu::FeatureName::DualSourceBlending) {
@@ -991,10 +1034,19 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         // https://github.com/TwilitRealm/dusklight/issues/2563
         "use_spirv_reconvergence_mode",
     };
+    std::vector<const char*> enabledToggles;
+    enabledToggles.reserve(enableToggles.size());
+    for (const char* toggle : enableToggles) {
+      // Profiles exist to surface validation errors, so they keep validation on in release builds
+      if (feature_profile_forces_validation(g_featureProfile) && std::string_view{toggle} == "skip_validation") {
+        continue;
+      }
+      enabledToggles.push_back(toggle);
+    }
     wgpu::DawnTogglesDescriptor togglesDescriptor(wgpu::DawnTogglesDescriptor::Init{
         .nextInChain = &cacheDescriptor,
-        .enabledToggleCount = enableToggles.size(),
-        .enabledToggles = enableToggles.data(),
+        .enabledToggleCount = enabledToggles.size(),
+        .enabledToggles = enabledToggles.data(),
         .disabledToggleCount = disableToggles.size(),
         .disabledToggles = disableToggles.data(),
     });
@@ -1042,6 +1094,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
       return false;
     }
     g_device.SetLoggingCallback(wgpu_log);
+    log_feature_profile(resolvedProfile, supportedFeatures, supportedLimits);
   }
   g_queue = g_device.GetQueue();
 
