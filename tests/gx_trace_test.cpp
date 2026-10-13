@@ -1,11 +1,13 @@
 #include "gx_test_common.hpp"
 #include "__gx.h"
+#include "../tools/gxreplay/self_test.hpp"
 #include "gx/guest_memory.hpp"
 #include "trace/capture_session.hpp"
 #include "trace/snapshot_store.hpp"
 #include "trace/state_preamble.hpp"
 #include "trace/trace_reader.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <cstring>
@@ -657,4 +659,129 @@ TEST_F(GXFifoTest, CapturedStreamReplaysAgainstZeroedMemory) {
   EXPECT_EQ(vertexReads[0], v1);
   EXPECT_EQ(vertexReads[1], v2);
   EXPECT_EQ(store.misses(), 0u);
+}
+
+namespace {
+struct DecodedFrame {
+  GXState state;
+  uint32_t draws = 0;
+  uint32_t resolves = 0;
+  std::vector<u8> colors;
+};
+
+std::vector<DecodedFrame> decode_trace(const std::filesystem::path& path, uint64_t& misses) {
+  std::vector<DecodedFrame> frames;
+  aurora::trace::TraceReader reader;
+  std::string error;
+  EXPECT_TRUE(reader.open(path, error)) << error;
+  aurora::trace::SnapshotStore store;
+  const aurora::trace::BlobSink sink = [&](const aurora::trace::Hash128& hash, std::span<const uint8_t> bytes,
+                                           std::string& sinkError) { return store.add_blob(hash, bytes, sinkError); };
+  g_gxState = GXState{};
+  sReplayStore = &store;
+  const aurora::gx::guest_memory::Hooks hooks{.resolve = replay_resolve, .observe = replay_observe};
+  aurora::gx::guest_memory::set_hooks(&hooks);
+  aurora::trace::FrameView frame;
+  while (reader.next(frame, sink, error) == aurora::trace::TraceReader::Status::Frame) {
+    sReplayReads.clear();
+    const uint32_t draws = aurora::gfx::g_testDrawCount;
+    const uint32_t resolves = aurora::gfx::testing::resolvePassCount.load();
+    for (const auto& record : frame.records) {
+      if (record.type == aurora::trace::RecordType::MemoryMap) {
+        aurora::trace::MemoryMapRecord map;
+        EXPECT_TRUE(aurora::trace::decode_memory_map(record.payload, map));
+        EXPECT_TRUE(store.apply(map, error)) << error;
+      } else if (record.type == aurora::trace::RecordType::Fifo) {
+        store.begin_record();
+        decode_all({record.payload.begin(), record.payload.end()});
+      }
+    }
+    DecodedFrame decoded{
+        g_gxState, aurora::gfx::g_testDrawCount - draws, aurora::gfx::testing::resolvePassCount.load() - resolves, {}};
+    for (const auto& read : sReplayReads) {
+      if (read.address == aurora::gxreplay::SelfTestColorAddress) {
+        decoded.colors = read.bytes;
+        break;
+      }
+    }
+    frames.push_back(std::move(decoded));
+  }
+  EXPECT_TRUE(error.empty()) << error;
+  aurora::gx::guest_memory::set_hooks(nullptr);
+  sReplayStore = nullptr;
+  misses = store.misses();
+  return frames;
+}
+} // namespace
+
+TEST_F(GXFifoTest, SelfTestTrace_HintsDoNotChangeDecodedState) {
+  const auto hintsPath = temp_trace("self_test_hints");
+  const auto plainPath = temp_trace("self_test_plain");
+  std::string error;
+  ASSERT_TRUE(aurora::gxreplay::write_self_test_trace(hintsPath, true, error)) << error;
+  ASSERT_TRUE(aurora::gxreplay::write_self_test_trace(plainPath, false, error)) << error;
+
+  uint64_t hintMisses = 0;
+  uint64_t plainMisses = 0;
+  const auto hints = decode_trace(hintsPath, hintMisses);
+  const auto plain = decode_trace(plainPath, plainMisses);
+  EXPECT_EQ(hintMisses, 0u);
+  EXPECT_EQ(plainMisses, 0u);
+  ASSERT_EQ(hints.size(), aurora::gxreplay::SelfTestFrameCount);
+  ASSERT_EQ(plain.size(), aurora::gxreplay::SelfTestFrameCount);
+  for (size_t i = 0; i < hints.size(); ++i) {
+    SCOPED_TRACE(i);
+    expect_state_eq(hints[i].state, plain[i].state);
+    EXPECT_EQ(hints[i].draws, plain[i].draws);
+    EXPECT_GT(hints[i].draws, 0u);
+    EXPECT_EQ(hints[i].resolves, plain[i].resolves);
+    EXPECT_EQ(hints[i].resolves, 1u);
+    EXPECT_EQ(hints[i].colors, plain[i].colors);
+    EXPECT_EQ(hints[i].colors.size(), 48u);
+  }
+  EXPECT_EQ(hints[0].colors, hints[1].colors);
+  EXPECT_NE(hints[2].colors, hints[1].colors);
+}
+
+TEST_F(GXFifoTest, SelfTestTrace_ContainsEveryHintIdAndSize) {
+  const auto path = temp_trace("self_test_scan");
+  std::string error;
+  ASSERT_TRUE(aurora::gxreplay::write_self_test_trace(path, true, error)) << error;
+
+  aurora::trace::TraceReader reader;
+  ASSERT_TRUE(reader.open(path, error)) << error;
+  EXPECT_NE(reader.header().flags & aurora::trace::FileSynthetic, 0u);
+  aurora::trace::FrameView frame;
+  uint32_t frames = 0;
+  while (reader.next(frame, {}, error) == aurora::trace::TraceReader::Status::Frame) {
+    std::vector<u8> fifo;
+    for (const auto& record : frame.records) {
+      if (record.type == aurora::trace::RecordType::Fifo) {
+        fifo.insert(fifo.end(), record.payload.begin(), record.payload.end());
+      }
+    }
+    for (const uint16_t id : aurora::gxreplay::SelfTestHintIds) {
+      for (const uint32_t size : aurora::gxreplay::SelfTestPayloadSizes) {
+        std::vector<u8> hint{GX_AURORA,
+                             static_cast<u8>(id >> 8),
+                             static_cast<u8>(id),
+                             static_cast<u8>(size >> 24),
+                             static_cast<u8>(size >> 16),
+                             static_cast<u8>(size >> 8),
+                             static_cast<u8>(size)};
+        for (uint32_t i = 0; i < size; ++i) {
+          hint.push_back(aurora::gxreplay::self_test_hint_byte(i));
+        }
+        uint32_t matches = 0;
+        for (auto it = std::search(fifo.begin(), fifo.end(), hint.begin(), hint.end()); it != fifo.end();
+             it = std::search(it + 1, fifo.end(), hint.begin(), hint.end())) {
+          ++matches;
+        }
+        EXPECT_EQ(matches, 1u) << "frame " << frames << " hint 0x" << std::hex << id << std::dec << " size " << size;
+      }
+    }
+    ++frames;
+  }
+  EXPECT_TRUE(error.empty()) << error;
+  EXPECT_EQ(frames, aurora::gxreplay::SelfTestFrameCount);
 }

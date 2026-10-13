@@ -58,6 +58,9 @@ std::atomic_bool g_surfaceReady = true;
 #endif
 bool g_lastPaused = false;
 bool g_gotFocus = false;
+bool g_startHidden = false;
+uint32_t g_frameBufferOverrideWidth = 0;
+uint32_t g_frameBufferOverrideHeight = 0;
 
 void retain_event_strings(SDL_Event& event) {
   switch (event.type) {
@@ -420,7 +423,7 @@ void destroy_window() {
 }
 
 void show_window() {
-  if (g_window != nullptr) {
+  if (g_window != nullptr && !g_startHidden) {
     TRY_WARN(SDL_ShowWindow(g_window), "Failed to show window: {}", SDL_GetError());
   }
 }
@@ -495,6 +498,10 @@ AuroraWindowSize get_window_size() {
       fb_w = fitW;
       fb_h = fitH;
     }
+  }
+  if (g_frameBufferOverrideWidth != 0 && g_frameBufferOverrideHeight != 0) {
+    fb_w = static_cast<int>(g_frameBufferOverrideWidth);
+    fb_h = static_cast<int>(g_frameBufferOverrideHeight);
   }
 
   const float scale = SDL_GetWindowDisplayScale(g_window);
@@ -601,6 +608,13 @@ void set_frame_buffer_scale(float scale) {
   }
   g_frameBufferScale = scale;
   request_frame_buffer_resize();
+}
+
+void set_start_hidden(bool hidden) { g_startHidden = hidden; }
+
+void set_frame_buffer_size_override(uint32_t width, uint32_t height) {
+  g_frameBufferOverrideWidth = width;
+  g_frameBufferOverrideHeight = height;
 }
 
 void set_frame_buffer_aspect_fit(bool fit) {

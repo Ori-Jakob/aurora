@@ -7,6 +7,7 @@
 
 #include "../dolphin/vi/vi_internal.hpp"
 #include "../gfx/frame.hpp"
+#include "../gfx/pipeline_cache.hpp"
 #include "../gfx/texture_replacement.hpp"
 #include "../gx/fifo.hpp"
 #include "../gx/guest_memory.hpp"
@@ -73,7 +74,7 @@ uint32_t device_features() noexcept {
 TraceInfo make_info() {
   const auto& graphics = webgpu::g_graphicsConfig;
   TraceInfo info{
-      .captureFlags = CaptureReplacementsBypassed | CaptureSynchronousPublish,
+      .captureFlags = CaptureReplacementsBypassed | CaptureBlockingPipelines | CaptureSynchronousPublish,
       .backend = g_config.desiredBackend,
       .msaaSamples = graphics.msaaSamples,
       .maxAnisotropy = graphics.textureAnisotropy,
@@ -109,6 +110,7 @@ void teardown() noexcept {
   gx::fifo::set_process_observer(nullptr);
   gx::guest_memory::set_hooks(nullptr);
   gfx::texture_replacement::set_bypass(false);
+  gfx::set_blocking_pipelines(false);
   gx::clear_static_texture_cache();
   g_stopRequested = false;
   g_abortReason.clear();
@@ -200,6 +202,7 @@ void on_frame_begin() noexcept {
       fail(std::move(error));
       return;
     }
+    gfx::set_blocking_pipelines(true);
     gx::guest_memory::set_hooks(&RecordHooks);
     gx::fifo::set_process_observer(&RecordObserver);
     gx::fifo::set_synchronous_publish(true);

@@ -34,6 +34,10 @@ bool create_window(AuroraBackend backend);
 bool create_renderer();
 void destroy_window();
 void show_window();
+// Headless tools drive frames through internal APIs and must not show a window.
+void set_start_hidden(bool hidden);
+// Replay renders at the recorded EFB size regardless of the host window or display scale.
+void set_frame_buffer_size_override(uint32_t width, uint32_t height);
 AuroraWindowSize get_window_size();
 const AuroraEvent* poll_events();
 SDL_Window* get_sdl_window();

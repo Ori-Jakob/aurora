@@ -24,6 +24,8 @@ std::optional<ReplacementResult> find_source_replacement(const GXTexObj_& obj,
 bool should_build_source_key() noexcept;
 // Trace capture bypasses replacements so every texture is read from guest memory and replays without the registry.
 void set_bypass(bool bypass) noexcept;
+// Replay needs replacement pixels on first use, not after a timing-dependent thumbnail stage.
+void set_synchronous_loads(bool synchronous) noexcept;
 bool has_replacement(const GXTexObj_& obj) noexcept;
 bool has_replacement(const GXTexObj_& obj, const GXTlutObj_& tlut) noexcept;
 std::string build_texture_replacement_name(const GXTexObj_& obj) noexcept;

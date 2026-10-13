@@ -135,6 +135,7 @@ struct ReplacementKeyHash {
 
 std::mutex s_registryMutex;
 std::atomic_bool s_bypass{false};
+std::atomic_bool s_synchronousLoads{false};
 absl::flat_hash_map<ReplacementKey, std::vector<ReplacementEntry>, ReplacementKeyHash> s_entriesByKey;
 absl::flat_hash_map<ReplacementKey, SelectedCache, ReplacementKeyHash> s_cacheByKey;
 absl::flat_hash_set<uint64_t> s_failedIds;
@@ -1165,7 +1166,7 @@ find_replacement_for_key_locked(const ReplacementKey& key) noexcept {
   erase_cache_locked(key);
   if constexpr (gx::texture::AsyncTextureReplacements) {
     // Raw entry data is borrowed, so they must take the synchronous path.
-    if (entry->kind != EntryKind::Raw) {
+    if (entry->kind != EntryKind::Raw && !s_synchronousLoads.load(std::memory_order_relaxed)) {
       gfx::TextureHandle thumbnailHandle;
       Tier tier = Tier::Thumbnail;
       if (entry->thumbnail.has_value() && !is_unsupported_texture_format(entry->thumbnail->format) &&
@@ -1868,6 +1869,10 @@ bool should_build_source_key() noexcept {
 }
 
 void set_bypass(bool bypass) noexcept { s_bypass.store(bypass, std::memory_order_relaxed); }
+
+void set_synchronous_loads(bool synchronous) noexcept {
+  s_synchronousLoads.store(synchronous, std::memory_order_relaxed);
+}
 
 bool has_replacement(const GXTexObj_& obj) noexcept {
   std::lock_guard lk(s_registryMutex);

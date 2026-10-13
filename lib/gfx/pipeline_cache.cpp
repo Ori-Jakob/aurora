@@ -91,6 +91,7 @@ static std::deque<PendingPipeline> g_pipelineQueue;
 static std::deque<PendingPipeline> g_backgroundPipelineQueue;
 static absl::flat_hash_set<PipelineRef> g_pendingPipelines;
 static std::atomic_bool g_gpuCachePrunePending = false;
+static std::atomic_bool g_blockingPipelines = false;
 
 static sqlite3* g_pipelineCacheDb = nullptr;
 static sqlite3_stmt* g_pipelineCacheLoadStmt = nullptr;
@@ -1087,15 +1088,21 @@ static void stop_pipeline_cache_writer() {
   g_pipelineCacheWriteQueue.clear();
 }
 
+static PipelinePriority draw_pipeline_priority() noexcept {
+  return g_blockingPipelines.load(std::memory_order_relaxed) ? PipelinePriority::Blocking : PipelinePriority::Normal;
+}
+
 PipelineRef find_pipeline(const clear::PipelineConfig& config, const RenderTargetLayout& layout) {
   remember_pipeline_config(ShaderType::Clear, config, current_frame(), true);
-  return resolve_pipeline(ShaderType::Clear, config, layout, PipelinePriority::Normal);
+  return resolve_pipeline(ShaderType::Clear, config, layout, draw_pipeline_priority());
 }
 
 PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) {
   remember_pipeline_config(ShaderType::GX, config, current_frame(), true);
-  return resolve_pipeline(ShaderType::GX, config, layout, PipelinePriority::Normal);
+  return resolve_pipeline(ShaderType::GX, config, layout, draw_pipeline_priority());
 }
+
+void set_blocking_pipelines(bool blocking) noexcept { g_blockingPipelines.store(blocking, std::memory_order_relaxed); }
 
 #ifdef AURORA_ENABLE_RMLUI
 PipelineRef find_pipeline(const rmlui::PipelineConfig& config) {

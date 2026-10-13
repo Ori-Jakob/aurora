@@ -106,4 +106,67 @@ load_png_file(const std::filesystem::path& path) noexcept {
   }
   return parse_png_bytes(*bytes);
 }
+
+static void writePngData(png_structp png, png_bytep data, const size_t length) {
+  static_cast<ByteBuffer*>(png_get_io_ptr(png))->append(data, length);
+}
+
+static void flushPngData(png_structp) {}
+
+struct PngWriteStructs {
+  png_structp pStruct = nullptr;
+  png_infop pInfo = nullptr;
+
+  ~PngWriteStructs() { png_destroy_write_struct(&pStruct, &pInfo); }
+};
+
+ByteBuffer encode_rgba8_png(uint32_t width, uint32_t height, ArrayRef<uint8_t> pixels) noexcept {
+  if (width == 0 || height == 0 || pixels.size() != static_cast<size_t>(width) * height * 4) {
+    Log.error("encode_rgba8_png: {} bytes do not form a {}x{} RGBA8 image", pixels.size(), width, height);
+    return {};
+  }
+  PngWriteStructs structs{};
+  structs.pStruct = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+  if (!structs.pStruct) {
+    Log.error("png_create_write_struct failed");
+    return {};
+  }
+  structs.pInfo = png_create_info_struct(structs.pStruct);
+  if (!structs.pInfo) {
+    Log.error("png_create_info_struct failed");
+    return {};
+  }
+
+  ByteBuffer encoded;
+  std::vector<png_const_bytep> rowPointers(height);
+  for (uint32_t y = 0; y < height; ++y) {
+    rowPointers[y] = pixels.data() + static_cast<size_t>(y) * width * 4;
+  }
+  if (setjmp(png_jmpbuf(structs.pStruct))) {
+    Log.error("libpng encountered an error");
+    return {};
+  }
+
+  png_set_write_fn(structs.pStruct, &encoded, writePngData, flushPngData);
+  png_set_IHDR(structs.pStruct, structs.pInfo, width, height, 8, PNG_COLOR_TYPE_RGB_ALPHA, PNG_INTERLACE_NONE,
+               PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+  png_set_compression_level(structs.pStruct, 6);
+  png_write_info(structs.pStruct, structs.pInfo);
+  png_write_image(structs.pStruct, const_cast<png_bytepp>(rowPointers.data()));
+  png_write_end(structs.pStruct, nullptr);
+  return encoded;
+}
+
+bool write_rgba8_png(const std::filesystem::path& path, uint32_t width, uint32_t height,
+                     ArrayRef<uint8_t> pixels) noexcept {
+  const auto encoded = encode_rgba8_png(width, height, pixels);
+  if (encoded.empty()) {
+    return false;
+  }
+  if (!io::write_file_atomic(path, {encoded.data(), encoded.size()})) {
+    Log.error("failed to write {}", io::fs_path_to_string(path));
+    return false;
+  }
+  return true;
+}
 }

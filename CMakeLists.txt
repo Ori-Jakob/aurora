@@ -17,6 +17,12 @@ option(AURORA_CACHE_USE_ZSTD "Compress WebGPU cache entries with zstd" ON)
 include(CMakeDependentOption)
 cmake_dependent_option(AURORA_ENABLE_EXAMPLES "Enable examples" ON "CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR" OFF)
 cmake_dependent_option(AURORA_ENABLE_TESTS "Enable tests" ON "NOT CMAKE_CROSSCOMPILING" OFF)
+if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND AURORA_ENABLE_GX)
+  set(_aurora_build_tools_default ON)
+else ()
+  set(_aurora_build_tools_default OFF)
+endif ()
+option(AURORA_BUILD_TOOLS "Build developer tools such as aurora_gxreplay" ${_aurora_build_tools_default})
 
 # Dependency versions
 include(cmake/AuroraDependencyVersions.cmake)
@@ -76,6 +82,13 @@ endif ()
 
 if (AURORA_ENABLE_EXAMPLES)
   add_subdirectory(examples)
+endif ()
+
+if (AURORA_BUILD_TOOLS)
+  if (NOT AURORA_ENABLE_GX)
+    message(FATAL_ERROR "AURORA_BUILD_TOOLS requires AURORA_ENABLE_GX")
+  endif ()
+  add_subdirectory(tools)
 endif ()
 
 if (AURORA_ENABLE_TESTS)

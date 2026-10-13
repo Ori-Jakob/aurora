@@ -132,6 +132,7 @@ if (AURORA_ENABLE_GX)
     ../lib/trace/trace_format.cpp
     ../lib/trace/trace_reader.cpp
     ../lib/trace/trace_writer.cpp
+    ../tools/gxreplay/self_test.cpp
   )
 
   target_include_directories(gx_fifo_tests PRIVATE
@@ -350,6 +351,35 @@ if (TARGET render_demo)
               --fail-on-error --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_smoke/${_profile})
     set_tests_properties(render_demo_smoke_${_profile} PROPERTIES LABELS smoke TIMEOUT 180)
   endforeach ()
+endif ()
+
+if (TARGET aurora_gxreplay)
+  add_executable(gxreplay_tests gxreplay_test.cpp ../tools/gxreplay/options.cpp ../tools/gxreplay/report.cpp)
+  target_include_directories(gxreplay_tests PRIVATE ../include ../tools/gxreplay)
+  target_compile_definitions(gxreplay_tests PRIVATE AURORA TARGET_PC=1)
+  target_link_libraries(gxreplay_tests PRIVATE gtest gtest_main fmt::fmt)
+  gtest_discover_tests(gxreplay_tests)
+
+  set(_gxreplay_dir ${CMAKE_CURRENT_BINARY_DIR}/gxreplay)
+  add_test(NAME gxreplay_usage COMMAND $<TARGET_FILE:aurora_gxreplay> --help)
+  add_test(NAME gxreplay_rejects_bad_args COMMAND $<TARGET_FILE:aurora_gxreplay> --repeat 0 missing.gxtrace)
+  set_tests_properties(gxreplay_rejects_bad_args PROPERTIES WILL_FAIL TRUE)
+  add_test(NAME gxreplay_self_test_null
+    COMMAND $<TARGET_FILE:aurora_gxreplay> --self-test --backend null --out ${_gxreplay_dir}/self_test)
+  set_tests_properties(gxreplay_self_test_null PROPERTIES LABELS smoke TIMEOUT 180)
+  if (TARGET render_demo)
+    add_test(NAME gxreplay_render_demo_capture
+      COMMAND $<TARGET_FILE:render_demo> --backend null --frames 8 --timeout 60
+              --data-dir ${_gxreplay_dir}/demo_data --trace ${_gxreplay_dir}/render_demo.gxtrace
+              --trace-start 2 --trace-frames 4)
+    set_tests_properties(gxreplay_render_demo_capture PROPERTIES LABELS smoke TIMEOUT 180
+      FIXTURES_SETUP gxreplay_demo_trace)
+    add_test(NAME gxreplay_render_demo_replay
+      COMMAND $<TARGET_FILE:aurora_gxreplay> ${_gxreplay_dir}/render_demo.gxtrace --backend null --repeat 2
+              --no-png --out ${_gxreplay_dir}/render_demo_replay)
+    set_tests_properties(gxreplay_render_demo_replay PROPERTIES LABELS smoke TIMEOUT 180
+      FIXTURES_REQUIRED gxreplay_demo_trace)
+  endif ()
 endif ()
 
 # DVD API tests
