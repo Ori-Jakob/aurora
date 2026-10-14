@@ -157,14 +157,6 @@ bool same_frames(std::span<const FrameResult> lhs, std::span<const FrameResult> 
   return true;
 }
 
-uint64_t total_misses(std::span<const FrameResult> frames) {
-  uint64_t misses = 0;
-  for (const auto& frame : frames) {
-    misses += frame.misses;
-  }
-  return misses;
-}
-
 int run_self_test(int argc, char* argv[], const Options& options) {
   std::string error;
   if (!io::create_directories(options.outDir)) {
@@ -218,7 +210,7 @@ int run_self_test(int argc, char* argv[], const Options& options) {
     failure = fmt::format("replayed {} frames instead of {}", first.frames.size(), SelfTestFrameCount);
   } else if (!same_frames(first.frames, plainResult.frames, mismatch)) {
     failure = "the plain trace differs from the hint trace: " + mismatch;
-  } else if (const uint64_t misses = total_misses(first.frames) + total_misses(plainResult.frames); misses != 0) {
+  } else if (const uint64_t misses = first.misses + second.misses + plainResult.misses; misses != 0) {
     failure = fmt::format("{} guest reads were not resolved", misses);
   } else {
     check_self_test_frames(first.images, plainResult.images, auroraInfo.backend != BACKEND_NULL, failure);
@@ -318,7 +310,8 @@ int run_replay(int argc, char* argv[], const Options& options) {
   const bool reportsWritten = write_reports(options, context, frames, timings);
   aurora_shutdown();
 
-  const uint64_t misses = total_misses(frames);
+  // Frames before --frames are still decoded, so their unresolved reads count too
+  const uint64_t misses = results[0].misses;
   std::printf("aurora_gxreplay: %zu frames x %u runs on %s, %llu unresolved reads\n", frames.size(), options.repeat,
               context.backend.c_str(), static_cast<unsigned long long>(misses));
   if (!deterministic) {

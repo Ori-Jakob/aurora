@@ -28,6 +28,7 @@ enum ExitCode : int {
 struct ReplayResult {
   std::vector<FrameResult> frames;
   std::vector<FrameTiming> timings;
+  uint64_t misses = 0;
   std::vector<std::vector<uint8_t>> images;
 };
 

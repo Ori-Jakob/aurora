@@ -265,6 +265,8 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
     if (!frameOk || !recordsOk) {
       return false;
     }
+    const uint64_t frameMisses = m_store.misses() - missesBefore;
+    out.misses += frameMisses;
     if (output) {
       const auto frameEnd = Clock::now();
       out.frames.push_back({
@@ -275,7 +277,7 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
           .rgbaHash = hash_rgba(rgba),
           .fifoBytes = fifoBytes,
           .mapRecords = mapRecords,
-          .misses = m_store.misses() - missesBefore,
+          .misses = frameMisses,
           .draws = aurora_get_stats()->drawCallCount,
       });
       out.timings.push_back({
