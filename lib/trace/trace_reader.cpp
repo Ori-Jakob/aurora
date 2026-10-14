@@ -236,6 +236,14 @@ bool TraceReader::parse_frame(std::vector<uint8_t>&& payload, FrameView& frame, 
     return false;
   }
 
+  if (recordCount == 0) {
+    error = fmt::format("corrupt trace: frame {} does not start with RENDER_CONFIG", frame.frameIndex);
+    return false;
+  }
+  if (recordCount > reader.remaining() / RecordHeaderSize) {
+    error = fmt::format("corrupt trace: frame {} claims {} records", frame.frameIndex, recordCount);
+    return false;
+  }
   frame.records.reserve(recordCount);
   for (uint32_t i = 0; i < recordCount; ++i) {
     uint8_t type = 0;

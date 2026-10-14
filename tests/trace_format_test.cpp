@@ -443,6 +443,31 @@ TEST(TraceFormat, MemoryMapMustReferenceKnownBlob) {
   EXPECT_NE(result.error.find("unknown blob"), std::string::npos) << result.error;
 }
 
+TEST(TraceFormat, RejectsFramesWithoutRecordsOrWithImpossibleCounts) {
+  for (const uint32_t recordCount : {0u, 0xFFFFFFFFu}) {
+    const auto path = temp_trace("record_count_" + std::to_string(recordCount));
+    TraceWriter writer;
+    std::string error;
+    ASSERT_TRUE(writer.open(path, 0, error)) << error;
+    ASSERT_TRUE(writer.write_chunk(ChunkType::Info, encode_info(TraceInfo{.label = "test"}), error)) << error;
+    ASSERT_TRUE(writer.write_chunk(ChunkType::StatePreamble, {}, error)) << error;
+    std::vector<uint8_t> payload;
+    LeWriter frame{payload};
+    frame.u32(0);
+    frame.u32(0);
+    frame.u32(recordCount);
+    ASSERT_TRUE(writer.write_chunk(ChunkType::Frame, payload, error)) << error;
+    const Trailer trailer{.frameCount = 1};
+    ASSERT_TRUE(writer.finalize(0, 1, 0, encode_trailer(trailer), error)) << error;
+
+    TraceReader reader;
+    ASSERT_TRUE(reader.open(path, error)) << error;
+    const auto result = read_all(reader);
+    EXPECT_EQ(result.status, TraceReader::Status::Error) << recordCount;
+    EXPECT_NE(result.error.find("frame 0"), std::string::npos) << result.error;
+  }
+}
+
 TEST(TraceFormat, ReadsExternalCaptureFromEnvironment) {
   const char* file = SDL_getenv("AURORA_TRACE_FILE");
   if (file == nullptr || *file == '\0') {
