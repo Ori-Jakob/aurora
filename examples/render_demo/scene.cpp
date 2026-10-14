@@ -123,7 +123,8 @@ Vec to_view(const Mtx view, const Vec& world) {
 
 Lights setup_lights(const Mtx view, f32 t) {
   Lights lights{};
-  GXLightObj light;
+  // Only the spot light sets a direction; the others must not load stack garbage into XF
+  GXLightObj light{};
 
   Vec sunDir{-0.4f, -1.f, -0.3f};
   C_VECNormalize(&sunDir, &sunDir);
