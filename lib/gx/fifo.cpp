@@ -208,6 +208,8 @@ void set_process_observer(const ProcessObserver* observer) noexcept {
   sProcessObserver.store(observer, std::memory_order_release);
 }
 
+const ProcessObserver* process_observer() noexcept { return sProcessObserver.load(std::memory_order_acquire); }
+
 void set_synchronous_publish(bool synchronous) noexcept { sSynchronousPublish = synchronous; }
 
 void finish_draw() noexcept {

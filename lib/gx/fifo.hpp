@@ -105,6 +105,7 @@ struct ProcessObserver {
 };
 // Swapped only while the FIFO is drained, like guest_memory::set_hooks.
 void set_process_observer(const ProcessObserver* observer) noexcept;
+const ProcessObserver* process_observer() noexcept;
 // Trace capture needs guest memory frozen while published commands decode.
 void set_synchronous_publish(bool synchronous) noexcept;
 

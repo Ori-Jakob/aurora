@@ -2,6 +2,7 @@
 #include <aurora/trace.hpp>
 #include <gtest/gtest.h>
 
+#include "gx/fifo.hpp"
 #include "gx/guest_memory.hpp"
 #include "trace/capture.hpp"
 #include "trace/trace_reader.hpp"
@@ -59,6 +60,7 @@ TEST_F(TraceCapture, CapturesRequestedFramesAndFinalizes) {
   run_frame();
   EXPECT_EQ(capture_status().state, CaptureState::Capturing);
   EXPECT_NE(gx::guest_memory::g_hooks.load(), nullptr);
+  EXPECT_NE(gx::fifo::process_observer(), nullptr);
   run_frame();
   run_frame();
 
@@ -70,6 +72,7 @@ TEST_F(TraceCapture, CapturesRequestedFramesAndFinalizes) {
   EXPECT_EQ(status.bytesWritten, std::filesystem::file_size(path));
   EXPECT_FALSE(is_capturing());
   EXPECT_EQ(gx::guest_memory::g_hooks.load(), nullptr);
+  EXPECT_EQ(gx::fifo::process_observer(), nullptr);
 
   TraceReader reader;
   std::string error;
