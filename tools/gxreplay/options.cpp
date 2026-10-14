@@ -217,15 +217,7 @@ std::optional<FrameRange> parse_frame_range(std::string_view text) noexcept {
 
 std::optional<Options> parse_options(int argc, const char* const* argv, const char* envBackend, std::string& error) {
   Options options;
-  if (envBackend != nullptr && *envBackend != '\0') {
-    const auto backend = parse_backend(envBackend);
-    if (!backend) {
-      error = std::string{"invalid AURORA_BACKEND value: "} + envBackend;
-      return std::nullopt;
-    }
-    options.backend = *backend;
-  }
-
+  bool backendFlag = false;
   bool haveTrace = false;
   for (int i = 1; i < argc; ++i) {
     const std::string_view arg = argv[i];
@@ -261,6 +253,15 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
       error = std::string{"invalid value for "} + std::string{arg} + ": " + std::string{value};
       return std::nullopt;
     }
+    backendFlag |= flag->name == "--backend";
+  }
+  if (!backendFlag && !options.help && envBackend != nullptr && *envBackend != '\0') {
+    const auto backend = parse_backend(envBackend);
+    if (!backend) {
+      error = std::string{"invalid AURORA_BACKEND value: "} + envBackend;
+      return std::nullopt;
+    }
+    options.backend = *backend;
   }
   if (options.help) {
     return options;

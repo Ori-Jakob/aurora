@@ -176,14 +176,7 @@ std::string_view backend_name(AuroraBackend backend) noexcept {
 
 std::optional<Options> parse_options(int argc, const char* const* argv, const char* envBackend, std::string& error) {
   Options options;
-  if (envBackend != nullptr && *envBackend != '\0') {
-    const auto backend = parse_backend(envBackend);
-    if (!backend) {
-      error = std::string{"invalid AURORA_BACKEND value: "} + envBackend;
-      return std::nullopt;
-    }
-    options.backend = *backend;
-  }
+  bool backendFlag = false;
   for (int i = 1; i < argc; ++i) {
     const std::string_view arg = argv[i];
     const Flag* flag = nullptr;
@@ -209,6 +202,15 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
       error = std::string{"invalid value for "} + std::string{arg} + ": " + std::string{value};
       return std::nullopt;
     }
+    backendFlag |= flag->name == "--backend";
+  }
+  if (!backendFlag && !options.help && envBackend != nullptr && *envBackend != '\0') {
+    const auto backend = parse_backend(envBackend);
+    if (!backend) {
+      error = std::string{"invalid AURORA_BACKEND value: "} + envBackend;
+      return std::nullopt;
+    }
+    options.backend = *backend;
   }
   if (!options.tracePath.empty() && options.frames != 0 &&
       options.frames < static_cast<uint64_t>(options.traceStart) + options.traceFrames) {

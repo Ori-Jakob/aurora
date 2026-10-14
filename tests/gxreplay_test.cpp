@@ -118,6 +118,12 @@ TEST(GxReplayOptions, EnvironmentBackendIsFallback) {
   EXPECT_EQ(flagWins->backend, BACKEND_D3D12);
 
   EXPECT_FALSE(parse({"demo.gxtrace", "--out", "o"}, "dx9"));
+  const auto badEnvWithFlag = parse({"demo.gxtrace", "--out", "o", "--backend", "null"}, "dx9");
+  ASSERT_TRUE(badEnvWithFlag);
+  EXPECT_EQ(badEnvWithFlag->backend, BACKEND_NULL);
+  const auto badEnvWithHelp = parse({"--help"}, "dx9");
+  ASSERT_TRUE(badEnvWithHelp);
+  EXPECT_TRUE(badEnvWithHelp->help);
 }
 
 TEST(GxReplayOptions, RejectsInvalidInput) {

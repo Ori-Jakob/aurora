@@ -149,6 +149,16 @@ TEST(RenderDemoOptions, EnvironmentBackendIsFallback) {
   EXPECT_EQ(flagWins->backend, BACKEND_VULKAN);
 }
 
+TEST(RenderDemoOptions, InvalidEnvironmentBackendOnlyFailsWhenUsed) {
+  EXPECT_FALSE(parse({}, "dx9"));
+  const auto flagWins = parse({"--backend", "null"}, "dx9");
+  ASSERT_TRUE(flagWins);
+  EXPECT_EQ(flagWins->backend, BACKEND_NULL);
+  const auto help = parse({"--help"}, "dx9");
+  ASSERT_TRUE(help);
+  EXPECT_TRUE(help->help);
+}
+
 TEST(RenderDemoOptions, RejectsInvalidInput) {
   EXPECT_FALSE(parse({"--frames", "-1"}));
   EXPECT_FALSE(parse({"--frames", "abc"}));
