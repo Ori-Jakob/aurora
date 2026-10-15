@@ -25,6 +25,7 @@
 #include "../internal.hpp"
 #include "../window.hpp"
 #include "feature_profile.hpp"
+#include "caps.hpp"
 #include "gpu_prof.hpp"
 
 #ifdef WEBGPU_DAWN
@@ -117,6 +118,142 @@ void log_feature_profile(const ResolvedFeatureProfile& resolved, const wgpu::Sup
       feature_profile_forces_validation(resolved.profile) ? "forced on" : "build default",
       maskedList.empty() ? " none" : maskedList, adapterLimits.maxColorAttachmentBytesPerSample,
       budget == 0 ? std::string{"none"} : std::to_string(budget), deviceLimits.maxColorAttachmentBytesPerSample);
+}
+
+std::string limit_text(uint32_t value) {
+  return value == WGPU_LIMIT_U32_UNDEFINED ? std::string{"default"} : std::to_string(value);
+}
+
+std::string limit_text(uint64_t value) {
+  return value == WGPU_LIMIT_U64_UNDEFINED ? std::string{"default"} : std::to_string(value);
+}
+
+void log_required_limits(const wgpu::Limits& limits, bool core) {
+  Log.info(
+      "Using limits ({}):"
+      "\n  maxTextureDimension1D: {}"
+      "\n  maxTextureDimension2D: {}"
+      "\n  maxTextureDimension3D: {}"
+      "\n  maxTextureArrayLayers: {}"
+      "\n  maxStorageBuffersPerShaderStage: {}"
+      "\n  minUniformBufferOffsetAlignment: {}"
+      "\n  minStorageBufferOffsetAlignment: {}"
+      "\n  maxImmediateSize: {}"
+      "\n  maxColorAttachments: {}"
+      "\n  maxColorAttachmentBytesPerSample: {}"
+      "\n  maxInterStageShaderVariables: {}"
+      "\n  maxStorageTexturesPerShaderStage: {}"
+      "\n  maxSampledTexturesPerShaderStage: {}"
+      "\n  maxBufferSize: {}"
+      "\n  maxStorageBufferBindingSize: {}"
+      "\n  maxComputeWorkgroupStorageSize: {}",
+      core ? "core" : "compatibility", limit_text(limits.maxTextureDimension1D),
+      limit_text(limits.maxTextureDimension2D), limit_text(limits.maxTextureDimension3D),
+      limit_text(limits.maxTextureArrayLayers), limit_text(limits.maxStorageBuffersPerShaderStage),
+      limit_text(limits.minUniformBufferOffsetAlignment), limit_text(limits.minStorageBufferOffsetAlignment),
+      limit_text(limits.maxImmediateSize), limit_text(limits.maxColorAttachments),
+      limit_text(limits.maxColorAttachmentBytesPerSample), limit_text(limits.maxInterStageShaderVariables),
+      limit_text(limits.maxStorageTexturesPerShaderStage), limit_text(limits.maxSampledTexturesPerShaderStage),
+      limit_text(limits.maxBufferSize), limit_text(limits.maxStorageBufferBindingSize),
+      limit_text(limits.maxComputeWorkgroupStorageSize));
+}
+
+std::string feature_state_list(const std::vector<FeatureRequestResult>& requests, FeatureRequestState state) {
+  std::string list;
+  for (const auto& request : requests) {
+    if (request.state != state) {
+      continue;
+    }
+    if (!list.empty()) {
+      list += ", ";
+    }
+    list += request.name;
+  }
+  return list.empty() ? std::string{"none"} : list;
+}
+
+void log_caps(const render::Caps& caps, const std::vector<FeatureRequestResult>& requests) {
+  constexpr uint64_t MiB = uint64_t{1} << 20;
+  const auto& limits = caps.limits;
+  const auto vertex = render::stage_binding_limits(caps, render::ShaderStage::Vertex);
+  const auto fragment = render::stage_binding_limits(caps, render::ShaderStage::Fragment);
+  const auto subgroups =
+      caps.subgroups ? fmt::format("{}-{}", caps.subgroupMinSize, caps.subgroupMaxSize) : std::string{"no"};
+  const auto vram = caps.vramSource == render::VramSource::Unknown
+                        ? std::string{"unknown"}
+                        : fmt::format("{} MiB ({}{})", caps.vramBytes / MiB, render::vram_source_name(caps.vramSource),
+                                      caps.unifiedMemory ? ", unified" : "");
+  Log.info(
+      "Device caps:"
+      "\n  Backend: {} ({}), profile {}, core features: {}"
+      "\n  Masked by profile: {}"
+      "\n  Not supported by adapter: {}"
+      "\n  Subgroups: {}"
+      "\n  Color attachments: {}, {} bytes per sample; inter-stage variables: {}"
+      "\n  Storage buffers per stage: {} (vertex {}, fragment {}); storage textures: {} (vertex {}, fragment {})"
+      "\n  Sampled textures: {}; samplers: {}; uniform buffers: {}"
+      "\n  Max buffer: {} MiB; storage binding: {} MiB; workgroup storage: {} bytes"
+      "\n  VRAM: {}"
+      "\n  D3D12 interop: {}; shader model: {}",
+      magic_enum::enum_name(g_backendType), render::adapter_kind_name(caps.adapterKind),
+      feature_profile_name(caps.profile), caps.core ? "yes" : "no",
+      feature_state_list(requests, FeatureRequestState::MaskedByProfile),
+      feature_state_list(requests, FeatureRequestState::Unsupported), subgroups, limits.maxColorAttachments,
+      limits.maxColorAttachmentBytesPerSample, limits.maxInterStageShaderVariables,
+      limits.maxStorageBuffersPerShaderStage, vertex.storageBuffers, fragment.storageBuffers,
+      limits.maxStorageTexturesPerShaderStage, vertex.storageTextures, fragment.storageTextures,
+      limits.maxSampledTexturesPerShaderStage, limits.maxSamplersPerShaderStage, limits.maxUniformBuffersPerShaderStage,
+      limits.maxBufferSize / MiB, limits.maxStorageBufferBindingSize / MiB, limits.maxComputeWorkgroupStorageSize, vram,
+      caps.d3d12Interop ? "yes" : "no", shader_model_text(caps.d3dShaderModel));
+}
+
+render::Caps query_device_caps(std::span<const wgpu::FeatureName> adapterFeatures) {
+  wgpu::SupportedFeatures deviceFeatures;
+  g_device.GetFeatures(&deviceFeatures);
+  wgpu::CompatibilityModeLimits compatLimits{};
+  wgpu::Limits limits{.nextInChain = &compatLimits};
+  g_device.GetLimits(&limits);
+  limits.nextInChain = nullptr;
+  const bool hasHeaps = g_device.HasFeature(wgpu::FeatureName::AdapterPropertiesMemoryHeaps);
+  const bool hasD3D = g_device.HasFeature(wgpu::FeatureName::AdapterPropertiesD3D);
+  wgpu::AdapterPropertiesMemoryHeaps memoryHeaps{};
+  wgpu::AdapterPropertiesD3D d3dProperties{};
+  wgpu::AdapterInfo info{};
+  // Chaining a property struct the adapter lacks fails the whole query, so only chain what the device has
+  wgpu::ChainedStructOut** next = &info.nextInChain;
+  if (hasHeaps) {
+    *next = &memoryHeaps;
+    next = &memoryHeaps.nextInChain;
+  }
+  if (hasD3D) {
+    *next = &d3dProperties;
+  }
+  const bool infoValid = g_device.GetAdapterInfo(&info) == wgpu::Status::Success;
+  if (!infoValid) {
+    Log.warn("Failed to query adapter info from the device; using the adapter's");
+  }
+  // The adapter query at init describes the same adapter, so backend and identity survive a failed device query
+  const wgpu::AdapterInfo& ids = infoValid ? info : g_adapterInfo;
+  const std::span<const wgpu::FeatureName> features{deviceFeatures.features, deviceFeatures.featureCount};
+  auto deviceCaps = build_caps({
+      .backend = ids.backendType,
+      .adapterType = ids.adapterType,
+      .profile = g_featureProfile,
+      .vendorId = ids.vendorID,
+      .deviceId = ids.deviceID,
+      .adapterName = ids.device.IsUndefined() ? std::string_view{"Unknown"} : std::string_view{ids.device},
+      .features = features,
+      .limits = limits,
+      .compatLimits = compatLimits,
+      .subgroupMinSize = ids.subgroupMinSize,
+      .subgroupMaxSize = ids.subgroupMaxSize,
+      .memoryHeaps = infoValid && hasHeaps
+                         ? std::span<const wgpu::MemoryHeapInfo>{memoryHeaps.heapInfo, memoryHeaps.heapCount}
+                         : std::span<const wgpu::MemoryHeapInfo>{},
+      .d3dShaderModel = infoValid && hasD3D ? d3dProperties.shaderModel : 0,
+  });
+  log_caps(deviceCaps, describe_feature_requests(adapterFeatures, features, g_featureProfile));
+  return deviceCaps;
 }
 
 struct ResampleUniformBlock {
@@ -438,7 +575,7 @@ static TextureWithSampler create_normal_texture(uint32_t width, uint32_t height)
   const wgpu::Extent3D size{width, height, 1};
   const wgpu::TextureDescriptor desc{
       .label = "Scene normals",
-      .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc,
+      .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc,
       .size = size,
       .format = NormalBufferFormat,
   };
@@ -918,85 +1055,36 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   }
   g_featureProfile = resolvedProfile.profile;
 
+  render::Caps deviceCaps;
   {
     wgpu::Limits supportedLimits{};
     g_adapter.GetLimits(&supportedLimits);
+    wgpu::SupportedFeatures supportedFeatures;
+    g_adapter.GetFeatures(&supportedFeatures);
+    const std::span<const wgpu::FeatureName> adapterFeatures{supportedFeatures.features,
+                                                             supportedFeatures.featureCount};
+    const bool requestCore = requests_core_features(adapterFeatures, g_featureProfile);
     wgpu::CompatibilityModeLimits compatibilityModeLimits{wgpu::CompatibilityModeLimits::Init{
         .maxStorageBuffersInVertexStage = 2,
         .maxStorageBuffersInFragmentStage = 2,
     }};
-    wgpu::Limits requiredLimits{
-        .nextInChain = &compatibilityModeLimits,
-        // Use "best" supported limits
-        .maxTextureDimension1D = supportedLimits.maxTextureDimension1D == 0 ? WGPU_LIMIT_U32_UNDEFINED
-                                                                            : supportedLimits.maxTextureDimension1D,
-        .maxTextureDimension2D = supportedLimits.maxTextureDimension2D == 0 ? WGPU_LIMIT_U32_UNDEFINED
-                                                                            : supportedLimits.maxTextureDimension2D,
-        .maxTextureDimension3D = supportedLimits.maxTextureDimension3D == 0 ? WGPU_LIMIT_U32_UNDEFINED
-                                                                            : supportedLimits.maxTextureDimension3D,
-        .maxTextureArrayLayers = supportedLimits.maxTextureArrayLayers == 0 ? WGPU_LIMIT_U32_UNDEFINED
-                                                                            : supportedLimits.maxTextureArrayLayers,
-        .maxStorageBuffersPerShaderStage = 2,
-        .minUniformBufferOffsetAlignment =
-            supportedLimits.minUniformBufferOffsetAlignment < 64 ? 64 : supportedLimits.minUniformBufferOffsetAlignment,
-        .minStorageBufferOffsetAlignment =
-            supportedLimits.minStorageBufferOffsetAlignment < 16 ? 16 : supportedLimits.minStorageBufferOffsetAlignment,
-        .maxImmediateSize = sizeof(gx::DrawImmediateData),
+    wgpu::Limits requiredLimits =
+        build_required_limits(supportedLimits, requestCore, g_featureProfile, sizeof(gx::DrawImmediateData));
+    requiredLimits.nextInChain = &compatibilityModeLimits;
+    log_required_limits(requiredLimits, requestCore);
+    const auto requiredFeatures = select_device_features(adapterFeatures, g_featureProfile);
+    const auto requested = [&](wgpu::FeatureName feature) {
+      return std::ranges::find(requiredFeatures, feature) != requiredFeatures.end();
     };
-    clamp_limits_to_feature_profile(g_featureProfile, requiredLimits);
-    Log.info(
-        "Using limits:"
-        "\n  maxTextureDimension1D: {}"
-        "\n  maxTextureDimension2D: {}"
-        "\n  maxTextureDimension3D: {}"
-        "\n  maxTextureArrayLayers: {}"
-        "\n  maxStorageBuffersPerShaderStage: {}"
-        "\n  minUniformBufferOffsetAlignment: {}"
-        "\n  minStorageBufferOffsetAlignment: {}"
-        "\n  maxImmediateSize: {}",
-        requiredLimits.maxTextureDimension1D, requiredLimits.maxTextureDimension2D,
-        requiredLimits.maxTextureDimension3D, requiredLimits.maxTextureArrayLayers,
-        requiredLimits.maxStorageBuffersPerShaderStage, requiredLimits.minUniformBufferOffsetAlignment,
-        requiredLimits.minStorageBufferOffsetAlignment, requiredLimits.maxImmediateSize);
-    std::vector<wgpu::FeatureName> requiredFeatures;
-    g_hasCoreFeatures = false;
-    g_bcTexturesSupported = false;
-    g_astcTexturesSupported = false;
-    g_textureComponentSwizzleSupported = false;
-    g_dualSourceBlendingSupported = false;
-    wgpu::SupportedFeatures supportedFeatures;
-    g_adapter.GetFeatures(&supportedFeatures);
-    for (size_t i = 0; i < supportedFeatures.featureCount; ++i) {
-      const auto feature = supportedFeatures.features[i];
-      if (!feature_profile_allows(g_featureProfile, feature)) {
-        continue;
-      }
-      if (feature == wgpu::FeatureName::CoreFeaturesAndLimits || feature == wgpu::FeatureName::TextureCompressionBC ||
-          feature == wgpu::FeatureName::TextureCompressionASTC ||
-          feature == wgpu::FeatureName::TextureComponentSwizzle || feature == wgpu::FeatureName::DualSourceBlending) {
-        if (feature == wgpu::FeatureName::CoreFeaturesAndLimits) {
-          g_hasCoreFeatures = true;
-        } else if (feature == wgpu::FeatureName::TextureCompressionBC) {
-          g_bcTexturesSupported = true;
-        } else if (feature == wgpu::FeatureName::TextureCompressionASTC) {
-          g_astcTexturesSupported = true;
-        } else if (feature == wgpu::FeatureName::TextureComponentSwizzle) {
-          g_textureComponentSwizzleSupported = true;
-        } else if (feature == wgpu::FeatureName::DualSourceBlending) {
-          g_dualSourceBlendingSupported = true;
-        }
-        requiredFeatures.push_back(feature);
-      }
-#ifdef TRACY_ENABLE
-      if (feature == wgpu::FeatureName::TimestampQuery) {
-        requiredFeatures.push_back(feature);
-      }
-#endif
-    }
+    g_hasCoreFeatures = requested(wgpu::FeatureName::CoreFeaturesAndLimits);
+    g_bcTexturesSupported = requested(wgpu::FeatureName::TextureCompressionBC);
+    g_astcTexturesSupported = requested(wgpu::FeatureName::TextureCompressionASTC);
+    g_textureComponentSwizzleSupported = requested(wgpu::FeatureName::TextureComponentSwizzle);
+    g_dualSourceBlendingSupported = requested(wgpu::FeatureName::DualSourceBlending);
     std::string featureList;
     for (auto featureName : requiredFeatures) {
       featureList += "\n  ";
-      featureList += magic_enum::enum_name(featureName);
+      featureList += requested_feature_name(featureName);
     }
     Log.info("Enabling features: {}", featureList);
 #ifdef WEBGPU_DAWN
@@ -1095,6 +1183,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     }
     g_device.SetLoggingCallback(wgpu_log);
     log_feature_profile(resolvedProfile, supportedFeatures, supportedLimits);
+    deviceCaps = query_device_caps(adapterFeatures);
   }
   g_queue = g_device.GetQueue();
 
@@ -1134,6 +1223,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   create_resample_pipeline();
   gpu_prof::initialize();
   resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
+  set_caps(std::move(deviceCaps));
   g_initialized = true;
   return true;
 }
@@ -1158,6 +1248,7 @@ void shutdown() {
   g_queue = {};
   g_surface = {};
   g_device = {};
+  reset_caps();
   g_adapter = {};
   g_instance = {};
   cache_shutdown();

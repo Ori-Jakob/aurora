@@ -10,12 +10,14 @@ constexpr std::array<MaskedFeature, 1> CompatMaskedFeatures{{
     {wgpu::FeatureName::CoreFeaturesAndLimits, "CoreFeaturesAndLimits"},
 }};
 
-// Worst-case Apple GPU: Dawn Metal has no MDI or resource table; PrimitiveIndex needs Apple7, atomic64 Apple8+
-constexpr std::array<MaskedFeature, 4> MetalMaskedFeatures{{
+// Worst-case Apple GPU: no MDI, resource table or D3D12 interop; PrimitiveIndex needs Apple7, atomic64 Apple8+
+constexpr std::array<MaskedFeature, 6> MetalMaskedFeatures{{
     {wgpu::FeatureName::MultiDrawIndirect, "MultiDrawIndirect"},
     {wgpu::FeatureName::ChromiumExperimentalSamplingResourceTable, "ChromiumExperimentalSamplingResourceTable"},
     {wgpu::FeatureName::PrimitiveIndex, "PrimitiveIndex"},
     {wgpu::FeatureName::AtomicVec2uMinMax, "AtomicVec2uMinMax"},
+    {wgpu::FeatureName::SharedBufferMemoryD3D12Resource, "SharedBufferMemoryD3D12Resource"},
+    {wgpu::FeatureName::SharedFenceDXGISharedHandle, "SharedFenceDXGISharedHandle"},
 }};
 
 constexpr std::array<std::pair<std::string_view, AuroraFeatureProfile>, 5> ProfileNames{{

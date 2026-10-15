@@ -83,6 +83,7 @@ if (AURORA_ENABLE_GX)
     target_sources(aurora_core PRIVATE
             lib/webgpu/gpu.cpp
             lib/webgpu/feature_profile.cpp
+            lib/webgpu/caps.cpp
             lib/webgpu/gpu_cache.cpp
             lib/webgpu/gpu_prof.cpp
             lib/dawn/BackendBinding.cpp

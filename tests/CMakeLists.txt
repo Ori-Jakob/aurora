@@ -300,6 +300,16 @@ if (AURORA_ENABLE_GX)
   target_link_libraries(feature_profile_tests PRIVATE gtest gtest_main dawn::dawncpp_headers)
   gtest_discover_tests(feature_profile_tests)
 
+  add_executable(caps_tests
+    caps_test.cpp
+    ../lib/webgpu/caps.cpp
+    ../lib/webgpu/feature_profile.cpp
+  )
+  target_include_directories(caps_tests PRIVATE ../include ../lib)
+  target_compile_definitions(caps_tests PRIVATE AURORA TARGET_PC=1)
+  target_link_libraries(caps_tests PRIVATE gtest gtest_main dawn::dawncpp_headers)
+  gtest_discover_tests(caps_tests)
+
   add_executable(trace_tests
     trace_format_test.cpp
     trace_store_test.cpp
