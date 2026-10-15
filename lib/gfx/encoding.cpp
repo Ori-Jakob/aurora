@@ -9,6 +9,7 @@
 #include "tex_palette_conv.hpp"
 #include "../gx/gx.hpp"
 #include "../gx/pipeline.hpp"
+#include "../render/stage.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
 #endif
@@ -419,6 +420,11 @@ void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op)
   case FrameOpType::EncoderTask:
     if (op.encoderTask != nullptr) {
       execute_encoder_task(cmd, frame, *op.encoderTask);
+    }
+    break;
+  case FrameOpType::RenderStage:
+    if (op.stageData != nullptr) {
+      ::aurora::render::detail::run_stage(cmd, *op.stageData);
     }
     break;
   }

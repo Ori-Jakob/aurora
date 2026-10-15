@@ -373,6 +373,7 @@ void end_frame() noexcept {
     webgpu::gpu_prof::frame_end(encoder);
     const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Redraw command buffer"};
     const auto buffer = encoder.Finish(&cmdBufDescriptor);
+    gfx::before_submit();
     {
       ZoneScopedN("Queue Submit");
       g_queue.Submit(1, &buffer);
@@ -420,6 +421,7 @@ void end_frame() noexcept {
         break;
       }
     }
+    gfx::after_frame();
     for (auto& callback : afterSubmitCallbacks) {
       if (callback) {
         callback();

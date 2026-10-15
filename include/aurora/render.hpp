@@ -182,4 +182,35 @@ FeatureSupport feature_support(Feature feature, uint8_t option, const Settings& 
 bool feature_ready(Feature feature) noexcept;
 std::string_view feature_name(Feature feature) noexcept;
 std::string_view reason_name(Reason reason) noexcept;
+
+enum class Stage : uint8_t {
+  SceneBegin,
+  OpaqueDone,
+  PrePost,
+  SceneEnd,
+  BeforeHud,
+  FrameEnd,
+  AfterFrame,
+};
+inline constexpr size_t StageCount = 7;
+
+constexpr std::string_view stage_name(Stage stage) noexcept {
+  switch (stage) {
+  case Stage::SceneBegin:
+    return "SceneBegin";
+  case Stage::OpaqueDone:
+    return "OpaqueDone";
+  case Stage::PrePost:
+    return "PrePost";
+  case Stage::SceneEnd:
+    return "SceneEnd";
+  case Stage::BeforeHud:
+    return "BeforeHud";
+  case Stage::FrameEnd:
+    return "FrameEnd";
+  case Stage::AfterFrame:
+    return "AfterFrame";
+  }
+  return "Unknown";
+}
 } // namespace aurora::render

@@ -631,7 +631,8 @@ std::shared_ptr<const FrameState> latch_frame() {
   }
   std::shared_ptr<const CompiledGraph> graph = g_frameState ? g_frameState->graph : nullptr;
 #if AURORA_ENABLE_RENDER
-  if (graph == nullptr || settingsChanged) {
+  const bool passesChanged = consume_graph_dirty();
+  if (graph == nullptr || settingsChanged || passesChanged) {
     graph = compile_graph(latched_settings(), caps());
   }
 #endif
@@ -658,6 +659,9 @@ void reset() noexcept {
   g_latched.reset();
   g_generation = 0;
   g_frameState.reset();
+#if AURORA_ENABLE_RENDER
+  clear_passes();
+#endif
 }
 
 uint64_t settings_generation() noexcept { return g_generation; }

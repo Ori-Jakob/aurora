@@ -365,8 +365,10 @@ bool Replayer::end_frame(bool readback, std::vector<uint8_t>& rgba, uint32_t& wi
     }
     const wgpu::CommandBufferDescriptor descriptor{.label = "gxreplay frame"};
     const auto buffer = encoder.Finish(&descriptor);
+    gfx::before_submit();
     webgpu::g_queue.Submit(1, &buffer);
     webgpu::gpu_prof::after_submit();
+    gfx::after_frame();
     for (auto& callback : callbacks) {
       if (callback) {
         callback();

@@ -14,12 +14,14 @@
 #include "../gx/fifo.hpp"
 #include "../gx/gx.hpp"
 #include "../gx/pipeline.hpp"
+#include "../render/stage.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
 #endif
 #include "../trace/capture.hpp"
 #include "../window.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <new>
@@ -55,6 +57,9 @@ struct FrameRecorder {
   ClipRect cachedScissor;
   bool suppressRenderWorker = false;
   bool normalRequested = false;
+  uint8_t nextStage = 0;
+  uint8_t pendingStageEnd = 0;
+  std::array<bool, render::StageCount> stageMarkerSeen{};
 #ifdef AURORA_GFX_DEBUG_GROUPS
   std::vector<std::string> debugGroupStack;
 #endif
@@ -260,6 +265,7 @@ FrameOp capture_frame_op(FramePacket& frame, FrameOpType type, uint32_t index) {
                          : nullptr,
       .encoderTask =
           type == FrameOpType::EncoderTask && index < frame.encoderTasks.size() ? &frame.encoderTasks[index] : nullptr,
+      .stageData = type == FrameOpType::RenderStage && index < frame.stages.size() ? &frame.stages[index] : nullptr,
       .highWater = current_high_water(frame),
   };
   op.textureUploads.reserve(op.highWater.textureUploadCount);
@@ -430,6 +436,11 @@ OffscreenCacheEntry get_offscreen_textures(uint32_t width, uint32_t height) {
 
 void enqueue_pass(FramePacket& frame, uint32_t passIndex);
 
+constexpr uint8_t LastMarkerStage = static_cast<uint8_t>(render::Stage::FrameEnd);
+constexpr uint8_t NoLiveMarker = UINT8_MAX;
+
+void run_stages_until(uint8_t end, uint8_t liveMarker);
+
 void resume_efb_pass_loading(const RenderPass& prevPass) {
   RenderPass newPass{
       .label = pass_label("EFB"),
@@ -544,6 +555,11 @@ void restore_efb() {
   g_recorder.cachedScissor = g_recorder.suspendedEfbScissor;
   push_command(CommandType::SetViewport, Command::Data{.setViewport = g_recorder.cachedViewport});
   push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
+
+  if (g_recorder.pendingStageEnd > g_recorder.nextStage) {
+    run_stages_until(std::exchange(g_recorder.pendingStageEnd, 0), NoLiveMarker);
+  }
+  g_recorder.pendingStageEnd = 0;
 }
 
 void enqueue_op(FramePacket& frame, uint32_t opIndex) {
@@ -552,7 +568,7 @@ void enqueue_op(FramePacket& frame, uint32_t opIndex) {
   }
   auto op = frame.ops[opIndex];
   render_worker::enqueue_encode_pass(frame.frameId, opIndex, [packet = &frame, op = std::move(op)] {
-    if (op.renderPass == nullptr && op.textureCopy == nullptr && op.encoderTask == nullptr) {
+    if (op.renderPass == nullptr && op.textureCopy == nullptr && op.encoderTask == nullptr && op.stageData == nullptr) {
       return;
     }
     encode_op(packet->encoder, *packet, op);
@@ -564,6 +580,61 @@ void enqueue_pass(FramePacket& frame, uint32_t passIndex) {
   const auto opIndex = static_cast<uint32_t>(frame.ops.size());
   frame.ops.emplace_back(capture_frame_op(frame, FrameOpType::RenderPass, passIndex));
   enqueue_op(frame, opIndex);
+}
+
+// The open pass is sealed only once a stage has work, so an empty graph leaves the EFB pass untouched
+bool emit_stage_ops(uint8_t end, uint8_t liveMarker, bool atFinish) {
+  auto& frame = current_frame_packet();
+  bool emitted = false;
+  for (uint8_t index = g_recorder.nextStage; index < end; ++index) {
+    const bool seen = g_recorder.stageMarkerSeen[index];
+    render::detail::StageData data{
+        .stage = static_cast<render::Stage>(index),
+        .frameId = frame.frameId,
+        .frameIndex = frame.frameIndex,
+        .markerSeen = seen,
+        .deferred = seen && index != liveMarker,
+        .flushedAtFinish = atFinish,
+        .frame = frame.renderState.get(),
+    };
+    if (!render::detail::build_stage_data(data)) {
+      continue;
+    }
+    if (!emitted && g_recorder.currentRenderPass != UINT32_MAX) {
+      auto& prevPass = current_render_passes()[g_recorder.currentRenderPass];
+      prevPass.discardable = !prevPass.has_consumer() && !prevPass.has_content();
+      enqueue_pass(frame, g_recorder.currentRenderPass);
+    }
+    emitted = true;
+    const auto stageIndex = static_cast<uint32_t>(frame.stages.size());
+    frame.stages.emplace_back(std::move(data));
+    const auto opIndex = static_cast<uint32_t>(frame.ops.size());
+    frame.ops.emplace_back(capture_frame_op(frame, FrameOpType::RenderStage, stageIndex));
+    enqueue_op(frame, opIndex);
+  }
+  g_recorder.nextStage = std::max(g_recorder.nextStage, end);
+  return emitted;
+}
+
+void run_stages_until(uint8_t end, uint8_t liveMarker) {
+  const bool hadPass = g_recorder.currentRenderPass != UINT32_MAX;
+  if (emit_stage_ops(end, liveMarker, false) && hadPass) {
+    resume_efb_pass_loading(current_render_passes()[g_recorder.currentRenderPass]);
+  }
+}
+
+enum class StageWarning : uint8_t { NotAMarker, LateOrRepeated };
+
+void warn_stage_once(uint8_t index, StageWarning kind) {
+  // Every invalid value shares the last slot, so a corrupt stream logs once instead of once per byte value
+  static std::array<std::array<bool, 2>, 8> warned{};
+  bool& flag = warned[std::min<uint8_t>(index, 7)][static_cast<size_t>(kind)];
+  if (std::exchange(flag, true)) {
+    return;
+  }
+  const std::string_view text =
+      kind == StageWarning::NotAMarker ? "is not a GX stage marker" : "arrived after a later stage or twice; ignored";
+  Log.warn("Render stage {} {}", render::stage_name(static_cast<render::Stage>(index)), text);
 }
 } // namespace
 
@@ -580,6 +651,9 @@ void begin_recording(FramePacket& packet, size_t frameSlot) {
   g_recorder.drawCallCount = 0;
   g_recorder.mergedDrawCallCount = 0;
   g_recorder.suspendedEfbPass.reset();
+  g_recorder.nextStage = 0;
+  g_recorder.pendingStageEnd = 0;
+  g_recorder.stageMarkerSeen = {};
 
   current_render_passes().emplace_back();
   auto& pass = current_render_passes()[0];
@@ -599,6 +673,7 @@ RecordedFrame end_recording() {
   AURORA_ASSERT(!g_recorder.inOffscreen, "end_frame called while offscreen rendering is active");
   AURORA_ASSERT(g_recorder.currentRenderPass == UINT32_MAX,
                 "end_frame called before finish finalized the current render pass");
+  CHECK(g_recorder.pendingStageEnd == 0, "end_frame called with render stages still pending");
   auto& frame = g_recorder.frame();
   frame.stats.drawCallCount = g_recorder.drawCallCount;
   frame.stats.mergedDrawCallCount = g_recorder.mergedDrawCallCount;
@@ -642,6 +717,9 @@ void shutdown_recording() {
   g_recorder.frameSlot = 0;
   g_recorder.suppressRenderWorker = false;
   g_recorder.normalRequested = false;
+  g_recorder.nextStage = 0;
+  g_recorder.pendingStageEnd = 0;
+  g_recorder.stageMarkerSeen = {};
 }
 
 namespace testing {
@@ -1150,6 +1228,28 @@ bool push_encoder_task(EncoderTaskId type, const void* payload, size_t payloadSi
   return true;
 }
 
+void record_stage(render::Stage stage) {
+  const auto index = static_cast<uint8_t>(stage);
+  if (index > LastMarkerStage) {
+    warn_stage_once(index, StageWarning::NotAMarker);
+    return;
+  }
+  if (!g_recorder.active() || g_recorder.packet->renderState == nullptr) {
+    return;
+  }
+  if (index < std::max(g_recorder.nextStage, g_recorder.pendingStageEnd) || g_recorder.stageMarkerSeen[index]) {
+    warn_stage_once(index, StageWarning::LateOrRepeated);
+    return;
+  }
+  g_recorder.stageMarkerSeen[index] = true;
+  if (g_recorder.inOffscreen || g_recorder.currentRenderPass == UINT32_MAX) {
+    g_recorder.pendingStageEnd = std::max<uint8_t>(g_recorder.pendingStageEnd, index + 1);
+    return;
+  }
+  const auto end = std::max<uint8_t>(index + 1, std::exchange(g_recorder.pendingStageEnd, 0));
+  run_stages_until(end, index);
+}
+
 template <>
 void push_draw_command(gx::DrawData data) {
   push_draw_command(make_draw_command<gx::render>(data));
@@ -1188,6 +1288,10 @@ void finish() {
     enqueue_pass(frame, g_recorder.currentRenderPass);
     g_recorder.currentRenderPass = UINT32_MAX;
   }
+  if (g_recorder.packet->renderState != nullptr) {
+    emit_stage_ops(LastMarkerStage + 1, NoLiveMarker, true);
+  }
+  g_recorder.pendingStageEnd = 0;
 }
 
 Range push_verts(const uint8_t* data, size_t length, size_t alignment) {

@@ -4,6 +4,7 @@
 #include "types.hpp"
 #include "tex_palette_conv.hpp"
 #include "texture.hpp"
+#include "../render/stage_data.hpp"
 
 #include <array>
 #include <cstddef>
@@ -12,10 +13,6 @@
 #include <memory>
 #include <string>
 #include <vector>
-
-namespace aurora::render::detail {
-struct FrameState;
-} // namespace aurora::render::detail
 
 namespace aurora::gfx::detail {
 
@@ -175,6 +172,7 @@ enum class FrameOpType : uint8_t {
   RenderPass,
   TextureCopy,
   EncoderTask,
+  RenderStage,
 };
 
 struct FrameOp {
@@ -183,6 +181,7 @@ struct FrameOp {
   RenderPass* renderPass = nullptr;
   TextureCopy* textureCopy = nullptr;
   EncoderTask* encoderTask = nullptr;
+  const render::detail::StageData* stageData = nullptr;
   StagingHighWater highWater;
   std::vector<const TextureUpload*> textureUploads;
 };
@@ -193,6 +192,7 @@ struct FramePacket {
   RenderPassList renderPasses;
   std::deque<TextureCopy> textureCopies;
   std::deque<EncoderTask> encoderTasks;
+  std::deque<render::detail::StageData> stages;
   std::deque<FrameOp> ops;
   std::deque<TextureUpload> textureUploads;
 #ifdef AURORA_GFX_DEBUG_GROUPS

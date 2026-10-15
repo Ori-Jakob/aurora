@@ -2,9 +2,13 @@ target_sources(aurora_gx PRIVATE
         lib/render/frame_state.hpp
         lib/render/graph.hpp
         lib/render/module.hpp
+        lib/render/pass_context.hpp
         lib/render/render.cpp
         lib/render/settings.cpp
         lib/render/settings.hpp
+        lib/render/stage.cpp
+        lib/render/stage.hpp
+        lib/render/stage_data.hpp
 )
 if (AURORA_ENABLE_RENDER)
     target_sources(aurora_gx PRIVATE

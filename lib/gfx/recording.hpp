@@ -2,6 +2,8 @@
 
 #include "types.hpp"
 
+#include <aurora/render.hpp>
+
 #include <cstddef>
 #include <string>
 
@@ -113,4 +115,5 @@ void set_viewport(const Viewport& viewport) noexcept;
 void set_scissor(const ClipRect& scissor) noexcept;
 void push_debug_group(std::string label);
 void insert_debug_marker(std::string label);
+void record_stage(render::Stage stage);
 } // namespace aurora::gfx
