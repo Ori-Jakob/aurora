@@ -267,6 +267,7 @@ if (AURORA_ENABLE_GX)
 
   add_executable(render_tests
     render_api_test.cpp
+    render_settings_test.cpp
   )
   target_include_directories(render_tests PRIVATE
     ../include

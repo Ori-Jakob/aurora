@@ -14,6 +14,7 @@
 #endif
 #include "../webgpu/gpu.hpp"
 #include "../webgpu/gpu_prof.hpp"
+#include "../render/frame_state.hpp"
 #include "../render/module.hpp"
 
 #include <array>
@@ -638,6 +639,7 @@ bool begin_frame() {
   frame.frameId = g_nextFrameId++;
   frame.frameIndex = g_frameIndex;
   frame.stagingBuffer = *stagingSlot;
+  frame.renderState = render::detail::latch_frame();
   size_t bufferOffset = 0;
   const auto& stagingBuf = g_stagingBuffers[*stagingSlot];
   const auto mapBuffer = [&](ByteBuffer& buf, uint64_t size) {

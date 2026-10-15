@@ -1,0 +1,182 @@
+#include <gtest/gtest.h>
+
+#include "render/frame_state.hpp"
+#include "render/graph.hpp"
+#include "render/module.hpp"
+#include "render/settings.hpp"
+#include "render_test_caps.hpp"
+#include "webgpu/gpu.hpp"
+
+#include <array>
+#include <cstdint>
+#include <random>
+#include <thread>
+
+namespace aurora::render::test {
+namespace {
+using detail::current_frame_state;
+using detail::latch_frame;
+using detail::testing::settings_generation;
+
+template <typename E>
+E random_level(std::mt19937& rng, E last) {
+  return static_cast<E>(std::uniform_int_distribution<int>{0, static_cast<int>(last)}(rng));
+}
+
+Settings random_request(std::mt19937& rng) {
+  std::bernoulli_distribution coin;
+  std::uniform_real_distribution<float> value{-1.f, 4.f};
+  Settings s;
+  s.textureMaterials = coin(rng);
+  s.legacyMatMaps = coin(rng);
+  s.pbr = coin(rng);
+  s.taa = coin(rng);
+  s.ssil = coin(rng);
+  s.ao = random_level(rng, Quality::Ultra);
+  s.shadows.quality = random_level(rng, Quality::Ultra);
+  s.shadows.game = random_level(rng, GameShadows::Remove);
+  s.rt = random_level(rng, RtMode::PathTraceReference);
+  s.rtBackend = random_level(rng, RtBackend::Dxr);
+  s.reflections = random_level(rng, Reflections::SsrRt);
+  s.fog.volumetric = random_level(rng, Quality::Ultra);
+  s.fog.godRays = random_level(rng, GodRays::Volumetric);
+  s.sky.clouds = random_level(rng, Quality::Ultra);
+  s.sky.cloudShadows = coin(rng);
+  s.grass.quality = random_level(rng, Quality::Ultra);
+  s.terrain.mode = random_level(rng, TerrainDetail::Tessellated);
+  // Out-of-range tuning values make the preview depend on sanitising as well as gating
+  s.legacyBlend = value(rng);
+  s.exposureBias = value(rng) * 4.f;
+  s.grass.distance = value(rng) * 50.f;
+  return s;
+}
+
+class RenderLatchTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    detail::testing::reset();
+    detail::testing::set_caps(full_caps());
+    latch_frame();
+  }
+  void TearDown() override { detail::testing::reset(); }
+};
+
+TEST_F(RenderLatchTest, ApplyLandsAtNextLatch) {
+  apply_settings({.legacyBlend = 0.5f});
+  EXPECT_EQ(effective_settings().legacyBlend, 0.f);
+  EXPECT_EQ(current_frame_state()->settings.legacyBlend, 0.f);
+  latch_frame();
+  EXPECT_EQ(effective_settings().legacyBlend, 0.5f);
+}
+
+TEST_F(RenderLatchTest, CurrentFrameStateIsImmutable) {
+  const auto s0 = latch_frame();
+  apply_settings({.legacyBlend = 0.5f});
+  const auto s1 = latch_frame();
+  EXPECT_EQ(s0->settings.legacyBlend, 0.f);
+  EXPECT_EQ(s1->settings.legacyBlend, 0.5f);
+  EXPECT_NE(s0, s1);
+  EXPECT_EQ(current_frame_state(), s1);
+}
+
+TEST_F(RenderLatchTest, LastApplyBeforeLatchWins) {
+  const uint64_t generation = settings_generation();
+  apply_settings({.legacyBlend = 0.25f});
+  apply_settings({.legacyBlend = 0.75f});
+  EXPECT_EQ(latch_frame()->settings.legacyBlend, 0.75f);
+  EXPECT_EQ(settings_generation(), generation + 1);
+}
+
+TEST_F(RenderLatchTest, IdenticalApplyKeepsFrameState) {
+  const auto state = current_frame_state();
+  const uint64_t generation = settings_generation();
+  apply_settings(effective_settings());
+  EXPECT_EQ(latch_frame(), state);
+  EXPECT_EQ(settings_generation(), generation);
+}
+
+TEST_F(RenderLatchTest, NormalisedApplyKeepsGeneration) {
+  apply_settings({.legacyBlend = 1.f});
+  latch_frame();
+  ASSERT_EQ(effective_settings().legacyBlend, 1.f);
+  const auto state = current_frame_state();
+  const uint64_t generation = settings_generation();
+  apply_settings({.legacyBlend = 2.f});
+  EXPECT_EQ(latch_frame(), state);
+  EXPECT_EQ(settings_generation(), generation);
+}
+
+TEST_F(RenderLatchTest, ApplyPreviewMatchesLatch) {
+  enable_all_built();
+  std::mt19937 rng{1};
+  for (int i = 0; i < 50; ++i) {
+    const Settings preview = apply_settings(random_request(rng));
+    EXPECT_EQ(preview, latch_frame()->settings) << "request " << i;
+  }
+}
+
+#if AURORA_ENABLE_RENDER
+TEST_F(RenderLatchTest, CapsChangeReclampsLastRequest) {
+  enable_all_built();
+  detail::testing::set_caps(compat_caps());
+  apply_settings({.ao = Quality::High});
+  EXPECT_EQ(latch_frame()->settings.ao, Quality::Off);
+  EXPECT_EQ(effective_settings().ao, Quality::Off);
+  detail::testing::set_caps(full_caps());
+  EXPECT_EQ(latch_frame()->settings.ao, Quality::High);
+  EXPECT_EQ(effective_settings().ao, Quality::High);
+}
+#endif
+
+TEST_F(RenderLatchTest, ApplyFromAnotherThread) {
+  constexpr int Iterations = 1000;
+  constexpr std::array Values{0.25f, 0.75f};
+  std::thread writer{[&] {
+    for (int i = 0; i < Iterations; ++i) {
+      apply_settings({.legacyBlend = Values[i % 2]});
+    }
+  }};
+  for (int i = 0; i < Iterations; ++i) {
+    const float value = latch_frame()->settings.legacyBlend;
+    EXPECT_TRUE(value == 0.f || value == Values[0] || value == Values[1]) << value;
+  }
+  writer.join();
+  EXPECT_EQ(latch_frame()->settings.legacyBlend, Values[(Iterations - 1) % 2]);
+}
+
+TEST_F(RenderLatchTest, FirstLatchAfterInitializeKeepsGeneration) {
+  detail::shutdown();
+  webgpu::g_graphicsConfig.msaaSamples = 1;
+  apply_settings({.legacyBlend = 0.5f});
+  detail::initialize();
+  EXPECT_EQ(effective_settings().legacyBlend, 0.5f);
+  const uint64_t generation = settings_generation();
+  EXPECT_EQ(latch_frame()->settings.legacyBlend, 0.5f);
+  EXPECT_EQ(settings_generation(), generation);
+  detail::shutdown();
+}
+
+TEST_F(RenderLatchTest, ShutdownDropsFrameState) {
+  ASSERT_NE(current_frame_state(), nullptr);
+  detail::shutdown();
+  EXPECT_EQ(current_frame_state(), nullptr);
+}
+
+#if AURORA_ENABLE_RENDER
+TEST_F(RenderLatchTest, GraphHandedThroughFrameState) {
+  const auto first = latch_frame();
+  ASSERT_NE(first->graph, nullptr);
+  EXPECT_EQ(first->graph, detail::empty_graph());
+  EXPECT_EQ(first->graph->graphHash, 0u);
+  EXPECT_EQ(latch_frame()->graph, first->graph);
+
+  apply_settings({.legacyBlend = 0.5f});
+  const auto changed = latch_frame();
+  EXPECT_NE(changed, first);
+  EXPECT_EQ(changed->graph, first->graph);
+}
+#else
+TEST_F(RenderLatchTest, ModuleOffHasNoGraph) { EXPECT_EQ(latch_frame()->graph, nullptr); }
+#endif
+} // namespace
+} // namespace aurora::render::test

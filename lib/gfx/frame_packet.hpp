@@ -9,8 +9,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <string>
 #include <vector>
+
+namespace aurora::render::detail {
+struct FrameState;
+} // namespace aurora::render::detail
 
 namespace aurora::gfx::detail {
 
@@ -200,6 +205,7 @@ struct FramePacket {
   ByteBuffer textureUpload;
   wgpu::CommandEncoder encoder;
   std::vector<AfterSubmitCallback> afterSubmitCallbacks;
+  std::shared_ptr<const render::detail::FrameState> renderState;
   uint64_t frameId = 0;
   uint32_t frameIndex = 0;
   size_t stagingBuffer = 0;

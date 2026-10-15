@@ -1,15 +1,22 @@
 #include "settings.hpp"
 
+#include "frame_state.hpp"
+#include "graph.hpp"
 #include "module.hpp"
+#include "../logging.hpp"
 #include "../webgpu/caps.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <utility>
 
 namespace aurora::render::detail {
 namespace {
+constexpr Module Log{"aurora::render"};
+
 constexpr std::array<FeatureInfo, FeatureCount> FeatureTable{{
     {"GBuffer", Tier::Base, 1},
     {"Pbr", Tier::Pbr, 1},
@@ -93,6 +100,12 @@ BuiltOptions g_built = DefaultBuiltOptions;
 uint32_t g_msaaSamples = 1;
 bool g_reclamp = false;
 std::optional<Settings> g_latched;
+
+uint64_t g_generation = 0;
+std::shared_ptr<const FrameState> g_frameState;
+
+using FeatureMask = uint32_t;
+static_assert(FeatureCount <= 32);
 
 constexpr size_t feature_index(Feature feature) noexcept { return static_cast<size_t>(feature); }
 
@@ -231,6 +244,36 @@ const Settings& initial_settings() noexcept {
     return clamp_settings(Settings{}, {noCaps, 1, noneBuilt, module_enabled()});
   }();
   return initial;
+}
+
+FeatureMask enabled_features(const Settings& settings) noexcept {
+  FeatureMask mask = 0;
+  for (size_t i = 0; i < FeatureCount; ++i) {
+    if (requested_option(settings, static_cast<Feature>(i)) != 0) {
+      mask |= FeatureMask{1} << i;
+    }
+  }
+  return mask;
+}
+
+void log_latched_settings(uint64_t generation, FeatureMask previous, const Settings& latched) {
+  const FeatureMask enabled = enabled_features(latched);
+  std::string names;
+  for (size_t i = 0; i < FeatureCount; ++i) {
+    if (((enabled >> i) & 1u) == 0) {
+      continue;
+    }
+    if (!names.empty()) {
+      names += ", ";
+    }
+    names += FeatureTable[i].name;
+  }
+  if (names.empty()) {
+    names = "legacy";
+  }
+  // Tuning changes arrive on every slider step, so only feature changes reach the info log
+  const AuroraLogLevel level = enabled != previous ? LOG_INFO : LOG_DEBUG;
+  Log.report(level, "Render settings generation {}: {}", generation, names);
 }
 } // namespace
 
@@ -555,10 +598,50 @@ void reset_settings_state(uint32_t msaaSamples) noexcept {
 }
 
 void shutdown_settings_state() noexcept {
+  g_frameState.reset();
   g_latched.reset();
   std::lock_guard lock{g_requestMutex};
   g_msaaSamples = 1;
 }
+
+std::shared_ptr<const FrameState> latch_frame() {
+  std::optional<Settings> request;
+  BuiltOptions built;
+  uint32_t msaaSamples = 1;
+  {
+    std::lock_guard lock{g_requestMutex};
+    request.swap(g_pending);
+    if (std::exchange(g_reclamp, false) && !request) {
+      request = g_lastRequest;
+    }
+    built = g_built;
+    msaaSamples = g_msaaSamples;
+  }
+  bool settingsChanged = false;
+  if (request) {
+    const SupportEnv env{.caps = caps(), .msaaSamples = msaaSamples, .built = built, .moduleEnabled = module_enabled()};
+    Settings next = clamp_settings(*request, env);
+    if (next != latched_settings()) {
+      const FeatureMask previous = enabled_features(latched_settings());
+      g_latched = std::move(next);
+      ++g_generation;
+      settingsChanged = true;
+      log_latched_settings(g_generation, previous, *g_latched);
+    }
+  }
+  std::shared_ptr<const CompiledGraph> graph = g_frameState ? g_frameState->graph : nullptr;
+#if AURORA_ENABLE_RENDER
+  if (graph == nullptr || settingsChanged) {
+    graph = compile_graph(latched_settings(), caps());
+  }
+#endif
+  if (!g_frameState || g_frameState->settingsGeneration != g_generation || g_frameState->graph != graph) {
+    g_frameState = std::make_shared<const FrameState>(FrameState{g_generation, latched_settings(), std::move(graph)});
+  }
+  return g_frameState;
+}
+
+const std::shared_ptr<const FrameState>& current_frame_state() noexcept { return g_frameState; }
 
 namespace testing {
 void reset() noexcept {
@@ -573,7 +656,11 @@ void reset() noexcept {
     g_reclamp = false;
   }
   g_latched.reset();
+  g_generation = 0;
+  g_frameState.reset();
 }
+
+uint64_t settings_generation() noexcept { return g_generation; }
 
 void set_caps(const Caps& caps, uint32_t msaaSamples) noexcept {
   webgpu::set_caps(caps);
