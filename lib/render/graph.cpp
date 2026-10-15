@@ -1,5 +1,7 @@
 #include "graph.hpp"
 
+#include "graph_slots.hpp"
+
 #include "../gfx/hash.hpp"
 #include "../logging.hpp"
 
@@ -277,11 +279,6 @@ constexpr bool reads(Access access) noexcept {
 }
 
 constexpr bool writes(Access access) noexcept { return !reads(access); }
-
-constexpr bool binds(Access access) noexcept {
-  return access == Access::Sampled || access == Access::Uniform || access == Access::StorageRead ||
-         access == Access::StorageWrite || access == Access::StorageRW;
-}
 
 constexpr bool is_storage(Access access) noexcept {
   return access == Access::StorageRead || access == Access::StorageWrite || access == Access::StorageRW;
@@ -682,6 +679,7 @@ struct GraphBuild {
     order_stages();
     cull_unconsumed();
     finish_programs();
+    m_graph.slots = plan_slots(m_graph, m_inputs.env.limits);
     hash_graph();
   }
 

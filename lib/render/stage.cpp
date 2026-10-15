@@ -2,6 +2,7 @@
 
 #include "frame_state.hpp"
 #include "graph.hpp"
+#include "graph_pool.hpp"
 #include "pass_context.hpp"
 #include "../logging.hpp"
 
@@ -80,13 +81,23 @@ void run_stage(const wgpu::CommandEncoder& encoder, const StageData& stage) {
   if (graph == nullptr) {
     return;
   }
+#if AURORA_ENABLE_RENDER
+  // The worker hook already did this for the frame's graph; without an encoder nothing could use the result
+  if (encoder) {
+    transient_pool().materialize(stage.frame->graph, TransientPool::Clock::now());
+  }
+#endif
   const StageProgram& program = graph->stages[static_cast<size_t>(stage.stage)];
   PassContext ctx{encoder, stage};
   for (uint32_t i = 0; i < stage.passCount; ++i) {
     if (!stage.is_enabled(i)) {
       continue;
     }
-    const CompiledNode& node = graph->nodes[program.passes[i]];
+    const NodeId nodeId = program.passes[i];
+    const CompiledNode& node = graph->nodes[nodeId];
+#if AURORA_ENABLE_RENDER
+    poison_before(encoder, stage, nodeId);
+#endif
     ctx.set_pass(node);
 #ifdef AURORA_GFX_DEBUG_GROUPS
     if (encoder) {
@@ -100,6 +111,9 @@ void run_stage(const wgpu::CommandEncoder& encoder, const StageData& stage) {
     if (encoder) {
       encoder.PopDebugGroup();
     }
+#endif
+#if AURORA_ENABLE_RENDER
+    after_pass(stage, nodeId);
 #endif
   }
 }

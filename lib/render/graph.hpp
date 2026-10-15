@@ -12,6 +12,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace aurora::render::detail {
@@ -51,6 +52,12 @@ enum class Access : uint8_t {
   Index,
   Indirect,
 };
+
+constexpr bool binds(Access access) noexcept {
+  return access == Access::Sampled || access == Access::Uniform || access == Access::StorageRead ||
+         access == Access::StorageWrite || access == Access::StorageRW;
+}
+
 enum class Missing : uint8_t { DisablePass, BindDummyBlack, BindDummyWhite };
 enum class PassKind : uint8_t { Compute, Render, Copy, Encoder, Native };
 enum class PassClass : uint8_t { Required, Optional, Diagnostic };
@@ -348,6 +355,59 @@ struct StageProgram {
   uint32_t useBits = 0;
 };
 
+struct TexKey {
+  wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
+  wgpu::TextureDimension dimension = wgpu::TextureDimension::e2D;
+  wgpu::TextureViewDimension bindingView = wgpu::TextureViewDimension::e2D;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t depthOrLayers = 1;
+  uint32_t mips = 1;
+  wgpu::TextureUsage usage = wgpu::TextureUsage::None;
+  SizeClass sizeClass = SizeClass::Absolute;
+
+  bool operator==(const TexKey&) const = default;
+};
+
+struct BufKey {
+  uint64_t bucketSize = 0;
+  wgpu::BufferUsage usage = wgpu::BufferUsage::None;
+  SizeClass sizeClass = SizeClass::Absolute;
+
+  bool operator==(const BufKey&) const = default;
+};
+
+using SlotId = uint16_t;
+inline constexpr SlotId InvalidSlot = UINT16_MAX;
+
+struct Lifetime {
+  uint32_t first = UINT32_MAX;
+  uint32_t last = 0;
+};
+
+struct SlotPlan {
+  struct Slot {
+    bool isBuffer = false;
+    TexKey tex;
+    BufKey buf;
+    std::string anchor;
+  };
+  struct History {
+    std::string name;
+    TexKey key;
+  };
+  std::vector<Slot> slots;
+  std::vector<SlotId> resourceSlot;
+  std::vector<Lifetime> lifetimes;
+  std::vector<uint32_t> positions;
+  std::vector<History> histories;
+  std::vector<std::pair<uint32_t, ResourceId>> poisonPoints;
+  GraphExtent efbSize;
+  GraphExtent outputSize;
+  uint64_t logicalBytes = 0;
+  uint64_t slotBytes = 0;
+};
+
 struct CompiledGraph {
   uint64_t graphHash = 0;
   GraphExtent efbSize;
@@ -362,6 +422,7 @@ struct CompiledGraph {
   std::vector<ResourceId> histories;
   std::array<StageProgram, StageCount> stages{};
   std::vector<Diagnostic> diagnostics;
+  SlotPlan slots;
 
   [[nodiscard]] bool stage_empty(Stage stage) const noexcept {
     return stages[static_cast<size_t>(stage)].passes.empty();

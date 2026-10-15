@@ -17,6 +17,10 @@ if (AURORA_ENABLE_RENDER)
         lib/render/gpu_heap.hpp
         lib/render/graph.cpp
         lib/render/graph_env.cpp
+        lib/render/graph_pool.cpp
+        lib/render/graph_pool.hpp
+        lib/render/graph_slots.cpp
+        lib/render/graph_slots.hpp
         lib/render/json.hpp
         lib/render/tlsf.cpp
         lib/render/tlsf.hpp
