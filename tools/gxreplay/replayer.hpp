@@ -6,6 +6,7 @@
 
 #include "trace/snapshot_store.hpp"
 #include "trace/trace_reader.hpp"
+#include "webgpu/gpu_prof.hpp"
 
 #include <aurora/aurora.h>
 
@@ -28,6 +29,7 @@ enum ExitCode : int {
 struct ReplayResult {
   std::vector<FrameResult> frames;
   std::vector<FrameTiming> timings;
+  std::vector<GpuFrameTiming> gpuTimings;
   uint64_t misses = 0;
   std::vector<std::vector<uint8_t>> images;
 };
@@ -46,6 +48,7 @@ private:
   bool process_fifo(std::span<const uint8_t> bytes, std::string& error);
   bool end_frame(bool readback, std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height, std::string& error);
   bool fail(ExitCode code, std::string message, std::string& error);
+  void collect_gpu_timing(uint32_t run, uint32_t frame, ReplayResult& out);
 
   const Options& m_options;
   trace::TraceReader& m_reader;
@@ -55,5 +58,6 @@ private:
   ExitCode m_exitCode = ExitOk;
   double m_finishMs = 0.0;
   double m_gpuWaitMs = 0.0;
+  webgpu::gpu_prof::FrameTimes m_gpuTimes;
 };
 } // namespace aurora::gxreplay

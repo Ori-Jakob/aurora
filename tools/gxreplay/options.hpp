@@ -36,6 +36,7 @@ struct Options {
   bool allowCpu = false;
   bool showWindow = false;
   bool verbose = false;
+  bool gpuTimings = false;
   bool help = false;
 };
 

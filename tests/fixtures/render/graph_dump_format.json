@@ -1,0 +1,180 @@
+{
+  "schema": "aurora.render.graph",
+  "version": 1,
+  "compiled": true,
+  "graphHash": "0x00000000000000ab",
+  "stages": [
+    {
+      "name": "SceneBegin",
+      "firstPass": 0,
+      "passCount": 0
+    },
+    {
+      "name": "OpaqueDone",
+      "firstPass": 0,
+      "passCount": 3
+    },
+    {
+      "name": "PrePost",
+      "firstPass": 3,
+      "passCount": 0
+    },
+    {
+      "name": "SceneEnd",
+      "firstPass": 3,
+      "passCount": 0
+    },
+    {
+      "name": "BeforeHud",
+      "firstPass": 3,
+      "passCount": 0
+    },
+    {
+      "name": "FrameEnd",
+      "firstPass": 3,
+      "passCount": 0
+    },
+    {
+      "name": "AfterFrame",
+      "firstPass": 3,
+      "passCount": 0
+    }
+  ],
+  "passes": [
+    {
+      "index": 0,
+      "name": "gx@OpaqueDone",
+      "stage": "OpaqueDone",
+      "node": "Gx",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": [
+        {
+          "resource": "gx.color",
+          "access": "ColorWrite"
+        }
+      ]
+    },
+    {
+      "index": 1,
+      "name": "phase.prepare",
+      "stage": "OpaqueDone",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 2,
+      "name": "test.blur",
+      "stage": "OpaqueDone",
+      "node": "Pass",
+      "kind": "Compute",
+      "class": "Optional",
+      "order": 5,
+      "registration": 7,
+      "active": false,
+      "cull": "NoConsumer",
+      "detail": "no sink reachable",
+      "sideEffect": false,
+      "reads": [
+        {
+          "resource": "gx.color",
+          "access": "Sampled",
+          "missing": "DisablePass",
+          "binding": "Resource"
+        }
+      ],
+      "writes": [
+        {
+          "resource": "test.tmp",
+          "access": "StorageWrite"
+        }
+      ]
+    }
+  ],
+  "resources": [
+    {
+      "name": "gx.color",
+      "kind": "Gx",
+      "type": "texture",
+      "format": "BGRA8Unorm",
+      "size": "Efb",
+      "width": 640,
+      "height": 480,
+      "depthOrLayers": 1,
+      "mips": 1,
+      "samples": 1,
+      "usage": [
+        "CopySrc",
+        "TextureBinding",
+        "RenderAttachment"
+      ],
+      "bytes": 1228800,
+      "slot": null,
+      "firstPass": 0,
+      "lastPass": 2
+    },
+    {
+      "name": "test.tmp",
+      "kind": "Transient",
+      "type": "texture",
+      "format": "RGBA16Float",
+      "size": "Efb/2",
+      "width": 320,
+      "height": 240,
+      "depthOrLayers": 1,
+      "mips": 1,
+      "samples": 1,
+      "usage": [
+        "TextureBinding",
+        "StorageBinding"
+      ],
+      "bytes": 614400,
+      "slot": 0,
+      "firstPass": 2,
+      "lastPass": 2
+    }
+  ],
+  "edges": [
+    {
+      "from": 0,
+      "to": 1,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 0,
+      "to": 2,
+      "kind": "Raw",
+      "resource": "gx.color"
+    },
+    {
+      "from": 1,
+      "to": 2,
+      "kind": "Anchor",
+      "resource": null
+    }
+  ],
+  "pool": {
+    "slots": 1,
+    "logicalBytes": 614400,
+    "slotBytes": 614400,
+    "claimedBytes": null,
+    "idleBytes": null
+  }
+}

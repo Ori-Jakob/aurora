@@ -89,6 +89,11 @@ bool apply_no_png(Options& options, std::string_view) {
   return true;
 }
 
+bool apply_gpu_timings(Options& options, std::string_view) {
+  options.gpuTimings = true;
+  return true;
+}
+
 bool apply_allow_incomplete(Options& options, std::string_view) {
   options.allowIncomplete = true;
   return true;
@@ -140,13 +145,14 @@ struct Flag {
   bool (*apply)(Options& options, std::string_view value);
 };
 
-constexpr std::array<Flag, 20> Flags{{
+constexpr std::array<Flag, 21> Flags{{
     {"--out", true, apply_out},
     {"--backend", true, apply_backend},
     {"--profile", true, apply_profile},
     {"--frames", true, apply_frames},
     {"--repeat", true, apply_repeat},
     {"--no-png", false, apply_no_png},
+    {"--gpu-timings", false, apply_gpu_timings},
     {"--replacements", true, apply_replacements},
     {"--data-dir", true, apply_data_dir},
     {"--allow-incomplete", false, apply_allow_incomplete},
@@ -295,6 +301,7 @@ std::string_view usage() noexcept {
          "  --frames N|A:B|A:         frames to output; B is exclusive\n"
          "  --repeat N                replay N times and require identical frames\n"
          "  --no-png                  skip PNG output\n"
+         "  --gpu-timings             write gpu_timing.json with per-pass GPU times (needs TimestampQuery)\n"
          "  --replacements DIR        load a texture replacement directory\n"
          "  --data-dir DIR            user and cache directory (defaults to <out>/.aurora)\n"
          "  --allow-incomplete        replay the complete frames of an aborted or unfinished trace\n"

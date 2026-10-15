@@ -15,6 +15,10 @@
 #include <utility>
 #include <vector>
 
+namespace aurora::render::debug {
+struct GraphInspection;
+} // namespace aurora::render::debug
+
 namespace aurora::render::detail {
 struct StageData;
 class PassContext;
@@ -585,6 +589,8 @@ std::string_view resource_kind_name(ResourceKind kind) noexcept;
 std::string_view cull_reason_name(CullReason reason) noexcept;
 std::string_view edge_kind_name(EdgeKind kind) noexcept;
 
+debug::GraphInspection inspect(const CompiledGraph& graph);
+
 struct StageMask {
   std::vector<uint64_t> passes;
   std::vector<uint64_t> dummies;
@@ -599,6 +605,9 @@ struct StageMask {
     return false;
   }
 };
+
+enum class FrameCullReason : uint8_t { Ran, NotEnabled, InputDisabled, NoActiveConsumer };
+std::string_view frame_cull_reason_name(FrameCullReason reason) noexcept;
 
 struct FrameCullState {
   uint64_t graphHash = 0;
@@ -617,7 +626,7 @@ DummyKey dummy_key(const CompiledGraph& graph, const CompiledUse& use, const Gra
 void begin_frame_cull(const CompiledGraph& graph, FrameCullState& state) noexcept;
 void invalidate_histories(FrameCullState& state) noexcept;
 void cull_stage(const CompiledGraph& graph, Stage stage, std::span<const uint64_t> enabled, FrameCullState& state,
-                StageMask& out);
+                StageMask& out, std::span<FrameCullReason> reasons = {});
 
 namespace testing {
 void clear_passes() noexcept;

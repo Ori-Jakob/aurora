@@ -33,6 +33,7 @@ namespace aurora::gxreplay {
 namespace {
 constexpr Module Log{"aurora::gxreplay"};
 using Clock = std::chrono::steady_clock;
+constexpr uint64_t GpuTimingWaitNs = 1'000'000'000;
 
 double elapsed_ms(Clock::time_point start, Clock::time_point end) {
   return std::chrono::duration<double, std::milli>{end - start}.count();
@@ -151,6 +152,9 @@ ExitCode bring_up_aurora(int argc, char* argv[], const Options& options, const t
 #if AURORA_ENABLE_RENDER
   render::jobs::set_synchronous(true);
 #endif
+  if (options.gpuTimings) {
+    webgpu::gpu_prof::set_always(true);
+  }
   if (!options.replacementsDir.empty()) {
     aurora::texture::load_replacement_directory(options.replacementsDir);
     gfx::texture_replacement::set_synchronous_loads(true);
@@ -294,6 +298,9 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
           .gpuWaitMs = m_gpuWaitMs,
           .totalMs = elapsed_ms(frameStart, frameEnd),
       });
+      if (m_options.gpuTimings) {
+        collect_gpu_timing(run, index, out);
+      }
       if (run == 0 && m_options.writePng) {
         const auto path = m_options.outDir / fmt::format("frame_{:05}.png", index);
         if (!gfx::png::write_rgba8_png(path, width, height, {rgba.data(), rgba.size()})) {
@@ -318,6 +325,19 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
     }
   }
   return true;
+}
+
+// Only output frames come here, after their CPU timings; their readback already waited for the GPU, so nothing stalls
+void Replayer::collect_gpu_timing(uint32_t run, uint32_t frame, ReplayResult& out) {
+  webgpu::gpu_prof::wait_idle(GpuTimingWaitNs);
+  if (!webgpu::gpu_prof::latest(m_gpuTimes) || m_gpuTimes.sequence != webgpu::gpu_prof::last_frame_sequence()) {
+    return;
+  }
+  GpuFrameTiming gpu{.run = run, .frame = frame, .frameMs = m_gpuTimes.frameMs, .dropped = m_gpuTimes.dropped};
+  for (const auto& pass : m_gpuTimes.passes) {
+    gpu.passes.push_back({.name = pass.name != nullptr ? pass.name : "", .ms = pass.ms});
+  }
+  out.gpuTimings.push_back(std::move(gpu));
 }
 
 bool Replayer::apply_render_config(const trace::RenderConfig& config, std::string& error) {

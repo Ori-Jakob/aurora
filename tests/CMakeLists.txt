@@ -341,15 +341,20 @@ if (AURORA_ENABLE_GX)
       render_graph_planned.cpp
       render_graph_slots_test.cpp
       render_graph_layout_test.cpp
+      render_graph_dump_test.cpp
       os_test_globals.cpp
       ../lib/logging.cpp
       ../lib/render/graph.cpp
       ../lib/render/graph_layout.cpp
       ../lib/render/graph_slots.cpp
+      ../lib/render/debug/graph_dump.cpp
     )
     target_include_directories(render_graph_tests PRIVATE ../include ../lib)
-    target_compile_definitions(render_graph_tests PRIVATE AURORA TARGET_PC=1)
-    target_link_libraries(render_graph_tests PRIVATE gtest gtest_main fmt::fmt xxHash::xxhash dawn::dawncpp_headers)
+    target_compile_definitions(render_graph_tests PRIVATE AURORA TARGET_PC=1
+      AURORA_RENDER_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/render"
+      AURORA_RENDER_FIXTURE_OUT="${CMAKE_CURRENT_BINARY_DIR}/render_fixture_out")
+    target_link_libraries(render_graph_tests PRIVATE gtest gtest_main fmt::fmt xxHash::xxhash dawn::dawncpp_headers
+      yyjson::yyjson)
     gtest_discover_tests(render_graph_tests)
   endif ()
 
@@ -418,6 +423,17 @@ if (AURORA_ENABLE_GX)
       SOURCES ${_render_test_wgsl})
     aurora_copy_runtime_dlls(render_shaders_tests)
     gtest_discover_tests(render_shaders_tests PROPERTIES TIMEOUT 120)
+
+    add_executable(render_debug_tests render_debug_test.cpp render_test_device.cpp)
+    target_include_directories(render_debug_tests PRIVATE ../include ../lib)
+    target_compile_definitions(render_debug_tests PRIVATE AURORA TARGET_PC=1 AURORA_ENABLE_RENDER=1
+      AURORA_RENDER_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/render"
+      AURORA_RENDER_FIXTURE_OUT="${CMAKE_CURRENT_BINARY_DIR}/render_fixture_out")
+    # Linked for its PUBLIC TRACY_ENABLE, which decides whether timings collect by default
+    target_link_libraries(render_debug_tests PRIVATE aurora::gx aurora::vi yyjson::yyjson Tracy::TracyClient gtest
+      gtest_main)
+    aurora_copy_runtime_dlls(render_debug_tests)
+    gtest_discover_tests(render_debug_tests)
   endif ()
 endif () # AURORA_ENABLE_GX
 

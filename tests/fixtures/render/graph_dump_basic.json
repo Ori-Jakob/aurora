@@ -1,0 +1,1355 @@
+{
+  "schema": "aurora.render.graph",
+  "version": 1,
+  "compiled": true,
+  "graphHash": "0xb1243e7db832f305",
+  "stages": [
+    {
+      "name": "SceneBegin",
+      "firstPass": 0,
+      "passCount": 2
+    },
+    {
+      "name": "OpaqueDone",
+      "firstPass": 2,
+      "passCount": 21
+    },
+    {
+      "name": "PrePost",
+      "firstPass": 23,
+      "passCount": 4
+    },
+    {
+      "name": "SceneEnd",
+      "firstPass": 27,
+      "passCount": 2
+    },
+    {
+      "name": "BeforeHud",
+      "firstPass": 29,
+      "passCount": 2
+    },
+    {
+      "name": "FrameEnd",
+      "firstPass": 31,
+      "passCount": 2
+    },
+    {
+      "name": "AfterFrame",
+      "firstPass": 33,
+      "passCount": 1
+    }
+  ],
+  "passes": [
+    {
+      "index": 0,
+      "name": "gx@SceneBegin",
+      "stage": "SceneBegin",
+      "node": "Gx",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": [
+        {
+          "resource": "gx.color",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gx.depth",
+          "access": "DepthWrite"
+        },
+        {
+          "resource": "gx.normal",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.motion",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.reactive",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.fog",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.surface",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.debug_id",
+          "access": "ColorRMW"
+        }
+      ]
+    },
+    {
+      "index": 1,
+      "name": "phase.scene_prep",
+      "stage": "SceneBegin",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 2,
+      "name": "gx@OpaqueDone",
+      "stage": "OpaqueDone",
+      "node": "Gx",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": [
+        {
+          "resource": "gx.color",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gx.depth",
+          "access": "DepthWrite"
+        },
+        {
+          "resource": "gx.normal",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.motion",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.reactive",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.fog",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.surface",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.debug_id",
+          "access": "ColorRMW"
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "name": "phase.capture",
+      "stage": "OpaqueDone",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 4,
+      "name": "phase.geometry",
+      "stage": "OpaqueDone",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 5,
+      "name": "phase.prepare",
+      "stage": "OpaqueDone",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 6,
+      "name": "test.write",
+      "stage": "OpaqueDone",
+      "node": "Pass",
+      "kind": "Compute",
+      "class": "Optional",
+      "order": 0,
+      "registration": 0,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": [
+        {
+          "resource": "test.tex",
+          "access": "StorageWrite"
+        }
+      ]
+    },
+    {
+      "index": 7,
+      "name": "phase.ao",
+      "stage": "OpaqueDone",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 8,
+      "name": "test.read",
+      "stage": "OpaqueDone",
+      "node": "Pass",
+      "kind": "Compute",
+      "class": "Optional",
+      "order": 0,
+      "registration": 1,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [
+        {
+          "resource": "test.tex",
+          "access": "Sampled",
+          "missing": "DisablePass",
+          "binding": "Resource"
+        }
+      ],
+      "writes": [
+        {
+          "resource": "test.buf",
+          "access": "StorageWrite"
+        }
+      ]
+    },
+    {
+      "index": 9,
+      "name": "phase.cloud_shadows",
+      "stage": "OpaqueDone",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 10,
+      "name": "phase.shadows",
+      "stage": "OpaqueDone",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 11,
+      "name": "phase.gi",
+      "stage": "OpaqueDone",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 12,
+      "name": "phase.lighting",
+      "stage": "OpaqueDone",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 13,
+      "name": "phase.reflections",
+      "stage": "OpaqueDone",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 14,
+      "name": "phase.exposure",
+      "stage": "OpaqueDone",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 15,
+      "name": "phase.sky",
+      "stage": "OpaqueDone",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 16,
+      "name": "phase.volumetrics",
+      "stage": "OpaqueDone",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 17,
+      "name": "phase.composite",
+      "stage": "OpaqueDone",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 18,
+      "name": "test.sink",
+      "stage": "OpaqueDone",
+      "node": "Pass",
+      "kind": "Render",
+      "class": "Optional",
+      "order": 0,
+      "registration": 2,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [
+        {
+          "resource": "test.buf",
+          "access": "StorageRead",
+          "missing": "DisablePass",
+          "binding": "Resource"
+        }
+      ],
+      "writes": [
+        {
+          "resource": "gx.color",
+          "access": "ColorRMW"
+        }
+      ]
+    },
+    {
+      "index": 19,
+      "name": "gx.overlay",
+      "stage": "OpaqueDone",
+      "node": "Overlay",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": [
+        {
+          "resource": "gx.color",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gx.depth",
+          "access": "DepthWrite"
+        },
+        {
+          "resource": "gx.normal",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.motion",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.reactive",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.fog",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.surface",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.debug_id",
+          "access": "ColorRMW"
+        }
+      ]
+    },
+    {
+      "index": 20,
+      "name": "test.dummy",
+      "stage": "OpaqueDone",
+      "node": "Pass",
+      "kind": "Compute",
+      "class": "Optional",
+      "order": 0,
+      "registration": 5,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": true,
+      "reads": [
+        {
+          "resource": "test.absent2",
+          "access": "Sampled",
+          "missing": "BindDummyWhite",
+          "binding": "DummyWhite"
+        }
+      ],
+      "writes": []
+    },
+    {
+      "index": 21,
+      "name": "test.orphan",
+      "stage": "OpaqueDone",
+      "node": "Pass",
+      "kind": "Compute",
+      "class": "Optional",
+      "order": 0,
+      "registration": 3,
+      "active": false,
+      "cull": "NoConsumer",
+      "detail": "render graph: nothing reads what 'test.orphan' writes; culled",
+      "sideEffect": false,
+      "reads": [],
+      "writes": [
+        {
+          "resource": "test.unused",
+          "access": "StorageWrite"
+        }
+      ]
+    },
+    {
+      "index": 22,
+      "name": "test.missing",
+      "stage": "OpaqueDone",
+      "node": "Pass",
+      "kind": "Compute",
+      "class": "Optional",
+      "order": 0,
+      "registration": 4,
+      "active": false,
+      "cull": "MissingInput",
+      "detail": "render graph: 'test.missing' reads 'test.absent', which is not available; disabled",
+      "sideEffect": true,
+      "reads": [
+        {
+          "resource": "test.absent",
+          "access": "Sampled",
+          "missing": "DisablePass",
+          "binding": "Resource"
+        }
+      ],
+      "writes": []
+    },
+    {
+      "index": 23,
+      "name": "gx@PrePost",
+      "stage": "PrePost",
+      "node": "Gx",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": [
+        {
+          "resource": "gx.color",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gx.depth",
+          "access": "DepthWrite"
+        },
+        {
+          "resource": "gx.normal",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.motion",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.reactive",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.fog",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.surface",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.debug_id",
+          "access": "ColorRMW"
+        }
+      ]
+    },
+    {
+      "index": 24,
+      "name": "phase.pre_taa",
+      "stage": "PrePost",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 25,
+      "name": "phase.taa",
+      "stage": "PrePost",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 26,
+      "name": "phase.post_taa",
+      "stage": "PrePost",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 27,
+      "name": "gx@SceneEnd",
+      "stage": "SceneEnd",
+      "node": "Gx",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": [
+        {
+          "resource": "gx.color",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gx.depth",
+          "access": "DepthWrite"
+        },
+        {
+          "resource": "gx.normal",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.motion",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.reactive",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.fog",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.surface",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.debug_id",
+          "access": "ColorRMW"
+        }
+      ]
+    },
+    {
+      "index": 28,
+      "name": "phase.scene_end",
+      "stage": "SceneEnd",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 29,
+      "name": "gx@BeforeHud",
+      "stage": "BeforeHud",
+      "node": "Gx",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": [
+        {
+          "resource": "gx.color",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gx.depth",
+          "access": "DepthWrite"
+        },
+        {
+          "resource": "gx.normal",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.motion",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.reactive",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.fog",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.surface",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.debug_id",
+          "access": "ColorRMW"
+        }
+      ]
+    },
+    {
+      "index": 30,
+      "name": "phase.before_hud",
+      "stage": "BeforeHud",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 31,
+      "name": "gx@FrameEnd",
+      "stage": "FrameEnd",
+      "node": "Gx",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": [
+        {
+          "resource": "gx.color",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gx.depth",
+          "access": "DepthWrite"
+        },
+        {
+          "resource": "gx.normal",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.motion",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.reactive",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.fog",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.surface",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.debug_id",
+          "access": "ColorRMW"
+        }
+      ]
+    },
+    {
+      "index": 32,
+      "name": "phase.frame_end",
+      "stage": "FrameEnd",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    },
+    {
+      "index": 33,
+      "name": "phase.after_frame",
+      "stage": "AfterFrame",
+      "node": "Phase",
+      "kind": null,
+      "class": null,
+      "order": null,
+      "registration": null,
+      "active": true,
+      "cull": null,
+      "detail": null,
+      "sideEffect": false,
+      "reads": [],
+      "writes": []
+    }
+  ],
+  "resources": [
+    {
+      "name": "gbuf.debug_id",
+      "kind": "Gx",
+      "type": "texture",
+      "format": "R32Uint",
+      "size": "Efb",
+      "width": 2560,
+      "height": 1440,
+      "depthOrLayers": 1,
+      "mips": 1,
+      "samples": 1,
+      "usage": [
+        "RenderAttachment"
+      ],
+      "bytes": 14745600,
+      "slot": null,
+      "firstPass": 0,
+      "lastPass": 31
+    },
+    {
+      "name": "gbuf.fog",
+      "kind": "Gx",
+      "type": "texture",
+      "format": "RGBA8Uint",
+      "size": "Efb",
+      "width": 2560,
+      "height": 1440,
+      "depthOrLayers": 1,
+      "mips": 1,
+      "samples": 1,
+      "usage": [
+        "RenderAttachment"
+      ],
+      "bytes": 14745600,
+      "slot": null,
+      "firstPass": 0,
+      "lastPass": 31
+    },
+    {
+      "name": "gbuf.motion",
+      "kind": "Gx",
+      "type": "texture",
+      "format": "RG16Float",
+      "size": "Efb",
+      "width": 2560,
+      "height": 1440,
+      "depthOrLayers": 1,
+      "mips": 1,
+      "samples": 1,
+      "usage": [
+        "RenderAttachment"
+      ],
+      "bytes": 14745600,
+      "slot": null,
+      "firstPass": 0,
+      "lastPass": 31
+    },
+    {
+      "name": "gbuf.reactive",
+      "kind": "Gx",
+      "type": "texture",
+      "format": "R8Unorm",
+      "size": "Efb",
+      "width": 2560,
+      "height": 1440,
+      "depthOrLayers": 1,
+      "mips": 1,
+      "samples": 1,
+      "usage": [
+        "RenderAttachment"
+      ],
+      "bytes": 3686400,
+      "slot": null,
+      "firstPass": 0,
+      "lastPass": 31
+    },
+    {
+      "name": "gbuf.surface",
+      "kind": "Gx",
+      "type": "texture",
+      "format": "RGBA32Uint",
+      "size": "Efb",
+      "width": 2560,
+      "height": 1440,
+      "depthOrLayers": 1,
+      "mips": 1,
+      "samples": 1,
+      "usage": [
+        "RenderAttachment"
+      ],
+      "bytes": 58982400,
+      "slot": null,
+      "firstPass": 0,
+      "lastPass": 31
+    },
+    {
+      "name": "gx.color",
+      "kind": "Gx",
+      "type": "texture",
+      "format": "BGRA8Unorm",
+      "size": "Efb",
+      "width": 2560,
+      "height": 1440,
+      "depthOrLayers": 1,
+      "mips": 1,
+      "samples": 1,
+      "usage": [
+        "RenderAttachment"
+      ],
+      "bytes": 14745600,
+      "slot": null,
+      "firstPass": 0,
+      "lastPass": 31
+    },
+    {
+      "name": "gx.depth",
+      "kind": "Gx",
+      "type": "texture",
+      "format": "Depth32Float",
+      "size": "Efb",
+      "width": 2560,
+      "height": 1440,
+      "depthOrLayers": 1,
+      "mips": 1,
+      "samples": 1,
+      "usage": [
+        "RenderAttachment"
+      ],
+      "bytes": 14745600,
+      "slot": null,
+      "firstPass": 0,
+      "lastPass": 31
+    },
+    {
+      "name": "gx.normal",
+      "kind": "Gx",
+      "type": "texture",
+      "format": "RGB10A2Unorm",
+      "size": "Efb",
+      "width": 2560,
+      "height": 1440,
+      "depthOrLayers": 1,
+      "mips": 1,
+      "samples": 1,
+      "usage": [
+        "RenderAttachment"
+      ],
+      "bytes": 14745600,
+      "slot": null,
+      "firstPass": 0,
+      "lastPass": 31
+    },
+    {
+      "name": "test.absent",
+      "kind": "Transient",
+      "type": "texture",
+      "format": "Undefined",
+      "size": "",
+      "width": 0,
+      "height": 0,
+      "depthOrLayers": 0,
+      "mips": 1,
+      "samples": 1,
+      "usage": [],
+      "bytes": 0,
+      "slot": null,
+      "firstPass": null,
+      "lastPass": null
+    },
+    {
+      "name": "test.absent2",
+      "kind": "Transient",
+      "type": "texture",
+      "format": "Undefined",
+      "size": "",
+      "width": 0,
+      "height": 0,
+      "depthOrLayers": 0,
+      "mips": 1,
+      "samples": 1,
+      "usage": [],
+      "bytes": 0,
+      "slot": null,
+      "firstPass": null,
+      "lastPass": null
+    },
+    {
+      "name": "test.buf",
+      "kind": "Transient",
+      "type": "buffer",
+      "format": "",
+      "size": "Absolute",
+      "width": 0,
+      "height": 0,
+      "depthOrLayers": 1,
+      "mips": 1,
+      "samples": 1,
+      "usage": [
+        "Storage"
+      ],
+      "bytes": 256,
+      "slot": 1,
+      "firstPass": 8,
+      "lastPass": 18
+    },
+    {
+      "name": "test.tex",
+      "kind": "Transient",
+      "type": "texture",
+      "format": "RGBA8Unorm",
+      "size": "Absolute",
+      "width": 64,
+      "height": 64,
+      "depthOrLayers": 1,
+      "mips": 1,
+      "samples": 1,
+      "usage": [
+        "TextureBinding",
+        "StorageBinding"
+      ],
+      "bytes": 16384,
+      "slot": 0,
+      "firstPass": 6,
+      "lastPass": 8
+    },
+    {
+      "name": "test.unused",
+      "kind": "Transient",
+      "type": "texture",
+      "format": "RGBA8Unorm",
+      "size": "Absolute",
+      "width": 64,
+      "height": 64,
+      "depthOrLayers": 1,
+      "mips": 1,
+      "samples": 1,
+      "usage": [],
+      "bytes": 16384,
+      "slot": null,
+      "firstPass": null,
+      "lastPass": null
+    }
+  ],
+  "edges": [
+    {
+      "from": 0,
+      "to": 1,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 2,
+      "to": 3,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 2,
+      "to": 18,
+      "kind": "Raw",
+      "resource": "gx.color"
+    },
+    {
+      "from": 2,
+      "to": 19,
+      "kind": "Waw",
+      "resource": "gbuf.debug_id"
+    },
+    {
+      "from": 2,
+      "to": 19,
+      "kind": "Waw",
+      "resource": "gbuf.fog"
+    },
+    {
+      "from": 2,
+      "to": 19,
+      "kind": "Waw",
+      "resource": "gbuf.motion"
+    },
+    {
+      "from": 2,
+      "to": 19,
+      "kind": "Waw",
+      "resource": "gbuf.reactive"
+    },
+    {
+      "from": 2,
+      "to": 19,
+      "kind": "Waw",
+      "resource": "gbuf.surface"
+    },
+    {
+      "from": 2,
+      "to": 19,
+      "kind": "Waw",
+      "resource": "gx.depth"
+    },
+    {
+      "from": 2,
+      "to": 19,
+      "kind": "Waw",
+      "resource": "gx.normal"
+    },
+    {
+      "from": 3,
+      "to": 4,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 4,
+      "to": 5,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 5,
+      "to": 6,
+      "kind": "Bound",
+      "resource": null
+    },
+    {
+      "from": 5,
+      "to": 7,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 6,
+      "to": 7,
+      "kind": "Bound",
+      "resource": null
+    },
+    {
+      "from": 6,
+      "to": 8,
+      "kind": "Raw",
+      "resource": "test.tex"
+    },
+    {
+      "from": 7,
+      "to": 8,
+      "kind": "Bound",
+      "resource": null
+    },
+    {
+      "from": 7,
+      "to": 9,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 8,
+      "to": 9,
+      "kind": "Bound",
+      "resource": null
+    },
+    {
+      "from": 8,
+      "to": 18,
+      "kind": "Raw",
+      "resource": "test.buf"
+    },
+    {
+      "from": 9,
+      "to": 10,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 10,
+      "to": 11,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 11,
+      "to": 12,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 12,
+      "to": 13,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 13,
+      "to": 14,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 14,
+      "to": 15,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 15,
+      "to": 16,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 16,
+      "to": 17,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 17,
+      "to": 18,
+      "kind": "Bound",
+      "resource": null
+    },
+    {
+      "from": 17,
+      "to": 19,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 18,
+      "to": 19,
+      "kind": "Bound",
+      "resource": null
+    },
+    {
+      "from": 18,
+      "to": 19,
+      "kind": "Waw",
+      "resource": "gx.color"
+    },
+    {
+      "from": 19,
+      "to": 20,
+      "kind": "Bound",
+      "resource": null
+    },
+    {
+      "from": 23,
+      "to": 24,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 24,
+      "to": 25,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 25,
+      "to": 26,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 27,
+      "to": 28,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 29,
+      "to": 30,
+      "kind": "Chain",
+      "resource": null
+    },
+    {
+      "from": 31,
+      "to": 32,
+      "kind": "Chain",
+      "resource": null
+    }
+  ],
+  "pool": {
+    "slots": 2,
+    "logicalBytes": 16640,
+    "slotBytes": 16640,
+    "claimedBytes": null,
+    "idleBytes": null
+  }
+}

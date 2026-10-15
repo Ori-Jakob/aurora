@@ -38,6 +38,7 @@ TEST(GxReplayOptions, Defaults) {
   EXPECT_FALSE(defaults.allowCpu);
   EXPECT_FALSE(defaults.showWindow);
   EXPECT_FALSE(defaults.verbose);
+  EXPECT_FALSE(defaults.gpuTimings);
   EXPECT_FALSE(defaults.help);
 
   const auto parsed = parse({"demo.gxtrace", "--out", "out"});
@@ -243,4 +244,52 @@ TEST(GxReplayReport, TimingJsonFormatsThreeDecimals) {
   EXPECT_NE(json.find("\"run\": 1"), std::string::npos) << json;
   EXPECT_NE(json.find("\"processMs\": 0.001"), std::string::npos) << json;
   EXPECT_NE(json.find("\"meanMs\": 10.000"), std::string::npos) << json;
+}
+
+TEST(GxReplayOptions, GpuTimingsFlag) {
+  const auto plain = parse({"demo.gxtrace", "--out", "o"});
+  ASSERT_TRUE(plain);
+  EXPECT_FALSE(plain->gpuTimings);
+  const auto timed = parse({"demo.gxtrace", "--out", "o", "--gpu-timings", "--no-png"});
+  ASSERT_TRUE(timed);
+  EXPECT_TRUE(timed->gpuTimings);
+  EXPECT_FALSE(timed->writePng);
+  EXPECT_NE(usage().find("--gpu-timings"), std::string_view::npos);
+}
+
+TEST(GxReplayReport, GpuTimingJsonFormat) {
+  const GpuFrameTiming timings[]{
+      {.run = 0, .frame = 0, .frameMs = 3.2154, .dropped = 0, .passes = {{"A", 1.1116}, {"B", 0.5}}},
+      {.run = 0, .frame = 1, .frameMs = 4.0, .dropped = 2, .passes = {{"A", 2.0}}},
+      {.run = 1, .frame = 0, .frameMs = 1.0, .dropped = 0, .passes = {}},
+  };
+  const std::string json = format_gpu_timing_json(true, timings);
+  EXPECT_EQ(json.find("{\n  \"supported\": true,\n  \"runs\": [\n"), 0u) << json;
+  EXPECT_NE(json.find("{\"frame\": 0, \"gpuFrameMs\": 3.215, \"dropped\": 0, \"passes\": "
+                      "[{\"name\": \"A\", \"ms\": 1.112}, {\"name\": \"B\", \"ms\": 0.500}]},"),
+            std::string::npos)
+      << json;
+  EXPECT_NE(json.find("{\"frame\": 1, \"gpuFrameMs\": 4.000, \"dropped\": 2, \"passes\": "
+                      "[{\"name\": \"A\", \"ms\": 2.000}]}\n"),
+            std::string::npos)
+      << json;
+  EXPECT_NE(json.find("\"meanGpuFrameMs\": 3.608"), std::string::npos) << json;
+  EXPECT_NE(json.find("\"p95GpuFrameMs\": 4.000"), std::string::npos) << json;
+  EXPECT_NE(json.find("{\"name\": \"A\", \"meanMs\": 1.556, \"p95Ms\": 2.000, \"frames\": 2},"), std::string::npos)
+      << json;
+  EXPECT_NE(json.find("{\"name\": \"B\", \"meanMs\": 0.500, \"p95Ms\": 0.500, \"frames\": 1}\n"), std::string::npos)
+      << json;
+  EXPECT_NE(json.find("\"run\": 1,"), std::string::npos) << json;
+  EXPECT_NE(json.find("{\"frame\": 0, \"gpuFrameMs\": 1.000, \"dropped\": 0, \"passes\": []}\n"), std::string::npos)
+      << json;
+  EXPECT_NE(json.find("\"meanGpuFrameMs\": 1.000"), std::string::npos) << json;
+  EXPECT_NE(json.find("      \"passes\": []\n"), std::string::npos) << json;
+  EXPECT_TRUE(json.ends_with("  ]\n}\n")) << json;
+}
+
+TEST(GxReplayReport, GpuTimingUnsupported) {
+  EXPECT_EQ(format_gpu_timing_json(false, {}), "{\"supported\": false, \"runs\": []}\n");
+  const GpuFrameTiming timings[]{{.run = 0, .frame = 0, .frameMs = 1.0}};
+  EXPECT_EQ(format_gpu_timing_json(false, timings), "{\"supported\": false, \"runs\": []}\n");
+  EXPECT_EQ(format_gpu_timing_json(true, {}), "{\"supported\": true, \"runs\": []}\n");
 }

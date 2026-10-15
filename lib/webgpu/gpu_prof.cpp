@@ -6,48 +6,48 @@
 #include <tracy/Tracy.hpp>
 
 #ifdef TRACY_ENABLE
-
 #include <tracy/TracyC.h>
+
+#include <bitset>
+#include <magic_enum.hpp>
+#endif
 
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <bitset>
 #include <chrono>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include <absl/container/flat_hash_map.h>
-#include <magic_enum.hpp>
 
 namespace aurora::webgpu::gpu_prof {
 namespace {
 Module Log("aurora::webgpu::gpu_prof");
 
+using detail::Event;
+using detail::EventKind;
+
 // Each zone consumes a begin/end timestamp pair.
 // The last pair is reserved for the frame zone.
-constexpr uint32_t MaxZones = 127;
+constexpr uint32_t MaxZones = 511;
 constexpr uint32_t QueryCount = MaxZones * 2 + 2;
 constexpr uint32_t FrameBeginQuery = MaxZones * 2;
 constexpr uint32_t FrameEndQuery = MaxZones * 2 + 1;
 constexpr uint64_t ReadbackSize = QueryCount * sizeof(uint64_t);
 constexpr size_t RingDepth = 4;
+#ifdef TRACY_ENABLE
+constexpr bool TracyBuild = true;
 constexpr uint8_t ContextId = 0;
 constexpr uint64_t SaneFrameGapNs = UINT64_C(5'000'000'000);
-
-enum class EventKind : uint8_t {
-  ZoneBegin,
-  PassBegin,
-  End,
-};
-
-struct Event {
-  const char* name; // static lifetime; nullptr for End
-  uint32_t query;
-  EventKind kind;
-};
+#else
+constexpr bool TracyBuild = false;
+#endif
+constexpr auto IdlePollInterval = std::chrono::microseconds{100};
 
 enum class SlotState : uint8_t {
   Free,
@@ -61,6 +61,8 @@ struct Slot {
   wgpu::Buffer readback;
   std::vector<Event> events;
   uint32_t passCount = 0;
+  uint64_t sequence = 0;
+  uint32_t dropped = 0;
   int64_t submitNs = 0;
   std::atomic<SlotState> state{SlotState::Free};
 };
@@ -72,8 +74,13 @@ struct TimestampBounds {
   bool valid() const { return begin != 0 && end > begin; }
 };
 
-bool g_enabled = false;
-bool g_timestampsEnabled = false;
+bool g_supported = false;
+bool g_resourcesCreated = false;
+bool g_encoderTimestamps = false;
+std::atomic_bool g_always{TracyBuild};
+std::atomic_uint64_t g_requestedUntil{0};
+std::atomic_uint64_t g_sequence{0};
+std::atomic_uint64_t g_resolveCount{0};
 wgpu::QuerySet g_querySet;
 wgpu::Buffer g_resolveBuffer;
 std::array<Slot, RingDepth> g_slots;
@@ -83,17 +90,24 @@ bool g_frameActive = false;
 bool g_framePending = false;
 uint32_t g_zoneCount = 0;
 
+std::mutex g_latestMutex;
+FrameTimes g_latest;
+// Worker only, or the wait_idle caller while the worker is idle
+FrameTimes g_scratch;
+
+#ifdef TRACY_ENABLE
 bool g_contextEmitted = false;
 uint16_t g_queryId = 0;
 uint64_t g_lastEmittedTs = 0;
 uint64_t g_lastFrameEnd = 0;
+#endif
 
 int64_t now_ns() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
       .count();
 }
 
-// Tracy keeps references to zone names; intern them for static lifetime.
+// Tracy and the published timings keep references to zone names; intern them for static lifetime.
 const char* intern_name(std::string_view name) {
   static absl::flat_hash_map<std::string, const char*> names;
   const auto it = names.find(name);
@@ -107,6 +121,7 @@ const char* intern_name(std::string_view name) {
   return stable;
 }
 
+#ifdef TRACY_ENABLE
 // tracy::GpuContextType not exposed through TracyC.h
 uint8_t tracy_context_type(wgpu::BackendType backend) {
   switch (backend) {
@@ -161,6 +176,7 @@ void emit_zone_end(uint64_t gpuNs) {
   ___tracy_emit_gpu_zone_end_serial({.queryId = queryId, .context = ContextId});
   ___tracy_emit_gpu_time_serial({.gpuTime = int64_t(gpuNs), .queryId = queryId, .context = ContextId});
 }
+#endif
 
 TimestampBounds event_bounds(const Slot& slot, const uint64_t* ts) {
   TimestampBounds bounds;
@@ -179,22 +195,44 @@ TimestampBounds event_bounds(const Slot& slot, const uint64_t* ts) {
   return bounds;
 }
 
+const uint64_t* mapped_timestamps(const Slot& slot) {
+  return static_cast<const uint64_t*>(slot.readback.GetConstMappedRange(0, ReadbackSize));
+}
+
+TimestampBounds frame_bounds(const Slot& slot, const uint64_t* ts) {
+  // Prefer recorded work bounds. Some backends expose encoder timestamps but
+  // report startup/epoch values that are not stable enough to anchor Tracy's
+  // GPU context, while pass timestamps are already what the emitted zones use.
+  TimestampBounds bounds = event_bounds(slot, ts);
+  if (!bounds.valid() && g_encoderTimestamps) {
+    bounds = {ts[FrameBeginQuery], ts[FrameEndQuery]};
+  }
+  return bounds;
+}
+
+void publish(const Slot& slot) {
+  const uint64_t* ts = mapped_timestamps(slot);
+  if (ts == nullptr) {
+    return;
+  }
+  const TimestampBounds bounds = frame_bounds(slot, ts);
+  detail::aggregate(slot.events, {ts, QueryCount}, bounds.begin, bounds.end, g_scratch);
+  g_scratch.sequence = slot.sequence;
+  g_scratch.dropped = slot.dropped;
+  std::lock_guard lock{g_latestMutex};
+  std::swap(g_latest, g_scratch);
+}
+
+#ifdef TRACY_ENABLE
 void emit_frame(Slot& slot) {
-  const auto* ts = static_cast<const uint64_t*>(slot.readback.GetConstMappedRange(0, ReadbackSize));
+  const uint64_t* ts = mapped_timestamps(slot);
   if (ts == nullptr) {
     return;
   }
 
-  // Prefer recorded work bounds. Some backends expose encoder timestamps but
-  // report startup/epoch values that are not stable enough to anchor Tracy's
-  // GPU context, while pass timestamps are already what the emitted zones use.
-  const TimestampBounds zoneBounds = event_bounds(slot, ts);
-  uint64_t frameBegin = zoneBounds.begin;
-  uint64_t frameEnd = zoneBounds.end;
-  if (!zoneBounds.valid() && g_timestampsEnabled) {
-    frameBegin = ts[FrameBeginQuery];
-    frameEnd = ts[FrameEndQuery];
-  }
+  const TimestampBounds bounds = frame_bounds(slot, ts);
+  uint64_t frameBegin = bounds.begin;
+  uint64_t frameEnd = bounds.end;
   if (frameBegin == 0 || frameEnd <= frameBegin) {
     return;
   }
@@ -278,24 +316,29 @@ void emit_frame(Slot& slot) {
   TracyPlot("aurora: gpuIdleMs", double(idleNs) * 1e-6);
   TracyPlot("aurora: gpuPasses", int64_t(slot.passCount));
 }
+#endif
 
 Slot& record_slot() { return g_slots[g_recordSlot]; }
 
 uint32_t alloc_zone() {
-  if (!g_frameActive || g_zoneCount >= MaxZones) {
+  if (!g_frameActive) {
+    return UINT32_MAX;
+  }
+  if (g_zoneCount >= MaxZones) {
+    ++record_slot().dropped;
     return UINT32_MAX;
   }
   return g_zoneCount++;
 }
-} // namespace
 
-void initialize() {
-  g_enabled = g_device.HasFeature(wgpu::FeatureName::TimestampQuery);
-  if (!g_enabled) {
-    Log.info("Timestamp queries unsupported; GPU profiling disabled");
+bool collecting(uint64_t sequence) noexcept {
+  return g_always.load(std::memory_order_relaxed) || sequence <= g_requestedUntil.load(std::memory_order_relaxed);
+}
+
+void ensure_resources() {
+  if (g_resourcesCreated) {
     return;
   }
-  g_timestampsEnabled = true; // TODO: check if allow_unsafe_apis enabled?
   constexpr wgpu::QuerySetDescriptor querySetDescriptor{
       .label = "GPU profiler timestamps",
       .type = wgpu::QueryType::Timestamp,
@@ -321,10 +364,96 @@ void initialize() {
   g_recordSlot = 0;
   g_emitSlot = 0;
   g_framePending = false;
+  g_resourcesCreated = true;
+}
+
+void release_resources() {
+  g_querySet = {};
+  g_resolveBuffer = {};
+  for (auto& slot : g_slots) {
+    slot.readback = {};
+  }
+  g_resourcesCreated = false;
+}
+
+bool ring_idle() {
+  return std::ranges::all_of(
+      g_slots, [](const Slot& slot) { return slot.state.load(std::memory_order_acquire) == SlotState::Free; });
+}
+
+void drain_mapped() {
+  while (true) {
+    auto& slot = g_slots[g_emitSlot];
+    const auto state = slot.state.load(std::memory_order_acquire);
+    if (state == SlotState::Mapped) {
+      publish(slot);
+#ifdef TRACY_ENABLE
+      emit_frame(slot);
+#endif
+      slot.readback.Unmap();
+    } else if (state != SlotState::Failed) {
+      break;
+    }
+    slot.state.store(SlotState::Free, std::memory_order_release);
+    g_emitSlot = (g_emitSlot + 1) % RingDepth;
+  }
+}
+} // namespace
+
+namespace detail {
+void aggregate(std::span<const Event> events, std::span<const uint64_t> timestamps, uint64_t frameBegin,
+               uint64_t frameEnd, FrameTimes& out) {
+  struct Open {
+    const char* name;
+    uint32_t endQuery;
+    bool counted;
+  };
+  std::vector<Open> open;
+  out.passes.clear();
+  out.frameMs = frameEnd > frameBegin ? static_cast<float>(static_cast<double>(frameEnd - frameBegin) * 1e-6) : 0.f;
+  for (const Event& event : events) {
+    if (event.kind == EventKind::End) {
+      const auto it = std::ranges::find(open, event.query, &Open::endQuery);
+      if (it != open.end()) {
+        open.erase(it);
+      }
+      continue;
+    }
+    const uint64_t begin = event.query + 1 < timestamps.size() ? timestamps[event.query] : 0;
+    const uint64_t end = event.query + 1 < timestamps.size() ? timestamps[event.query + 1] : 0;
+    const bool valid = begin != 0 && end != 0 && end >= begin;
+    // An encoder zone and the passes it opens share the graph pass name, so only the outermost counts
+    const bool nested =
+        std::ranges::any_of(open, [&](const Open& outer) { return outer.counted && outer.name == event.name; });
+    open.push_back({event.name, event.query + 1, valid && !nested});
+    if (!valid || nested) {
+      continue;
+    }
+    const auto ms = static_cast<float>(static_cast<double>(end - begin) * 1e-6);
+    const auto it = std::ranges::find(out.passes, event.name, &PassTime::name);
+    if (it != out.passes.end()) {
+      it->ms += ms;
+    } else {
+      out.passes.push_back({event.name, ms});
+    }
+  }
+}
+} // namespace detail
+
+void initialize() {
+  g_supported = g_device.HasFeature(wgpu::FeatureName::TimestampQuery);
+  // Browsers have no encoder timestamps; native devices inherit allow_unsafe_apis from the instance
+  g_encoderTimestamps = g_supported && g_backendType != wgpu::BackendType::WebGPU;
+  if (!g_supported) {
+    Log.info("Timestamp queries unsupported; GPU timings disabled");
+    return;
+  }
+#ifdef TRACY_ENABLE
   TracyPlotConfig("aurora: gpuFrameMs", tracy::PlotFormatType::Number, false, true, 0);
   TracyPlotConfig("aurora: gpuIdleMs", tracy::PlotFormatType::Number, false, true, 0);
   TracyPlotConfig("aurora: gpuPasses", tracy::PlotFormatType::Number, true, true, 0);
-  Log.info("GPU profiling enabled ({} zones max)", MaxZones);
+#endif
+  Log.info("GPU timestamps available ({} zones max)", MaxZones);
 }
 
 void shutdown() {
@@ -334,18 +463,32 @@ void shutdown() {
     slot.readback = {};
     slot.events.clear();
     slot.passCount = 0;
+    slot.sequence = 0;
+    slot.dropped = 0;
     slot.state = SlotState::Free;
   }
-  g_enabled = false;
-  g_timestampsEnabled = false;
+  g_supported = false;
+  g_resourcesCreated = false;
+  g_encoderTimestamps = false;
   g_frameActive = false;
   g_framePending = false;
+  g_sequence = 0;
+  g_requestedUntil = 0;
+  std::lock_guard lock{g_latestMutex};
+  g_latest = {};
 }
 
 void frame_begin(const wgpu::CommandEncoder& encoder) {
-  if (!g_enabled) {
+  const uint64_t sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (!g_supported || !collecting(sequence)) {
+    g_frameActive = false;
+    // Once the last requested frame is read back, a frame without timings costs nothing again
+    if (g_resourcesCreated && ring_idle()) {
+      release_resources();
+    }
     return;
   }
+  ensure_resources();
   auto& slot = record_slot();
   if (slot.state != SlotState::Free) {
     g_frameActive = false;
@@ -354,33 +497,36 @@ void frame_begin(const wgpu::CommandEncoder& encoder) {
   slot.state = SlotState::Recording;
   slot.events.clear();
   slot.passCount = 0;
+  slot.sequence = sequence;
+  slot.dropped = 0;
   g_zoneCount = 0;
   g_frameActive = true;
-  if (g_timestampsEnabled) {
+  if (g_encoderTimestamps) {
     encoder.WriteTimestamp(g_querySet, FrameBeginQuery);
   }
 }
 
 void frame_end(const wgpu::CommandEncoder& encoder) {
-  if (!g_enabled || !g_frameActive) {
+  if (!g_frameActive) {
     return;
   }
   g_frameActive = false;
   auto& slot = record_slot();
-  if (slot.events.empty() && !g_timestampsEnabled) {
+  if (slot.events.empty() && !g_encoderTimestamps) {
     slot.state = SlotState::Free;
     return;
   }
-  if (g_timestampsEnabled) {
+  if (g_encoderTimestamps) {
     encoder.WriteTimestamp(g_querySet, FrameEndQuery);
   }
   encoder.ResolveQuerySet(g_querySet, 0, QueryCount, g_resolveBuffer, 0);
   encoder.CopyBufferToBuffer(g_resolveBuffer, 0, slot.readback, 0, ReadbackSize);
+  g_resolveCount.fetch_add(1, std::memory_order_relaxed);
   g_framePending = true;
 }
 
 void after_submit() {
-  if (!g_enabled) {
+  if (!g_resourcesCreated) {
     return;
   }
   if (g_framePending) {
@@ -395,22 +541,13 @@ void after_submit() {
                            });
     g_recordSlot = (g_recordSlot + 1) % RingDepth;
   }
+#ifdef TRACY_ENABLE
   {
     ZoneScopedN("ProcessEvents");
     g_instance.ProcessEvents();
   }
-  while (true) {
-    auto& slot = g_slots[g_emitSlot];
-    const auto state = slot.state.load(std::memory_order_acquire);
-    if (state == SlotState::Mapped) {
-      emit_frame(slot);
-      slot.readback.Unmap();
-    } else if (state != SlotState::Failed) {
-      break;
-    }
-    slot.state.store(SlotState::Free, std::memory_order_release);
-    g_emitSlot = (g_emitSlot + 1) % RingDepth;
-  }
+#endif
+  drain_mapped();
 }
 
 const wgpu::PassTimestampWrites* pass_writes(std::string_view name) {
@@ -434,8 +571,48 @@ const wgpu::PassTimestampWrites* pass_writes(std::string_view name) {
   return &out;
 }
 
+bool supported() noexcept { return g_supported; }
+
+void request(uint32_t frames) noexcept {
+  const uint64_t until = g_sequence.load(std::memory_order_relaxed) + frames;
+  uint64_t current = g_requestedUntil.load(std::memory_order_relaxed);
+  while (current < until && !g_requestedUntil.compare_exchange_weak(current, until, std::memory_order_relaxed)) {}
+}
+
+void set_always(bool always) noexcept { g_always.store(always, std::memory_order_relaxed); }
+
+bool latest(FrameTimes& out) {
+  std::lock_guard lock{g_latestMutex};
+  if (g_latest.sequence == 0 || g_latest.sequence == out.sequence) {
+    return false;
+  }
+  out = g_latest;
+  return true;
+}
+
+uint64_t last_frame_sequence() noexcept { return g_sequence.load(std::memory_order_relaxed); }
+
+bool wait_idle(uint64_t timeoutNs) {
+  if (!g_resourcesCreated) {
+    return true;
+  }
+  const auto start = std::chrono::steady_clock::now();
+  while (true) {
+    g_instance.ProcessEvents();
+    drain_mapped();
+    if (std::ranges::none_of(g_slots, [](const Slot& slot) { return slot.state == SlotState::InFlight; })) {
+      return true;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start);
+    if (static_cast<uint64_t>(elapsed.count()) >= timeoutNs) {
+      return false;
+    }
+    std::this_thread::sleep_for(IdlePollInterval);
+  }
+}
+
 Zone::Zone(const wgpu::CommandEncoder& encoder, std::string_view name) {
-  if (!g_timestampsEnabled) {
+  if (!g_frameActive || !g_encoderTimestamps) {
     return;
   }
   const uint32_t index = alloc_zone();
@@ -456,19 +633,12 @@ Zone::~Zone() {
   m_encoder->WriteTimestamp(g_querySet, m_endQuery);
 }
 
+namespace testing {
+uint64_t resolve_count() noexcept { return g_resolveCount.load(std::memory_order_relaxed); }
+
+bool resources_created() noexcept { return g_resourcesCreated; }
+
+std::span<const detail::Event> recording_events() noexcept { return record_slot().events; }
+} // namespace testing
+
 } // namespace aurora::webgpu::gpu_prof
-
-#else
-
-namespace aurora::webgpu::gpu_prof {
-void initialize() {}
-void shutdown() {}
-void frame_begin(const wgpu::CommandEncoder&) {}
-void frame_end(const wgpu::CommandEncoder&) {}
-void after_submit() {}
-const wgpu::PassTimestampWrites* pass_writes(std::string_view) { return nullptr; }
-Zone::Zone(const wgpu::CommandEncoder&, std::string_view) {}
-Zone::~Zone() = default;
-} // namespace aurora::webgpu::gpu_prof
-
-#endif

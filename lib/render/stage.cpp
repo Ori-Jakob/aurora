@@ -7,13 +7,16 @@
 #include "../logging.hpp"
 
 #if AURORA_ENABLE_RENDER
+#include "debug/debug.hpp"
 #include "shaders.hpp"
+#include "../webgpu/gpu_prof.hpp"
 #endif
 
 #include <aurora/gfx.h>
 
 #include <array>
 #include <utility>
+#include <vector>
 
 namespace aurora::render::detail {
 namespace {
@@ -21,6 +24,9 @@ constexpr Module Log{"aurora::render"};
 
 // Recording thread only; a frame's stages are built in order and never concurrently
 FrameCullState g_frameCull;
+#if AURORA_ENABLE_RENDER
+std::vector<FrameCullReason> g_cullReasons;
+#endif
 
 const CompiledGraph* stage_graph(const StageData& stage) noexcept {
   return stage.frame != nullptr ? stage.frame->graph.get() : nullptr;
@@ -38,6 +44,19 @@ void warn_missing_marker(Stage stage) {
   }
   Log.warn("Render stage {} marker missing; passes that need it are skipped", stage_name(stage));
 }
+
+#if AURORA_ENABLE_RENDER
+bool encode_timed(const wgpu::CommandEncoder& encoder, const StageData& stage, const CompiledGraph& graph,
+                  NodeId nodeId) {
+  const CompiledNode& node = graph.nodes[nodeId];
+  // Compute and render passes carry their own pass timestamps
+  if (!encoder || (node.passKind != PassKind::Copy && node.passKind != PassKind::Encoder)) {
+    return encode_pass(encoder, stage, nodeId);
+  }
+  const webgpu::gpu_prof::Zone zone{encoder, node.name};
+  return encode_pass(encoder, stage, nodeId);
+}
+#endif
 } // namespace
 
 bool build_stage_data(StageData& stage) {
@@ -53,6 +72,13 @@ bool build_stage_data(StageData& stage) {
 #endif
   const StageProgram& program = graph->stages[static_cast<size_t>(stage.stage)];
   if (program.passes.empty()) {
+#if AURORA_ENABLE_RENDER
+    // FrameEnd publishes even without passes, so a frame whose passes all sit in other stages still pairs
+    if (stage.stage == Stage::FrameEnd && stage.frame->inspectorOpen) {
+      debug::record_stage_cull(*graph, stage.stage, stage.frameId, {});
+      debug::publish_frame_cull(stage.frameId, graph->graphHash);
+    }
+#endif
     return false;
   }
   const auto passCount = static_cast<uint32_t>(program.passes.size());
@@ -78,7 +104,16 @@ bool build_stage_data(StageData& stage) {
   }
 #if AURORA_ENABLE_RENDER
   StageMask mask;
-  cull_stage(*graph, stage.stage, stage.enabled, g_frameCull, mask);
+  if (stage.frame->inspectorOpen) {
+    g_cullReasons.assign(passCount, FrameCullReason::Ran);
+    cull_stage(*graph, stage.stage, stage.enabled, g_frameCull, mask, g_cullReasons);
+    debug::record_stage_cull(*graph, stage.stage, stage.frameId, g_cullReasons);
+    if (stage.stage == Stage::FrameEnd) {
+      debug::publish_frame_cull(stage.frameId, graph->graphHash);
+    }
+  } else {
+    cull_stage(*graph, stage.stage, stage.enabled, g_frameCull, mask);
+  }
   stage.enabled = std::move(mask.passes);
   stage.dummies = std::move(mask.dummies);
   stage.prevValid = std::move(mask.prevValid);
@@ -110,7 +145,7 @@ void run_stage(const wgpu::CommandEncoder& encoder, const StageData& stage) {
     const NodeId nodeId = program.passes[i];
     poison_before(encoder, stage, nodeId);
     // A pass skipped at bind time wrote nothing, so its histories must not flip
-    if (encode_pass(encoder, stage, nodeId)) {
+    if (encode_timed(encoder, stage, *graph, nodeId)) {
       after_pass(stage, nodeId);
     }
   }

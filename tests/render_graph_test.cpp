@@ -2546,5 +2546,75 @@ TEST_F(RenderGraphCull, MaskSizes) {
   }
   EXPECT_FALSE(test_bit(mask.passes, Count));
 }
+
+struct ReasonFrame {
+  CullFrame frame;
+  std::array<std::vector<FrameCullReason>, StageCount> reasons;
+};
+
+ReasonFrame run_frame_with_reasons(const CompiledGraph& graph, FrameCullState& state, const EnabledFn& enabled) {
+  ReasonFrame out;
+  begin_frame_cull(graph, state);
+  for (size_t s = 0; s < StageCount; ++s) {
+    const StageProgram& program = graph.stages[s];
+    if (program.passes.empty()) {
+      continue;
+    }
+    std::vector<uint64_t> bits((program.passes.size() + 63) / 64, 0);
+    for (size_t i = 0; i < program.passes.size(); ++i) {
+      if (enabled(graph.nodes[program.passes[i]].name)) {
+        bits[i / 64] |= uint64_t{1} << (i % 64);
+      }
+    }
+    // Seeded with a value cull_stage must overwrite
+    out.reasons[s].assign(program.passes.size(), FrameCullReason::NoActiveConsumer);
+    cull_stage(graph, static_cast<Stage>(s), bits, state, out.frame.masks[s], out.reasons[s]);
+    out.frame.culled[s] = true;
+  }
+  return out;
+}
+
+FrameCullReason reason_of(const CompiledGraph& graph, const ReasonFrame& frame, std::string_view pass) {
+  const CompiledNode& compiled = node(graph, pass);
+  return frame.reasons[static_cast<size_t>(compiled.stage)][compiled.programIndex];
+}
+
+TEST_F(RenderGraphCull, CullReasonsMatchMask) {
+  const auto planned = compile_planned();
+  const CompiledGraph& graph = *planned.graph;
+  const std::vector<std::set<std::string, std::less<>>> cases{
+      {}, {"capture.replay"}, {"hzb.opaque"}, {"refl.apply"}, {"godrays.apply"}, {"clouds.upsample"},
+  };
+  for (const auto& off : cases) {
+    FrameCullState plainState;
+    FrameCullState reasonState;
+    const CullFrame plain = run_frame(graph, plainState, all_except(off));
+    const ReasonFrame frame = run_frame_with_reasons(graph, reasonState, all_except(off));
+    for (size_t s = 0; s < StageCount; ++s) {
+      if (!plain.culled[s]) {
+        continue;
+      }
+      EXPECT_EQ(frame.frame.masks[s].passes, plain.masks[s].passes) << s;
+      EXPECT_EQ(frame.frame.masks[s].dummies, plain.masks[s].dummies) << s;
+      for (size_t i = 0; i < graph.stages[s].passes.size(); ++i) {
+        const std::string& name = graph.nodes[graph.stages[s].passes[i]].name;
+        const FrameCullReason reason = frame.reasons[s][i];
+        EXPECT_EQ(reason == FrameCullReason::Ran, test_bit(plain.masks[s].passes, i)) << name;
+        EXPECT_EQ(reason == FrameCullReason::NotEnabled, off.contains(name)) << name;
+      }
+    }
+  }
+
+  FrameCullState forwardState;
+  const ReasonFrame forward = run_frame_with_reasons(graph, forwardState, all_except({"hzb.opaque"}));
+  EXPECT_EQ(reason_of(graph, forward, "hzb.opaque"), FrameCullReason::NotEnabled);
+  EXPECT_EQ(reason_of(graph, forward, "vg.cull"), FrameCullReason::InputDisabled);
+  FrameCullState backwardState;
+  const ReasonFrame backward = run_frame_with_reasons(graph, backwardState, all_except({"refl.apply"}));
+  EXPECT_EQ(reason_of(graph, backward, "refl.denoise"), FrameCullReason::NoActiveConsumer);
+  EXPECT_EQ(reason_of(graph, backward, "ao.gtao"), FrameCullReason::Ran);
+  EXPECT_EQ(frame_cull_reason_name(FrameCullReason::InputDisabled), "InputDisabled");
+  EXPECT_EQ(frame_cull_reason_name(static_cast<FrameCullReason>(9)), "Unknown");
+}
 } // namespace
 } // namespace aurora::render::detail

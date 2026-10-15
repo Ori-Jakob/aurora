@@ -2,9 +2,12 @@
 
 #include "graph_layout.hpp"
 #include "graph_slots.hpp"
+#include "debug/graph_inspection.hpp"
 
 #include "../gfx/hash.hpp"
 #include "../internal.hpp"
+
+#include <magic_enum.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -259,6 +262,11 @@ constexpr std::array<std::string_view, 21> CullReasonNames{
 static_assert(CullReasonNames.size() == static_cast<size_t>(CullReason::BindingViewMismatch) + 1);
 constexpr std::array<std::string_view, 6> EdgeKindNames{"Chain", "Bound", "Anchor", "Raw", "War", "Waw"};
 static_assert(EdgeKindNames.size() == static_cast<size_t>(EdgeKind::Waw) + 1);
+constexpr std::array<std::string_view, 4> NodeKindNames{"Pass", "Gx", "Phase", "Overlay"};
+static_assert(NodeKindNames.size() == static_cast<size_t>(NodeKind::Overlay) + 1);
+constexpr std::array<std::string_view, 4> FrameCullReasonNames{"Ran", "NotEnabled", "InputDisabled",
+                                                               "NoActiveConsumer"};
+static_assert(FrameCullReasonNames.size() == static_cast<size_t>(FrameCullReason::NoActiveConsumer) + 1);
 
 std::string_view view_dimension_name(wgpu::TextureViewDimension dimension) noexcept {
   switch (dimension) {
@@ -2735,6 +2743,253 @@ std::string_view cull_reason_name(CullReason reason) noexcept { return enum_name
 
 std::string_view edge_kind_name(EdgeKind kind) noexcept { return enum_name(EdgeKindNames, kind); }
 
+std::string_view frame_cull_reason_name(FrameCullReason reason) noexcept {
+  return enum_name(FrameCullReasonNames, reason);
+}
+
+namespace {
+constexpr std::array<std::pair<wgpu::TextureUsage, std::string_view>, 7> TextureUsageNames{{
+    {wgpu::TextureUsage::CopySrc, "CopySrc"},
+    {wgpu::TextureUsage::CopyDst, "CopyDst"},
+    {wgpu::TextureUsage::TextureBinding, "TextureBinding"},
+    {wgpu::TextureUsage::StorageBinding, "StorageBinding"},
+    {wgpu::TextureUsage::RenderAttachment, "RenderAttachment"},
+    {wgpu::TextureUsage::TransientAttachment, "TransientAttachment"},
+    {wgpu::TextureUsage::StorageAttachment, "StorageAttachment"},
+}};
+
+constexpr std::array<std::pair<wgpu::BufferUsage, std::string_view>, 11> BufferUsageNames{{
+    {wgpu::BufferUsage::MapRead, "MapRead"},
+    {wgpu::BufferUsage::MapWrite, "MapWrite"},
+    {wgpu::BufferUsage::CopySrc, "CopySrc"},
+    {wgpu::BufferUsage::CopyDst, "CopyDst"},
+    {wgpu::BufferUsage::Index, "Index"},
+    {wgpu::BufferUsage::Vertex, "Vertex"},
+    {wgpu::BufferUsage::Uniform, "Uniform"},
+    {wgpu::BufferUsage::Storage, "Storage"},
+    {wgpu::BufferUsage::Indirect, "Indirect"},
+    {wgpu::BufferUsage::QueryResolve, "QueryResolve"},
+    {wgpu::BufferUsage::TexelBuffer, "TexelBuffer"},
+}};
+
+template <typename Flags, size_t N>
+std::vector<std::string> flag_names(Flags flags, const std::array<std::pair<Flags, std::string_view>, N>& names) {
+  std::vector<std::string> out;
+  const auto bits = static_cast<uint64_t>(flags);
+  for (uint32_t bit = 0; bit < 64; ++bit) {
+    const uint64_t mask = uint64_t{1} << bit;
+    if ((bits & mask) == 0) {
+      continue;
+    }
+    const auto it =
+        std::ranges::find_if(names, [&](const auto& row) { return static_cast<uint64_t>(row.first) == mask; });
+    out.emplace_back(it != names.end() ? std::string{it->second} : fmt::format("0x{:x}", mask));
+  }
+  return out;
+}
+
+std::string size_class_text(SizeClass sizeClass, uint16_t divisor) {
+  if (sizeClass == SizeClass::Absolute) {
+    return "Absolute";
+  }
+  const std::string_view base = sizeClass == SizeClass::Efb ? "Efb" : "Output";
+  return divisor > 1 ? fmt::format("{}/{}", base, divisor) : std::string{base};
+}
+
+uint64_t texture_bytes(const CompiledResource& resource, uint32_t samples) noexcept {
+  const auto info = texture_format_info(resource.tex.format);
+  if (!resource.described || !info) {
+    return 0;
+  }
+  const wgpu::Extent3D& extent = resource.extent;
+  const bool volume = resource.tex.dimension == wgpu::TextureDimension::e3D;
+  uint64_t bytes = 0;
+  for (uint32_t mip = 0; mip < resource.mipLevels && mip < 32; ++mip) {
+    const uint32_t width = std::max(1u, extent.width >> mip);
+    const uint32_t height = std::max(1u, extent.height >> mip);
+    const uint32_t depth = volume ? std::max(1u, extent.depthOrArrayLayers >> mip) : extent.depthOrArrayLayers;
+    bytes += ceil_div(width, info->blockWidth) * ceil_div(height, info->blockHeight) * info->bytesPerBlock * depth;
+  }
+  return bytes * samples;
+}
+
+std::string_view binding_text(const CompiledUse& use) noexcept {
+  if (use.staticDummy) {
+    const DummyColor color = use.hasFallback                          ? use.fallback.color
+                             : use.missing == Missing::BindDummyWhite ? DummyColor::White
+                                                                      : DummyColor::Black;
+    return color == DummyColor::White ? "DummyWhite" : "DummyBlack";
+  }
+  return use.unresolved ? "Unresolved" : "Resource";
+}
+
+bool node_active(const CompiledNode& node) noexcept {
+  return node.kind != NodeKind::Pass || node.status == CullReason::None;
+}
+
+// Each stage lists what it executes first, then its culled passes in registration order
+std::vector<NodeId> flattened_order(const CompiledGraph& graph, std::vector<debug::InspectStage>& stages) {
+  std::vector<NodeId> order;
+  order.reserve(graph.nodes.size());
+  for (size_t s = 0; s < StageCount; ++s) {
+    const auto stage = static_cast<Stage>(s);
+    debug::InspectStage& out = stages.emplace_back();
+    out.name = std::string{stage_name(stage)};
+    out.firstPass = static_cast<uint32_t>(order.size());
+    order.insert(order.end(), graph.stages[s].nodes.begin(), graph.stages[s].nodes.end());
+    for (size_t n = 0; n < graph.nodes.size(); ++n) {
+      const CompiledNode& node = graph.nodes[n];
+      // A pass declared with an unknown stage still shows its diagnostic, after the last stage
+      const bool inStage =
+          node.stage == stage || (s + 1 == StageCount && static_cast<size_t>(node.stage) >= StageCount);
+      if (inStage && !node_active(node)) {
+        order.push_back(static_cast<NodeId>(n));
+      }
+    }
+    out.passCount = static_cast<uint32_t>(order.size()) - out.firstPass;
+  }
+  return order;
+}
+} // namespace
+
+debug::GraphInspection inspect(const CompiledGraph& graph) {
+  debug::GraphInspection out;
+  out.graphHash = graph.graphHash;
+  const std::vector<NodeId> order = flattened_order(graph, out.stages);
+  std::vector<uint32_t> flat(graph.nodes.size(), InvalidIndex);
+  for (size_t i = 0; i < order.size(); ++i) {
+    flat[order[i]] = static_cast<uint32_t>(i);
+  }
+
+  out.passes.reserve(order.size());
+  for (const NodeId nodeId : order) {
+    const CompiledNode& node = graph.nodes[nodeId];
+    debug::InspectPass& pass = out.passes.emplace_back();
+    pass.name = node.name;
+    pass.stage = std::string{stage_name(node.stage)};
+    pass.nodeKind = std::string{enum_name(NodeKindNames, node.kind)};
+    pass.active = node_active(node);
+    if (node.kind == NodeKind::Pass) {
+      pass.kind = std::string{pass_kind_name(node.passKind)};
+      pass.cls = std::string{pass_class_name(node.cls)};
+      pass.order = node.order;
+      pass.registration = node.registration;
+      if (pass.active && node.frameSlot != InvalidNode) {
+        pass.frameSlot = node.frameSlot;
+      }
+    }
+    if (node.status != CullReason::None) {
+      pass.cull = std::string{cull_reason_name(node.status)};
+      const auto diagnostic = std::ranges::find_if(graph.diagnostics, [&](const Diagnostic& candidate) {
+        return candidate.node == nodeId && candidate.reason == node.status;
+      });
+      if (diagnostic != graph.diagnostics.end()) {
+        pass.detail = diagnostic->message;
+      }
+    }
+    pass.sideEffect = node.sideEffect;
+    for (const CompiledUse& use : graph.node_uses(nodeId)) {
+      const std::string& resource = graph.resources[use.resource].name;
+      if (reads(use.access)) {
+        pass.reads.push_back({
+            .resource = resource,
+            .access = std::string{access_name(use.access)},
+            .missing = std::string{missing_name(use.missing)},
+            .binding = std::string{binding_text(use)},
+        });
+      } else {
+        pass.writes.push_back({.resource = resource, .access = std::string{access_name(use.access)}});
+      }
+    }
+  }
+
+  // The compiled graph keeps no EFB sample count, so it comes from the attachments that use each resource
+  std::vector<uint32_t> samples(graph.resources.size(), 1);
+  const auto note_samples = [&](const AttachmentSlot& attachment) {
+    if (attachment.resource < samples.size()) {
+      samples[attachment.resource] = std::max(samples[attachment.resource], attachment.samples);
+    }
+  };
+  for (const BindingPlan& plan : graph.bindingPlans) {
+    std::ranges::for_each(plan.colors, note_samples);
+    if (plan.depth) {
+      note_samples(*plan.depth);
+    }
+  }
+  std::vector<std::optional<std::pair<uint32_t, uint32_t>>> spans(graph.resources.size());
+  for (const CompiledUse& use : graph.uses) {
+    if (use.staticDummy || use.node >= flat.size() || flat[use.node] == InvalidIndex ||
+        !node_active(graph.nodes[use.node])) {
+      continue;
+    }
+    auto& span = spans[use.resource];
+    const uint32_t at = flat[use.node];
+    span = span ? std::pair{std::min(span->first, at), std::max(span->second, at)} : std::pair{at, at};
+  }
+
+  out.resources.reserve(graph.resources.size());
+  for (size_t r = 0; r < graph.resources.size(); ++r) {
+    const CompiledResource& resource = graph.resources[r];
+    debug::InspectResource& entry = out.resources.emplace_back();
+    entry.name = resource.name;
+    entry.kind = std::string{resource_kind_name(resource.kind)};
+    if (!resource.described) {
+      // Neither a declaration nor the environment gave it a size, so there is no extent to report
+      entry.type = resource.buffer ? "buffer" : "texture";
+      entry.format = resource.buffer ? "" : std::string{magic_enum::enum_name(resource.tex.format)};
+      entry.depthOrLayers = 0;
+      entry.usage = resource.buffer ? flag_names(resource.bufferUsage, BufferUsageNames)
+                                    : flag_names(resource.textureUsage, TextureUsageNames);
+    } else if (resource.buffer) {
+      entry.type = "buffer";
+      entry.size = size_class_text(resource.buf.sizeClass, resource.buf.divisor);
+      entry.usage = flag_names(resource.bufferUsage, BufferUsageNames);
+      entry.bytes = resource.bufferSize;
+    } else {
+      entry.type = "texture";
+      entry.format = std::string{magic_enum::enum_name(resource.tex.format)};
+      entry.size = size_class_text(resource.tex.sizeClass, resource.tex.divisor);
+      entry.width = resource.extent.width;
+      entry.height = resource.extent.height;
+      entry.depthOrLayers = resource.extent.depthOrArrayLayers;
+      entry.mips = resource.mipLevels;
+      entry.samples = samples[r];
+      entry.usage = flag_names(resource.textureUsage, TextureUsageNames);
+      entry.bytes = texture_bytes(resource, entry.samples);
+    }
+    if (r < graph.slots.resourceSlot.size() && graph.slots.resourceSlot[r] != InvalidSlot) {
+      entry.slot = graph.slots.resourceSlot[r];
+    }
+    if (spans[r]) {
+      entry.firstPass = spans[r]->first;
+      entry.lastPass = spans[r]->second;
+    }
+  }
+  std::ranges::sort(out.resources, {}, &debug::InspectResource::name);
+
+  for (const Edge& edge : graph.edges) {
+    if (edge.from >= flat.size() || edge.to >= flat.size() || flat[edge.from] == InvalidIndex ||
+        flat[edge.to] == InvalidIndex) {
+      continue;
+    }
+    debug::InspectEdge& entry = out.edges.emplace_back();
+    entry.from = flat[edge.from];
+    entry.to = flat[edge.to];
+    entry.kind = std::string{edge_kind_name(edge.kind)};
+    if (edge.resource != InvalidResource) {
+      entry.resource = graph.resources[edge.resource].name;
+    }
+  }
+  std::ranges::sort(out.edges, {}, [](const debug::InspectEdge& edge) {
+    return std::tie(edge.from, edge.to, edge.kind, edge.resource);
+  });
+
+  out.poolSlots = static_cast<uint32_t>(graph.slots.slots.size());
+  out.logicalBytes = graph.slots.logicalBytes;
+  out.slotBytes = graph.slots.slotBytes;
+  return out;
+}
+
 DummyKey dummy_key(const CompiledGraph& graph, const CompiledUse& use, const GraphFeatures& features) noexcept {
   DummyKey key{.color = use.missing == Missing::BindDummyWhite ? DummyColor::White : DummyColor::Black};
   if (use.buffer) {
@@ -2802,12 +3057,16 @@ void invalidate_histories(FrameCullState& state) noexcept {
 }
 
 void cull_stage(const CompiledGraph& graph, Stage stage, std::span<const uint64_t> enabled, FrameCullState& state,
-                StageMask& out) {
+                StageMask& out, std::span<FrameCullReason> reasons) {
   assert(static_cast<uint8_t>(stage) >= state.nextStage);
   const StageProgram& program = graph.stages[static_cast<size_t>(stage)];
+  assert(reasons.empty() || reasons.size() == program.passes.size());
   out.passes.assign(bit_words(program.passes.size()), 0);
   for (size_t i = 0; i < program.passes.size(); ++i) {
     assign_bit(out.passes, i, test_bit(enabled, i));
+  }
+  for (size_t i = 0; i < reasons.size(); ++i) {
+    reasons[i] = test_bit(enabled, i) ? FrameCullReason::Ran : FrameCullReason::NotEnabled;
   }
   out.dummies.assign(bit_words(program.useBits), 0);
   out.prevValid = state.prevValid;
@@ -2841,6 +3100,9 @@ void cull_stage(const CompiledGraph& graph, Stage stage, std::span<const uint64_
     }
     if (!on) {
       turn_off(nodeId);
+      if (!reasons.empty()) {
+        reasons[node.programIndex] = FrameCullReason::InputDisabled;
+      }
     }
   }
 
@@ -2857,6 +3119,9 @@ void cull_stage(const CompiledGraph& graph, Stage stage, std::span<const uint64_
     });
     if (!consumed) {
       turn_off(*it);
+      if (!reasons.empty()) {
+        reasons[node.programIndex] = FrameCullReason::NoActiveConsumer;
+      }
     }
   }
 

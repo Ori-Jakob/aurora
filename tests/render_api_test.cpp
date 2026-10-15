@@ -1,9 +1,14 @@
 #include <gtest/gtest.h>
 
+#include "render/debug/debug.hpp"
 #include "render/module.hpp"
 #include "render/settings.hpp"
 #include "render_test_caps.hpp"
 #include "webgpu/gpu.hpp"
+
+#if !AURORA_ENABLE_RENDER
+#include <imgui.h>
+#endif
 
 #include <limits>
 #include <random>
@@ -549,6 +554,24 @@ TEST_F(RenderApiTest, CapsEmptyAfterReset) {
 }
 
 #if !AURORA_ENABLE_RENDER
+TEST(RenderApi, DebugApiLinksWhenModuleOff) {
+  ImGui::CreateContext();
+  ImGuiIO& io = ImGui::GetIO();
+  io.IniFilename = nullptr;
+  io.DisplaySize = {1280.f, 720.f};
+  io.Fonts->Build();
+  ImGui::NewFrame();
+  bool open = true;
+  draw_debug_window(&open);
+  draw_debug_window(nullptr);
+  ImGui::Render();
+  ImGui::DestroyContext();
+  EXPECT_TRUE(open);
+  EXPECT_TRUE(pass_timings().empty());
+  EXPECT_EQ(graph_dump_json(true), debug::NotCompiledGraphJson);
+  EXPECT_EQ(graph_dump_json(), debug::NotCompiledGraphJson);
+}
+
 TEST_F(RenderApiTest, ModuleOffReportsBuildDisabled) {
   detail::testing::set_caps(full_caps());
   enable_all_built();

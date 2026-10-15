@@ -1,4 +1,5 @@
 #include "graph.hpp"
+#include "debug/debug.hpp"
 
 #include "../webgpu/gpu.hpp"
 
@@ -55,6 +56,7 @@ GraphEnvironment gather_graph_environment() {
   }
   env.gxSampleCount = config.msaaSamples;
   env.profile = webgpu::g_featureProfile;
+  env.inspectorOpen = debug::inspector_open();
   return env;
 }
 } // namespace aurora::render::detail

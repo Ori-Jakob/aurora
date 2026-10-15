@@ -9,6 +9,10 @@
 #include "../logging.hpp"
 #include "../webgpu/caps.hpp"
 
+#if AURORA_ENABLE_RENDER
+#include "debug/debug.hpp"
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <mutex>
@@ -651,7 +655,9 @@ std::shared_ptr<const FrameState> latch_frame() {
     gfx::detail::request_streaming_sizes({.storage = ModuleStorageBufferSize});
   }
   std::shared_ptr<const CompiledGraph> graph = g_frameState ? g_frameState->graph : nullptr;
+  bool inspectorOpen = false;
 #if AURORA_ENABLE_RENDER
+  debug::on_latch();
   const bool passesChanged = consume_graph_dirty();
   GraphEnvironment environment = gather_graph_environment();
   const bool environmentChanged = environment != g_graphEnvironment;
@@ -665,9 +671,13 @@ std::shared_ptr<const FrameState> latch_frame() {
     graph = compiled ? std::move(compiled) : empty_graph();
   }
   latch_pass_params();
+  inspectorOpen = g_graphEnvironment.inspectorOpen;
 #endif
-  if (!g_frameState || g_frameState->settingsGeneration != g_generation || g_frameState->graph != graph) {
-    g_frameState = std::make_shared<const FrameState>(FrameState{g_generation, latched_settings(), std::move(graph)});
+  // An empty graph compiles to the same shared object, so the flag needs its own check
+  if (!g_frameState || g_frameState->settingsGeneration != g_generation || g_frameState->graph != graph ||
+      g_frameState->inspectorOpen != inspectorOpen) {
+    g_frameState = std::make_shared<const FrameState>(
+        FrameState{g_generation, latched_settings(), std::move(graph), inspectorOpen});
   }
   return g_frameState;
 }

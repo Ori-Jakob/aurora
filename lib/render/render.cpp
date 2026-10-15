@@ -7,9 +7,14 @@
 #include "jobs.hpp"
 #include "settings.hpp"
 #include "shaders.hpp"
+#include "debug/debug.hpp"
 
 #include "../logging.hpp"
 #include "../webgpu/gpu.hpp"
+
+#if !AURORA_ENABLE_RENDER
+#include <imgui.h>
+#endif
 
 #include <array>
 
@@ -62,6 +67,7 @@ void initialize() {
   transient_pool().set_release_listener(&bind_cache_on_release);
   jobs::initialize(webgpu::g_backendType == wgpu::BackendType::WebGPU ? 0 : jobs::default_worker_count());
   shaders::initialize();
+  debug::initialize();
 #endif
 }
 
@@ -73,6 +79,7 @@ void quiesce() noexcept {
 
 void shutdown() noexcept {
 #if AURORA_ENABLE_RENDER
+  debug::shutdown();
   // Compile jobs use the device, so they finish before the job pool and the device go away
   shaders::shutdown();
   jobs::shutdown();
@@ -122,4 +129,26 @@ std::string_view reason_name(Reason reason) noexcept {
   const auto index = static_cast<size_t>(reason);
   return index < ReasonNames.size() ? ReasonNames[index] : "Unknown";
 }
+
+#if AURORA_ENABLE_RENDER
+void draw_debug_window(bool* open) { debug::draw_window(open); }
+
+std::span<const PassTiming> pass_timings() noexcept { return debug::pass_timings(); }
+
+std::string graph_dump_json(bool includeFrameState) { return debug::graph_dump_json(includeFrameState); }
+#else
+void draw_debug_window(bool* open) {
+  if (open == nullptr || !*open) {
+    return;
+  }
+  if (ImGui::Begin(debug::RendererWindowId, open)) {
+    ImGui::TextUnformatted("Render module disabled at build time");
+  }
+  ImGui::End();
+}
+
+std::span<const PassTiming> pass_timings() noexcept { return {}; }
+
+std::string graph_dump_json(bool) { return std::string{debug::NotCompiledGraphJson}; }
+#endif
 } // namespace aurora::render

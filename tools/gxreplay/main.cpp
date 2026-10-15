@@ -7,6 +7,7 @@
 #include "io.hpp"
 #include "trace/trace_reader.hpp"
 #include "webgpu/gpu.hpp"
+#include "webgpu/gpu_prof.hpp"
 
 #include <aurora/aurora.h>
 #include <SDL3/SDL_error.h>
@@ -46,9 +47,19 @@ bool write_text(const std::filesystem::path& path, const std::string& text) {
 }
 
 bool write_reports(const Options& options, const ReportContext& context, std::span<const FrameResult> frames,
-                   std::span<const FrameTiming> timings) {
-  return write_text(options.outDir / "frames.json", format_frames_json(context, frames)) &&
-         write_text(options.outDir / "timing.json", format_timing_json(timings));
+                   std::span<const FrameTiming> timings, std::span<const GpuFrameTiming> gpuTimings) {
+  if (!write_text(options.outDir / "frames.json", format_frames_json(context, frames)) ||
+      !write_text(options.outDir / "timing.json", format_timing_json(timings))) {
+    return false;
+  }
+  if (!options.gpuTimings) {
+    return true;
+  }
+  const bool supported = webgpu::gpu_prof::supported();
+  if (!supported) {
+    print_error("--gpu-timings needs timestamp queries, which this device lacks; gpu_timing.json has no runs");
+  }
+  return write_text(options.outDir / "gpu_timing.json", format_gpu_timing_json(supported, gpuTimings));
 }
 
 std::string flag_names(uint32_t flags) {
@@ -218,6 +229,8 @@ int run_self_test(int argc, char* argv[], const Options& options) {
 
   std::vector<FrameTiming> timings = first.timings;
   timings.insert(timings.end(), second.timings.begin(), second.timings.end());
+  std::vector<GpuFrameTiming> gpuTimings = first.gpuTimings;
+  gpuTimings.insert(gpuTimings.end(), second.gpuTimings.begin(), second.gpuTimings.end());
   const ReportContext context{
       .traceFile = io::fs_path_to_string(hintsPath),
       .traceVersion = fmt::format("{}.{}", hintsReader.header().versionMajor, hintsReader.header().versionMinor),
@@ -227,7 +240,7 @@ int run_self_test(int argc, char* argv[], const Options& options) {
       .runs = 2,
       .deterministic = deterministic,
   };
-  const bool reportsWritten = write_reports(options, context, first.frames, timings);
+  const bool reportsWritten = write_reports(options, context, first.frames, timings, gpuTimings);
   aurora_shutdown();
   if (!failure.empty()) {
     print_error("self-test failed: " + failure);
@@ -295,8 +308,10 @@ int run_replay(int argc, char* argv[], const Options& options) {
     print_error(fmt::format("--frames clamped to the trace's last frame, {}", frames.back().frame));
   }
   std::vector<FrameTiming> timings;
+  std::vector<GpuFrameTiming> gpuTimings;
   for (const auto& result : results) {
     timings.insert(timings.end(), result.timings.begin(), result.timings.end());
+    gpuTimings.insert(gpuTimings.end(), result.gpuTimings.begin(), result.gpuTimings.end());
   }
   const ReportContext context{
       .traceFile = io::fs_path_to_string(options.trace),
@@ -307,7 +322,7 @@ int run_replay(int argc, char* argv[], const Options& options) {
       .runs = options.repeat,
       .deterministic = deterministic,
   };
-  const bool reportsWritten = write_reports(options, context, frames, timings);
+  const bool reportsWritten = write_reports(options, context, frames, timings, gpuTimings);
   aurora_shutdown();
 
   // Frames before --frames are still decoded, so their unresolved reads count too

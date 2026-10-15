@@ -16,6 +16,7 @@
 #include "render/shaders.hpp"
 #include "render/stage.hpp"
 #include "webgpu/gpu.hpp"
+#include "webgpu/gpu_prof.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1871,6 +1872,79 @@ TEST_F(GraphBindTest, BindCacheStatsFromAnotherThread) {
   reader.join();
   EXPECT_GT(reads.load(), 0u);
   EXPECT_EQ(bind_cache_stats().staleEntries, 0u);
+}
+
+std::vector<std::string_view> recorded_names(webgpu::gpu_prof::detail::EventKind kind) {
+  std::vector<std::string_view> names;
+  for (const auto& event : webgpu::gpu_prof::testing::recording_events()) {
+    if (event.kind == kind) {
+      names.emplace_back(event.name);
+    }
+  }
+  return names;
+}
+
+TEST_F(GraphBindTest, TimingZonesWrapCopyAndEncoderPasses) {
+  namespace gpu_prof = webgpu::gpu_prof;
+  using gpu_prof::detail::EventKind;
+  gpu_prof::shutdown();
+  gpu_prof::initialize();
+  if (!gpu_prof::supported()) {
+    GTEST_SKIP() << "the device has no timestamp queries";
+  }
+  gpu_prof::request(2);
+  const auto sideEffect = [](InternalPassBuilder& b) { b.side_effect(); };
+  const auto openCompute = [](PassContext& ctx) {
+    if (const wgpu::ComputePassEncoder pass = ctx.begin_compute()) {
+      pass.End();
+    }
+  };
+  const std::vector<TestPass> passes{
+      {.name = "t.compute", .order = 0, .declare = sideEffect, .encode = openCompute},
+      {.name = "t.copy", .kind = PassKind::Copy, .order = 1, .declare = sideEffect},
+      {.name = "t.encoder", .kind = PassKind::Encoder, .order = 2, .declare = sideEffect, .encode = openCompute},
+      {.name = "t.render",
+       .kind = PassKind::Render,
+       .order = 3,
+       .declare =
+           [](InternalPassBuilder& b) {
+             b.create("t.target", absolute(TextureFormat::RGBA8Unorm), Access::ColorWrite);
+             b.side_effect();
+           },
+       .encode =
+           [](PassContext& ctx) {
+             if (const wgpu::RenderPassEncoder pass = ctx.begin_render()) {
+               pass.End();
+             }
+           }},
+  };
+  const TestFrame frame{compile(passes)};
+  ASSERT_EQ(frame.graph->framePasses.size(), passes.size());
+  on_worker_frame_begin(1, &frame.state);
+  StageData stage = stage_for(frame, Stage::OpaqueDone, 1);
+  build_stage_bindings(stage, &fake_sink);
+  upload_uniforms();
+  push_validation_scope();
+  const wgpu::CommandEncoder encoder = m_device->device.CreateCommandEncoder();
+  gpu_prof::frame_begin(encoder);
+  run_stage(encoder, stage);
+  const std::vector<std::string_view> zones{"t.copy", "t.encoder"};
+  const std::vector<std::string_view> passTimestamps{"t.compute", "t.encoder", "t.render"};
+  EXPECT_EQ(recorded_names(EventKind::ZoneBegin), zones);
+  EXPECT_EQ(recorded_names(EventKind::PassBegin), passTimestamps);
+  run_stage({}, stage);
+  EXPECT_EQ(recorded_names(EventKind::ZoneBegin), zones);
+  EXPECT_EQ(recorded_names(EventKind::PassBegin), passTimestamps);
+  gpu_prof::frame_end(encoder);
+  const wgpu::CommandBuffer commands = encoder.Finish();
+  m_device->queue.Submit(1, &commands);
+  gpu_prof::after_submit();
+  EXPECT_EQ(pop_validation_scope(), std::nullopt);
+  EXPECT_TRUE(gpu_prof::wait_idle(5'000'000'000));
+  gpu_prof::shutdown();
+  for (const TestPass& pass : passes) {
+    EXPECT_EQ(pass.calls, 2) << pass.name;
+  }
 }
 } // namespace
 } // namespace aurora::render::detail

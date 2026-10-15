@@ -4,6 +4,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
+#include <string>
 #include <string_view>
 
 namespace aurora::render {
@@ -213,4 +215,13 @@ constexpr std::string_view stage_name(Stage stage) noexcept {
   }
   return "Unknown";
 }
+
+struct PassTiming {
+  std::string_view name;
+  float gpuMs = 0.f;
+};
+
+void draw_debug_window(bool* open);
+std::span<const PassTiming> pass_timings() noexcept;
+std::string graph_dump_json(bool includeFrameState = false);
 } // namespace aurora::render

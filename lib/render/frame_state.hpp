@@ -12,6 +12,7 @@ struct FrameState {
   uint64_t settingsGeneration = 0;
   Settings settings;
   std::shared_ptr<const CompiledGraph> graph;
+  bool inspectorOpen = false;
 };
 
 std::shared_ptr<const FrameState> latch_frame();
