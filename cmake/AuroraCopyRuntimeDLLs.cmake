@@ -35,6 +35,26 @@ function(aurora_copy_runtime_dlls target)
       endforeach ()
     endif ()
   endif ()
+
+  # A vendored Dawn builds dxcompiler and copies dxil.dll into the top-level build directory only
+  if (TARGET dxcompiler)
+    add_dependencies(${target} dxcompiler)
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:dxcompiler> $<TARGET_FILE_DIR:${target}>
+    )
+  endif ()
+  if (TARGET copy_dxil_dll)
+    add_dependencies(${target} copy_dxil_dll)
+    get_property(_aurora_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+    if (_aurora_multi_config)
+      set(_aurora_dxil_dll "${CMAKE_BINARY_DIR}/$<CONFIG>/dxil.dll")
+    else ()
+      set(_aurora_dxil_dll "${CMAKE_BINARY_DIR}/dxil.dll")
+    endif ()
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_aurora_dxil_dll}" $<TARGET_FILE_DIR:${target}>
+    )
+  endif ()
 endfunction()
 
 # aurora_install_runtime_dlls(<executable_target> <install_destination>)
