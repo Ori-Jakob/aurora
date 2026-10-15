@@ -122,4 +122,46 @@ inline void enable_all_built() {
 inline detail::SupportEnv env(const Caps& caps, const detail::BuiltOptions& built, uint32_t msaaSamples = 1) {
   return {caps, msaaSamples, built, true};
 }
+
+inline Settings everything_on() {
+  Settings s;
+  s.preset = Preset::Ultra;
+  s.textureMaterials = true;
+  s.stochasticTiling = true;
+  s.legacyMatMaps = true;
+  s.pbr = true;
+  s.taa = true;
+  s.ao = Quality::Ultra;
+  s.ssil = true;
+  s.shadows.quality = Quality::Ultra;
+  s.shadows.game = GameShadows::Remove;
+  s.shadows.keepCues = true;
+  s.gi = GiMode::Ddgi;
+  s.rt = RtMode::PathTraceReference;
+  s.rtBackend = RtBackend::Dxr;
+  s.reflections = Reflections::SsrRt;
+  s.fog.volumetric = Quality::Ultra;
+  s.fog.godRays = GodRays::Volumetric;
+  s.fog.legacyMatch = true;
+  s.fog.translucents = true;
+  s.sky.clouds = Quality::Ultra;
+  s.sky.cloudShadows = true;
+  s.sky.keepCloudDome = true;
+  s.grass.quality = Quality::Ultra;
+  s.grass.replaceGamePatches = true;
+  s.grass.terrainGrass = true;
+  s.grass.shadows = GrassShadows::Full;
+  s.grass.interaction = true;
+  s.grass.legacyShadowTransfer = true;
+  s.terrain.mode = TerrainDetail::Tessellated;
+  s.terrain.quality = Quality::Ultra;
+  s.terrain.flattenVolumes = true;
+  s.gpuFoliage = true;
+  s.gpuWeather = true;
+  s.gpuParticles = true;
+  s.gpuDeform = true;
+  s.meshReplacement = true;
+  s.staticWorld = StaticWorld::On;
+  return s;
+}
 } // namespace aurora::render::test

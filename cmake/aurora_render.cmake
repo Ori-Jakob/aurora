@@ -13,9 +13,13 @@ target_sources(aurora_gx PRIVATE
 )
 if (AURORA_ENABLE_RENDER)
     target_sources(aurora_gx PRIVATE
+        lib/render/gpu_heap.cpp
+        lib/render/gpu_heap.hpp
         lib/render/graph.cpp
         lib/render/graph_env.cpp
         lib/render/json.hpp
+        lib/render/tlsf.cpp
+        lib/render/tlsf.hpp
     )
     target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_RENDER=1)
     target_link_libraries(aurora_gx PRIVATE yyjson::yyjson)

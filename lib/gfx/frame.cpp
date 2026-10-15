@@ -18,8 +18,10 @@
 #include "../render/module.hpp"
 #include "../render/stage.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -30,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include <SDL3/SDL_stdinc.h>
 #include <tracy/Tracy.hpp>
 #include <magic_enum.hpp>
 
@@ -44,6 +47,13 @@ constexpr Module Log{"aurora::gfx"};
 
 Resources g_resources;
 
+constexpr uint64_t MiB = 1024 * 1024;
+constexpr auto VertexBufferUsage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst;
+// Storage lets later stream-out passes read the u16 indices as u32 words
+constexpr auto IndexBufferUsage = wgpu::BufferUsage::Index | wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+constexpr auto StorageBufferUsage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+constexpr auto StagingBufferUsage = wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc;
+
 enum class BufferMapState {
   Unmapped,
   Mapping,
@@ -52,6 +62,12 @@ enum class BufferMapState {
 
 std::array<wgpu::Buffer, StagingBufferCount> g_stagingBuffers;
 std::array<std::atomic<BufferMapState>, StagingBufferCount> g_mappingStates;
+// Game thread, except that the worker reads a slot's sizes while it maps that slot
+std::array<StreamingSizes, StagingBufferCount> g_stagingSizes;
+StreamingSizes g_targetSizes;
+StreamingSizes g_requestedSizes;
+uint32_t g_testGrowthFrame = 0;
+bool g_loggedStagingCap = false;
 uint32_t g_frameIndex = UINT32_MAX;
 
 std::array<FramePacket, FrameSlotCount> g_framePackets;
@@ -226,7 +242,7 @@ void map_staging_buffer(size_t slot, bool releaseSlotOnCompletion = false) {
   }
 
   g_stagingBuffers[slot].MapAsync(
-      wgpu::MapMode::Write, 0, StagingBufferSize, wgpu::CallbackMode::AllowSpontaneous,
+      wgpu::MapMode::Write, 0, staging_layout(g_stagingSizes[slot]).total, wgpu::CallbackMode::AllowSpontaneous,
       [slot, releaseSlotOnCompletion](wgpu::MapAsyncStatus status, wgpu::StringView message) {
         if (status == wgpu::MapAsyncStatus::CallbackCancelled || status == wgpu::MapAsyncStatus::Aborted) {
           Log.warn("Buffer mapping {}: {}", magic_enum::enum_name(status), message);
@@ -244,6 +260,121 @@ void map_staging_buffer(size_t slot, bool releaseSlotOnCompletion = false) {
         }
       });
 }
+
+void create_buffer(wgpu::Buffer& out, wgpu::BufferUsage usage, uint64_t size, const char* label,
+                   bool mappedAtCreation = false) {
+  if (size <= 0) {
+    return;
+  }
+  const wgpu::BufferDescriptor descriptor{
+      .label = label,
+      .usage = usage,
+      .size = size,
+      .mappedAtCreation = mappedAtCreation,
+  };
+  out = g_device.CreateBuffer(&descriptor);
+}
+
+void create_staging_buffer(size_t slot, bool mappedAtCreation) {
+  const auto label = fmt::format("Staging Buffer {}", slot);
+  create_buffer(g_stagingBuffers[slot], StagingBufferUsage, staging_layout(g_stagingSizes[slot]).total, label.c_str(),
+                mappedAtCreation);
+}
+
+void create_static_bind_group() {
+  if (!g_resources.staticBindGroupLayout) {
+    constexpr std::array layoutEntries{
+        // Vertex data buffer
+        wgpu::BindGroupLayoutEntry{
+            .binding = 0,
+            .visibility = wgpu::ShaderStage::Vertex,
+            .buffer =
+                wgpu::BufferBindingLayout{
+                    .type = wgpu::BufferBindingType::ReadOnlyStorage,
+                },
+        },
+        // Storage data buffer
+        wgpu::BindGroupLayoutEntry{
+            .binding = 1,
+            .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
+            .buffer =
+                wgpu::BufferBindingLayout{
+                    .type = wgpu::BufferBindingType::ReadOnlyStorage,
+                },
+        },
+    };
+    const wgpu::BindGroupLayoutDescriptor layoutDesc{
+        .label = "Static bind group layout",
+        .entryCount = layoutEntries.size(),
+        .entries = layoutEntries.data(),
+    };
+    g_resources.staticBindGroupLayout = g_device.CreateBindGroupLayout(&layoutDesc);
+  }
+  const std::array entries{
+      wgpu::BindGroupEntry{
+          .binding = 0,
+          .buffer = g_resources.vertexBuffer,
+      },
+      wgpu::BindGroupEntry{
+          .binding = 1,
+          .buffer = g_resources.storageBuffer,
+      },
+  };
+  const wgpu::BindGroupDescriptor bindGroupDescriptor{
+      .label = "Static bind group",
+      .layout = g_resources.staticBindGroupLayout,
+      .entryCount = entries.size(),
+      .entries = entries.data(),
+  };
+  g_resources.staticBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
+}
+
+// Worker only, between the previous frame's submit and this frame's first encode
+void ensure_device_buffers(const StreamingSizes& sizes) {
+  auto& current = g_resources.deviceSizes;
+  bool rebuildStaticGroup = false;
+  bool resized = false;
+  if (current.vertex < sizes.vertex) {
+    create_buffer(g_resources.vertexBuffer, VertexBufferUsage, sizes.vertex, "Shared Vertex Buffer");
+    current.vertex = sizes.vertex;
+    rebuildStaticGroup = true;
+  }
+  if (current.index < sizes.index) {
+    create_buffer(g_resources.indexBuffer, IndexBufferUsage, sizes.index, "Shared Index Buffer");
+    current.index = sizes.index;
+    resized = true;
+  }
+  if (current.storage < sizes.storage) {
+    create_buffer(g_resources.storageBuffer, StorageBufferUsage, sizes.storage, "Shared Storage Buffer");
+    current.storage = sizes.storage;
+    rebuildStaticGroup = true;
+  }
+  if (rebuildStaticGroup) {
+    create_static_bind_group();
+  }
+  if (rebuildStaticGroup || resized) {
+    Log.info("Streaming buffers resized: vertex {} MiB, index {} MiB, storage {} MiB", current.vertex / MiB,
+             current.index / MiB, current.storage / MiB);
+  }
+}
+
+StreamingLimits streaming_limits() noexcept {
+  const auto& limits = g_resources.limits;
+  // Vertex and storage are bound whole in the static group; stream-out binds the index buffer whole
+  const uint64_t bound = std::min(limits.maxBufferSize, limits.maxStorageBufferBindingSize);
+  return {.vertex = bound, .index = bound, .storage = bound, .staging = limits.maxBufferSize};
+}
+
+uint32_t read_test_growth_frame() noexcept {
+  const char* value = SDL_getenv("AURORA_TEST_STREAMING_GROWTH");
+  if (value == nullptr) {
+    return 0;
+  }
+  const std::string_view text{value};
+  uint32_t frame = 0;
+  const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), frame);
+  return ec == std::errc{} && end == text.data() + text.size() ? frame : 0;
+}
 } // namespace
 
 namespace detail {
@@ -251,6 +382,52 @@ namespace detail {
 Resources& resources() noexcept { return g_resources; }
 
 const wgpu::Buffer& staging_buffer(size_t slot) { return g_stagingBuffers[slot]; }
+
+void request_streaming_sizes(const StreamingSizes& minimum) noexcept {
+  g_requestedSizes.vertex = std::max(g_requestedSizes.vertex, minimum.vertex);
+  g_requestedSizes.index = std::max(g_requestedSizes.index, minimum.index);
+  g_requestedSizes.storage = std::max(g_requestedSizes.storage, minimum.storage);
+}
+
+StreamingSizes streaming_sizes() noexcept { return g_targetSizes; }
+
+namespace testing {
+StreamingSizes requested_streaming_sizes() noexcept { return g_requestedSizes; }
+
+void reset_streaming_request() noexcept { g_requestedSizes = {}; }
+} // namespace testing
+
+StreamingGrowth next_streaming_sizes(const StreamingSizes& current, const AuroraStats& lastFrame,
+                                     const StreamingSizes& requested, const StreamingLimits& limits) noexcept {
+  const auto target = [](uint64_t size, uint64_t request, uint32_t highWater, uint64_t limit) {
+    uint64_t next = std::max(size, request);
+    // High water is a u32, so the comparison is formed in 64 bits
+    if (uint64_t{highWater} * 4 > next * 3) {
+      next *= 2;
+    }
+    return std::max(std::min(next, limit), size);
+  };
+  const StreamingSizes wanted{
+      .vertex = target(current.vertex, requested.vertex, lastFrame.lastVertSize, limits.vertex),
+      .index = target(current.index, requested.index, lastFrame.lastIndexSize, limits.index),
+      .storage = target(current.storage, requested.storage, lastFrame.lastStorageSize, limits.storage),
+  };
+  StreamingGrowth growth{.sizes = current};
+  // Steps are taken in order while one staging slot still fits in a single buffer
+  for (const auto member : {&StreamingSizes::vertex, &StreamingSizes::index, &StreamingSizes::storage}) {
+    if (wanted.*member == current.*member) {
+      continue;
+    }
+    StreamingSizes candidate = growth.sizes;
+    candidate.*member = wanted.*member;
+    if (staging_layout(candidate).total <= limits.staging) {
+      growth.sizes = candidate;
+    } else {
+      growth.stagingCapped = true;
+    }
+  }
+  return growth;
+}
 
 std::optional<RegisteredDrawType> find_runtime_draw_type(DrawTypeId id) {
   std::lock_guard lock{g_runtimeTypeMutex};
@@ -410,31 +587,16 @@ void initialize() {
 
   // For uniform & storage buffer offset alignments
   g_device.GetLimits(&g_resources.limits);
+  g_testGrowthFrame = read_test_growth_frame();
 
-  const auto createBuffer = [](wgpu::Buffer& out, wgpu::BufferUsage usage, uint64_t size, const char* label) {
-    if (size <= 0) {
-      return;
-    }
-    const wgpu::BufferDescriptor descriptor{
-        .label = label,
-        .usage = usage,
-        .size = size,
-    };
-    out = g_device.CreateBuffer(&descriptor);
-  };
-  createBuffer(g_resources.uniformBuffer, wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst, UniformBufferSize,
-               "Shared Uniform Buffer");
-  createBuffer(g_resources.vertexBuffer,
-               wgpu::BufferUsage::Storage | wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst, VertexBufferSize,
-               "Shared Vertex Buffer");
-  createBuffer(g_resources.indexBuffer, wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst, IndexBufferSize,
-               "Shared Index Buffer");
-  createBuffer(g_resources.storageBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, StorageBufferSize,
-               "Shared Storage Buffer");
+  create_buffer(g_resources.uniformBuffer, wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst, UniformBufferSize,
+                "Shared Uniform Buffer");
+  create_buffer(g_resources.vertexBuffer, VertexBufferUsage, g_targetSizes.vertex, "Shared Vertex Buffer");
+  create_buffer(g_resources.indexBuffer, IndexBufferUsage, g_targetSizes.index, "Shared Index Buffer");
+  create_buffer(g_resources.storageBuffer, StorageBufferUsage, g_targetSizes.storage, "Shared Storage Buffer");
+  g_resources.deviceSizes = g_targetSizes;
   for (size_t i = 0; i < g_stagingBuffers.size(); ++i) {
-    const auto label = fmt::format("Staging Buffer {}", i);
-    createBuffer(g_stagingBuffers[i], wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc, StagingBufferSize,
-                 label.c_str());
+    create_staging_buffer(i, false);
   }
   for (auto& state : g_mappingStates) {
     state.store(BufferMapState::Unmapped, std::memory_order_release);
@@ -443,51 +605,7 @@ void initialize() {
     map_staging_buffer(slot);
   }
 
-  {
-    constexpr std::array layoutEntries{
-        // Vertex data buffer
-        wgpu::BindGroupLayoutEntry{
-            .binding = 0,
-            .visibility = wgpu::ShaderStage::Vertex,
-            .buffer =
-                wgpu::BufferBindingLayout{
-                    .type = wgpu::BufferBindingType::ReadOnlyStorage,
-                },
-        },
-        // Storage data buffer
-        wgpu::BindGroupLayoutEntry{
-            .binding = 1,
-            .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
-            .buffer =
-                wgpu::BufferBindingLayout{
-                    .type = wgpu::BufferBindingType::ReadOnlyStorage,
-                },
-        },
-    };
-    const wgpu::BindGroupLayoutDescriptor layoutDesc{
-        .label = "Static bind group layout",
-        .entryCount = layoutEntries.size(),
-        .entries = layoutEntries.data(),
-    };
-    g_resources.staticBindGroupLayout = g_device.CreateBindGroupLayout(&layoutDesc);
-    const std::array entries{
-        wgpu::BindGroupEntry{
-            .binding = 0,
-            .buffer = g_resources.vertexBuffer,
-        },
-        wgpu::BindGroupEntry{
-            .binding = 1,
-            .buffer = g_resources.storageBuffer,
-        },
-    };
-    const wgpu::BindGroupDescriptor bindGroupDescriptor{
-        .label = "Static bind group",
-        .layout = g_resources.staticBindGroupLayout,
-        .entryCount = entries.size(),
-        .entries = entries.data(),
-    };
-    g_resources.staticBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
-  }
+  create_static_bind_group();
 
   {
     constexpr std::array layoutEntries{
@@ -566,7 +684,12 @@ void shutdown() {
   g_resources.uniformBuffer = {};
   g_resources.indexBuffer = {};
   g_resources.storageBuffer = {};
+  g_resources.deviceSizes = {};
   g_stagingBuffers.fill({});
+  g_stagingSizes.fill({});
+  g_targetSizes = {};
+  g_requestedSizes = {};
+  g_loggedStagingCap = false;
   for (auto& packet : g_framePackets) {
     packet = {};
   }
@@ -637,11 +760,18 @@ bool begin_frame() {
     return false;
   }
 
+  if (g_stagingSizes[*stagingSlot] != g_targetSizes) {
+    // A held slot has no map callback in flight, so its buffer can be swapped for one mapped at creation
+    g_stagingSizes[*stagingSlot] = g_targetSizes;
+    create_staging_buffer(*stagingSlot, true);
+  }
+
   auto& frame = g_framePackets[frameSlot];
   frame = {};
   frame.frameId = g_nextFrameId++;
   frame.frameIndex = g_frameIndex;
   frame.stagingBuffer = *stagingSlot;
+  frame.sizes = g_targetSizes;
   frame.renderState = render::detail::latch_frame();
   size_t bufferOffset = 0;
   const auto& stagingBuf = g_stagingBuffers[*stagingSlot];
@@ -652,21 +782,24 @@ bool begin_frame() {
     buf = ByteBuffer{static_cast<u8*>(stagingBuf.GetMappedRange(bufferOffset, size)), static_cast<size_t>(size)};
     bufferOffset += size;
   };
-  mapBuffer(frame.verts, VertexBufferSize);
+  mapBuffer(frame.verts, frame.sizes.vertex);
   mapBuffer(frame.uniforms, UniformBufferSize);
-  mapBuffer(frame.indices, IndexBufferSize);
-  mapBuffer(frame.storage, StorageBufferSize);
+  mapBuffer(frame.indices, frame.sizes.index);
+  mapBuffer(frame.storage, frame.sizes.storage);
   if constexpr (UseTextureBuffer) {
     mapBuffer(frame.textureUpload, TextureUploadSize);
   }
 
   begin_recording(frame, frameSlot);
   begin_pipeline_frame();
-  render_worker::enqueue_begin_frame(frame.frameId, [frameSlot] {
-    constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "Redraw encoder"};
-    g_framePackets[frameSlot].encoder = g_device.CreateCommandEncoder(&EncoderDescriptor);
-    webgpu::gpu_prof::frame_begin(g_framePackets[frameSlot].encoder);
-  });
+  render_worker::enqueue_begin_frame(
+      frame.frameId, [frameSlot, frameId = frame.frameId, sizes = frame.sizes, renderState = frame.renderState] {
+        ensure_device_buffers(sizes);
+        render::detail::on_worker_frame_begin(frameId, renderState.get());
+        constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "Redraw encoder"};
+        g_framePackets[frameSlot].encoder = g_device.CreateCommandEncoder(&EncoderDescriptor);
+        webgpu::gpu_prof::frame_begin(g_framePackets[frameSlot].encoder);
+      });
   g_cpuFrameStart = PresentClock::now();
   return true;
 }
@@ -685,6 +818,17 @@ void end_frame(EndFrameCallback callback) {
   const uint64_t frameId = frame.frameId;
   end_pipeline_frame();
   ++g_frameIndex;
+
+  // Runs before the end-frame item, which resets the packet and its stats on the worker
+  if (g_testGrowthFrame != 0 && frame.frameIndex == g_testGrowthFrame) {
+    g_requestedSizes.storage = 2 * g_targetSizes.storage;
+  }
+  const auto growth = next_streaming_sizes(g_targetSizes, frame.stats, g_requestedSizes, streaming_limits());
+  g_targetSizes = growth.sizes;
+  if (growth.stagingCapped && !std::exchange(g_loggedStagingCap, true)) {
+    Log.warn("Streaming buffer growth capped: a staging slot would exceed maxBufferSize ({} MiB)",
+             g_resources.limits.maxBufferSize / MiB);
+  }
 
   const size_t stagingSlot = frame.stagingBuffer;
   render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback)]() mutable {

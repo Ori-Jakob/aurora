@@ -246,6 +246,7 @@ if (AURORA_ENABLE_GX)
 
   add_executable(gfx_recording_tests
     gfx_recording_test.cpp
+    gfx_streaming_sizes_test.cpp
     render_target_layout_test.cpp
     trace_capture_test.cpp
   )
@@ -348,6 +349,20 @@ if (AURORA_ENABLE_GX)
     gtest_discover_tests(render_graph_tests)
   endif ()
 
+  if (AURORA_ENABLE_RENDER)
+    add_executable(render_tlsf_tests render_tlsf_test.cpp ../lib/render/tlsf.cpp)
+    target_include_directories(render_tlsf_tests PRIVATE ../lib)
+    target_link_libraries(render_tlsf_tests PRIVATE gtest gtest_main)
+    gtest_discover_tests(render_tlsf_tests)
+
+    add_executable(render_gpu_tests render_test_device.cpp render_gpu_heap_test.cpp)
+    target_include_directories(render_gpu_tests PRIVATE ../include ../lib)
+    target_compile_definitions(render_gpu_tests PRIVATE AURORA TARGET_PC=1 AURORA_ENABLE_RENDER=1)
+    target_link_libraries(render_gpu_tests PRIVATE aurora::gx aurora::vi gtest gtest_main)
+    aurora_copy_runtime_dlls(render_gpu_tests)
+    gtest_discover_tests(render_gpu_tests)
+  endif ()
+
   add_executable(trace_tests
     trace_format_test.cpp
     trace_store_test.cpp
@@ -399,6 +414,13 @@ if (TARGET render_demo)
               --fail-on-error --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_smoke/${_profile})
     set_tests_properties(render_demo_smoke_${_profile} PROPERTIES LABELS smoke TIMEOUT 180)
   endforeach ()
+  add_test(NAME render_demo_smoke_streaming_growth
+    COMMAND $<TARGET_FILE:render_demo> --backend null --profile compat --frames 90 --timeout 60
+            --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_smoke/streaming)
+  set_tests_properties(render_demo_smoke_streaming_growth PROPERTIES LABELS smoke TIMEOUT 180
+    ENVIRONMENT "AURORA_TEST_STREAMING_GROWTH=30"
+    PASS_REGULAR_EXPRESSION "Streaming buffers resized"
+    FAIL_REGULAR_EXPRESSION "\\[(ERROR|FATAL): ")
 endif ()
 
 if (TARGET aurora_gxreplay)

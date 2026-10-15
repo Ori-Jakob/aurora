@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "gfx/frame.hpp"
 #include "render/frame_state.hpp"
 #include "render/graph.hpp"
 #include "render/module.hpp"
@@ -7,6 +8,7 @@
 #include "render_test_caps.hpp"
 #include "webgpu/gpu.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <random>
@@ -125,6 +127,44 @@ TEST_F(RenderLatchTest, CapsChangeReclampsLastRequest) {
   detail::testing::set_caps(full_caps());
   EXPECT_EQ(latch_frame()->settings.ao, Quality::High);
   EXPECT_EQ(effective_settings().ao, Quality::High);
+}
+
+TEST_F(RenderLatchTest, OnlyMaterialFeaturesKeepLegacyStorageSize) {
+  constexpr std::array MaterialFeatures{Feature::TextureMaterials, Feature::StochasticTiling, Feature::LegacyMatMaps};
+  const auto is_material = [&](Feature feature) {
+    return std::ranges::find(MaterialFeatures, feature) != MaterialFeatures.end();
+  };
+  size_t requests = 0;
+  // Building one feature at a time makes the clamp turn every other feature off
+  for (size_t i = 0; i < FeatureCount; ++i) {
+    const auto feature = static_cast<Feature>(i);
+    detail::testing::reset();
+    detail::testing::set_caps(full_caps());
+    gfx::detail::testing::reset_streaming_request();
+    if (is_material(feature)) {
+      for (const Feature material : MaterialFeatures) {
+        detail::testing::set_built_options(material, ~0u);
+      }
+    } else {
+      detail::testing::set_built_options(feature, ~0u);
+    }
+    apply_settings(everything_on());
+    latch_frame();
+    bool moduleFeature = false;
+    for (size_t j = 0; j < FeatureCount; ++j) {
+      const auto enabled = static_cast<Feature>(j);
+      moduleFeature = moduleFeature || (feature_enabled(effective_settings(), enabled) && !is_material(enabled));
+    }
+    if (is_material(feature)) {
+      EXPECT_TRUE(feature_enabled(effective_settings(), feature)) << feature_name(feature);
+      EXPECT_FALSE(moduleFeature) << feature_name(feature);
+    }
+    const uint64_t storage = gfx::detail::testing::requested_streaming_sizes().storage;
+    EXPECT_EQ(storage, moduleFeature ? 32 * MiB : gfx::StorageBufferSize) << feature_name(feature);
+    requests += moduleFeature ? 1 : 0;
+  }
+  EXPECT_GT(requests, 0u);
+  gfx::detail::testing::reset_streaming_request();
 }
 #endif
 

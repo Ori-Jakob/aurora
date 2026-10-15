@@ -4,6 +4,7 @@
 #include "graph.hpp"
 #include "module.hpp"
 #include "stage.hpp"
+#include "../gfx/frame.hpp"
 #include "../logging.hpp"
 #include "../webgpu/caps.hpp"
 
@@ -90,6 +91,7 @@ constexpr BuiltOptions DefaultBuiltOptions{};
 constexpr uint32_t CompanionSampledTextures = 16;
 constexpr uint32_t TessellationVertexStorageBuffers = 4;
 constexpr float MaxExposureBias = 8.f;
+constexpr uint64_t ModuleStorageBufferSize = 32 * 1024 * 1024;
 
 constexpr Settings Defaults{};
 
@@ -258,6 +260,14 @@ FeatureMask enabled_features(const Settings& settings) noexcept {
     }
   }
   return mask;
+}
+
+// The material features are GX shader paths that never write the streaming storage buffer
+bool module_features_effective(const Settings& settings) noexcept {
+  constexpr auto bit = [](Feature feature) { return FeatureMask{1} << feature_index(feature); };
+  constexpr FeatureMask MaterialFeatures =
+      bit(Feature::TextureMaterials) | bit(Feature::StochasticTiling) | bit(Feature::LegacyMatMaps);
+  return (enabled_features(settings) & ~MaterialFeatures) != 0;
 }
 
 void log_latched_settings(uint64_t generation, FeatureMask previous, const Settings& latched) {
@@ -635,6 +645,9 @@ std::shared_ptr<const FrameState> latch_frame() {
       settingsChanged = true;
       log_latched_settings(g_generation, previous, *g_latched);
     }
+  }
+  if (settingsChanged && module_features_effective(latched_settings())) {
+    gfx::detail::request_streaming_sizes({.storage = ModuleStorageBufferSize});
   }
   std::shared_ptr<const CompiledGraph> graph = g_frameState ? g_frameState->graph : nullptr;
 #if AURORA_ENABLE_RENDER

@@ -1,4 +1,6 @@
 #include "module.hpp"
+
+#include "gpu_heap.hpp"
 #include "settings.hpp"
 
 #include "../logging.hpp"
@@ -53,7 +55,19 @@ void initialize() {
            deviceCaps.limits.maxColorAttachmentBytesPerSample);
 }
 
-void shutdown() noexcept { shutdown_settings_state(); }
+void shutdown() noexcept {
+#if AURORA_ENABLE_RENDER
+  gpu_heap::shutdown();
+#endif
+  shutdown_settings_state();
+}
+
+void on_worker_frame_begin([[maybe_unused]] uint64_t frameId, [[maybe_unused]] const FrameState* frame) {
+#if AURORA_ENABLE_RENDER
+  // Heap generations bump here, before anything later in the frame compares them
+  gpu_heap::begin_frame_worker();
+#endif
+}
 } // namespace detail
 
 Settings apply_settings(const Settings& requested) { return detail::submit_request(requested); }

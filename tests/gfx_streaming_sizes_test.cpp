@@ -1,0 +1,95 @@
+#include <gtest/gtest.h>
+
+#include "gfx/resources.hpp"
+
+#include <cstdint>
+
+namespace aurora::gfx::detail {
+namespace {
+constexpr uint64_t MiB = 1024 * 1024;
+constexpr uint64_t GiB = 1024 * MiB;
+constexpr StreamingLimits Limits{.vertex = 128 * MiB, .index = 128 * MiB, .storage = 128 * MiB, .staging = 256 * MiB};
+
+AuroraStats high_water(uint64_t vertex, uint64_t index, uint64_t storage) {
+  AuroraStats stats{};
+  stats.lastVertSize = static_cast<uint32_t>(vertex);
+  stats.lastIndexSize = static_cast<uint32_t>(index);
+  stats.lastStorageSize = static_cast<uint32_t>(storage);
+  return stats;
+}
+
+TEST(StreamingSizesTest, DefaultLayoutMatchesLegacy) {
+  constexpr StagingLayout layout = staging_layout({});
+  EXPECT_EQ(layout.vertex, 0u);
+  EXPECT_EQ(layout.uniform, 5 * MiB);
+  EXPECT_EQ(layout.index, 29 * MiB);
+  EXPECT_EQ(layout.storage, 31 * MiB);
+  EXPECT_EQ(layout.textureUpload, 39 * MiB);
+  EXPECT_EQ(layout.total, 63 * MiB);
+}
+
+TEST(StreamingSizesTest, NoGrowthAtOrBelowThreeQuarters) {
+  const auto growth = next_streaming_sizes({}, high_water(0, 0, 6 * MiB), {}, Limits);
+  EXPECT_EQ(growth.sizes, StreamingSizes{});
+  EXPECT_FALSE(growth.stagingCapped);
+}
+
+TEST(StreamingSizesTest, GrowsAboveThreeQuarters) {
+  const auto growth = next_streaming_sizes({}, high_water(0, 0, 6 * MiB + 1), {}, Limits);
+  EXPECT_EQ(growth.sizes.storage, 16 * MiB);
+  EXPECT_EQ(growth.sizes.vertex, VertexBufferSize);
+  EXPECT_EQ(growth.sizes.index, IndexBufferSize);
+  EXPECT_FALSE(growth.stagingCapped);
+}
+
+TEST(StreamingSizesTest, RequestedMinimumApplied) {
+  const auto growth = next_streaming_sizes({}, high_water(0, 0, 0), {.storage = 32 * MiB}, Limits);
+  EXPECT_EQ(growth.sizes.storage, 32 * MiB);
+  EXPECT_EQ(growth.sizes.vertex, VertexBufferSize);
+  EXPECT_EQ(growth.sizes.index, IndexBufferSize);
+}
+
+TEST(StreamingSizesTest, NeverShrinks) {
+  const auto growth = next_streaming_sizes({.storage = 16 * MiB}, high_water(0, 0, 0), {.storage = 8 * MiB}, Limits);
+  EXPECT_EQ(growth.sizes.storage, 16 * MiB);
+}
+
+TEST(StreamingSizesTest, CappedByLimits) {
+  const auto growth = next_streaming_sizes({.storage = 128 * MiB}, high_water(0, 0, 128 * MiB), {}, Limits);
+  EXPECT_EQ(growth.sizes.storage, 128 * MiB);
+  EXPECT_FALSE(growth.stagingCapped);
+}
+
+TEST(StreamingSizesTest, CappedByStagingTotal) {
+  const StreamingSizes current{.vertex = 80 * MiB, .index = 2 * MiB, .storage = 64 * MiB};
+  // 80 + 24 + 2 + 128 + 24 = 258 MiB would not fit one 256 MiB staging slot
+  const auto growth = next_streaming_sizes(current, high_water(0, 0, 64 * MiB), {}, Limits);
+  EXPECT_EQ(growth.sizes, current);
+  EXPECT_TRUE(growth.stagingCapped);
+}
+
+TEST(StreamingSizesTest, StagingCapKeepsFittingGrowth) {
+  const StreamingSizes current{.vertex = 80 * MiB, .index = 2 * MiB, .storage = 64 * MiB};
+  constexpr StreamingLimits limits{.vertex = 96 * MiB, .index = 128 * MiB, .storage = 128 * MiB, .staging = 256 * MiB};
+  const auto growth = next_streaming_sizes(current, high_water(80 * MiB, 0, 64 * MiB), {}, limits);
+  EXPECT_EQ(growth.sizes.vertex, 96 * MiB);
+  EXPECT_EQ(staging_layout(growth.sizes).total, 210 * MiB);
+  EXPECT_EQ(growth.sizes.index, 2 * MiB);
+  EXPECT_EQ(growth.sizes.storage, 64 * MiB);
+  EXPECT_TRUE(growth.stagingCapped);
+}
+
+TEST(StreamingSizesTest, HighWaterComparedInU64) {
+  constexpr StreamingLimits limits{.vertex = 2 * GiB, .index = 2 * GiB, .storage = 2 * GiB, .staging = 8 * GiB};
+  const auto growth = next_streaming_sizes({.storage = 1 * GiB}, high_water(0, 0, 1 * GiB), {}, limits);
+  EXPECT_EQ(growth.sizes.storage, 2 * GiB);
+}
+
+TEST(StreamingSizesTest, VertexAndIndexIndependent) {
+  const auto growth = next_streaming_sizes({}, high_water(9 * MiB / 2, 0, 0), {}, Limits);
+  EXPECT_EQ(growth.sizes.vertex, 10 * MiB);
+  EXPECT_EQ(growth.sizes.index, IndexBufferSize);
+  EXPECT_EQ(growth.sizes.storage, StorageBufferSize);
+}
+} // namespace
+} // namespace aurora::gfx::detail

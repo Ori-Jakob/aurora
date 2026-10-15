@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pipeline_cache.hpp"
+#include "resources.hpp"
 #include "types.hpp"
 #include "tex_palette_conv.hpp"
 #include "texture.hpp"
@@ -209,6 +210,7 @@ struct FramePacket {
   uint64_t frameId = 0;
   uint32_t frameIndex = 0;
   size_t stagingBuffer = 0;
+  StreamingSizes sizes;
   StagingHighWater copied;
   AuroraStats stats{};
 };
