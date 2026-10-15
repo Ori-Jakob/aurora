@@ -340,9 +340,11 @@ if (AURORA_ENABLE_GX)
       render_graph_test.cpp
       render_graph_planned.cpp
       render_graph_slots_test.cpp
+      render_graph_layout_test.cpp
       os_test_globals.cpp
       ../lib/logging.cpp
       ../lib/render/graph.cpp
+      ../lib/render/graph_layout.cpp
       ../lib/render/graph_slots.cpp
     )
     target_include_directories(render_graph_tests PRIVATE ../include ../lib)
@@ -358,7 +360,7 @@ if (AURORA_ENABLE_GX)
     gtest_discover_tests(render_tlsf_tests)
 
     add_executable(render_gpu_tests render_test_device.cpp render_gpu_heap_test.cpp render_graph_pool_test.cpp
-      render_graph_planned.cpp)
+      render_graph_bind_test.cpp render_graph_planned.cpp)
     target_include_directories(render_gpu_tests PRIVATE ../include ../lib)
     target_compile_definitions(render_gpu_tests PRIVATE AURORA TARGET_PC=1 AURORA_ENABLE_RENDER=1)
     target_link_libraries(render_gpu_tests PRIVATE aurora::gx aurora::vi gtest gtest_main)

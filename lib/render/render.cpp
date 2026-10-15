@@ -2,6 +2,7 @@
 
 #include "frame_state.hpp"
 #include "gpu_heap.hpp"
+#include "graph_bind.hpp"
 #include "graph_pool.hpp"
 #include "settings.hpp"
 
@@ -55,10 +56,15 @@ void initialize() {
   Log.info("Render tiers: base {}, PBR {} (core {}, msaa {}, colour budget {} B)", yes_no(tier != Tier::None),
            yes_no(tier == Tier::Pbr), yes_no(deviceCaps.core), msaaSamples,
            deviceCaps.limits.maxColorAttachmentBytesPerSample);
+#if AURORA_ENABLE_RENDER
+  transient_pool().set_release_listener(&bind_cache_on_release);
+#endif
 }
 
 void shutdown() noexcept {
 #if AURORA_ENABLE_RENDER
+  // Unhooks the release listener first, so the pool's last releases have no cache left to evict from
+  shutdown_bindings();
   transient_pool().clear();
   gpu_heap::shutdown();
 #endif
@@ -70,6 +76,7 @@ void on_worker_frame_begin([[maybe_unused]] uint64_t frameId, [[maybe_unused]] c
   // Heap generations bump here, before anything later in the frame compares them
   gpu_heap::begin_frame_worker();
   transient_pool_tick(frame != nullptr ? frame->graph : nullptr, TransientPool::Clock::now());
+  bind_cache_tick(frameId);
 #endif
 }
 } // namespace detail

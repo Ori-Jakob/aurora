@@ -2,6 +2,7 @@
 
 #include "frame_state.hpp"
 #include "graph.hpp"
+#include "graph_bind.hpp"
 #include "module.hpp"
 #include "stage.hpp"
 #include "../gfx/frame.hpp"
@@ -658,8 +659,12 @@ std::shared_ptr<const FrameState> latch_frame() {
     g_graphEnvironment = std::move(environment);
     // An equal graphHash still carries new state and callbacks, so the new object is always published
     std::shared_ptr<CompiledGraph> compiled = compile_graph(latched_settings(), caps(), g_graphEnvironment);
+    if (compiled) {
+      prepare_graph_bindings(*compiled);
+    }
     graph = compiled ? std::move(compiled) : empty_graph();
   }
+  latch_pass_params();
 #endif
   if (!g_frameState || g_frameState->settingsGeneration != g_generation || g_frameState->graph != graph) {
     g_frameState = std::make_shared<const FrameState>(FrameState{g_generation, latched_settings(), std::move(graph)});

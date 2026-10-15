@@ -455,6 +455,7 @@ void TransientPool::materialize(const std::shared_ptr<const CompiledGraph>& grap
   }
   for (HistoryPair& pair : m_histories) {
     pair.pendingSwap = false;
+    pair.fresh = false;
     pair.idleSince = now;
     m_idleHistories.push_back(std::move(pair));
   }
@@ -530,10 +531,31 @@ void TransientPool::mark_history_written(uint16_t historySlot) noexcept {
 
 void TransientPool::apply_history_swaps() noexcept {
   for (HistoryPair& pair : m_histories) {
-    if (std::exchange(pair.pendingSwap, false)) {
+    pair.fresh = std::exchange(pair.pendingSwap, false);
+    if (pair.fresh) {
       pair.read ^= 1;
     }
   }
+}
+
+bool TransientPool::history_fresh(uint16_t historySlot) const noexcept {
+  return historySlot < m_histories.size() && m_histories[historySlot].fresh;
+}
+
+std::vector<uint64_t> TransientPool::serials() const {
+  std::vector<uint64_t> out;
+  out.reserve(m_physicals.size() + 2 * (m_histories.size() + m_idleHistories.size()));
+  for (const auto& physical : m_physicals) {
+    out.push_back(serial_of(*physical));
+  }
+  for (const auto* pairs : {&m_histories, &m_idleHistories}) {
+    for (const HistoryPair& pair : *pairs) {
+      out.push_back(pair.textures[0].serial);
+      out.push_back(pair.textures[1].serial);
+    }
+  }
+  std::ranges::sort(out);
+  return out;
 }
 
 void TransientPool::collect(Clock::time_point now, bool pressure) {
@@ -976,8 +998,8 @@ void poison_before(const wgpu::CommandEncoder& cmd, const StageData& stage, Node
   for (const CompiledUse& use : graph.node_uses(node)) {
     const CompiledResource& resource = graph.resources[use.resource];
     const uint16_t history = resource.historySlot;
-    if (use.role != UseRole::History || history >= state.historyDone.size() || stage.prev_valid(history) ||
-        state.historyDone[history]) {
+    const bool valid = stage.prev_valid(history) && pool.history_fresh(history);
+    if (use.role != UseRole::History || history >= state.historyDone.size() || valid || state.historyDone[history]) {
       continue;
     }
     state.historyDone[history] = true;

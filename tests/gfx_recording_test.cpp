@@ -8,6 +8,8 @@
 #if AURORA_ENABLE_RENDER
 #include "render/frame_state.hpp"
 #include "render/graph.hpp"
+#include "render/graph_bind.hpp"
+#include "render/graph_layout.hpp"
 #include "render/settings.hpp"
 #include "render/stage.hpp"
 #endif
@@ -1014,6 +1016,33 @@ TEST_F(GfxRenderStageTest, DummyBitsReachStageData) {
   ASSERT_EQ(uses.size(), 1u);
   EXPECT_TRUE(stage.dummy_bound(uses[0].stageUse));
   EXPECT_EQ(run(stage), (std::vector<std::string>{"r"}));
+}
+
+TEST_F(GfxRenderStageTest, StagesPushUniformsOnlyForPasses) {
+  constexpr std::array Markers{Stage::SceneBegin, Stage::OpaqueDone, Stage::PrePost,
+                               Stage::SceneEnd,   Stage::BeforeHud,  Stage::FrameEnd};
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(0));
+  frame.frameId = 11;
+  const size_t empty = frame.uniforms.size();
+  for (const auto stage : Markers) {
+    record_stage(stage);
+  }
+  EXPECT_TRUE(frame.stages.empty());
+  EXPECT_EQ(frame.uniforms.size(), empty);
+  EXPECT_FALSE(render::detail::testing::frame_objects_created());
+
+  add_pass("pushes", Stage::OpaqueDone);
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+  frame.frameId = 12;
+  const size_t before = frame.uniforms.size();
+  for (const auto stage : Markers) {
+    record_stage(stage);
+  }
+  ASSERT_EQ(frame.stages.size(), 1u);
+  EXPECT_GE(frame.uniforms.size(), before + render::detail::FrameUniformsSize);
+  EXPECT_GE(frame.stages[0].bindings.constantsOffset, before);
+  EXPECT_TRUE(frame.stages[0].bindings.params.empty());
+  EXPECT_EQ(run(frame.stages[0]), (std::vector<std::string>{"pushes"}));
 }
 
 class GfxHistoryStageTest : public GfxRenderStageTest {

@@ -87,6 +87,8 @@ enum class CullReason : uint8_t {
   InspectorClosed,
   UnknownAnchor,
   CoercedMissing,
+  SampleCountMismatch,
+  BindingViewMismatch,
 };
 enum class DummyColor : uint8_t { Black, White };
 
@@ -227,6 +229,7 @@ struct PassDesc {
   PassClass cls = PassClass::Required;
   uint16_t order = 0;
   bool runsWithoutMarker = false;
+  uint32_t paramsSize = 0;
   PassDeclareFn declare = nullptr;
   PassEnabledFn enabled = nullptr;
   PassEncodeFn encode = nullptr;
@@ -240,6 +243,11 @@ inline constexpr PassId InvalidPassId = 0;
 PassId register_pass(const PassDesc& desc);
 void unregister_pass(PassId id) noexcept;
 bool consume_graph_dirty() noexcept;
+
+bool set_pass_params(PassId pass, std::span<const std::byte> payload);
+void clear_pass_params(PassId pass) noexcept;
+void latch_pass_params();
+std::span<const std::byte> latched_pass_params(PassId pass) noexcept;
 
 struct GxReadDesc {
   std::string_view node;
@@ -326,6 +334,7 @@ struct CompiledNode {
   uint16_t frameSlot = InvalidNode;
   std::array<BindingCounts, 3> bindings{};
   uint32_t colorBytes = 0;
+  uint32_t paramsSize = 0;
   PassEnabledFn enabled = nullptr;
   PassEncodeFn encode = nullptr;
   PassEncodeNativeFn encodeNative = nullptr;
@@ -408,6 +417,52 @@ struct SlotPlan {
   uint64_t slotBytes = 0;
 };
 
+enum class BindingType : uint8_t {
+  None,
+  UniformBuffer,
+  ReadOnlyStorageBuffer,
+  StorageBuffer,
+  SampledTexture,
+  ReadOnlyStorageTexture,
+  WriteOnlyStorageTexture,
+  ReadWriteStorageTexture,
+};
+
+struct BindingSlot {
+  uint32_t use = InvalidIndex;
+  ResourceId resource = InvalidResource;
+  uint32_t binding = 0;
+  BindingType type = BindingType::None;
+  wgpu::ShaderStage visibility = wgpu::ShaderStage::None;
+  wgpu::TextureViewDimension viewDimension = wgpu::TextureViewDimension::Undefined;
+  wgpu::TextureSampleType sampleType = wgpu::TextureSampleType::Undefined;
+  wgpu::TextureFormat storageFormat = wgpu::TextureFormat::Undefined;
+  bool multisampled = false;
+  bool prev = false;
+};
+
+struct AttachmentSlot {
+  uint32_t use = InvalidIndex;
+  ResourceId resource = InvalidResource;
+  Access access = Access::ColorWrite;
+  bool creatorWrite = false;
+  uint32_t samples = 1;
+};
+
+// Defined with the Dawn objects in graph_bind.hpp, so graph code links without Dawn
+struct BindingLayout;
+
+struct BindingPlan {
+  std::vector<BindingSlot> slots;
+  std::vector<AttachmentSlot> colors;
+  std::optional<AttachmentSlot> depth;
+  uint32_t paramsSize = 0;
+  uint64_t layoutHash = 0;
+  bool manual = false;
+  std::shared_ptr<const BindingLayout> layout;
+  uint64_t layoutSerial = 0;
+};
+
 struct CompiledGraph {
   uint64_t graphHash = 0;
   GraphExtent efbSize;
@@ -422,6 +477,7 @@ struct CompiledGraph {
   std::vector<ResourceId> histories;
   std::array<StageProgram, StageCount> stages{};
   std::vector<Diagnostic> diagnostics;
+  std::vector<BindingPlan> bindingPlans;
   SlotPlan slots;
 
   [[nodiscard]] bool stage_empty(Stage stage) const noexcept {

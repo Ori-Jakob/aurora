@@ -314,7 +314,7 @@ TEST_F(RenderGraph, NameHelpers) {
   expect_unique_names<PassKind>(static_cast<size_t>(PassKind::Native) + 1, pass_kind_name);
   expect_unique_names<PassClass>(static_cast<size_t>(PassClass::Diagnostic) + 1, pass_class_name);
   expect_unique_names<ResourceKind>(static_cast<size_t>(ResourceKind::External) + 1, resource_kind_name);
-  expect_unique_names<CullReason>(static_cast<size_t>(CullReason::CoercedMissing) + 1, cull_reason_name);
+  expect_unique_names<CullReason>(static_cast<size_t>(CullReason::BindingViewMismatch) + 1, cull_reason_name);
   expect_unique_names<EdgeKind>(static_cast<size_t>(EdgeKind::Waw) + 1, edge_kind_name);
 }
 

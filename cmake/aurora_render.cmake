@@ -16,7 +16,11 @@ if (AURORA_ENABLE_RENDER)
         lib/render/gpu_heap.cpp
         lib/render/gpu_heap.hpp
         lib/render/graph.cpp
+        lib/render/graph_bind.cpp
+        lib/render/graph_bind.hpp
         lib/render/graph_env.cpp
+        lib/render/graph_layout.cpp
+        lib/render/graph_layout.hpp
         lib/render/graph_pool.cpp
         lib/render/graph_pool.hpp
         lib/render/graph_slots.cpp

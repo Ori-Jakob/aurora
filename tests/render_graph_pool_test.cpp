@@ -5,6 +5,7 @@
 
 #include "render/frame_state.hpp"
 #include "render/graph.hpp"
+#include "render/graph_bind.hpp"
 #include "render/graph_pool.hpp"
 #include "render/graph_slots.hpp"
 #include "render/module.hpp"
@@ -87,7 +88,10 @@ struct TestPass {
   uint16_t order = 0;
   std::function<void(InternalPassBuilder&)> body;
   bool sink = false;
+  PassEncodeFn encode = nullptr;
 };
+
+void encode_nothing(PassContext&, const void*) {}
 
 void declare_test_pass(InternalPassBuilder& builder, const PassSetup&, const void* state) {
   const auto& pass = *static_cast<const TestPass*>(state);
@@ -118,6 +122,7 @@ std::shared_ptr<const CompiledGraph> compile(const std::vector<TestPass>& passes
         .kind = pass.kind,
         .order = pass.order,
         .declare = declare_test_pass,
+        .encode = pass.encode,
         .state = &pass,
     });
   }
@@ -580,10 +585,12 @@ protected:
       GTEST_SKIP() << "no null device: " << error;
     }
     m_globals = std::make_unique<test::ScopedGlobalDevice>(*m_device, test::TestDeviceOptions{});
+    shutdown_bindings();
     testing::reset_transient_pool(nullptr);
   }
 
   void TearDown() override {
+    shutdown_bindings();
     testing::reset_transient_pool(nullptr);
     if (m_device) {
       EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
@@ -846,7 +853,8 @@ TEST_F(GraphPoolDeviceTest, RunStagePoisonsAndSwaps) {
            [desc](InternalPassBuilder& b) {
              b.history("hist", desc, Access::StorageWrite);
              b.create("tmp", desc, Access::StorageWrite);
-           }},
+           },
+       .encode = encode_nothing},
       {.name = "use",
        .order = 1,
        .body =
@@ -854,7 +862,8 @@ TEST_F(GraphPoolDeviceTest, RunStagePoisonsAndSwaps) {
              b.use("tmp", Access::Sampled);
              b.use_prev("hist");
            },
-       .sink = true},
+       .sink = true,
+       .encode = encode_nothing},
   };
   const auto graph = compile(passes);
   const StageProgram& program = graph->stages[static_cast<size_t>(Stage::OpaqueDone)];

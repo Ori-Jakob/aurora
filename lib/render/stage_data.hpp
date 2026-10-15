@@ -1,12 +1,26 @@
 #pragma once
 
+#include <aurora/gfx.hpp>
 #include <aurora/render.hpp>
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
 namespace aurora::render::detail {
 struct FrameState;
+
+struct StageBindings {
+  struct Params {
+    uint16_t node = UINT16_MAX;
+    uint32_t uniformOffset = 0;
+    uint16_t size = 0;
+    std::array<std::byte, gfx::InlineDrawPayloadSize> bytes{};
+  };
+  uint32_t constantsOffset = 0;
+  std::vector<Params> params;
+};
 
 struct StageData {
   Stage stage = Stage::SceneBegin;
@@ -20,6 +34,7 @@ struct StageData {
   std::vector<uint64_t> enabled;
   std::vector<uint64_t> dummies;
   std::vector<uint64_t> prevValid;
+  StageBindings bindings;
 
   [[nodiscard]] bool is_enabled(uint32_t index) const noexcept {
     return index < passCount && ((enabled[index / 64] >> (index % 64)) & 1u) != 0;

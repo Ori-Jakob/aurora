@@ -1,9 +1,10 @@
 #include "graph.hpp"
 
+#include "graph_layout.hpp"
 #include "graph_slots.hpp"
 
 #include "../gfx/hash.hpp"
-#include "../logging.hpp"
+#include "../internal.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -14,6 +15,7 @@
 #include <optional>
 #include <queue>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -231,7 +233,7 @@ constexpr std::array<std::string_view, 3> PassClassNames{"Required", "Optional",
 static_assert(PassClassNames.size() == static_cast<size_t>(PassClass::Diagnostic) + 1);
 constexpr std::array<std::string_view, 5> ResourceKindNames{"Transient", "History", "Persistent", "Gx", "External"};
 static_assert(ResourceKindNames.size() == static_cast<size_t>(ResourceKind::External) + 1);
-constexpr std::array<std::string_view, 19> CullReasonNames{
+constexpr std::array<std::string_view, 21> CullReasonNames{
     "None",
     "Skipped",
     "InvalidDeclaration",
@@ -251,10 +253,31 @@ constexpr std::array<std::string_view, 19> CullReasonNames{
     "InspectorClosed",
     "UnknownAnchor",
     "CoercedMissing",
+    "SampleCountMismatch",
+    "BindingViewMismatch",
 };
-static_assert(CullReasonNames.size() == static_cast<size_t>(CullReason::CoercedMissing) + 1);
+static_assert(CullReasonNames.size() == static_cast<size_t>(CullReason::BindingViewMismatch) + 1);
 constexpr std::array<std::string_view, 6> EdgeKindNames{"Chain", "Bound", "Anchor", "Raw", "War", "Waw"};
 static_assert(EdgeKindNames.size() == static_cast<size_t>(EdgeKind::Waw) + 1);
+
+std::string_view view_dimension_name(wgpu::TextureViewDimension dimension) noexcept {
+  switch (dimension) {
+  case wgpu::TextureViewDimension::e1D:
+    return "1d";
+  case wgpu::TextureViewDimension::e2D:
+    return "2d";
+  case wgpu::TextureViewDimension::e2DArray:
+    return "2d-array";
+  case wgpu::TextureViewDimension::Cube:
+    return "cube";
+  case wgpu::TextureViewDimension::CubeArray:
+    return "cube-array";
+  case wgpu::TextureViewDimension::e3D:
+    return "3d";
+  default:
+    return "undefined";
+  }
+}
 
 template <typename E, size_t N>
 std::string_view enum_name(const std::array<std::string_view, N>& names, E value) noexcept {
@@ -566,6 +589,8 @@ std::optional<AuroraLogLevel> diagnostic_level(CullReason reason) noexcept {
   case CullReason::FormatUnsupported:
   case CullReason::ResourceLimit:
   case CullReason::UnknownAnchor:
+  case CullReason::SampleCountMismatch:
+  case CullReason::BindingViewMismatch:
     return LOG_WARNING;
   case CullReason::MissingInput:
   case CullReason::MissingTarget:
@@ -593,10 +618,16 @@ void hash_string(Hasher& hasher, std::string_view value) {
 
 constexpr uint16_t InvalidRef = 0xFFFF;
 
+struct PassParams {
+  std::array<std::byte, MaxPassParamsSize> bytes{};
+  uint32_t size = 0;
+};
+
 struct RegisteredPass {
   PassDesc desc;
   PassId id = InvalidPassId;
   uint64_t sequence = 0;
+  std::optional<PassParams> params;
 };
 
 struct Slot {
@@ -604,11 +635,19 @@ struct Slot {
   uint32_t generation = 1;
 };
 
+struct LatchedParams {
+  PassId id = InvalidPassId;
+  PassParams params;
+};
+
 std::mutex g_passMutex;
 std::vector<Slot> g_passSlots;
 std::vector<uint32_t> g_freePassSlots;
 uint64_t g_nextSequence = 1;
 std::atomic_bool g_graphDirty = false;
+// Only the latch writes it, while the recording thread is idle, so recording reads it without the lock
+std::vector<LatchedParams> g_latchedParams;
+std::atomic<std::thread::id> g_latchThread;
 
 constexpr uint32_t pass_index(PassId id) noexcept { return static_cast<uint32_t>(id & 0xFFFFFFFFu); }
 constexpr uint32_t pass_generation(PassId id) noexcept { return static_cast<uint32_t>(id >> 32); }
@@ -627,6 +666,11 @@ Slot* find_pass_slot_locked(PassId id) noexcept {
     return nullptr;
   }
   return &slot;
+}
+
+[[maybe_unused]] bool on_latch_thread() noexcept {
+  const std::thread::id latch = g_latchThread.load(std::memory_order_relaxed);
+  return latch == std::thread::id{} || latch == std::this_thread::get_id();
 }
 
 // Requires g_passMutex held.
@@ -678,7 +722,13 @@ struct GraphBuild {
     check_backwards_edges();
     order_stages();
     cull_unconsumed();
+    // A pass disabled here can strand its producers and consumers, so ordering and culling run again
+    while (disable_binding_view_mismatches()) {
+      order_stages();
+      cull_unconsumed();
+    }
     finish_programs();
+    drop_inactive_plans();
     m_graph.slots = plan_slots(m_graph, m_inputs.env.limits);
     hash_graph();
   }
@@ -860,6 +910,7 @@ private:
       node.opaque = desc.declare == nullptr;
       node.sideEffect = node.opaque;
       node.runsWithoutMarker = desc.runsWithoutMarker;
+      node.paramsSize = desc.paramsSize;
       node.enabled = desc.enabled;
       node.encode = desc.encode;
       node.encodeNative = desc.encodeNative;
@@ -1412,6 +1463,92 @@ private:
       }
       if (auto failure = check_pass_limits(i)) {
         disable(i, failure->first, std::move(failure->second));
+      }
+    }
+    derive_binding_plans();
+  }
+
+  void derive_binding_plans() {
+    m_graph.bindingPlans.assign(m_graph.nodes.size(), {});
+    for (NodeId i = 0; i < m_passCount; ++i) {
+      const CompiledNode& node = m_graph.nodes[i];
+      if (!active(i) || node.passKind == PassKind::Native) {
+        continue;
+      }
+      if (derive_plan(i) == CullReason::SampleCountMismatch) {
+        disable(i, CullReason::SampleCountMismatch, sample_count_message(i));
+      }
+    }
+  }
+
+  CullReason derive_plan(NodeId nodeId, std::span<const wgpu::TextureViewDimension> views = {},
+                         ResourceId* mismatch = nullptr) {
+    const CompiledNode& node = m_graph.nodes[nodeId];
+    return derive_binding_plan(
+        {
+            .kind = node.passKind,
+            .paramsSize = node.paramsSize,
+            .manual = node.manualBindings,
+            .uses = uses_of(nodeId),
+            .resources = m_graph.resources,
+            .env = &m_inputs.env,
+            .bindingViews = views,
+        },
+        m_graph.bindingPlans[nodeId], mismatch);
+  }
+
+  // Judged on the final programs with the pool's own rule, so dummy reads and culled passes never decide a view
+  bool disable_binding_view_mismatches() {
+    if (m_inputs.env.limits.features.core) {
+      return false;
+    }
+    std::vector<wgpu::TextureViewDimension> views(m_graph.resources.size(), wgpu::TextureViewDimension::Undefined);
+    for (size_t r = 0; r < m_graph.resources.size(); ++r) {
+      const CompiledResource& resource = m_graph.resources[r];
+      const bool pooled = resource.kind == ResourceKind::Transient || resource.kind == ResourceKind::History;
+      if (pooled && resource.described && !resource.buffer) {
+        views[r] = binding_view_dimension(m_graph, static_cast<ResourceId>(r));
+      }
+    }
+    bool disabled = false;
+    for (NodeId i = 0; i < m_passCount; ++i) {
+      if (!active(i) || m_graph.nodes[i].passKind == PassKind::Native) {
+        continue;
+      }
+      ResourceId resource = InvalidResource;
+      if (derive_plan(i, views, &resource) != CullReason::BindingViewMismatch) {
+        continue;
+      }
+      disable(i, CullReason::BindingViewMismatch,
+              fmt::format("render graph: '{}' samples '{}' with a view other than {}, the only one its compat texture "
+                          "binds as; disabled",
+                          m_graph.nodes[i].name, resource_name(resource), view_dimension_name(views[resource])),
+              InvalidNode, resource);
+      disabled = true;
+    }
+    return disabled;
+  }
+
+  [[nodiscard]] std::string sample_count_message(NodeId nodeId) const {
+    const BindingPlan& plan = m_graph.bindingPlans[nodeId];
+    uint32_t fewest = UINT32_MAX;
+    uint32_t most = 0;
+    const auto count = [&](const AttachmentSlot& attachment) {
+      fewest = std::min(fewest, attachment.samples);
+      most = std::max(most, attachment.samples);
+    };
+    std::ranges::for_each(plan.colors, count);
+    if (plan.depth) {
+      count(*plan.depth);
+    }
+    return fmt::format("render graph: '{}' mixes attachments with {} and {} samples; disabled",
+                       m_graph.nodes[nodeId].name, fewest, most);
+  }
+
+  void drop_inactive_plans() {
+    for (NodeId i = 0; i < m_passCount; ++i) {
+      if (!active(i)) {
+        m_graph.bindingPlans[i] = {};
       }
     }
   }
@@ -2374,6 +2511,10 @@ PassId register_pass(const PassDesc& desc) {
     Log.warn("register_pass: '{}' has unknown stage {}", desc.name, static_cast<uint32_t>(desc.stage));
     return InvalidPassId;
   }
+  if (desc.paramsSize > MaxPassParamsSize) {
+    Log.warn("register_pass: '{}' has {} bytes of params, more than {}", desc.name, desc.paramsSize, MaxPassParamsSize);
+    return InvalidPassId;
+  }
 
   std::lock_guard lock{g_passMutex};
   if (has_live_pass_named(desc.name)) {
@@ -2408,6 +2549,52 @@ void unregister_pass(PassId id) noexcept {
 }
 
 bool consume_graph_dirty() noexcept { return g_graphDirty.exchange(false); }
+
+bool set_pass_params(PassId pass, std::span<const std::byte> payload) {
+  if (payload.size() > MaxPassParamsSize) {
+    Log.warn("set_pass_params: payload size {} exceeds {}", payload.size(), MaxPassParamsSize);
+    return false;
+  }
+  if (pass == InvalidPassId) {
+    return false;
+  }
+  CHECK(on_latch_thread(), "set_pass_params: called off the thread that latches frames");
+  std::lock_guard lock{g_passMutex};
+  Slot* slot = find_pass_slot_locked(pass);
+  if (slot == nullptr) {
+    return false;
+  }
+  PassParams& params = slot->pass->params.emplace();
+  std::ranges::copy(payload, params.bytes.begin());
+  params.size = static_cast<uint32_t>(payload.size());
+  return true;
+}
+
+void clear_pass_params(PassId pass) noexcept {
+  std::lock_guard lock{g_passMutex};
+  if (Slot* slot = find_pass_slot_locked(pass)) {
+    slot->pass->params.reset();
+  }
+}
+
+void latch_pass_params() {
+  g_latchThread.store(std::this_thread::get_id(), std::memory_order_relaxed);
+  std::lock_guard lock{g_passMutex};
+  g_latchedParams.resize(g_passSlots.size());
+  for (size_t i = 0; i < g_passSlots.size(); ++i) {
+    const auto& pass = g_passSlots[i].pass;
+    g_latchedParams[i] = pass && pass->params ? LatchedParams{pass->id, *pass->params} : LatchedParams{};
+  }
+}
+
+std::span<const std::byte> latched_pass_params(PassId pass) noexcept {
+  const uint32_t index = pass_index(pass);
+  if (pass == InvalidPassId || index >= g_latchedParams.size() || g_latchedParams[index].id != pass) {
+    return {};
+  }
+  const PassParams& params = g_latchedParams[index].params;
+  return std::span{params.bytes}.first(params.size);
+}
 
 std::shared_ptr<CompiledGraph> compile_graph(const GraphInputs& inputs) {
   auto graph = std::make_shared<CompiledGraph>();
@@ -2686,6 +2873,8 @@ void clear_passes() noexcept {
   g_freePassSlots.clear();
   g_nextSequence = 1;
   g_graphDirty = false;
+  g_latchedParams.clear();
+  g_latchThread.store(std::thread::id{}, std::memory_order_relaxed);
 }
 
 void reset_logged_diagnostics() noexcept {

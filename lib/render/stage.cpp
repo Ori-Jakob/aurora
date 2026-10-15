@@ -2,8 +2,8 @@
 
 #include "frame_state.hpp"
 #include "graph.hpp"
+#include "graph_bind.hpp"
 #include "graph_pool.hpp"
-#include "pass_context.hpp"
 #include "../logging.hpp"
 
 #include <aurora/gfx.h>
@@ -72,8 +72,14 @@ bool build_stage_data(StageData& stage) {
   stage.enabled = std::move(mask.passes);
   stage.dummies = std::move(mask.dummies);
   stage.prevValid = std::move(mask.prevValid);
-#endif
+  if (!stage.any_enabled()) {
+    return false;
+  }
+  build_stage_bindings(stage);
+  return true;
+#else
   return stage.any_enabled();
+#endif
 }
 
 void run_stage(const wgpu::CommandEncoder& encoder, const StageData& stage) {
@@ -86,36 +92,19 @@ void run_stage(const wgpu::CommandEncoder& encoder, const StageData& stage) {
   if (encoder) {
     transient_pool().materialize(stage.frame->graph, TransientPool::Clock::now());
   }
-#endif
   const StageProgram& program = graph->stages[static_cast<size_t>(stage.stage)];
-  PassContext ctx{encoder, stage};
   for (uint32_t i = 0; i < stage.passCount; ++i) {
     if (!stage.is_enabled(i)) {
       continue;
     }
     const NodeId nodeId = program.passes[i];
-    const CompiledNode& node = graph->nodes[nodeId];
-#if AURORA_ENABLE_RENDER
     poison_before(encoder, stage, nodeId);
-#endif
-    ctx.set_pass(node);
-#ifdef AURORA_GFX_DEBUG_GROUPS
-    if (encoder) {
-      encoder.PushDebugGroup(node.name.c_str());
+    // A pass skipped at bind time wrote nothing, so its histories must not flip
+    if (encode_pass(encoder, stage, nodeId)) {
+      after_pass(stage, nodeId);
     }
-#endif
-    if (node.encode != nullptr) {
-      node.encode(ctx, node.state);
-    }
-#ifdef AURORA_GFX_DEBUG_GROUPS
-    if (encoder) {
-      encoder.PopDebugGroup();
-    }
-#endif
-#if AURORA_ENABLE_RENDER
-    after_pass(stage, nodeId);
-#endif
   }
+#endif
 }
 
 // Native passes are rejected at registration, so no graph has a submit bracket to open yet

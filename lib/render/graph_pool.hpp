@@ -96,6 +96,8 @@ public:
   const PhysicalTexture& history_prev(uint16_t historySlot) const;
   void mark_history_written(uint16_t historySlot) noexcept;
   void apply_history_swaps() noexcept;
+  [[nodiscard]] bool history_fresh(uint16_t historySlot) const noexcept;
+  [[nodiscard]] std::vector<uint64_t> serials() const;
   void collect(Clock::time_point now, bool pressure);
   void set_release_listener(ReleaseListener listener) noexcept;
   [[nodiscard]] PoolStats stats() const noexcept;
@@ -121,6 +123,7 @@ private:
     std::array<PhysicalTexture, 2> textures;
     uint8_t read = 0;
     bool pendingSwap = false;
+    bool fresh = false;
     Clock::time_point idleSince{};
   };
 
