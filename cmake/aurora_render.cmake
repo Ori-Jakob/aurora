@@ -3,6 +3,7 @@ target_sources(aurora_gx PRIVATE
         lib/render/graph.hpp
         lib/render/module.hpp
         lib/render/pass_context.hpp
+        lib/render/phases.inl
         lib/render/render.cpp
         lib/render/settings.cpp
         lib/render/settings.hpp
@@ -13,6 +14,7 @@ target_sources(aurora_gx PRIVATE
 if (AURORA_ENABLE_RENDER)
     target_sources(aurora_gx PRIVATE
         lib/render/graph.cpp
+        lib/render/graph_env.cpp
         lib/render/json.hpp
     )
     target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_RENDER=1)

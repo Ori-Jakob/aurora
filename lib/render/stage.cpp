@@ -37,20 +37,21 @@ bool build_stage_data(StageData& stage) {
   if (graph == nullptr) {
     return false;
   }
-  const StageRange& range = graph->range(stage.stage);
-  if (range.count == 0) {
+  const StageProgram& program = graph->stages[static_cast<size_t>(stage.stage)];
+  if (program.passes.empty()) {
     return false;
   }
-  stage.passCount = range.count;
-  stage.enabled.assign((range.count + 63) / 64, 0);
+  const auto passCount = static_cast<uint32_t>(program.passes.size());
+  stage.passCount = passCount;
+  stage.enabled.assign((passCount + 63) / 64, 0);
   const bool needsMarker = !stage.markerSeen && stage.stage <= Stage::OpaqueDone;
-  for (uint32_t i = 0; i < range.count; ++i) {
-    const PassDesc& desc = graph->passes[range.first + i].desc;
-    if (needsMarker && !desc.runsWithoutMarker) {
+  for (uint32_t i = 0; i < passCount; ++i) {
+    const CompiledNode& node = graph->nodes[program.passes[i]];
+    if (needsMarker && !node.runsWithoutMarker) {
       warn_missing_marker(stage.stage);
       continue;
     }
-    if (desc.enabled != nullptr && !desc.enabled(stage, desc.state)) {
+    if (node.enabled != nullptr && !node.enabled(stage, node.state)) {
       continue;
     }
     stage.enabled[i / 64] |= uint64_t{1} << (i % 64);
@@ -63,20 +64,22 @@ void run_stage(const wgpu::CommandEncoder& encoder, const StageData& stage) {
   if (graph == nullptr) {
     return;
   }
-  const StageRange& range = graph->range(stage.stage);
+  const StageProgram& program = graph->stages[static_cast<size_t>(stage.stage)];
   PassContext ctx{encoder, stage};
   for (uint32_t i = 0; i < stage.passCount; ++i) {
     if (!stage.is_enabled(i)) {
       continue;
     }
-    const CompiledPass& pass = graph->passes[range.first + i];
-    ctx.set_pass(pass);
+    const CompiledNode& node = graph->nodes[program.passes[i]];
+    ctx.set_pass(node);
 #ifdef AURORA_GFX_DEBUG_GROUPS
     if (encoder) {
-      encoder.PushDebugGroup(pass.desc.name.c_str());
+      encoder.PushDebugGroup(node.name.c_str());
     }
 #endif
-    pass.desc.encode(ctx, pass.desc.state);
+    if (node.encode != nullptr) {
+      node.encode(ctx, node.state);
+    }
 #ifdef AURORA_GFX_DEBUG_GROUPS
     if (encoder) {
       encoder.PopDebugGroup();

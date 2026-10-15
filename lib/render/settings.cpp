@@ -103,6 +103,9 @@ std::optional<Settings> g_latched;
 
 uint64_t g_generation = 0;
 std::shared_ptr<const FrameState> g_frameState;
+#if AURORA_ENABLE_RENDER
+GraphEnvironment g_graphEnvironment;
+#endif
 
 using FeatureMask = uint32_t;
 static_assert(FeatureCount <= 32);
@@ -600,6 +603,9 @@ void reset_settings_state(uint32_t msaaSamples) noexcept {
 void shutdown_settings_state() noexcept {
   g_frameState.reset();
   g_latched.reset();
+#if AURORA_ENABLE_RENDER
+  g_graphEnvironment = {};
+#endif
   std::lock_guard lock{g_requestMutex};
   g_msaaSamples = 1;
 }
@@ -632,8 +638,13 @@ std::shared_ptr<const FrameState> latch_frame() {
   std::shared_ptr<const CompiledGraph> graph = g_frameState ? g_frameState->graph : nullptr;
 #if AURORA_ENABLE_RENDER
   const bool passesChanged = consume_graph_dirty();
-  if (graph == nullptr || settingsChanged || passesChanged) {
-    graph = compile_graph(latched_settings(), caps());
+  GraphEnvironment environment = gather_graph_environment();
+  const bool environmentChanged = environment != g_graphEnvironment;
+  if (graph == nullptr || settingsChanged || passesChanged || environmentChanged) {
+    g_graphEnvironment = std::move(environment);
+    // An equal graphHash still carries new state and callbacks, so the new object is always published
+    std::shared_ptr<CompiledGraph> compiled = compile_graph(latched_settings(), caps(), g_graphEnvironment);
+    graph = compiled ? std::move(compiled) : empty_graph();
   }
 #endif
   if (!g_frameState || g_frameState->settingsGeneration != g_generation || g_frameState->graph != graph) {
@@ -660,6 +671,7 @@ void reset() noexcept {
   g_generation = 0;
   g_frameState.reset();
 #if AURORA_ENABLE_RENDER
+  g_graphEnvironment = {};
   clear_passes();
 #endif
 }

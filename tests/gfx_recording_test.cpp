@@ -354,7 +354,10 @@ protected:
     detail::begin_recording(frame, 0);
     ASSERT_NE(frame.renderState, nullptr);
     ASSERT_NE(frame.renderState->graph, nullptr);
-    ASSERT_EQ(frame.renderState->graph->passes.size(), expectedPasses);
+    const auto& nodes = frame.renderState->graph->nodes;
+    ASSERT_EQ(static_cast<size_t>(
+                  std::ranges::count(nodes, render::detail::NodeKind::Pass, &render::detail::CompiledNode::kind)),
+              expectedPasses);
   }
 
   render::detail::PassId add_pass(std::string name, Stage stage, uint16_t order = 0, bool enabled = true,
@@ -425,6 +428,11 @@ protected:
   static void encode_pass(render::detail::PassContext&, const void* state) {
     const auto* pass = static_cast<const TestPass*>(state);
     pass->owner->encoded.push_back(pass->name);
+  }
+
+  static void declare_side_effect(render::detail::InternalPassBuilder& builder, const render::detail::PassSetup&,
+                                  const void*) {
+    builder.side_effect();
   }
 
   static bool check_stage_data(const render::detail::StageData& stage, const void* state) {
@@ -830,8 +838,42 @@ TEST_F(GfxRenderStageTest, ReRegisteredPassReplacesGraph) {
 
   EXPECT_NE(second, first);
   EXPECT_EQ(second->graphHash, first->graphHash);
-  EXPECT_EQ(second->passes[0].desc.state, &passes.back());
-  EXPECT_NE(first->passes[0].desc.state, second->passes[0].desc.state);
+  EXPECT_EQ(second->nodes[0].state, &passes.back());
+  EXPECT_NE(first->nodes[0].state, second->nodes[0].state);
+}
+
+TEST_F(GfxRenderStageTest, RecompilePublishesNewGraph) {
+  using render::detail::InvalidPassId;
+  const auto register_declared = [this](const std::string& stateName) {
+    auto& pass = passes.emplace_back(TestPass{.owner = this, .name = stateName});
+    return render::detail::register_pass({
+        .name = "a",
+        .stage = Stage::OpaqueDone,
+        .declare = declare_side_effect,
+        .encode = encode_pass,
+        .state = &pass,
+    });
+  };
+  const auto id = register_declared("s1");
+  ASSERT_NE(id, InvalidPassId);
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+  const auto first = frame.renderState->graph;
+
+  render::detail::unregister_pass(id);
+  ASSERT_NE(register_declared("s2"), InvalidPassId);
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+  const auto second = frame.renderState->graph;
+
+  EXPECT_NE(second, first);
+  EXPECT_EQ(second->graphHash, first->graphHash);
+  const auto node = second->find_node("a");
+  ASSERT_NE(node, render::detail::InvalidNode);
+  EXPECT_EQ(second->nodes[node].state, &passes.back());
+  EXPECT_FALSE(second->nodes[node].opaque);
+
+  record_stage(Stage::OpaqueDone);
+  ASSERT_EQ(frame.stages.size(), 1u);
+  EXPECT_EQ(run(frame.stages[0]), (std::vector<std::string>{"s2"}));
 }
 
 TEST_F(GfxRenderStageTest, RegisterRejectsInvalidPasses) {
@@ -855,8 +897,8 @@ TEST_F(GfxRenderStageTest, RegisterRejectsInvalidPasses) {
   render::detail::unregister_pass(stale);
 
   ASSERT_NO_FATAL_FAILURE(latch_new_frame(2));
-  EXPECT_EQ(frame.renderState->graph->passes[0].id, kept);
-  EXPECT_EQ(frame.renderState->graph->passes[1].id, reused);
+  EXPECT_EQ(frame.renderState->graph->nodes[0].id, kept);
+  EXPECT_EQ(frame.renderState->graph->nodes[1].id, reused);
 }
 
 TEST_F(GfxRenderStageTest, StageDataAddressesStayValid) {

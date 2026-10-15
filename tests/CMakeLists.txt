@@ -334,6 +334,20 @@ if (AURORA_ENABLE_GX)
   target_link_libraries(caps_tests PRIVATE gtest gtest_main dawn::dawncpp_headers)
   gtest_discover_tests(caps_tests)
 
+  if (AURORA_ENABLE_RENDER)
+    add_executable(render_graph_tests
+      render_graph_test.cpp
+      render_graph_planned.cpp
+      os_test_globals.cpp
+      ../lib/logging.cpp
+      ../lib/render/graph.cpp
+    )
+    target_include_directories(render_graph_tests PRIVATE ../include ../lib)
+    target_compile_definitions(render_graph_tests PRIVATE AURORA TARGET_PC=1)
+    target_link_libraries(render_graph_tests PRIVATE gtest gtest_main fmt::fmt xxHash::xxhash dawn::dawncpp_headers)
+    gtest_discover_tests(render_graph_tests)
+  endif ()
+
   add_executable(trace_tests
     trace_format_test.cpp
     trace_store_test.cpp

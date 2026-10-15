@@ -3,7 +3,7 @@
 #include <webgpu/webgpu_cpp.h>
 
 namespace aurora::render::detail {
-struct CompiledPass;
+struct CompiledNode;
 struct StageData;
 
 class PassContext {
@@ -13,12 +13,12 @@ public:
 
   [[nodiscard]] const wgpu::CommandEncoder& encoder() const noexcept { return m_encoder; }
   [[nodiscard]] const StageData& stage() const noexcept { return m_stage; }
-  [[nodiscard]] const CompiledPass& pass() const noexcept { return *m_pass; }
-  void set_pass(const CompiledPass& pass) noexcept { m_pass = &pass; }
+  [[nodiscard]] const CompiledNode& pass() const noexcept { return *m_pass; }
+  void set_pass(const CompiledNode& pass) noexcept { m_pass = &pass; }
 
 private:
   const wgpu::CommandEncoder& m_encoder;
   const StageData& m_stage;
-  const CompiledPass* m_pass = nullptr;
+  const CompiledNode* m_pass = nullptr;
 };
 } // namespace aurora::render::detail
