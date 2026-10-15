@@ -48,8 +48,10 @@ std::unique_ptr<TestDevice> create_test_device(const TestDeviceOptions& options,
     return nullptr;
   }
 
+  // Matches gpu.cpp, so hardware runs land on the discrete GPU the game would use
   const wgpu::RequestAdapterOptions adapterOptions{
       .featureLevel = options.core ? wgpu::FeatureLevel::Core : wgpu::FeatureLevel::Compatibility,
+      .powerPreference = wgpu::PowerPreference::HighPerformance,
       .backendType = options.backend,
   };
   std::string message;
@@ -84,7 +86,11 @@ std::unique_ptr<TestDevice> create_test_device(const TestDeviceOptions& options,
     }
   }
   // Errors reach the callback during the failing call, so a test sees them before its next check
-  constexpr std::array deviceToggles{"enable_immediate_error_handling"};
+  std::vector<const char*> deviceToggles{"enable_immediate_error_handling"};
+  if (options.productionToggles) {
+    // Mirrors a Release full-profile device
+    deviceToggles.insert(deviceToggles.end(), {"skip_validation", "disable_robustness"});
+  }
   wgpu::DawnTogglesDescriptor deviceTogglesDescriptor{wgpu::DawnTogglesDescriptor::Init{
       .enabledToggleCount = deviceToggles.size(),
       .enabledToggles = deviceToggles.data(),

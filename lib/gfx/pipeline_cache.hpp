@@ -38,6 +38,7 @@ void end_pipeline_frame();
 void rebuild_pipeline_cache();
 // Replay must never skip a draw because its pipeline is still compiling.
 void set_blocking_pipelines(bool blocking) noexcept;
+bool blocking_pipelines() noexcept;
 
 PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout);
 PipelineRef find_pipeline(const clear::PipelineConfig& config, const RenderTargetLayout& layout);

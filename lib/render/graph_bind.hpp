@@ -25,7 +25,7 @@ struct BindingLayout {
 
 const wgpu::BindGroupLayout& frame_layout();
 const wgpu::BindGroup& frame_group();
-void prepare_graph_bindings(CompiledGraph& graph);
+void prepare_graph_bindings(CompiledGraph& graph, const PassSetup& setup = {});
 void shutdown_bindings();
 
 enum class PersistentKind : uint8_t { Buffer, Texture };

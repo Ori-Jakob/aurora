@@ -914,6 +914,7 @@ private:
       node.enabled = desc.enabled;
       node.encode = desc.encode;
       node.encodeNative = desc.encodeNative;
+      node.pipelines = desc.pipelines;
       node.state = desc.state;
     }
     for (size_t i = accepted; i < m_inputs.passes.size(); ++i) {

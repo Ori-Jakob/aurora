@@ -6,6 +6,10 @@
 #include "graph_pool.hpp"
 #include "../logging.hpp"
 
+#if AURORA_ENABLE_RENDER
+#include "shaders.hpp"
+#endif
+
 #include <aurora/gfx.h>
 
 #include <array>
@@ -64,6 +68,12 @@ bool build_stage_data(StageData& stage) {
     if (node.enabled != nullptr && !node.enabled(stage, node.state)) {
       continue;
     }
+#if AURORA_ENABLE_RENDER
+    // A pass still compiling drops out like a disabled one, so the cull treats it as missing for its consumers
+    if (!shaders::pipelines_ready(node.pipelineIds)) {
+      continue;
+    }
+#endif
     stage.enabled[i / 64] |= uint64_t{1} << (i % 64);
   }
 #if AURORA_ENABLE_RENDER

@@ -10,14 +10,17 @@
 #include "render/graph_bind.hpp"
 #include "render/graph_layout.hpp"
 #include "render/graph_pool.hpp"
+#include "render/jobs.hpp"
 #include "render/module.hpp"
 #include "render/settings.hpp"
+#include "render/shaders.hpp"
 #include "render/stage.hpp"
 #include "webgpu/gpu.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -71,6 +74,7 @@ struct TestPass {
   uint32_t paramsSize = 0;
   std::function<void(InternalPassBuilder&)> declare;
   std::function<void(PassContext&)> encode;
+  std::function<void(const PipelineSetup&, std::span<uint32_t, MaxPassPipelines>)> pipelines;
   bool encodes = true;
   mutable int calls = 0;
 };
@@ -90,6 +94,10 @@ void encode_test_pass(PassContext& ctx, const void* state) {
   }
 }
 
+void pipelines_test_pass(const PipelineSetup& setup, const void* state, std::span<uint32_t, MaxPassPipelines> ids) {
+  static_cast<const TestPass*>(state)->pipelines(setup, ids);
+}
+
 PassDesc desc_of(const TestPass& pass) {
   return {
       .name = pass.name,
@@ -99,6 +107,7 @@ PassDesc desc_of(const TestPass& pass) {
       .paramsSize = pass.paramsSize,
       .declare = declare_test_pass,
       .encode = pass.encodes ? encode_test_pass : nullptr,
+      .pipelines = pass.pipelines ? pipelines_test_pass : nullptr,
       .state = &pass,
   };
 }
@@ -1606,6 +1615,234 @@ TEST_F(GraphBindTest, BindIdentityKindsNeverCollide) {
   const BindIdentity storage{.kind = IdentityKind::Transient, .selector = 1, .value = 42};
   EXPECT_NE(bind_group_key(1, std::array{transient}), bind_group_key(1, std::array{storage}));
   EXPECT_EQ(bind_group_key(1, std::array{transient}), bind_group_key(1, std::array{transient}));
+}
+
+constexpr uint64_t PipelineWaitNs = 5'000'000'000;
+
+constexpr std::string_view GraphFillWgsl = R"(//#import aurora/frame
+@group(1) @binding(0) var<storage, read_write> fill_out: array<u32>;
+@compute @workgroup_size(1)
+fn main() {
+  fill_out[0] = aurora_frame.frame_index;
+}
+)";
+
+constexpr std::string_view GraphBrokenWgsl = R"(@compute @workgroup_size(1)
+fn main() {
+  let bad: u32 = 1.5;
+}
+)";
+
+class GraphBindPipelineTest : public GraphBindTest {
+protected:
+  void SetUp() override {
+    GraphBindTest::SetUp();
+    if (!m_device) {
+      return;
+    }
+    jobs::initialize(1);
+    shaders::initialize();
+    ASSERT_TRUE(shaders::register_source("test/graph_fill", GraphFillWgsl));
+    ASSERT_TRUE(shaders::register_source("test/graph_broken", GraphBrokenWgsl));
+  }
+
+  void TearDown() override {
+    if (m_device) {
+      shaders::shutdown();
+      jobs::shutdown();
+    }
+    GraphBindTest::TearDown();
+  }
+
+  static TestPass fill_pass(std::string_view shader) {
+    TestPass pass{
+        .name = "gp.fill",
+        .declare =
+            [](InternalPassBuilder& b) {
+              b.create_buffer("gp.buf", {.size = 256}, Access::StorageWrite);
+              b.side_effect();
+            },
+    };
+    pass.pipelines = [shader](const PipelineSetup& setup, std::span<uint32_t, MaxPassPipelines> ids) {
+      ids[0] = shaders::request_compute(
+                   {.label = "gp.fill", .shader = shader, .layout = setup.layout, .layoutKey = setup.layoutHash})
+                   .value;
+    };
+    pass.encode = [](PassContext& ctx) {
+      const wgpu::ComputePipeline pipeline = shaders::compute_pipeline(ctx.pipeline());
+      ASSERT_TRUE(pipeline);
+      const wgpu::ComputePassEncoder pass = ctx.begin_compute();
+      pass.SetPipeline(pipeline);
+      pass.DispatchWorkgroups(1);
+      pass.End();
+    };
+    return pass;
+  }
+
+  static TestPass reader_pass() {
+    return {
+        .name = "gp.read",
+        .order = 1,
+        .declare =
+            [](InternalPassBuilder& b) {
+              b.use_buffer("gp.buf", Access::StorageRead);
+              b.side_effect();
+            },
+        .encodes = false,
+    };
+  }
+
+  // Every frame starts at SceneBegin, which resets the cull state the later stages read
+  static StageData build_opaque(const TestFrame& frame, uint64_t frameId) {
+    StageData begin{.stage = Stage::SceneBegin, .frameId = frameId, .markerSeen = true, .frame = &frame.state};
+    build_stage_data(begin);
+    StageData opaque{.stage = Stage::OpaqueDone, .frameId = frameId, .markerSeen = true, .frame = &frame.state};
+    build_stage_data(opaque);
+    return opaque;
+  }
+};
+
+TEST_F(GraphBindPipelineTest, HookRequestsWithPassLayout) {
+  std::vector<TestPass> passes{fill_pass("test/graph_fill")};
+  std::optional<PipelineSetup> seen;
+  const auto request = passes[0].pipelines;
+  passes[0].pipelines = [&](const PipelineSetup& setup, std::span<uint32_t, MaxPassPipelines> ids) {
+    seen = setup;
+    request(setup, ids);
+  };
+  const TestFrame frame{compile(passes)};
+  const NodeId node = frame.node("gp.fill");
+  const CompiledNode& compiled = frame.graph->nodes[node];
+  const BindingPlan& plan = frame.graph->bindingPlans[node];
+  ASSERT_TRUE(seen);
+  ASSERT_TRUE(plan.layout);
+  EXPECT_NE(seen->pass, nullptr);
+  EXPECT_EQ(seen->frameLayout.Get(), frame_layout().Get());
+  EXPECT_EQ(seen->passLayout.Get(), plan.layout->passLayout.Get());
+  EXPECT_EQ(seen->layout.Get(), plan.layout->pipelineLayout.Get());
+  EXPECT_EQ(seen->layoutHash, plan.layoutHash);
+  EXPECT_EQ(seen->local.data(), compiled.local.data());
+  ASSERT_NE(compiled.pipelineIds[0], 0u);
+  EXPECT_EQ(compiled.pipelineIds[1], 0u);
+  ASSERT_EQ(shaders::wait({compiled.pipelineIds[0]}, PipelineWaitNs), shaders::PipelineStatus::Ready);
+
+  const auto encode = passes[0].encode;
+  passes[0].encode = [&](PassContext& ctx) {
+    EXPECT_EQ(ctx.pipeline().value, compiled.pipelineIds[0]);
+    EXPECT_FALSE(ctx.pipeline(MaxPassPipelines));
+    encode(ctx);
+  };
+  EXPECT_EQ(run_frame(frame, 1), std::nullopt);
+  EXPECT_EQ(passes[0].calls, 1);
+
+  // Equal declarations give an equal layout hash, so a recompile reuses the pipeline
+  const TestFrame again{compile(passes)};
+  EXPECT_EQ(again.graph->nodes[again.node("gp.fill")].pipelineIds, compiled.pipelineIds);
+  EXPECT_EQ(shaders::stats().ready, 1u);
+}
+
+TEST_F(GraphBindPipelineTest, PendingPipelineGatesPassAndConsumers) {
+  std::atomic_bool release = false;
+  std::atomic_bool started = false;
+  const jobs::JobHandle gate = jobs::submit([&](const jobs::JobContext& context) {
+    started = true;
+    while (!release && !context.cancelled()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+  });
+  while (!started) {
+    std::this_thread::yield();
+  }
+  const std::vector<TestPass> passes{fill_pass("test/graph_fill"), reader_pass()};
+  const TestFrame frame{compile(passes)};
+  const uint32_t id = frame.graph->nodes[frame.node("gp.fill")].pipelineIds[0];
+  ASSERT_NE(id, 0u);
+  EXPECT_EQ(shaders::status({id}), shaders::PipelineStatus::Pending);
+
+  const StageData pending = build_opaque(frame, 1);
+  EXPECT_FALSE(pending.is_enabled(frame.program_index("gp.fill")));
+  EXPECT_FALSE(pending.is_enabled(frame.program_index("gp.read")));
+
+  release = true;
+  gate.wait();
+  ASSERT_EQ(shaders::wait({id}, PipelineWaitNs), shaders::PipelineStatus::Ready);
+  const StageData ready = build_opaque(frame, 2);
+  EXPECT_TRUE(ready.is_enabled(frame.program_index("gp.fill")));
+  EXPECT_TRUE(ready.is_enabled(frame.program_index("gp.read")));
+}
+
+TEST_F(GraphBindPipelineTest, FailedPipelineKeepsPassDisabled) {
+  const std::vector<TestPass> passes{fill_pass("test/graph_broken"), reader_pass()};
+  const TestFrame frame{compile(passes)};
+  const uint32_t id = frame.graph->nodes[frame.node("gp.fill")].pipelineIds[0];
+  ASSERT_EQ(shaders::wait({id}, PipelineWaitNs), shaders::PipelineStatus::Failed);
+  for (uint64_t frameId = 1; frameId <= 3; ++frameId) {
+    const StageData stage = build_opaque(frame, frameId);
+    EXPECT_FALSE(stage.is_enabled(frame.program_index("gp.fill")));
+    EXPECT_FALSE(stage.is_enabled(frame.program_index("gp.read")));
+  }
+  EXPECT_EQ(count_logs(LOG_WARNING, "test/graph_broken.wgsl:3:"), 1u);
+  EXPECT_EQ(passes[0].calls, 0);
+}
+
+TEST_F(GraphBindPipelineTest, RejectedRequestsKeepPassesDisabled) {
+  std::vector<TestPass> passes{fill_pass("Not/Valid")};
+  TestPass wide{
+      .name = "gp.wide",
+      .order = 1,
+      .declare =
+          [](InternalPassBuilder& b) {
+            b.create_buffer("gp.wide_buf", {.size = 256}, Access::StorageWrite);
+            b.side_effect();
+          },
+  };
+  wide.pipelines = [](const PipelineSetup& setup, std::span<uint32_t, MaxPassPipelines> ids) {
+    ids[0] = shaders::request_render({.label = "gp.wide",
+                                      .shader = "test/graph_fill",
+                                      .layout = setup.layout,
+                                      .layoutKey = setup.layoutHash,
+                                      .colorCount = shaders::MaxColorTargets + 1})
+                 .value;
+  };
+  passes.push_back(std::move(wide));
+  for (uint64_t round = 1; round <= 2; ++round) {
+    const TestFrame frame{compile(passes)};
+    const StageData stage = build_opaque(frame, round);
+    for (const std::string_view name : {"gp.fill", "gp.wide"}) {
+      const uint32_t id = frame.graph->nodes[frame.node(name)].pipelineIds[0];
+      ASSERT_NE(id, 0u) << name;
+      EXPECT_EQ(shaders::status({id}), shaders::PipelineStatus::Failed) << name;
+      EXPECT_FALSE(stage.is_enabled(frame.program_index(name))) << name;
+    }
+  }
+  EXPECT_EQ(count_logs(LOG_WARNING, "'Not/Valid'"), 1u);
+  EXPECT_EQ(count_logs(LOG_WARNING, "more than 8"), 1u);
+  EXPECT_EQ(passes[0].calls + passes[1].calls, 0);
+}
+
+TEST_F(GraphBindPipelineTest, LatchPassesCompileSetupToHook) {
+  testing::reset();
+  const PassSetup* seen = nullptr;
+  const Settings* settings = nullptr;
+  const Caps* deviceCaps = nullptr;
+  TestPass pass = fill_pass("test/graph_fill");
+  const auto request = pass.pipelines;
+  pass.pipelines = [&](const PipelineSetup& setup, std::span<uint32_t, MaxPassPipelines> ids) {
+    seen = setup.pass;
+    settings = setup.pass->settings;
+    deviceCaps = setup.pass->caps;
+    EXPECT_NE(setup.pass->env, nullptr);
+    request(setup, ids);
+  };
+  ASSERT_NE(register_pass(desc_of(pass)), InvalidPassId);
+  const std::shared_ptr<const FrameState> state = latch_frame();
+  ASSERT_NE(seen, nullptr);
+  EXPECT_EQ(settings, &latched_settings());
+  EXPECT_EQ(deviceCaps, &caps());
+  const NodeId node = state->graph->find_node("gp.fill");
+  ASSERT_NE(node, InvalidNode);
+  EXPECT_NE(state->graph->nodes[node].pipelineIds[0], 0u);
+  testing::reset();
 }
 
 TEST_F(GraphBindTest, BindCacheStatsFromAnotherThread) {

@@ -6,6 +6,7 @@
 #include "graph_pool.hpp"
 #include "jobs.hpp"
 #include "settings.hpp"
+#include "shaders.hpp"
 
 #include "../logging.hpp"
 #include "../webgpu/gpu.hpp"
@@ -60,11 +61,20 @@ void initialize() {
 #if AURORA_ENABLE_RENDER
   transient_pool().set_release_listener(&bind_cache_on_release);
   jobs::initialize(webgpu::g_backendType == wgpu::BackendType::WebGPU ? 0 : jobs::default_worker_count());
+  shaders::initialize();
+#endif
+}
+
+void quiesce() noexcept {
+#if AURORA_ENABLE_RENDER
+  shaders::quiesce();
 #endif
 }
 
 void shutdown() noexcept {
 #if AURORA_ENABLE_RENDER
+  // Compile jobs use the device, so they finish before the job pool and the device go away
+  shaders::shutdown();
   jobs::shutdown();
   // Unhooks the release listener before the pool clears, so its last releases have no cache left to evict from
   shutdown_bindings();

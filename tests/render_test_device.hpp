@@ -19,6 +19,7 @@ struct TestDeviceOptions {
   uint32_t msaaSamples = 1;
   bool createEfb = false;
   uint64_t uniformBufferSize = 64 * 1024;
+  bool productionToggles = false;
 };
 
 struct TestDevice {

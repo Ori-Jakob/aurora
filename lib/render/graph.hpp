@@ -222,6 +222,20 @@ using PassEnabledFn = bool (*)(const StageData& stage, const void* state);
 using PassEncodeFn = void (*)(PassContext& ctx, const void* state);
 using PassEncodeNativeFn = void (*)(NativeContext& ctx, const void* state);
 
+inline constexpr size_t MaxPassPipelines = 4;
+
+struct PipelineSetup {
+  const PassSetup* pass = nullptr;
+  wgpu::BindGroupLayout frameLayout;
+  wgpu::BindGroupLayout passLayout;
+  wgpu::PipelineLayout layout;
+  uint64_t layoutHash = 0;
+  std::span<const std::byte, PassLocalSize> local;
+};
+
+using PassPipelinesFn = void (*)(const PipelineSetup& setup, const void* state,
+                                 std::span<uint32_t, MaxPassPipelines> pipelines);
+
 struct PassDesc {
   std::string name;
   Stage stage = Stage::SceneBegin;
@@ -234,6 +248,7 @@ struct PassDesc {
   PassEnabledFn enabled = nullptr;
   PassEncodeFn encode = nullptr;
   PassEncodeNativeFn encodeNative = nullptr;
+  PassPipelinesFn pipelines = nullptr;
   const void* state = nullptr;
 };
 
@@ -338,6 +353,8 @@ struct CompiledNode {
   PassEnabledFn enabled = nullptr;
   PassEncodeFn encode = nullptr;
   PassEncodeNativeFn encodeNative = nullptr;
+  PassPipelinesFn pipelines = nullptr;
+  std::array<uint32_t, MaxPassPipelines> pipelineIds{};
   const void* state = nullptr;
   std::array<std::byte, PassLocalSize> local{};
 };

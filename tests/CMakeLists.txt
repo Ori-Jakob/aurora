@@ -404,6 +404,20 @@ if (AURORA_ENABLE_GX)
     target_compile_definitions(render_jobs_tests PRIVATE AURORA TARGET_PC=1 AURORA_ENABLE_RENDER=1)
     target_link_libraries(render_jobs_tests PRIVATE gtest gtest_main Tracy::TracyClient ${AURORA_SDL3_TARGET})
     gtest_discover_tests(render_jobs_tests PROPERTIES TIMEOUT 60)
+
+    file(GLOB_RECURSE _render_test_wgsl CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/shaders/render/*.wgsl")
+    add_executable(render_shaders_tests render_shaders_test.cpp render_test_device.cpp)
+    target_include_directories(render_shaders_tests PRIVATE ../include ../lib)
+    target_compile_definitions(render_shaders_tests PRIVATE AURORA TARGET_PC=1 AURORA_ENABLE_RENDER=1)
+    target_link_libraries(render_shaders_tests PRIVATE aurora::gx aurora::vi absl::flat_hash_map gtest gtest_main)
+    aurora_embed_wgsl(render_shaders_tests
+      ROOT "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/shaders/render"
+      TABLE embedded_test_shaders
+      HEADER "${CMAKE_CURRENT_SOURCE_DIR}/../lib/render/shaders_embed.hpp"
+      OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/render_test_wgsl.cpp"
+      SOURCES ${_render_test_wgsl})
+    aurora_copy_runtime_dlls(render_shaders_tests)
+    gtest_discover_tests(render_shaders_tests PROPERTIES TIMEOUT 120)
   endif ()
 endif () # AURORA_ENABLE_GX
 

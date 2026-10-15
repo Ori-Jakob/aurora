@@ -3,6 +3,7 @@
 #include "frame_state.hpp"
 #include "graph_pool.hpp"
 #include "graph_slots.hpp"
+#include "shaders.hpp"
 #include "stage_data.hpp"
 
 #include "../gfx/hash.hpp"
@@ -906,7 +907,7 @@ const wgpu::BindGroup& frame_group() {
   return g_shared.frameGroup;
 }
 
-void prepare_graph_bindings(CompiledGraph& graph) {
+void prepare_graph_bindings(CompiledGraph& graph, const PassSetup& setup) {
   const auto live = [&](size_t node) {
     const CompiledNode& compiled = graph.nodes[node];
     return node < graph.bindingPlans.size() && compiled.kind == NodeKind::Pass && compiled.status == CullReason::None &&
@@ -920,9 +921,11 @@ void prepare_graph_bindings(CompiledGraph& graph) {
   if (!any || !webgpu::g_device) {
     return;
   }
+  wgpu::BindGroupLayout frameLayout;
   {
     std::lock_guard lock{g_shared.mutex};
     ensure_frame_group_locked();
+    frameLayout = g_shared.frameLayout;
   }
   for (size_t node = 0; node < graph.nodes.size(); ++node) {
     if (!live(node)) {
@@ -931,6 +934,19 @@ void prepare_graph_bindings(CompiledGraph& graph) {
     BindingPlan& plan = graph.bindingPlans[node];
     plan.layout = find_layout(plan);
     plan.layoutSerial = plan.layout ? plan.layout->serial : 0;
+    CompiledNode& compiled = graph.nodes[node];
+    // The graph is still private to the latch here, so the ids can be written before it is published
+    if (compiled.pipelines != nullptr && plan.layout) {
+      const PipelineSetup pipelineSetup{
+          .pass = &setup,
+          .frameLayout = frameLayout,
+          .passLayout = plan.layout->passLayout,
+          .layout = plan.layout->pipelineLayout,
+          .layoutHash = plan.layoutHash,
+          .local = compiled.local,
+      };
+      compiled.pipelines(pipelineSetup, compiled.state, compiled.pipelineIds);
+    }
   }
 }
 
@@ -1481,6 +1497,10 @@ const wgpu::PipelineLayout& PassContext::pipeline_layout() const noexcept {
 }
 
 uint64_t PassContext::layout_hash() const noexcept { return m_bound.plan->layoutHash; }
+
+shaders::PipelineId PassContext::pipeline(uint32_t index) const noexcept {
+  return {index < MaxPassPipelines ? m_pass.pipelineIds[index] : 0};
+}
 
 namespace testing {
 void record_bind_details(bool enabled) noexcept { g_recordDetails.store(enabled, std::memory_order_relaxed); }

@@ -1104,6 +1104,8 @@ PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLa
 
 void set_blocking_pipelines(bool blocking) noexcept { g_blockingPipelines.store(blocking, std::memory_order_relaxed); }
 
+bool blocking_pipelines() noexcept { return g_blockingPipelines.load(std::memory_order_relaxed); }
+
 #ifdef AURORA_ENABLE_RMLUI
 PipelineRef find_pipeline(const rmlui::PipelineConfig& config) {
   remember_pipeline_config(ShaderType::Rml, config, 0, true);

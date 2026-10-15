@@ -1,3 +1,5 @@
+include(${CMAKE_CURRENT_LIST_DIR}/AuroraEmbedShaders.cmake)
+
 target_sources(aurora_gx PRIVATE
         lib/render/frame_state.hpp
         lib/render/graph.hpp
@@ -28,9 +30,21 @@ if (AURORA_ENABLE_RENDER)
         lib/render/jobs.cpp
         lib/render/jobs.hpp
         lib/render/json.hpp
+        lib/render/shader_resolve.cpp
+        lib/render/shader_resolve.hpp
+        lib/render/shaders.cpp
+        lib/render/shaders.hpp
+        lib/render/shaders_embed.hpp
         lib/render/tlsf.cpp
         lib/render/tlsf.hpp
     )
+    file(GLOB_RECURSE _aurora_render_wgsl CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/../lib/render/*.wgsl")
+    aurora_embed_wgsl(aurora_gx
+        ROOT "${CMAKE_CURRENT_LIST_DIR}/../lib/render"
+        TABLE embedded_library
+        HEADER "${CMAKE_CURRENT_LIST_DIR}/../lib/render/shaders_embed.hpp"
+        OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/aurora_render_wgsl.cpp"
+        SOURCES ${_aurora_render_wgsl})
     target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_RENDER=1)
     target_link_libraries(aurora_gx PRIVATE yyjson::yyjson)
 else ()

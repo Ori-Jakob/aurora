@@ -660,7 +660,7 @@ std::shared_ptr<const FrameState> latch_frame() {
     // An equal graphHash still carries new state and callbacks, so the new object is always published
     std::shared_ptr<CompiledGraph> compiled = compile_graph(latched_settings(), caps(), g_graphEnvironment);
     if (compiled) {
-      prepare_graph_bindings(*compiled);
+      prepare_graph_bindings(*compiled, {&latched_settings(), &caps(), &g_graphEnvironment});
     }
     graph = compiled ? std::move(compiled) : empty_graph();
   }

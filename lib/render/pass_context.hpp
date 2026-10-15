@@ -10,6 +10,10 @@
 #include <span>
 #include <string_view>
 
+namespace aurora::render::shaders {
+struct PipelineId;
+} // namespace aurora::render::shaders
+
 namespace aurora::render::detail {
 struct StageData;
 struct BoundPass;
@@ -77,6 +81,7 @@ public:
   [[nodiscard]] const wgpu::BindGroupLayout& pass_layout() const noexcept;
   [[nodiscard]] const wgpu::PipelineLayout& pipeline_layout() const noexcept;
   [[nodiscard]] uint64_t layout_hash() const noexcept;
+  [[nodiscard]] shaders::PipelineId pipeline(uint32_t index = 0) const noexcept;
 
 private:
   template <typename Encoder>

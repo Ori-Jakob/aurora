@@ -653,6 +653,7 @@ void initialize() {
 void shutdown() {
   render_worker::synchronize();
   render_worker::shutdown();
+  render::detail::quiesce();
   g_processEventsQueued.store(false, std::memory_order_release);
   g_lastPresentNs.store(0, std::memory_order_release);
   g_presentPeriodNs.store(0, std::memory_order_release);
