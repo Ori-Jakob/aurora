@@ -4,6 +4,7 @@
 #include "gpu_heap.hpp"
 #include "graph_bind.hpp"
 #include "graph_pool.hpp"
+#include "jobs.hpp"
 #include "settings.hpp"
 
 #include "../logging.hpp"
@@ -58,12 +59,14 @@ void initialize() {
            deviceCaps.limits.maxColorAttachmentBytesPerSample);
 #if AURORA_ENABLE_RENDER
   transient_pool().set_release_listener(&bind_cache_on_release);
+  jobs::initialize(webgpu::g_backendType == wgpu::BackendType::WebGPU ? 0 : jobs::default_worker_count());
 #endif
 }
 
 void shutdown() noexcept {
 #if AURORA_ENABLE_RENDER
-  // Unhooks the release listener first, so the pool's last releases have no cache left to evict from
+  jobs::shutdown();
+  // Unhooks the release listener before the pool clears, so its last releases have no cache left to evict from
   shutdown_bindings();
   transient_pool().clear();
   gpu_heap::shutdown();

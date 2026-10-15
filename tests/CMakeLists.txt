@@ -397,6 +397,14 @@ if (AURORA_ENABLE_GX)
   endif ()
   aurora_copy_runtime_dlls(trace_tests)
   gtest_discover_tests(trace_tests)
+
+  if (AURORA_ENABLE_RENDER)
+    add_executable(render_jobs_tests render_jobs_test.cpp ../lib/render/jobs.cpp ../lib/thread.cpp)
+    target_include_directories(render_jobs_tests PRIVATE ../include ../lib)
+    target_compile_definitions(render_jobs_tests PRIVATE AURORA TARGET_PC=1 AURORA_ENABLE_RENDER=1)
+    target_link_libraries(render_jobs_tests PRIVATE gtest gtest_main Tracy::TracyClient ${AURORA_SDL3_TARGET})
+    gtest_discover_tests(render_jobs_tests PROPERTIES TIMEOUT 60)
+  endif ()
 endif () # AURORA_ENABLE_GX
 
 if (TARGET render_demo)

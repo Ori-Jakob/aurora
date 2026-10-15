@@ -12,6 +12,9 @@
 #include "gx/gx.hpp"
 #include "gx/texture.hpp"
 #include "io.hpp"
+#if AURORA_ENABLE_RENDER
+#include "render/jobs.hpp"
+#endif
 #include "webgpu/gpu.hpp"
 #include "webgpu/gpu_prof.hpp"
 #include "window.hpp"
@@ -145,6 +148,9 @@ ExitCode bring_up_aurora(int argc, char* argv[], const Options& options, const t
   }
 
   gfx::set_blocking_pipelines(true);
+#if AURORA_ENABLE_RENDER
+  render::jobs::set_synchronous(true);
+#endif
   if (!options.replacementsDir.empty()) {
     aurora::texture::load_replacement_directory(options.replacementsDir);
     gfx::texture_replacement::set_synchronous_loads(true);
