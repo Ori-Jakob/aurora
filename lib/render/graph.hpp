@@ -451,6 +451,40 @@ std::string_view resource_kind_name(ResourceKind kind) noexcept;
 std::string_view cull_reason_name(CullReason reason) noexcept;
 std::string_view edge_kind_name(EdgeKind kind) noexcept;
 
+struct StageMask {
+  std::vector<uint64_t> passes;
+  std::vector<uint64_t> dummies;
+  std::vector<uint64_t> prevValid;
+
+  [[nodiscard]] bool any() const noexcept {
+    for (const auto word : passes) {
+      if (word != 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+};
+
+struct FrameCullState {
+  uint64_t graphHash = 0;
+  bool primed = false;
+  uint8_t nextStage = 0;
+  uint8_t cutStage = 0;
+  std::vector<uint64_t> ran;
+  std::vector<uint64_t> prevValid;
+};
+
+constexpr bool test_bit(std::span<const uint64_t> bits, size_t index) noexcept {
+  return index / 64 < bits.size() && ((bits[index / 64] >> (index % 64)) & 1) != 0;
+}
+
+DummyKey dummy_key(const CompiledGraph& graph, const CompiledUse& use, const GraphFeatures& features = {}) noexcept;
+void begin_frame_cull(const CompiledGraph& graph, FrameCullState& state) noexcept;
+void invalidate_histories(FrameCullState& state) noexcept;
+void cull_stage(const CompiledGraph& graph, Stage stage, std::span<const uint64_t> enabled, FrameCullState& state,
+                StageMask& out);
+
 namespace testing {
 void clear_passes() noexcept;
 void reset_logged_diagnostics() noexcept;

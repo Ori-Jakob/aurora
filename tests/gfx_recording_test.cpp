@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -316,6 +317,7 @@ struct TestPass {
   GfxRenderStageTest* owner = nullptr;
   std::string name;
   bool enabled = true;
+  std::function<void(render::detail::InternalPassBuilder&)> declare;
 };
 
 struct PassShape {
@@ -368,6 +370,21 @@ protected:
         .stage = stage,
         .order = order,
         .runsWithoutMarker = runsWithoutMarker,
+        .enabled = pass_enabled,
+        .encode = encode_pass,
+        .state = &pass,
+    });
+  }
+
+  render::detail::PassId add_declared(std::string name, uint16_t order, bool enabled,
+                                      std::function<void(render::detail::InternalPassBuilder&)> declare) {
+    auto& pass =
+        passes.emplace_back(TestPass{.owner = this, .name = name, .enabled = enabled, .declare = std::move(declare)});
+    return render::detail::register_pass({
+        .name = std::move(name),
+        .stage = Stage::OpaqueDone,
+        .order = order,
+        .declare = declare_test_pass,
         .enabled = pass_enabled,
         .encode = encode_pass,
         .state = &pass,
@@ -433,6 +450,11 @@ protected:
   static void declare_side_effect(render::detail::InternalPassBuilder& builder, const render::detail::PassSetup&,
                                   const void*) {
     builder.side_effect();
+  }
+
+  static void declare_test_pass(render::detail::InternalPassBuilder& builder, const render::detail::PassSetup&,
+                                const void* state) {
+    static_cast<const TestPass*>(state)->declare(builder);
   }
 
   static bool check_stage_data(const render::detail::StageData& stage, const void* state) {
@@ -927,6 +949,124 @@ TEST_F(GfxRenderStageTest, StageDataAddressesStayValid) {
     ++next;
   }
   EXPECT_EQ(next, Order.size());
+}
+
+constexpr render::detail::TexDesc StageTexture{.format = wgpu::TextureFormat::RGBA8Unorm};
+
+void create_stage_texture(render::detail::InternalPassBuilder& b) {
+  b.create("t", StageTexture, render::detail::Access::StorageWrite);
+}
+
+TEST_F(GfxRenderStageTest, StructurallyCulledStageEmitsNoOp) {
+  ASSERT_NE(add_declared("lonely", 0, true, create_stage_texture), render::detail::InvalidPassId);
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+  const auto& graph = *frame.renderState->graph;
+  EXPECT_TRUE(graph.stage_empty(Stage::OpaqueDone));
+  EXPECT_EQ(graph.nodes[graph.find_node("lonely")].status, render::detail::CullReason::NoConsumer);
+
+  record_stage(Stage::OpaqueDone);
+
+  EXPECT_TRUE(frame.ops.empty());
+  EXPECT_TRUE(frame.stages.empty());
+  EXPECT_EQ(frame.renderPasses.size(), 1u);
+}
+
+void read_stage_texture(render::detail::InternalPassBuilder& b, render::detail::Missing missing) {
+  b.use("t", render::detail::Access::Sampled, missing);
+  b.side_effect();
+}
+
+TEST_F(GfxRenderStageTest, PerFrameCullSuppressesOp) {
+  add_declared("w", 0, false, create_stage_texture);
+  add_declared("r", 1, true, [](auto& b) { read_stage_texture(b, render::detail::Missing::DisablePass); });
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(2));
+
+  record_stage(Stage::OpaqueDone);
+
+  EXPECT_EQ(std::ranges::count(op_types(), StageOp), 0);
+  EXPECT_TRUE(frame.stages.empty());
+
+  passes[0].enabled = true;
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(2));
+  record_stage(Stage::OpaqueDone);
+
+  EXPECT_EQ(op_types(), (std::vector{PassOp, StageOp}));
+  ASSERT_EQ(frame.stages.size(), 1u);
+  EXPECT_TRUE(frame.stages[0].is_enabled(0));
+  EXPECT_TRUE(frame.stages[0].is_enabled(1));
+  EXPECT_EQ(run(frame.stages[0]), (std::vector<std::string>{"w", "r"}));
+}
+
+TEST_F(GfxRenderStageTest, DummyBitsReachStageData) {
+  add_declared("w", 0, false, create_stage_texture);
+  add_declared("r", 1, true, [](auto& b) { read_stage_texture(b, render::detail::Missing::BindDummyBlack); });
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(2));
+
+  record_stage(Stage::OpaqueDone);
+
+  EXPECT_EQ(op_types(), (std::vector{PassOp, StageOp}));
+  ASSERT_EQ(frame.stages.size(), 1u);
+  const auto& stage = frame.stages[0];
+  EXPECT_FALSE(stage.is_enabled(0));
+  EXPECT_TRUE(stage.is_enabled(1));
+  const auto& graph = *frame.renderState->graph;
+  const auto uses = graph.node_uses(graph.find_node("r"));
+  ASSERT_EQ(uses.size(), 1u);
+  EXPECT_TRUE(stage.dummy_bound(uses[0].stageUse));
+  EXPECT_EQ(run(stage), (std::vector<std::string>{"r"}));
+}
+
+class GfxHistoryStageTest : public GfxRenderStageTest {
+protected:
+  void add_history_passes() {
+    add_declared("h", 0, true, [](auto& b) { b.history("hist", StageTexture, render::detail::Access::StorageWrite); });
+    add_declared("p", 1, true, [](auto& b) {
+      b.use_prev("hist");
+      b.side_effect();
+    });
+  }
+
+  bool prev_valid_at_marker() {
+    record_stage(Stage::OpaqueDone);
+    EXPECT_EQ(frame.stages.size(), 1u);
+    if (frame.stages.empty()) {
+      return false;
+    }
+    const auto& graph = *frame.renderState->graph;
+    const auto slot = graph.resources[graph.find_resource("hist")].historySlot;
+    EXPECT_NE(slot, render::detail::InvalidResource);
+    return frame.stages[0].prev_valid(slot);
+  }
+};
+
+TEST_F(GfxHistoryStageTest, PrevBitsAcrossFrames) {
+  add_history_passes();
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(2));
+  EXPECT_FALSE(prev_valid_at_marker());
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(2));
+  EXPECT_TRUE(prev_valid_at_marker());
+
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(2));
+  render::detail::invalidate_frame_histories();
+  EXPECT_FALSE(prev_valid_at_marker());
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(2));
+  EXPECT_TRUE(prev_valid_at_marker());
+}
+
+TEST_F(GfxHistoryStageTest, SameHashRecompileKeepsCullState) {
+  add_history_passes();
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(2));
+  EXPECT_FALSE(prev_valid_at_marker());
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(2));
+  EXPECT_TRUE(prev_valid_at_marker());
+  const auto before = frame.renderState->graph;
+
+  render::apply_settings({.legacyBlend = 0.5f});
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(2));
+
+  EXPECT_NE(frame.renderState->graph, before);
+  EXPECT_EQ(frame.renderState->graph->graphHash, before->graphHash);
+  EXPECT_TRUE(prev_valid_at_marker());
 }
 #endif
 

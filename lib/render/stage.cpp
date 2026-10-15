@@ -14,6 +14,9 @@ namespace aurora::render::detail {
 namespace {
 constexpr Module Log{"aurora::render"};
 
+// Recording thread only; a frame's stages are built in order and never concurrently
+FrameCullState g_frameCull;
+
 const CompiledGraph* stage_graph(const StageData& stage) noexcept {
   return stage.frame != nullptr ? stage.frame->graph.get() : nullptr;
 }
@@ -37,6 +40,12 @@ bool build_stage_data(StageData& stage) {
   if (graph == nullptr) {
     return false;
   }
+#if AURORA_ENABLE_RENDER
+  // Runs before the empty-program return so every frame resets the cull state
+  if (stage.stage == Stage::SceneBegin) {
+    begin_frame_cull(*graph, g_frameCull);
+  }
+#endif
   const StageProgram& program = graph->stages[static_cast<size_t>(stage.stage)];
   if (program.passes.empty()) {
     return false;
@@ -56,6 +65,13 @@ bool build_stage_data(StageData& stage) {
     }
     stage.enabled[i / 64] |= uint64_t{1} << (i % 64);
   }
+#if AURORA_ENABLE_RENDER
+  StageMask mask;
+  cull_stage(*graph, stage.stage, stage.enabled, g_frameCull, mask);
+  stage.enabled = std::move(mask.passes);
+  stage.dummies = std::move(mask.dummies);
+  stage.prevValid = std::move(mask.prevValid);
+#endif
   return stage.any_enabled();
 }
 
@@ -99,5 +115,13 @@ void after_frame(const FrameState* frame) noexcept {
   if (!has_native_passes(frame)) {
     return;
   }
+}
+
+void reset_frame_cull() noexcept { g_frameCull = {}; }
+
+void invalidate_frame_histories() noexcept {
+#if AURORA_ENABLE_RENDER
+  invalidate_histories(g_frameCull);
+#endif
 }
 } // namespace aurora::render::detail

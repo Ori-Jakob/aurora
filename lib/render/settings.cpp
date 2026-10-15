@@ -3,6 +3,7 @@
 #include "frame_state.hpp"
 #include "graph.hpp"
 #include "module.hpp"
+#include "stage.hpp"
 #include "../logging.hpp"
 #include "../webgpu/caps.hpp"
 
@@ -670,6 +671,7 @@ void reset() noexcept {
   g_latched.reset();
   g_generation = 0;
   g_frameState.reset();
+  reset_frame_cull();
 #if AURORA_ENABLE_RENDER
   g_graphEnvironment = {};
   clear_passes();

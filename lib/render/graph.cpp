@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cassert>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -147,6 +148,72 @@ std::string format_name(wgpu::TextureFormat format) {
 bool is_depth_format(wgpu::TextureFormat format) noexcept {
   const FormatRow* row = find_format(format);
   return row != nullptr && (row->caps & CapDepth) != 0;
+}
+
+wgpu::TextureSampleType format_sample_type(wgpu::TextureFormat format, bool float32Filterable) noexcept {
+  if (is_depth_format(format)) {
+    return wgpu::TextureSampleType::Depth;
+  }
+  switch (format) {
+  case TextureFormat::R8Uint:
+  case TextureFormat::R16Uint:
+  case TextureFormat::R32Uint:
+  case TextureFormat::RG8Uint:
+  case TextureFormat::RG16Uint:
+  case TextureFormat::RG32Uint:
+  case TextureFormat::RGBA8Uint:
+  case TextureFormat::RGBA16Uint:
+  case TextureFormat::RGBA32Uint:
+  case TextureFormat::RGB10A2Uint:
+    return wgpu::TextureSampleType::Uint;
+  case TextureFormat::R8Sint:
+  case TextureFormat::R16Sint:
+  case TextureFormat::R32Sint:
+  case TextureFormat::RG8Sint:
+  case TextureFormat::RG16Sint:
+  case TextureFormat::RG32Sint:
+  case TextureFormat::RGBA8Sint:
+  case TextureFormat::RGBA16Sint:
+  case TextureFormat::RGBA32Sint:
+    return wgpu::TextureSampleType::Sint;
+  case TextureFormat::R32Float:
+  case TextureFormat::RG32Float:
+  case TextureFormat::RGBA32Float:
+    return float32Filterable ? wgpu::TextureSampleType::Float : wgpu::TextureSampleType::UnfilterableFloat;
+  default:
+    return wgpu::TextureSampleType::Float;
+  }
+}
+
+constexpr size_t bit_words(size_t bits) noexcept { return (bits + 63) / 64; }
+
+void assign_bit(std::vector<uint64_t>& bits, size_t index, bool value) noexcept {
+  if (index / 64 >= bits.size()) {
+    return;
+  }
+  const uint64_t mask = uint64_t{1} << (index % 64);
+  bits[index / 64] = value ? bits[index / 64] | mask : bits[index / 64] & ~mask;
+}
+
+bool input_missing(const CompiledGraph& graph, const CompiledUse& use, Stage stage, const FrameCullState& state,
+                   const StageMask& mask) noexcept {
+  const CompiledResource& resource = graph.resources[use.resource];
+  if (use.role == UseRole::Prev) {
+    return !test_bit(state.prevValid, resource.historySlot);
+  }
+  // Only the creator decides: with a modifier off, readers still get the creator's valid version
+  if (use.role != UseRole::Use ||
+      (resource.kind != ResourceKind::Transient && resource.kind != ResourceKind::History)) {
+    return false;
+  }
+  if (resource.creator == InvalidNode) {
+    return true;
+  }
+  const CompiledNode& creator = graph.nodes[resource.creator];
+  if (creator.stage == stage) {
+    return !test_bit(mask.passes, creator.programIndex);
+  }
+  return creator.stage > stage || !test_bit(state.ran, creator.frameSlot);
 }
 
 constexpr std::array<std::string_view, 14> AccessNames{
@@ -613,6 +680,7 @@ struct GraphBuild {
     check_limits();
     check_backwards_edges();
     order_stages();
+    cull_unconsumed();
     finish_programs();
     hash_graph();
   }
@@ -698,6 +766,18 @@ private:
   [[nodiscard]] std::span<CompiledUse> uses_of(NodeId node) noexcept {
     const CompiledNode& compiled = m_graph.nodes[node];
     return std::span{m_graph.uses}.subspan(compiled.firstUse, compiled.useCount);
+  }
+
+  // A storage-read dummy is created with the resource's format, so one without any known format cannot exist
+  [[nodiscard]] static bool needs_dummy_format(const CompiledUse& use, const CompiledResource& resource) noexcept {
+    return !use.buffer && use.role == UseRole::Use && use.access == Access::StorageRead &&
+           use.missing != Missing::DisablePass && !resource.described && resource.kind != ResourceKind::Gx &&
+           use.options.format == wgpu::TextureFormat::Undefined;
+  }
+
+  [[nodiscard]] bool is_pure_write(const CompiledUse& use) const noexcept {
+    return use.role == UseRole::GxWrite || ((use.role == UseRole::Create || use.role == UseRole::History) &&
+                                            m_graph.resources[use.resource].creator == use.node);
   }
 
   void add_diagnostic(Diagnostic diagnostic) {
@@ -1125,6 +1205,11 @@ private:
     } else if (existing && m_mentioned[known] && m_graph.resources[known].buffer != use.buffer) {
       problem = fmt::format("uses '{}' as a {}, but it is a {}", use.name, use.buffer ? "buffer" : "texture",
                             use.buffer ? "texture" : "buffer");
+    } else if (!use.buffer && use.access == Access::StorageRead &&
+               use.options.format == wgpu::TextureFormat::Undefined &&
+               !(existing && m_graph.resources[known].described)) {
+      // Every GX read can fall back to a dummy, and a storage-read dummy needs a format
+      problem = fmt::format("reads storage texture '{}' with no known format", use.name);
     } else if (!existing && m_resourceIds.size() >= MaxResources) {
       problem = std::string{"declares too many resources"};
     }
@@ -1197,6 +1282,11 @@ private:
         continue;
       }
       place(i);
+      if (m_graph.nodes[i].cls == PassClass::Diagnostic && !m_inputs.env.inspectorOpen) {
+        disable(i, CullReason::InspectorClosed,
+                fmt::format("render graph: '{}' is a diagnostic pass and the inspector is closed; disabled",
+                            m_graph.nodes[i].name));
+      }
     }
   }
 
@@ -1214,6 +1304,9 @@ private:
       }
       if (use.role == UseRole::Prev && resource.described && resource.kind != ResourceKind::History) {
         return fmt::format("reads the previous frame of '{}', which is not a history", resource.name);
+      }
+      if (needs_dummy_format(use, resource)) {
+        return fmt::format("reads storage texture '{}' with a dummy fallback but no known format", resource.name);
       }
       if (node.passKind == PassKind::Native && resource.kind != ResourceKind::External) {
         return fmt::format("is a native pass and cannot use {} resource '{}'", resource_kind_name(resource.kind),
@@ -1553,6 +1646,72 @@ private:
     }
   }
 
+  [[nodiscard]] bool use_available(const CompiledUse& use) const noexcept {
+    const CompiledResource& resource = m_graph.resources[use.resource];
+    if (use.role == UseRole::Prev) {
+      return resource.kind == ResourceKind::History && resource.creator != InvalidNode && active(resource.creator);
+    }
+    switch (resource.kind) {
+    case ResourceKind::Gx:
+      return gx_use_available(m_inputs.env, resource.gx, use.access);
+    case ResourceKind::Persistent:
+    case ResourceKind::External:
+      return true;
+    default:
+      // Passes reading a later stage's resource are already disabled as backwards edges; GX reads are not
+      return resource.creator != InvalidNode && active(resource.creator) &&
+             m_graph.nodes[resource.creator].stage <= m_graph.nodes[use.node].stage;
+    }
+  }
+
+  void apply_missing() {
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (size_t i = 0; i < m_graph.nodes.size(); ++i) {
+        const auto nodeId = static_cast<NodeId>(i);
+        if (!active(nodeId)) {
+          continue;
+        }
+        const bool chain = m_graph.nodes[i].kind != NodeKind::Pass;
+        for (CompiledUse& use : uses_of(nodeId)) {
+          if ((use.role != UseRole::Use && use.role != UseRole::Prev) || use.staticDummy || use_available(use)) {
+            continue;
+          }
+          const std::string_view name = m_graph.nodes[i].name;
+          const std::string_view resource = m_graph.resources[use.resource].name;
+          if (chain) {
+            use.staticDummy = true;
+            if (use.missing == Missing::DisablePass) {
+              add_diagnostic({
+                  .reason = CullReason::CoercedMissing,
+                  .node = nodeId,
+                  .resource = use.resource,
+                  .message = fmt::format("render graph: GX read on '{}' needs missing '{}'; bound a black dummy", name,
+                                         resource),
+              });
+            }
+            continue;
+          }
+          if (writes(use.access)) {
+            disable(nodeId, CullReason::MissingTarget,
+                    fmt::format("render graph: '{}' writes '{}', which is not available; disabled", name, resource),
+                    InvalidNode, use.resource);
+            changed = true;
+            break;
+          }
+          if (use.missing == Missing::DisablePass) {
+            disable(nodeId, CullReason::MissingInput,
+                    fmt::format("render graph: '{}' reads '{}', which is not available; disabled", name, resource),
+                    InvalidNode, use.resource);
+            changed = true;
+            break;
+          }
+          use.staticDummy = true;
+        }
+      }
+    }
+  }
+
   void add_edge(NodeId from, NodeId to, EdgeKind kind, ResourceId resource = InvalidResource) {
     const uint64_t key =
         uint64_t{from} | uint64_t{to} << 16 | uint64_t{resource} << 32 | uint64_t{static_cast<uint8_t>(kind)} << 48;
@@ -1789,8 +1948,7 @@ private:
         CompiledUse& use = m_graph.uses[index];
         const NodeId node = use.node;
         const Stage stage = m_graph.nodes[node].stage;
-        const bool pure = use.role == UseRole::GxWrite ||
-                          ((use.role == UseRole::Create || use.role == UseRole::History) && node == resource.creator);
+        const bool pure = is_pure_write(use);
         const bool writer = writes(use.access);
         const bool reader = reads(use.access) || (writer && !pure);
         const bool sameStage = lastWriter != InvalidNode && m_graph.nodes[lastWriter].stage == stage;
@@ -1825,6 +1983,7 @@ private:
     std::vector<NodeId> order;
     std::array<std::vector<NodeId>, StageCount> programs;
     for (;;) {
+      apply_missing();
       m_edges.clear();
       m_edgeKeys.clear();
       add_placement_edges();
@@ -1853,9 +2012,104 @@ private:
     m_graph.edges = std::move(m_edges);
   }
 
-  void finish_programs() {
+  void mark_sinks() {
+    for (size_t i = 0; i < m_graph.nodes.size(); ++i) {
+      CompiledNode& node = m_graph.nodes[i];
+      if (node.kind != NodeKind::Pass) {
+        node.sink = true;
+        continue;
+      }
+      if (node.status != CullReason::None) {
+        continue;
+      }
+      node.sink = node.sideEffect || (node.cls == PassClass::Diagnostic && m_inputs.env.inspectorOpen) ||
+                  std::ranges::any_of(uses_of(static_cast<NodeId>(i)), [&](const CompiledUse& use) {
+                    const ResourceKind kind = m_graph.resources[use.resource].kind;
+                    return writes(use.access) && kind != ResourceKind::Transient;
+                  });
+    }
+  }
+
+  void cull_unconsumed() {
+    mark_sinks();
+    std::vector<bool> live(m_graph.nodes.size(), false);
+    std::vector<NodeId> pending;
+    for (size_t i = 0; i < m_graph.nodes.size(); ++i) {
+      if (active(static_cast<NodeId>(i)) && m_graph.nodes[i].sink) {
+        live[i] = true;
+        pending.push_back(static_cast<NodeId>(i));
+      }
+    }
+    // A modifier also reads the version it changes, so walking producers keeps the earlier writers live too
+    while (!pending.empty()) {
+      const NodeId node = pending.back();
+      pending.pop_back();
+      for (const CompiledUse& use : uses_of(node)) {
+        if (!use.staticDummy && use.producer != InvalidNode && !live[use.producer]) {
+          live[use.producer] = true;
+          pending.push_back(use.producer);
+        }
+      }
+    }
+    for (NodeId i = 0; i < m_passCount; ++i) {
+      if (active(i) && !live[i]) {
+        disable(i, CullReason::NoConsumer,
+                fmt::format("render graph: nothing reads what '{}' writes; culled", m_graph.nodes[i].name));
+      }
+    }
     for (StageProgram& program : m_graph.stages) {
-      for (const NodeId node : program.nodes) {
+      std::erase_if(program.nodes, [&](NodeId node) { return !active(node); });
+    }
+    std::erase_if(m_graph.edges, [&](const Edge& edge) { return !active(edge.from) || !active(edge.to); });
+  }
+
+  [[nodiscard]] const CompiledUse* find_use(NodeId node, ResourceId resource) noexcept {
+    for (const CompiledUse& use : uses_of(node)) {
+      if (use.resource == resource) {
+        return &use;
+      }
+    }
+    return nullptr;
+  }
+
+  void collect_consumers(const std::vector<uint32_t>& position) {
+    std::vector<std::vector<NodeId>> lists(m_graph.nodes.size());
+    for (const StageProgram& program : m_graph.stages) {
+      for (const NodeId consumer : program.nodes) {
+        for (const CompiledUse& use : uses_of(consumer)) {
+          if (use.staticDummy || use.role == UseRole::Prev) {
+            continue;
+          }
+          // Reading a modified version depends on every writer of that version, not only the last one
+          for (NodeId producer = use.producer; producer != InvalidNode;) {
+            lists[producer].push_back(consumer);
+            const CompiledUse* written = find_use(producer, use.resource);
+            if (written == nullptr || !writes(written->access) || is_pure_write(*written)) {
+              break;
+            }
+            producer = written->producer;
+          }
+        }
+      }
+    }
+    for (size_t i = 0; i < lists.size(); ++i) {
+      auto& list = lists[i];
+      std::ranges::sort(list, {}, [&](NodeId node) { return std::pair{m_graph.nodes[node].stage, position[node]}; });
+      const auto duplicates = std::ranges::unique(list);
+      list.erase(duplicates.begin(), duplicates.end());
+      CompiledNode& node = m_graph.nodes[i];
+      node.firstConsumer = static_cast<uint32_t>(m_graph.consumers.size());
+      node.consumerCount = static_cast<uint32_t>(list.size());
+      m_graph.consumers.insert(m_graph.consumers.end(), list.begin(), list.end());
+    }
+  }
+
+  void finish_programs() {
+    std::vector<uint32_t> position(m_graph.nodes.size(), 0);
+    for (StageProgram& program : m_graph.stages) {
+      for (size_t i = 0; i < program.nodes.size(); ++i) {
+        const NodeId node = program.nodes[i];
+        position[node] = static_cast<uint32_t>(i);
         if (m_graph.nodes[node].kind == NodeKind::Pass) {
           m_graph.nodes[node].programIndex = static_cast<uint16_t>(program.passes.size());
           program.passes.push_back(node);
@@ -1879,22 +2133,43 @@ private:
         resource.textureUsage = resource.textureUsage | texture_usage(use.access);
       }
     }
-    for (size_t i = 0; i < m_graph.nodes.size(); ++i) {
-      CompiledNode& node = m_graph.nodes[i];
-      if (node.kind != NodeKind::Pass) {
-        node.sink = true;
-        continue;
+    for (const StageProgram& program : m_graph.stages) {
+      for (const NodeId node : program.passes) {
+        m_graph.hasNativePasses = m_graph.hasNativePasses || m_graph.nodes[node].passKind == PassKind::Native;
+        m_graph.nodes[node].frameSlot = static_cast<uint16_t>(m_graph.framePasses.size());
+        m_graph.framePasses.push_back(node);
       }
-      if (node.status != CullReason::None) {
-        continue;
-      }
-      m_graph.hasNativePasses = m_graph.hasNativePasses || node.passKind == PassKind::Native;
-      node.sink = node.sideEffect || (node.cls == PassClass::Diagnostic && m_inputs.env.inspectorOpen) ||
-                  std::ranges::any_of(uses_of(static_cast<NodeId>(i)), [&](const CompiledUse& use) {
-                    const ResourceKind kind = m_graph.resources[use.resource].kind;
-                    return writes(use.access) && kind != ResourceKind::Transient;
-                  });
     }
+    // Only histories something writes get a slot; a prev read of an ownerless one is a static dummy
+    for (size_t r = 0; r < m_graph.resources.size(); ++r) {
+      const CompiledResource& resource = m_graph.resources[r];
+      if (resource.kind == ResourceKind::History && resource.creator != InvalidNode && active(resource.creator)) {
+        m_graph.histories.push_back(static_cast<ResourceId>(r));
+      }
+    }
+    std::ranges::sort(m_graph.histories, {},
+                      [&](ResourceId r) -> std::string_view { return m_graph.resources[r].name; });
+    for (size_t h = 0; h < m_graph.histories.size(); ++h) {
+      m_graph.resources[m_graph.histories[h]].historySlot = static_cast<uint16_t>(h);
+    }
+    const GraphFeatures& features = m_inputs.env.limits.features;
+    for (StageProgram& program : m_graph.stages) {
+      uint32_t stageUse = 0;
+      for (const NodeId node : program.nodes) {
+        const bool chain = m_graph.nodes[node].kind != NodeKind::Pass;
+        for (CompiledUse& use : uses_of(node)) {
+          use.stageUse = stageUse++;
+          // A GX read cannot disable its chain node, so it always needs something to bind
+          const bool dummyable = use.staticDummy || chain || use.missing != Missing::DisablePass;
+          if ((use.role == UseRole::Use || use.role == UseRole::Prev) && reads(use.access) && dummyable) {
+            use.hasFallback = true;
+            use.fallback = dummy_key(m_graph, use, features);
+          }
+        }
+      }
+      program.useBits = stageUse;
+    }
+    collect_consumers(position);
   }
 
   void hash_graph() {
@@ -2273,6 +2548,138 @@ std::string_view resource_kind_name(ResourceKind kind) noexcept { return enum_na
 std::string_view cull_reason_name(CullReason reason) noexcept { return enum_name(CullReasonNames, reason); }
 
 std::string_view edge_kind_name(EdgeKind kind) noexcept { return enum_name(EdgeKindNames, kind); }
+
+DummyKey dummy_key(const CompiledGraph& graph, const CompiledUse& use, const GraphFeatures& features) noexcept {
+  DummyKey key{.color = use.missing == Missing::BindDummyWhite ? DummyColor::White : DummyColor::Black};
+  if (use.buffer) {
+    constexpr uint64_t Largest = 0xFFFFFFF0u;
+    const uint64_t size = std::min<uint64_t>(std::max<uint64_t>(16, use.options.dummySize), Largest);
+    key.buffer = true;
+    key.bufferSize = static_cast<uint32_t>((size + 15) & ~uint64_t{15});
+    return key;
+  }
+  const CompiledResource& resource = graph.resources[use.resource];
+  auto format = wgpu::TextureFormat::Undefined;
+  auto dimension = wgpu::TextureViewDimension::e2D;
+  if (resource.kind == ResourceKind::Gx) {
+    format = resource.tex.format != wgpu::TextureFormat::Undefined ? resource.tex.format : gx_fixed_format(resource.gx);
+  } else if (resource.described) {
+    format = resource.tex.format;
+    if (resource.tex.dimension == wgpu::TextureDimension::e3D) {
+      dimension = wgpu::TextureViewDimension::e3D;
+    } else if (resource.tex.depthOrLayers > 1) {
+      dimension = wgpu::TextureViewDimension::e2DArray;
+    }
+  }
+  key.dimension = use.options.dimension != wgpu::TextureViewDimension::Undefined ? use.options.dimension : dimension;
+  key.sampleType = use.options.sampleType != wgpu::TextureSampleType::Undefined
+                       ? use.options.sampleType
+                       : format_sample_type(format, features.float32Filterable);
+  if (use.access == Access::StorageRead) {
+    key.storageFormat = format != wgpu::TextureFormat::Undefined ? format : use.options.format;
+  }
+  return key;
+}
+
+void begin_frame_cull(const CompiledGraph& graph, FrameCullState& state) noexcept {
+  const size_t ranWords = bit_words(graph.framePasses.size());
+  const size_t historyWords = bit_words(graph.histories.size());
+  // Equal hashes give equal frame and history slots, so last frame's bits still describe this graph
+  if (!state.primed || state.graphHash != graph.graphHash || state.ran.size() != ranWords ||
+      state.prevValid.size() != historyWords) {
+    state.ran.assign(ranWords, 0);
+    state.prevValid.assign(historyWords, 0);
+    state.graphHash = graph.graphHash;
+    state.primed = true;
+    state.nextStage = 0;
+    state.cutStage = 0;
+    return;
+  }
+  for (size_t h = 0; h < graph.histories.size(); ++h) {
+    const CompiledResource& resource = graph.resources[graph.histories[h]];
+    bool valid = false;
+    if (resource.creator != InvalidNode) {
+      const CompiledNode& owner = graph.nodes[resource.creator];
+      // An owner culled before the cut wrote content the cut discards
+      valid = test_bit(state.ran, owner.frameSlot) && static_cast<uint8_t>(owner.stage) >= state.cutStage;
+    }
+    assign_bit(state.prevValid, h, valid);
+  }
+  std::ranges::fill(state.ran, 0);
+  state.nextStage = 0;
+  state.cutStage = 0;
+}
+
+void invalidate_histories(FrameCullState& state) noexcept {
+  std::ranges::fill(state.prevValid, 0);
+  state.cutStage = state.nextStage;
+}
+
+void cull_stage(const CompiledGraph& graph, Stage stage, std::span<const uint64_t> enabled, FrameCullState& state,
+                StageMask& out) {
+  assert(static_cast<uint8_t>(stage) >= state.nextStage);
+  const StageProgram& program = graph.stages[static_cast<size_t>(stage)];
+  out.passes.assign(bit_words(program.passes.size()), 0);
+  for (size_t i = 0; i < program.passes.size(); ++i) {
+    assign_bit(out.passes, i, test_bit(enabled, i));
+  }
+  out.dummies.assign(bit_words(program.useBits), 0);
+  out.prevValid = state.prevValid;
+  const auto turn_off = [&](NodeId nodeId) {
+    assign_bit(out.passes, graph.nodes[nodeId].programIndex, false);
+    for (const CompiledUse& use : graph.node_uses(nodeId)) {
+      assign_bit(out.dummies, use.stageUse, false);
+    }
+  };
+
+  for (const NodeId nodeId : program.nodes) {
+    const CompiledNode& node = graph.nodes[nodeId];
+    const bool chain = node.kind != NodeKind::Pass;
+    if (!chain && !test_bit(out.passes, node.programIndex)) {
+      continue;
+    }
+    bool on = true;
+    for (const CompiledUse& use : graph.node_uses(nodeId)) {
+      if (use.staticDummy) {
+        assign_bit(out.dummies, use.stageUse, true);
+        continue;
+      }
+      if (!input_missing(graph, use, stage, state, out)) {
+        continue;
+      }
+      if (!chain && (writes(use.access) || use.missing == Missing::DisablePass)) {
+        on = false;
+        break;
+      }
+      assign_bit(out.dummies, use.stageUse, true);
+    }
+    if (!on) {
+      turn_off(nodeId);
+    }
+  }
+
+  // Consumers in later stages are not culled yet, so they count as running
+  for (auto it = program.nodes.rbegin(); it != program.nodes.rend(); ++it) {
+    const CompiledNode& node = graph.nodes[*it];
+    if (node.kind != NodeKind::Pass || node.sink || !test_bit(out.passes, node.programIndex)) {
+      continue;
+    }
+    const auto consumers = std::span{graph.consumers}.subspan(node.firstConsumer, node.consumerCount);
+    const bool consumed = std::ranges::any_of(consumers, [&](NodeId consumerId) {
+      const CompiledNode& consumer = graph.nodes[consumerId];
+      return consumer.stage > stage || consumer.kind != NodeKind::Pass || test_bit(out.passes, consumer.programIndex);
+    });
+    if (!consumed) {
+      turn_off(*it);
+    }
+  }
+
+  for (const NodeId nodeId : program.passes) {
+    const CompiledNode& node = graph.nodes[nodeId];
+    assign_bit(state.ran, node.frameSlot, test_bit(out.passes, node.programIndex));
+  }
+  state.nextStage = static_cast<uint8_t>(static_cast<size_t>(stage) + 1);
+}
 
 namespace testing {
 void clear_passes() noexcept {
