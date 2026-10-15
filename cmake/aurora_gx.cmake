@@ -80,3 +80,5 @@ if (AURORA_ENABLE_RMLUI)
         lib/rmlui/pipeline.hpp
     )
 endif ()
+
+include(${CMAKE_CURRENT_LIST_DIR}/aurora_render.cmake)

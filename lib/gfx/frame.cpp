@@ -14,6 +14,7 @@
 #endif
 #include "../webgpu/gpu.hpp"
 #include "../webgpu/gpu_prof.hpp"
+#include "../render/module.hpp"
 
 #include <array>
 #include <atomic>
@@ -524,6 +525,7 @@ void initialize() {
   rmlui::initialize_pipeline();
 #endif
   initialize_pipeline_cache();
+  render::detail::initialize();
 }
 
 void shutdown() {
@@ -564,6 +566,7 @@ void shutdown() {
   for (auto& packet : g_framePackets) {
     packet = {};
   }
+  render::detail::shutdown();
   shutdown_recording();
   g_resources.staticBindGroup = {};
   g_resources.staticBindGroupLayout = {};

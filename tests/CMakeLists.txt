@@ -253,7 +253,8 @@ if (AURORA_ENABLE_GX)
     ../include
     ../lib
   )
-  target_compile_definitions(gfx_recording_tests PRIVATE AURORA TARGET_PC=1)
+  target_compile_definitions(gfx_recording_tests PRIVATE AURORA TARGET_PC=1
+    AURORA_ENABLE_RENDER=$<BOOL:${AURORA_ENABLE_RENDER}>)
   target_link_libraries(gfx_recording_tests PRIVATE
     aurora::gx
     aurora::vi
@@ -263,6 +264,28 @@ if (AURORA_ENABLE_GX)
   )
   aurora_copy_runtime_dlls(gfx_recording_tests)
   gtest_discover_tests(gfx_recording_tests)
+
+  add_executable(render_tests
+    render_api_test.cpp
+  )
+  target_include_directories(render_tests PRIVATE
+    ../include
+    ../lib
+  )
+  target_compile_definitions(render_tests PRIVATE AURORA TARGET_PC=1
+    AURORA_ENABLE_RENDER=$<BOOL:${AURORA_ENABLE_RENDER}>)
+  target_link_libraries(render_tests PRIVATE
+    aurora::gx
+    aurora::vi
+    gtest
+    gtest_main
+  )
+  if (AURORA_ENABLE_RENDER)
+    target_sources(render_tests PRIVATE render_json_test.cpp)
+    target_link_libraries(render_tests PRIVATE yyjson::yyjson)
+  endif ()
+  aurora_copy_runtime_dlls(render_tests)
+  gtest_discover_tests(render_tests)
 
   add_library(gx_shader_corpus_lib STATIC
     gx_shader_corpus.cpp

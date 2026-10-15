@@ -255,6 +255,23 @@ if (AURORA_ENABLE_GX)
     target_include_directories(sqlite3 PUBLIC ${sqlite3_SOURCE_DIR})
   endif ()
 
+  if (AURORA_ENABLE_RENDER AND NOT TARGET yyjson::yyjson)
+    message(STATUS "aurora: Fetching yyjson")
+    # src/ has no CMakeLists.txt, so FetchContent only downloads and the library stays static and uninstalled
+    FetchContent_Declare(yyjson
+      URL https://github.com/ibireme/yyjson/archive/refs/tags/0.12.0.tar.gz
+      URL_HASH SHA256=b16246f617b2a136c78d73e5e2647c6f1de1313e46678062985bdcf1f40bb75d
+      SOURCE_SUBDIR src
+      DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+      EXCLUDE_FROM_ALL
+    )
+    FetchContent_MakeAvailable(yyjson)
+    add_library(aurora_yyjson STATIC ${yyjson_SOURCE_DIR}/src/yyjson.c)
+    target_include_directories(aurora_yyjson SYSTEM PUBLIC ${yyjson_SOURCE_DIR}/src)
+    set_target_properties(aurora_yyjson PROPERTIES FOLDER "extern")
+    add_library(yyjson::yyjson ALIAS aurora_yyjson)
+  endif ()
+
   if (AURORA_CACHE_USE_ZSTD)
     aurora_find_package_global(zstd CONFIG QUIET)
     if (NOT TARGET zstd::libzstd)
