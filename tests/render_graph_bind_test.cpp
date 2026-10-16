@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -1050,6 +1051,95 @@ TEST_F(GraphBindTest, GxNormalWithoutTextureIsMissing) {
   ASSERT_EQ(identities.size(), 1u);
   EXPECT_EQ(identities[0].kind, IdentityKind::Dummy);
   EXPECT_EQ(count_logs(LOG_WARNING, "needs 'gx.normal'"), 1u);
+}
+
+// Null by default; hardware runs pick their backend from the environment
+class GraphBindDeviceTest : public GraphBindTest {
+protected:
+  GraphBindDeviceTest() {
+    m_options.backend = test::parse_test_backend(std::getenv("AURORA_TEST_BACKEND")).value_or(wgpu::BackendType::Null);
+    m_options.efbSize = {64, 64, 1};
+  }
+};
+
+TEST_F(GraphBindDeviceTest, GxNormalBufferBindsAsSampled) {
+  if (!webgpu::g_hasCoreFeatures) {
+    GTEST_SKIP() << "the normal buffer needs a core device";
+  }
+  push_validation_scope();
+  ASSERT_TRUE(webgpu::enable_normal_buffer());
+  ASSERT_EQ(pop_validation_scope(), std::nullopt);
+  const webgpu::TextureWithSampler& normal = webgpu::g_normalBuffer;
+  ASSERT_TRUE(normal.texture);
+  const wgpu::TextureUsage usage = normal.texture.GetUsage();
+  EXPECT_TRUE(usage & wgpu::TextureUsage::TextureBinding);
+  EXPECT_TRUE(usage & wgpu::TextureUsage::RenderAttachment);
+  EXPECT_TRUE(usage & wgpu::TextureUsage::CopySrc);
+
+  GraphInputs inputs = test_inputs();
+  const auto index = static_cast<size_t>(GxResource::Normal);
+  // The graph plans against the environment, so it has to describe the texture gpu.cpp made
+  EXPECT_EQ(inputs.env.gxFormats[index], normal.texture.GetFormat());
+  EXPECT_EQ(inputs.env.gxUsage[index], usage);
+
+  const std::string writeSource = std::string{R"(
+@fragment
+fn fs() -> @location(0) vec4<f32> {
+  return vec4<f32>(0.5, 0.5, 1.0, 1.0);
+}
+)"} + std::string{FullscreenVertexWgsl};
+  const std::string readSource = std::string{R"(
+@group(1) @binding(0) var nb_normal: texture_2d<f32>;
+
+@fragment
+fn fs(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+  return textureLoad(nb_normal, vec2<u32>(position.xy), 0);
+}
+)"} + std::string{FullscreenVertexWgsl};
+  std::vector<TestPass> passes{
+      {.name = "nb.write",
+       .kind = PassKind::Render,
+       .order = 0,
+       .declare = [](InternalPassBuilder& b) { b.use("gx.normal", Access::ColorRMW); }},
+      {.name = "nb.read",
+       .kind = PassKind::Render,
+       .order = 1,
+       .declare =
+           [](InternalPassBuilder& b) {
+             // A refused resolve then shows up as a dummy binding rather than a skipped pass
+             b.use("gx.normal", Access::Sampled, Missing::BindDummyBlack);
+             b.create("nb.out", absolute(TextureFormat::RGBA8Unorm), Access::ColorWrite);
+             b.side_effect();
+           }},
+  };
+  const auto draw = [](PassContext& ctx, const std::string& source, TexRef target) {
+    const wgpu::RenderPipeline pipeline = render_pipeline(ctx.pipeline_layout(), source, ctx.format(target));
+    const wgpu::RenderPassEncoder pass = ctx.begin_render();
+    pass.SetPipeline(pipeline);
+    pass.Draw(3);
+    pass.End();
+  };
+  passes[0].encode = [&](PassContext& ctx) { draw(ctx, writeSource, TexRef{0}); };
+  passes[1].encode = [&](PassContext& ctx) { draw(ctx, readSource, TexRef{1}); };
+  const TestFrame frame{compile(passes, inputs)};
+  ASSERT_EQ(frame.graph->nodes[frame.node("nb.write")].status, CullReason::None);
+  ASSERT_EQ(frame.graph->nodes[frame.node("nb.read")].status, CullReason::None);
+  EXPECT_EQ(frame.graph->bindingPlans[frame.node("nb.write")].colors.size(), 1u);
+  EXPECT_FALSE(frame.use("nb.read", 0).staticDummy);
+  const BindingPlan& plan = frame.graph->bindingPlans[frame.node("nb.read")];
+  ASSERT_EQ(plan.slots.size(), 1u);
+  EXPECT_EQ(plan.slots[0].type, BindingType::SampledTexture);
+  EXPECT_EQ(plan.slots[0].viewDimension, TextureViewDimension::e2D);
+  EXPECT_EQ(plan.slots[0].sampleType, TextureSampleType::Float);
+
+  ASSERT_EQ(run_frame(frame, 1), std::nullopt);
+  EXPECT_EQ(passes[0].calls, 1);
+  EXPECT_EQ(passes[1].calls, 1);
+  const auto identities = testing::last_identities(frame.node("nb.read"));
+  ASSERT_EQ(identities.size(), 1u);
+  EXPECT_EQ(identities[0].kind, IdentityKind::Gx);
+  EXPECT_EQ(identities[0].value, reinterpret_cast<uintptr_t>(normal.view.Get()));
+  EXPECT_EQ(count_logs(LOG_WARNING, "needs 'gx.normal'"), 0u);
 }
 
 TEST_F(GraphBindTest, LoadOpsFollowCreator) {
