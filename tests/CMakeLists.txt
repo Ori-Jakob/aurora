@@ -342,9 +342,11 @@ if (AURORA_ENABLE_GX)
       render_graph_slots_test.cpp
       render_graph_layout_test.cpp
       render_graph_dump_test.cpp
+      render_graph_api_test.cpp
       os_test_globals.cpp
       ../lib/logging.cpp
       ../lib/render/graph.cpp
+      ../lib/render/graph_api.cpp
       ../lib/render/graph_layout.cpp
       ../lib/render/graph_slots.cpp
       ../lib/render/debug/graph_dump.cpp
@@ -365,7 +367,7 @@ if (AURORA_ENABLE_GX)
     gtest_discover_tests(render_tlsf_tests)
 
     add_executable(render_gpu_tests render_test_device.cpp render_gpu_heap_test.cpp render_graph_pool_test.cpp
-      render_graph_bind_test.cpp render_graph_planned.cpp)
+      render_graph_bind_test.cpp render_graph_planned.cpp render_graph_api_gpu_test.cpp)
     target_include_directories(render_gpu_tests PRIVATE ../include ../lib)
     target_compile_definitions(render_gpu_tests PRIVATE AURORA TARGET_PC=1 AURORA_ENABLE_RENDER=1)
     target_link_libraries(render_gpu_tests PRIVATE aurora::gx aurora::vi gtest gtest_main)
@@ -440,6 +442,7 @@ endif () # AURORA_ENABLE_GX
 if (TARGET render_demo)
   add_executable(render_demo_tests
     render_demo_test.cpp
+    ../examples/render_demo/graph_checks.cpp
     ../examples/render_demo/options.cpp
     ../examples/render_demo/procedural.cpp
   )
@@ -464,6 +467,27 @@ if (TARGET render_demo)
     ENVIRONMENT "AURORA_TEST_STREAMING_GROWTH=30"
     PASS_REGULAR_EXPRESSION "Streaming buffers resized"
     FAIL_REGULAR_EXPRESSION "\\[(ERROR|FATAL): ")
+
+  if (AURORA_ENABLE_RENDER)
+    foreach (_profile IN ITEMS full compat metal metal32)
+      add_test(NAME render_demo_vignette_${_profile}
+        COMMAND $<TARGET_FILE:render_demo> --backend null --profile ${_profile} --frames 120 --timeout 60
+                --fail-on-error --vignette --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_vignette/${_profile})
+      set_tests_properties(render_demo_vignette_${_profile} PROPERTIES LABELS smoke TIMEOUT 180)
+    endforeach ()
+    add_test(NAME render_demo_vignette_msaa
+      COMMAND $<TARGET_FILE:render_demo> --backend null --profile metal --msaa 4 --frames 60 --timeout 60
+              --fail-on-error --vignette --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_vignette/msaa)
+    set_tests_properties(render_demo_vignette_msaa PROPERTIES LABELS smoke TIMEOUT 180)
+    add_test(NAME render_demo_vignette_unknown_anchor
+      COMMAND $<TARGET_FILE:render_demo> --backend null --frames 30 --timeout 60 --fail-on-error
+              --vignette-anchor phase.not_a_phase --expect-anchor-warnings 1
+              --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_vignette/unknown_anchor)
+    set_tests_properties(render_demo_vignette_unknown_anchor PROPERTIES LABELS smoke TIMEOUT 180)
+    add_test(NAME render_demo_rejects_vignette_with_trace
+      COMMAND $<TARGET_FILE:render_demo> --vignette --trace ${CMAKE_CURRENT_BINARY_DIR}/never.gxtrace)
+    set_tests_properties(render_demo_rejects_vignette_with_trace PROPERTIES WILL_FAIL TRUE)
+  endif ()
 endif ()
 
 if (TARGET aurora_gxreplay)

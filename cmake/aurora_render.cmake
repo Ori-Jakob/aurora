@@ -3,6 +3,7 @@ include(${CMAKE_CURRENT_LIST_DIR}/AuroraEmbedShaders.cmake)
 target_sources(aurora_gx PRIVATE
         lib/render/frame_state.hpp
         lib/render/graph.hpp
+        lib/render/graph_api.hpp
         lib/render/module.hpp
         lib/render/pass_context.hpp
         lib/render/phases.inl
@@ -24,6 +25,7 @@ if (AURORA_ENABLE_RENDER)
         lib/render/gpu_heap.cpp
         lib/render/gpu_heap.hpp
         lib/render/graph.cpp
+        lib/render/graph_api.cpp
         lib/render/graph_bind.cpp
         lib/render/graph_bind.hpp
         lib/render/graph_env.cpp
@@ -54,5 +56,6 @@ if (AURORA_ENABLE_RENDER)
     target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_RENDER=1)
     target_link_libraries(aurora_gx PRIVATE yyjson::yyjson)
 else ()
+    target_sources(aurora_gx PRIVATE lib/render/graph_api_off.cpp)
     target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_RENDER=0)
 endif ()

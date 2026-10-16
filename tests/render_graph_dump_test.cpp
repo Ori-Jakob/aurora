@@ -69,6 +69,7 @@ GraphInspection format_inspection() {
           .active = false,
           .cull = "NoConsumer",
           .detail = "no sink reachable",
+          .external = true,
           .reads = {{"gx.color", "Sampled", "DisablePass", "Resource"}},
           .writes = {{"test.tmp", "StorageWrite"}},
       },

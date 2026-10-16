@@ -54,6 +54,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": [
         {
@@ -103,6 +104,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -119,6 +121,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": [
         {
@@ -168,6 +171,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -184,6 +188,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -200,6 +205,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -216,6 +222,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": [
         {
@@ -237,6 +244,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -253,6 +261,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [
         {
           "resource": "test.tex",
@@ -281,6 +290,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -297,6 +307,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -313,6 +324,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -329,6 +341,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -345,6 +358,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -361,6 +375,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -377,6 +392,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -393,6 +409,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -409,6 +426,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -425,6 +443,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [
         {
           "resource": "test.buf",
@@ -453,6 +472,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": [
         {
@@ -502,6 +522,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": true,
+      "external": false,
       "reads": [
         {
           "resource": "test.absent2",
@@ -525,6 +546,7 @@
       "cull": "NoConsumer",
       "detail": "render graph: nothing reads what 'test.orphan' writes; culled",
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": [
         {
@@ -546,6 +568,7 @@
       "cull": "MissingInput",
       "detail": "render graph: 'test.missing' reads 'test.absent', which is not available; disabled",
       "sideEffect": true,
+      "external": false,
       "reads": [
         {
           "resource": "test.absent",
@@ -569,6 +592,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": [
         {
@@ -618,6 +642,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -634,6 +659,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -650,6 +676,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -666,6 +693,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": [
         {
@@ -715,6 +743,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -731,6 +760,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": [
         {
@@ -780,6 +810,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -796,6 +827,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": [
         {
@@ -845,6 +877,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -861,6 +894,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     }

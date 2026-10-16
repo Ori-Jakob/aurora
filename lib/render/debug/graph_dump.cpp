@@ -82,6 +82,7 @@ void write_pass(const Writer& w, yyjson_mut_val* passes, const InspectPass& pass
   w.add(obj, "cull", pass.cull);
   w.add(obj, "detail", pass.detail);
   w.add_bool(obj, "sideEffect", pass.sideEffect);
+  w.add_bool(obj, "external", pass.external);
   yyjson_mut_val* reads = w.add_array(obj, "reads");
   for (const InspectRead& read : pass.reads) {
     yyjson_mut_val* entry = w.append_object(reads);

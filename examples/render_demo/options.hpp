@@ -21,6 +21,11 @@ struct Options {
   uint32_t traceFrames = 4;
   bool failOnError = false;
   bool help = false;
+  bool vignette = false;
+  std::string vignetteAnchor;
+  uint32_t expectAnchorWarnings = 0;
+  bool expectAnchorWarningsSet = false;
+  uint32_t msaa = 1;
 };
 
 std::optional<AuroraBackend> parse_backend(std::string_view name) noexcept;

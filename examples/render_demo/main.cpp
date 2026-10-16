@@ -1,8 +1,11 @@
+#include "graph_checks.hpp"
+#include "graph_passes.hpp"
 #include "options.hpp"
 #include "scene.hpp"
 
 #include <aurora/aurora.h>
 #include <aurora/event.h>
+#include <aurora/gfx.hpp>
 #include <aurora/trace.hpp>
 #include <dolphin/gx.h>
 #include <SDL3/SDL_stdinc.h>
@@ -27,11 +30,16 @@ enum ExitCode : int {
   ExitBackendMismatch = 4,
   ExitSceneInit = 5,
   ExitTraceFailed = 6,
+  ExitRenderGraphCheck = 7,
 };
 
 std::atomic_uint32_t g_errorCount = 0;
+std::atomic_uint32_t g_anchorWarnings = 0;
 
 void log_callback(AuroraLogLevel level, const char* module, const char* message, unsigned int len) {
+  if (render_demo::is_unknown_anchor_warning(level, module != nullptr ? module : "", {message, len})) {
+    g_anchorWarnings.fetch_add(1, std::memory_order_relaxed);
+  }
   const char* levelStr = "INFO";
   FILE* out = stdout;
   switch (level) {
@@ -95,6 +103,7 @@ int main(int argc, char* argv[]) {
   config.windowPosY = -1;
   config.logCallback = &log_callback;
   config.logLevel = LOG_INFO;
+  config.msaa = options.msaa;
   const AuroraInfo info = aurora_initialize(argc, argv, &config);
   if (options.backend != BACKEND_AUTO && info.backend != options.backend) {
     std::fprintf(stderr, "render_demo: requested %.*s but got %.*s\n",
@@ -112,6 +121,13 @@ int main(int argc, char* argv[]) {
     std::fprintf(stderr, "render_demo: scene initialisation failed\n");
     aurora_shutdown();
     return ExitSceneInit;
+  }
+  if (std::string graphError; !render_demo::register_graph_passes(
+          {.vignette = options.vignette, .vignetteAnchor = options.vignetteAnchor}, graphError)) {
+    std::fprintf(stderr, "render_demo: render graph setup failed: %s\n", graphError.c_str());
+    render_demo::shutdown_scene();
+    aurora_shutdown();
+    return ExitRenderGraphCheck;
   }
 
   const auto start = std::chrono::steady_clock::now();
@@ -154,6 +170,8 @@ int main(int argc, char* argv[]) {
         return ExitTraceFailed;
       }
     }
+    // Params set before aurora_begin_frame apply to the frame it begins
+    render_demo::update_graph_passes(frame);
     if (exiting || paused || !aurora_begin_frame()) {
       continue;
     }
@@ -165,6 +183,11 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  // Every recorded frame has been encoded and its after-submit callbacks have run once this returns
+  aurora::gfx::synchronize();
+  render_demo::finish_graph_passes();
+  const auto graphReport = render_demo::graph_pass_report();
+  render_demo::unregister_graph_passes();
   render_demo::shutdown_scene();
   aurora_shutdown();
   const auto traceStatus = aurora::trace::capture_status();
@@ -175,8 +198,26 @@ int main(int argc, char* argv[]) {
   const auto backend = render_demo::backend_name(info.backend);
   std::printf("render_demo: %u frames on %.*s in %lld ms, %u errors\n", frame, static_cast<int>(backend.size()),
               backend.data(), static_cast<long long>(elapsed), errors);
+  const uint32_t anchorWarnings = g_anchorWarnings.load(std::memory_order_relaxed);
+  if (options.vignette) {
+    std::printf("render_demo: graph: vignette %u/%u encodes, %u unknown-anchor warnings\n", graphReport.vignetteEncodes,
+                frame, anchorWarnings);
+  }
   if (timedOut) {
     return ExitTimeout;
+  }
+  if (options.vignette) {
+    // Registered before frame 0's latch and counted after the final synchronize, so every frame encodes it
+    if (options.frames != 0 && graphReport.vignetteEncodes != frame) {
+      std::fprintf(stderr, "render_demo: demo.vignette encoded %u times in %u frames\n", graphReport.vignetteEncodes,
+                   frame);
+      return ExitRenderGraphCheck;
+    }
+    if (anchorWarnings != options.expectAnchorWarnings) {
+      std::fprintf(stderr, "render_demo: expected %u unknown-anchor warnings, got %u\n", options.expectAnchorWarnings,
+                   anchorWarnings);
+      return ExitRenderGraphCheck;
+    }
   }
   if (!options.tracePath.empty() && traceStatus.state != aurora::trace::CaptureState::Finished) {
     std::fprintf(stderr, "render_demo: trace capture did not finish: %s\n",

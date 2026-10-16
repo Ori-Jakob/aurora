@@ -18,8 +18,6 @@ namespace aurora::render::detail {
 struct StageData;
 struct BoundPass;
 
-inline constexpr uint32_t AllMips = UINT32_MAX;
-
 struct ColorTarget {
   TexRef ref;
   uint32_t mip = 0;
@@ -32,12 +30,6 @@ struct DepthTarget {
   uint32_t mip = 0;
   uint32_t layer = 0;
   std::optional<float> clear;
-};
-
-struct BufferView {
-  wgpu::Buffer buffer;
-  uint64_t offset = 0;
-  uint64_t size = 0;
 };
 
 class PassContext {

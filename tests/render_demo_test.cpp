@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "graph_checks.hpp"
 #include "options.hpp"
 #include "procedural.hpp"
 
@@ -7,6 +8,7 @@
 #include <cmath>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace render_demo;
@@ -188,4 +190,79 @@ TEST(RenderDemoOptions, ProfileNamesMatchAurora) {
   EXPECT_EQ(parse_profile("metal"), FEATURE_PROFILE_METAL);
   EXPECT_EQ(parse_profile("metal32"), FEATURE_PROFILE_METAL32);
   EXPECT_FALSE(parse_profile("auto"));
+}
+
+namespace {
+std::string parse_error(std::vector<const char*> args) {
+  args.insert(args.begin(), "render_demo");
+  std::string error;
+  EXPECT_FALSE(parse_options(static_cast<int>(args.size()), args.data(), nullptr, error));
+  return error;
+}
+} // namespace
+
+TEST(RenderDemoOptions, ParsesVignetteFlags) {
+  const auto defaults = parse({});
+  ASSERT_TRUE(defaults);
+  EXPECT_FALSE(defaults->vignette);
+  EXPECT_TRUE(defaults->vignetteAnchor.empty());
+  EXPECT_EQ(defaults->expectAnchorWarnings, 0u);
+  EXPECT_EQ(defaults->msaa, 1u);
+
+  const auto vignette = parse({"--vignette"});
+  ASSERT_TRUE(vignette);
+  EXPECT_TRUE(vignette->vignette);
+  EXPECT_TRUE(vignette->vignetteAnchor.empty());
+
+  const auto anchored = parse({"--vignette-anchor", "phase.ao", "--expect-anchor-warnings", "2"});
+  ASSERT_TRUE(anchored);
+  EXPECT_TRUE(anchored->vignette);
+  EXPECT_EQ(anchored->vignetteAnchor, "phase.ao");
+  EXPECT_EQ(anchored->expectAnchorWarnings, 2u);
+  EXPECT_FALSE(parse({"--vignette-anchor", ""}));
+  EXPECT_FALSE(parse({"--vignette", "--expect-anchor-warnings", "x"}));
+}
+
+TEST(RenderDemoOptions, RejectsExpectWarningsWithoutVignette) {
+  EXPECT_EQ(parse_error({"--expect-anchor-warnings", "1"}), "--expect-anchor-warnings needs --vignette");
+  EXPECT_TRUE(parse({"--expect-anchor-warnings", "1", "--vignette"}));
+}
+
+TEST(RenderDemoOptions, RejectsGraphPassesWithTrace) {
+  EXPECT_EQ(parse_error({"--vignette", "--trace", "x"}), "render graph passes cannot be traced");
+  EXPECT_EQ(parse_error({"--trace", "x", "--vignette-anchor", "phase.ao"}), "render graph passes cannot be traced");
+}
+
+TEST(RenderDemoOptions, ParsesMsaa) {
+  for (const char* samples : {"1", "4"}) {
+    const auto options = parse({"--msaa", samples});
+    ASSERT_TRUE(options) << samples;
+    EXPECT_EQ(options->msaa, static_cast<uint32_t>(std::stoul(samples)));
+  }
+  for (const char* samples : {"0", "2", "8", "x"}) {
+    EXPECT_FALSE(parse({"--msaa", samples})) << samples;
+  }
+}
+
+TEST(RenderDemoGraph, VignetteParamsDeterministic) {
+  const VignetteParams first = vignette_params(0);
+  EXPECT_NEAR(first.strength, 0.45f, 1e-6f);
+  EXPECT_NEAR(vignette_params(240).strength, first.strength, 1e-6f);
+  EXPECT_NEAR(vignette_params(300).strength, vignette_params(60).strength, 1e-6f);
+  for (u32 frame = 0; frame < 480; ++frame) {
+    const VignetteParams params = vignette_params(frame);
+    EXPECT_GE(params.strength, 0.30f - 1e-6f) << frame;
+    EXPECT_LE(params.strength, 0.60f + 1e-6f) << frame;
+    EXPECT_LT(params.inner, params.outer) << frame;
+    EXPECT_EQ(params.pad, 0.f) << frame;
+  }
+}
+
+TEST(RenderDemoGraph, UnknownAnchorMatcher) {
+  constexpr std::string_view Line =
+      "render graph: 'demo.vignette' has unknown anchor 'phase.nope' in BeforeHud; ignored";
+  EXPECT_TRUE(is_unknown_anchor_warning(LOG_WARNING, "aurora::render::graph", Line));
+  EXPECT_FALSE(is_unknown_anchor_warning(LOG_WARNING, "aurora::render", Line));
+  EXPECT_FALSE(is_unknown_anchor_warning(LOG_INFO, "aurora::render::graph", Line));
+  EXPECT_FALSE(is_unknown_anchor_warning(LOG_WARNING, "aurora::render::graph", "render graph: 'demo.vignette' culled"));
 }

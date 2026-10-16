@@ -4,6 +4,11 @@
 
 #include "gx/fifo.hpp"
 #include "gx/guest_memory.hpp"
+#if AURORA_ENABLE_RENDER
+#include "render/graph_api.hpp"
+
+#include <aurora/render_graph.hpp>
+#endif
 #include "trace/capture.hpp"
 #include "trace/trace_reader.hpp"
 #include "webgpu/gpu.hpp"
@@ -111,6 +116,42 @@ TEST_F(TraceCapture, UntraceableCallDiscardsTrace) {
   EXPECT_EQ(gx::guest_memory::g_hooks.load(), nullptr);
   EXPECT_FALSE(is_capturing());
 }
+
+#if AURORA_ENABLE_RENDER
+class TraceCaptureWithExternal : public TraceCapture {
+protected:
+  void TearDown() override {
+    TraceCapture::TearDown();
+    render::detail::testing::reset_external_passes();
+  }
+
+  static void declare_sink(render::PassBuilder& builder, void*) { builder.side_effect(); }
+
+  static void encode_nothing(render::PassContext&, void*) {}
+};
+
+TEST_F(TraceCaptureWithExternal, ExternalPassDiscardsCapture) {
+  const auto path = temp_trace("capture_external");
+  ASSERT_TRUE(start_capture({.path = path, .frameCount = 2}));
+  ASSERT_NE(render::register_pass({
+                .name = "demo.test",
+                .kind = render::PassKind::Compute,
+                .declare = declare_sink,
+                .encode = encode_nothing,
+            }),
+            render::InvalidPass);
+  render::detail::latch_external_passes();
+  run_frame();
+
+  const auto status = capture_status();
+  EXPECT_NE(status.state, CaptureState::Finished);
+  EXPECT_NE(status.error.find("render graph pass demo.test"), std::string::npos) << status.error;
+  EXPECT_FALSE(std::filesystem::exists(path));
+  EXPECT_EQ(gx::guest_memory::g_hooks.load(), nullptr);
+  EXPECT_EQ(gx::fifo::process_observer(), nullptr);
+  EXPECT_FALSE(is_capturing());
+}
+#endif
 
 TEST_F(TraceCapture, StopWhilePendingCancels) {
   const auto path = temp_trace("capture_cancel");

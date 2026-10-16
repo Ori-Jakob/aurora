@@ -1,6 +1,10 @@
 include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/AuroraCopyRuntimeDLLs.cmake)
 
 add_executable(render_demo
+  graph_checks.cpp
+  graph_checks.hpp
+  graph_passes.cpp
+  graph_passes.hpp
   main.cpp
   options.cpp
   options.hpp

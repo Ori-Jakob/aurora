@@ -125,13 +125,46 @@ bool apply_help(Options& options, std::string_view) {
   return true;
 }
 
+bool apply_vignette(Options& options, std::string_view) {
+  options.vignette = true;
+  return true;
+}
+
+bool apply_vignette_anchor(Options& options, std::string_view value) {
+  if (value.empty()) {
+    return false;
+  }
+  options.vignette = true;
+  options.vignetteAnchor = value;
+  return true;
+}
+
+bool apply_expect_anchor_warnings(Options& options, std::string_view value) {
+  const auto count = parse_u32(value);
+  if (count) {
+    options.expectAnchorWarnings = *count;
+    options.expectAnchorWarningsSet = true;
+  }
+  return count.has_value();
+}
+
+bool apply_msaa(Options& options, std::string_view value) {
+  // WebGPU allows only 1 and 4 samples
+  const auto samples = parse_u32(value);
+  if (!samples || (*samples != 1 && *samples != 4)) {
+    return false;
+  }
+  options.msaa = *samples;
+  return true;
+}
+
 struct Flag {
   std::string_view name;
   bool takesValue;
   bool (*apply)(Options& options, std::string_view value);
 };
 
-constexpr std::array<Flag, 12> Flags{{
+constexpr std::array<Flag, 16> Flags{{
     {"--frames", true, apply_frames},
     {"--timeout", true, apply_timeout},
     {"--backend", true, apply_backend},
@@ -142,6 +175,10 @@ constexpr std::array<Flag, 12> Flags{{
     {"--trace-start", true, apply_trace_start},
     {"--trace-frames", true, apply_trace_frames},
     {"--fail-on-error", false, apply_fail_on_error},
+    {"--vignette", false, apply_vignette},
+    {"--vignette-anchor", true, apply_vignette_anchor},
+    {"--expect-anchor-warnings", true, apply_expect_anchor_warnings},
+    {"--msaa", true, apply_msaa},
     {"-h", false, apply_help},
     {"--help", false, apply_help},
 }};
@@ -217,6 +254,15 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
     error = "--frames must cover the trace window";
     return std::nullopt;
   }
+  if (options.expectAnchorWarningsSet && !options.vignette) {
+    error = "--expect-anchor-warnings needs --vignette";
+    return std::nullopt;
+  }
+  // Graph passes record GPU work outside the GX FIFO, so the capture would be discarded
+  if (options.vignette && !options.tracePath.empty()) {
+    error = "render graph passes cannot be traced";
+    return std::nullopt;
+  }
   return options;
 }
 
@@ -233,6 +279,12 @@ std::string_view usage() noexcept {
          "  --trace-start N     first frame to capture (default 2)\n"
          "  --trace-frames N    number of frames to capture (default 4)\n"
          "  --fail-on-error     exit with code 3 if any error is logged\n"
+         "  --vignette          register the demo.vignette render graph pass\n"
+         "  --vignette-anchor NAME\n"
+         "                      anchor demo.vignette after NAME (implies --vignette)\n"
+         "  --expect-anchor-warnings N\n"
+         "                      exit with code 7 unless N unknown-anchor warnings are logged (default 0)\n"
+         "  --msaa N            EFB sample count, 1 or 4 (default 1)\n"
          "  -h, --help          show this message\n";
 }
 } // namespace render_demo

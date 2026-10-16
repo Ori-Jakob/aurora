@@ -2,6 +2,7 @@
 
 #include <aurora/aurora.h>
 #include <aurora/render.hpp>
+#include <aurora/render_graph.hpp>
 #include <webgpu/webgpu_cpp.h>
 
 #include <array>
@@ -23,6 +24,22 @@ namespace aurora::render::detail {
 struct StageData;
 class PassContext;
 struct NativeContext;
+struct ExternalPassSet;
+
+using render::Access;
+using render::AllMips;
+using render::BufDesc;
+using render::BufferView;
+using render::BufRef;
+using render::FrameBinding;
+using render::FrameConstants;
+using render::FrameFlagMultisampled;
+using render::FrameFlagReversedZ;
+using render::Missing;
+using render::PassKind;
+using render::SizeClass;
+using render::TexDesc;
+using render::TexRef;
 
 enum class GxResource : uint8_t {
 #define AURORA_RENDER_GX(id, label, format) id,
@@ -32,6 +49,25 @@ enum class GxResource : uint8_t {
 inline constexpr size_t GxResourceCount = 8;
 inline constexpr size_t ChainNodeCount = 28;
 
+// Public phase names and stage scheduling both rely on these rows following Stage order
+constexpr bool chain_rows_follow_stages() noexcept {
+  constexpr std::array rows{
+#define AURORA_RENDER_NODE(stage, kind, name) Stage::stage,
+#include "phases.inl"
+#undef AURORA_RENDER_NODE
+  };
+  size_t next = 0;
+  for (const Stage stage : rows) {
+    const auto index = static_cast<size_t>(stage);
+    if (index != next && index + 1 != next) {
+      return false;
+    }
+    next = index + 1;
+  }
+  return rows.size() == ChainNodeCount && next == StageCount;
+}
+static_assert(chain_rows_follow_stages());
+
 enum class ChainKind : uint8_t { Gx, Phase, Overlay };
 
 struct ChainNode {
@@ -40,34 +76,14 @@ struct ChainNode {
   std::string_view name;
 };
 
-enum class Access : uint8_t {
-  Sampled,
-  Uniform,
-  StorageRead,
-  StorageWrite,
-  StorageRW,
-  ColorWrite,
-  ColorRMW,
-  DepthRead,
-  DepthWrite,
-  CopySrc,
-  CopyDst,
-  Vertex,
-  Index,
-  Indirect,
-};
-
 constexpr bool binds(Access access) noexcept {
   return access == Access::Sampled || access == Access::Uniform || access == Access::StorageRead ||
          access == Access::StorageWrite || access == Access::StorageRW;
 }
 
-enum class Missing : uint8_t { DisablePass, BindDummyBlack, BindDummyWhite };
-enum class PassKind : uint8_t { Compute, Render, Copy, Encoder, Native };
 enum class PassClass : uint8_t { Required, Optional, Diagnostic };
 enum class Owner : uint8_t { Dawn, NativeD3D12 };
 enum class ResourceKind : uint8_t { Transient, History, Persistent, Gx, External };
-enum class SizeClass : uint8_t { Absolute, Efb, Output };
 enum class UseRole : uint8_t { Create, History, Use, Prev, Import, GxWrite };
 enum class NodeKind : uint8_t { Pass, Gx, Phase, Overlay };
 enum class EdgeKind : uint8_t { Chain, Bound, Anchor, Raw, War, Waw };
@@ -111,27 +127,6 @@ struct PersistentHandle {
   bool operator==(const PersistentHandle&) const = default;
 };
 
-struct TexDesc {
-  wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
-  wgpu::TextureDimension dimension = wgpu::TextureDimension::e2D;
-  SizeClass sizeClass = SizeClass::Efb;
-  uint32_t width = 0;
-  uint32_t height = 0;
-  uint32_t depthOrLayers = 1;
-  uint16_t divisor = 1;
-  uint32_t mips = 1;
-  wgpu::TextureUsage extraUsage = wgpu::TextureUsage::None;
-  bool operator==(const TexDesc&) const = default;
-};
-
-struct BufDesc {
-  uint64_t size = 0;
-  SizeClass sizeClass = SizeClass::Absolute;
-  uint32_t bytesPerTexel = 0;
-  uint16_t divisor = 1;
-  wgpu::BufferUsage extraUsage = wgpu::BufferUsage::None;
-};
-
 struct UseOptions {
   Missing missing = Missing::DisablePass;
   wgpu::ShaderStage visibility = wgpu::ShaderStage::None;
@@ -139,16 +134,6 @@ struct UseOptions {
   wgpu::TextureSampleType sampleType = wgpu::TextureSampleType::Undefined;
   wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
   uint32_t dummySize = 256;
-};
-
-struct TexRef {
-  uint16_t index = 0xFFFF;
-  bool valid() const noexcept { return index != 0xFFFF; }
-};
-
-struct BufRef {
-  uint16_t index = 0xFFFF;
-  bool valid() const noexcept { return index != 0xFFFF; }
 };
 
 struct GraphFeatures {
@@ -248,6 +233,7 @@ struct PassDesc {
   uint16_t order = 0;
   bool runsWithoutMarker = false;
   uint32_t paramsSize = 0;
+  bool external = false;
   PassDeclareFn declare = nullptr;
   PassEnabledFn enabled = nullptr;
   PassEncodeFn encode = nullptr;
@@ -281,6 +267,7 @@ struct GraphInputs {
   const Settings* settings = nullptr;
   const Caps* caps = nullptr;
   GraphEnvironment env;
+  std::shared_ptr<const ExternalPassSet> externals;
 };
 
 struct DummyKey {
@@ -344,6 +331,7 @@ struct CompiledNode {
   bool sideEffect = false;
   bool manualBindings = false;
   bool runsWithoutMarker = false;
+  bool external = false;
   bool sink = false;
   uint32_t firstUse = 0;
   uint32_t useCount = 0;
@@ -500,6 +488,7 @@ struct CompiledGraph {
   std::vector<Diagnostic> diagnostics;
   std::vector<BindingPlan> bindingPlans;
   SlotPlan slots;
+  std::shared_ptr<const ExternalPassSet> externals;
 
   [[nodiscard]] bool stage_empty(Stage stage) const noexcept {
     return stages[static_cast<size_t>(stage)].passes.empty();
@@ -533,41 +522,51 @@ inline const std::shared_ptr<const CompiledGraph>& empty_graph() noexcept {
 
 struct GraphBuild;
 
-class InternalPassBuilder {
+struct PassBuilderState {
+  GraphBuild* build = nullptr;
+  NodeId node = InvalidNode;
+  bool gxReadsOnly = false;
+  bool external = false;
+  std::string_view prefix;
+  Stage stage = Stage::SceneBegin;
+  PassKind kind = PassKind::Compute;
+};
+
+class InternalPassBuilder : public PassBuilder {
 public:
-  TexRef create(std::string_view name, const TexDesc& desc, Access access);
-  BufRef create_buffer(std::string_view name, const BufDesc& desc, Access access);
-  TexRef history(std::string_view name, const TexDesc& desc, Access access);
-  TexRef use(std::string_view name, Access access, Missing missing = Missing::DisablePass);
+  using PassBuilder::use;
+  using PassBuilder::use_buffer;
+
   TexRef use(std::string_view name, Access access, const UseOptions& options);
   TexRef use_prev(std::string_view name, Missing missing = Missing::BindDummyBlack);
-  BufRef use_buffer(std::string_view name, Access access, Missing missing = Missing::DisablePass);
   BufRef use_buffer(std::string_view name, Access access, const UseOptions& options);
   BufRef import_persistent(std::string_view name, PersistentHandle handle, Access access, Owner owner = Owner::Dawn);
   TexRef import_persistent_texture(std::string_view name, PersistentHandle handle, const TexDesc& desc, Access access,
                                    Owner owner = Owner::Dawn);
-  void after(std::string_view passOrPhase);
-  void before(std::string_view passOrPhase);
-  void side_effect();
-  void manual_bindings();
   void skip();
   std::span<std::byte, PassLocalSize> local() noexcept;
 
 private:
   friend struct GraphBuild;
-  InternalPassBuilder(GraphBuild& build, NodeId node, bool gxReadsOnly) noexcept;
-  GraphBuild* m_build;
-  NodeId m_node;
-  bool m_gxReadsOnly;
+  friend void external_declare(InternalPassBuilder& builder, const PassSetup& setup, const void* state);
+  explicit InternalPassBuilder(PassBuilderState& state) noexcept : PassBuilder(state) {}
 };
+
+void external_declare(InternalPassBuilder& builder, const PassSetup& setup, const void* state);
 
 struct ColorTargetCost {
   uint32_t bytes = 0;
   uint32_t alignment = 1;
 };
 
+struct LatchGraphInputs {
+  std::shared_ptr<const ExternalPassSet> externals;
+  PassEncodeFn externalEncode = nullptr;
+};
+
 std::shared_ptr<CompiledGraph> compile_graph(const GraphInputs& inputs);
-std::shared_ptr<CompiledGraph> compile_graph(const Settings& settings, const Caps& caps, const GraphEnvironment& env);
+std::shared_ptr<CompiledGraph> compile_graph(const Settings& settings, const Caps& caps, const GraphEnvironment& env,
+                                             const LatchGraphInputs& latch = {});
 GraphEnvironment gather_graph_environment();
 GraphLimits graph_limits(const wgpu::Limits& limits, const wgpu::CompatibilityModeLimits& compat,
                          const GraphFeatures& features) noexcept;

@@ -1,6 +1,7 @@
 #include "graph_bind.hpp"
 
 #include "frame_state.hpp"
+#include "graph_api.hpp"
 #include "graph_pool.hpp"
 #include "graph_slots.hpp"
 #include "shaders.hpp"
@@ -464,8 +465,12 @@ struct FrameConstantsPush {
 
 FrameConstantsPush g_frameConstants;
 
+// Render worker only; every encode of a frame comes before that frame's after-frame point
+std::vector<gfx::AfterSubmitCallback> g_afterFrame;
+
 void reset_worker_state() {
   g_worker = {};
+  g_afterFrame.clear();
   g_stats.entries.store(0, std::memory_order_relaxed);
   g_stats.staleEntries.store(0, std::memory_order_relaxed);
   g_stats.created.store(0, std::memory_order_relaxed);
@@ -893,7 +898,27 @@ constexpr bool creator_write(const CompiledUse& use) noexcept {
 constexpr bool owned_elsewhere(ResourceKind kind) noexcept {
   return kind == ResourceKind::Gx || kind == ResourceKind::Persistent;
 }
+
+bool targets_gx_color(const PassContext& ctx, TexRef ref) noexcept {
+  const CompiledGraph* graph = ctx.stage_data().frame != nullptr ? ctx.stage_data().frame->graph.get() : nullptr;
+  const CompiledNode& node = ctx.pass();
+  if (graph == nullptr || ref.index >= node.useCount) {
+    return false;
+  }
+  const CompiledResource& resource = graph->resources[graph->uses[node.firstUse + ref.index].resource];
+  return resource.kind == ResourceKind::Gx && resource.gx == GxResource::Color;
+}
+
+class ExternalPassContext final : public render::PassContext {
+public:
+  explicit ExternalPassContext(PassContextState& state) noexcept : render::PassContext(state) {}
+};
 } // namespace
+
+struct PassContextState {
+  PassContext& ctx;
+  const ExternalNodeState& node;
+};
 
 const wgpu::BindGroupLayout& frame_layout() {
   std::lock_guard lock{g_shared.mutex};
@@ -1157,7 +1182,15 @@ void build_stage_bindings(StageData& stage, UniformSink sink) {
         .node = program.passes[i],
         .size = static_cast<uint16_t>(size),
     });
-    const std::span<const std::byte> latched = latched_pass_params(node.id);
+    // Internal and external ids come from separate registries and can be equal
+    std::span<const std::byte> latched;
+    if (node.external) {
+      if (const LatchedExternalPass* external = latched_external_pass(node.id)) {
+        latched = std::span{external->params}.first(std::min<size_t>(external->paramsSize, size));
+      }
+    } else {
+      latched = latched_pass_params(node.id);
+    }
     std::copy_n(latched.begin(), std::min<size_t>(latched.size(), size), params.bytes.begin());
     params.uniformOffset = sink(reinterpret_cast<const uint8_t*>(params.bytes.data()), params.bytes.size()).offset;
   }
@@ -1210,6 +1243,40 @@ bool encode_pass(const wgpu::CommandEncoder& cmd, const StageData& stage, NodeId
 #endif
   return true;
 }
+
+void external_encode(PassContext& ctx, const void* state) {
+  const auto& node = *static_cast<const ExternalNodeState*>(state);
+  if (!external_pass_alive(node.id)) {
+    return;
+  }
+  PassContextState contextState{ctx, node};
+  ExternalPassContext external{contextState};
+  node.desc.encode(external, node.desc.userdata);
+  if (node.desc.afterSubmit != nullptr) {
+    queue_after_frame([id = node.id, callback = node.desc.afterSubmit, userdata = node.desc.userdata,
+                       frame = ctx.stage_data().frameIndex] {
+      if (external_pass_alive(id)) {
+        callback(frame, userdata);
+      }
+    });
+  }
+}
+
+void queue_after_frame(gfx::AfterSubmitCallback callback) { g_afterFrame.push_back(std::move(callback)); }
+
+void run_after_frame_callbacks() noexcept {
+  if (g_afterFrame.empty()) {
+    return;
+  }
+  const std::vector<gfx::AfterSubmitCallback> callbacks = std::exchange(g_afterFrame, {});
+  for (const auto& callback : callbacks) {
+    if (callback) {
+      callback();
+    }
+  }
+}
+
+void clear_after_frame_callbacks() noexcept { g_afterFrame.clear(); }
 
 Stage PassContext::stage() const noexcept { return m_stage.stage; }
 
@@ -1520,3 +1587,52 @@ bool frame_objects_created() noexcept {
 }
 } // namespace testing
 } // namespace aurora::render::detail
+
+namespace aurora::render {
+Stage PassContext::stage() const noexcept { return m_state->ctx.stage(); }
+
+std::string_view PassContext::name() const noexcept { return m_state->ctx.name(); }
+
+uint32_t PassContext::frame() const noexcept { return m_state->ctx.stage_data().frameIndex; }
+
+std::span<const std::byte> PassContext::params() const noexcept { return m_state->ctx.params(); }
+
+const wgpu::Device& PassContext::device() const noexcept { return m_state->ctx.device(); }
+
+const wgpu::CommandEncoder& PassContext::encoder() const noexcept { return m_state->ctx.encoder(); }
+
+wgpu::ComputePassEncoder PassContext::begin_compute() { return m_state->ctx.begin_compute(); }
+
+wgpu::RenderPassEncoder PassContext::begin_render() { return m_state->ctx.begin_render(); }
+
+wgpu::Texture PassContext::texture(TexRef ref) const { return m_state->ctx.texture(ref); }
+
+wgpu::TextureView PassContext::view(TexRef ref, uint32_t mip) const { return m_state->ctx.view(ref, mip); }
+
+wgpu::TextureView PassContext::prev(TexRef ref) const { return m_state->ctx.prev(ref); }
+
+bool PassContext::prev_valid(TexRef ref) const noexcept { return m_state->ctx.prev_valid(ref); }
+
+BufferView PassContext::buffer(BufRef ref) const { return m_state->ctx.buffer(ref); }
+
+wgpu::Extent3D PassContext::extent(TexRef ref) const { return m_state->ctx.extent(ref); }
+
+wgpu::TextureFormat PassContext::format(TexRef ref) const { return m_state->ctx.format(ref); }
+
+uint32_t PassContext::sample_count(TexRef ref) const { return m_state->ctx.sample_count(ref); }
+
+wgpu::ColorTargetState PassContext::color_target(TexRef ref) const {
+  // EFB alpha belongs to the game (destination-alpha blends and EFB copies read it), so gx.color writes keep it
+  const wgpu::ColorWriteMask mask =
+      detail::targets_gx_color(m_state->ctx, ref)
+          ? wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue
+          : wgpu::ColorWriteMask::All;
+  return {.format = format(ref), .blend = nullptr, .writeMask = mask};
+}
+
+const wgpu::BindGroupLayout& PassContext::frame_layout() const noexcept { return m_state->ctx.frame_layout(); }
+
+const wgpu::BindGroupLayout& PassContext::pass_layout() const noexcept { return m_state->ctx.pass_layout(); }
+
+const wgpu::PipelineLayout& PassContext::pipeline_layout() const noexcept { return m_state->ctx.pipeline_layout(); }
+} // namespace aurora::render

@@ -54,6 +54,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": [
         {
@@ -75,6 +76,7 @@
       "cull": null,
       "detail": null,
       "sideEffect": false,
+      "external": false,
       "reads": [],
       "writes": []
     },
@@ -91,6 +93,7 @@
       "cull": "NoConsumer",
       "detail": "no sink reachable",
       "sideEffect": false,
+      "external": true,
       "reads": [
         {
           "resource": "gx.color",

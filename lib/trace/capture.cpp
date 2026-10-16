@@ -14,6 +14,7 @@
 #include "../gx/gx.hpp"
 #include "../internal.hpp"
 #include "../io.hpp"
+#include "../render/graph_api.hpp"
 #include "../webgpu/gpu.hpp"
 
 #include <fmt/format.h>
@@ -213,6 +214,15 @@ void on_frame_begin() noexcept {
   const auto config = current_render_config();
   g_frameViSize = {config.viFbWidth, config.viEfbHeight};
   g_session.begin_frame(gfx::current_frame(), config);
+
+  // The latch has just run, and stages flushed at finish run after on_frame_end commits the frame
+  if (g_abortReason.empty()) {
+    if (const auto pass = render::detail::untraceable_external_pass(); !pass.empty()) {
+      g_abortReason = fmt::format("render graph pass {} records GPU work outside the GX FIFO; trace discarded", pass);
+      g_status.error = g_abortReason;
+      Log.warn("{}", g_abortReason);
+    }
+  }
 }
 
 void on_frame_end() noexcept {

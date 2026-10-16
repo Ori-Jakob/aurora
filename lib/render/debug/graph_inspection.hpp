@@ -35,6 +35,7 @@ struct InspectPass {
   std::optional<std::string> cull;
   std::optional<std::string> detail;
   bool sideEffect = false;
+  bool external = false;
   std::vector<InspectRead> reads;
   std::vector<InspectWrite> writes;
 };

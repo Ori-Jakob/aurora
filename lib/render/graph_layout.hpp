@@ -15,27 +15,8 @@ inline constexpr uint32_t FrameGroupIndex = 0;
 inline constexpr uint32_t PassGroupIndex = 1;
 inline constexpr uint32_t FrameUniformsSize = 256;
 inline constexpr uint32_t MaxPassParamsSize = static_cast<uint32_t>(gfx::InlineDrawPayloadSize);
+static_assert(MaxPassParamsSize == render::MaxPassParamsSize);
 
-enum class FrameBinding : uint32_t {
-  Constants = 0,
-  Params = 1,
-  LinearClamp = 2,
-  NearestClamp = 3,
-  LinearRepeat = 4,
-  DepthCompare = 5,
-};
-
-struct FrameConstants {
-  uint32_t efbSize[2];
-  uint32_t outputSize[2];
-  float invEfbSize[2];
-  float invOutputSize[2];
-  uint32_t frameIndex;
-  uint32_t flags;
-  uint32_t msaaSamples;
-  uint32_t pad0;
-};
-static_assert(sizeof(FrameConstants) == 48);
 static_assert(offsetof(FrameConstants, invEfbSize) == 16);
 static_assert(offsetof(FrameConstants, frameIndex) == 32);
 
@@ -44,9 +25,6 @@ struct FrameUniforms {
   std::array<uint32_t, 52> reserved{};
 };
 static_assert(sizeof(FrameUniforms) == FrameUniformsSize);
-
-inline constexpr uint32_t FrameFlagReversedZ = 1u << 0;
-inline constexpr uint32_t FrameFlagMultisampled = 1u << 1;
 
 std::span<const wgpu::BindGroupLayoutEntry> frame_layout_entries() noexcept;
 

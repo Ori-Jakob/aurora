@@ -160,6 +160,10 @@ void before_submit(const FrameState* frame) noexcept {
 }
 
 void after_frame(const FrameState* frame) noexcept {
+#if AURORA_ENABLE_RENDER
+  // The stage that queued these has no frame packet, so this is its only after-submit point
+  run_after_frame_callbacks();
+#endif
   if (!has_native_passes(frame)) {
     return;
   }

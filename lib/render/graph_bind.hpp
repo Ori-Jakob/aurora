@@ -5,6 +5,8 @@
 #include "graph_layout.hpp"
 #include "pass_context.hpp"
 
+#include "../gfx/types.hpp"
+
 #include <aurora/gfx.hpp>
 #include <webgpu/webgpu_cpp.h>
 
@@ -95,6 +97,11 @@ using UniformSink = gfx::Range (*)(const uint8_t* data, size_t length);
 void build_stage_bindings(StageData& stage, UniformSink sink = nullptr);
 
 bool encode_pass(const wgpu::CommandEncoder& cmd, const StageData& stage, NodeId node);
+
+void external_encode(PassContext& ctx, const void* state);
+void queue_after_frame(gfx::AfterSubmitCallback callback);
+void run_after_frame_callbacks() noexcept;
+void clear_after_frame_callbacks() noexcept;
 
 namespace testing {
 struct AttachmentOps {

@@ -2,6 +2,7 @@
 
 #include "frame_state.hpp"
 #include "gpu_heap.hpp"
+#include "graph_api.hpp"
 #include "graph_bind.hpp"
 #include "graph_pool.hpp"
 #include "jobs.hpp"
@@ -79,6 +80,9 @@ void quiesce() noexcept {
 
 void shutdown() noexcept {
 #if AURORA_ENABLE_RENDER
+  // Game registrations are dropped first so no callback can reach anything torn down below
+  shutdown_external_passes();
+  clear_after_frame_callbacks();
   debug::shutdown();
   // Compile jobs use the device, so they finish before the job pool and the device go away
   shaders::shutdown();

@@ -8,6 +8,7 @@
 #if AURORA_ENABLE_RENDER
 #include "render/frame_state.hpp"
 #include "render/graph.hpp"
+#include "render/graph_api.hpp"
 #include "render/graph_bind.hpp"
 #include "render/graph_layout.hpp"
 #include "render/settings.hpp"
@@ -341,12 +342,14 @@ class GfxRenderStageTest : public GfxRecordingTest {
 protected:
   void SetUp() override {
     render::detail::testing::reset();
+    render::detail::testing::reset_external_passes();
     GfxRecordingTest::SetUp();
   }
 
   void TearDown() override {
     GfxRecordingTest::TearDown();
     render::detail::testing::reset();
+    render::detail::testing::reset_external_passes();
   }
 
   // The base fixture's first frame began before any pass was registered, so it has no FrameState to schedule from
@@ -1080,6 +1083,85 @@ TEST_F(GfxHistoryStageTest, PrevBitsAcrossFrames) {
   EXPECT_FALSE(prev_valid_at_marker());
   ASSERT_NO_FATAL_FAILURE(latch_new_frame(2));
   EXPECT_TRUE(prev_valid_at_marker());
+}
+
+void declare_external_sink(render::PassBuilder& builder, void*) { builder.side_effect(); }
+
+void encode_external_a(render::PassContext&, void*) {}
+
+void encode_external_b(render::PassContext&, void*) {}
+
+render::ExternalPassDesc external_sink(render::PassEncodeCallback encode) {
+  return {
+      .name = "mod.pass",
+      .kind = render::PassKind::Compute,
+      .declare = declare_external_sink,
+      .encode = encode,
+  };
+}
+
+TEST_F(GfxRenderStageTest, SteadyLatchesKeepGraphAndEpoch) {
+  add_pass("steady", Stage::OpaqueDone);
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+  const auto state = frame.renderState;
+  const auto graph = state->graph;
+  const uint64_t hash = graph->graphHash;
+  const uint64_t epoch = render::detail::external_pass_epoch();
+  EXPECT_EQ(graph->externals, nullptr);
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+    EXPECT_EQ(frame.renderState, state) << i;
+    EXPECT_EQ(frame.renderState->graph, graph) << i;
+    EXPECT_EQ(frame.renderState->graph->graphHash, hash) << i;
+    EXPECT_EQ(render::detail::external_pass_epoch(), epoch) << i;
+  }
+  EXPECT_TRUE(render::detail::untraceable_external_pass().empty());
+}
+
+TEST_F(GfxRenderStageTest, ExternalPassRunsWithoutMarkers) {
+  ASSERT_NE(render::register_pass(external_sink(encode_external_a)), render::InvalidPass);
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+
+  finish();
+
+  EXPECT_EQ(op_types(), (std::vector{PassOp, StageOp}));
+  ASSERT_EQ(frame.stages.size(), 1u);
+  const auto& stage = frame.stages[0];
+  EXPECT_EQ(stage.stage, Stage::BeforeHud);
+  EXPECT_FALSE(stage.markerSeen);
+  EXPECT_TRUE(stage.flushedAtFinish);
+  EXPECT_TRUE(stage.is_enabled(0));
+  detail::end_recording();
+  recordingActive = false;
+}
+
+TEST_F(GfxRenderStageTest, ReRegisterSameDeclarationAdoptsNewGraph) {
+  const auto first = render::register_pass(external_sink(encode_external_a));
+  ASSERT_NE(first, render::InvalidPass);
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+  const auto before = frame.renderState->graph;
+
+  render::unregister_pass(first);
+  const auto second = render::register_pass(external_sink(encode_external_b));
+  ASSERT_NE(second, render::InvalidPass);
+  ASSERT_NE(second, first);
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+  const auto after = frame.renderState->graph;
+
+  EXPECT_NE(after, before);
+  EXPECT_EQ(after->graphHash, before->graphHash);
+  const auto node = after->find_node("mod.pass");
+  ASSERT_NE(node, render::detail::InvalidNode);
+  const auto& state = *static_cast<const render::detail::ExternalNodeState*>(after->nodes[node].state);
+  EXPECT_EQ(state.id, second);
+  EXPECT_EQ(state.desc.encode, encode_external_b);
+  EXPECT_EQ(after->nodes[node].id, second);
+
+  finish();
+  ASSERT_EQ(frame.stages.size(), 1u);
+  EXPECT_TRUE(frame.stages[0].is_enabled(0));
+  detail::end_recording();
+  recordingActive = false;
 }
 
 TEST_F(GfxHistoryStageTest, SameHashRecompileKeepsCullState) {

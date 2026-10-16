@@ -1,5 +1,6 @@
 #include "graph.hpp"
 
+#include "graph_api.hpp"
 #include "graph_layout.hpp"
 #include "graph_slots.hpp"
 #include "debug/graph_inspection.hpp"
@@ -431,6 +432,42 @@ bool gx_use_available(const GraphEnvironment& env, GxResource resource, Access a
   return env.gxSampleCount <= 1 || msaa_allows(resource, access);
 }
 
+constexpr uint32_t access_bit(Access access) noexcept { return 1u << static_cast<uint32_t>(access); }
+
+struct ContractResource {
+  std::string_view name;
+  uint32_t accesses;
+};
+
+constexpr uint32_t SampledOnly = access_bit(Access::Sampled);
+
+// Contract v1: the aurora resources external passes may name, and how
+constexpr std::array ContractResources{
+    ContractResource{resource::GxColor,
+                     access_bit(Access::Sampled) | access_bit(Access::ColorRMW) | access_bit(Access::CopySrc)},
+    ContractResource{resource::GxDepth, access_bit(Access::Sampled) | access_bit(Access::DepthRead)},
+    ContractResource{resource::GxNormal, SampledOnly},
+    ContractResource{resource::Motion, SampledOnly},
+    ContractResource{resource::Reactive, SampledOnly},
+    ContractResource{resource::Fog, SampledOnly},
+    ContractResource{resource::Surface, SampledOnly},
+    ContractResource{resource::AoFinal, SampledOnly},
+    ContractResource{resource::SceneHdr, SampledOnly},
+    ContractResource{resource::SunVisibility, SampledOnly},
+    ContractResource{resource::RtShadow, SampledOnly},
+    ContractResource{resource::GiIrradiance, SampledOnly},
+    ContractResource{resource::SsilIrradiance, SampledOnly},
+    ContractResource{resource::ReflectionSpecular, SampledOnly},
+    ContractResource{resource::FogIntegrated, SampledOnly},
+    ContractResource{resource::Clouds, SampledOnly},
+    ContractResource{resource::RadianceDefogged, SampledOnly},
+};
+
+const ContractResource* find_contract_resource(std::string_view name) noexcept {
+  const auto it = std::ranges::find(ContractResources, name, &ContractResource::name);
+  return it != ContractResources.end() ? &*it : nullptr;
+}
+
 bool format_supports(wgpu::TextureFormat format, Access access, const GraphFeatures& features) noexcept {
   const FormatRow* row = find_format(format);
   switch (access) {
@@ -741,14 +778,18 @@ struct GraphBuild {
     hash_graph();
   }
 
-  uint16_t declare(const InternalPassBuilder& builder, DeclaredUse use) {
-    if (builder.m_gxReadsOnly) {
-      return declare_gx_read(builder.m_node, std::move(use));
+  uint16_t declare(const PassBuilderState& builder, DeclaredUse use) {
+    if (builder.gxReadsOnly) {
+      return declare_gx_read(builder.node, std::move(use));
     }
     if (m_skipped) {
       return InvalidRef;
     }
-    if (auto problem = check_declaration(builder.m_node, use)) {
+    auto problem = builder.external ? check_external_use(builder.prefix, use) : std::nullopt;
+    if (!problem) {
+      problem = check_declaration(builder.node, use);
+    }
+    if (problem) {
       reject(std::move(*problem));
       return InvalidRef;
     }
@@ -759,9 +800,9 @@ struct GraphBuild {
     return static_cast<uint16_t>(m_declared.size() - 1);
   }
 
-  void declare_anchor(const InternalPassBuilder& builder, std::string_view name, bool after) {
-    if (builder.m_gxReadsOnly) {
-      gx_read_problem(builder.m_node, "cannot declare anchors", InvalidResource);
+  void declare_anchor(const PassBuilderState& builder, std::string_view name, bool after) {
+    if (builder.gxReadsOnly) {
+      gx_read_problem(builder.node, "cannot declare anchors", InvalidResource);
       return;
     }
     if (!m_skipped) {
@@ -769,36 +810,36 @@ struct GraphBuild {
     }
   }
 
-  void declare_side_effect(const InternalPassBuilder& builder) {
-    if (builder.m_gxReadsOnly) {
-      gx_read_problem(builder.m_node, "cannot declare side effects", InvalidResource);
+  void declare_side_effect(const PassBuilderState& builder) {
+    if (builder.gxReadsOnly) {
+      gx_read_problem(builder.node, "cannot declare side effects", InvalidResource);
       return;
     }
     m_sideEffect = true;
   }
 
-  void declare_manual_bindings(const InternalPassBuilder& builder) {
-    if (builder.m_gxReadsOnly) {
-      gx_read_problem(builder.m_node, "cannot declare manual bindings", InvalidResource);
+  void declare_manual_bindings(const PassBuilderState& builder) {
+    if (builder.gxReadsOnly) {
+      gx_read_problem(builder.node, "cannot declare manual bindings", InvalidResource);
       return;
     }
     m_manualBindings = true;
   }
 
-  void declare_skip(const InternalPassBuilder& builder) {
-    if (builder.m_gxReadsOnly) {
-      gx_read_problem(builder.m_node, "cannot be skipped", InvalidResource);
+  void declare_skip(const PassBuilderState& builder) {
+    if (builder.gxReadsOnly) {
+      gx_read_problem(builder.node, "cannot be skipped", InvalidResource);
       return;
     }
     m_skipped = true;
   }
 
-  std::span<std::byte, PassLocalSize> local(const InternalPassBuilder& builder) noexcept {
-    if (builder.m_gxReadsOnly) {
-      gx_read_problem(builder.m_node, "has no local storage", InvalidResource);
+  std::span<std::byte, PassLocalSize> local(const PassBuilderState& builder) noexcept {
+    if (builder.gxReadsOnly) {
+      gx_read_problem(builder.node, "has no local storage", InvalidResource);
       return m_scratch;
     }
-    return m_graph.nodes[builder.m_node].local;
+    return m_graph.nodes[builder.node].local;
   }
 
 private:
@@ -914,10 +955,14 @@ private:
       node.cls = desc.cls;
       node.order = desc.order;
       node.registration = static_cast<uint16_t>(i);
-      node.id = i < m_inputs.ids.size() ? m_inputs.ids[i] : InvalidPassId;
+      // External ids come from their own registry, which the pass state belongs to
+      node.id = desc.external && desc.state != nullptr ? static_cast<const ExternalNodeState*>(desc.state)->id
+                : i < m_inputs.ids.size()              ? m_inputs.ids[i]
+                                                       : InvalidPassId;
       node.opaque = desc.declare == nullptr;
       node.sideEffect = node.opaque;
       node.runsWithoutMarker = desc.runsWithoutMarker;
+      node.external = desc.external;
       node.paramsSize = desc.paramsSize;
       node.enabled = desc.enabled;
       node.encode = desc.encode;
@@ -1012,7 +1057,8 @@ private:
       m_sideEffect = false;
       m_manualBindings = false;
       m_rejection.reset();
-      InternalPassBuilder builder{*this, i, false};
+      PassBuilderState state{.build = this, .node = i, .stage = node.stage, .kind = node.passKind};
+      InternalPassBuilder builder{state};
       const PassSetup setup{m_inputs.settings, m_inputs.caps, &m_inputs.env};
       desc.declare(builder, setup, desc.state);
       if (m_skipped) {
@@ -1156,6 +1202,32 @@ private:
     resource.extent = texture_extent(declared.tex, m_inputs.env);
     resource.mipLevels =
         declared.tex.mips == 0 ? full_mip_chain(resource.extent, declared.tex.dimension) : declared.tex.mips;
+  }
+
+  // Runs before the generic checks, so a contract violation is reported as one even where those allow the use
+  static std::optional<std::string> check_external_use(std::string_view prefix, const DeclaredUse& use) {
+    if (!valid_external_name(use.name)) {
+      return fmt::format("resource '{}' does not follow the external name rules", use.name);
+    }
+    // The public builder cannot reach the other roles, but a pass that casts its builder still must not get them
+    if (use.role != UseRole::Create && use.role != UseRole::History && use.role != UseRole::Use) {
+      return fmt::format("may only create, keep history of or use '{}'", use.name);
+    }
+    const bool own = external_prefix(use.name) == prefix;
+    if (use.role == UseRole::Create || use.role == UseRole::History) {
+      return own ? std::nullopt : std::optional{fmt::format("resource '{}' must use prefix '{}'", use.name, prefix)};
+    }
+    if (own) {
+      return std::nullopt;
+    }
+    const ContractResource* contract = find_contract_resource(use.name);
+    if (contract == nullptr) {
+      return fmt::format("cannot use '{}'", use.name);
+    }
+    if ((contract->accesses & access_bit(use.access)) == 0) {
+      return fmt::format("{} is not allowed on '{}'", access_name(use.access), use.name);
+    }
+    return std::nullopt;
   }
 
   std::optional<std::string> check_declaration(NodeId nodeId, const DeclaredUse& use) const {
@@ -1309,7 +1381,13 @@ private:
       if (desc.declare == nullptr) {
         continue;
       }
-      InternalPassBuilder builder{*this, static_cast<NodeId>(m_chainBase + *chain), true};
+      PassBuilderState state{
+          .build = this,
+          .node = static_cast<NodeId>(m_chainBase + *chain),
+          .gxReadsOnly = true,
+          .stage = ChainNodes[*chain].stage,
+      };
+      InternalPassBuilder builder{state};
       desc.declare(builder, setup, desc.state);
     }
   }
@@ -2335,7 +2413,7 @@ private:
         hasher.update(static_cast<uint8_t>(node.cls));
         const auto flags = static_cast<uint8_t>(uint8_t{node.sideEffect} | uint8_t{node.manualBindings} << 1 |
                                                 uint8_t{node.sink} << 2 | uint8_t{node.runsWithoutMarker} << 3 |
-                                                uint8_t{node.opaque} << 4);
+                                                uint8_t{node.opaque} << 4 | uint8_t{node.external} << 5);
         hasher.update(flags);
         hasher.update(node.useCount);
         for (const CompiledUse& use : uses_of(nodeId)) {
@@ -2428,76 +2506,51 @@ private:
   std::unordered_set<uint64_t> m_edgeKeys;
 };
 
-InternalPassBuilder::InternalPassBuilder(GraphBuild& build, NodeId node, bool gxReadsOnly) noexcept
-: m_build(&build), m_node(node), m_gxReadsOnly(gxReadsOnly) {}
-
-TexRef InternalPassBuilder::create(std::string_view name, const TexDesc& desc, Access access) {
-  return {m_build->declare(*this, {.name = std::string{name}, .role = UseRole::Create, .access = access, .tex = desc})};
-}
-
-BufRef InternalPassBuilder::create_buffer(std::string_view name, const BufDesc& desc, Access access) {
-  return {m_build->declare(
-      *this, {.name = std::string{name}, .role = UseRole::Create, .access = access, .buffer = true, .buf = desc})};
-}
-
-TexRef InternalPassBuilder::history(std::string_view name, const TexDesc& desc, Access access) {
-  return {
-      m_build->declare(*this, {.name = std::string{name}, .role = UseRole::History, .access = access, .tex = desc})};
-}
-
-TexRef InternalPassBuilder::use(std::string_view name, Access access, Missing missing) {
-  return use(name, access, UseOptions{.missing = missing});
-}
-
 TexRef InternalPassBuilder::use(std::string_view name, Access access, const UseOptions& options) {
-  return {m_build->declare(*this, {.name = std::string{name}, .access = access, .options = options})};
+  return {m_state->build->declare(*m_state, {.name = std::string{name}, .access = access, .options = options})};
 }
 
 TexRef InternalPassBuilder::use_prev(std::string_view name, Missing missing) {
-  return {m_build->declare(
-      *this,
+  return {m_state->build->declare(
+      *m_state,
       {.name = std::string{name}, .role = UseRole::Prev, .access = Access::Sampled, .options = {.missing = missing}})};
 }
 
-BufRef InternalPassBuilder::use_buffer(std::string_view name, Access access, Missing missing) {
-  return use_buffer(name, access, UseOptions{.missing = missing});
-}
-
 BufRef InternalPassBuilder::use_buffer(std::string_view name, Access access, const UseOptions& options) {
-  return {m_build->declare(*this, {.name = std::string{name}, .access = access, .buffer = true, .options = options})};
+  return {m_state->build->declare(*m_state,
+                                  {.name = std::string{name}, .access = access, .buffer = true, .options = options})};
 }
 
 BufRef InternalPassBuilder::import_persistent(std::string_view name, PersistentHandle handle, Access access,
                                               Owner owner) {
-  return {m_build->declare(*this, {.name = std::string{name},
-                                   .role = UseRole::Import,
-                                   .access = access,
-                                   .buffer = true,
-                                   .handle = handle,
-                                   .owner = owner})};
+  return {m_state->build->declare(*m_state, {.name = std::string{name},
+                                             .role = UseRole::Import,
+                                             .access = access,
+                                             .buffer = true,
+                                             .handle = handle,
+                                             .owner = owner})};
 }
 
 TexRef InternalPassBuilder::import_persistent_texture(std::string_view name, PersistentHandle handle,
                                                       const TexDesc& desc, Access access, Owner owner) {
-  return {m_build->declare(*this, {.name = std::string{name},
-                                   .role = UseRole::Import,
-                                   .access = access,
-                                   .tex = desc,
-                                   .handle = handle,
-                                   .owner = owner})};
+  return {m_state->build->declare(*m_state, {.name = std::string{name},
+                                             .role = UseRole::Import,
+                                             .access = access,
+                                             .tex = desc,
+                                             .handle = handle,
+                                             .owner = owner})};
 }
 
-void InternalPassBuilder::after(std::string_view passOrPhase) { m_build->declare_anchor(*this, passOrPhase, true); }
+void InternalPassBuilder::skip() { m_state->build->declare_skip(*m_state); }
 
-void InternalPassBuilder::before(std::string_view passOrPhase) { m_build->declare_anchor(*this, passOrPhase, false); }
+std::span<std::byte, PassLocalSize> InternalPassBuilder::local() noexcept { return m_state->build->local(*m_state); }
 
-void InternalPassBuilder::side_effect() { m_build->declare_side_effect(*this); }
-
-void InternalPassBuilder::manual_bindings() { m_build->declare_manual_bindings(*this); }
-
-void InternalPassBuilder::skip() { m_build->declare_skip(*this); }
-
-std::span<std::byte, PassLocalSize> InternalPassBuilder::local() noexcept { return m_build->local(*this); }
+void external_declare(InternalPassBuilder& builder, const PassSetup&, const void* state) {
+  const auto& node = *static_cast<const ExternalNodeState*>(state);
+  builder.m_state->external = true;
+  builder.m_state->prefix = node.prefix;
+  node.desc.declare(builder, node.desc.userdata);
+}
 
 PassId register_pass(const PassDesc& desc) {
   if (desc.name.empty()) {
@@ -2607,11 +2660,15 @@ std::span<const std::byte> latched_pass_params(PassId pass) noexcept {
 
 std::shared_ptr<CompiledGraph> compile_graph(const GraphInputs& inputs) {
   auto graph = std::make_shared<CompiledGraph>();
+  graph->externals = inputs.externals;
   GraphBuild{inputs, *graph}.compile();
   return graph;
 }
 
-std::shared_ptr<CompiledGraph> compile_graph(const Settings& settings, const Caps& caps, const GraphEnvironment& env) {
+std::shared_ptr<CompiledGraph> compile_graph(const Settings& settings, const Caps& caps, const GraphEnvironment& env,
+                                             const LatchGraphInputs& latch) {
+  // External nodes without an encode function would compile and then silently never run
+  assert(latch.externals == nullptr || latch.externalEncode != nullptr);
   std::vector<RegisteredPass> registered;
   {
     std::lock_guard lock{g_passMutex};
@@ -2620,9 +2677,6 @@ std::shared_ptr<CompiledGraph> compile_graph(const Settings& settings, const Cap
         registered.push_back(*slot.pass);
       }
     }
-  }
-  if (registered.empty()) {
-    return nullptr;
   }
   std::ranges::sort(registered, {}, &RegisteredPass::sequence);
   std::vector<PassDesc> passes;
@@ -2633,12 +2687,20 @@ std::shared_ptr<CompiledGraph> compile_graph(const Settings& settings, const Cap
     passes.push_back(std::move(pass.desc));
     ids.push_back(pass.id);
   }
+  // Appended last, so external passes sort after internal ones of equal order
+  if (latch.externals != nullptr) {
+    append_external_passes(*latch.externals, latch.externalEncode, passes);
+  }
+  if (passes.empty()) {
+    return nullptr;
+  }
   return compile_graph(GraphInputs{
       .passes = passes,
       .ids = ids,
       .settings = &settings,
       .caps = &caps,
       .env = env,
+      .externals = latch.externals,
   });
 }
 
@@ -2874,6 +2936,7 @@ debug::GraphInspection inspect(const CompiledGraph& graph) {
       pass.cls = std::string{pass_class_name(node.cls)};
       pass.order = node.order;
       pass.registration = node.registration;
+      pass.external = node.external;
       if (pass.active && node.frameSlot != InvalidNode) {
         pass.frameSlot = node.frameSlot;
       }
@@ -3149,3 +3212,41 @@ void reset_logged_diagnostics() noexcept {
 }
 } // namespace testing
 } // namespace aurora::render::detail
+
+namespace aurora::render {
+TexRef PassBuilder::create(std::string_view name, const TexDesc& desc, Access access) {
+  return {m_state->build->declare(
+      *m_state, {.name = std::string{name}, .role = detail::UseRole::Create, .access = access, .tex = desc})};
+}
+
+BufRef PassBuilder::create_buffer(std::string_view name, const BufDesc& desc, Access access) {
+  return {m_state->build->declare(
+      *m_state,
+      {.name = std::string{name}, .role = detail::UseRole::Create, .access = access, .buffer = true, .buf = desc})};
+}
+
+TexRef PassBuilder::history(std::string_view name, const TexDesc& desc, Access access) {
+  return {m_state->build->declare(
+      *m_state, {.name = std::string{name}, .role = detail::UseRole::History, .access = access, .tex = desc})};
+}
+
+TexRef PassBuilder::use(std::string_view name, Access access, Missing missing) {
+  return {m_state->build->declare(*m_state,
+                                  {.name = std::string{name}, .access = access, .options = {.missing = missing}})};
+}
+
+BufRef PassBuilder::use_buffer(std::string_view name, Access access, Missing missing) {
+  return {m_state->build->declare(
+      *m_state, {.name = std::string{name}, .access = access, .buffer = true, .options = {.missing = missing}})};
+}
+
+void PassBuilder::after(std::string_view passOrPhase) { m_state->build->declare_anchor(*m_state, passOrPhase, true); }
+
+void PassBuilder::before(std::string_view passOrPhase) { m_state->build->declare_anchor(*m_state, passOrPhase, false); }
+
+void PassBuilder::side_effect() { m_state->build->declare_side_effect(*m_state); }
+
+void PassBuilder::manual_bindings() { m_state->build->declare_manual_bindings(*m_state); }
+
+Stage PassBuilder::stage() const noexcept { return m_state->stage; }
+} // namespace aurora::render

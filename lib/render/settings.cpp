@@ -2,6 +2,7 @@
 
 #include "frame_state.hpp"
 #include "graph.hpp"
+#include "graph_api.hpp"
 #include "graph_bind.hpp"
 #include "module.hpp"
 #include "stage.hpp"
@@ -113,6 +114,8 @@ uint64_t g_generation = 0;
 std::shared_ptr<const FrameState> g_frameState;
 #if AURORA_ENABLE_RENDER
 GraphEnvironment g_graphEnvironment;
+std::shared_ptr<const ExternalPassSet> g_externals;
+uint64_t g_externalEpoch = 0;
 #endif
 
 using FeatureMask = uint32_t;
@@ -621,6 +624,8 @@ void shutdown_settings_state() noexcept {
   g_latched.reset();
 #if AURORA_ENABLE_RENDER
   g_graphEnvironment = {};
+  g_externals.reset();
+  g_externalEpoch = 0;
 #endif
   std::lock_guard lock{g_requestMutex};
   g_msaaSamples = 1;
@@ -657,14 +662,23 @@ std::shared_ptr<const FrameState> latch_frame() {
   std::shared_ptr<const CompiledGraph> graph = g_frameState ? g_frameState->graph : nullptr;
   bool inspectorOpen = false;
 #if AURORA_ENABLE_RENDER
+  latch_external_passes();
   debug::on_latch();
   const bool passesChanged = consume_graph_dirty();
+  // The hash ignores ids and callbacks, so a re-registered external pass is only noticed by the epoch
+  const bool externalsChanged = external_pass_epoch() != g_externalEpoch;
+  if (externalsChanged) {
+    std::shared_ptr<const ExternalPassSet> externals = snapshot_external_passes();
+    g_externalEpoch = externals->epoch;
+    g_externals = externals->nodes.empty() ? nullptr : std::move(externals);
+  }
   GraphEnvironment environment = gather_graph_environment();
   const bool environmentChanged = environment != g_graphEnvironment;
-  if (graph == nullptr || settingsChanged || passesChanged || environmentChanged) {
+  if (graph == nullptr || settingsChanged || passesChanged || externalsChanged || environmentChanged) {
     g_graphEnvironment = std::move(environment);
     // An equal graphHash still carries new state and callbacks, so the new object is always published
-    std::shared_ptr<CompiledGraph> compiled = compile_graph(latched_settings(), caps(), g_graphEnvironment);
+    std::shared_ptr<CompiledGraph> compiled = compile_graph(
+        latched_settings(), caps(), g_graphEnvironment, {.externals = g_externals, .externalEncode = &external_encode});
     if (compiled) {
       prepare_graph_bindings(*compiled, {&latched_settings(), &caps(), &g_graphEnvironment});
     }
@@ -702,6 +716,8 @@ void reset() noexcept {
   reset_frame_cull();
 #if AURORA_ENABLE_RENDER
   g_graphEnvironment = {};
+  g_externals.reset();
+  g_externalEpoch = 0;
   clear_passes();
 #endif
 }
