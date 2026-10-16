@@ -256,4 +256,12 @@ inline constexpr std::string_view FrameWgsl = R"(struct AuroraFrame {
 };
 @group(0) @binding(0) var<uniform> aurora_frame: AuroraFrame;
 )";
+
+enum class DepthSource : uint8_t {
+  Unavailable,
+  Direct,
+  Copy,
+};
+
+DepthSource scene_depth_source() noexcept;
 } // namespace aurora::render

@@ -2,9 +2,12 @@
 
 #include "render/debug/graph_inspection.hpp"
 #include "render/graph.hpp"
+#include "render/graph_api.hpp"
 #include "render/json.hpp"
 #include "render_graph_planned.hpp"
 #include "webgpu/gpu_prof.hpp"
+
+#include <aurora/render_graph.hpp>
 
 #include <algorithm>
 #include <array>
@@ -318,6 +321,49 @@ TEST(RenderGraphDump, CompiledGraphMatchesFixture) {
   EXPECT_EQ(graph.graphHash, compiled->graphHash);
   EXPECT_EQ(graph.stages.size(), StageCount);
   EXPECT_TRUE(std::ranges::is_sorted(graph.resources, {}, &debug::InspectResource::name));
+}
+
+void declare_depth_reader(PassBuilder& builder, void*) {
+  builder.use(render::resource::GxDepth, Access::Sampled);
+  builder.side_effect();
+}
+
+void encode_nothing(render::PassContext&, void*) {}
+
+TEST(RenderGraphDump, DumpReportsSceneDepthAndExternals) {
+  testing::reset_external_passes();
+  const PassId id = render::register_pass({
+      .name = "mod.depth",
+      .kind = PassKind::Compute,
+      .declare = declare_depth_reader,
+      .encode = encode_nothing,
+  });
+  ASSERT_NE(id, render::InvalidPass);
+  const std::shared_ptr<const ExternalPassSet> set = snapshot_external_passes();
+  std::vector<PassDesc> passes;
+  append_external_passes(*set, nullptr, passes);
+  GraphInputs inputs = planned::planned_inputs(planned::full_limits(), passes, {});
+  inputs.externals = set;
+  inputs.env.gxSampleCount = 4;
+  inputs.sceneDepthSource = DepthSource::Copy;
+  const auto compiled = compile_graph(inputs);
+  testing::reset_external_passes();
+
+  const json::Doc doc = json::read(format_graph_json(inspect(*compiled)));
+  ASSERT_NE(doc, nullptr);
+  yyjson_val* root = yyjson_doc_get_root(doc.get());
+  EXPECT_EQ(str(key(root, "sceneDepth")), "copy");
+  yyjson_val* passList = key(root, "passes");
+  bool found = false;
+  for (size_t i = 0; i < yyjson_arr_size(passList); ++i) {
+    yyjson_val* pass = yyjson_arr_get(passList, i);
+    if (str(key(pass, "name")) == "mod.depth") {
+      found = true;
+      EXPECT_TRUE(yyjson_get_bool(key(pass, "external")));
+      EXPECT_TRUE(yyjson_get_bool(key(pass, "active")));
+    }
+  }
+  EXPECT_TRUE(found);
 }
 } // namespace
 } // namespace aurora::render::detail

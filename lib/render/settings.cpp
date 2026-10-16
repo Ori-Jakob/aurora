@@ -7,6 +7,7 @@
 #include "module.hpp"
 #include "stage.hpp"
 #include "../gfx/frame.hpp"
+#include "../gfx/recording.hpp"
 #include "../logging.hpp"
 #include "../webgpu/caps.hpp"
 
@@ -116,6 +117,7 @@ std::shared_ptr<const FrameState> g_frameState;
 GraphEnvironment g_graphEnvironment;
 std::shared_ptr<const ExternalPassSet> g_externals;
 uint64_t g_externalEpoch = 0;
+DepthSource g_sceneDepthSource = DepthSource::Unavailable;
 #endif
 
 using FeatureMask = uint32_t;
@@ -626,6 +628,7 @@ void shutdown_settings_state() noexcept {
   g_graphEnvironment = {};
   g_externals.reset();
   g_externalEpoch = 0;
+  g_sceneDepthSource = DepthSource::Unavailable;
 #endif
   std::lock_guard lock{g_requestMutex};
   g_msaaSamples = 1;
@@ -674,11 +677,16 @@ std::shared_ptr<const FrameState> latch_frame() {
   }
   GraphEnvironment environment = gather_graph_environment();
   const bool environmentChanged = environment != g_graphEnvironment;
-  if (graph == nullptr || settingsChanged || passesChanged || externalsChanged || environmentChanged) {
+  const DepthSource sceneDepthSource = gfx::current_scene_depth_source();
+  const bool sceneDepthChanged = sceneDepthSource != g_sceneDepthSource;
+  if (graph == nullptr || settingsChanged || passesChanged || externalsChanged || environmentChanged ||
+      sceneDepthChanged) {
     g_graphEnvironment = std::move(environment);
+    g_sceneDepthSource = sceneDepthSource;
     // An equal graphHash still carries new state and callbacks, so the new object is always published
     std::shared_ptr<CompiledGraph> compiled = compile_graph(
-        latched_settings(), caps(), g_graphEnvironment, {.externals = g_externals, .externalEncode = &external_encode});
+        latched_settings(), caps(), g_graphEnvironment,
+        {.externals = g_externals, .externalEncode = &external_encode, .sceneDepthSource = sceneDepthSource});
     if (compiled) {
       prepare_graph_bindings(*compiled, {&latched_settings(), &caps(), &g_graphEnvironment});
     }
@@ -718,6 +726,7 @@ void reset() noexcept {
   g_graphEnvironment = {};
   g_externals.reset();
   g_externalEpoch = 0;
+  g_sceneDepthSource = DepthSource::Unavailable;
   clear_passes();
 #endif
 }

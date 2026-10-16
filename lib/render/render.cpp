@@ -66,6 +66,7 @@ void initialize() {
            deviceCaps.limits.maxColorAttachmentBytesPerSample);
 #if AURORA_ENABLE_RENDER
   transient_pool().set_release_listener(&bind_cache_on_release);
+  register_gx_resolver(GxResource::Depth, &resolve_gx_depth);
   jobs::initialize(webgpu::g_backendType == wgpu::BackendType::WebGPU ? 0 : jobs::default_worker_count());
   shaders::initialize();
   debug::initialize();

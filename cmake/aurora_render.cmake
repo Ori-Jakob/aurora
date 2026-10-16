@@ -8,6 +8,7 @@ target_sources(aurora_gx PRIVATE
         lib/render/pass_context.hpp
         lib/render/phases.inl
         lib/render/render.cpp
+        lib/render/scene_depth.hpp
         lib/render/settings.cpp
         lib/render/settings.hpp
         lib/render/stage.cpp

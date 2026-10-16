@@ -343,6 +343,7 @@ if (AURORA_ENABLE_GX)
       render_graph_layout_test.cpp
       render_graph_dump_test.cpp
       render_graph_api_test.cpp
+      scene_depth_test.cpp
       os_test_globals.cpp
       ../lib/logging.cpp
       ../lib/render/graph.cpp
@@ -487,6 +488,16 @@ if (TARGET render_demo)
     add_test(NAME render_demo_rejects_vignette_with_trace
       COMMAND $<TARGET_FILE:render_demo> --vignette --trace ${CMAKE_CURRENT_BINARY_DIR}/never.gxtrace)
     set_tests_properties(render_demo_rejects_vignette_with_trace PROPERTIES WILL_FAIL TRUE)
+    foreach (_profile IN ITEMS full compat metal metal32)
+      add_test(NAME render_demo_depth_probe_${_profile}
+        COMMAND $<TARGET_FILE:render_demo> --backend null --profile ${_profile} --frames 60 --timeout 60
+                --fail-on-error --depth-check --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_depth/${_profile})
+      set_tests_properties(render_demo_depth_probe_${_profile} PROPERTIES LABELS smoke TIMEOUT 180)
+    endforeach ()
+    add_test(NAME render_demo_depth_probe_msaa
+      COMMAND $<TARGET_FILE:render_demo> --backend null --profile metal --msaa 4 --frames 60 --timeout 60
+              --fail-on-error --depth-check --vignette --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_depth/msaa)
+    set_tests_properties(render_demo_depth_probe_msaa PROPERTIES LABELS smoke TIMEOUT 180)
   endif ()
 endif ()
 

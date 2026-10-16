@@ -11,6 +11,7 @@
 #include "render/graph_api.hpp"
 #include "render/graph_bind.hpp"
 #include "render/graph_layout.hpp"
+#include "render/scene_depth.hpp"
 #include "render/settings.hpp"
 #include "render/stage.hpp"
 #endif
@@ -18,9 +19,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -1178,6 +1181,372 @@ TEST_F(GfxHistoryStageTest, SameHashRecompileKeepsCullState) {
   EXPECT_NE(frame.renderState->graph, before);
   EXPECT_EQ(frame.renderState->graph->graphHash, before->graphHash);
   EXPECT_TRUE(prev_valid_at_marker());
+}
+
+using render::DepthSource;
+
+constexpr std::array AllDepthSources{DepthSource::Unavailable, DepthSource::Direct, DepthSource::Copy};
+
+struct PassDetail {
+  std::string label;
+  bool sealed = false;
+  bool discardable = false;
+  bool captureDepthSnapshot = false;
+  bool depthSnapshot = false;
+  bool clearDepth = false;
+  wgpu::StoreOp depthStoreOp = wgpu::StoreOp::Undefined;
+
+  bool operator==(const PassDetail&) const = default;
+};
+
+struct RecordedRun {
+  FrameShape shape;
+  std::vector<PassDetail> passes;
+  size_t uniformBytes = 0;
+  size_t stages = 0;
+
+  bool operator==(const RecordedRun&) const = default;
+};
+
+TEST_F(GfxRenderStageTest, SceneDepthSourceChangeRecompiles) {
+  ASSERT_NE(render::register_pass(external_sink(encode_external_a)), render::InvalidPass);
+  detail::testing::override_scene_depth_source(DepthSource::Direct);
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+  const auto direct = frame.renderState->graph;
+  EXPECT_EQ(direct->sceneDepthSource, DepthSource::Direct);
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+  EXPECT_EQ(frame.renderState->graph, direct);
+
+  detail::testing::override_scene_depth_source(DepthSource::Copy);
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+  EXPECT_NE(frame.renderState->graph, direct);
+  EXPECT_EQ(frame.renderState->graph->sceneDepthSource, DepthSource::Copy);
+}
+
+// Real snapshots stay on here, so any attempt to make one would fail without a device
+TEST_F(GfxRenderStageTest, FramesWithoutDepthSamplersIgnoreTheSource) {
+  const auto recorded = [this] {
+    RecordedRun run{.shape = frame_shape(), .uniformBytes = frame.uniforms.size(), .stages = frame.stages.size()};
+    for (const auto& pass : frame.renderPasses) {
+      run.passes.push_back({
+          .label = pass.label,
+          .sealed = pass.sealed,
+          .discardable = pass.discardable,
+          .captureDepthSnapshot = pass.captureDepthSnapshot,
+          .depthSnapshot = static_cast<bool>(pass.snapshotDepthDst),
+          .clearDepth = pass.clearDepth,
+          .depthStoreOp = pass.depthStoreOp,
+      });
+    }
+    return run;
+  };
+  seed(320, 180);
+  std::vector<RecordedRun> legacy;
+  for (const auto source : AllDepthSources) {
+    detail::testing::override_scene_depth_source(source);
+    FrameShape shape;
+    ASSERT_NO_FATAL_FAILURE(run_marker_script(true, shape));
+    legacy.push_back(recorded());
+  }
+  EXPECT_EQ(legacy[1], legacy[0]);
+  EXPECT_EQ(legacy[2], legacy[0]);
+
+  add_pass("opaque", Stage::OpaqueDone);
+  std::vector<RecordedRun> staged;
+  for (const auto source : AllDepthSources) {
+    detail::testing::override_scene_depth_source(source);
+    ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+    // Frame constants are pushed once per frame id, so each run needs its own
+    frame.frameId = 100 + staged.size();
+    record_stage(Stage::OpaqueDone);
+    finish();
+    staged.push_back(recorded());
+    ASSERT_EQ(frame.stages.size(), 1u);
+    EXPECT_FALSE(frame.stages[0].sceneDepth->sampled);
+  }
+  EXPECT_EQ(staged[1], staged[0]);
+  EXPECT_EQ(staged[2], staged[0]);
+  for (uint8_t stage = 0; stage < render::StageCount; ++stage) {
+    EXPECT_EQ(detail::testing::stage_depth_snapshot_requests(static_cast<Stage>(stage)), 0u);
+    EXPECT_EQ(detail::testing::stage_depth_snapshot_generation(static_cast<Stage>(stage)), 0u);
+  }
+  for (const auto& pass : legacy[0].passes) {
+    EXPECT_FALSE(pass.depthSnapshot) << pass.label;
+  }
+}
+
+struct DepthReader {
+  render::Missing missing = render::Missing::DisablePass;
+  bool enabled = true;
+  bool samples = true;
+};
+
+void declare_depth_reader(render::PassBuilder& builder, void* userdata) {
+  const auto& reader = *static_cast<const DepthReader*>(userdata);
+  if (reader.samples) {
+    builder.use(render::resource::GxDepth, render::Access::Sampled, reader.missing);
+  }
+  builder.side_effect();
+}
+
+bool depth_reader_enabled(std::span<const std::byte>, void* userdata) {
+  return static_cast<const DepthReader*>(userdata)->enabled;
+}
+
+class GfxSceneDepthTest : public GfxRenderStageTest {
+protected:
+  void SetUp() override {
+    GfxRenderStageTest::SetUp();
+    detail::testing::fake_depth_snapshots(true);
+  }
+
+  void add_reader(const char* name, Stage stage, DepthReader reader = {}) {
+    DepthReader& stored = readers.emplace_back(reader);
+    ASSERT_NE(render::register_pass({
+                  .name = name,
+                  .stage = stage,
+                  .kind = render::PassKind::Compute,
+                  .declare = declare_depth_reader,
+                  .enabled = depth_reader_enabled,
+                  .encode = encode_external_a,
+                  .userdata = &stored,
+              }),
+              render::InvalidPass);
+  }
+
+  static render::detail::GraphEnvironment depth_environment() {
+    render::detail::GraphEnvironment env;
+    env.efbSize = {webgpu::g_frameBuffer.size.width, webgpu::g_frameBuffer.size.height};
+    env.outputSize = env.efbSize;
+    const auto color = static_cast<size_t>(render::detail::GxResource::Color);
+    const auto depth = static_cast<size_t>(render::detail::GxResource::Depth);
+    env.gxFormats[color] = ColorFormat;
+    env.gxUsage[color] = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding |
+                         wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst;
+    env.gxFormats[depth] = DepthFormat;
+    env.gxUsage[depth] = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding;
+    return env;
+  }
+
+  // The latch takes its environment from the device, which these tests lack, so the frame's graph is compiled here
+  void compile_new_frame(DepthSource source) {
+    finish();
+    detail::end_recording();
+    detail::testing::override_scene_depth_source(source);
+    render::detail::latch_external_passes();
+    const auto set = render::detail::snapshot_external_passes();
+    std::vector<render::detail::PassDesc> descs;
+    render::detail::append_external_passes(*set, &render::detail::external_encode, descs);
+    const auto graph = render::detail::compile_graph({
+        .passes = descs,
+        .env = depth_environment(),
+        .externals = set,
+        .sceneDepthSource = source,
+    });
+    frame = {};
+    frame.renderState = std::make_shared<const render::detail::FrameState>(render::detail::FrameState{.graph = graph});
+    detail::begin_recording(frame, 0);
+  }
+
+  static uint32_t requests(Stage stage) { return detail::testing::stage_depth_snapshot_requests(stage); }
+  static uint32_t generation(Stage stage) { return detail::testing::stage_depth_snapshot_generation(stage); }
+
+  std::deque<DepthReader> readers;
+};
+
+TEST_F(GfxSceneDepthTest, CopySourceRequestsSnapshot) {
+  ASSERT_NO_FATAL_FAILURE(add_reader("mod.opaque", Stage::OpaqueDone));
+  ASSERT_NO_FATAL_FAILURE(compile_new_frame(DepthSource::Copy));
+
+  record_stage(Stage::OpaqueDone);
+
+  EXPECT_EQ(op_types(), (std::vector{PassOp, StageOp}));
+  ASSERT_EQ(frame.stages.size(), 1u);
+  EXPECT_EQ(requests(Stage::OpaqueDone), 1u);
+  EXPECT_EQ(generation(Stage::OpaqueDone), 1u);
+  const auto& depth = frame.stages[0].sceneDepth;
+  ASSERT_NE(depth, nullptr);
+  EXPECT_EQ(depth->source, DepthSource::Copy);
+  EXPECT_EQ(depth->sampledFormat, wgpu::TextureFormat::R32Float);
+  EXPECT_EQ(depth->size.width, 640u);
+  EXPECT_EQ(depth->size.height, 480u);
+}
+
+TEST_F(GfxSceneDepthTest, CaptureFollowsTheLatchedSource) {
+  ASSERT_NO_FATAL_FAILURE(add_reader("mod.opaque", Stage::OpaqueDone));
+  ASSERT_NO_FATAL_FAILURE(compile_new_frame(DepthSource::Copy));
+  detail::testing::override_scene_depth_source(DepthSource::Direct);
+
+  record_stage(Stage::OpaqueDone);
+
+  ASSERT_EQ(frame.stages.size(), 1u);
+  EXPECT_EQ(frame.stages[0].sceneDepth->source, DepthSource::Copy);
+  EXPECT_EQ(frame.stages[0].sceneDepth->sampledFormat, wgpu::TextureFormat::R32Float);
+  EXPECT_EQ(requests(Stage::OpaqueDone), 1u);
+}
+
+TEST_F(GfxSceneDepthTest, BackToBackSamplingStagesEachRequestSnapshot) {
+  ASSERT_NO_FATAL_FAILURE(add_reader("mod.opaque", Stage::OpaqueDone));
+  ASSERT_NO_FATAL_FAILURE(add_reader("mod.post", Stage::PrePost));
+  ASSERT_NO_FATAL_FAILURE(compile_new_frame(DepthSource::Copy));
+
+  record_stage(Stage::OpaqueDone);
+  EXPECT_EQ(requests(Stage::OpaqueDone), 1u);
+  EXPECT_EQ(requests(Stage::PrePost), 0u);
+  record_stage(Stage::PrePost);
+
+  EXPECT_EQ(op_types(), (std::vector{PassOp, StageOp, PassOp, StageOp}));
+  ASSERT_EQ(frame.renderPasses.size(), 3u);
+  const auto& continuation = frame.renderPasses[1];
+  EXPECT_TRUE(continuation.sealed);
+  EXPECT_FALSE(continuation.has_content());
+  EXPECT_EQ(frame.ops[2].renderPass, &continuation);
+  EXPECT_EQ(requests(Stage::PrePost), 1u);
+  EXPECT_EQ(generation(Stage::OpaqueDone), 1u);
+  EXPECT_EQ(generation(Stage::PrePost), 1u);
+  ASSERT_EQ(frame.stages.size(), 2u);
+  EXPECT_NE(frame.stages[0].sceneDepth, frame.stages[1].sceneDepth);
+  EXPECT_EQ(frame.stages[1].sceneDepth->sampledFormat, wgpu::TextureFormat::R32Float);
+}
+
+TEST_F(GfxSceneDepthTest, StagesInOneBatchShareOneSnapshot) {
+  ASSERT_NO_FATAL_FAILURE(add_reader("mod.hud", Stage::BeforeHud));
+  ASSERT_NO_FATAL_FAILURE(add_reader("mod.end", Stage::FrameEnd));
+  ASSERT_NO_FATAL_FAILURE(compile_new_frame(DepthSource::Copy));
+
+  finish();
+
+  EXPECT_EQ(requests(Stage::BeforeHud), 1u);
+  EXPECT_EQ(requests(Stage::FrameEnd), 0u);
+  ASSERT_EQ(frame.stages.size(), 2u);
+  EXPECT_EQ(frame.stages[0].stage, Stage::BeforeHud);
+  EXPECT_EQ(frame.stages[1].stage, Stage::FrameEnd);
+  ASSERT_NE(frame.stages[0].sceneDepth, nullptr);
+  EXPECT_EQ(frame.stages[0].sceneDepth, frame.stages[1].sceneDepth);
+  EXPECT_EQ(frame.stages[1].sceneDepth->sampledFormat, wgpu::TextureFormat::R32Float);
+  detail::end_recording();
+  recordingActive = false;
+}
+
+TEST_F(GfxSceneDepthTest, FinishBatchCapturesOnFinalPass) {
+  ASSERT_NO_FATAL_FAILURE(add_reader("mod.hud", Stage::BeforeHud));
+  ASSERT_NO_FATAL_FAILURE(add_reader("mod.end", Stage::FrameEnd));
+  ASSERT_NO_FATAL_FAILURE(compile_new_frame(DepthSource::Copy));
+
+  finish();
+
+  EXPECT_EQ(op_types(), (std::vector{PassOp, StageOp, StageOp}));
+  ASSERT_EQ(frame.renderPasses.size(), 1u);
+  EXPECT_TRUE(frame.renderPasses[0].captureDepthSnapshot);
+  EXPECT_FALSE(frame.renderPasses[0].discardable);
+  EXPECT_EQ(frame.ops[0].renderPass, &frame.renderPasses[0]);
+  EXPECT_EQ(requests(Stage::BeforeHud), 1u);
+  detail::end_recording();
+  recordingActive = false;
+}
+
+TEST_F(GfxSceneDepthTest, FinishWithoutOpenPassHasNoCopySnapshot) {
+  ASSERT_NO_FATAL_FAILURE(add_reader("mod.hud", Stage::BeforeHud));
+  for (const auto source : {DepthSource::Copy, DepthSource::Direct}) {
+    ASSERT_NO_FATAL_FAILURE(compile_new_frame(source));
+    queue_texture_copy({}, {}, {1, 1, 1});
+
+    finish();
+
+    EXPECT_EQ(op_types(), (std::vector{PassOp, CopyOp, StageOp}));
+    ASSERT_EQ(frame.stages.size(), 1u);
+    const auto& depth = *frame.stages[0].sceneDepth;
+    EXPECT_EQ(depth.source, source);
+    EXPECT_EQ(depth.attachmentFormat, DepthFormat);
+    EXPECT_EQ(depth.size.width, 640u);
+    if (source == DepthSource::Copy) {
+      EXPECT_FALSE(depth.sampled);
+      EXPECT_EQ(depth.sampledFormat, wgpu::TextureFormat::Undefined);
+    } else {
+      EXPECT_EQ(depth.sampledFormat, DepthFormat);
+    }
+  }
+  EXPECT_EQ(requests(Stage::BeforeHud), 0u);
+  EXPECT_EQ(generation(Stage::BeforeHud), 0u);
+}
+
+TEST_F(GfxSceneDepthTest, DirectSourceAddsNoSnapshot) {
+  ASSERT_NO_FATAL_FAILURE(add_reader("mod.opaque", Stage::OpaqueDone));
+  ASSERT_NO_FATAL_FAILURE(compile_new_frame(DepthSource::Direct));
+  record_stage(Stage::OpaqueDone);
+  const auto sampling = op_types();
+  ASSERT_EQ(frame.stages.size(), 1u);
+  EXPECT_EQ(frame.stages[0].sceneDepth->source, DepthSource::Direct);
+  EXPECT_EQ(frame.stages[0].sceneDepth->sampledFormat, frame.renderPasses[0].depthStencilFormat);
+  EXPECT_FALSE(frame.renderPasses[0].snapshotDepthDst);
+  EXPECT_EQ(requests(Stage::OpaqueDone), 0u);
+  EXPECT_EQ(generation(Stage::OpaqueDone), 0u);
+
+  readers[0].samples = false;
+  ASSERT_NO_FATAL_FAILURE(compile_new_frame(DepthSource::Direct));
+  record_stage(Stage::OpaqueDone);
+  EXPECT_EQ(op_types(), sampling);
+  ASSERT_EQ(frame.stages.size(), 1u);
+  EXPECT_EQ(frame.stages[0].sceneDepth->sampledFormat, wgpu::TextureFormat::Undefined);
+}
+
+TEST_F(GfxSceneDepthTest, InactiveSamplerAddsNoSnapshot) {
+  ASSERT_NO_FATAL_FAILURE(add_reader("mod.plain", Stage::OpaqueDone, {.samples = false}));
+  ASSERT_NO_FATAL_FAILURE(add_reader("mod.sampler", Stage::OpaqueDone, {.enabled = false}));
+  ASSERT_NO_FATAL_FAILURE(compile_new_frame(DepthSource::Copy));
+
+  record_stage(Stage::OpaqueDone);
+
+  ASSERT_EQ(frame.stages.size(), 1u);
+  EXPECT_FALSE(frame.stages[0].sceneDepth->sampled);
+  EXPECT_EQ(frame.stages[0].sceneDepth->sampledFormat, wgpu::TextureFormat::Undefined);
+  EXPECT_EQ(requests(Stage::OpaqueDone), 0u);
+  EXPECT_EQ(generation(Stage::OpaqueDone), 0u);
+}
+
+TEST_F(GfxSceneDepthTest, AttachmentFieldsAlwaysFilled) {
+  ASSERT_NO_FATAL_FAILURE(add_reader("mod.opaque", Stage::OpaqueDone, {.missing = render::Missing::BindDummyBlack}));
+  for (const auto source : AllDepthSources) {
+    ASSERT_NO_FATAL_FAILURE(compile_new_frame(source));
+    record_stage(Stage::OpaqueDone);
+    ASSERT_EQ(frame.stages.size(), 1u) << static_cast<int>(source);
+    const auto& sealed = frame.renderPasses[0];
+    const auto& depth = *frame.stages[0].sceneDepth;
+    EXPECT_EQ(depth.source, source);
+    EXPECT_EQ(depth.attachmentFormat, sealed.depthStencilFormat);
+    EXPECT_EQ(depth.attachmentSamples, sealed.msaaSamples);
+    EXPECT_EQ(depth.size.width, sealed.colorAttachments[SceneColorAttachmentIndex].size.width);
+    EXPECT_EQ(depth.size.height, sealed.colorAttachments[SceneColorAttachmentIndex].size.height);
+  }
+}
+
+TEST_F(GfxSceneDepthTest, SnapshotTextureReusedAcrossFrames) {
+  ASSERT_NO_FATAL_FAILURE(add_reader("mod.opaque", Stage::OpaqueDone));
+  for (uint32_t i = 1; i <= 3; ++i) {
+    ASSERT_NO_FATAL_FAILURE(compile_new_frame(DepthSource::Copy));
+    record_stage(Stage::OpaqueDone);
+    EXPECT_EQ(generation(Stage::OpaqueDone), 1u) << i;
+    EXPECT_EQ(requests(Stage::OpaqueDone), i);
+  }
+}
+
+TEST_F(GfxSceneDepthTest, SnapshotRecreatedOnEfbResize) {
+  ASSERT_NO_FATAL_FAILURE(add_reader("mod.opaque", Stage::OpaqueDone));
+  ASSERT_NO_FATAL_FAILURE(compile_new_frame(DepthSource::Copy));
+  record_stage(Stage::OpaqueDone);
+  EXPECT_EQ(generation(Stage::OpaqueDone), 1u);
+
+  webgpu::g_frameBuffer.size = {1280, 720, 1};
+  webgpu::g_depthBuffer.size = {1280, 720, 1};
+  ASSERT_NO_FATAL_FAILURE(compile_new_frame(DepthSource::Copy));
+  record_stage(Stage::OpaqueDone);
+  EXPECT_EQ(generation(Stage::OpaqueDone), 2u);
+  ASSERT_EQ(frame.stages.size(), 1u);
+  EXPECT_EQ(frame.stages[0].sceneDepth->size.width, 1280u);
+
+  ASSERT_NO_FATAL_FAILURE(compile_new_frame(DepthSource::Copy));
+  record_stage(Stage::OpaqueDone);
+  EXPECT_EQ(generation(Stage::OpaqueDone), 2u);
 }
 #endif
 

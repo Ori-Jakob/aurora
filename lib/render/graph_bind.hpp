@@ -69,6 +69,7 @@ struct GxBinding {
 
 using GxResolveFn = bool (*)(const StageData& stage, Access access, GxBinding& out);
 void register_gx_resolver(GxResource resource, GxResolveFn resolve);
+bool resolve_gx_depth(const StageData& stage, Access access, GxBinding& out);
 
 enum class IdentityKind : uint8_t { Transient, History, Persistent, Gx, Dummy };
 

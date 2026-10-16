@@ -14,6 +14,7 @@
 #include "../gx/fifo.hpp"
 #include "../gx/gx.hpp"
 #include "../gx/pipeline.hpp"
+#include "../render/scene_depth.hpp"
 #include "../render/stage.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
@@ -24,6 +25,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <optional>
 #include <ranges>
@@ -582,13 +584,29 @@ void enqueue_pass(FramePacket& frame, uint32_t passIndex) {
   enqueue_op(frame, opIndex);
 }
 
-// The open pass is sealed only once a stage has work, so an empty graph leaves the EFB pass untouched
-bool emit_stage_ops(uint8_t end, uint8_t liveMarker, bool atFinish) {
+// Keyed by the batch's first sampling stage, so batches never share one; queue order keeps reads before the rewrite
+struct StageDepthSnapshot {
+  webgpu::TextureWithSampler texture;
+  uint32_t generation = 0;
+  uint32_t requests = 0;
+};
+std::array<StageDepthSnapshot, render::StageCount> g_stageDepthSnapshots;
+std::optional<render::DepthSource> g_sceneDepthOverride;
+bool g_fakeDepthSnapshots = false;
+
+struct StageBatch {
+  std::array<render::detail::StageData, render::StageCount> stages;
+  uint8_t count = 0;
+  uint8_t snapshotSlot = UINT8_MAX;
+};
+
+StageBatch build_stage_batch(uint8_t end, uint8_t liveMarker, bool atFinish) {
   auto& frame = current_frame_packet();
-  bool emitted = false;
+  StageBatch batch;
   for (uint8_t index = g_recorder.nextStage; index < end; ++index) {
     const bool seen = g_recorder.stageMarkerSeen[index];
-    render::detail::StageData data{
+    render::detail::StageData& data = batch.stages[batch.count];
+    data = render::detail::StageData{
         .stage = static_cast<render::Stage>(index),
         .frameId = frame.frameId,
         .frameIndex = frame.frameIndex,
@@ -600,20 +618,132 @@ bool emit_stage_ops(uint8_t end, uint8_t liveMarker, bool atFinish) {
     if (!render::detail::build_stage_data(data)) {
       continue;
     }
-    if (!emitted && g_recorder.currentRenderPass != UINT32_MAX) {
-      auto& prevPass = current_render_passes()[g_recorder.currentRenderPass];
-      prevPass.discardable = !prevPass.has_consumer() && !prevPass.has_content();
-      enqueue_pass(frame, g_recorder.currentRenderPass);
+    if (batch.snapshotSlot == UINT8_MAX && render::detail::stage_samples_scene_depth(data)) {
+      batch.snapshotSlot = index;
     }
-    emitted = true;
+    ++batch.count;
+  }
+  g_recorder.nextStage = std::max(g_recorder.nextStage, end);
+  return batch;
+}
+
+webgpu::TextureWithSampler create_stage_depth_snapshot(const wgpu::Extent3D& size) {
+  if (g_fakeDepthSnapshots) {
+    return {.size = size, .format = wgpu::TextureFormat::R32Float};
+  }
+  // The snapshot shader renders it and passes sample it; unlike resolve_pass snapshots nothing copies from it
+  const wgpu::TextureDescriptor desc{
+      .label = "Stage Depth Snapshot",
+      .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+      .dimension = wgpu::TextureDimension::e2D,
+      .size = {size.width, size.height, 1},
+      .format = wgpu::TextureFormat::R32Float,
+      .mipLevelCount = 1,
+      .sampleCount = 1,
+  };
+  auto texture = webgpu::g_device.CreateTexture(&desc);
+  auto view = texture.CreateView();
+  return {
+      .texture = std::move(texture),
+      .view = std::move(view),
+      .size = desc.size,
+      .format = desc.format,
+  };
+}
+
+// EFB passes attach the EFB depth and read it back through the same view; begin_color_pass targets do neither
+bool is_efb_depth_pass(const RenderPass& pass) noexcept {
+  return pass.depthStencilView.Get() == webgpu::g_depthBuffer.view.Get() &&
+         pass.copySourceDepthView.Get() == webgpu::g_depthBuffer.view.Get();
+}
+
+render::detail::SceneDepth capture_scene_depth(RenderPass* sealed, const StageBatch& batch) {
+  AURORA_ASSERT(!g_recorder.inOffscreen, "Scene depth captured while offscreen rendering is active");
+  // Taken from the batch's own graph, so the views always match the plan it was compiled with
+  render::detail::SceneDepth depth{.source = render::detail::stage_scene_depth_source(batch.stages[0])};
+  if (sealed != nullptr && !is_efb_depth_pass(*sealed)) {
+    static bool warned = false;
+    if (!std::exchange(warned, true)) {
+      Log.warn("Render stages sealed a pass without the EFB depth; their scene depth is missing");
+    }
+    return depth;
+  }
+  depth.attachmentTexture = webgpu::g_depthBuffer.texture;
+  if (sealed != nullptr) {
+    depth.attachment = sealed->depthStencilView;
+    depth.attachmentFormat = sealed->depthStencilFormat;
+    depth.attachmentSamples = sealed->msaaSamples;
+    depth.size = sealed->colorAttachments[SceneColorAttachmentIndex].size;
+  } else {
+    depth.attachment = webgpu::g_depthBuffer.view;
+    depth.attachmentFormat = webgpu::g_graphicsConfig.depthFormat;
+    depth.attachmentSamples = webgpu::g_graphicsConfig.msaaSamples;
+    depth.size = webgpu::g_frameBuffer.size;
+  }
+  if (batch.snapshotSlot == UINT8_MAX) {
+    return depth;
+  }
+  if (depth.source == render::DepthSource::Direct) {
+    depth.sampledTexture = webgpu::g_depthBuffer.texture;
+    depth.sampled = sealed != nullptr ? sealed->copySourceDepthView : webgpu::g_depthBuffer.view;
+    depth.sampledFormat = depth.attachmentFormat;
+    // Direct sampling binds the whole view; a stencil aspect would need a depth-only view
+    AURORA_ASSERT(depth.sampledFormat == wgpu::TextureFormat::Depth32Float ||
+                      depth.sampledFormat == wgpu::TextureFormat::Depth24Plus ||
+                      depth.sampledFormat == wgpu::TextureFormat::Depth16Unorm,
+                  "Scene depth format {} cannot be sampled directly", static_cast<uint32_t>(depth.sampledFormat));
+  } else if (depth.source == render::DepthSource::Copy && sealed != nullptr) {
+    auto& snapshot = g_stageDepthSnapshots[batch.snapshotSlot];
+    const bool missing = g_fakeDepthSnapshots ? snapshot.generation == 0 : !snapshot.texture.texture;
+    if (missing || snapshot.texture.size.width != depth.size.width ||
+        snapshot.texture.size.height != depth.size.height) {
+      snapshot.texture = create_stage_depth_snapshot(depth.size);
+      ++snapshot.generation;
+    }
+    AURORA_ASSERT(!sealed->snapshotDepthDst, "Scene depth captured twice on one render pass");
+    sealed->snapshotDepthDst = snapshot.texture.view;
+    depth.sampledTexture = snapshot.texture.texture;
+    depth.sampled = snapshot.texture.view;
+    depth.sampledFormat = wgpu::TextureFormat::R32Float;
+    ++snapshot.requests;
+  }
+  return depth;
+}
+
+void emit_stage_batch(StageBatch& batch, const render::detail::SceneDepth& depth) {
+  if (batch.count == 0) {
+    return;
+  }
+  auto& frame = current_frame_packet();
+  const auto shared = std::make_shared<const render::detail::SceneDepth>(depth);
+  for (uint8_t i = 0; i < batch.count; ++i) {
+    render::detail::StageData& data = batch.stages[i];
+    data.sceneDepth = shared;
     const auto stageIndex = static_cast<uint32_t>(frame.stages.size());
     frame.stages.emplace_back(std::move(data));
     const auto opIndex = static_cast<uint32_t>(frame.ops.size());
     frame.ops.emplace_back(capture_frame_op(frame, FrameOpType::RenderStage, stageIndex));
     enqueue_op(frame, opIndex);
   }
-  g_recorder.nextStage = std::max(g_recorder.nextStage, end);
-  return emitted;
+}
+
+// The open pass is sealed only once a stage has work, so an empty graph leaves the EFB pass untouched
+bool emit_stage_ops(uint8_t end, uint8_t liveMarker, bool atFinish) {
+  StageBatch batch = build_stage_batch(end, liveMarker, atFinish);
+  if (batch.count == 0) {
+    return false;
+  }
+  auto& frame = current_frame_packet();
+  RenderPass* sealed =
+      g_recorder.currentRenderPass != UINT32_MAX ? &current_render_passes()[g_recorder.currentRenderPass] : nullptr;
+  // Captured before the discardable check, so a snapshot keeps an otherwise empty sealed pass alive
+  const render::detail::SceneDepth depth = capture_scene_depth(sealed, batch);
+  if (sealed != nullptr) {
+    sealed->discardable = !sealed->has_consumer() && !sealed->has_content();
+    enqueue_pass(frame, g_recorder.currentRenderPass);
+  }
+  emit_stage_batch(batch, depth);
+  return true;
 }
 
 void run_stages_until(uint8_t end, uint8_t liveMarker) {
@@ -707,6 +837,9 @@ void shutdown_recording() {
   for (auto& pool : g_passSnapshotPools) {
     pool = {};
   }
+  g_stageDepthSnapshots = {};
+  g_sceneDepthOverride.reset();
+  g_fakeDepthSnapshots = false;
   g_recorder.currentRenderPass = UINT32_MAX;
   g_offscreenCache.clear();
   g_recorder.offscreenColor = {};
@@ -743,6 +876,20 @@ OffscreenCacheStats offscreen_cache_stats() noexcept {
 bool is_offscreen_cached(uint32_t width, uint32_t height, wgpu::TextureFormat colorFormat,
                          wgpu::TextureFormat depthFormat) {
   return g_offscreenCache.contains({width, height, colorFormat, depthFormat});
+}
+
+void override_scene_depth_source(std::optional<render::DepthSource> source) noexcept { g_sceneDepthOverride = source; }
+
+void fake_depth_snapshots(bool fake) noexcept { g_fakeDepthSnapshots = fake; }
+
+uint32_t stage_depth_snapshot_generation(render::Stage slot) noexcept {
+  const auto index = static_cast<size_t>(slot);
+  return index < g_stageDepthSnapshots.size() ? g_stageDepthSnapshots[index].generation : 0;
+}
+
+uint32_t stage_depth_snapshot_requests(render::Stage slot) noexcept {
+  const auto index = static_cast<size_t>(slot);
+  return index < g_stageDepthSnapshots.size() ? g_stageDepthSnapshots[index].requests : 0;
 }
 
 } // namespace testing
@@ -1280,18 +1427,33 @@ void finish() {
     return;
   }
   AURORA_ASSERT(!g_recorder.inOffscreen, "finish called while offscreen rendering is active");
+  // Built before the final pass is sealed, so the batch's scene depth can still be captured on it
+  StageBatch batch = g_recorder.packet->renderState != nullptr
+                         ? build_stage_batch(LastMarkerStage + 1, NoLiveMarker, true)
+                         : StageBatch{};
+  RenderPass* finalPass = nullptr;
   if (g_recorder.currentRenderPass != UINT32_MAX) {
     auto& frame = current_frame_packet();
     frame.uniforms.append_zeroes(gx::MaxUniformSize);
-    auto& pass = frame.renderPasses[g_recorder.currentRenderPass];
-    pass.captureDepthSnapshot = true;
-    enqueue_pass(frame, g_recorder.currentRenderPass);
+    finalPass = &frame.renderPasses[g_recorder.currentRenderPass];
+    finalPass->captureDepthSnapshot = true;
+  }
+  const render::detail::SceneDepth depth =
+      batch.count != 0 ? capture_scene_depth(finalPass, batch) : render::detail::SceneDepth{};
+  if (finalPass != nullptr) {
+    enqueue_pass(current_frame_packet(), g_recorder.currentRenderPass);
     g_recorder.currentRenderPass = UINT32_MAX;
   }
-  if (g_recorder.packet->renderState != nullptr) {
-    emit_stage_ops(LastMarkerStage + 1, NoLiveMarker, true);
-  }
+  emit_stage_batch(batch, depth);
   g_recorder.pendingStageEnd = 0;
+}
+
+render::DepthSource current_scene_depth_source() noexcept {
+  if (g_sceneDepthOverride) {
+    return *g_sceneDepthOverride;
+  }
+  return render::detail::select_scene_depth_source(webgpu::g_hasCoreFeatures, webgpu::g_graphicsConfig.msaaSamples,
+                                                   tex_copy_conv::snapshot_depth_supported());
 }
 
 Range push_verts(const uint8_t* data, size_t length, size_t alignment) {
@@ -1358,6 +1520,17 @@ void push_debug_group(std::string label) {
 #endif
 }
 } // namespace aurora::gfx
+
+namespace aurora::render {
+DepthSource scene_depth_source() noexcept {
+#if AURORA_ENABLE_RENDER
+  if (webgpu::g_device) {
+    return gfx::current_scene_depth_source();
+  }
+#endif
+  return DepthSource::Unavailable;
+}
+} // namespace aurora::render
 
 void push_debug_group(const char* label) {
 #ifdef AURORA_GFX_DEBUG_GROUPS

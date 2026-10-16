@@ -542,6 +542,8 @@ GraphInputs planned_inputs(const GraphLimits& limits, std::span<const PassDesc> 
               .gxSampleCount = 1,
               .inspectorOpen = false,
           },
+      // What the recorder picks for these limits at one sample
+      .sceneDepthSource = limits.features.core ? DepthSource::Direct : DepthSource::Unavailable,
   };
 }
 

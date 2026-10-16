@@ -1,8 +1,11 @@
 #include "graph.hpp"
 
+#include "frame_state.hpp"
 #include "graph_api.hpp"
 #include "graph_layout.hpp"
 #include "graph_slots.hpp"
+#include "scene_depth.hpp"
+#include "stage.hpp"
 #include "debug/graph_inspection.hpp"
 
 #include "../gfx/hash.hpp"
@@ -414,13 +417,17 @@ bool gx_access_allowed(GxResource resource, Access access) noexcept {
   return resource == GxResource::Depth ? is_depth(access) : access == Access::ColorRMW;
 }
 
-// Under MSAA every EFB texture is multisampled; only the resolved colour and the colour attachment stay usable
+// Under MSAA every EFB texture is multisampled; only resolved colour, its attachment and read-only depth stay usable
 bool msaa_allows(GxResource resource, Access access) noexcept {
+  if (resource == GxResource::Depth) {
+    return access == Access::DepthRead;
+  }
   return resource == GxResource::Color &&
          (access == Access::Sampled || access == Access::CopySrc || access == Access::ColorRMW);
 }
 
-bool gx_use_available(const GraphEnvironment& env, GxResource resource, Access access) noexcept {
+bool gx_use_available(const GraphEnvironment& env, DepthSource sceneDepth, GxResource resource,
+                      Access access) noexcept {
   const auto index = static_cast<size_t>(resource);
   if (env.gxFormats[index] == wgpu::TextureFormat::Undefined) {
     return false;
@@ -429,7 +436,15 @@ bool gx_use_available(const GraphEnvironment& env, GxResource resource, Access a
   if (needed != wgpu::TextureUsage::None && !(env.gxUsage[index] & needed)) {
     return false;
   }
+  // Sampled depth binds a single-sample view or snapshot, so the source decides at every sample count
+  if (resource == GxResource::Depth && access == Access::Sampled) {
+    return sceneDepth != DepthSource::Unavailable;
+  }
   return env.gxSampleCount <= 1 || msaa_allows(resource, access);
+}
+
+bool is_scene_depth(const CompiledResource& resource) noexcept {
+  return resource.kind == ResourceKind::Gx && resource.gx == GxResource::Depth;
 }
 
 constexpr uint32_t access_bit(Access access) noexcept { return 1u << static_cast<uint32_t>(access); }
@@ -650,6 +665,7 @@ std::optional<AuroraLogLevel> diagnostic_level(CullReason reason) noexcept {
 
 std::mutex g_logMutex;
 std::unordered_set<std::string> g_loggedDiagnostics;
+std::optional<DepthSource> g_loggedSceneDepth;
 
 bool first_report(std::string key) {
   std::lock_guard lock{g_logMutex};
@@ -773,9 +789,11 @@ struct GraphBuild {
       cull_unconsumed();
     }
     finish_programs();
+    collect_scene_depth_samplers();
     drop_inactive_plans();
     m_graph.slots = plan_slots(m_graph, m_inputs.env.limits);
     hash_graph();
+    log_scene_depth_choice();
   }
 
   uint16_t declare(const PassBuilderState& builder, DeclaredUse use) {
@@ -1444,6 +1462,19 @@ private:
       if (needs_dummy_format(use, resource)) {
         return fmt::format("reads storage texture '{}' with a dummy fallback but no known format", resource.name);
       }
+      // Scene depth is the depth texture or its R32Float snapshot, so it binds one way whatever the pass asks for
+      if (use.access == Access::Sampled && is_scene_depth(resource)) {
+        const auto sampleType = use.options.sampleType;
+        if (sampleType != wgpu::TextureSampleType::Undefined &&
+            sampleType != wgpu::TextureSampleType::UnfilterableFloat) {
+          return fmt::format("samples '{}' as other than unfilterable float, the only way it binds", resource.name);
+        }
+        const auto dimension = use.options.dimension;
+        if (dimension != wgpu::TextureViewDimension::Undefined && dimension != wgpu::TextureViewDimension::e2D) {
+          return fmt::format("samples '{}' through a {} view, but it binds only as 2d", resource.name,
+                             view_dimension_name(dimension));
+        }
+      }
       if (node.passKind == PassKind::Native && resource.kind != ResourceKind::External) {
         return fmt::format("is a native pass and cannot use {} resource '{}'", resource_kind_name(resource.kind),
                            resource.name);
@@ -1734,7 +1765,8 @@ private:
           continue;
         }
         const CompiledResource& resource = m_graph.resources[use.resource];
-        if (resource.kind == ResourceKind::Gx && !gx_use_available(m_inputs.env, resource.gx, use.access)) {
+        if (resource.kind == ResourceKind::Gx &&
+            !gx_use_available(m_inputs.env, m_inputs.sceneDepthSource, resource.gx, use.access)) {
           continue;
         }
         ++colorCount;
@@ -1875,7 +1907,7 @@ private:
     }
     switch (resource.kind) {
     case ResourceKind::Gx:
-      return gx_use_available(m_inputs.env, resource.gx, use.access);
+      return gx_use_available(m_inputs.env, m_inputs.sceneDepthSource, resource.gx, use.access);
     case ResourceKind::Persistent:
     case ResourceKind::External:
       return true;
@@ -2394,6 +2426,41 @@ private:
     collect_consumers(position);
   }
 
+  // A static dummy never reads the depth texture, so only live uses ask the recorder for a snapshot
+  void collect_scene_depth_samplers() {
+    m_graph.sceneDepthSource = m_inputs.sceneDepthSource;
+    for (size_t s = 0; s < StageCount; ++s) {
+      const StageProgram& program = m_graph.stages[s];
+      std::vector<uint64_t>& bits = m_graph.sceneDepthSamplers[s];
+      bits.assign(bit_words(program.passes.size()), 0);
+      for (size_t i = 0; i < program.passes.size(); ++i) {
+        const bool samples = std::ranges::any_of(uses_of(program.passes[i]), [&](const CompiledUse& use) {
+          return use.access == Access::Sampled && !use.staticDummy && is_scene_depth(m_graph.resources[use.resource]);
+        });
+        assign_bit(bits, i, samples);
+      }
+    }
+  }
+
+  void log_scene_depth_choice() {
+    const auto reader = [&](const CompiledUse& use) {
+      return use.node < m_passCount && is_scene_depth(m_graph.resources[use.resource]);
+    };
+    if (std::ranges::none_of(m_graph.uses, reader)) {
+      return;
+    }
+    const GraphEnvironment& env = m_inputs.env;
+    {
+      std::lock_guard lock{g_logMutex};
+      if (g_loggedSceneDepth == m_inputs.sceneDepthSource) {
+        return;
+      }
+      g_loggedSceneDepth = m_inputs.sceneDepthSource;
+    }
+    Log.info("{}", scene_depth_choice_text(m_inputs.sceneDepthSource, env.gxSampleCount, env.limits.features.core,
+                                           env.gxFormats[static_cast<size_t>(GxResource::Depth)]));
+  }
+
   void hash_graph() {
     Hasher hasher{0};
     constexpr std::string_view Tag = "aurora.render.graph/1";
@@ -2701,6 +2768,7 @@ std::shared_ptr<CompiledGraph> compile_graph(const Settings& settings, const Cap
       .caps = &caps,
       .env = env,
       .externals = latch.externals,
+      .sceneDepthSource = latch.sceneDepthSource,
   });
 }
 
@@ -2917,6 +2985,7 @@ std::vector<NodeId> flattened_order(const CompiledGraph& graph, std::vector<debu
 debug::GraphInspection inspect(const CompiledGraph& graph) {
   debug::GraphInspection out;
   out.graphHash = graph.graphHash;
+  out.sceneDepth = std::string{scene_depth_source_name(graph.sceneDepthSource)};
   const std::vector<NodeId> order = flattened_order(graph, out.stages);
   std::vector<uint32_t> flat(graph.nodes.size(), InvalidIndex);
   for (size_t i = 0; i < order.size(); ++i) {
@@ -3076,9 +3145,14 @@ DummyKey dummy_key(const CompiledGraph& graph, const CompiledUse& use, const Gra
     }
   }
   key.dimension = use.options.dimension != wgpu::TextureViewDimension::Undefined ? use.options.dimension : dimension;
-  key.sampleType = use.options.sampleType != wgpu::TextureSampleType::Undefined
-                       ? use.options.sampleType
-                       : format_sample_type(format, features.float32Filterable);
+  // Matches the plan's binding for scene depth, which both the depth texture and its R32Float snapshot satisfy
+  if (use.access == Access::Sampled && is_scene_depth(resource)) {
+    key.sampleType = wgpu::TextureSampleType::UnfilterableFloat;
+  } else {
+    key.sampleType = use.options.sampleType != wgpu::TextureSampleType::Undefined
+                         ? use.options.sampleType
+                         : format_sample_type(format, features.float32Filterable);
+  }
   if (use.access == Access::StorageRead) {
     key.storageFormat = format != wgpu::TextureFormat::Undefined ? format : use.options.format;
   }
@@ -3195,6 +3269,26 @@ void cull_stage(const CompiledGraph& graph, Stage stage, std::span<const uint64_
   state.nextStage = static_cast<uint8_t>(static_cast<size_t>(stage) + 1);
 }
 
+bool stage_samples_scene_depth(const StageData& stage) noexcept {
+  const CompiledGraph* graph = stage.frame != nullptr ? stage.frame->graph.get() : nullptr;
+  const auto index = static_cast<size_t>(stage.stage);
+  if (graph == nullptr || index >= StageCount) {
+    return false;
+  }
+  const std::vector<uint64_t>& samplers = graph->sceneDepthSamplers[index];
+  for (size_t word = 0; word < samplers.size() && word < stage.enabled.size(); ++word) {
+    if ((samplers[word] & stage.enabled[word]) != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+DepthSource stage_scene_depth_source(const StageData& stage) noexcept {
+  const CompiledGraph* graph = stage.frame != nullptr ? stage.frame->graph.get() : nullptr;
+  return graph != nullptr ? graph->sceneDepthSource : DepthSource::Unavailable;
+}
+
 namespace testing {
 void clear_passes() noexcept {
   std::lock_guard lock{g_passMutex};
@@ -3209,6 +3303,7 @@ void clear_passes() noexcept {
 void reset_logged_diagnostics() noexcept {
   std::lock_guard lock{g_logMutex};
   g_loggedDiagnostics.clear();
+  g_loggedSceneDepth.reset();
 }
 } // namespace testing
 } // namespace aurora::render::detail

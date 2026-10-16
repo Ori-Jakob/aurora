@@ -6,10 +6,13 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace aurora::render::detail {
 struct FrameState;
+// Defined with its Dawn views in scene_depth.hpp, so stage data links without Dawn
+struct SceneDepth;
 
 struct StageBindings {
   struct Params {
@@ -35,6 +38,7 @@ struct StageData {
   std::vector<uint64_t> dummies;
   std::vector<uint64_t> prevValid;
   StageBindings bindings;
+  std::shared_ptr<const SceneDepth> sceneDepth;
 
   [[nodiscard]] bool is_enabled(uint32_t index) const noexcept {
     return index < passCount && ((enabled[index / 64] >> (index % 64)) & 1u) != 0;

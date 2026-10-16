@@ -66,6 +66,7 @@ GraphInputs test_inputs() {
   inputs.env.gxFormats = planned::gx_formats_tier_p();
   inputs.env.gxUsage = planned::gx_usage_future();
   inputs.env.inspectorOpen = true;
+  inputs.sceneDepthSource = DepthSource::Direct;
   return inputs;
 }
 
@@ -1881,6 +1882,42 @@ TEST_F(RenderGraphCull, MissingBindsDummyWhite) {
   EXPECT_FALSE(std::ranges::any_of(graph->edges, [&](const Edge& edge) { return edge.resource == id; }));
   EXPECT_EQ(resource(*graph, "never.created").textureUsage, wgpu::TextureUsage::None);
   EXPECT_TRUE(graph->diagnostics.empty());
+}
+
+TEST_F(RenderGraph, GxDepthRejectsConflictingSampleOptions) {
+  const auto sampler = [](std::string name, UseOptions options) {
+    return TestPass{.name = std::move(name), .body = [options](InternalPassBuilder& b) {
+                      b.after("phase.lighting");
+                      b.use("gx.depth", Access::Sampled, options);
+                    }};
+  };
+  const auto graph = compile({
+      sampler("depth.type", {.sampleType = wgpu::TextureSampleType::Depth}),
+      sampler("float.type", {.sampleType = wgpu::TextureSampleType::Float}),
+      sampler("array.view", {.dimension = wgpu::TextureViewDimension::e2DArray}),
+      sampler("unfilterable", {.sampleType = wgpu::TextureSampleType::UnfilterableFloat}),
+      sampler("flat.view", {.dimension = wgpu::TextureViewDimension::e2D}),
+  });
+  for (const std::string name : {"depth.type", "float.type"}) {
+    EXPECT_EQ(node(*graph, name).status, CullReason::InvalidDeclaration) << name;
+    const Diagnostic* rejected = diagnostic_for(*graph, name, CullReason::InvalidDeclaration);
+    ASSERT_NE(rejected, nullptr) << name;
+    EXPECT_EQ(rejected->message, "render graph: '" + name +
+                                     "' samples 'gx.depth' as other than unfilterable float, the only way it binds; "
+                                     "disabled");
+  }
+  EXPECT_EQ(node(*graph, "array.view").status, CullReason::InvalidDeclaration);
+  const Diagnostic* array = diagnostic_for(*graph, "array.view", CullReason::InvalidDeclaration);
+  ASSERT_NE(array, nullptr);
+  EXPECT_EQ(array->message,
+            "render graph: 'array.view' samples 'gx.depth' through a 2d-array view, but it binds only as 2d; disabled");
+  for (const std::string_view name : {"unfilterable", "flat.view"}) {
+    EXPECT_TRUE(active(*graph, name)) << name;
+    const BindingPlan& plan = graph->bindingPlans[graph->find_node(name)];
+    ASSERT_EQ(plan.slots.size(), 1u) << name;
+    EXPECT_EQ(plan.slots[0].sampleType, wgpu::TextureSampleType::UnfilterableFloat) << name;
+    EXPECT_EQ(plan.slots[0].viewDimension, wgpu::TextureViewDimension::e2D) << name;
+  }
 }
 
 DummyKey fallback_from_disabled_creator(const TexDesc& desc, Access access, bool float32Filterable = true,

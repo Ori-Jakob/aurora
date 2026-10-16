@@ -3,8 +3,10 @@
 #include "types.hpp"
 
 #include <aurora/render.hpp>
+#include <aurora/render_graph.hpp>
 
 #include <cstddef>
+#include <optional>
 #include <string>
 
 namespace aurora::gfx::detail {
@@ -32,6 +34,10 @@ void seed_offscreen_cache(uint32_t width, uint32_t height, wgpu::TextureFormat c
 OffscreenCacheStats offscreen_cache_stats() noexcept;
 bool is_offscreen_cached(uint32_t width, uint32_t height, wgpu::TextureFormat colorFormat,
                          wgpu::TextureFormat depthFormat);
+void override_scene_depth_source(std::optional<render::DepthSource> source) noexcept;
+void fake_depth_snapshots(bool fake) noexcept;
+uint32_t stage_depth_snapshot_generation(render::Stage slot) noexcept;
+uint32_t stage_depth_snapshot_requests(render::Stage slot) noexcept;
 }
 
 } // namespace aurora::gfx::detail
@@ -116,4 +122,5 @@ void set_scissor(const ClipRect& scissor) noexcept;
 void push_debug_group(std::string label);
 void insert_debug_marker(std::string label);
 void record_stage(render::Stage stage);
+render::DepthSource current_scene_depth_source() noexcept;
 } // namespace aurora::gfx

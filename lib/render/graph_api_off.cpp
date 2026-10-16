@@ -1,4 +1,5 @@
 #include "graph_api.hpp"
+#include "stage.hpp"
 
 #include "../logging.hpp"
 
@@ -16,6 +17,10 @@ std::atomic_bool g_warned{false};
 
 namespace detail {
 std::string untraceable_external_pass() { return {}; }
+
+bool stage_samples_scene_depth(const StageData&) noexcept { return false; }
+
+DepthSource stage_scene_depth_source(const StageData&) noexcept { return DepthSource::Unavailable; }
 } // namespace detail
 
 PassId register_pass(const ExternalPassDesc&) {

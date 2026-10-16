@@ -73,6 +73,7 @@ struct InspectStage {
 
 struct GraphInspection {
   uint64_t graphHash = 0;
+  std::string sceneDepth = "unavailable";
   std::vector<InspectStage> stages;
   std::vector<InspectPass> passes;
   std::vector<InspectResource> resources;

@@ -37,6 +37,10 @@ wgpu::TextureFormat resource_format(const CompiledResource& resource) noexcept {
 
 wgpu::TextureSampleType sample_type(const CompiledUse& use, const CompiledResource& resource,
                                     const GraphFeatures& features) noexcept {
+  // Scene depth is the depth texture itself or an R32Float snapshot of it, and only unfilterable float binds both
+  if (resource.kind == ResourceKind::Gx && resource.gx == GxResource::Depth) {
+    return wgpu::TextureSampleType::UnfilterableFloat;
+  }
   if (use.options.sampleType != wgpu::TextureSampleType::Undefined) {
     return use.options.sampleType;
   }

@@ -4,6 +4,7 @@
 #include "graph_api.hpp"
 #include "graph_pool.hpp"
 #include "graph_slots.hpp"
+#include "scene_depth.hpp"
 #include "shaders.hpp"
 #include "stage_data.hpp"
 
@@ -1090,6 +1091,38 @@ void register_gx_resolver(GxResource resource, GxResolveFn resolve) {
   if (index < GxResourceCount) {
     g_gxResolvers[index].store(resolve, std::memory_order_release);
   }
+}
+
+// The recorder captured these views when the stage's batch sealed its EFB pass, so they differ per stage and access
+bool resolve_gx_depth(const StageData& stage, Access access, GxBinding& out) {
+  if (stage.sceneDepth == nullptr) {
+    return false;
+  }
+  const SceneDepth& depth = *stage.sceneDepth;
+  if (access == Access::Sampled) {
+    if (!depth.sampled) {
+      return false;
+    }
+    out = {
+        .texture = depth.sampledTexture,
+        .sampleView = depth.sampled,
+        .size = depth.size,
+        .format = depth.sampledFormat,
+        .samples = 1,
+    };
+    return true;
+  }
+  if (!depth.attachment) {
+    return false;
+  }
+  out = {
+      .texture = depth.attachmentTexture,
+      .attachmentView = depth.attachment,
+      .size = depth.size,
+      .format = depth.attachmentFormat,
+      .samples = depth.attachmentSamples,
+  };
+  return true;
 }
 
 BindCacheStats bind_cache_stats() noexcept {

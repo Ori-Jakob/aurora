@@ -2,8 +2,11 @@
 
 #include "logging.hpp"
 #include "render/debug/graph_inspection.hpp"
+#include "render/frame_state.hpp"
 #include "render/graph.hpp"
 #include "render/graph_api.hpp"
+#include "render/scene_depth.hpp"
+#include "render/stage.hpp"
 #include "render/stage_data.hpp"
 #include "render_graph_planned.hpp"
 
@@ -960,6 +963,173 @@ TEST_F(RenderGraphApi, ExternalFlagReachesInspection) {
   EXPECT_TRUE(find("mod.pass")->external);
   EXPECT_FALSE(find("internal.pass")->external);
   EXPECT_NE(debug::format_graph_json(inspection).find("\"external\": true"), std::string::npos);
+}
+
+GraphInputs depth_inputs(DepthSource source, uint32_t samples = 1) {
+  GraphInputs inputs = test_inputs();
+  inputs.env.gxSampleCount = samples;
+  inputs.sceneDepthSource = source;
+  return inputs;
+}
+
+void samples_gx_depth(PassBuilder& b, Missing missing = Missing::DisablePass) {
+  b.use(resource::GxDepth, Access::Sampled, missing);
+  b.side_effect();
+}
+
+void reads_gx_depth_attachment(PassBuilder& b) {
+  b.use(resource::GxDepth, Access::DepthRead);
+  b.side_effect();
+}
+
+void declare_internal_depth_write(InternalPassBuilder& builder, const PassSetup&, const void*) {
+  builder.use(resource::GxDepth, Access::DepthWrite);
+}
+
+TEST_F(RenderGraphApi, UnavailableSceneDepthAppliesMissing) {
+  add("mod.disabled", Stage::BeforeHud, PassKind::Compute, [](PassBuilder& b) { samples_gx_depth(b); });
+  add("mod.black", Stage::BeforeHud, PassKind::Compute,
+      [](PassBuilder& b) { samples_gx_depth(b, Missing::BindDummyBlack); });
+  add("mod.read", Stage::BeforeHud, PassKind::Render, reads_gx_depth_attachment);
+  const auto graph = compile_externals({}, depth_inputs(DepthSource::Unavailable));
+  EXPECT_EQ(graph->sceneDepthSource, DepthSource::Unavailable);
+  EXPECT_EQ(status(*graph, "mod.disabled"), CullReason::MissingInput);
+  EXPECT_NE(diagnostic(*graph, "mod.disabled").find("'gx.depth'"), std::string::npos);
+  EXPECT_EQ(status(*graph, "mod.black"), CullReason::None);
+  const CompiledUse* black = use_of(*graph, "mod.black", "gx.depth");
+  ASSERT_NE(black, nullptr);
+  EXPECT_TRUE(black->staticDummy);
+  ASSERT_TRUE(black->hasFallback);
+  EXPECT_EQ(black->fallback, (DummyKey{.color = DummyColor::Black,
+                                       .dimension = wgpu::TextureViewDimension::e2D,
+                                       .sampleType = wgpu::TextureSampleType::UnfilterableFloat}));
+  EXPECT_EQ(status(*graph, "mod.read"), CullReason::None);
+}
+
+TEST_F(RenderGraphApi, MsaaGxDepthFollowsSource) {
+  add("mod.sample", Stage::BeforeHud, PassKind::Compute, [](PassBuilder& b) { samples_gx_depth(b); });
+  add("mod.read", Stage::BeforeHud, PassKind::Render, reads_gx_depth_attachment);
+  const auto compile_at = [](DepthSource source) {
+    const std::shared_ptr<const ExternalPassSet> set = snapshot_external_passes();
+    std::vector<PassDesc> passes{{
+        .name = "internal.depth_write",
+        .stage = Stage::BeforeHud,
+        .kind = PassKind::Render,
+        .declare = declare_internal_depth_write,
+    }};
+    append_external_passes(*set, nullptr, passes);
+    GraphInputs inputs = depth_inputs(source, 4);
+    inputs.passes = passes;
+    inputs.externals = set;
+    return compile_graph(inputs);
+  };
+  const auto copy = compile_at(DepthSource::Copy);
+  EXPECT_EQ(status(*copy, "mod.sample"), CullReason::None);
+  EXPECT_EQ(status(*copy, "mod.read"), CullReason::None);
+  EXPECT_EQ(status(*copy, "internal.depth_write"), CullReason::MissingTarget);
+  const BindingPlan& plan = copy->bindingPlans[copy->find_node("mod.read")];
+  ASSERT_TRUE(plan.depth.has_value());
+  EXPECT_EQ(plan.depth->access, Access::DepthRead);
+  EXPECT_EQ(plan.depth->samples, 4u);
+
+  const auto unavailable = compile_at(DepthSource::Unavailable);
+  EXPECT_EQ(status(*unavailable, "mod.sample"), CullReason::MissingInput);
+  EXPECT_EQ(status(*unavailable, "mod.read"), CullReason::None);
+  EXPECT_EQ(status(*unavailable, "internal.depth_write"), CullReason::MissingTarget);
+}
+
+TEST_F(RenderGraphApi, SampledAndDepthReadOnOnePassRejected) {
+  add("mod.both", Stage::BeforeHud, PassKind::Render, [](PassBuilder& b) {
+    b.use(resource::GxDepth, Access::Sampled);
+    b.use(resource::GxDepth, Access::DepthRead);
+  });
+  const auto graph = compile_externals({}, depth_inputs(DepthSource::Direct));
+  EXPECT_EQ(status(*graph, "mod.both"), CullReason::InvalidDeclaration);
+  EXPECT_NE(diagnostic(*graph, "mod.both").find("uses 'gx.depth' twice"), std::string::npos);
+}
+
+TEST_F(RenderGraphApi, DepthReadAttachmentSampleCountMismatchRejected) {
+  add("mod.mixed", Stage::BeforeHud, PassKind::Render, [](PassBuilder& b) {
+    b.use(resource::GxDepth, Access::DepthRead);
+    b.create("mod.t", efb_tex(wgpu::TextureFormat::RGBA8Unorm), Access::ColorWrite);
+    b.side_effect();
+  });
+  EXPECT_EQ(status(*compile_externals({}, depth_inputs(DepthSource::Copy, 4)), "mod.mixed"),
+            CullReason::SampleCountMismatch);
+  EXPECT_EQ(status(*compile_externals({}, depth_inputs(DepthSource::Direct)), "mod.mixed"), CullReason::None);
+}
+
+TEST_F(RenderGraphApi, SceneDepthChoiceLoggedOnce) {
+  const auto choices = [] {
+    return std::ranges::count_if(g_logLines, [](const LogLine& line) {
+      return line.level == LOG_INFO && line.module == "aurora::render::graph" &&
+             line.message.starts_with("Scene depth for render passes: ");
+    });
+  };
+  const auto lines = [](const std::string& text) {
+    return std::ranges::count_if(g_logLines, [&](const LogLine& line) {
+      return line.level == LOG_INFO && line.module == "aurora::render::graph" && line.message == text;
+    });
+  };
+  constexpr auto Depth = wgpu::TextureFormat::Depth32Float;
+  const PassId reader =
+      add("mod.depth", Stage::BeforeHud, PassKind::Compute, [](PassBuilder& b) { samples_gx_depth(b); });
+  compile_externals({}, depth_inputs(DepthSource::Direct));
+  EXPECT_EQ(lines(scene_depth_choice_text(DepthSource::Direct, 1, true, Depth)), 1);
+  EXPECT_EQ(choices(), 1);
+  compile_externals({}, depth_inputs(DepthSource::Direct));
+  EXPECT_EQ(choices(), 1);
+  compile_externals({}, depth_inputs(DepthSource::Copy, 4));
+  EXPECT_EQ(lines(scene_depth_choice_text(DepthSource::Copy, 4, true, Depth)), 1);
+  EXPECT_EQ(choices(), 2);
+
+  render::unregister_pass(reader);
+  add("mod.color", Stage::BeforeHud, PassKind::Compute, [](PassBuilder& b) {
+    b.use(resource::GxColor, Access::Sampled);
+    b.side_effect();
+  });
+  compile_externals({}, depth_inputs(DepthSource::Unavailable));
+  EXPECT_EQ(choices(), 2);
+
+  // The fixture's reset clears the remembered choice, so the next depth reader logs again
+  testing::reset_logged_diagnostics();
+  add("mod.depth2", Stage::BeforeHud, PassKind::Compute, [](PassBuilder& b) { samples_gx_depth(b); });
+  GraphInputs compat = depth_inputs(DepthSource::Unavailable);
+  compat.env.limits = planned::compat_limits();
+  compile_externals({}, compat);
+  EXPECT_EQ(lines("Scene depth for render passes: unavailable (compatibility mode)"), 1);
+  EXPECT_EQ(choices(), 3);
+}
+
+TEST_F(RenderGraphApi, StageSamplerMaskTracksActivePasses) {
+  add("mod.plain", Stage::BeforeHud, PassKind::Compute, [](PassBuilder& b) { b.side_effect(); });
+  add("mod.depth", Stage::BeforeHud, PassKind::Compute, [](PassBuilder& b) { samples_gx_depth(b); });
+  add("mod.dummy", Stage::BeforeHud, PassKind::Compute,
+      [](PassBuilder& b) { samples_gx_depth(b, Missing::BindDummyBlack); });
+  const auto graph = compile_externals({}, depth_inputs(DepthSource::Direct));
+  ASSERT_EQ(stage_passes(*graph, Stage::BeforeHud).size(), 3u);
+  const FrameState state{.graph = graph};
+  const auto samples = [&](Stage stage, std::initializer_list<std::string_view> names) {
+    StageData data{.stage = stage, .frame = &state, .passCount = 3, .enabled = {0}};
+    for (const std::string_view name : names) {
+      data.enabled[0] |= uint64_t{1} << node(*graph, name).programIndex;
+    }
+    return stage_samples_scene_depth(data);
+  };
+  EXPECT_TRUE(samples(Stage::BeforeHud, {"mod.plain", "mod.depth", "mod.dummy"}));
+  EXPECT_TRUE(samples(Stage::BeforeHud, {"mod.depth"}));
+  EXPECT_TRUE(samples(Stage::BeforeHud, {"mod.dummy"}));
+  EXPECT_FALSE(samples(Stage::BeforeHud, {"mod.plain"}));
+  EXPECT_FALSE(samples(Stage::BeforeHud, {}));
+  EXPECT_FALSE(samples(Stage::FrameEnd, {"mod.plain", "mod.depth", "mod.dummy"}));
+  EXPECT_FALSE(stage_samples_scene_depth(StageData{.stage = Stage::BeforeHud}));
+  EXPECT_EQ(stage_scene_depth_source(StageData{.stage = Stage::BeforeHud, .frame = &state}), DepthSource::Direct);
+  EXPECT_EQ(stage_scene_depth_source(StageData{.stage = Stage::BeforeHud}), DepthSource::Unavailable);
+
+  // Without a source the reader is disabled and the dummy reader binds a static dummy, so neither asks for depth
+  const auto unavailable = compile_externals({}, depth_inputs(DepthSource::Unavailable));
+  const auto& bits = unavailable->sceneDepthSamplers[static_cast<size_t>(Stage::BeforeHud)];
+  EXPECT_TRUE(std::ranges::all_of(bits, [](uint64_t word) { return word == 0; }));
 }
 } // namespace
 } // namespace aurora::render::detail

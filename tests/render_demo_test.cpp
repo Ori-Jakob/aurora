@@ -5,6 +5,7 @@
 #include "procedural.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <optional>
 #include <string>
@@ -265,4 +266,64 @@ TEST(RenderDemoGraph, UnknownAnchorMatcher) {
   EXPECT_FALSE(is_unknown_anchor_warning(LOG_WARNING, "aurora::render", Line));
   EXPECT_FALSE(is_unknown_anchor_warning(LOG_INFO, "aurora::render::graph", Line));
   EXPECT_FALSE(is_unknown_anchor_warning(LOG_WARNING, "aurora::render::graph", "render graph: 'demo.vignette' culled"));
+}
+
+TEST(RenderDemoOptions, ParsesDepthCheck) {
+  const auto defaults = parse({});
+  ASSERT_TRUE(defaults);
+  EXPECT_FALSE(defaults->depthCheck);
+  const auto check = parse({"--depth-check"});
+  ASSERT_TRUE(check);
+  EXPECT_TRUE(check->depthCheck);
+  EXPECT_FALSE(check->vignette);
+  EXPECT_EQ(parse_error({"--depth-check", "--frames", "39"}), "--depth-check needs at least 40 frames");
+  EXPECT_EQ(parse_error({"--frames", "1", "--depth-check"}), "--depth-check needs at least 40 frames");
+  EXPECT_TRUE(parse({"--depth-check", "--frames", "40"}));
+  EXPECT_TRUE(parse({"--depth-check", "--frames", "0"}));
+  EXPECT_TRUE(parse({"--frames", "39"}));
+  EXPECT_EQ(parse_error({"--depth-check", "--trace", "x"}), "render graph passes cannot be traced");
+}
+
+namespace {
+std::array<f32, 4> probe(f32 sky, f32 mid, f32 close, f32 width = 1280.f) { return {sky, mid, close, width}; }
+} // namespace
+
+TEST(RenderDemoGraph, DepthProbeAcceptsExpected) {
+  EXPECT_EQ(check_depth_probe(probe(0.f, 0.027f, 0.034f), true), std::nullopt);
+}
+
+TEST(RenderDemoGraph, DepthProbeRejectsSky) {
+  EXPECT_EQ(check_depth_probe(probe(0.5f, 0.027f, 0.034f), true), "sky probe 0.5 is not the clear depth 0");
+}
+
+TEST(RenderDemoGraph, DepthProbeRejectsGroundOutOfRange) {
+  EXPECT_EQ(check_depth_probe(probe(0.f, 0.f, 0.034f), true), "ground probe 1 = 0 is outside (0, 1)");
+  EXPECT_EQ(check_depth_probe(probe(0.f, 0.027f, 1.f), true), "ground probe 2 = 1 is outside (0, 1)");
+}
+
+TEST(RenderDemoGraph, DepthProbeRejectsOrder) {
+  EXPECT_EQ(check_depth_probe(probe(0.f, 0.027f, 0.02f), true), "near probe 0.02 is not closer than mid probe 0.027");
+  EXPECT_EQ(check_depth_probe(probe(0.f, 0.027f, 0.027f), true), "near probe 0.027 is not closer than mid probe 0.027");
+}
+
+TEST(RenderDemoGraph, DepthProbeRejectsShaderNotRun) {
+  EXPECT_EQ(check_depth_probe(probe(0.f, 0.027f, 0.034f, 0.f), true), "probe shader did not run");
+  EXPECT_EQ(check_depth_probe(probe(0.f, 0.f, 0.f, 0.f), false), "probe shader did not run");
+}
+
+TEST(RenderDemoGraph, DepthProbeForwardZ) {
+  EXPECT_EQ(check_depth_probe(probe(1.f, 0.98f, 0.97f), false), std::nullopt);
+  EXPECT_EQ(check_depth_probe(probe(0.f, 0.98f, 0.97f), false), "sky probe 0 is not the clear depth 1");
+  EXPECT_EQ(check_depth_probe(probe(1.f, 1.f, 0.97f), false), "ground probe 1 = 1 is outside (0, 1)");
+  EXPECT_EQ(check_depth_probe(probe(1.f, 0.97f, 0.98f), false), "near probe 0.98 is not closer than mid probe 0.97");
+  // The reversed-Z expectations fail a forward-Z depth buffer
+  EXPECT_NE(check_depth_probe(probe(0.f, 0.027f, 0.034f), false), std::nullopt);
+}
+
+TEST(RenderDemoGraph, DepthProbeRowsSampleSkyAndGround) {
+  EXPECT_EQ(DepthProbeRows.size(), 3u);
+  EXPECT_LT(DepthProbeRows[0], DepthProbeRows[1]);
+  EXPECT_LT(DepthProbeRows[1], DepthProbeRows[2]);
+  EXPECT_LT(DepthProbeRows[2], 1.f);
+  EXPECT_LT(DepthCheckFrame, 40u);
 }

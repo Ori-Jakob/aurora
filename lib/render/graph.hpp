@@ -268,6 +268,7 @@ struct GraphInputs {
   const Caps* caps = nullptr;
   GraphEnvironment env;
   std::shared_ptr<const ExternalPassSet> externals;
+  DepthSource sceneDepthSource = DepthSource::Unavailable;
 };
 
 struct DummyKey {
@@ -489,6 +490,8 @@ struct CompiledGraph {
   std::vector<BindingPlan> bindingPlans;
   SlotPlan slots;
   std::shared_ptr<const ExternalPassSet> externals;
+  DepthSource sceneDepthSource = DepthSource::Unavailable;
+  std::array<std::vector<uint64_t>, StageCount> sceneDepthSamplers{};
 
   [[nodiscard]] bool stage_empty(Stage stage) const noexcept {
     return stages[static_cast<size_t>(stage)].passes.empty();
@@ -562,6 +565,7 @@ struct ColorTargetCost {
 struct LatchGraphInputs {
   std::shared_ptr<const ExternalPassSet> externals;
   PassEncodeFn externalEncode = nullptr;
+  DepthSource sceneDepthSource = DepthSource::Unavailable;
 };
 
 std::shared_ptr<CompiledGraph> compile_graph(const GraphInputs& inputs);

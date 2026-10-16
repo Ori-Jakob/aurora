@@ -12,6 +12,7 @@
 #include "render/graph_layout.hpp"
 #include "render/graph_pool.hpp"
 #include "render/module.hpp"
+#include "render/scene_depth.hpp"
 #include "render/stage.hpp"
 #include "webgpu/gpu.hpp"
 
@@ -149,6 +150,8 @@ protected:
     shutdown_bindings();
     testing::reset_transient_pool(nullptr);
     transient_pool().set_release_listener(&bind_cache_on_release);
+    // Module initialisation registers it in the app, and these tests never run that
+    register_gx_resolver(GxResource::Depth, &resolve_gx_depth);
     testing::clear_passes();
     testing::reset_external_passes();
     reset_frame_cull();
@@ -187,7 +190,7 @@ protected:
   }
 
   // Mirrors the latch: params and enabled bits first, then a compile that appends the external set
-  static TestFrame compile_externals() {
+  static TestFrame compile_externals(DepthSource sceneDepthSource = DepthSource::Unavailable) {
     latch_external_passes();
     const std::shared_ptr<const ExternalPassSet> set = snapshot_external_passes();
     std::vector<PassDesc> passes;
@@ -196,6 +199,7 @@ protected:
     inputs.env = gather_graph_environment();
     inputs.passes = passes;
     inputs.externals = set;
+    inputs.sceneDepthSource = sceneDepthSource;
     const std::shared_ptr<CompiledGraph> graph = compile_graph(inputs);
     prepare_graph_bindings(*graph);
     return TestFrame{graph};
@@ -207,11 +211,13 @@ protected:
     return test::pop_validation_error(*m_device);
   }
 
-  std::optional<std::string> run_frame(const TestFrame& frame, uint64_t frameId, StageData* out = nullptr) const {
+  std::optional<std::string> run_frame(const TestFrame& frame, uint64_t frameId, StageData* out = nullptr,
+                                       std::shared_ptr<const SceneDepth> sceneDepth = nullptr) const {
     g_uniforms.clear();
     g_pushes.clear();
     on_worker_frame_begin(frameId, &frame.state);
     StageData stage = stage_for(frame, Stage::OpaqueDone, frameId);
+    stage.sceneDepth = std::move(sceneDepth);
     build_stage_bindings(stage, &fake_sink);
     if (!g_uniforms.empty()) {
       g_uniforms.resize((g_uniforms.size() + 3) & ~size_t{3});
@@ -417,6 +423,207 @@ TEST_F(RenderGraphApiGpu, ExternalEncodeRunsCallbackAndQueuesAfterSubmit) {
   EXPECT_EQ(pass.submitted.size(), 1u);
   ASSERT_EQ(run_frame(frame, 3), std::nullopt);
   EXPECT_EQ(pass.encodes, 2);
+}
+
+struct DepthTestTexture {
+  wgpu::Texture texture;
+  wgpu::TextureView view;
+};
+
+DepthTestTexture depth_test_texture(TextureFormat format, uint32_t samples, wgpu::TextureUsage usage) {
+  const wgpu::TextureDescriptor descriptor{
+      .label = "scene depth test",
+      .usage = usage,
+      .size = {64, 64, 1},
+      .format = format,
+      .sampleCount = samples,
+  };
+  wgpu::Texture texture = webgpu::g_device.CreateTexture(&descriptor);
+  wgpu::TextureView view = texture.CreateView();
+  return {.texture = std::move(texture), .view = std::move(view)};
+}
+
+constexpr wgpu::TextureUsage SampledDepthUsage =
+    wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding;
+
+std::shared_ptr<const SceneDepth> sampled_scene_depth(DepthSource source) {
+  const bool copy = source == DepthSource::Copy;
+  const TextureFormat format = copy ? TextureFormat::R32Float : TextureFormat::Depth32Float;
+  DepthTestTexture sampled = depth_test_texture(format, 1, SampledDepthUsage);
+  return std::make_shared<const SceneDepth>(SceneDepth{
+      .source = source,
+      .sampledTexture = std::move(sampled.texture),
+      .sampled = std::move(sampled.view),
+      .sampledFormat = format,
+      .size = {64, 64, 1},
+  });
+}
+
+TEST_F(RenderGraphApiGpu, SceneDepthSampledPlanIsUnfilterableFloat2d) {
+  add("mod.cs", PassKind::Compute, [](PassBuilder& b) {
+    b.use(resource::GxDepth, Access::Sampled);
+    b.side_effect();
+  });
+  add("mod.fs", PassKind::Render, [](PassBuilder& b) {
+    b.use(resource::GxDepth, Access::Sampled);
+    b.use(resource::GxColor, Access::ColorRMW);
+  });
+  const TestFrame frame = compile_externals(DepthSource::Direct);
+  for (const auto& [name, visibility] :
+       {std::pair{"mod.cs", wgpu::ShaderStage::Compute}, std::pair{"mod.fs", wgpu::ShaderStage::Fragment}}) {
+    ASSERT_EQ(frame.graph->nodes[frame.node(name)].status, CullReason::None) << name;
+    const BindingPlan& plan = frame.graph->bindingPlans[frame.node(name)];
+    ASSERT_EQ(plan.slots.size(), 1u) << name;
+    const BindingSlot& slot = plan.slots[0];
+    EXPECT_EQ(slot.type, BindingType::SampledTexture) << name;
+    EXPECT_EQ(slot.sampleType, wgpu::TextureSampleType::UnfilterableFloat) << name;
+    EXPECT_EQ(slot.viewDimension, wgpu::TextureViewDimension::e2D) << name;
+    EXPECT_FALSE(slot.multisampled) << name;
+    EXPECT_EQ(slot.visibility, visibility) << name;
+  }
+}
+
+TEST_F(RenderGraphApiGpu, SceneDepthBindsDepthTextureAndSnapshot) {
+  constexpr std::string_view Source = R"(
+@group(1) @binding(0) var scene_depth: texture_2d<f32>;
+
+@compute @workgroup_size(1)
+fn main() {
+  _ = textureLoad(scene_depth, vec2u(0u, 0u), 0).r;
+}
+)";
+  std::optional<std::string> pipelineError = "not encoded";
+  std::vector<TextureFormat> formats;
+  std::vector<TextureFormat> textureFormats;
+  add(
+      "mod.depth", PassKind::Compute,
+      [](PassBuilder& b) {
+        b.use(resource::GxDepth, Access::Sampled);
+        b.side_effect();
+      },
+      [&](render::PassContext& ctx) {
+        formats.push_back(ctx.format(TexRef{0}));
+        const wgpu::Texture texture = ctx.texture(TexRef{0});
+        textureFormats.push_back(texture ? texture.GetFormat() : TextureFormat::Undefined);
+        EXPECT_EQ(ctx.extent(TexRef{0}).width, 64u);
+        EXPECT_EQ(ctx.sample_count(TexRef{0}), 1u);
+        push_validation_scope();
+        const wgpu::ComputePipelineDescriptor descriptor{
+            .layout = ctx.pipeline_layout(),
+            .compute = {.module = shader_module(Source), .entryPoint = "main"},
+        };
+        const wgpu::ComputePipeline pipeline = ctx.device().CreateComputePipeline(&descriptor);
+        pipelineError = pop_validation_scope();
+        if (const wgpu::ComputePassEncoder pass = ctx.begin_compute()) {
+          pass.SetPipeline(pipeline);
+          pass.DispatchWorkgroups(1);
+          pass.End();
+        }
+      });
+  const TestFrame frame = compile_externals(DepthSource::Direct);
+  ASSERT_EQ(frame.graph->nodes[frame.node("mod.depth")].status, CullReason::None);
+  EXPECT_EQ(run_frame(frame, 1, nullptr, sampled_scene_depth(DepthSource::Direct)), std::nullopt);
+  EXPECT_EQ(pipelineError, std::nullopt);
+  EXPECT_EQ(run_frame(frame, 2, nullptr, sampled_scene_depth(DepthSource::Copy)), std::nullopt);
+  EXPECT_EQ(pipelineError, std::nullopt);
+  EXPECT_EQ(formats, (std::vector{TextureFormat::Depth32Float, TextureFormat::R32Float}));
+  EXPECT_EQ(textureFormats, formats);
+}
+
+TEST_F(RenderGraphApiGpu, DepthReadIsAttachmentOnly) {
+  std::optional<TextureFormat> format;
+  std::optional<uint32_t> samples;
+  WGPUTexture bound = nullptr;
+  add(
+      "mod.depth_read", PassKind::Render,
+      [](PassBuilder& b) {
+        b.use(resource::GxDepth, Access::DepthRead);
+        b.side_effect();
+      },
+      [&](render::PassContext& ctx) {
+        format = ctx.format(TexRef{0});
+        samples = ctx.sample_count(TexRef{0});
+        bound = ctx.texture(TexRef{0}).Get();
+        if (const wgpu::RenderPassEncoder pass = ctx.begin_render()) {
+          pass.End();
+        }
+      });
+  const TestFrame frame = compile_externals(DepthSource::Direct);
+  ASSERT_EQ(frame.graph->nodes[frame.node("mod.depth_read")].status, CullReason::None);
+  const BindingPlan& plan = frame.graph->bindingPlans[frame.node("mod.depth_read")];
+  EXPECT_TRUE(plan.slots.empty());
+  EXPECT_TRUE(plan.colors.empty());
+  ASSERT_TRUE(plan.depth.has_value());
+  EXPECT_EQ(plan.depth->access, Access::DepthRead);
+  EXPECT_FALSE(plan.depth->creatorWrite);
+
+  const DepthTestTexture target = depth_test_texture(TextureFormat::Depth32Float, 1, SampledDepthUsage);
+  const auto depth = std::make_shared<const SceneDepth>(SceneDepth{
+      .source = DepthSource::Direct,
+      .attachmentTexture = target.texture,
+      .attachment = target.view,
+      .attachmentFormat = TextureFormat::Depth32Float,
+      .size = {64, 64, 1},
+  });
+  testing::record_bind_details(true);
+  const std::optional<std::string> error = run_frame(frame, 1, nullptr, depth);
+  testing::record_bind_details(false);
+  EXPECT_EQ(error, std::nullopt);
+  EXPECT_EQ(format, TextureFormat::Depth32Float);
+  EXPECT_EQ(samples, 1u);
+  EXPECT_EQ(bound, target.texture.Get());
+  const std::vector<testing::AttachmentOps> ops = testing::last_attachment_ops();
+  ASSERT_EQ(ops.size(), 1u);
+  EXPECT_TRUE(ops[0].depth);
+  EXPECT_TRUE(ops[0].readOnly);
+  EXPECT_EQ(ops[0].load, wgpu::LoadOp::Undefined);
+  EXPECT_EQ(ops[0].store, wgpu::StoreOp::Undefined);
+  EXPECT_EQ(ops[0].width, 64u);
+}
+
+TEST_F(RenderGraphApiGpu, GxDepthResolverPerAccess) {
+  const DepthTestTexture sampled = depth_test_texture(TextureFormat::R32Float, 1, SampledDepthUsage);
+  const DepthTestTexture attachment =
+      depth_test_texture(TextureFormat::Depth32Float, 4, wgpu::TextureUsage::RenderAttachment);
+  StageData stage{.stage = Stage::FrameEnd};
+  GxBinding out;
+  EXPECT_FALSE(resolve_gx_depth(stage, Access::Sampled, out));
+
+  stage.sceneDepth = std::make_shared<const SceneDepth>(SceneDepth{
+      .source = DepthSource::Copy,
+      .sampledTexture = sampled.texture,
+      .sampled = sampled.view,
+      .sampledFormat = TextureFormat::R32Float,
+      .attachmentTexture = attachment.texture,
+      .attachment = attachment.view,
+      .attachmentFormat = TextureFormat::Depth32Float,
+      .attachmentSamples = 4,
+      .size = {64, 64, 1},
+  });
+  ASSERT_TRUE(resolve_gx_depth(stage, Access::Sampled, out));
+  EXPECT_EQ(out.texture.Get(), sampled.texture.Get());
+  EXPECT_EQ(out.sampleView.Get(), sampled.view.Get());
+  EXPECT_EQ(out.format, TextureFormat::R32Float);
+  EXPECT_EQ(out.samples, 1u);
+  EXPECT_EQ(out.size.width, 64u);
+
+  out = {};
+  ASSERT_TRUE(resolve_gx_depth(stage, Access::DepthRead, out));
+  EXPECT_EQ(out.texture.Get(), attachment.texture.Get());
+  EXPECT_EQ(out.attachmentView.Get(), attachment.view.Get());
+  EXPECT_EQ(out.format, TextureFormat::Depth32Float);
+  EXPECT_EQ(out.samples, 4u);
+  EXPECT_EQ(out.size.height, 64u);
+
+  stage.sceneDepth = std::make_shared<const SceneDepth>(SceneDepth{
+      .source = DepthSource::Copy,
+      .attachmentTexture = attachment.texture,
+      .attachment = attachment.view,
+      .attachmentFormat = TextureFormat::Depth32Float,
+      .attachmentSamples = 4,
+  });
+  EXPECT_FALSE(resolve_gx_depth(stage, Access::Sampled, out));
+  EXPECT_TRUE(resolve_gx_depth(stage, Access::DepthRead, out));
 }
 } // namespace
 } // namespace aurora::render::detail

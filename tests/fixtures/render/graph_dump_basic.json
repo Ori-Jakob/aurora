@@ -3,6 +3,7 @@
   "version": 1,
   "compiled": true,
   "graphHash": "0xb1243e7db832f305",
+  "sceneDepth": "direct",
   "stages": [
     {
       "name": "SceneBegin",

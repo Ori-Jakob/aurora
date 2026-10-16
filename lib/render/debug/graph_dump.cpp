@@ -135,6 +135,7 @@ std::string format_graph_json(const GraphInspection& graph, const FrameCullSnaps
   w.add(root, "version", uint64_t{1});
   w.add_bool(root, "compiled", true);
   w.add(root, "graphHash", std::string_view{fmt::format("0x{:016x}", graph.graphHash)});
+  w.add(root, "sceneDepth", std::string_view{graph.sceneDepth});
 
   yyjson_mut_val* stages = w.add_array(root, "stages");
   for (const InspectStage& stage : graph.stages) {

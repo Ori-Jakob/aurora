@@ -15,7 +15,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <system_error>
 
 // Last because it redefines main
@@ -66,6 +68,37 @@ void log_callback(AuroraLogLevel level, const char* module, const char* message,
     std::fflush(out);
     std::abort();
   }
+}
+
+std::string_view depth_source_name(aurora::render::DepthSource source) noexcept {
+  switch (source) {
+  case aurora::render::DepthSource::Direct:
+    return "direct";
+  case aurora::render::DepthSource::Copy:
+    return "copy";
+  default:
+    return "unavailable";
+  }
+}
+
+std::optional<std::string> depth_check_failure(const render_demo::GraphPassReport& report, bool nullBackend,
+                                               bool reversedZ) {
+  // A probe that runs without scene depth, or never runs with it, means DisablePass did not follow the source
+  const bool available = report.source != aurora::render::DepthSource::Unavailable;
+  if (available == (report.probeEncodes == 0)) {
+    char text[96];
+    std::snprintf(text, sizeof(text), "probe encoded %u times with scene depth %.*s", report.probeEncodes,
+                  static_cast<int>(depth_source_name(report.source).size()), depth_source_name(report.source).data());
+    return std::string{text};
+  }
+  // The null backend runs no shaders, so its values say nothing
+  if (!available || nullBackend) {
+    return std::nullopt;
+  }
+  if (!report.probeReady) {
+    return std::string{"probe readback did not complete"};
+  }
+  return render_demo::check_depth_probe(report.probe, reversedZ);
 }
 } // namespace
 
@@ -123,7 +156,8 @@ int main(int argc, char* argv[]) {
     return ExitSceneInit;
   }
   if (std::string graphError; !render_demo::register_graph_passes(
-          {.vignette = options.vignette, .vignetteAnchor = options.vignetteAnchor}, graphError)) {
+          {.vignette = options.vignette, .vignetteAnchor = options.vignetteAnchor, .depthCheck = options.depthCheck},
+          graphError)) {
     std::fprintf(stderr, "render_demo: render graph setup failed: %s\n", graphError.c_str());
     render_demo::shutdown_scene();
     aurora_shutdown();
@@ -203,6 +237,26 @@ int main(int argc, char* argv[]) {
     std::printf("render_demo: graph: vignette %u/%u encodes, %u unknown-anchor warnings\n", graphReport.vignetteEncodes,
                 frame, anchorWarnings);
   }
+  const std::optional<std::string> depthFailure =
+      options.depthCheck
+          ? depth_check_failure(graphReport, info.backend == BACKEND_NULL, aurora::gfx::uses_reversed_z())
+          : std::nullopt;
+  if (options.depthCheck) {
+    std::string status;
+    if (depthFailure) {
+      status = "FAILED: " + *depthFailure;
+    } else if (graphReport.source == aurora::render::DepthSource::Unavailable) {
+      status = "skipped (scene depth unavailable)";
+    } else if (info.backend == BACKEND_NULL) {
+      status = "skipped (null backend)";
+    } else {
+      status = "passed";
+    }
+    const std::string_view source = depth_source_name(graphReport.source);
+    std::printf("render_demo: depth check %s (%.*s): sky %.6g, mid %.6g, near %.6g\n", status.c_str(),
+                static_cast<int>(source.size()), source.data(), graphReport.probe[0], graphReport.probe[1],
+                graphReport.probe[2]);
+  }
   if (timedOut) {
     return ExitTimeout;
   }
@@ -218,6 +272,9 @@ int main(int argc, char* argv[]) {
                    anchorWarnings);
       return ExitRenderGraphCheck;
     }
+  }
+  if (depthFailure) {
+    return ExitRenderGraphCheck;
   }
   if (!options.tracePath.empty() && traceStatus.state != aurora::trace::CaptureState::Finished) {
     std::fprintf(stderr, "render_demo: trace capture did not finish: %s\n",
