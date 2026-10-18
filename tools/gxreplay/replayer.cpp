@@ -10,6 +10,7 @@
 #include "gx/fifo.hpp"
 #include "gx/guest_memory.hpp"
 #include "gx/gx.hpp"
+#include "gx/hints.hpp"
 #include "gx/texture.hpp"
 #include "io.hpp"
 #if AURORA_ENABLE_RENDER
@@ -177,6 +178,7 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
   gx::guest_memory::set_hooks(nullptr);
   gx::g_gxState = gx::GXState{};
   gx::fifo::clear_draw_cache();
+  gx::hints::reset_state();
   gx::reset_texture_caches();
   m_store.reset();
   if (!m_reader.rewind(error)) {
@@ -225,6 +227,7 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
     gx::fifo::begin_frame();
 
     const uint64_t missesBefore = m_store.misses();
+    const uint64_t hintBytesBefore = gx::hints::total_bytes();
     uint64_t fifoBytes = 0;
     uint32_t mapRecords = 0;
     bool recordsOk = true;
@@ -270,6 +273,7 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
       }
     }
     const auto processEnd = Clock::now();
+    const uint64_t hintBytes = gx::hints::total_bytes() - hintBytesBefore;
 
     const bool frameOk = end_frame(output && recordsOk, rgba, width, height, error);
     if (!frameOk || !recordsOk) {
@@ -286,6 +290,7 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
           .height = height,
           .rgbaHash = hash_rgba(rgba),
           .fifoBytes = fifoBytes,
+          .hintBytes = hintBytes,
           .mapRecords = mapRecords,
           .misses = frameMisses,
           .draws = aurora_get_stats()->drawCallCount,

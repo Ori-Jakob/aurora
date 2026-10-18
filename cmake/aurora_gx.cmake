@@ -20,6 +20,9 @@ add_library(aurora_gx STATIC
         lib/gx/dl.cpp
         lib/gx/fifo.cpp
         lib/gx/gx.cpp
+        lib/gx/draw_route.hpp
+        lib/gx/hints.cpp
+        lib/gx/hints.hpp
         lib/gx/texture.cpp
         lib/gx/pipeline.cpp
         lib/gx/shader.cpp

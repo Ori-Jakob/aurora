@@ -224,4 +224,16 @@ struct PassTiming {
 void draw_debug_window(bool* open);
 std::span<const PassTiming> pass_timings() noexcept;
 std::string graph_dump_json(bool includeFrameState = false);
+
+struct HintCounters {
+  uint64_t decoded = 0;
+  uint64_t skipped = 0;
+  uint64_t malformed = 0;
+  uint64_t late = 0;
+  uint64_t bytes = 0;
+  bool operator==(const HintCounters&) const = default;
+};
+
+bool hints_enabled() noexcept;
+HintCounters hint_counters(uint16_t id) noexcept;
 } // namespace aurora::render

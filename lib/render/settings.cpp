@@ -13,6 +13,7 @@
 
 #if AURORA_ENABLE_RENDER
 #include "debug/debug.hpp"
+#include "hints.hpp"
 #endif
 
 #include <algorithm>
@@ -665,6 +666,7 @@ std::shared_ptr<const FrameState> latch_frame() {
   std::shared_ptr<const CompiledGraph> graph = g_frameState ? g_frameState->graph : nullptr;
   bool inspectorOpen = false;
 #if AURORA_ENABLE_RENDER
+  begin_hint_frame();
   latch_external_passes();
   debug::on_latch();
   const bool passesChanged = consume_graph_dirty();

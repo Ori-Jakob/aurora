@@ -5,6 +5,7 @@
 #include "graph_api.hpp"
 #include "graph_bind.hpp"
 #include "graph_pool.hpp"
+#include "hints.hpp"
 #include "jobs.hpp"
 #include "settings.hpp"
 #include "shaders.hpp"
@@ -70,6 +71,7 @@ void initialize() {
   jobs::initialize(webgpu::g_backendType == wgpu::BackendType::WebGPU ? 0 : jobs::default_worker_count());
   shaders::initialize();
   debug::initialize();
+  install_hints();
 #endif
 }
 
@@ -84,6 +86,7 @@ void shutdown() noexcept {
   // Game registrations are dropped first so no callback can reach anything torn down below
   shutdown_external_passes();
   clear_after_frame_callbacks();
+  remove_hints();
   debug::shutdown();
   // Compile jobs use the device, so they finish before the job pool and the device go away
   shaders::shutdown();
@@ -133,6 +136,25 @@ std::string_view feature_name(Feature feature) noexcept { return detail::feature
 std::string_view reason_name(Reason reason) noexcept {
   const auto index = static_cast<size_t>(reason);
   return index < ReasonNames.size() ? ReasonNames[index] : "Unknown";
+}
+
+bool hints_enabled() noexcept {
+#if AURORA_ENABLE_RENDER
+  return detail::hints_enabled();
+#else
+  return false;
+#endif
+}
+
+HintCounters hint_counters(uint16_t id) noexcept {
+  const gx::hints::Counters counters = gx::hints::counters(id);
+  return {
+      .decoded = counters.decoded,
+      .skipped = counters.skipped,
+      .malformed = counters.malformed,
+      .late = counters.late,
+      .bytes = counters.bytes,
+  };
 }
 
 #if AURORA_ENABLE_RENDER

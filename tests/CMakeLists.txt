@@ -92,6 +92,7 @@ if (AURORA_ENABLE_GX)
   # Compile GX sources directly to avoid pulling in the full renderer/WebGPU runtime
   add_executable(gx_fifo_tests
     gx_fifo_test.cpp
+    gx_hints_test.cpp
     gx_test_stubs.cpp
     # GX API implementations (encoders)
     ../lib/dolphin/gx/GXBump.cpp
@@ -116,6 +117,7 @@ if (AURORA_ENABLE_GX)
     # FIFO/command processor (encoder + decoder)
     ../lib/gx/fifo.cpp
     ../lib/gx/command_processor.cpp
+    ../lib/gx/hints.cpp
     ../lib/gx/regs.cpp
     ../lib/thread.cpp
     # Display list reader/optimizer
@@ -268,6 +270,7 @@ if (AURORA_ENABLE_GX)
 
   add_executable(render_tests
     render_api_test.cpp
+    render_hints_test.cpp
     render_settings_test.cpp
   )
   target_include_directories(render_tests PRIVATE

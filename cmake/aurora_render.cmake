@@ -36,6 +36,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/graph_pool.hpp
         lib/render/graph_slots.cpp
         lib/render/graph_slots.hpp
+        lib/render/hints.cpp
+        lib/render/hints.hpp
         lib/render/jobs.cpp
         lib/render/jobs.hpp
         lib/render/json.hpp

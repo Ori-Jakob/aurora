@@ -6,11 +6,13 @@
 #include "gfx/recording.hpp"
 #include "gfx/texture.hpp"
 #if AURORA_ENABLE_RENDER
+#include "hint_bytes.hpp"
 #include "render/frame_state.hpp"
 #include "render/graph.hpp"
 #include "render/graph_api.hpp"
 #include "render/graph_bind.hpp"
 #include "render/graph_layout.hpp"
+#include "render/hints.hpp"
 #include "render/scene_depth.hpp"
 #include "render/settings.hpp"
 #include "render/stage.hpp"
@@ -25,6 +27,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace aurora::gfx {
@@ -424,8 +427,10 @@ protected:
   void run_marker_script(bool markers, FrameShape& shape) {
     ASSERT_NO_FATAL_FAILURE(latch_new_frame(0));
     ASSERT_EQ(frame.renderState->graph, render::detail::empty_graph());
-    const auto marker = [markers](Stage stage) {
-      if (markers) {
+    const auto marker = [this, markers](Stage stage) {
+      if (markers && hintMarkers) {
+        aurora::test::process_hints(aurora::test::stage_hint(stage));
+      } else if (markers) {
         record_stage(stage);
       }
     };
@@ -477,6 +482,7 @@ protected:
   std::deque<TestPass> passes;
   std::vector<std::string> encoded;
   bool stageDataChecked = false;
+  bool hintMarkers = false;
 };
 
 TEST_F(GfxRenderStageTest, EmptyGraphEmitsNoOps) {
@@ -1547,6 +1553,157 @@ TEST_F(GfxSceneDepthTest, SnapshotRecreatedOnEfbResize) {
   ASSERT_NO_FATAL_FAILURE(compile_new_frame(DepthSource::Copy));
   record_stage(Stage::OpaqueDone);
   EXPECT_EQ(generation(Stage::OpaqueDone), 2u);
+}
+
+std::vector<std::string> g_capturedWarnings;
+
+void capture_warning(AuroraLogLevel level, const char*, const char* message, unsigned int len) {
+  if (level == LOG_WARNING) {
+    g_capturedWarnings.emplace_back(message, len);
+  }
+}
+
+// Restores the previous log callback even when an assertion leaves the test early
+class ScopedWarningCapture {
+public:
+  ScopedWarningCapture() noexcept : m_previous(aurora::g_config.logCallback) {
+    g_capturedWarnings.clear();
+    aurora::g_config.logCallback = &capture_warning;
+  }
+  ~ScopedWarningCapture() { aurora::g_config.logCallback = m_previous; }
+  ScopedWarningCapture(const ScopedWarningCapture&) = delete;
+  ScopedWarningCapture& operator=(const ScopedWarningCapture&) = delete;
+
+  [[nodiscard]] size_t count(std::string_view text) const {
+    return static_cast<size_t>(std::ranges::count_if(
+        g_capturedWarnings, [text](const std::string& line) { return line.find(text) != std::string::npos; }));
+  }
+
+private:
+  AuroraLogCallback m_previous;
+};
+
+class GfxRenderStageHintTest : public GfxRenderStageTest {
+protected:
+  void SetUp() override {
+    GfxRenderStageTest::SetUp();
+    gx::hints::testing::reset_counters();
+    render::detail::testing::set_hints_override(1);
+    render::detail::install_hints();
+    // The missing-marker warning fires once per process, so repeated and whole-binary runs start it fresh
+    render::detail::testing::reset_missing_marker_warnings();
+  }
+
+  void TearDown() override {
+    GfxRenderStageTest::TearDown();
+    render::detail::testing::reset_hints();
+  }
+
+  static bool needs_lights(const render::detail::StageData& stage, const void*) {
+    return stage.sceneHints != nullptr && stage.sceneHints->has(render::detail::SceneHasLights);
+  }
+};
+
+TEST_F(GfxRenderStageHintTest, HintMarkersWithEmptyGraphEmitNoOps) {
+  seed(320, 180);
+  hintMarkers = true;
+  FrameShape withHints;
+  ASSERT_NO_FATAL_FAILURE(run_marker_script(true, withHints));
+  FrameShape withoutMarkers;
+  ASSERT_NO_FATAL_FAILURE(run_marker_script(false, withoutMarkers));
+
+  EXPECT_FALSE(withHints.ops.empty());
+  EXPECT_EQ(withHints.ops, withoutMarkers.ops);
+  EXPECT_EQ(withHints.passes, withoutMarkers.passes);
+  EXPECT_EQ(render::hint_counters(GX_AURORA_RENDER_STAGE).decoded, 6u);
+}
+
+TEST_F(GfxRenderStageHintTest, HintMarkerSealsAndResumes) {
+  add_pass("opaque", Stage::OpaqueDone);
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+
+  aurora::test::process_hints(aurora::test::stage_hint(Stage::OpaqueDone));
+
+  EXPECT_EQ(op_types(), (std::vector{PassOp, StageOp}));
+  ASSERT_EQ(frame.renderPasses.size(), 2u);
+  EXPECT_TRUE(frame.renderPasses[0].sealed);
+  EXPECT_FALSE(frame.renderPasses[1].sealed);
+  ASSERT_EQ(frame.stages.size(), 1u);
+  EXPECT_EQ(frame.stages[0].stage, Stage::OpaqueDone);
+  EXPECT_TRUE(frame.stages[0].markerSeen);
+  EXPECT_TRUE(frame.stages[0].is_enabled(0));
+}
+
+TEST_F(GfxRenderStageHintTest, StageDataCarriesSceneHints) {
+  add_pass("opaque", Stage::OpaqueDone);
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+
+  aurora::test::process_hints(aurora::test::lights_hint(3));
+  aurora::test::process_hints(aurora::test::environment_hint());
+  aurora::test::process_hints(aurora::test::stage_hint(Stage::SceneBegin));
+  aurora::test::process_hints(aurora::test::stage_hint(Stage::OpaqueDone));
+
+  ASSERT_EQ(frame.stages.size(), 1u);
+  const auto& hints = frame.stages[0].sceneHints;
+  ASSERT_NE(hints, nullptr);
+  EXPECT_EQ(hints->lights.size(), 3u);
+  EXPECT_TRUE(hints->has(render::detail::SceneHasLights | render::detail::SceneHasEnvironment));
+  EXPECT_EQ(hints->environment.version, 2u);
+}
+
+TEST_F(GfxRenderStageHintTest, StageDataWithoutHintsHasEmptySnapshot) {
+  add_pass("opaque", Stage::OpaqueDone);
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+
+  record_stage(Stage::SceneBegin);
+  record_stage(Stage::OpaqueDone);
+
+  ASSERT_EQ(frame.stages.size(), 1u);
+  ASSERT_NE(frame.stages[0].sceneHints, nullptr);
+  EXPECT_EQ(frame.stages[0].sceneHints->present, 0u);
+}
+
+TEST_F(GfxRenderStageHintTest, EnabledSeesSceneHints) {
+  auto& pass = passes.emplace_back(TestPass{.owner = this, .name = "lit"});
+  ASSERT_NE(render::detail::register_pass({
+                .name = "lit",
+                .stage = Stage::OpaqueDone,
+                .enabled = needs_lights,
+                .encode = encode_pass,
+                .state = &pass,
+            }),
+            render::detail::InvalidPassId);
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+  aurora::test::process_hints(aurora::test::stage_hint(Stage::OpaqueDone));
+  EXPECT_TRUE(frame.stages.empty());
+
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+  aurora::test::process_hints(aurora::test::lights_hint(1));
+  aurora::test::process_hints(aurora::test::stage_hint(Stage::OpaqueDone));
+  ASSERT_EQ(frame.stages.size(), 1u);
+  EXPECT_TRUE(frame.stages[0].is_enabled(0));
+  EXPECT_EQ(run(frame.stages[0]), (std::vector<std::string>{"lit"}));
+}
+
+TEST_F(GfxRenderStageHintTest, MissingMarkerWarnsOnlyWithMainCamera) {
+  const ScopedWarningCapture warnings;
+  add_pass("scene", Stage::SceneBegin);
+  add_pass("opaque", Stage::OpaqueDone);
+
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(2));
+  aurora::test::process_hints(aurora::test::camera_hint(AURORA_CAMERA_MAIN, false));
+  aurora::test::process_hints(aurora::test::stage_hint(Stage::OpaqueDone));
+  EXPECT_EQ(warnings.count("marker missing"), 0u);
+  ASSERT_EQ(frame.stages.size(), 1u);
+  EXPECT_EQ(frame.stages[0].stage, Stage::OpaqueDone);
+
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(2));
+  aurora::test::process_hints(aurora::test::camera_hint(AURORA_CAMERA_MAIN, true));
+  aurora::test::process_hints(aurora::test::stage_hint(Stage::OpaqueDone));
+  EXPECT_EQ(warnings.count("marker missing"), 1u);
+  ASSERT_EQ(frame.stages.size(), 1u);
+  EXPECT_EQ(frame.stages[0].stage, Stage::OpaqueDone);
+  EXPECT_EQ(run(frame.stages[0]), (std::vector<std::string>{"opaque"}));
 }
 #endif
 

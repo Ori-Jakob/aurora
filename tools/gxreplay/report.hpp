@@ -14,6 +14,7 @@ struct FrameResult {
   uint32_t height = 0;
   uint64_t rgbaHash = 0;
   uint64_t fifoBytes = 0;
+  uint64_t hintBytes = 0;
   uint32_t mapRecords = 0;
   uint64_t misses = 0;
   uint32_t draws = 0;

@@ -105,6 +105,7 @@ std::string format_frames_json(const ReportContext& context, std::span<const Fra
       out += fmt::format("      \"height\": {},\n", frame.height);
       out += fmt::format("      \"rgbaXxh3\": \"{}\",\n", hex64(frame.rgbaHash));
       out += fmt::format("      \"fifoBytes\": {},\n", frame.fifoBytes);
+      out += fmt::format("      \"hintBytes\": {},\n", frame.hintBytes);
       out += fmt::format("      \"mapRecords\": {},\n", frame.mapRecords);
       out += fmt::format("      \"misses\": {},\n", frame.misses);
       out += fmt::format("      \"draws\": {}\n", frame.draws);

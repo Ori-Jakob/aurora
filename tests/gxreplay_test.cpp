@@ -174,6 +174,7 @@ TEST(GxReplayReport, FramesJsonIsStable) {
        .height = 960,
        .rgbaHash = 0x0123456789ABCDEFull,
        .fifoBytes = 4096,
+       .hintBytes = 41,
        .mapRecords = 4,
        .misses = 0,
        .draws = 19},
@@ -183,6 +184,7 @@ TEST(GxReplayReport, FramesJsonIsStable) {
        .height = 960,
        .rgbaHash = 0xFEull,
        .fifoBytes = 3000,
+       .hintBytes = 0,
        .mapRecords = 0,
        .misses = 0,
        .draws = 18},
@@ -204,6 +206,7 @@ TEST(GxReplayReport, FramesJsonIsStable) {
       "height": 960,
       "rgbaXxh3": "0123456789abcdef",
       "fifoBytes": 4096,
+      "hintBytes": 41,
       "mapRecords": 4,
       "misses": 0,
       "draws": 19
@@ -215,6 +218,7 @@ TEST(GxReplayReport, FramesJsonIsStable) {
       "height": 960,
       "rgbaXxh3": "00000000000000fe",
       "fifoBytes": 3000,
+      "hintBytes": 0,
       "mapRecords": 0,
       "misses": 0,
       "draws": 18

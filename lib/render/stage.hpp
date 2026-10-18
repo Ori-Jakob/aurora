@@ -14,4 +14,8 @@ void reset_frame_cull() noexcept;
 void invalidate_frame_histories() noexcept;
 bool stage_samples_scene_depth(const StageData& stage) noexcept;
 DepthSource stage_scene_depth_source(const StageData& stage) noexcept;
+
+namespace testing {
+void reset_missing_marker_warnings() noexcept;
+} // namespace testing
 } // namespace aurora::render::detail

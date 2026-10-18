@@ -164,6 +164,11 @@ bool same_frames(std::span<const FrameResult> lhs, std::span<const FrameResult> 
           fmt::format("frame {} hashes {} instead of {}", lhs[i].frame, hex64(rhs[i].rgbaHash), hex64(lhs[i].rgbaHash));
       return false;
     }
+    // The null backend renders nothing, so draw counts are what a CI run can compare
+    if (lhs[i].draws != rhs[i].draws) {
+      mismatch = fmt::format("frame {} has {} draws instead of {}", lhs[i].frame, rhs[i].draws, lhs[i].draws);
+      return false;
+    }
   }
   return true;
 }

@@ -8,6 +8,7 @@
 
 #if AURORA_ENABLE_RENDER
 #include "debug/debug.hpp"
+#include "hints.hpp"
 #include "shaders.hpp"
 #include "../webgpu/gpu_prof.hpp"
 #endif
@@ -24,6 +25,7 @@ constexpr Module Log{"aurora::render"};
 
 // Recording thread only; a frame's stages are built in order and never concurrently
 FrameCullState g_frameCull;
+std::array<bool, StageCount> g_warnedMissingMarker{};
 #if AURORA_ENABLE_RENDER
 std::vector<FrameCullReason> g_cullReasons;
 #endif
@@ -37,9 +39,7 @@ bool has_native_passes(const FrameState* frame) noexcept {
 }
 
 void warn_missing_marker(Stage stage) {
-  // Stages are only built on the recording thread
-  static std::array<bool, StageCount> warned{};
-  if (std::exchange(warned[static_cast<size_t>(stage)], true)) {
+  if (std::exchange(g_warnedMissingMarker[static_cast<size_t>(stage)], true)) {
     return;
   }
   Log.warn("Render stage {} marker missing; passes that need it are skipped", stage_name(stage));
@@ -83,12 +83,21 @@ bool build_stage_data(StageData& stage) {
   }
   const auto passCount = static_cast<uint32_t>(program.passes.size());
   stage.passCount = passCount;
+#if AURORA_ENABLE_RENDER
+  stage.sceneHints = scene_hints();
+  // Frames without a scene camera (logos, loads) legitimately send no scene markers
+  const bool sceneFrame = stage.sceneHints->has(SceneHasMainCamera);
+#else
+  constexpr bool sceneFrame = false;
+#endif
   stage.enabled.assign((passCount + 63) / 64, 0);
   const bool needsMarker = !stage.markerSeen && stage.stage <= Stage::OpaqueDone;
   for (uint32_t i = 0; i < passCount; ++i) {
     const CompiledNode& node = graph->nodes[program.passes[i]];
     if (needsMarker && !node.runsWithoutMarker) {
-      warn_missing_marker(stage.stage);
+      if (sceneFrame) {
+        warn_missing_marker(stage.stage);
+      }
       continue;
     }
     if (node.enabled != nullptr && !node.enabled(stage, node.state)) {
@@ -170,6 +179,10 @@ void after_frame(const FrameState* frame) noexcept {
 }
 
 void reset_frame_cull() noexcept { g_frameCull = {}; }
+
+namespace testing {
+void reset_missing_marker_warnings() noexcept { g_warnedMissingMarker = {}; }
+} // namespace testing
 
 void invalidate_frame_histories() noexcept {
 #if AURORA_ENABLE_RENDER

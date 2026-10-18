@@ -28,139 +28,6 @@ extern std::atomic<uint32_t> resolvePassCount;
 } // namespace aurora::gfx
 
 namespace {
-template <typename T>
-bool same_bits(const T& lhs, const T& rhs) {
-  return std::memcmp(&lhs, &rhs, sizeof(T)) == 0;
-}
-
-#define EXPECT_SAME_BITS(field) EXPECT_TRUE(same_bits(want.field, got.field)) << #field
-
-void expect_state_eq(const GXState& want, const GXState& got) {
-  EXPECT_SAME_BITS(pnMtx);
-  EXPECT_EQ(want.currentPnMtx, got.currentPnMtx);
-  EXPECT_SAME_BITS(proj);
-  EXPECT_EQ(want.fog.type, got.fog.type);
-  EXPECT_SAME_BITS(fog.a);
-  EXPECT_SAME_BITS(fog.b);
-  EXPECT_SAME_BITS(fog.c);
-  EXPECT_SAME_BITS(fog.color);
-  EXPECT_EQ(want.fog.rangeK, got.fog.rangeK);
-  EXPECT_EQ(want.fog.rangeCenter, got.fog.rangeCenter);
-  EXPECT_EQ(want.fog.rangeEnabled, got.fog.rangeEnabled);
-  EXPECT_EQ(want.fog.fog0Raw, got.fog.fog0Raw);
-  EXPECT_EQ(want.fog.fog1Raw, got.fog.fog1Raw);
-  EXPECT_EQ(want.fog.fog2Raw, got.fog.fog2Raw);
-  EXPECT_EQ(want.cullMode, got.cullMode);
-  EXPECT_EQ(want.lineWidth, got.lineWidth);
-  EXPECT_EQ(want.pointSize, got.pointSize);
-  EXPECT_EQ(want.lineTexOffset, got.lineTexOffset);
-  EXPECT_EQ(want.pointTexOffset, got.pointTexOffset);
-  EXPECT_EQ(want.lineHalfAspect, got.lineHalfAspect);
-  EXPECT_EQ(want.blendMode, got.blendMode);
-  EXPECT_EQ(want.blendFacSrc, got.blendFacSrc);
-  EXPECT_EQ(want.blendFacDst, got.blendFacDst);
-  EXPECT_EQ(want.blendOp, got.blendOp);
-  EXPECT_EQ(want.depthFunc, got.depthFunc);
-  EXPECT_SAME_BITS(clearColor);
-  EXPECT_EQ(want.clearDepth, got.clearDepth);
-  EXPECT_EQ(want.pixelFmt, got.pixelFmt);
-  EXPECT_EQ(want.zFmt, got.zFmt);
-  EXPECT_EQ(want.zCompLocBeforeTex, got.zCompLocBeforeTex);
-  EXPECT_EQ(want.dstAlpha, got.dstAlpha);
-  EXPECT_SAME_BITS(alphaCompare);
-  EXPECT_SAME_BITS(colorRegs);
-  EXPECT_SAME_BITS(kcolors);
-  EXPECT_SAME_BITS(colorChannelConfig);
-  for (size_t i = 0; i < want.colorChannelState.size(); ++i) {
-    EXPECT_SAME_BITS(colorChannelState[i].matColor) << i;
-    EXPECT_SAME_BITS(colorChannelState[i].ambColor) << i;
-    EXPECT_EQ(want.colorChannelState[i].lightMask, got.colorChannelState[i].lightMask) << i;
-  }
-  EXPECT_SAME_BITS(lights);
-  EXPECT_SAME_BITS(tevStages);
-  for (size_t i = 0; i < want.loadedTextures.size(); ++i) {
-    const auto& w = want.loadedTextures[i];
-    const auto& g = got.loadedTextures[i];
-    EXPECT_EQ(w.mode0, g.mode0) << "texture " << i;
-    EXPECT_EQ(w.mode1, g.mode1) << "texture " << i;
-    EXPECT_EQ(w.image0, g.image0) << "texture " << i;
-    EXPECT_EQ(w.image3, g.image3) << "texture " << i;
-    EXPECT_EQ(w.data, g.data) << "texture " << i;
-    EXPECT_EQ(w.mWidth, g.mWidth) << "texture " << i;
-    EXPECT_EQ(w.mHeight, g.mHeight) << "texture " << i;
-    EXPECT_EQ(w.mFormat, g.mFormat) << "texture " << i;
-    EXPECT_EQ(w.tlut, g.tlut) << "texture " << i;
-    EXPECT_EQ(w.texObjId, g.texObjId) << "texture " << i;
-    EXPECT_EQ(w.texDataVersion, g.texDataVersion) << "texture " << i;
-    EXPECT_EQ(w.flags & 1, g.flags & 1) << "texture " << i;
-  }
-  for (size_t i = 0; i < want.loadedTluts.size(); ++i) {
-    const auto& w = want.loadedTluts[i];
-    const auto& g = got.loadedTluts[i];
-    EXPECT_EQ(w.loadTlut0, g.loadTlut0) << "tlut " << i;
-    EXPECT_EQ(w.numEntries, g.numEntries) << "tlut " << i;
-    EXPECT_EQ(w.data, g.data) << "tlut " << i;
-    EXPECT_EQ(w.format, g.format) << "tlut " << i;
-    EXPECT_EQ(w.tlutObjId, g.tlutObjId) << "tlut " << i;
-    EXPECT_EQ(w.tlutDataVersion, g.tlutDataVersion) << "tlut " << i;
-  }
-  EXPECT_SAME_BITS(texMtxs);
-  EXPECT_SAME_BITS(ptTexMtxs);
-  EXPECT_SAME_BITS(tcgs);
-  EXPECT_EQ(want.texCoordScales, got.texCoordScales);
-  EXPECT_EQ(want.vtxDesc, got.vtxDesc);
-  EXPECT_SAME_BITS(vtxFmts);
-  EXPECT_SAME_BITS(tevSwapTable);
-  EXPECT_SAME_BITS(indStages);
-  for (size_t i = 0; i < want.indTexMtxs.size(); ++i) {
-    EXPECT_SAME_BITS(indTexMtxs[i].mtx) << i;
-    EXPECT_EQ(want.indTexMtxs[i].scaleExp, got.indTexMtxs[i].scaleExp) << i;
-    EXPECT_EQ(want.indTexMtxs[i].adjScaleRaw, got.indTexMtxs[i].adjScaleRaw) << i;
-  }
-  for (size_t i = 0; i < want.arrays.size(); ++i) {
-    EXPECT_EQ(want.arrays[i], got.arrays[i]) << "array " << i;
-  }
-  EXPECT_EQ(want.depthCompare, got.depthCompare);
-  EXPECT_EQ(want.depthUpdate, got.depthUpdate);
-  EXPECT_EQ(want.colorUpdate, got.colorUpdate);
-  EXPECT_EQ(want.alphaUpdate, got.alphaUpdate);
-  EXPECT_EQ(want.numChans, got.numChans);
-  EXPECT_EQ(want.numIndStages, got.numIndStages);
-  EXPECT_EQ(want.numTevStages, got.numTevStages);
-  EXPECT_EQ(want.numTexGens, got.numTexGens);
-  EXPECT_SAME_BITS(frontOffset);
-  EXPECT_SAME_BITS(frontScale);
-  EXPECT_SAME_BITS(backOffset);
-  EXPECT_SAME_BITS(backScale);
-  EXPECT_SAME_BITS(clamp);
-  EXPECT_SAME_BITS(logicalViewport);
-  EXPECT_SAME_BITS(renderViewport);
-  EXPECT_EQ(want.logicalScissor, got.logicalScissor);
-  EXPECT_EQ(want.renderScissor, got.renderScissor);
-  EXPECT_EQ(want.texCopySrc, got.texCopySrc);
-  EXPECT_EQ(want.texCopyFmt, got.texCopyFmt);
-  EXPECT_EQ(want.texCopyDstWidth, got.texCopyDstWidth);
-  EXPECT_EQ(want.texCopyDstHeight, got.texCopyDstHeight);
-  EXPECT_EQ(want.texCopyDstWide, got.texCopyDstWide);
-  EXPECT_EQ(want.texCopyDest, got.texCopyDest);
-
-  // The shadows the preamble cannot rebuild are trigger registers and color/konst writes that were overwritten
-  for (u32 reg = 0; reg < 0x100; ++reg) {
-    if (reg == 0x45 || reg == 0x52 || reg == 0x65 || (reg >= 0xE0 && reg <= 0xE7 && !want.bpRegValid.test(reg))) {
-      continue;
-    }
-    EXPECT_EQ(want.bpRegCache[reg], got.bpRegCache[reg]) << "BP 0x" << std::hex << reg;
-  }
-  EXPECT_EQ(want.cpRegCache, got.cpRegCache);
-  for (u32 reg = 0; reg < aurora::gx::XfRegCount; ++reg) {
-    if (want.xfRegValid.test(reg) || (reg >= 0x1A && reg <= 0x1F)) {
-      EXPECT_EQ(want.xfRegCache[reg], got.xfRegCache[reg]) << "XF 0x" << std::hex << reg;
-    }
-  }
-}
-
-#undef EXPECT_SAME_BITS
-
 struct PreambleCommand {
   u8 opcode;
   u32 reg;
@@ -741,6 +608,119 @@ TEST_F(GXFifoTest, SelfTestTrace_HintsDoNotChangeDecodedState) {
   }
   EXPECT_EQ(hints[0].colors, hints[1].colors);
   EXPECT_NE(hints[2].colors, hints[1].colors);
+}
+
+TEST_F(GXFifoTest, SelfTestTrace_DecodedHintsDoNotChangeDecodedState) {
+  const auto hintsPath = temp_trace("self_test_decoded_hints");
+  const auto plainPath = temp_trace("self_test_decoded_plain");
+  std::string error;
+  ASSERT_TRUE(aurora::gxreplay::write_self_test_trace(hintsPath, true, error)) << error;
+  ASSERT_TRUE(aurora::gxreplay::write_self_test_trace(plainPath, false, error)) << error;
+
+  HintRecorder recorder;
+  const auto sink = recorder.sink();
+  aurora::gx::hints::set_sink(&sink);
+  uint64_t hintMisses = 0;
+  const auto hints = decode_trace(hintsPath, hintMisses);
+  aurora::gx::hints::set_sink(nullptr);
+  uint64_t plainMisses = 0;
+  const auto plain = decode_trace(plainPath, plainMisses);
+  EXPECT_FALSE(recorder.events.empty());
+  EXPECT_EQ(hintMisses, 0u);
+  ASSERT_EQ(hints.size(), aurora::gxreplay::SelfTestFrameCount);
+  ASSERT_EQ(plain.size(), aurora::gxreplay::SelfTestFrameCount);
+  for (size_t i = 0; i < hints.size(); ++i) {
+    SCOPED_TRACE(i);
+    expect_state_eq(hints[i].state, plain[i].state);
+    EXPECT_EQ(hints[i].draws, plain[i].draws);
+    EXPECT_EQ(hints[i].resolves, plain[i].resolves);
+    EXPECT_EQ(hints[i].colors, plain[i].colors);
+  }
+  aurora::gx::hints::testing::reset_counters();
+}
+
+TEST_F(GXFifoTest, SelfTestTrace_ValidHintsDecode) {
+  const auto path = temp_trace("self_test_valid_hints");
+  std::string error;
+  ASSERT_TRUE(aurora::gxreplay::write_self_test_trace(path, true, error)) << error;
+
+  HintRecorder recorder;
+  const auto sink = recorder.sink();
+  aurora::gx::hints::set_sink(&sink);
+  aurora::gx::hints::testing::reset_counters();
+  const uint32_t drawsBefore = aurora::gfx::g_testDrawCount;
+  uint64_t misses = 0;
+  const auto frames = decode_trace(path, misses);
+  aurora::gx::hints::set_sink(nullptr);
+  ASSERT_EQ(frames.size(), aurora::gxreplay::SelfTestFrameCount);
+
+  constexpr size_t Frames = aurora::gxreplay::SelfTestFrameCount;
+  const std::array<std::pair<u16, size_t>, 14> perFrame{{
+      {GX_AURORA_RENDER_CAMERA, 1},
+      {GX_AURORA_RENDER_OBJECT_BEGIN, 3},
+      {GX_AURORA_RENDER_OBJECT_END, 3},
+      {GX_AURORA_RENDER_SCOPE_PUSH, 1},
+      {GX_AURORA_RENDER_SCOPE_POP, 1},
+      {GX_AURORA_RENDER_STAGE, 6},
+      {GX_AURORA_RENDER_LIGHTS, 1},
+      {GX_AURORA_RENDER_ENVIRONMENT, 1},
+      {GX_AURORA_RENDER_MATERIAL, 1},
+      {GX_AURORA_RENDER_SKELETON, 1},
+      {GX_AURORA_RENDER_SCENE_EPOCH, 1},
+      {GX_AURORA_RENDER_TEV_POLICY, 1},
+      {GX_AURORA_RENDER_INFLUENCERS, 1},
+      {GX_AURORA_RENDER_WIND_SOURCES, 1},
+  }};
+  size_t total = 0;
+  for (const auto& [id, count] : perFrame) {
+    EXPECT_EQ(recorder.count(id), count * Frames) << "hint 0x" << std::hex << id;
+    EXPECT_EQ(aurora::gx::hints::counters(id).decoded, count * Frames) << "hint 0x" << std::hex << id;
+    total += count * Frames;
+  }
+  EXPECT_EQ(recorder.events.size(), total);
+  // The self-test's garbage payloads under CAMERA are rejected, and every skip-only ID is skipped
+  EXPECT_EQ(aurora::gx::hints::counters(GX_AURORA_RENDER_CAMERA).malformed, 4 * Frames);
+  for (const u16 id :
+       {u16{GX_AURORA_RENDER_GRASS_PATCHES}, u16{GX_AURORA_RENDER_SKY}, u16{GX_AURORA_RENDER_FOG_VOLUMES}}) {
+    EXPECT_EQ(aurora::gx::hints::counters(id).skipped, Frames) << "hint 0x" << std::hex << id;
+  }
+  EXPECT_EQ(aurora::gx::hints::counters(GX_AURORA_SET_ARRAY_IMMUTABLE).skipped, 5 * Frames);
+
+  ASSERT_EQ(recorder.objects.size(), 3 * Frames);
+  ASSERT_EQ(recorder.stages.size(), 6 * Frames);
+  std::vector<HintRecorder::Event> stageEvents;
+  std::vector<HintRecorder::Event> endEvents;
+  for (const auto& event : recorder.events) {
+    if (event.id == GX_AURORA_RENDER_STAGE) {
+      stageEvents.push_back(event);
+    } else if (event.id == GX_AURORA_RENDER_OBJECT_END) {
+      endEvents.push_back(event);
+    }
+  }
+  for (size_t frame = 0; frame < Frames; ++frame) {
+    SCOPED_TRACE(frame);
+    for (size_t quad = 0; quad < 3; ++quad) {
+      const auto& object = recorder.objects[frame * 3 + quad];
+      EXPECT_EQ(object.id, aurora::gxreplay::SelfTestObjects[quad].id);
+      EXPECT_EQ(object.categories, aurora::gxreplay::SelfTestObjects[quad].categories);
+      EXPECT_EQ(object.generation, 1u);
+    }
+    const uint32_t frameStart = stageEvents[frame * 6].draws;
+    EXPECT_EQ(frameStart, drawsBefore + frame * frames[0].draws);
+    EXPECT_EQ(recorder.stages[frame * 6], aurora::render::Stage::SceneBegin);
+    const uint32_t afterQuad3 = endEvents[frame * 3 + 2].draws;
+    EXPECT_EQ(afterQuad3, frameStart + frames[frame].draws);
+    for (size_t marker = 1; marker < 6; ++marker) {
+      EXPECT_EQ(recorder.stages[frame * 6 + marker], static_cast<aurora::render::Stage>(marker));
+      EXPECT_EQ(stageEvents[frame * 6 + marker].draws, afterQuad3);
+    }
+  }
+  ASSERT_EQ(recorder.cameras.size(), Frames);
+  EXPECT_TRUE(aurora::gx::hints::main_camera_usable(recorder.cameras[0].gxProj));
+  ASSERT_EQ(recorder.scopes.size(), Frames);
+  EXPECT_EQ(recorder.scopes[0].categories, AURORA_CAT_EMISSIVE);
+  EXPECT_EQ(recorder.scopes[0].role, AURORA_CAMERA_INHERIT);
+  aurora::gx::hints::testing::reset_counters();
 }
 
 TEST_F(GXFifoTest, SelfTestTrace_ContainsEveryHintIdAndSize) {

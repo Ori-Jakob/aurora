@@ -7,6 +7,7 @@
 #include "dolphin/gx/GXAurora.h"
 #include "guest_memory.hpp"
 #include "gx.hpp"
+#include "hints.hpp"
 #include "pipeline.hpp"
 #include "regs.hpp"
 #include "shader_info.hpp"
@@ -559,14 +560,6 @@ static void handle_draw(u8 cmd, ByteReader& reader) noexcept {
   draw_prim(prim, fmt, reader.read<u16>(), reader);
 }
 
-static void skip_aurora_hint(u16 subCmd, ByteReader& reader) noexcept {
-  const u32 payloadSize = reader.read<u32>();
-  AURORA_ASSERT(payloadSize <= reader.remaining(),
-                "GX_AURORA hint {:04X}: {}-byte payload overruns the command buffer ({} bytes left)", subCmd,
-                payloadSize, reader.remaining());
-  reader.skip(payloadSize);
-}
-
 void handle_aurora(ByteReader& reader) noexcept {
   ZoneScoped;
   const u16 subCmd = reader.read<u16>();
@@ -771,7 +764,7 @@ void handle_aurora(ByteReader& reader) noexcept {
     auto label = reader.read_string();
     gfx::insert_debug_marker(std::move(label));
   } else if (subCmd >= GX_AURORA_HINT_FIRST && subCmd <= GX_AURORA_HINT_LAST) {
-    skip_aurora_hint(subCmd, reader);
+    hints::handle(subCmd, reader);
   }
 
   else {
