@@ -10,6 +10,7 @@
 #include "settings.hpp"
 #include "shaders.hpp"
 #include "debug/debug.hpp"
+#include "debug/views.hpp"
 
 #include "../gx/command_processor.hpp"
 #include "../logging.hpp"
@@ -72,6 +73,7 @@ void initialize() {
   jobs::initialize(webgpu::g_backendType == wgpu::BackendType::WebGPU ? 0 : jobs::default_worker_count());
   shaders::initialize();
   debug::initialize();
+  debug::initialize_classification();
   install_hints();
 #endif
 }
@@ -88,6 +90,7 @@ void shutdown() noexcept {
   shutdown_external_passes();
   clear_after_frame_callbacks();
   remove_hints();
+  debug::shutdown_classification();
   debug::shutdown();
   // Compile jobs use the device, so they finish before the job pool and the device go away
   shaders::shutdown();

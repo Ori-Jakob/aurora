@@ -77,6 +77,7 @@ struct FrameRecorder {
 };
 
 FrameRecorder g_recorder;
+uint32_t g_lastRecordedUniformSize = 0;
 
 std::string pass_label(std::string_view kind) {
 #ifdef AURORA_GFX_DEBUG_GROUPS
@@ -809,6 +810,7 @@ RecordedFrame end_recording() {
   frame.stats.mergedDrawCallCount = g_recorder.mergedDrawCallCount;
   frame.stats.lastVertSize = frame.verts.size();
   frame.stats.lastUniformSize = frame.uniforms.size();
+  g_lastRecordedUniformSize = frame.stats.lastUniformSize;
   frame.stats.lastIndexSize = frame.indices.size();
   frame.stats.lastStorageSize = frame.storage.size();
   frame.stats.lastTextureUploadSize = frame.textureUpload.size();
@@ -848,6 +850,7 @@ void shutdown_recording() {
   g_recorder.inOffscreen = false;
   g_recorder.packet = nullptr;
   g_recorder.frameSlot = 0;
+  g_lastRecordedUniformSize = 0;
   g_recorder.suppressRenderWorker = false;
   g_recorder.normalRequested = false;
   g_recorder.nextStage = 0;
@@ -1504,6 +1507,21 @@ Range push_texture_data(const uint8_t* data, u32 bytesPerRow, u32 rowsPerImage) 
 uint32_t align_uniform(uint32_t value) {
   return AURORA_ALIGN(value, detail::resources().limits.minUniformBufferOffsetAlignment);
 }
+
+uint64_t uniform_space_left() noexcept {
+  if (!g_recorder.active()) {
+    return 0;
+  }
+  const ByteBuffer& uniforms = current_frame_packet().uniforms;
+  if (uniforms.owned()) {
+    return UINT64_MAX;
+  }
+  const size_t alignment = resources().limits.minUniformBufferOffsetAlignment;
+  const size_t begin = alignment != 0 ? AURORA_ALIGN(uniforms.size(), alignment) : uniforms.size();
+  return begin < uniforms.capacity() ? uniforms.capacity() - begin : 0;
+}
+
+uint32_t last_recorded_uniform_size() noexcept { return g_lastRecordedUniformSize; }
 
 void insert_debug_marker(std::string label) {
 #if defined(AURORA_GFX_DEBUG_GROUPS)

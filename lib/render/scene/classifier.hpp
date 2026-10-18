@@ -173,6 +173,15 @@ struct HintCounts {
   }
 };
 
+// The view hook updates these on the FIFO thread
+struct ViewCounts {
+  uint32_t substituted = 0;
+  uint32_t untouched = 0;
+  uint32_t pending = 0;
+  uint32_t overBudget = 0;
+  uint32_t uniformBytes = 0;
+};
+
 struct FrameStats {
   uint64_t frame = 0;
   uint32_t draws = 0;
@@ -194,6 +203,7 @@ struct FrameStats {
   uint32_t fakeShadowOverlay = 0;
   uint32_t skyMisses = 0;
   uint32_t droppedObjects = 0;
+  ViewCounts view;
 };
 
 [[nodiscard]] constexpr bool would_capture(const DrawClass& cls) noexcept {

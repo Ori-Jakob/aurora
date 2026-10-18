@@ -1097,9 +1097,22 @@ PipelineRef find_pipeline(const clear::PipelineConfig& config, const RenderTarge
   return resolve_pipeline(ShaderType::Clear, config, layout, draw_pipeline_priority());
 }
 
+static PipelineRef find_gx_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout, bool remember) {
+  if (remember) {
+    remember_pipeline_config(ShaderType::GX, config, current_frame(), true);
+    return resolve_pipeline(ShaderType::GX, config, layout, draw_pipeline_priority());
+  }
+  // Callers keep their own pipeline meanwhile, so live lookups go to the background queue or the inline frame budget
+  const auto priority = blocking_pipelines() ? PipelinePriority::Blocking : PipelinePriority::Background;
+  return resolve_pipeline(ShaderType::GX, config, layout, priority);
+}
+
 PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) {
-  remember_pipeline_config(ShaderType::GX, config, current_frame(), true);
-  return resolve_pipeline(ShaderType::GX, config, layout, draw_pipeline_priority());
+  return find_gx_pipeline(config, layout, true);
+}
+
+PipelineRef find_debug_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) {
+  return find_gx_pipeline(config, layout, false);
 }
 
 void set_blocking_pipelines(bool blocking) noexcept { g_blockingPipelines.store(blocking, std::memory_order_relaxed); }

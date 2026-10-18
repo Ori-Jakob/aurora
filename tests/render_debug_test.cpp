@@ -3,12 +3,14 @@
 #include "render_test_device.hpp"
 
 #include "render/debug/debug.hpp"
+#include "render/debug/views.hpp"
 #include "render/frame_state.hpp"
 #include "render/gpu_heap.hpp"
 #include "render/graph.hpp"
 #include "render/graph_bind.hpp"
 #include "render/graph_pool.hpp"
 #include "render/json.hpp"
+#include "render/scene/classify.hpp"
 #include "render/settings.hpp"
 #include "render/stage.hpp"
 #include "webgpu/gpu_prof.hpp"
@@ -16,6 +18,7 @@
 #include <aurora/render.hpp>
 #include <imgui.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <memory>
@@ -322,7 +325,9 @@ protected:
   }
 
   void TearDown() override {
+    debug::shutdown_classification();
     debug::shutdown();
+    scene::testing::reset();
     detail::testing::reset();
     debug::testing::reset();
   }
@@ -486,6 +491,56 @@ TEST_F(RenderDebugWindow, TabRegistryOrdersAndReplaces) {
   }
   EXPECT_EQ(names, (std::vector<std::string>{"Overview", "Alpha", "Graph", "Zeta"}));
   EXPECT_EQ(debug::tabs().back().order, 50);
+}
+
+TEST_F(RenderDebugWindow, SceneTabRegisteredAtSceneOrder) {
+  debug::initialize();
+  debug::initialize_classification();
+  const auto tabs = debug::tabs();
+  const auto scene = std::ranges::find(tabs, std::string{"Scene"}, &debug::Tab::name);
+  ASSERT_NE(scene, tabs.end());
+  EXPECT_EQ(scene->order, debug::SceneTabOrder);
+  EXPECT_EQ(scene->draw, &debug::draw_scene_tab);
+  EXPECT_EQ(tabs.back().name, "Scene");
+}
+
+TEST_F(RenderDebugWindow, SceneTabDrawsHeadless) {
+  const ImGuiFrame imgui;
+  const auto draw_tab = [&] {
+    imgui.frame([] {
+      ImGui::Begin("t");
+      debug::draw_scene_tab();
+      ImGui::End();
+    });
+  };
+  draw_tab();
+
+  // A frame with a MAIN camera, one object draw and one scope-only draw, published with records and objects
+  scene::Classifier& classifier = scene::testing::classifier();
+  classifier.reserve();
+  classifier.begin_frame();
+  classifier.set_record(true);
+  classifier.set_objects(true);
+  classifier.camera(scene::Role::Main);
+  EXPECT_TRUE(classifier.stage(Stage::SceneBegin));
+  classifier.object_begin({.id = 0x10, .generation = 1, .categories = scene::category::Terrain});
+  classifier.route({.mainCamera = true, .perspective = true, .vertices = 4});
+  classifier.object_end();
+  classifier.scope_push({.categories = scene::category::Emissive});
+  classifier.route({.mainCamera = true, .indexed = true, .vertices = 4});
+  classifier.scope_pop();
+  scene::seal_frame();
+  const auto report = scene::latest_report();
+  ASSERT_NE(report, nullptr);
+  ASSERT_EQ(report->draws.size(), 2u);
+  ASSERT_EQ(report->objects.size(), 1u);
+  draw_tab();
+
+  debug::set_view_override(static_cast<uint16_t>(debug::ClassView::Object));
+  debug::set_view_bit(scene::category::Decal);
+  draw_tab();
+  EXPECT_EQ(debug::view_override(), static_cast<uint16_t>(debug::ClassView::Object));
+  EXPECT_EQ(debug::view_bit(), scene::category::Decal);
 }
 
 TEST_F(RenderDebugWindow, PassTimingsEmptyWithoutTimestamps) {

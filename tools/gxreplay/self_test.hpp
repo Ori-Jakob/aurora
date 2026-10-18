@@ -33,6 +33,14 @@ inline constexpr std::array<SelfTestObject, 3> SelfTestObjects{{
     {0x12, AURORA_CAT_FOLIAGE},
 }};
 
+struct SelfTestColor {
+  uint8_t r = 0;
+  uint8_t g = 0;
+  uint8_t b = 0;
+  bool operator==(const SelfTestColor&) const = default;
+};
+using SelfTestQuadColors = std::array<SelfTestColor, SelfTestObjects.size()>;
+
 struct SelfTestCamera {
   f32 view[3][4];
   f32 proj[4][4];
@@ -54,4 +62,7 @@ uint8_t self_test_hint_byte(size_t index) noexcept;
 bool write_self_test_trace(const std::filesystem::path& path, bool withHints, std::string& error);
 bool check_self_test_frames(std::span<const std::vector<uint8_t>> withHints,
                             std::span<const std::vector<uint8_t>> plain, bool pixelProbes, std::string& error);
+// A debug view gives each quad a colour only its classification knows, so the caller supplies one per frame and quad
+bool check_self_test_view_frames(std::span<const std::vector<uint8_t>> images,
+                                 std::span<const SelfTestQuadColors> quadColors, std::string& error);
 } // namespace aurora::gxreplay

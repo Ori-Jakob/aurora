@@ -291,6 +291,7 @@ if (AURORA_ENABLE_GX)
     target_link_libraries(render_tests PRIVATE yyjson::yyjson)
     target_sources(render_tests PRIVATE render_classify_glue_test.cpp)
     target_link_libraries(render_tests PRIVATE absl::flat_hash_map)
+    target_sources(render_tests PRIVATE render_views_test.cpp)
   endif ()
   aurora_copy_runtime_dlls(render_tests)
   gtest_discover_tests(render_tests)
@@ -515,9 +516,9 @@ endif ()
 
 if (TARGET aurora_gxreplay)
   add_executable(gxreplay_tests gxreplay_test.cpp ../tools/gxreplay/options.cpp ../tools/gxreplay/report.cpp)
-  target_include_directories(gxreplay_tests PRIVATE ../include ../tools/gxreplay)
+  target_include_directories(gxreplay_tests PRIVATE ../include ../lib ../tools/gxreplay)
   target_compile_definitions(gxreplay_tests PRIVATE AURORA TARGET_PC=1)
-  target_link_libraries(gxreplay_tests PRIVATE gtest gtest_main fmt::fmt)
+  target_link_libraries(gxreplay_tests PRIVATE gtest gtest_main fmt::fmt dawn::dawncpp_headers xxHash::xxhash)
   gtest_discover_tests(gxreplay_tests)
 
   set(_gxreplay_dir ${CMAKE_CURRENT_BINARY_DIR}/gxreplay)
@@ -539,6 +540,27 @@ if (TARGET aurora_gxreplay)
               --no-png --out ${_gxreplay_dir}/render_demo_replay)
     set_tests_properties(gxreplay_render_demo_replay PROPERTIES LABELS smoke TIMEOUT 180
       FIXTURES_REQUIRED gxreplay_demo_trace)
+  endif ()
+  if (AURORA_ENABLE_RENDER)
+    set(_classify_trace ${_gxreplay_dir}/classify/self_test_hints.gxtrace)
+    add_test(NAME gxreplay_classify_trace COMMAND $<TARGET_FILE:aurora_gxreplay> --write-self-test ${_classify_trace})
+    set_tests_properties(gxreplay_classify_trace PROPERTIES LABELS smoke TIMEOUT 60 FIXTURES_SETUP gxreplay_classify)
+    add_test(NAME gxreplay_classify_counts
+      COMMAND $<TARGET_FILE:aurora_gxreplay> ${_classify_trace} --backend null --no-png --classify-objects
+              --classify-draws --out ${_gxreplay_dir}/classify/counts)
+    set_tests_properties(gxreplay_classify_counts PROPERTIES LABELS smoke TIMEOUT 180
+      FIXTURES_REQUIRED gxreplay_classify
+      PASS_REGULAR_EXPRESSION "frames 3, draws 9, main 0, sky 0, sky misses 0, suppressed 0, hint errors 0"
+      FAIL_REGULAR_EXPRESSION "\\[(ERROR|FATAL): ")
+    foreach (_view IN ITEMS role kind main window category object scope bit)
+      add_test(NAME gxreplay_debug_view_${_view}
+        COMMAND $<TARGET_FILE:aurora_gxreplay> ${_classify_trace} --backend null --no-png --debug-view ${_view}
+                --out ${_gxreplay_dir}/classify/view_${_view})
+      set_tests_properties(gxreplay_debug_view_${_view} PROPERTIES LABELS smoke TIMEOUT 180
+        FIXTURES_REQUIRED gxreplay_classify
+        PASS_REGULAR_EXPRESSION "hint errors 0, .*view substituted [1-9]"
+        FAIL_REGULAR_EXPRESSION "\\[(ERROR|FATAL): ")
+    endforeach ()
   endif ()
 endif ()
 

@@ -284,6 +284,9 @@ public:
   [[nodiscard]] const uint8_t* data() const noexcept { return m_data; }
   [[nodiscard]] size_t size() const noexcept { return m_length; }
   [[nodiscard]] bool empty() const noexcept { return m_length == 0; }
+  [[nodiscard]] size_t capacity() const noexcept { return m_capacity; }
+  // A buffer over memory it does not own cannot grow, so appending past its capacity aborts
+  [[nodiscard]] bool owned() const noexcept { return m_owned; }
 
   void append(const void* data, size_t size) {
     resize(m_length + size, false);

@@ -5,6 +5,7 @@
 
 #include "gx/fifo.hpp"
 #include "io.hpp"
+#include "render/debug/views.hpp"
 #include "trace/trace_reader.hpp"
 #include "webgpu/gpu.hpp"
 #include "webgpu/gpu_prof.hpp"
@@ -14,6 +15,7 @@
 #include <SDL3/SDL_stdinc.h>
 #include <fmt/format.h>
 
+#include <bit>
 #include <cstdio>
 #include <filesystem>
 #include <span>
@@ -61,6 +63,68 @@ bool write_reports(const Options& options, const ReportContext& context, std::sp
   }
   return write_text(options.outDir / "gpu_timing.json", format_gpu_timing_json(supported, gpuTimings));
 }
+
+bool write_classify(const Options& options, const ReportContext& context, const ReplayResult& result) {
+  if (!options.writes_classify_json()) {
+    return true;
+  }
+  const bool bitView = options.debugView == static_cast<uint16_t>(render::debug::ClassView::Bit);
+  const std::string_view viewBit =
+      bitView ? render::scene::category_name(static_cast<uint32_t>(std::countr_zero(options.debugViewBit)))
+              : std::string_view{};
+  if (!write_text(options.outDir / "classify.json", format_classify_json(context, options.debugViewName, viewBit,
+                                                                         result.classify, options.classifyObjects))) {
+    return false;
+  }
+  const std::string summary = format_classify_summary(result.classify, result.malformedHints);
+  std::fputs(summary.c_str(), stdout);
+  return true;
+}
+
+#if AURORA_ENABLE_RENDER
+// A view recolours the hint trace, so each quad is checked against the colour its own record picks
+bool check_view_frames(const Options& options, const ReplayResult& hints, const ReplayResult& plain, bool pixelProbes,
+                       std::string& error) {
+  const auto view = static_cast<render::debug::ClassView>(options.debugView);
+  for (const ClassifyFrame& frame : plain.classify) {
+    if (frame.report.stats.view.substituted != 0) {
+      error = fmt::format("frame {}: the view substituted {} draws of the plain trace", frame.frame,
+                          frame.report.stats.view.substituted);
+      return false;
+    }
+  }
+  if (hints.classify.size() != SelfTestFrameCount) {
+    error = fmt::format("classified {} frames instead of {}", hints.classify.size(), SelfTestFrameCount);
+    return false;
+  }
+  std::vector<SelfTestQuadColors> colors;
+  for (const ClassifyFrame& frame : hints.classify) {
+    const auto& draws = frame.report.draws;
+    if (draws.size() != SelfTestObjects.size()) {
+      error = fmt::format("frame {}: {} draw records instead of one per quad", frame.frame, draws.size());
+      return false;
+    }
+    if (frame.report.stats.view.substituted != SelfTestObjects.size()) {
+      error = fmt::format("frame {}: the view substituted {} of {} quads", frame.frame,
+                          frame.report.stats.view.substituted, SelfTestObjects.size());
+      return false;
+    }
+    SelfTestQuadColors& quads = colors.emplace_back();
+    for (size_t quad = 0; quad < quads.size(); ++quad) {
+      const render::debug::Rgb8 color = render::debug::view_color(view, options.debugViewBit, draws[quad].cls);
+      quads[quad] = {color.r, color.g, color.b};
+    }
+  }
+  if (!pixelProbes) {
+    return true;
+  }
+  if (!check_self_test_frames(plain.images, plain.images, true, error)) {
+    error = "plain trace under the view: " + error;
+    return false;
+  }
+  return check_self_test_view_frames(hints.images, colors, error);
+}
+#endif
 
 std::string flag_names(uint32_t flags) {
   std::string names;
@@ -185,6 +249,13 @@ int run_self_test(int argc, char* argv[], const Options& options) {
     print_error(error);
     return code;
   }
+  // An id outside the classification range selects nothing, so that run is compared like one without a view
+  const bool view = render::debug::find_view(options.debugView) != nullptr;
+#if AURORA_ENABLE_RENDER
+  if (view) {
+    render::scene::request_report({.records = true, .objects = options.classifyObjects});
+  }
+#endif
 
   const auto hintsPath = options.outDir / "self_test_hints.gxtrace";
   const auto plainPath = options.outDir / "self_test_plain.gxtrace";
@@ -201,7 +272,8 @@ int run_self_test(int argc, char* argv[], const Options& options) {
   hintsOptions.frames = {};
   Options plainOptions = hintsOptions;
   plainOptions.writePng = false;
-  Replayer hints{hintsOptions, hintsReader, true};
+  plainOptions.classifyDraws = false;
+  Replayer hints{hintsOptions, hintsReader, true, view};
   Replayer plain{plainOptions, plainReader, true};
   ReplayResult first;
   ReplayResult second;
@@ -224,10 +296,14 @@ int run_self_test(int argc, char* argv[], const Options& options) {
     failure = "run 1 differs from run 0: " + mismatch;
   } else if (first.frames.size() != SelfTestFrameCount) {
     failure = fmt::format("replayed {} frames instead of {}", first.frames.size(), SelfTestFrameCount);
-  } else if (!same_frames(first.frames, plainResult.frames, mismatch)) {
+  } else if (!view && !same_frames(first.frames, plainResult.frames, mismatch)) {
     failure = "the plain trace differs from the hint trace: " + mismatch;
   } else if (const uint64_t misses = first.misses + second.misses + plainResult.misses; misses != 0) {
     failure = fmt::format("{} guest reads were not resolved", misses);
+  } else if (view) {
+#if AURORA_ENABLE_RENDER
+    check_view_frames(options, first, plainResult, auroraInfo.backend != BACKEND_NULL, failure);
+#endif
   } else {
     check_self_test_frames(first.images, plainResult.images, auroraInfo.backend != BACKEND_NULL, failure);
   }
@@ -245,7 +321,8 @@ int run_self_test(int argc, char* argv[], const Options& options) {
       .runs = 2,
       .deterministic = deterministic,
   };
-  const bool reportsWritten = write_reports(options, context, first.frames, timings, gpuTimings);
+  const bool reportsWritten =
+      write_reports(options, context, first.frames, timings, gpuTimings) && write_classify(options, context, first);
   aurora_shutdown();
   if (!failure.empty()) {
     print_error("self-test failed: " + failure);
@@ -327,7 +404,8 @@ int run_replay(int argc, char* argv[], const Options& options) {
       .runs = options.repeat,
       .deterministic = deterministic,
   };
-  const bool reportsWritten = write_reports(options, context, frames, timings, gpuTimings);
+  const bool reportsWritten =
+      write_reports(options, context, frames, timings, gpuTimings) && write_classify(options, context, results[0]);
   aurora_shutdown();
 
   // Frames before --frames are still decoded, so their unresolved reads count too

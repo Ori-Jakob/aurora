@@ -30,6 +30,7 @@ constexpr std::array<Quad, 3> Quads{{
     {352.f, 64.f, 576.f, 288.f, 464, 176},
     {64.f, 304.f, 320.f, 464.f, 192, 384},
 }};
+static_assert(Quads.size() == SelfTestObjects.size());
 
 struct Rgb {
   uint8_t r;
@@ -497,6 +498,42 @@ bool check_self_test_frames(std::span<const std::vector<uint8_t>> withHints,
   if (pixel(withHints[2], quadA.probeX, quadA.probeY) == pixel(withHints[1], quadA.probeX, quadA.probeY)) {
     error = "quad A did not change color in frame 2";
     return false;
+  }
+  return true;
+}
+
+bool check_self_test_view_frames(std::span<const std::vector<uint8_t>> images,
+                                 std::span<const SelfTestQuadColors> quadColors, std::string& error) {
+  if (images.size() != SelfTestFrameCount || quadColors.size() != SelfTestFrameCount) {
+    error = fmt::format("expected {} frames and colour sets, got {} and {}", SelfTestFrameCount, images.size(),
+                        quadColors.size());
+    return false;
+  }
+  constexpr size_t ImageSize = static_cast<size_t>(SelfTestWidth) * SelfTestHeight * 4;
+  for (uint32_t frame = 0; frame < SelfTestFrameCount; ++frame) {
+    const auto& image = images[frame];
+    if (image.size() != ImageSize) {
+      error = fmt::format("frame {} is {} bytes, expected a {}x{} RGBA8 image", frame, image.size(), SelfTestWidth,
+                          SelfTestHeight);
+      return false;
+    }
+    const Rgb expected = background(frame);
+    if (const Rgb corner = pixel(image, 8, 8); corner != expected) {
+      error = fmt::format("frame {}: pixel (8, 8) is {} but the clear color is {}", frame, describe(corner),
+                          describe(expected));
+      return false;
+    }
+    for (size_t quad = 0; quad < Quads.size(); ++quad) {
+      const auto& probe = Quads[quad];
+      const SelfTestColor& color = quadColors[frame][quad];
+      const Rgb want{color.r, color.g, color.b};
+      if (const Rgb actual = pixel(image, probe.probeX, probe.probeY); actual != want) {
+        error =
+            fmt::format("frame {}: quad {} at ({}, {}) is {} but its view colour is {}", frame,
+                        static_cast<char>('A' + quad), probe.probeX, probe.probeY, describe(actual), describe(want));
+        return false;
+      }
+    }
   }
   return true;
 }

@@ -1,5 +1,7 @@
 #include "options.hpp"
 
+#include "render/debug/views.hpp"
+
 #include <array>
 #include <charconv>
 #include <utility>
@@ -139,13 +141,41 @@ bool apply_help(Options& options, std::string_view) {
   return true;
 }
 
+bool apply_debug_view(Options& options, std::string_view value) {
+  const auto selection = render::debug::parse_view(value);
+  if (!selection) {
+    return false;
+  }
+  options.debugView = selection->id;
+  options.debugViewBit = selection->bit;
+  const auto* view = render::debug::find_view(selection->id);
+  options.debugViewName = view != nullptr ? std::string{view->name} : std::string{};
+  return true;
+}
+
+bool apply_classify_json(Options& options, std::string_view) {
+  options.classifyJson = true;
+  return true;
+}
+
+bool apply_classify_objects(Options& options, std::string_view) {
+  options.classifyObjects = true;
+  options.classifyJson = true;
+  return true;
+}
+
+bool apply_classify_draws(Options& options, std::string_view) {
+  options.classifyDraws = true;
+  return true;
+}
+
 struct Flag {
   std::string_view name;
   bool takesValue;
   bool (*apply)(Options& options, std::string_view value);
 };
 
-constexpr std::array<Flag, 21> Flags{{
+constexpr std::array<Flag, 25> Flags{{
     {"--out", true, apply_out},
     {"--backend", true, apply_backend},
     {"--profile", true, apply_profile},
@@ -163,6 +193,10 @@ constexpr std::array<Flag, 21> Flags{{
     {"--self-test", false, apply_self_test},
     {"--write-self-test", true, apply_write_self_test},
     {"--info", false, apply_info},
+    {"--debug-view", true, apply_debug_view},
+    {"--classify-json", false, apply_classify_json},
+    {"--classify-objects", false, apply_classify_objects},
+    {"--classify-draws", false, apply_classify_draws},
     {"-v", false, apply_verbose},
     {"--verbose", false, apply_verbose},
     {"-h", false, apply_help},
@@ -256,7 +290,9 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
       value = argv[++i];
     }
     if (!flag->apply(options, value)) {
-      error = std::string{"invalid value for "} + std::string{arg} + ": " + std::string{value};
+      error = flag->name == "--debug-view"
+                  ? std::string{"unknown debug view: "} + std::string{value}
+                  : std::string{"invalid value for "} + std::string{arg} + ": " + std::string{value};
       return std::nullopt;
     }
     backendFlag |= flag->name == "--backend";
@@ -312,6 +348,11 @@ std::string_view usage() noexcept {
          "  --self-test               replay the synthetic self-test traces\n"
          "  --write-self-test PATH    write the synthetic self-test trace and exit\n"
          "  --info                    print the trace header, INFO and per-frame counts\n"
+         "  --debug-view VIEW         render a classification view (role, kind, main, window, category, object,\n"
+         "                            scope, bit[:category] or an id)\n"
+         "  --classify-json           write classify.json with per-frame classification counters\n"
+         "  --classify-objects        also list each frame's objects in classify.json\n"
+         "  --classify-draws          write classify_draws.jsonl with one line per routed draw\n"
          "  -v, --verbose             debug logging\n"
          "  -h, --help                show this message\n";
 }

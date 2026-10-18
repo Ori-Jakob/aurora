@@ -17,12 +17,16 @@ target_sources(aurora_gx PRIVATE
 )
 if (AURORA_ENABLE_RENDER)
     target_sources(aurora_gx PRIVATE
+        lib/render/debug/class_view.cpp
         lib/render/debug/debug.hpp
         lib/render/debug/debug_window.cpp
         lib/render/debug/graph_dump.cpp
         lib/render/debug/graph_inspection.hpp
         lib/render/debug/graph_tab.cpp
         lib/render/debug/overview_tab.cpp
+        lib/render/debug/scene_tab.cpp
+        lib/render/debug/views.cpp
+        lib/render/debug/views.hpp
         lib/render/gpu_heap.cpp
         lib/render/gpu_heap.hpp
         lib/render/graph.cpp

@@ -56,6 +56,7 @@ int g_override = -1;
 // Raised while a debug view colours draws by identity
 bool g_demand = false;
 ReportRequest g_request;
+const ViewHooks* g_hooks = nullptr;
 
 std::mutex g_reportMutex;
 std::shared_ptr<const FrameReport> g_report;
@@ -138,7 +139,12 @@ gx::draw_route::Decision route(void*, const gx::draw_route::Query& query) noexce
   return {.route = gx::draw_route::Route::Push, .breakMerge = breakMerge};
 }
 
-constexpr gx::draw_route::Router g_router{.route = &route, .push = nullptr, .userData = nullptr};
+// The router ran first for this same draw, so the classifier's last draw is the one being pushed
+bool push(void*, gx::DrawData& draw, const gx::PipelineConfig& config, const gx::ShaderInfo& info) noexcept {
+  return g_hooks != nullptr && g_hooks->push != nullptr && g_hooks->push(draw, config, info, g_classifier.last());
+}
+
+constexpr gx::draw_route::Router g_router{.route = &route, .push = &push, .userData = nullptr};
 } // namespace
 
 void install() noexcept {
@@ -173,6 +179,10 @@ void begin_frame() noexcept {
 }
 
 void apply_frame_state(const detail::FrameState& state) noexcept {
+  // First, so the identity demand the view sets decides this frame's collection and merge key
+  if (g_hooks != nullptr && g_hooks->beginFrame != nullptr) {
+    g_hooks->beginFrame(state);
+  }
   g_classifier.set_record(state.inspectorOpen || g_request.records);
   g_classifier.set_objects(state.inspectorOpen || g_request.objects);
   apply_merge_key();
@@ -204,12 +214,18 @@ void seal_frame() noexcept {
 
 void request_report(const ReportRequest& request) noexcept { g_request = request; }
 
+void set_view_hooks(const ViewHooks* hooks) noexcept { g_hooks = hooks; }
+
+void set_identity_demand(bool demand) noexcept { g_demand = demand; }
+
 bool identity_collecting() noexcept {
   if (g_override >= 0) {
     return g_override != 0;
   }
   return g_env == 1 || g_env == 2 || g_demand;
 }
+
+ViewCounts& view_counts() noexcept { return g_classifier.stats().view; }
 
 void on_camera(const gx::hints::Camera& camera) noexcept { g_classifier.camera(static_cast<Role>(camera.role)); }
 
@@ -274,6 +290,7 @@ void reset() noexcept {
   g_env = 0;
   g_demand = false;
   g_request = {};
+  g_hooks = nullptr;
   scene::reset();
 }
 } // namespace testing

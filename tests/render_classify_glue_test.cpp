@@ -3,6 +3,7 @@
 #include "gx/draw_route.hpp"
 #include "gx/gx.hpp"
 #include "gx/hints.hpp"
+#include "gx/pipeline.hpp"
 #include "hint_bytes.hpp"
 #include "render/frame_state.hpp"
 #include "render/hints.hpp"
@@ -89,7 +90,7 @@ TEST_F(RenderClassifyGlue, InstallSetsRouterRemoveClears) {
   const gx::draw_route::Router* router = gx::draw_route::router();
   ASSERT_NE(router, nullptr);
   EXPECT_NE(router->route, nullptr);
-  EXPECT_EQ(router->push, nullptr);
+  EXPECT_NE(router->push, nullptr);
   EXPECT_EQ(router->userData, nullptr);
   detail::remove_hints();
   EXPECT_EQ(gx::draw_route::router(), nullptr);
@@ -328,6 +329,59 @@ TEST_F(RenderClassifyGlue, ResetKeepsRequestAndIdentityMode) {
   EXPECT_EQ(report->objects.size(), 3u);
   EXPECT_EQ(report->stats.mergeBreaks, 1u);
   EXPECT_TRUE(identity_collecting());
+}
+
+struct PushProbe {
+  static inline int frames = 0;
+  static inline int pushes = 0;
+  static inline DrawClass last;
+
+  static void begin(const detail::FrameState&) noexcept { ++frames; }
+  static bool push(gx::DrawData& draw, const gx::PipelineConfig&, const gx::ShaderInfo&,
+                   const DrawClass& cls) noexcept {
+    ++pushes;
+    last = cls;
+    draw.pipeline = 99;
+    return true;
+  }
+};
+
+TEST_F(RenderClassifyGlue, PushForwardsToViewHooks) {
+  const gx::draw_route::Router* router = gx::draw_route::router();
+  ASSERT_NE(router, nullptr);
+  gx::DrawData data{};
+  data.pipeline = 7;
+  const gx::PipelineConfig config{};
+  const gx::ShaderInfo info{};
+  EXPECT_FALSE(router->push(router->userData, data, config, info));
+  EXPECT_EQ(data.pipeline, 7u);
+
+  static constexpr ViewHooks Hooks{.beginFrame = &PushProbe::begin, .push = &PushProbe::push};
+  PushProbe::frames = 0;
+  PushProbe::pushes = 0;
+  set_view_hooks(&Hooks);
+  apply_frame_state(detail::FrameState{});
+  EXPECT_EQ(PushProbe::frames, 1);
+  main_scene();
+  begin_object(0x42);
+  draw();
+  // The router classified this draw just before its push, so the hook sees its class
+  EXPECT_TRUE(router->push(router->userData, data, config, info));
+  EXPECT_EQ(PushProbe::pushes, 1);
+  EXPECT_EQ(data.pipeline, 99u);
+  EXPECT_EQ(PushProbe::last.key.object.id, 0x42u);
+  EXPECT_TRUE(PushProbe::last.mainClass);
+  set_view_hooks(nullptr);
+  EXPECT_FALSE(router->push(router->userData, data, config, info));
+  EXPECT_EQ(PushProbe::pushes, 1);
+}
+
+TEST_F(RenderClassifyGlue, IdentityDemandStartsCollection) {
+  EXPECT_FALSE(identity_collecting());
+  set_identity_demand(true);
+  EXPECT_TRUE(identity_collecting());
+  set_identity_demand(false);
+  EXPECT_FALSE(identity_collecting());
 }
 
 TEST_F(RenderClassifyGlue, BlendedRule) {

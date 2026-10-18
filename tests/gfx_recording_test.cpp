@@ -6,7 +6,12 @@
 #include "gfx/recording.hpp"
 #include "gfx/texture.hpp"
 #if AURORA_ENABLE_RENDER
+#include "gfx/resources.hpp"
+#include "gx/gx.hpp"
+#include "gx/pipeline.hpp"
+#include "gx/shader_info.hpp"
 #include "hint_bytes.hpp"
+#include "render/debug/views.hpp"
 #include "render/frame_state.hpp"
 #include "render/graph.hpp"
 #include "render/graph_api.hpp"
@@ -24,6 +29,7 @@
 #include <array>
 #include <bit>
 #include <cstddef>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -1760,6 +1766,180 @@ TEST_F(GfxRenderStageHintTest, MarkerAcceptanceMatchesRecorder) {
     EXPECT_EQ(classified, recorded) << "sequence " << i;
     EXPECT_EQ(stats.hints.markers, static_cast<uint32_t>(std::popcount(recorded))) << "sequence " << i;
   }
+}
+
+constexpr PipelineRef FixedVariant = 0xC0FFEE;
+
+PipelineRef fixed_variant(const gx::PipelineConfig&, const RenderTargetLayout&) { return FixedVariant; }
+
+class RenderViewUniform : public GfxRecordingTest {
+protected:
+  void SetUp() override {
+    GfxRecordingTest::SetUp();
+    m_alignment = detail::resources().limits.minUniformBufferOffsetAlignment;
+    detail::resources().limits.minUniformBufferOffsetAlignment = 256;
+    render::scene::testing::reset();
+    render::debug::testing::reset_views();
+    render::debug::testing::set_variant_lookup(&fixed_variant);
+    gx::g_gxState = {};
+  }
+
+  void TearDown() override {
+    render::debug::testing::reset_views();
+    render::scene::testing::reset();
+    gx::g_gxState = {};
+    detail::resources().limits.minUniformBufferOffsetAlignment = m_alignment;
+    GfxRecordingTest::TearDown();
+  }
+
+  // One stage passing the rasterised colour through, so no konst register is sampled
+  static gx::PipelineConfig pass_through_config() {
+    gx::PipelineConfig config{};
+    config.shaderConfig.tevStageCount = 1;
+    auto& stage = config.shaderConfig.tevStages[0];
+    stage.colorPass = {GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_RASC};
+    stage.alphaPass = {GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_RASA};
+    stage.channelId = GX_COLOR0A0;
+    return config;
+  }
+
+  static render::scene::DrawClass span_draw() {
+    render::scene::DrawClass cls;
+    cls.key.role = render::scene::Role::Main;
+    cls.key.window = render::scene::Window::Opaque;
+    cls.key.mainCamera = true;
+    return cls;
+  }
+
+  static render::detail::FrameState frame_with_view(uint16_t id) {
+    return {.settings = render::Settings{.debugView = id}};
+  }
+
+  const uint8_t* uniform_bytes(Range range) const { return frame.uniforms.data() + range.offset; }
+
+  uint32_t m_alignment = 0;
+};
+
+TEST_F(RenderViewUniform, UniformPatchesOnlyTheKonst) {
+  render::debug::testing::assume_variants_ready(true);
+  const Vec4<float> k3{0.1f, 0.2f, 0.3f, 0.4f};
+  gx::g_gxState.kcolors[3] = k3;
+  const gx::PipelineConfig config = pass_through_config();
+  const gx::ShaderInfo info = gx::build_shader_info(config.shaderConfig);
+  render::debug::begin_view_frame(frame_with_view(static_cast<uint16_t>(render::debug::ClassView::Role)));
+  const Range source = gx::build_uniform(info);
+  gx::DrawData draw{};
+  draw.pipeline = 77;
+  draw.uniformRange = source;
+  const render::scene::DrawClass cls = span_draw();
+  ASSERT_TRUE(render::debug::push_view(draw, config, info, cls));
+  EXPECT_EQ(draw.pipeline, FixedVariant);
+  EXPECT_NE(draw.uniformRange, source);
+  EXPECT_EQ(gx::g_gxState.kcolors[3], k3);
+
+  gx::PipelineConfig variant{};
+  ASSERT_TRUE(render::debug::make_view_variant(config, info, variant));
+  const gx::ShaderInfo variantInfo = gx::build_shader_info(variant.shaderConfig);
+  const render::debug::Rgb8 color = render::debug::RoleColors[static_cast<size_t>(render::scene::Role::Main)];
+  gx::g_gxState.kcolors[3] = {color.r / 255.f, color.g / 255.f, color.b / 255.f, k3.w()};
+  const Range expected = gx::build_uniform(variantInfo);
+  gx::g_gxState.kcolors[3] = k3;
+  ASSERT_EQ(draw.uniformRange.size, expected.size);
+  EXPECT_EQ(std::memcmp(uniform_bytes(draw.uniformRange), uniform_bytes(expected), expected.size), 0);
+  const render::scene::ViewCounts& counts = render::scene::view_counts();
+  EXPECT_EQ(counts.substituted, 1u);
+  EXPECT_EQ(counts.uniformBytes, align_uniform(draw.uniformRange.size));
+
+  gx::DrawData repeat{};
+  repeat.pipeline = 77;
+  repeat.uniformRange = source;
+  ASSERT_TRUE(render::debug::push_view(repeat, config, info, cls));
+  EXPECT_EQ(repeat.uniformRange, draw.uniformRange);
+  EXPECT_EQ(counts.substituted, 2u);
+  EXPECT_EQ(counts.uniformBytes, align_uniform(draw.uniformRange.size));
+
+  render::debug::testing::set_view_uniform_budget(1);
+  render::scene::DrawClass sky = cls;
+  sky.key.role = render::scene::Role::Sky;
+  gx::DrawData skipped{};
+  skipped.pipeline = 77;
+  skipped.uniformRange = source;
+  const gx::DrawData before = skipped;
+  EXPECT_FALSE(render::debug::push_view(skipped, config, info, sky));
+  EXPECT_EQ(std::memcmp(&skipped, &before, sizeof(skipped)), 0);
+  EXPECT_EQ(counts.overBudget, 1u);
+  EXPECT_EQ(counts.substituted, 2u);
+}
+
+TEST_F(RenderViewUniform, PendingKeepsOriginalPipeline) {
+  // The fixed ref was never built, so get_pipeline does not know it and the variant stays pending
+  const gx::PipelineConfig config = pass_through_config();
+  const gx::ShaderInfo info = gx::build_shader_info(config.shaderConfig);
+  render::debug::begin_view_frame(frame_with_view(static_cast<uint16_t>(render::debug::ClassView::Kind)));
+  gx::DrawData draw{};
+  draw.pipeline = 77;
+  draw.uniformRange = {256, 512};
+  const gx::DrawData before = draw;
+  EXPECT_FALSE(render::debug::push_view(draw, config, info, span_draw()));
+  EXPECT_FALSE(render::debug::push_view(draw, config, info, span_draw()));
+  EXPECT_EQ(std::memcmp(&draw, &before, sizeof(draw)), 0);
+  EXPECT_EQ(render::scene::view_counts().pending, 2u);
+  EXPECT_EQ(render::scene::view_counts().substituted, 0u);
+}
+
+TEST_F(RenderViewUniform, RefusedVariantCountsUntouched) {
+  gx::PipelineConfig config = pass_through_config();
+  config.shaderConfig.tevStages[0].alphaOp.op = GX_TEV_COMP_R8_GT;
+  const gx::ShaderInfo info = gx::build_shader_info(config.shaderConfig);
+  render::debug::testing::assume_variants_ready(true);
+  render::debug::begin_view_frame(frame_with_view(static_cast<uint16_t>(render::debug::ClassView::Role)));
+  gx::DrawData draw{};
+  draw.pipeline = 77;
+  draw.uniformRange = {256, 512};
+  const gx::DrawData before = draw;
+  EXPECT_FALSE(render::debug::push_view(draw, config, info, span_draw()));
+  EXPECT_FALSE(render::debug::push_view(draw, config, info, span_draw()));
+  EXPECT_EQ(std::memcmp(&draw, &before, sizeof(draw)), 0);
+  const render::scene::ViewCounts& counts = render::scene::view_counts();
+  EXPECT_EQ(counts.untouched, 2u);
+  EXPECT_EQ(counts.substituted + counts.pending + counts.overBudget, 0u);
+}
+
+TEST_F(RenderViewUniform, BudgetFollowsRecordedUniformSize) {
+  // The render worker never runs here, so its stats stay empty and only the recorded size can shrink the budget
+  const std::vector<uint8_t> bulk(10u << 20);
+  push_uniform(bulk.data(), bulk.size());
+  next_frame();
+  const uint32_t recorded = last_recorded_uniform_size();
+  ASSERT_GE(recorded, bulk.size());
+  EXPECT_EQ(aurora_get_stats()->lastUniformSize, 0u);
+  render::debug::begin_view_frame(frame_with_view(static_cast<uint16_t>(render::debug::ClassView::Role)));
+  const uint32_t budget = render::debug::testing::view_uniform_budget();
+  EXPECT_EQ(budget, static_cast<uint32_t>((UniformBufferSize - recorded) / 2));
+  EXPECT_LT(budget, 8u << 20);
+}
+
+TEST_F(RenderViewUniform, FullUniformBufferRefusesTheView) {
+  EXPECT_EQ(uniform_space_left(), UINT64_MAX);
+  render::debug::testing::assume_variants_ready(true);
+  const gx::PipelineConfig config = pass_through_config();
+  const gx::ShaderInfo info = gx::build_shader_info(config.shaderConfig);
+  render::debug::begin_view_frame(frame_with_view(static_cast<uint16_t>(render::debug::ClassView::Role)));
+  // A mapped buffer that cannot take the patched uniform; pushing into it would abort
+  std::vector<uint8_t> storage(512);
+  frame.uniforms = ByteBuffer{storage.data(), storage.size()};
+  EXPECT_EQ(uniform_space_left(), storage.size());
+  gx::DrawData draw{};
+  draw.pipeline = 77;
+  draw.uniformRange = {0, 256};
+  const gx::DrawData before = draw;
+  EXPECT_FALSE(render::debug::push_view(draw, config, info, span_draw()));
+  EXPECT_EQ(std::memcmp(&draw, &before, sizeof(draw)), 0);
+  const render::scene::ViewCounts& counts = render::scene::view_counts();
+  EXPECT_EQ(counts.overBudget, 1u);
+  EXPECT_EQ(counts.uniformBytes, 0u);
+  EXPECT_EQ(frame.uniforms.size(), 0u);
+  frame.uniforms = ByteBuffer{};
 }
 #endif
 

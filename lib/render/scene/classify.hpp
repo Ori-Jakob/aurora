@@ -9,6 +9,12 @@
 #include <memory>
 #include <vector>
 
+namespace aurora::gx {
+struct DrawData;
+struct PipelineConfig;
+struct ShaderInfo;
+} // namespace aurora::gx
+
 namespace aurora::render::detail {
 struct FrameState;
 } // namespace aurora::render::detail
@@ -29,6 +35,12 @@ struct ReportRequest {
   bool objects = false;
 };
 
+struct ViewHooks {
+  void (*beginFrame)(const detail::FrameState& state) noexcept = nullptr;
+  bool (*push)(gx::DrawData& draw, const gx::PipelineConfig& config, const gx::ShaderInfo& info,
+               const DrawClass& cls) noexcept = nullptr;
+};
+
 // Game thread while the FIFO is idle
 void install() noexcept;
 void remove() noexcept;
@@ -37,9 +49,12 @@ void begin_frame() noexcept;
 void apply_frame_state(const detail::FrameState& state) noexcept;
 void seal_frame() noexcept;
 void request_report(const ReportRequest& request) noexcept;
+void set_view_hooks(const ViewHooks* hooks) noexcept;
+void set_identity_demand(bool demand) noexcept;
 
 // FIFO thread
 [[nodiscard]] bool identity_collecting() noexcept;
+[[nodiscard]] ViewCounts& view_counts() noexcept;
 void on_camera(const gx::hints::Camera& camera) noexcept;
 void on_object_begin(const gx::hints::ObjectBegin& object) noexcept;
 void on_object_end() noexcept;

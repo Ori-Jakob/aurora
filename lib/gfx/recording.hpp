@@ -116,6 +116,10 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
                        Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat,
                        GXPixelFmt sourceFormat);
 uint32_t align_uniform(uint32_t value);
+// Optional uniform pushes check this first, because a push past the mapped frame buffer aborts
+uint64_t uniform_space_left() noexcept;
+// Set by end_recording on the thread that ends frames, so the next latch reads it without the render worker
+uint32_t last_recorded_uniform_size() noexcept;
 Vec2<uint32_t> get_render_target_size() noexcept;
 void set_viewport(const Viewport& viewport) noexcept;
 void set_scissor(const ClipRect& scissor) noexcept;

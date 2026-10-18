@@ -38,6 +38,16 @@ struct Options {
   bool verbose = false;
   bool gpuTimings = false;
   bool help = false;
+  uint16_t debugView = 0;
+  uint32_t debugViewBit = 0;
+  std::string debugViewName;
+  bool classifyJson = false;
+  bool classifyObjects = false;
+  bool classifyDraws = false;
+
+  // A view also writes classify.json, so its counters explain what the view coloured
+  [[nodiscard]] bool writes_classify_json() const noexcept { return classifyJson || debugView != 0; }
+  [[nodiscard]] bool classifies() const noexcept { return writes_classify_json() || classifyDraws; }
 };
 
 std::optional<AuroraBackend> parse_backend(std::string_view name) noexcept;

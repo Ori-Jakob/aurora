@@ -5,6 +5,7 @@
 
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace aurora::gxreplay;
@@ -296,4 +297,244 @@ TEST(GxReplayReport, GpuTimingUnsupported) {
   const GpuFrameTiming timings[]{{.run = 0, .frame = 0, .frameMs = 1.0}};
   EXPECT_EQ(format_gpu_timing_json(false, timings), "{\"supported\": false, \"runs\": []}\n");
   EXPECT_EQ(format_gpu_timing_json(true, {}), "{\"supported\": true, \"runs\": []}\n");
+}
+
+TEST(GxReplayOptions, ParsesDebugView) {
+  const auto role = parse({"demo.gxtrace", "--out", "o", "--debug-view", "role"});
+  ASSERT_TRUE(role);
+  EXPECT_EQ(role->debugView, 1u);
+  EXPECT_EQ(role->debugViewBit, 0u);
+  EXPECT_EQ(role->debugViewName, "class.role");
+  EXPECT_TRUE(role->writes_classify_json());
+  EXPECT_TRUE(role->classifies());
+  EXPECT_FALSE(role->classifyJson);
+
+  const auto byId = parse({"demo.gxtrace", "--out", "o", "--debug-view", "6"});
+  ASSERT_TRUE(byId);
+  EXPECT_EQ(byId->debugView, 6u);
+  EXPECT_EQ(byId->debugViewName, "class.object");
+
+  const auto bit = parse({"demo.gxtrace", "--out", "o", "--debug-view", "bit"});
+  ASSERT_TRUE(bit);
+  EXPECT_EQ(bit->debugView, 8u);
+  EXPECT_EQ(bit->debugViewBit, AURORA_CAT_STATIC);
+  EXPECT_EQ(bit->debugViewName, "class.bit");
+
+  const auto decal = parse({"demo.gxtrace", "--out", "o", "--debug-view", "bit:decal"});
+  ASSERT_TRUE(decal);
+  EXPECT_EQ(decal->debugView, 8u);
+  EXPECT_EQ(decal->debugViewBit, AURORA_CAT_DECAL);
+
+  const auto reserved = parse({"demo.gxtrace", "--out", "o", "--debug-view", "100"});
+  ASSERT_TRUE(reserved);
+  EXPECT_EQ(reserved->debugView, 100u);
+  EXPECT_TRUE(reserved->debugViewName.empty());
+
+  std::vector<const char*> args{"aurora_gxreplay", "demo.gxtrace", "--out", "o", "--debug-view", "nope"};
+  std::string error;
+  EXPECT_FALSE(parse_options(static_cast<int>(args.size()), args.data(), nullptr, error));
+  EXPECT_EQ(error, "unknown debug view: nope");
+  args.back() = "bit:nope";
+  EXPECT_FALSE(parse_options(static_cast<int>(args.size()), args.data(), nullptr, error));
+  EXPECT_EQ(error, "unknown debug view: bit:nope");
+  EXPECT_NE(usage().find("--debug-view VIEW"), std::string_view::npos);
+}
+
+TEST(GxReplayOptions, ParsesClassifyFlags) {
+  const Options defaults;
+  EXPECT_FALSE(defaults.classifies());
+  EXPECT_FALSE(defaults.writes_classify_json());
+
+  const auto json = parse({"demo.gxtrace", "--out", "o", "--classify-json"});
+  ASSERT_TRUE(json);
+  EXPECT_TRUE(json->classifyJson);
+  EXPECT_FALSE(json->classifyObjects);
+  EXPECT_FALSE(json->classifyDraws);
+
+  const auto objects = parse({"demo.gxtrace", "--out", "o", "--classify-objects"});
+  ASSERT_TRUE(objects);
+  EXPECT_TRUE(objects->classifyObjects);
+  EXPECT_TRUE(objects->classifyJson);
+  EXPECT_TRUE(objects->writes_classify_json());
+
+  const auto draws = parse({"demo.gxtrace", "--out", "o", "--classify-draws"});
+  ASSERT_TRUE(draws);
+  EXPECT_TRUE(draws->classifyDraws);
+  EXPECT_FALSE(draws->writes_classify_json());
+  EXPECT_TRUE(draws->classifies());
+}
+
+namespace {
+namespace scene = aurora::render::scene;
+
+ClassifyFrame crafted_frame() {
+  ClassifyFrame frame{.frame = 0, .uniformBytes = 4096};
+  scene::FrameReport& report = frame.report;
+  scene::FrameStats& stats = report.stats;
+  stats.draws = 3;
+  stats.suppressed = 1;
+  stats.mergeBreaks = 2;
+  stats.unclassified = 1;
+  stats.tevPolicyDraws = 1;
+  stats.kinds[static_cast<size_t>(scene::Kind::Foreign)] = 2;
+  stats.roles[static_cast<size_t>(scene::Role::Main)] = 2;
+  stats.checks[static_cast<size_t>(scene::MainCheck::Ortho)] = 2;
+  stats.windows[static_cast<size_t>(scene::Window::Opaque)] = 2;
+  stats.categories[3] = 1;
+  stats.categories[24] = 1;
+  stats.underScope[static_cast<size_t>(scene::Role::Main)] = {.draws = 1, .asRole = 1};
+  stats.markerDraw.fill(-1);
+  stats.markerDraw[0] = 0;
+  stats.markerDraw[1] = 2;
+  stats.hints = {.cameras = 1, .mainCameras = 1, .objectBegins = 1, .objectEnds = 1, .markers = 2, .nestedObjects = 1};
+  stats.view = {.substituted = 2, .untouched = 1, .uniformBytes = 512};
+  report.mainCamera = true;
+  report.cutEpoch = 7;
+  report.sceneEpochKnown = true;
+  report.sceneEpoch = 3;
+  report.objects.push_back({
+      .ref = {.id = 0x100000001ull, .subId = 0, .generation = 1, .valid = true},
+      .categories = 9,
+      .flags = 64,
+      .roles = 0b11,
+      .draws = 1,
+      .mainDraws = 1,
+  });
+  return frame;
+}
+} // namespace
+
+TEST(GxReplayReport, FormatsClassifyJson) {
+  const ReportContext context{
+      .traceFile = "C:\\traces\\t1.gxtrace",
+      .backend = "d3d12",
+      .adapter = "Test GPU",
+  };
+  const ClassifyFrame frames[]{crafted_frame()};
+  const std::string zeros = R"({"draws": 0, "asRole": 0, "main": 0, "roleOnly": 0, "captures": 0, "skyKind": 0})";
+  const std::string expected =
+      "{\n"
+      "  \"schema\": \"aurora.classify\",\n"
+      "  \"version\": 1,\n"
+      "  \"trace\": \"C:\\\\traces\\\\t1.gxtrace\",\n"
+      "  \"backend\": \"d3d12\",\n"
+      "  \"adapter\": \"Test GPU\",\n"
+      "  \"view\": \"class.role\",\n"
+      "  \"viewBit\": null,\n"
+      "  \"frames\": [\n"
+      "    {\n"
+      "      \"frame\": 0,\n"
+      "      \"draws\": 3,\n"
+      "      \"suppressed\": 1,\n"
+      "      \"mergeBreaks\": 2,\n"
+      "      \"captureCandidates\": 0,\n"
+      "      \"fakeShadow\": 0,\n"
+      "      \"fakeShadowOverlay\": 0,\n"
+      "      \"unclassified\": 1,\n"
+      "      \"tevPolicyDraws\": 1,\n"
+      "      \"skyMisses\": 0,\n"
+      "      \"droppedRecords\": 0,\n"
+      "      \"droppedObjects\": 0,\n"
+      "      \"kinds\": {\"mainOpaque\": 0, \"mainBlended\": 0, \"overlay\": 0, \"sky\": 0, \"foreign\": 2, "
+      "\"mainDepthOnly\": 0},\n"
+      "      \"roles\": {\"main\": 2, \"sky\": 0, \"reflection\": 0, \"shadow\": 0, \"offscreen\": 0, \"ui\": 0, "
+      "\"none\": 0},\n"
+      "      \"checks\": {\"passed\": 0, \"role\": 0, \"target\": 0, \"window\": 0, \"ortho\": 2, \"noCamera\": 0, "
+      "\"projection\": 0},\n"
+      "      \"windows\": {\"preScene\": 0, \"opaque\": 2, \"translucent\": 0, \"post\": 0, \"sceneEnd\": 0, "
+      "\"hud\": 0, \"final\": 0},\n"
+      "      \"categories\": {\"static\": 0, \"dynamic\": 0, \"skinned\": 0, \"terrain\": 1, \"foliage\": 0, "
+      "\"water\": 0, \"sky\": 0, \"particle\": 0, \"decal\": 0, \"ui\": 0, \"player\": 0, \"emissive\": 0, "
+      "\"overlay\": 0, \"noShadowCast\": 0, \"noShadowReceive\": 0, \"noPbr\": 0, \"noCapture\": 0, \"noRt\": 0, "
+      "\"screenRead\": 0, \"fakeShadow\": 0, \"cloudReceiver\": 0, \"noAo\": 1},\n"
+      "      \"underScope\": {\"main\": {\"draws\": 1, \"asRole\": 1, \"main\": 0, \"roleOnly\": 0, \"captures\": 0, "
+      "\"skyKind\": 0}, \"sky\": " +
+      zeros + ", \"reflection\": " + zeros + ", \"shadow\": " + zeros + ", \"offscreen\": " + zeros +
+      ", \"ui\": " + zeros + ", \"none\": " + zeros +
+      "},\n"
+      "      \"markers\": {\"sceneBegin\": 0, \"opaqueDone\": 2, \"prePost\": -1, \"sceneEnd\": -1, \"beforeHud\": -1, "
+      "\"frameEnd\": -1},\n"
+      "      \"hints\": {\"cameras\": 1, \"mainCameras\": 1, \"scopePushes\": 0, \"scopePops\": 0, \"objectBegins\": "
+      "1, "
+      "\"objectEnds\": 1, \"markers\": 2, \"staleMarkers\": 0, \"scopeOverflow\": 0, \"scopeUnderflow\": 0, "
+      "\"nestedObjects\": 1, \"objectUnderflow\": 0, \"openScopes\": 0, \"openObjects\": 0, \"errors\": 1},\n"
+      "      \"camera\": {\"main\": true, \"cutEpoch\": 7},\n"
+      "      \"sceneEpoch\": 3,\n"
+      "      \"viewCounts\": {\"substituted\": 2, \"untouched\": 1, \"pending\": 0, \"overBudget\": 0, "
+      "\"uniformBytes\": 512},\n"
+      "      \"uniformBytes\": 4096,\n"
+      "      \"objects\": [\n"
+      "        {\"id\": \"0x0000000100000001\", \"subId\": 0, \"generation\": 1, \"categories\": 9, \"flags\": 64, "
+      "\"roles\": [\"main\", \"sky\"], \"draws\": 1, \"mainDraws\": 1}\n"
+      "      ]\n"
+      "    }\n"
+      "  ]\n"
+      "}\n";
+  EXPECT_EQ(format_classify_json(context, "class.role", "", frames, true), expected);
+
+  ClassifyFrame second = crafted_frame();
+  second.frame = 1;
+  second.report.sceneEpochKnown = false;
+  const ClassifyFrame two[]{crafted_frame(), second};
+  const std::string plain = format_classify_json(context, "", "decal", two, false);
+  EXPECT_NE(plain.find("  \"view\": null,\n  \"viewBit\": \"decal\",\n"), std::string::npos) << plain;
+  EXPECT_EQ(plain.find("\"objects\""), std::string::npos) << plain;
+  EXPECT_NE(plain.find("      \"sceneEpoch\": 3,\n"), std::string::npos) << plain;
+  EXPECT_NE(plain.find("      \"sceneEpoch\": null,\n"), std::string::npos) << plain;
+  EXPECT_NE(plain.find("      \"uniformBytes\": 4096\n    },\n    {\n      \"frame\": 1,\n"), std::string::npos)
+      << plain;
+  EXPECT_TRUE(plain.ends_with("      \"uniformBytes\": 4096\n    }\n  ]\n}\n")) << plain;
+
+  ClassifyFrame empty = crafted_frame();
+  empty.report.objects.clear();
+  const ClassifyFrame noObjects[]{empty};
+  EXPECT_NE(format_classify_json(context, "", "", noObjects, true).find("      \"objects\": []\n    }\n"),
+            std::string::npos);
+  EXPECT_TRUE(
+      format_classify_json(context, "", "", {}, false).ends_with("  \"viewBit\": null,\n  \"frames\": []\n}\n"));
+}
+
+TEST(GxReplayReport, FormatsClassifyDrawLine) {
+  scene::ClassifiedDraw draw;
+  draw.cls.index = 4;
+  draw.cls.kind = scene::Kind::MainOpaque;
+  draw.cls.check = scene::MainCheck::Passed;
+  draw.cls.key.role = scene::Role::Main;
+  draw.cls.key.window = scene::Window::Translucent;
+  draw.cls.key.object = {.id = 0x12, .subId = 3, .generation = 2, .valid = true};
+  draw.cls.key.categories = 9;
+  draw.cls.key.flags = 2;
+  draw.cls.key.materialClass = 1;
+  draw.cls.key.tevPolicy = 16;
+  draw.cls.key.scope = 0xDEADBEEF;
+  draw.vertices = 36;
+  draw.indexed = true;
+  EXPECT_EQ(format_classify_draw_line(5, draw),
+            "{\"frame\": 5, \"index\": 4, \"kind\": \"mainOpaque\", \"role\": \"main\", \"check\": \"passed\", "
+            "\"window\": \"translucent\", \"object\": \"0x0000000000000012\", \"subId\": 3, \"generation\": 2, "
+            "\"categories\": 9, \"flags\": 2, \"material\": 1, \"tevPolicy\": 16, \"scope\": 3735928559, "
+            "\"vertices\": 36, \"indexed\": true, \"suppressed\": false}\n");
+
+  scene::ClassifiedDraw loose;
+  loose.cls.suppressed = true;
+  EXPECT_EQ(format_classify_draw_line(0, loose),
+            "{\"frame\": 0, \"index\": 0, \"kind\": \"foreign\", \"role\": \"none\", \"check\": \"role\", "
+            "\"window\": \"preScene\", \"object\": null, \"subId\": 0, \"generation\": 0, \"categories\": 0, "
+            "\"flags\": 0, \"material\": 0, \"tevPolicy\": 0, \"scope\": 0, \"vertices\": 0, \"indexed\": false, "
+            "\"suppressed\": true}\n");
+}
+
+TEST(GxReplayReport, FormatsClassifySummary) {
+  ClassifyFrame first = crafted_frame();
+  first.report.stats.kinds[static_cast<size_t>(scene::Kind::MainOpaque)] = 4;
+  first.report.stats.kinds[static_cast<size_t>(scene::Kind::MainDepthOnly)] = 1;
+  first.report.stats.kinds[static_cast<size_t>(scene::Kind::Sky)] = 2;
+  first.report.stats.skyMisses = 1;
+  const ClassifyFrame frames[]{first, crafted_frame()};
+  EXPECT_EQ(format_classify_summary(frames, 3),
+            "aurora_gxreplay: classification: frames 2, draws 6, main 5, sky 2, sky misses 1, suppressed 2, "
+            "hint errors 2, malformed hints 3, view substituted 4\n");
+  EXPECT_EQ(format_classify_summary({}, 0),
+            "aurora_gxreplay: classification: frames 0, draws 0, main 0, sky 0, sky misses 0, suppressed 0, "
+            "hint errors 0, malformed hints 0, view substituted 0\n");
 }

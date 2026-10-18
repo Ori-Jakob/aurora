@@ -14,7 +14,9 @@
 #include "gx/texture.hpp"
 #include "io.hpp"
 #if AURORA_ENABLE_RENDER
+#include "render/debug/views.hpp"
 #include "render/jobs.hpp"
+#include "render/scene/classify.hpp"
 #endif
 #include "webgpu/gpu.hpp"
 #include "webgpu/gpu_prof.hpp"
@@ -29,6 +31,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 
 namespace aurora::gxreplay {
 namespace {
@@ -88,6 +91,14 @@ uint32_t device_features() noexcept {
   return features;
 }
 
+uint64_t malformed_hints() noexcept {
+  uint64_t total = 0;
+  for (uint16_t id = GX_AURORA_RENDER_CAMERA; id <= GX_AURORA_RENDER_WIND_SOURCES; ++id) {
+    total += gx::hints::counters(id).malformed;
+  }
+  return total;
+}
+
 class ScopedStoreHooks {
 public:
   explicit ScopedStoreHooks(const gx::guest_memory::Hooks* hooks) noexcept { gx::guest_memory::set_hooks(hooks); }
@@ -99,6 +110,12 @@ public:
 
 ExitCode bring_up_aurora(int argc, char* argv[], const Options& options, const trace::TraceInfo& info, bool synthetic,
                          AuroraInfo& auroraInfo, std::string& error) {
+#if !AURORA_ENABLE_RENDER
+  if (options.classifies()) {
+    error = "--debug-view and --classify-* need the render module";
+    return ExitUsage;
+  }
+#endif
   window::set_start_hidden(!options.showWindow);
   const auto dataDir = options.dataDir.empty() ? options.outDir / ".aurora" : options.dataDir;
   if (!io::create_directories(dataDir)) {
@@ -152,6 +169,14 @@ ExitCode bring_up_aurora(int argc, char* argv[], const Options& options, const t
   gfx::set_blocking_pipelines(true);
 #if AURORA_ENABLE_RENDER
   render::jobs::set_synchronous(true);
+  // The request outlives the run-start reset, so every repeat classifies the same way
+  render::scene::request_report({.records = options.classifyDraws, .objects = options.classifyObjects});
+  if (options.debugView != 0) {
+    render::apply_settings(render::Settings{.debugView = options.debugView});
+    if (options.debugViewBit != 0) {
+      render::debug::set_view_bit(options.debugViewBit);
+    }
+  }
 #endif
   if (options.gpuTimings) {
     webgpu::gpu_prof::set_always(true);
@@ -163,8 +188,8 @@ ExitCode bring_up_aurora(int argc, char* argv[], const Options& options, const t
   return ExitOk;
 }
 
-Replayer::Replayer(const Options& options, trace::TraceReader& reader, bool keepImages)
-: m_options(options), m_reader(reader), m_keepImages(keepImages) {}
+Replayer::Replayer(const Options& options, trace::TraceReader& reader, bool keepImages, bool keepRecords)
+: m_options(options), m_reader(reader), m_keepImages(keepImages), m_keepRecords(keepRecords) {}
 
 bool Replayer::fail(ExitCode code, std::string message, std::string& error) {
   m_exitCode = code;
@@ -183,6 +208,16 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
   m_store.reset();
   if (!m_reader.rewind(error)) {
     return fail(ExitTrace, error, error);
+  }
+  const uint64_t malformedBefore = malformed_hints();
+  // One line per draw is written as each frame ends, so long traces never hold their records
+  std::ofstream drawLines;
+  const auto drawLinesPath = m_options.outDir / "classify_draws.jsonl";
+  if (run == 0 && m_options.classifyDraws) {
+    drawLines.open(drawLinesPath, std::ios::binary | std::ios::trunc);
+    if (!drawLines) {
+      return fail(ExitUsage, fmt::format("failed to write {}", io::fs_path_to_string(drawLinesPath)), error);
+    }
   }
 
   const trace::BlobSink sink = [this](const trace::Hash128& hash, std::span<const uint8_t> bytes,
@@ -316,6 +351,36 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
         out.images.push_back(std::move(rgba));
         rgba = {};
       }
+#if AURORA_ENABLE_RENDER
+      if (run == 0 && m_options.classifies()) {
+        // The next latch would seal this frame too; sealing now keeps the report next to its frame
+        render::scene::seal_frame();
+        if (const auto report = render::scene::latest_report()) {
+          if (drawLines.is_open()) {
+            for (const auto& draw : report->draws) {
+              drawLines << format_classify_draw_line(index, draw);
+            }
+            if (!drawLines) {
+              return fail(ExitUsage, fmt::format("failed to write {}", io::fs_path_to_string(drawLinesPath)), error);
+            }
+          }
+          out.classify.push_back({
+              .frame = index,
+              .report =
+                  {
+                      .stats = report->stats,
+                      .mainCamera = report->mainCamera,
+                      .cutEpoch = report->cutEpoch,
+                      .sceneEpochKnown = report->sceneEpochKnown,
+                      .sceneEpoch = report->sceneEpoch,
+                      .draws = m_keepRecords ? report->draws : std::vector<render::scene::ClassifiedDraw>{},
+                      .objects = report->objects,
+                  },
+              .uniformBytes = gfx::last_recorded_uniform_size(),
+          });
+        }
+      }
+#endif
     }
 
     if (++index >= m_options.frames.last) {
@@ -329,6 +394,13 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
       break;
     }
   }
+  if (drawLines.is_open()) {
+    drawLines.close();
+    if (!drawLines) {
+      return fail(ExitUsage, fmt::format("failed to write {}", io::fs_path_to_string(drawLinesPath)), error);
+    }
+  }
+  out.malformedHints = malformed_hints() - malformedBefore;
   return true;
 }
 

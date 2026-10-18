@@ -43,6 +43,8 @@ bool blocking_pipelines() noexcept;
 PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout);
 PipelineRef find_pipeline(const clear::PipelineConfig& config, const RenderTargetLayout& layout);
 PipelineRef find_pipeline(const rmlui::PipelineConfig& config);
+// Debug variants are built like any GX pipeline but never remembered, so they never reach the cache file
+PipelineRef find_debug_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout);
 
 bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline);
 

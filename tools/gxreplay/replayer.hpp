@@ -32,6 +32,8 @@ struct ReplayResult {
   std::vector<GpuFrameTiming> gpuTimings;
   uint64_t misses = 0;
   std::vector<std::vector<uint8_t>> images;
+  std::vector<ClassifyFrame> classify;
+  uint64_t malformedHints = 0;
 };
 
 ExitCode bring_up_aurora(int argc, char* argv[], const Options& options, const trace::TraceInfo& info, bool synthetic,
@@ -39,7 +41,7 @@ ExitCode bring_up_aurora(int argc, char* argv[], const Options& options, const t
 
 class Replayer {
 public:
-  Replayer(const Options& options, trace::TraceReader& reader, bool keepImages = false);
+  Replayer(const Options& options, trace::TraceReader& reader, bool keepImages = false, bool keepRecords = false);
   bool replay(uint32_t run, ReplayResult& out, std::string& error);
   [[nodiscard]] ExitCode exit_code() const noexcept { return m_exitCode; }
 
@@ -55,6 +57,7 @@ private:
   trace::SnapshotStore m_store;
   EfbReadback m_readback;
   bool m_keepImages = false;
+  bool m_keepRecords = false;
   ExitCode m_exitCode = ExitOk;
   double m_finishMs = 0.0;
   double m_gpuWaitMs = 0.0;

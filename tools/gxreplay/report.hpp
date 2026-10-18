@@ -1,5 +1,7 @@
 #pragma once
 
+#include "render/scene/classify.hpp"
+
 #include <cstdint>
 #include <span>
 #include <string>
@@ -52,7 +54,18 @@ struct ReportContext {
   bool deterministic = true;
 };
 
+struct ClassifyFrame {
+  uint32_t frame = 0;
+  render::scene::FrameReport report;
+  uint32_t uniformBytes = 0;
+};
+
 std::string format_frames_json(const ReportContext& context, std::span<const FrameResult> frames);
+// The schema writes null for no view or bit, so a run without one never names an empty category
+std::string format_classify_json(const ReportContext& context, std::string_view view, std::string_view viewBit,
+                                 std::span<const ClassifyFrame> frames, bool objects);
+std::string format_classify_draw_line(uint32_t frame, const render::scene::ClassifiedDraw& draw);
+std::string format_classify_summary(std::span<const ClassifyFrame> frames, uint64_t malformedHints);
 std::string format_timing_json(std::span<const FrameTiming> timings);
 std::string format_gpu_timing_json(bool supported, std::span<const GpuFrameTiming> timings);
 std::string json_escape(std::string_view text);
