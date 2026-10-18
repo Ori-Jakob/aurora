@@ -165,13 +165,23 @@ bool apply_depth_check(Options& options, std::string_view) {
   return true;
 }
 
+bool apply_no_hints(Options& options, std::string_view) {
+  options.hints = false;
+  return true;
+}
+
+bool apply_check_hints(Options& options, std::string_view) {
+  options.checkHints = true;
+  return true;
+}
+
 struct Flag {
   std::string_view name;
   bool takesValue;
   bool (*apply)(Options& options, std::string_view value);
 };
 
-constexpr std::array<Flag, 17> Flags{{
+constexpr std::array<Flag, 19> Flags{{
     {"--frames", true, apply_frames},
     {"--timeout", true, apply_timeout},
     {"--backend", true, apply_backend},
@@ -187,6 +197,8 @@ constexpr std::array<Flag, 17> Flags{{
     {"--expect-anchor-warnings", true, apply_expect_anchor_warnings},
     {"--msaa", true, apply_msaa},
     {"--depth-check", false, apply_depth_check},
+    {"--no-hints", false, apply_no_hints},
+    {"--check-hints", false, apply_check_hints},
     {"-h", false, apply_help},
     {"--help", false, apply_help},
 }};
@@ -300,6 +312,8 @@ std::string_view usage() noexcept {
          "  --msaa N            EFB sample count, 1 or 4 (default 1)\n"
          "  --depth-check       register demo.depth_probe and exit with code 7 if scene depth reads wrong\n"
          "                      (needs at least 40 frames)\n"
+         "  --no-hints          emit no render hints and no capture-only draw\n"
+         "  --check-hints       exit with code 8 unless aurora decoded or skipped every emitted hint as expected\n"
          "  -h, --help          show this message\n";
 }
 } // namespace render_demo

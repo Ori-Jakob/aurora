@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 
 #include "graph_checks.hpp"
+#include "hint_checks.hpp"
 #include "options.hpp"
 #include "procedural.hpp"
+
+#include <dolphin/gx/GXAurora.h>
 
 #include <algorithm>
 #include <array>
@@ -326,4 +329,222 @@ TEST(RenderDemoGraph, DepthProbeRowsSampleSkyAndGround) {
   EXPECT_LT(DepthProbeRows[1], DepthProbeRows[2]);
   EXPECT_LT(DepthProbeRows[2], 1.f);
   EXPECT_LT(DepthCheckFrame, 40u);
+}
+
+TEST(RenderDemoOptions, ParsesHintFlags) {
+  const auto defaults = parse({});
+  ASSERT_TRUE(defaults);
+  EXPECT_TRUE(defaults->hints);
+  EXPECT_FALSE(defaults->checkHints);
+  const auto off = parse({"--no-hints"});
+  ASSERT_TRUE(off);
+  EXPECT_FALSE(off->hints);
+  EXPECT_FALSE(off->checkHints);
+  const auto checked = parse({"--check-hints"});
+  ASSERT_TRUE(checked);
+  EXPECT_TRUE(checked->hints);
+  EXPECT_TRUE(checked->checkHints);
+  const auto traced = parse({"--check-hints", "--trace", "x"});
+  ASSERT_TRUE(traced);
+  EXPECT_TRUE(traced->checkHints);
+  EXPECT_EQ(traced->tracePath, "x");
+  EXPECT_TRUE(parse({"--no-hints", "--check-hints", "--vignette", "--depth-check"}));
+}
+
+namespace {
+constexpr size_t HintIdCount = LastHintId + 1 - FirstHintId;
+
+struct FakeCounters {
+  std::array<ObservedCounters, HintIdCount> ids{};
+  ObservedCounters& operator[](u16 id) { return ids[id - FirstHintId]; }
+};
+
+ObservedCounters fake_lookup(u16 id, void* userData) {
+  return static_cast<const FakeCounters*>(userData)->ids[id - FirstHintId];
+}
+
+// One demo frame as draw_scene emits it
+HintTally demo_tally(u32 frames, bool captureOnlyBox) {
+  HintTally tally;
+  const u32 objects = captureOnlyBox ? 13 : 12;
+  tally.add(GX_AURORA_RENDER_CAMERA, 2 * frames);
+  tally.add(GX_AURORA_RENDER_SCENE_EPOCH, frames);
+  tally.add(GX_AURORA_SET_ARRAY_IMMUTABLE, 3 * frames);
+  tally.add(GX_AURORA_RENDER_LIGHTS, frames);
+  tally.add(GX_AURORA_RENDER_ENVIRONMENT, frames);
+  tally.add(GX_AURORA_RENDER_INFLUENCERS, frames);
+  tally.add(GX_AURORA_RENDER_WIND_SOURCES, frames);
+  tally.add(GX_AURORA_RENDER_FOG_VOLUMES, frames);
+  tally.add(GX_AURORA_RENDER_STAGE, 6 * frames);
+  tally.add(GX_AURORA_RENDER_OBJECT_BEGIN, objects * frames);
+  tally.add(GX_AURORA_RENDER_OBJECT_END, objects * frames);
+  tally.add(GX_AURORA_RENDER_SCOPE_PUSH, 2 * frames);
+  tally.add(GX_AURORA_RENDER_SCOPE_POP, 2 * frames);
+  tally.add(GX_AURORA_RENDER_MATERIAL, frames);
+  tally.add(GX_AURORA_RENDER_TEV_POLICY, frames);
+  tally.add(GX_AURORA_RENDER_SKELETON, frames);
+  tally.captureOnlyDraws = captureOnlyBox ? frames : 0;
+  return tally;
+}
+
+// What M3 aurora reports: the module decodes CAMERA through WIND_SOURCES and skips the rest
+FakeCounters observe(const HintTally& tally, bool decoding) {
+  FakeCounters counters;
+  for (u32 id = FirstHintId; id <= LastHintId; ++id) {
+    const auto hint = static_cast<u16>(id);
+    const bool decoded = decoding && hint >= GX_AURORA_RENDER_CAMERA && hint <= GX_AURORA_RENDER_WIND_SOURCES;
+    (decoded ? counters[hint].decoded : counters[hint].skipped) = tally.at(hint);
+  }
+  return counters;
+}
+
+std::optional<std::string> check(const HintTally& tally, bool decoding, FakeCounters& counters, u64 suppressed) {
+  return check_hints(tally, decoding, fake_lookup, &counters, suppressed);
+}
+} // namespace
+
+TEST(RenderDemoHints, TallyCountsPerId) {
+  HintTally tally;
+  tally.add(GX_AURORA_RENDER_CAMERA);
+  tally.add(GX_AURORA_RENDER_CAMERA);
+  tally.add(GX_AURORA_RENDER_STAGE, 6);
+  tally.add(GX_AURORA_SET_ARRAY_IMMUTABLE, 3);
+  tally.add(LastHintId);
+  // Outside the hint range, so not a hint
+  tally.add(0x0041);
+  tally.add(0x0200);
+  EXPECT_EQ(tally.at(GX_AURORA_RENDER_CAMERA), 2u);
+  EXPECT_EQ(tally.at(GX_AURORA_RENDER_STAGE), 6u);
+  EXPECT_EQ(tally.at(GX_AURORA_SET_ARRAY_IMMUTABLE), 3u);
+  EXPECT_EQ(tally.at(LastHintId), 1u);
+  EXPECT_EQ(tally.at(GX_AURORA_RENDER_LIGHTS), 0u);
+  EXPECT_EQ(tally.at(0x0041), 0u);
+  EXPECT_EQ(tally.total(), 12u);
+  EXPECT_EQ(demo_tally(1, true).total(), 50u);
+  EXPECT_EQ(demo_tally(1, false).total(), 48u);
+}
+
+TEST(RenderDemoHints, CheckAcceptsDecoding) {
+  const HintTally tally = demo_tally(120, true);
+  FakeCounters counters = observe(tally, true);
+  EXPECT_EQ(check(tally, true, counters, 120), std::nullopt);
+}
+
+TEST(RenderDemoHints, CheckAcceptsSkipping) {
+  const HintTally tally = demo_tally(120, false);
+  FakeCounters counters = observe(tally, false);
+  EXPECT_EQ(check(tally, false, counters, 0), std::nullopt);
+  // --no-hints emits nothing, so every counter stays zero
+  FakeCounters none;
+  EXPECT_EQ(check(HintTally{}, true, none, 0), std::nullopt);
+  EXPECT_EQ(check(HintTally{}, false, none, 0), std::nullopt);
+}
+
+TEST(RenderDemoHints, CheckRejectsMissingDecode) {
+  const HintTally tally = demo_tally(4, true);
+  FakeCounters counters = observe(tally, true);
+  counters[GX_AURORA_RENDER_CAMERA] = {.skipped = 8};
+  EXPECT_EQ(check(tally, true, counters, 4), "CAMERA (0x0100): decoded 0, emitted 8");
+  // A build that decodes but was told it does not is caught the other way round
+  FakeCounters decoded = observe(tally, true);
+  EXPECT_EQ(check(demo_tally(4, false), false, decoded, 0), "CAMERA (0x0100): decoded with decoding off 8, emitted 8");
+}
+
+TEST(RenderDemoHints, CheckRejectsMalformed) {
+  const HintTally tally = demo_tally(4, true);
+  FakeCounters counters = observe(tally, true);
+  counters[GX_AURORA_RENDER_ENVIRONMENT] = {.decoded = 3, .malformed = 1};
+  EXPECT_EQ(check(tally, true, counters, 4), "ENVIRONMENT (0x0107): malformed 1, emitted 4");
+}
+
+TEST(RenderDemoHints, CheckRejectsLate) {
+  const HintTally tally = demo_tally(4, true);
+  FakeCounters counters = observe(tally, true);
+  counters[GX_AURORA_RENDER_LIGHTS].late = 1;
+  EXPECT_EQ(check(tally, true, counters, 4), "LIGHTS (0x0106): late 1, emitted 4");
+}
+
+TEST(RenderDemoHints, CheckRejectsStrayHint) {
+  const HintTally tally = demo_tally(4, true);
+  FakeCounters counters = observe(tally, true);
+  counters[GX_AURORA_RENDER_SKY].skipped = 1;
+  EXPECT_EQ(check(tally, true, counters, 4), "SKY (0x010F): decoded + skipped 1, emitted 0");
+  FakeCounters reserved = observe(tally, true);
+  reserved[0x0150].skipped = 2;
+  EXPECT_EQ(check(tally, true, reserved, 4), "reserved (0x0150): decoded + skipped 2, emitted 0");
+  FakeCounters lost = observe(tally, true);
+  lost[GX_AURORA_RENDER_FOG_VOLUMES].skipped = 3;
+  EXPECT_EQ(check(tally, true, lost, 4), "FOG_VOLUMES (0x0110): decoded + skipped 3, emitted 4");
+}
+
+TEST(RenderDemoHints, CheckRejectsWrongSuppression) {
+  const HintTally tally = demo_tally(4, true);
+  FakeCounters counters = observe(tally, true);
+  EXPECT_EQ(check(tally, true, counters, 3), "3 draws suppressed, expected 4");
+  EXPECT_EQ(check(tally, true, counters, 5), "5 draws suppressed, expected 4");
+  // With decoding off nothing may be suppressed, whatever the scene drew
+  const HintTally skipped = demo_tally(4, false);
+  FakeCounters skippedCounters = observe(skipped, false);
+  EXPECT_EQ(check(skipped, false, skippedCounters, 1), "1 draws suppressed, expected 0");
+}
+
+TEST(RenderDemoHints, CheckIgnoresLaterMilestoneDecodes) {
+  const HintTally tally = demo_tally(4, true);
+  FakeCounters counters = observe(tally, true);
+  counters[GX_AURORA_SET_ARRAY_IMMUTABLE] = {.decoded = 12};
+  counters[GX_AURORA_RENDER_FOG_VOLUMES] = {.decoded = 4};
+  EXPECT_EQ(check(tally, true, counters, 4), std::nullopt);
+  // Decoding off still means nothing decodes, later milestones included
+  const HintTally skipped = demo_tally(4, false);
+  FakeCounters skippedCounters = observe(skipped, false);
+  skippedCounters[GX_AURORA_RENDER_FOG_VOLUMES] = {.decoded = 4};
+  EXPECT_EQ(check(skipped, false, skippedCounters, 0), "FOG_VOLUMES (0x0110): decoded with decoding off 4, emitted 4");
+}
+
+TEST(RenderDemoHints, NamesFollowTheCatalogue) {
+  EXPECT_EQ(hint_name(GX_AURORA_SET_ARRAY_IMMUTABLE), "SET_ARRAY_IMMUTABLE");
+  EXPECT_EQ(hint_name(GX_AURORA_RENDER_CAMERA), "CAMERA");
+  EXPECT_EQ(hint_name(GX_AURORA_RENDER_WIND_SOURCES), "WIND_SOURCES");
+  EXPECT_EQ(hint_name(GX_AURORA_RENDER_FOG_VOLUMES), "FOG_VOLUMES");
+  EXPECT_EQ(hint_name(GX_AURORA_GPU_DESTROY_SYSTEM), "GPU_DESTROY_SYSTEM");
+  EXPECT_EQ(hint_name(0x0052), "reserved");
+  EXPECT_EQ(hint_name(0x01FF), "reserved");
+}
+
+TEST(RenderDemoHints, DistanceRadius) {
+  // 1 + 0.05 d + 0.005 d^2 = 255
+  const DistanceFalloff medium = distance_falloff(10.f, 0.5f, GX_DA_MEDIUM);
+  EXPECT_NEAR(medium.radius, 220.444f, 0.01f);
+  EXPECT_EQ(medium.exponent, 1.5f);
+  // 1 + d / 15 = 255
+  const DistanceFalloff gentle = distance_falloff(15.f, 0.5f, GX_DA_GENTLE);
+  EXPECT_NEAR(gentle.radius, 3810.f, 0.01f);
+  EXPECT_EQ(gentle.exponent, 1.f);
+  // 1 + 0.01 d^2 = 255
+  const DistanceFalloff steep = distance_falloff(10.f, 0.5f, GX_DA_STEEP);
+  EXPECT_NEAR(steep.radius, 159.374f, 0.01f);
+  EXPECT_EQ(steep.exponent, 2.f);
+  EXPECT_NEAR(distance_falloff(1.f, 0.25f, GX_DA_STEEP).radius, std::sqrt(254.f / 3.f), 1e-3f);
+
+  struct Case {
+    f32 distance;
+    f32 brightness;
+    GXDistAttnFn fn;
+  };
+  // OFF, and every argument GXInitLightDistAttn turns into OFF, sends radius 0 and exponent 0, never an infinity
+  constexpr Case NoFalloff[] = {
+      {10.f, 0.5f, GX_DA_OFF}, {10.f, 1.f, GX_DA_MEDIUM}, {-1.f, 0.5f, GX_DA_GENTLE}, {10.f, -0.5f, GX_DA_STEEP}};
+  for (const Case& c : NoFalloff) {
+    const DistanceFalloff falloff = distance_falloff(c.distance, c.brightness, c.fn);
+    EXPECT_EQ(falloff.radius, 0.f) << c.distance << " " << c.brightness << " " << c.fn;
+    EXPECT_EQ(falloff.exponent, 0.f) << c.distance << " " << c.brightness << " " << c.fn;
+  }
+  // A zero reference distance or brightness makes the GX coefficients infinite; the radius stays a finite 0
+  constexpr Case Degenerate[] = {{0.f, 0.5f, GX_DA_GENTLE}, {0.f, 0.5f, GX_DA_MEDIUM}, {0.f, 0.5f, GX_DA_STEEP},
+                                 {10.f, 0.f, GX_DA_GENTLE}, {10.f, 0.f, GX_DA_MEDIUM}, {10.f, 0.f, GX_DA_STEEP}};
+  for (const Case& c : Degenerate) {
+    const DistanceFalloff falloff = distance_falloff(c.distance, c.brightness, c.fn);
+    EXPECT_EQ(falloff.radius, 0.f) << c.distance << " " << c.brightness << " " << c.fn;
+    EXPECT_GT(falloff.exponent, 0.f) << c.distance << " " << c.brightness << " " << c.fn;
+  }
 }

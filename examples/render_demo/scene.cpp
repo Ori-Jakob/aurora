@@ -1,5 +1,6 @@
 #include "scene.hpp"
 
+#include "hints.hpp"
 #include "procedural.hpp"
 
 #include <dolphin/gx.h>
@@ -15,6 +16,26 @@ constexpr f32 Pi = 3.14159265358979f;
 constexpr GXColor ClearColor{112, 160, 208, 255};
 constexpr GXColor AmbientColor{40, 44, 56, 255};
 constexpr GXColor White{255, 255, 255, 255};
+constexpr GXColor HudColor{20, 24, 32, 160};
+constexpr FogParams Fog{GX_FOG_PERSP_LIN, 40.f, 160.f, 0.5f, 400.f, ClearColor};
+constexpr f32 PointRefDistance = 10.f;
+constexpr f32 PointRefBrightness = 0.5f;
+constexpr f32 SpotCutoff = 25.f;
+constexpr f32 SpotRefDistance = 15.f;
+constexpr f32 SpotRefBrightness = 0.5f;
+constexpr Vec WindDirection{1.f, 0.f, 0.f};
+constexpr f32 WindPower = 0.3f;
+constexpr u32 TentacleBones = 4;
+constexpr f32 MarkerScale = 0.35f;
+
+constexpr u64 GroundObject = 1;
+constexpr u64 FirstBoxObject = 0x100;
+constexpr u64 TentacleObject = 0x200;
+constexpr u64 FirstMarkerObject = 0x210;
+constexpr u64 CaptureOnlyObject = 0x300;
+constexpr u64 WaterObject = 0x400;
+constexpr u32 GroundMaterial = 1;
+constexpr u32 SceneEpoch = 1;
 constexpr u32 GroundTextureSize = 64;
 constexpr u32 GroundMipCount = 7;
 constexpr u32 GroundCells = 16;
@@ -53,6 +74,8 @@ constexpr u8 BoxFaces[6][4] = {
 struct Lights {
   Vec positions[4];
   GXColor colors[4];
+  Vec sunDir;
+  Vec spotDir;
 };
 
 alignas(32) u8 sBoxDisplayList[256];
@@ -126,7 +149,8 @@ Lights setup_lights(const Mtx view, f32 t) {
   // Only the spot light sets a direction; the others must not load stack garbage into XF
   GXLightObj light{};
 
-  Vec sunDir{-0.4f, -1.f, -0.3f};
+  Vec& sunDir = lights.sunDir;
+  sunDir = Vec{-0.4f, -1.f, -0.3f};
   C_VECNormalize(&sunDir, &sunDir);
   lights.positions[0] = Vec{-sunDir.x * 1e5f, -sunDir.y * 1e5f, -sunDir.z * 1e5f};
   // Dim enough that the point and spot lights still read on sunlit ground
@@ -147,13 +171,14 @@ Lights setup_lights(const Mtx view, f32 t) {
     GXInitLightPos(&light, pos.x, pos.y, pos.z);
     GXInitLightColor(&light, PointColors[i]);
     GXInitLightSpot(&light, 0.f, GX_SP_OFF);
-    GXInitLightDistAttn(&light, 10.f, 0.5f, GX_DA_MEDIUM);
+    GXInitLightDistAttn(&light, PointRefDistance, PointRefBrightness, GX_DA_MEDIUM);
     GXLoadLightObjImm(&light, PointIds[i]);
   }
 
   lights.positions[3] = Vec{0.f, 10.f, 0.f};
   lights.colors[3] = GXColor{255, 250, 220, 255};
-  Vec spotDir{0.3f * std::sin(0.5f * t), -1.f, 0.3f * std::cos(0.5f * t)};
+  Vec& spotDir = lights.spotDir;
+  spotDir = Vec{0.3f * std::sin(0.5f * t), -1.f, 0.3f * std::cos(0.5f * t)};
   C_VECNormalize(&spotDir, &spotDir);
   Vec spotDirView;
   C_MTXMultVecSR(view, &spotDir, &spotDirView);
@@ -161,8 +186,8 @@ Lights setup_lights(const Mtx view, f32 t) {
   GXInitLightPos(&light, spotPos.x, spotPos.y, spotPos.z);
   GXInitLightDir(&light, spotDirView.x, spotDirView.y, spotDirView.z);
   GXInitLightColor(&light, lights.colors[3]);
-  GXInitLightSpot(&light, 25.f, GX_SP_COS2);
-  GXInitLightDistAttn(&light, 15.f, 0.5f, GX_DA_GENTLE);
+  GXInitLightSpot(&light, SpotCutoff, GX_SP_COS2);
+  GXInitLightDistAttn(&light, SpotRefDistance, SpotRefBrightness, GX_DA_GENTLE);
   GXLoadLightObjImm(&light, GX_LIGHT3);
   return lights;
 }
@@ -222,9 +247,11 @@ void draw_boxes(const Mtx view, f32 t) {
     C_MTXConcat(translate, rotate, model);
     C_MTXConcat(model, scale, model);
     C_MTXConcat(view, model, modelView);
+    begin_object(FirstBoxObject + i, AURORA_CAT_DYNAMIC, 0);
     load_matrices(modelView, GX_PNMTX0);
     set_box_format();
     GXCallDisplayList(sBoxDisplayList, sBoxDisplayListSize);
+    end_object();
   }
 }
 
@@ -236,20 +263,36 @@ void bone_joint(Mtx out, f32 t, int k) {
   C_MTXConcat(rz, rx, out);
 }
 
-void draw_tentacle(const Mtx view, f32 t) {
+void tentacle_bones(f32 t, Mtx (&bones)[TentacleBones]) {
   Mtx bone;
   Mtx joint;
   C_MTXTrans(bone, 6.f, 0.f, -2.f);
-  for (int k = 0; k < 4; ++k) {
+  for (u32 k = 0; k < TentacleBones; ++k) {
     if (k != 0) {
       Mtx offset;
       C_MTXTrans(offset, 0.f, 1.5f, 0.f);
       C_MTXConcat(bone, offset, bone);
     }
-    bone_joint(joint, t, k);
+    bone_joint(joint, t, static_cast<int>(k));
     C_MTXConcat(bone, joint, bone);
+    C_MTXCopy(bone, bones[k]);
+  }
+}
+
+Vec tentacle_tip(f32 t) {
+  // The last ring sits 1.5 units up the last bone
+  Mtx bones[TentacleBones];
+  tentacle_bones(t, bones);
+  const Vec local{0.f, 1.5f, 0.f};
+  Vec tip;
+  C_MTXMultVec(bones[TentacleBones - 1], &local, &tip);
+  return tip;
+}
+
+void draw_tentacle(const Mtx view, const Mtx (&bones)[TentacleBones]) {
+  for (u32 k = 0; k < TentacleBones; ++k) {
     Mtx modelView;
-    C_MTXConcat(view, bone, modelView);
+    C_MTXConcat(view, bones[k], modelView);
     load_matrices(modelView, GX_PNMTX1 + 3 * k);
   }
 
@@ -283,19 +326,42 @@ void draw_light_markers(const Mtx view, const Lights& lights) {
   set_pass_color_tev();
   GXSetCurrentMtx(GX_PNMTX0);
   GXSetCullMode(GX_CULL_BACK);
+  push_scope(AURORA_CAT_EMISSIVE | AURORA_CAT_NO_SHADOW_CAST, 0, AURORA_CAMERA_INHERIT);
   for (int i = 1; i < 4; ++i) {
     Mtx model;
     Mtx scale;
     Mtx modelView;
     C_MTXTrans(model, lights.positions[i].x, lights.positions[i].y, lights.positions[i].z);
-    C_MTXScale(scale, 0.35f, 0.35f, 0.35f);
+    C_MTXScale(scale, MarkerScale, MarkerScale, MarkerScale);
     C_MTXConcat(model, scale, model);
     C_MTXConcat(view, model, modelView);
+    begin_object(FirstMarkerObject + static_cast<u64>(i - 1), AURORA_CAT_DYNAMIC, 0);
     load_matrices(modelView, GX_PNMTX0);
     GXSetChanMatColor(GX_COLOR0A0, lights.colors[i]);
     set_box_format();
     GXCallDisplayList(sBoxDisplayList, sBoxDisplayListSize);
+    end_object();
   }
+  pop_scope();
+}
+
+// Reuses the marker state; ten units behind the eye it is clipped even where a skipping replayer draws it
+void draw_capture_only_box(const Mtx view, const Point3d& eye, const Point3d& target) {
+  Vec back{eye.x - target.x, eye.y - target.y, eye.z - target.z};
+  C_VECNormalize(&back, &back);
+  Mtx model;
+  Mtx scale;
+  Mtx modelView;
+  C_MTXTrans(model, eye.x + 10.f * back.x, eye.y + 10.f * back.y, eye.z + 10.f * back.z);
+  C_MTXScale(scale, MarkerScale, MarkerScale, MarkerScale);
+  C_MTXConcat(model, scale, model);
+  C_MTXConcat(view, model, modelView);
+  begin_object(CaptureOnlyObject, AURORA_CAT_DYNAMIC, AURORA_OBJ_CAPTURE_ONLY);
+  load_matrices(modelView, GX_PNMTX0);
+  set_box_format();
+  GXCallDisplayList(sBoxDisplayList, sBoxDisplayListSize);
+  end_object();
+  count_capture_only_draw();
 }
 
 void draw_water(const Mtx view) {
@@ -329,6 +395,85 @@ void draw_water(const Mtx view) {
   GXSetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
   GXSetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
 }
+
+// Sets every piece of state it draws with and restores blend and Z, so the depth probe and the next frame see M2 state
+void draw_hud_panel() {
+  push_scope(AURORA_CAT_UI, 0, AURORA_CAMERA_UI);
+  Mtx44 ortho;
+  C_MTXOrtho(ortho, 0.f, 480.f, 0.f, 640.f, 0.f, 1.f);
+  GXSetProjection(ortho, GX_ORTHOGRAPHIC);
+  Mtx identity;
+  C_MTXIdentity(identity);
+  hint_camera(AURORA_CAMERA_UI, identity, ortho, GX_ORTHOGRAPHIC);
+  GXLoadPosMtxImm(identity, GX_PNMTX0);
+  GXSetCurrentMtx(GX_PNMTX0);
+  GXSetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+  GXSetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+  GXSetFog(GX_FOG_NONE, 0.f, 0.f, 0.f, 0.f, ClearColor);
+  GXSetCullMode(GX_CULL_NONE);
+  GXSetNumChans(1);
+  GXSetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_VTX, GX_SRC_VTX, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
+  set_pass_color_tev();
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  GXSetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT4, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  GXSetVtxAttrFmt(GX_VTXFMT4, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+
+  // Top left, clear of the depth probe's centre column
+  constexpr f32 Corners[4][2] = {{16.f, 16.f}, {144.f, 16.f}, {144.f, 54.f}, {16.f, 54.f}};
+  GXBegin(GX_QUADS, GX_VTXFMT4, 4);
+  for (const auto& [x, y] : Corners) {
+    GXPosition3f32(x, y, -0.5f);
+    GXColor4u8(HudColor.r, HudColor.g, HudColor.b, HudColor.a);
+  }
+  GXEnd();
+
+  GXSetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+  GXSetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
+  pop_scope();
+}
+
+void emit_frame_hints(u32 frame, const Mtx view, const Mtx44 projection, const Lights& lights) {
+  if (!hint_emission()) {
+    return;
+  }
+  hint_camera(AURORA_CAMERA_MAIN, view, projection, GX_PERSPECTIVE);
+  hint_scene_epoch(SceneEpoch);
+  // Re-sent every frame, so a trace that starts on any frame still declares the arrays its boxes read
+  hint_array_immutable(BoxPositions, sizeof(BoxPositions));
+  hint_array_immutable(BoxNormals, sizeof(BoxNormals));
+  hint_array_immutable(BoxColors, sizeof(BoxColors));
+
+  const std::array<AuroraLight, 4> sceneLights{
+      directional_light(1, lights.sunDir, lights.colors[0]),
+      point_light(2, lights.positions[1], lights.colors[1], PointRefDistance, PointRefBrightness, GX_DA_MEDIUM),
+      point_light(3, lights.positions[2], lights.colors[2], PointRefDistance, PointRefBrightness, GX_DA_MEDIUM),
+      spot_light(4, lights.positions[3], lights.spotDir, lights.colors[3], SpotCutoff, SpotRefDistance,
+                 SpotRefBrightness, GX_DA_GENTLE),
+  };
+  hint_lights(sceneLights);
+  hint_environment(environment(AmbientColor, Fog, WindDirection, WindPower));
+
+  const Vec tip = tentacle_tip(static_cast<f32>(frame) / 60.f);
+  const Vec lastTip = frame == 0 ? tip : tentacle_tip(static_cast<f32>(frame - 1) / 60.f);
+  const AuroraInfluencer influencer{
+      .pos = {tip.x, tip.y, tip.z},
+      .radius = 1.5f,
+      .vel = {tip.x - lastTip.x, tip.y - lastTip.y, tip.z - lastTip.z},
+      .kind = AURORA_INFLUENCER_PUSH,
+  };
+  hint_influencers({&influencer, 1});
+  const AuroraWindSource wind{
+      .pos = {0.f, 0.f, 0.f},
+      .radius = 50.f,
+      .dir = {WindDirection.x, WindDirection.y, WindDirection.z},
+      .power = WindPower,
+  };
+  hint_wind_sources({&wind, 1});
+  const AuroraFogVolume waterMist = fog_volume(Vec{-18.f, 1.f, 14.f}, Vec{6.f, 1.5f, 6.f}, 0.05f);
+  hint_fog_volumes({&waterMist, 1});
+}
 } // namespace
 
 bool init_scene() {
@@ -346,7 +491,9 @@ bool init_scene() {
   return sBoxDisplayListSize != 0;
 }
 
-void draw_scene(u32 frame) {
+void draw_scene(u32 frame, const SceneOptions& options) {
+  // Not gated on hints_enabled() so the off capture proves emitters add only hint bytes; real producers do gate on it
+  set_hint_emission(options.hints);
   const f32 t = static_cast<f32>(frame) / 60.f;
   GXSetCopyClear(ClearColor, GX_MAX_Z24);
   GXSetViewport(0.f, 0.f, 640.f, 480.f, 0.f, 1.f);
@@ -362,13 +509,44 @@ void draw_scene(u32 frame) {
   Mtx view;
   C_MTXLookAt(view, &eye, &up, &target);
 
-  GXSetFog(GX_FOG_PERSP_LIN, 40.f, 160.f, 0.5f, 400.f, ClearColor);
+  GXSetFog(Fog.type, Fog.start, Fog.end, Fog.nearZ, Fog.farZ, Fog.color);
   const Lights lights = setup_lights(view, t);
+  // Every frame-level hint goes out before SCENE_BEGIN, where aurora freezes the frame's values
+  emit_frame_hints(frame, view, projection, lights);
+  hint_stage(AURORA_STAGE_SCENE_BEGIN);
+
+  begin_object(GroundObject, AURORA_CAT_STATIC | AURORA_CAT_TERRAIN, AURORA_OBJ_IMMOBILE);
+  hint_material(GroundMaterial);
   draw_ground(view);
+  end_object();
   draw_boxes(view, t);
-  draw_tentacle(view, t);
+
+  Mtx bones[TentacleBones];
+  tentacle_bones(t, bones);
+  begin_object(TentacleObject, AURORA_CAT_DYNAMIC | AURORA_CAT_SKINNED, 0);
+  hint_skeleton(TentacleObject, bones);
+  draw_tentacle(view, bones);
+  end_object();
+
   draw_light_markers(view, lights);
+  if (options.captureOnlyBox) {
+    draw_capture_only_box(view, eye, target);
+  }
+  hint_stage(AURORA_STAGE_OPAQUE_DONE);
+
+  // The water never reads K1; the policy gives the decoder and tevPolicyDraws a producer that CI runs
+  AuroraTevPolicy waterPolicy{};
+  waterPolicy.mask = AURORA_TEV_POLICY_BIT(AURORA_TEV_REG_K1, AURORA_TEV_CH_R);
+  begin_object(WaterObject, AURORA_CAT_WATER | AURORA_CAT_NO_PBR, 0);
+  hint_tev_policy(waterPolicy);
   draw_water(view);
+  end_object();
+
+  hint_stage(AURORA_STAGE_PRE_POST);
+  hint_stage(AURORA_STAGE_SCENE_END);
+  hint_stage(AURORA_STAGE_BEFORE_HUD);
+  draw_hud_panel();
+  hint_stage(AURORA_STAGE_FRAME_END);
 }
 
 void shutdown_scene() {

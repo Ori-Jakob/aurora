@@ -27,6 +27,8 @@ struct Options {
   bool expectAnchorWarningsSet = false;
   uint32_t msaa = 1;
   bool depthCheck = false;
+  bool hints = true;
+  bool checkHints = false;
 };
 
 std::optional<AuroraBackend> parse_backend(std::string_view name) noexcept;

@@ -5,6 +5,10 @@ add_executable(render_demo
   graph_checks.hpp
   graph_passes.cpp
   graph_passes.hpp
+  hint_checks.cpp
+  hint_checks.hpp
+  hints.cpp
+  hints.hpp
   main.cpp
   options.cpp
   options.hpp

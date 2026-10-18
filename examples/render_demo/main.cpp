@@ -1,15 +1,19 @@
 #include "graph_checks.hpp"
 #include "graph_passes.hpp"
+#include "hint_checks.hpp"
+#include "hints.hpp"
 #include "options.hpp"
 #include "scene.hpp"
 
 #include <aurora/aurora.h>
 #include <aurora/event.h>
 #include <aurora/gfx.hpp>
+#include <aurora/render.hpp>
 #include <aurora/trace.hpp>
 #include <dolphin/gx.h>
 #include <SDL3/SDL_stdinc.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -33,6 +37,7 @@ enum ExitCode : int {
   ExitSceneInit = 5,
   ExitTraceFailed = 6,
   ExitRenderGraphCheck = 7,
+  ExitHintCheck = 8,
 };
 
 std::atomic_uint32_t g_errorCount = 0;
@@ -100,6 +105,50 @@ std::optional<std::string> depth_check_failure(const render_demo::GraphPassRepor
   }
   return render_demo::check_depth_probe(report.probe, reversedZ);
 }
+
+struct HintCounterSnapshot {
+  std::array<render_demo::ObservedCounters, render_demo::LastHintId + 1 - render_demo::FirstHintId> ids{};
+  uint64_t suppressedDraws = 0;
+};
+
+// aurora_end_frame drained every frame's FIFO, so the core counters already cover each hint the demo emitted
+HintCounterSnapshot read_hint_counters() {
+  HintCounterSnapshot snapshot;
+  for (uint32_t id = render_demo::FirstHintId; id <= render_demo::LastHintId; ++id) {
+    const aurora::render::HintCounters counters = aurora::render::hint_counters(static_cast<uint16_t>(id));
+    snapshot.ids[id - render_demo::FirstHintId] = {
+        .decoded = counters.decoded,
+        .skipped = counters.skipped,
+        .malformed = counters.malformed,
+        .late = counters.late,
+        .bytes = counters.bytes,
+    };
+  }
+  snapshot.suppressedDraws = aurora::render::draw_route_counters().suppressed;
+  return snapshot;
+}
+
+render_demo::ObservedCounters snapshot_counters(u16 id, void* userData) {
+  return static_cast<const HintCounterSnapshot*>(userData)->ids[id - render_demo::FirstHintId];
+}
+
+void print_hint_summary(const render_demo::HintTally& tally, const HintCounterSnapshot& snapshot) {
+  render_demo::ObservedCounters total;
+  for (const auto& counters : snapshot.ids) {
+    total.decoded += counters.decoded;
+    total.skipped += counters.skipped;
+    total.malformed += counters.malformed;
+    total.late += counters.late;
+    total.bytes += counters.bytes;
+  }
+  std::printf(
+      "render_demo: hints: emitted %llu, decoded %llu, skipped %llu, malformed %llu, late %llu, bytes %llu; "
+      "suppressed draws %llu\n",
+      static_cast<unsigned long long>(tally.total()), static_cast<unsigned long long>(total.decoded),
+      static_cast<unsigned long long>(total.skipped), static_cast<unsigned long long>(total.malformed),
+      static_cast<unsigned long long>(total.late), static_cast<unsigned long long>(total.bytes),
+      static_cast<unsigned long long>(snapshot.suppressedDraws));
+}
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -147,6 +196,10 @@ int main(int argc, char* argv[]) {
     aurora_shutdown();
     return ExitBackendMismatch;
   }
+  // The receiver is installed once at initialisation, so the answer is fixed for the whole run
+  const bool decoding = aurora::render::hints_enabled();
+  const render_demo::SceneOptions sceneOptions{.hints = options.hints, .captureOnlyBox = options.hints && decoding};
+  bool decodingChanged = false;
 
   GXInit(nullptr, 0);
   AuroraSetViewportPolicy(AURORA_VIEWPORT_FIT);
@@ -209,7 +262,8 @@ int main(int argc, char* argv[]) {
     if (exiting || paused || !aurora_begin_frame()) {
       continue;
     }
-    render_demo::draw_scene(frame);
+    decodingChanged |= aurora::render::hints_enabled() != decoding;
+    render_demo::draw_scene(frame, sceneOptions);
     aurora_end_frame();
     ++frame;
     if (options.frames != 0 && frame >= options.frames) {
@@ -221,6 +275,7 @@ int main(int argc, char* argv[]) {
   aurora::gfx::synchronize();
   render_demo::finish_graph_passes();
   const auto graphReport = render_demo::graph_pass_report();
+  HintCounterSnapshot hintCounters = read_hint_counters();
   render_demo::unregister_graph_passes();
   render_demo::shutdown_scene();
   aurora_shutdown();
@@ -257,6 +312,16 @@ int main(int argc, char* argv[]) {
                 static_cast<int>(source.size()), source.data(), graphReport.probe[0], graphReport.probe[1],
                 graphReport.probe[2]);
   }
+  const render_demo::HintTally& tally = render_demo::hint_tally();
+  print_hint_summary(tally, hintCounters);
+  std::optional<std::string> hintFailure;
+  if (options.checkHints) {
+    hintFailure = decodingChanged ? std::optional<std::string>{"hints_enabled() changed during the run"}
+                                  : render_demo::check_hints(tally, decoding, snapshot_counters, &hintCounters,
+                                                             hintCounters.suppressedDraws);
+    std::printf("render_demo: hint check %s%s (decoding %s)\n", hintFailure ? "FAILED: " : "passed",
+                hintFailure ? hintFailure->c_str() : "", decoding ? "on" : "off");
+  }
   if (timedOut) {
     return ExitTimeout;
   }
@@ -275,6 +340,9 @@ int main(int argc, char* argv[]) {
   }
   if (depthFailure) {
     return ExitRenderGraphCheck;
+  }
+  if (hintFailure) {
+    return ExitHintCheck;
   }
   if (!options.tracePath.empty() && traceStatus.state != aurora::trace::CaptureState::Finished) {
     std::fprintf(stderr, "render_demo: trace capture did not finish: %s\n",

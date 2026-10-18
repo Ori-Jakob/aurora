@@ -457,6 +457,7 @@ if (TARGET render_demo)
   add_executable(render_demo_tests
     render_demo_test.cpp
     ../examples/render_demo/graph_checks.cpp
+    ../examples/render_demo/hint_checks.cpp
     ../examples/render_demo/options.cpp
     ../examples/render_demo/procedural.cpp
   )
@@ -512,6 +513,30 @@ if (TARGET render_demo)
               --fail-on-error --depth-check --vignette --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_depth/msaa)
     set_tests_properties(render_demo_depth_probe_msaa PROPERTIES LABELS smoke TIMEOUT 180)
   endif ()
+
+  foreach (_profile IN ITEMS full compat metal metal32)
+    add_test(NAME render_demo_hints_${_profile}
+      COMMAND $<TARGET_FILE:render_demo> --backend null --profile ${_profile} --frames 120 --timeout 60
+              --fail-on-error --check-hints --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_hints/${_profile})
+    set_tests_properties(render_demo_hints_${_profile} PROPERTIES LABELS smoke TIMEOUT 180
+      ENVIRONMENT "AURORA_RENDER_HINTS=1")
+  endforeach ()
+  add_test(NAME render_demo_hints_disabled
+    COMMAND $<TARGET_FILE:render_demo> --backend null --frames 120 --timeout 60 --fail-on-error --check-hints
+            --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_hints/disabled)
+  set_tests_properties(render_demo_hints_disabled PROPERTIES LABELS smoke TIMEOUT 180
+    ENVIRONMENT "AURORA_RENDER_HINTS=0")
+  add_test(NAME render_demo_no_hints
+    COMMAND $<TARGET_FILE:render_demo> --backend null --frames 120 --timeout 60 --fail-on-error --no-hints
+            --check-hints --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_hints/none)
+  set_tests_properties(render_demo_no_hints PROPERTIES LABELS smoke TIMEOUT 180)
+  if (AURORA_ENABLE_RENDER)
+    add_test(NAME render_demo_hints_vignette
+      COMMAND $<TARGET_FILE:render_demo> --backend null --frames 120 --timeout 60 --fail-on-error --check-hints
+              --vignette --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_hints/vignette)
+    set_tests_properties(render_demo_hints_vignette PROPERTIES LABELS smoke TIMEOUT 180
+      ENVIRONMENT "AURORA_RENDER_HINTS=1")
+  endif ()
 endif ()
 
 if (TARGET aurora_gxreplay)
@@ -532,14 +557,14 @@ if (TARGET aurora_gxreplay)
     add_test(NAME gxreplay_render_demo_capture
       COMMAND $<TARGET_FILE:render_demo> --backend null --frames 8 --timeout 60
               --data-dir ${_gxreplay_dir}/demo_data --trace ${_gxreplay_dir}/render_demo.gxtrace
-              --trace-start 2 --trace-frames 4)
+              --trace-start 2 --trace-frames 4 --check-hints)
     set_tests_properties(gxreplay_render_demo_capture PROPERTIES LABELS smoke TIMEOUT 180
-      FIXTURES_SETUP gxreplay_demo_trace)
+      ENVIRONMENT "AURORA_RENDER_HINTS=1" FIXTURES_SETUP gxreplay_demo_trace)
     add_test(NAME gxreplay_render_demo_replay
       COMMAND $<TARGET_FILE:aurora_gxreplay> ${_gxreplay_dir}/render_demo.gxtrace --backend null --repeat 2
               --no-png --out ${_gxreplay_dir}/render_demo_replay)
     set_tests_properties(gxreplay_render_demo_replay PROPERTIES LABELS smoke TIMEOUT 180
-      FIXTURES_REQUIRED gxreplay_demo_trace)
+      ENVIRONMENT "AURORA_RENDER_HINTS=1" FIXTURES_REQUIRED gxreplay_demo_trace)
   endif ()
   if (AURORA_ENABLE_RENDER)
     set(_classify_trace ${_gxreplay_dir}/classify/self_test_hints.gxtrace)
@@ -561,6 +586,86 @@ if (TARGET aurora_gxreplay)
         PASS_REGULAR_EXPRESSION "hint errors 0, .*view substituted [1-9]"
         FAIL_REGULAR_EXPRESSION "\\[(ERROR|FATAL): ")
     endforeach ()
+  endif ()
+  if (TARGET render_demo AND AURORA_ENABLE_RENDER)
+    set(_demo_capture --backend null --frames 8 --timeout 60 --trace-start 2 --trace-frames 4 --check-hints)
+    add_test(NAME gxreplay_render_demo_plain_capture
+      COMMAND $<TARGET_FILE:render_demo> ${_demo_capture} --no-hints --data-dir ${_gxreplay_dir}/demo_plain_data
+              --trace ${_gxreplay_dir}/render_demo_plain.gxtrace)
+    set_tests_properties(gxreplay_render_demo_plain_capture PROPERTIES LABELS smoke TIMEOUT 180
+      FIXTURES_SETUP gxreplay_demo_plain_trace)
+    add_test(NAME gxreplay_render_demo_off_capture
+      COMMAND $<TARGET_FILE:render_demo> ${_demo_capture} --data-dir ${_gxreplay_dir}/demo_off_data
+              --trace ${_gxreplay_dir}/render_demo_off.gxtrace)
+    set_tests_properties(gxreplay_render_demo_off_capture PROPERTIES LABELS smoke TIMEOUT 180
+      ENVIRONMENT "AURORA_RENDER_HINTS=0" FIXTURES_SETUP gxreplay_demo_off_trace)
+
+    set(_demo_ab ${_gxreplay_dir}/hints_ab)
+    add_test(NAME gxreplay_render_demo_hints_ab_replay
+      COMMAND $<TARGET_FILE:aurora_gxreplay> ${_gxreplay_dir}/render_demo.gxtrace --backend null --no-png
+              --out ${_demo_ab}/hints)
+    set_tests_properties(gxreplay_render_demo_hints_ab_replay PROPERTIES LABELS smoke TIMEOUT 180
+      ENVIRONMENT "AURORA_RENDER_HINTS=1" FIXTURES_REQUIRED gxreplay_demo_trace
+      FIXTURES_SETUP gxreplay_demo_ab_hints)
+    add_test(NAME gxreplay_render_demo_plain_replay
+      COMMAND $<TARGET_FILE:aurora_gxreplay> ${_gxreplay_dir}/render_demo_plain.gxtrace --backend null --no-png
+              --out ${_demo_ab}/plain)
+    set_tests_properties(gxreplay_render_demo_plain_replay PROPERTIES LABELS smoke TIMEOUT 180
+      ENVIRONMENT "AURORA_RENDER_HINTS=1" FIXTURES_REQUIRED gxreplay_demo_plain_trace
+      FIXTURES_SETUP gxreplay_demo_ab_plain)
+    add_test(NAME gxreplay_render_demo_off_replay
+      COMMAND $<TARGET_FILE:aurora_gxreplay> ${_gxreplay_dir}/render_demo_off.gxtrace --backend null --no-png
+              --out ${_demo_ab}/off_capture)
+    set_tests_properties(gxreplay_render_demo_off_replay PROPERTIES LABELS smoke TIMEOUT 180
+      ENVIRONMENT "AURORA_RENDER_HINTS=1" FIXTURES_REQUIRED gxreplay_demo_off_trace
+      FIXTURES_SETUP gxreplay_demo_ab_off_capture)
+    add_test(NAME gxreplay_render_demo_hints_off_replay
+      COMMAND $<TARGET_FILE:aurora_gxreplay> ${_gxreplay_dir}/render_demo.gxtrace --backend null --no-png
+              --out ${_demo_ab}/off_replay)
+    set_tests_properties(gxreplay_render_demo_hints_off_replay PROPERTIES LABELS smoke TIMEOUT 180
+      ENVIRONMENT "AURORA_RENDER_HINTS=0" FIXTURES_REQUIRED gxreplay_demo_trace
+      FIXTURES_SETUP gxreplay_demo_ab_off_replay)
+
+    set(_compare_frames ${CMAKE_CURRENT_SOURCE_DIR}/compare_replay_frames.cmake)
+    add_test(NAME gxreplay_render_demo_hint_ab
+      COMMAND ${CMAKE_COMMAND} -DA=${_demo_ab}/hints/frames.json -DB=${_demo_ab}/plain/frames.json -DKEY=draws
+              -P ${_compare_frames})
+    set_tests_properties(gxreplay_render_demo_hint_ab PROPERTIES LABELS smoke TIMEOUT 60
+      FIXTURES_REQUIRED "gxreplay_demo_ab_hints;gxreplay_demo_ab_plain")
+    add_test(NAME gxreplay_render_demo_off_draws_ab
+      COMMAND ${CMAKE_COMMAND} -DA=${_demo_ab}/off_capture/frames.json -DB=${_demo_ab}/plain/frames.json
+              -DKEY=draws -P ${_compare_frames})
+    set_tests_properties(gxreplay_render_demo_off_draws_ab PROPERTIES LABELS smoke TIMEOUT 60
+      FIXTURES_REQUIRED "gxreplay_demo_ab_off_capture;gxreplay_demo_ab_plain")
+    # Emitting hints with decoding off may add nothing to the GX stream but the hints themselves
+    add_test(NAME gxreplay_render_demo_off_bytes_ab
+      COMMAND ${CMAKE_COMMAND} -DA=${_demo_ab}/off_capture/frames.json -DB=${_demo_ab}/plain/frames.json
+              -DKEY=fifoBytes -DMINUS_A=hintBytes -P ${_compare_frames})
+    set_tests_properties(gxreplay_render_demo_off_bytes_ab PROPERTIES LABELS smoke TIMEOUT 60
+      FIXTURES_REQUIRED "gxreplay_demo_ab_off_capture;gxreplay_demo_ab_plain")
+    # A replay that skips the hints draws the capture-only box, one draw per frame
+    add_test(NAME gxreplay_render_demo_hints_off_ab
+      COMMAND ${CMAKE_COMMAND} -DA=${_demo_ab}/off_replay/frames.json -DB=${_demo_ab}/plain/frames.json
+              -DKEY=draws -DOFFSET=1 -P ${_compare_frames})
+    set_tests_properties(gxreplay_render_demo_hints_off_ab PROPERTIES LABELS smoke TIMEOUT 60
+      FIXTURES_REQUIRED "gxreplay_demo_ab_off_replay;gxreplay_demo_ab_plain")
+    # The decoded trace has no extra draw, so this comparison must fail; it proves the script can
+    add_test(NAME gxreplay_render_demo_compare_rejects
+      COMMAND ${CMAKE_COMMAND} -DA=${_demo_ab}/hints/frames.json -DB=${_demo_ab}/plain/frames.json -DKEY=draws
+              -DOFFSET=1 -P ${_compare_frames})
+    set_tests_properties(gxreplay_render_demo_compare_rejects PROPERTIES LABELS smoke TIMEOUT 60 WILL_FAIL TRUE
+      FIXTURES_REQUIRED "gxreplay_demo_ab_hints;gxreplay_demo_ab_plain")
+
+    # A view forces identity collection and so adds draws, which is why the A/B replays above run without one
+    add_test(NAME gxreplay_render_demo_view_kind
+      COMMAND $<TARGET_FILE:aurora_gxreplay> ${_gxreplay_dir}/render_demo.gxtrace --backend null --no-png
+              --debug-view kind --classify-json --out ${_gxreplay_dir}/view_kind)
+    string(CONCAT _view_summary "main [1-9][0-9]*, sky 0, sky misses 0, suppressed 4, "
+                                "hint errors 0, malformed hints 0, view substituted [1-9]")
+    set_tests_properties(gxreplay_render_demo_view_kind PROPERTIES LABELS smoke TIMEOUT 180
+      ENVIRONMENT "AURORA_RENDER_HINTS=1" FIXTURES_REQUIRED gxreplay_demo_trace
+      PASS_REGULAR_EXPRESSION "${_view_summary}"
+      FAIL_REGULAR_EXPRESSION "\\[(ERROR|FATAL): ")
   endif ()
 endif ()
 
