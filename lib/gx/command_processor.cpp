@@ -5,6 +5,7 @@
 #include "../internal.hpp"
 #include "dolphin/gd/GDGeometry.h"
 #include "dolphin/gx/GXAurora.h"
+#include "draw_route.hpp"
 #include "guest_memory.hpp"
 #include "gx.hpp"
 #include "hints.hpp"
@@ -16,6 +17,7 @@
 #include <tracy/Tracy.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <span>
@@ -148,6 +150,11 @@ struct DrawCache {
   GXVtxFmt lastDrawFmt = GX_MAX_VTXFMT;
 };
 DrawCache sDrawCache;
+
+std::atomic<uint64_t> g_routed{0};
+std::atomic<uint64_t> g_suppressed{0};
+std::atomic<uint64_t> g_mergeBreaks{0};
+std::atomic<uint64_t> g_substituted{0};
 
 FogRangeLutKey fog_range_lut_key() noexcept {
   const auto& state = g_gxState.fog;
@@ -465,7 +472,7 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     instanceCount = vtxCount;
   }
   cache.lastDrawFmt = fmt;
-  gfx::push_draw_command(DrawData{
+  DrawData draw{
       .pipeline = cache.pipelineRef,
       .bindGroups = cache.bindGroups,
       .vertRange = vertRange,
@@ -476,7 +483,44 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
       .indexCount = numIndices,
       .instanceCount = instanceCount,
       .dstAlpha = state.dstAlpha,
-  });
+  };
+  const auto* router = draw_route::router();
+  if (router != nullptr && router->push != nullptr &&
+      router->push(router->userData, draw, cache.config, cache.shaderInfo)) {
+    // The command no longer matches the cached state, so a later clean draw must not merge into it
+    break_draw_merge();
+    g_substituted.fetch_add(1, std::memory_order_relaxed);
+  }
+  gfx::push_draw_command(draw);
+}
+
+// draw_prim's merge test; it has no side effects, so routing can tell whether a break prevents a real merge
+static DrawData* merge_target(GXPrimitive prim, GXVtxFmt fmt) noexcept {
+  const bool cleanState = g_gxState.dirty == 0 && fmt == sDrawCache.lastDrawFmt && sDrawCache.lineMode == 0 &&
+                          prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS;
+  auto* lastDraw = cleanState ? gfx::get_last_draw_command<DrawData>() : nullptr;
+  return lastDraw != nullptr && lastDraw->instanceCount == 1 ? lastDraw : nullptr;
+}
+
+// A diverted draw ends the merge chain, so no later draw can merge across what was left out
+static bool route_draw(const draw_route::Query& query) noexcept {
+  const auto* router = draw_route::router();
+  if (router == nullptr || router->route == nullptr) {
+    return false;
+  }
+  g_routed.fetch_add(1, std::memory_order_relaxed);
+  const draw_route::Decision decision = router->route(router->userData, query);
+  if (decision.route != draw_route::Route::Push) {
+    break_draw_merge();
+    g_suppressed.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  // Only a break that prevents a merge counts; an indexed draw always starts its own command
+  if (decision.breakMerge && !query.indexed && merge_target(query.prim, query.fmt) != nullptr) {
+    break_draw_merge();
+    g_mergeBreaks.fetch_add(1, std::memory_order_relaxed);
+  }
+  return false;
 }
 
 static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange) noexcept {
@@ -507,10 +551,13 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
   if (totalVtxBytes > reader.remaining())
     UNLIKELY { handle_draw_overrun(totalVtxBytes, reader); }
 
-  const bool cleanState = g_gxState.dirty == 0 && fmt == sDrawCache.lastDrawFmt && sDrawCache.lineMode == 0 &&
-                          prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS;
-  auto* lastDraw = cleanState ? gfx::get_last_draw_command<DrawData>() : nullptr;
-  const bool canMerge = lastDraw != nullptr && lastDraw->instanceCount == 1;
+  if (route_draw({.prim = prim, .fmt = fmt, .vtxCount = vtxCount})) {
+    reader.skip(totalVtxBytes);
+    return;
+  }
+
+  auto* lastDraw = merge_target(prim, fmt);
+  const bool canMerge = lastDraw != nullptr;
 
   // Push raw vertex data to buffer. Merged draws must remain contiguous with the previous range.
   const auto vertexData = reader.take(totalVtxBytes);
@@ -558,6 +605,37 @@ static void handle_draw(u8 cmd, ByteReader& reader) noexcept {
   const auto fmt = static_cast<GXVtxFmt>(cmd & CP_VAT_MASK);
   const auto prim = static_cast<GXPrimitive>(cmd & CP_OPCODE_MASK);
   draw_prim(prim, fmt, reader.read<u16>(), reader);
+}
+
+static void handle_draw_indexed(ByteReader& reader) noexcept {
+  ZoneScopedN("DRAW_INDEXED");
+  const u8 cmd = reader.read<u8>();
+  const u16 vtxCount = reader.read<u16>();
+  const u32 indexCount = reader.read<u32>();
+  const GXVtxFmt fmt = static_cast<GXVtxFmt>(cmd & CP_VAT_MASK);
+  const GXPrimitive prim = static_cast<GXPrimitive>(cmd & CP_OPCODE_MASK);
+  AURORA_ASSERT(prim == GX_TRIANGLES, "GX_AURORA_DRAW_INDEXED: primitive must be GX_TRIANGLES, got {}",
+                static_cast<u32>(prim));
+  const size_t idxBytes = static_cast<size_t>(indexCount) * sizeof(u16);
+  u32 vtxSize;
+  if (g_gxState.lastVtxFmt == fmt) {
+    vtxSize = g_gxState.lastVtxSize;
+  } else {
+    vtxSize = calc_vtx_size(fmt);
+  }
+  const u32 totalVtxBytes = vtxCount * vtxSize;
+  if (indexCount != 0 && route_draw({.prim = prim, .fmt = fmt, .vtxCount = vtxCount, .indexed = true})) {
+    reader.skip(idxBytes + totalVtxBytes);
+    return;
+  }
+  // Index data is always host-endian; push it to the GPU buffer as-is
+  const auto indexData = reader.take(idxBytes);
+  const gfx::Range idxRange = gfx::push_indices(indexData.data(), indexData.size(), 4);
+  const auto vertexData = reader.take(totalVtxBytes);
+  const gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), 4);
+  if (indexCount != 0) {
+    push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, indexCount);
+  }
 }
 
 void handle_aurora(ByteReader& reader) noexcept {
@@ -731,30 +809,7 @@ void handle_aurora(ByteReader& reader) noexcept {
       draw_prim(prim, fmt, static_cast<u16>(vtxCount), reader);
     }
   } else if (subCmd == GX_AURORA_DRAW_INDEXED) {
-    ZoneScopedN("DRAW_INDEXED");
-    const u8 cmd = reader.read<u8>();
-    const u16 vtxCount = reader.read<u16>();
-    const u32 indexCount = reader.read<u32>();
-    const GXVtxFmt fmt = static_cast<GXVtxFmt>(cmd & CP_VAT_MASK);
-    const GXPrimitive prim = static_cast<GXPrimitive>(cmd & CP_OPCODE_MASK);
-    AURORA_ASSERT(prim == GX_TRIANGLES, "GX_AURORA_DRAW_INDEXED: primitive must be GX_TRIANGLES, got {}",
-                  static_cast<u32>(prim));
-    const size_t idxBytes = static_cast<size_t>(indexCount) * sizeof(u16);
-    // Index data is always host-endian; push it to the GPU buffer as-is
-    const auto indexData = reader.take(idxBytes);
-    const gfx::Range idxRange = gfx::push_indices(indexData.data(), indexData.size(), 4);
-    u32 vtxSize;
-    if (g_gxState.lastVtxFmt == fmt) {
-      vtxSize = g_gxState.lastVtxSize;
-    } else {
-      vtxSize = calc_vtx_size(fmt);
-    }
-    const u32 totalVtxBytes = vtxCount * vtxSize;
-    const auto vertexData = reader.take(totalVtxBytes);
-    const gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), 4);
-    if (indexCount != 0) {
-      push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, indexCount);
-    }
+    handle_draw_indexed(reader);
   } else if (subCmd == GX_AURORA_DEBUG_GROUP_PUSH) {
     auto label = reader.read_string();
     gfx::push_debug_group(std::move(label));
@@ -778,5 +833,32 @@ void clear_draw_cache() noexcept {
   sDrawCache.fogRange = {};
   sDrawCache.hasFogRange = false;
 }
+
+// Failing the format check fails the whole merge test, and only push_gx_draw re-arms it
+void break_draw_merge() noexcept { sDrawCache.lastDrawFmt = GX_MAX_VTXFMT; }
+
+void invalidate_draw_cache() noexcept {
+  clear_draw_cache();
+  sDrawCache.hasPipeline = false;
+  break_draw_merge();
+}
+
+DrawRouteStats draw_route_stats() noexcept {
+  return {
+      .routed = g_routed.load(std::memory_order_relaxed),
+      .suppressed = g_suppressed.load(std::memory_order_relaxed),
+      .mergeBreaks = g_mergeBreaks.load(std::memory_order_relaxed),
+      .substituted = g_substituted.load(std::memory_order_relaxed),
+  };
+}
+
+namespace testing {
+void reset_draw_route_stats() noexcept {
+  g_routed.store(0, std::memory_order_relaxed);
+  g_suppressed.store(0, std::memory_order_relaxed);
+  g_mergeBreaks.store(0, std::memory_order_relaxed);
+  g_substituted.store(0, std::memory_order_relaxed);
+}
+} // namespace testing
 
 } // namespace aurora::gx::fifo

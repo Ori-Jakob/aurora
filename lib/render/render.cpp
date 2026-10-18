@@ -11,6 +11,7 @@
 #include "shaders.hpp"
 #include "debug/debug.hpp"
 
+#include "../gx/command_processor.hpp"
 #include "../logging.hpp"
 #include "../webgpu/gpu.hpp"
 
@@ -154,6 +155,16 @@ HintCounters hint_counters(uint16_t id) noexcept {
       .malformed = counters.malformed,
       .late = counters.late,
       .bytes = counters.bytes,
+  };
+}
+
+DrawRouteCounters draw_route_counters() noexcept {
+  const gx::fifo::DrawRouteStats stats = gx::fifo::draw_route_stats();
+  return {
+      .routed = stats.routed,
+      .suppressed = stats.suppressed,
+      .mergeBreaks = stats.mergeBreaks,
+      .substituted = stats.substituted,
   };
 }
 

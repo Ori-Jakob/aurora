@@ -236,4 +236,15 @@ struct HintCounters {
 
 bool hints_enabled() noexcept;
 HintCounters hint_counters(uint16_t id) noexcept;
+
+struct DrawRouteCounters {
+  uint64_t routed = 0;
+  uint64_t suppressed = 0;
+  // Merges actually prevented; classify.json's mergeBreaks counts every requested break
+  uint64_t mergeBreaks = 0;
+  uint64_t substituted = 0;
+  bool operator==(const DrawRouteCounters&) const = default;
+};
+
+DrawRouteCounters draw_route_counters() noexcept;
 } // namespace aurora::render

@@ -39,6 +39,10 @@ auto fmt::formatter<AuroraLogLevel>::format(AuroraLogLevel level, format_context
   return fmt::format_to(ctx.out(), "{}", static_cast<int>(level));
 }
 
+namespace aurora::gfx {
+uint32_t g_testMergedDrawCount = 0;
+} // namespace aurora::gfx
+
 // --- GPU resources (default-constructed, not used in tests) ---
 namespace aurora::gfx::detail {
 Resources& resources() noexcept {
@@ -46,7 +50,7 @@ Resources& resources() noexcept {
   return resources;
 }
 
-void increment_merged_draw_count() noexcept {}
+void increment_merged_draw_count() noexcept { ++g_testMergedDrawCount; }
 } // namespace aurora::gfx::detail
 
 namespace aurora::webgpu {
@@ -102,35 +106,90 @@ void set_logical_viewport(const gfx::Viewport& viewport) noexcept {
   g_gxState.logicalViewport = viewport;
   set_render_viewport(map_logical_viewport(viewport));
 }
-void set_render_viewport(const gfx::Viewport& viewport) noexcept { g_gxState.renderViewport = viewport; }
+void set_render_viewport(const gfx::Viewport& viewport) noexcept {
+  g_gxState.renderViewport = viewport;
+  gfx::set_viewport(viewport);
+}
 void set_logical_scissor(const gfx::ClipRect& scissor) noexcept {
   g_gxState.logicalScissor = scissor;
   set_render_scissor(map_logical_scissor(scissor));
 }
-void set_render_scissor(const gfx::ClipRect& scissor) noexcept { g_gxState.renderScissor = scissor; }
+void set_render_scissor(const gfx::ClipRect& scissor) noexcept {
+  g_gxState.renderScissor = scissor;
+  gfx::set_scissor(scissor);
+}
 } // namespace aurora::gx
 
 // --- Shader/pipeline stubs ---
 namespace aurora::gx {
 uint32_t g_testPipelineBuildCount = 0;
+uint32_t g_testUniformBuildCount = 0;
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
   ++g_testPipelineBuildCount;
 }
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept { return {}; }
 ShaderInfo build_shader_info(const ShaderConfig& config) noexcept { return {}; }
-gfx::Range build_uniform(const ShaderInfo& info) noexcept { return {.size = 1}; }
+gfx::Range build_uniform(const ShaderInfo& info) noexcept {
+  ++g_testUniformBuildCount;
+  return {.size = 1};
+}
 void resolve_sampled_textures(const ShaderInfo& info) noexcept {}
 } // namespace aurora::gx
 
 // --- Buffer push stubs ---
 namespace aurora::gfx {
-Range push_verts(const uint8_t* data, size_t length, size_t alignment) { return {}; }
-Range push_indices(const uint8_t* data, size_t length, size_t alignment) { return {}; }
+namespace {
+// Offsets advance like the real frame buffers, so the merge contiguity CHECKs compare real ranges
+size_t s_vertCursor = 0;
+size_t s_idxCursor = 0;
+
+Range push_range(size_t& cursor, size_t length, size_t alignment) {
+  const size_t offset = alignment != 0 ? AURORA_ALIGN(cursor, alignment) : cursor;
+  cursor = offset + length;
+  return {static_cast<uint32_t>(offset), static_cast<uint32_t>(length)};
+}
+
+// Like the recorder, only a GX draw that is still the newest command of its pass can take a merge
+bool s_lastCommandIsGxDraw = false;
+Viewport s_viewport{};
+ClipRect s_scissor{};
+} // namespace
+
+uint64_t g_testPushedVertexBytes = 0;
+uint64_t g_testPushedIndexBytes = 0;
+
+namespace testing {
+void reset_stub_ranges() noexcept {
+  s_vertCursor = 0;
+  s_idxCursor = 0;
+}
+} // namespace testing
+
+Range push_verts(const uint8_t* data, size_t length, size_t alignment) {
+  g_testPushedVertexBytes += length;
+  return push_range(s_vertCursor, length, alignment);
+}
+Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
+  g_testPushedIndexBytes += length;
+  return push_range(s_idxCursor, length, alignment);
+}
 Range push_uniform(const uint8_t* data, size_t length) { return {}; }
 Range push_storage(const uint8_t* data, size_t length) { return {}; }
 
 Vec2<uint32_t> get_render_target_size() noexcept { return {640, 480}; }
-void set_viewport(const Viewport& viewport) noexcept {}
+// The recorder appends a command only when the value changes
+void set_viewport(const Viewport& viewport) noexcept {
+  if (viewport != s_viewport) {
+    s_viewport = viewport;
+    s_lastCommandIsGxDraw = false;
+  }
+}
+void set_scissor(const ClipRect& scissor) noexcept {
+  if (scissor != s_scissor) {
+    s_scissor = scissor;
+    s_lastCommandIsGxDraw = false;
+  }
+}
 void set_scissor(uint32_t x, uint32_t y, uint32_t w, uint32_t h) noexcept {}
 bool g_testNormalAttachment = false;
 bool has_normal_attachment() noexcept { return g_testNormalAttachment; }
@@ -158,7 +217,7 @@ PipelineRef pipeline_ref<clear::PipelineConfig>(const clear::PipelineConfig& con
 }
 template <>
 void push_draw_command<clear::DrawData>(clear::DrawData data) {
-  // No-op
+  s_lastCommandIsGxDraw = false;
 }
 template <>
 PipelineRef pipeline_ref<gx::PipelineConfig>(const gx::PipelineConfig& config) {
@@ -167,16 +226,19 @@ PipelineRef pipeline_ref<gx::PipelineConfig>(const gx::PipelineConfig& config) {
 gx::DrawData g_testLastDraw{};
 uint32_t g_testDrawCount = 0;
 std::atomic<uint32_t> g_testProcessedDrawCount{0};
+// Off by default so tests written before merging was emulated still see one command per draw
+bool g_testMergeDraws = false;
 
 template <>
 void push_draw_command<gx::DrawData>(gx::DrawData data) {
   g_testLastDraw = data;
   ++g_testDrawCount;
+  s_lastCommandIsGxDraw = true;
   g_testProcessedDrawCount.fetch_add(1, std::memory_order_release);
 }
 template <>
 gx::DrawData* get_last_draw_command() {
-  return nullptr;
+  return g_testMergeDraws && g_testDrawCount != 0 && s_lastCommandIsGxDraw ? &g_testLastDraw : nullptr;
 }
 } // namespace aurora::gfx
 
@@ -215,14 +277,20 @@ std::atomic<uint32_t> offscreenHeight{0};
 void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
                        Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat,
                        GXPixelFmt sourceFormat) {
+  // Each of these starts a new pass, which never holds a merge target
+  s_lastCommandIsGxDraw = false;
   testing::resolvePassCount.fetch_add(1, std::memory_order_release);
 }
 void begin_offscreen(uint32_t width, uint32_t height) {
+  s_lastCommandIsGxDraw = false;
   testing::offscreenWidth.store(width, std::memory_order_relaxed);
   testing::offscreenHeight.store(height, std::memory_order_relaxed);
   testing::beginOffscreenCount.fetch_add(1, std::memory_order_release);
 }
-void end_offscreen() { testing::endOffscreenCount.fetch_add(1, std::memory_order_release); }
+void end_offscreen() {
+  s_lastCommandIsGxDraw = false;
+  testing::endOffscreenCount.fetch_add(1, std::memory_order_release);
+}
 bool is_offscreen() noexcept { return false; }
 } // namespace aurora::gfx
 

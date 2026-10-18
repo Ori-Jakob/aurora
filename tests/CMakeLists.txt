@@ -93,6 +93,7 @@ if (AURORA_ENABLE_GX)
   add_executable(gx_fifo_tests
     gx_fifo_test.cpp
     gx_hints_test.cpp
+    gx_draw_route_test.cpp
     gx_test_stubs.cpp
     # GX API implementations (encoders)
     ../lib/dolphin/gx/GXBump.cpp
