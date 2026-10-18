@@ -1,5 +1,6 @@
 #include "hints.hpp"
 
+#include "scene/classify.hpp"
 #include "../gfx/recording.hpp"
 #include "../logging.hpp"
 
@@ -53,9 +54,11 @@ void on_reset(void*) noexcept {
   g_live.hintFrame = 0;
   g_epochSeen = false;
   g_epochBaseline = 0;
+  scene::reset();
 }
 
 void on_camera(void*, const gx::hints::Camera& camera) noexcept {
+  scene::on_camera(camera);
   if (camera.role != AURORA_CAMERA_MAIN) {
     return;
   }
@@ -72,13 +75,13 @@ void on_camera(void*, const gx::hints::Camera& camera) noexcept {
   }
 }
 
-void on_object_begin(void*, const gx::hints::ObjectBegin&) noexcept {}
+void on_object_begin(void*, const gx::hints::ObjectBegin& object) noexcept { scene::on_object_begin(object); }
 
-void on_object_end(void*) noexcept {}
+void on_object_end(void*) noexcept { scene::on_object_end(); }
 
-void on_scope_push(void*, const gx::hints::ScopePush&) noexcept {}
+void on_scope_push(void*, const gx::hints::ScopePush& scope) noexcept { scene::on_scope_push(scope); }
 
-void on_scope_pop(void*) noexcept {}
+void on_scope_pop(void*) noexcept { scene::on_scope_pop(); }
 
 void on_stage(void*, Stage stage) noexcept {
   // Mirrors record_stage, which refuses a marker that does not come after every marker it accepted this frame
@@ -88,6 +91,7 @@ void on_stage(void*, Stage stage) noexcept {
       g_frozen = true;
     }
   }
+  scene::on_stage(stage);
   gfx::record_stage(stage);
 }
 
@@ -109,7 +113,7 @@ void on_environment(void*, const gx::hints::Environment& environment) noexcept {
   g_live.present |= SceneHasEnvironment;
 }
 
-void on_material(void*, uint32_t) noexcept {}
+void on_material(void*, uint32_t materialClass) noexcept { scene::on_material(materialClass); }
 
 void on_skeleton(void*, const gx::hints::Skeleton&) noexcept {}
 
@@ -125,7 +129,7 @@ void on_scene_epoch(void*, uint32_t epoch) noexcept {
   g_epochBaseline = epoch;
 }
 
-void on_tev_policy(void*, const AuroraTevPolicy&) noexcept {}
+void on_tev_policy(void*, const AuroraTevPolicy& policy) noexcept { scene::on_tev_policy(policy); }
 
 void on_influencers(void*, std::span<const AuroraInfluencer> influencers) noexcept {
   if (g_frozen) {
@@ -173,9 +177,11 @@ void install_hints() noexcept {
   }
   gx::hints::set_sink(&g_sink);
   g_installed = true;
+  scene::install();
 }
 
 void remove_hints() noexcept {
+  scene::remove();
   if (gx::hints::sink() == &g_sink) {
     gx::hints::set_sink(nullptr);
   }
@@ -184,6 +190,7 @@ void remove_hints() noexcept {
 }
 
 void begin_hint_frame() noexcept {
+  scene::begin_frame();
   clear_frame();
   ++g_live.hintFrame;
 }

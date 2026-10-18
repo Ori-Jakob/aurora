@@ -14,6 +14,7 @@
 #if AURORA_ENABLE_RENDER
 #include "debug/debug.hpp"
 #include "hints.hpp"
+#include "scene/classify.hpp"
 #endif
 
 #include <algorithm>
@@ -703,6 +704,10 @@ std::shared_ptr<const FrameState> latch_frame() {
     g_frameState = std::make_shared<const FrameState>(
         FrameState{g_generation, latched_settings(), std::move(graph), inspectorOpen});
   }
+#if AURORA_ENABLE_RENDER
+  // The FIFO worker is idle until fifo::begin_frame
+  scene::apply_frame_state(*g_frameState);
+#endif
   return g_frameState;
 }
 

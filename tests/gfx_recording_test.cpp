@@ -13,6 +13,7 @@
 #include "render/graph_bind.hpp"
 #include "render/graph_layout.hpp"
 #include "render/hints.hpp"
+#include "render/scene/classify.hpp"
 #include "render/scene_depth.hpp"
 #include "render/settings.hpp"
 #include "render/stage.hpp"
@@ -21,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <deque>
 #include <functional>
@@ -1704,6 +1706,60 @@ TEST_F(GfxRenderStageHintTest, MissingMarkerWarnsOnlyWithMainCamera) {
   ASSERT_EQ(frame.stages.size(), 1u);
   EXPECT_EQ(frame.stages[0].stage, Stage::OpaqueDone);
   EXPECT_EQ(run(frame.stages[0]), (std::vector<std::string>{"opaque"}));
+}
+
+TEST_F(GfxRenderStageHintTest, MarkerAcceptanceMatchesRecorder) {
+  constexpr std::array MarkerStages{Stage::SceneBegin, Stage::OpaqueDone, Stage::PrePost,
+                                    Stage::SceneEnd,   Stage::BeforeHud,  Stage::FrameEnd};
+  // Passes that run without a marker make every stage emit, so markerSeen alone tells accepted from synthesized
+  for (const Stage stage : MarkerStages) {
+    add_pass(std::string{render::stage_name(stage)}, stage, 0, true, true);
+  }
+  seed(320, 180);
+  enum class Step : uint8_t { Marker, BeginOffscreen, EndOffscreen };
+  struct Action {
+    Step step = Step::Marker;
+    Stage stage = Stage::SceneBegin;
+  };
+  const auto mark = [](Stage stage) { return Action{.step = Step::Marker, .stage = stage}; };
+  const Action begin{.step = Step::BeginOffscreen};
+  const Action end{.step = Step::EndOffscreen};
+  const std::vector<std::vector<Action>> sequences{
+      {mark(Stage::SceneBegin), mark(Stage::OpaqueDone), mark(Stage::PrePost), mark(Stage::SceneEnd),
+       mark(Stage::BeforeHud), mark(Stage::FrameEnd)},
+      {mark(Stage::SceneBegin), mark(Stage::SceneBegin), mark(Stage::OpaqueDone)},
+      {mark(Stage::OpaqueDone), mark(Stage::SceneBegin), mark(Stage::PrePost)},
+      {mark(Stage::PrePost), mark(Stage::OpaqueDone), mark(Stage::SceneEnd), mark(Stage::SceneEnd)},
+      {begin, mark(Stage::SceneBegin), end, mark(Stage::OpaqueDone)},
+      {begin, mark(Stage::OpaqueDone), mark(Stage::SceneBegin), end, mark(Stage::PrePost)},
+      {mark(Stage::FrameEnd), mark(Stage::BeforeHud)},
+      {},
+  };
+  for (size_t i = 0; i < sequences.size(); ++i) {
+    ASSERT_NO_FATAL_FAILURE(latch_new_frame(MarkerStages.size()));
+    for (const Action& action : sequences[i]) {
+      if (action.step == Step::BeginOffscreen) {
+        begin_offscreen(320, 180);
+      } else if (action.step == Step::EndOffscreen) {
+        end_offscreen();
+      } else {
+        aurora::test::process_hints(aurora::test::stage_hint(action.stage));
+      }
+    }
+    finish();
+    uint32_t recorded = 0;
+    for (const auto& data : frame.stages) {
+      recorded |= data.markerSeen ? 1u << static_cast<uint32_t>(data.stage) : 0u;
+    }
+    uint32_t classified = 0;
+    const render::scene::FrameStats& stats = render::scene::testing::classifier().stats();
+    for (const Stage stage : MarkerStages) {
+      classified |= stats.markerDraw[static_cast<size_t>(stage)] >= 0 ? 1u << static_cast<uint32_t>(stage) : 0u;
+    }
+    EXPECT_EQ(frame.stages.size(), MarkerStages.size()) << "sequence " << i;
+    EXPECT_EQ(classified, recorded) << "sequence " << i;
+    EXPECT_EQ(stats.hints.markers, static_cast<uint32_t>(std::popcount(recorded))) << "sequence " << i;
+  }
 }
 #endif
 

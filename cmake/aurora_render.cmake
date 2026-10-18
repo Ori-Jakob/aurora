@@ -41,6 +41,10 @@ if (AURORA_ENABLE_RENDER)
         lib/render/jobs.cpp
         lib/render/jobs.hpp
         lib/render/json.hpp
+        lib/render/scene/classifier.cpp
+        lib/render/scene/classifier.hpp
+        lib/render/scene/classify.cpp
+        lib/render/scene/classify.hpp
         lib/render/shader_resolve.cpp
         lib/render/shader_resolve.hpp
         lib/render/shaders.cpp
