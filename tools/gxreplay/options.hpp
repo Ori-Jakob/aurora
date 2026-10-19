@@ -37,6 +37,8 @@ struct Options {
   bool showWindow = false;
   bool verbose = false;
   bool gpuTimings = false;
+  bool cpuZones = false;
+  bool cpuDrawZones = false;
   bool help = false;
   uint16_t debugView = 0;
   uint32_t debugViewBit = 0;

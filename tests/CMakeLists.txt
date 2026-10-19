@@ -553,6 +553,14 @@ if (TARGET aurora_gxreplay)
   add_test(NAME gxreplay_self_test_null
     COMMAND $<TARGET_FILE:aurora_gxreplay> --self-test --backend null --out ${_gxreplay_dir}/self_test)
   set_tests_properties(gxreplay_self_test_null PROPERTIES LABELS smoke TIMEOUT 180)
+  add_test(NAME gxreplay_self_test_cpu_zones_null
+    COMMAND $<TARGET_FILE:aurora_gxreplay> --self-test --backend null --cpu-zones
+            --out ${_gxreplay_dir}/self_test_cpu_zones)
+  set_tests_properties(gxreplay_self_test_cpu_zones_null PROPERTIES LABELS smoke TIMEOUT 180)
+  add_test(NAME gxreplay_self_test_cpu_draw_zones_null
+    COMMAND $<TARGET_FILE:aurora_gxreplay> --self-test --backend null --cpu-draw-zones
+            --out ${_gxreplay_dir}/self_test_cpu_draw_zones)
+  set_tests_properties(gxreplay_self_test_cpu_draw_zones_null PROPERTIES LABELS smoke TIMEOUT 180)
   if (TARGET render_demo)
     add_test(NAME gxreplay_render_demo_capture
       COMMAND $<TARGET_FILE:render_demo> --backend null --frames 8 --timeout 60

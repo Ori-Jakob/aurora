@@ -49,9 +49,14 @@ bool write_text(const std::filesystem::path& path, const std::string& text) {
 }
 
 bool write_reports(const Options& options, const ReportContext& context, std::span<const FrameResult> frames,
-                   std::span<const FrameTiming> timings, std::span<const GpuFrameTiming> gpuTimings) {
+                   std::span<const FrameTiming> timings, std::span<const GpuFrameTiming> gpuTimings,
+                   std::span<const CpuFrameZones> cpuZones) {
   if (!write_text(options.outDir / "frames.json", format_frames_json(context, frames)) ||
       !write_text(options.outDir / "timing.json", format_timing_json(timings))) {
+    return false;
+  }
+  if (options.cpuZones &&
+      !write_text(options.outDir / "cpu_zones.json", format_cpu_zones_json(options.cpuDrawZones, cpuZones))) {
     return false;
   }
   if (!options.gpuTimings) {
@@ -312,6 +317,11 @@ int run_self_test(int argc, char* argv[], const Options& options) {
   timings.insert(timings.end(), second.timings.begin(), second.timings.end());
   std::vector<GpuFrameTiming> gpuTimings = first.gpuTimings;
   gpuTimings.insert(gpuTimings.end(), second.gpuTimings.begin(), second.gpuTimings.end());
+  std::vector<CpuFrameZones> cpuZones = first.cpuZones;
+  cpuZones.insert(cpuZones.end(), second.cpuZones.begin(), second.cpuZones.end());
+  if (failure.empty() && options.cpuZones) {
+    check_cpu_zones(cpuZones, first.frames.size(), options.cpuDrawZones, failure);
+  }
   const ReportContext context{
       .traceFile = io::fs_path_to_string(hintsPath),
       .traceVersion = fmt::format("{}.{}", hintsReader.header().versionMajor, hintsReader.header().versionMinor),
@@ -321,8 +331,8 @@ int run_self_test(int argc, char* argv[], const Options& options) {
       .runs = 2,
       .deterministic = deterministic,
   };
-  const bool reportsWritten =
-      write_reports(options, context, first.frames, timings, gpuTimings) && write_classify(options, context, first);
+  const bool reportsWritten = write_reports(options, context, first.frames, timings, gpuTimings, cpuZones) &&
+                              write_classify(options, context, first);
   aurora_shutdown();
   if (!failure.empty()) {
     print_error("self-test failed: " + failure);
@@ -391,9 +401,11 @@ int run_replay(int argc, char* argv[], const Options& options) {
   }
   std::vector<FrameTiming> timings;
   std::vector<GpuFrameTiming> gpuTimings;
+  std::vector<CpuFrameZones> cpuZones;
   for (const auto& result : results) {
     timings.insert(timings.end(), result.timings.begin(), result.timings.end());
     gpuTimings.insert(gpuTimings.end(), result.gpuTimings.begin(), result.gpuTimings.end());
+    cpuZones.insert(cpuZones.end(), result.cpuZones.begin(), result.cpuZones.end());
   }
   const ReportContext context{
       .traceFile = io::fs_path_to_string(options.trace),
@@ -404,8 +416,8 @@ int run_replay(int argc, char* argv[], const Options& options) {
       .runs = options.repeat,
       .deterministic = deterministic,
   };
-  const bool reportsWritten =
-      write_reports(options, context, frames, timings, gpuTimings) && write_classify(options, context, results[0]);
+  const bool reportsWritten = write_reports(options, context, frames, timings, gpuTimings, cpuZones) &&
+                              write_classify(options, context, results[0]);
   aurora_shutdown();
 
   // Frames before --frames are still decoded, so their unresolved reads count too

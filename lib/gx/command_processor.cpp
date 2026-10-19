@@ -17,7 +17,9 @@
 #include <tracy/Tracy.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <span>
@@ -155,6 +157,41 @@ std::atomic<uint64_t> g_routed{0};
 std::atomic<uint64_t> g_suppressed{0};
 std::atomic<uint64_t> g_mergeBreaks{0};
 std::atomic<uint64_t> g_substituted{0};
+std::atomic_uint32_t g_cpuZoneTimed{0};
+std::array<std::atomic_uint64_t, CpuZoneCount> g_cpuZoneCalls{};
+std::array<std::atomic_uint64_t, CpuZoneCount> g_cpuZoneNs{};
+std::atomic_uint64_t g_cpuArrayBytes{0};
+std::atomic_uint64_t g_cpuFogLutBytes{0};
+
+// Only the decoding thread writes these, so a plain add keeps lock prefixes off the per-draw path
+inline void bump(std::atomic_uint64_t& counter, uint64_t n = 1) noexcept {
+  counter.store(counter.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
+}
+
+class CpuZoneScope {
+public:
+  explicit CpuZoneScope(CpuZone zone) noexcept
+  : m_zone(zone), m_timed(((g_cpuZoneTimed.load(std::memory_order_relaxed) >> zone) & 1u) != 0) {
+    if (m_timed) {
+      m_start = std::chrono::steady_clock::now();
+    }
+  }
+  ~CpuZoneScope() {
+    bump(g_cpuZoneCalls[m_zone]);
+    if (m_timed) {
+      const auto elapsed = std::chrono::steady_clock::now() - m_start;
+      bump(g_cpuZoneNs[m_zone],
+           static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()));
+    }
+  }
+  CpuZoneScope(const CpuZoneScope&) = delete;
+  CpuZoneScope& operator=(const CpuZoneScope&) = delete;
+
+private:
+  std::chrono::steady_clock::time_point m_start{};
+  CpuZone m_zone;
+  bool m_timed;
+};
 
 FogRangeLutKey fog_range_lut_key() noexcept {
   const auto& state = g_gxState.fog;
@@ -227,6 +264,7 @@ static void handle_aurora(ByteReader& reader) noexcept;
 
 ProcessResult process(const u8* data, u32 size) noexcept {
   ZoneScoped;
+  const CpuZoneScope zone{CpuZoneProcess};
   ByteReader reader{{data, size}};
 
   while (!reader.empty()) {
@@ -394,6 +432,8 @@ static u32 calc_vtx_size(GXVtxFmt fmt) noexcept {
 
 static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
                          u32 numIndices) noexcept {
+  ZoneScoped;
+  const CpuZoneScope zone{CpuZonePushDraw};
   auto& state = g_gxState;
   auto& cache = sDrawCache;
 
@@ -404,8 +444,11 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     }
     auto& array = state.arrays[i];
     if (array.cachedRange.size == 0) {
+      ZoneScopedN("upload array");
+      const CpuZoneScope arrays{CpuZoneArrays};
       const auto bytes = guest_memory::read(guest_memory::Kind::VertexArray, array.data, array.size);
       array.cachedRange = gfx::push_storage(bytes.data(), bytes.size());
+      bump(g_cpuArrayBytes, bytes.size());
     }
     immediates.arrayStart[i - GX_VA_POS] = array.cachedRange.offset;
   }
@@ -415,6 +458,8 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
   const bool pipelineValid = cache.hasPipeline && (state.dirty & DirtyPipeline) == 0 && cache.fmt == fmt &&
                              cache.lineMode == lineMode && cache.targetLayoutKey == targetLayoutKey;
   if (!pipelineValid) {
+    ZoneScopedN("build pipeline");
+    const CpuZoneScope build{CpuZonePipelineBuild};
     const bool hadPipeline = cache.hasPipeline;
     const auto prevSampledTextures = cache.shaderInfo.sampledTextures;
     const auto prevSampledIndTextures = cache.shaderInfo.sampledIndTextures;
@@ -435,6 +480,8 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
   const bool bindGroupsValid =
       (state.dirty & DirtyTextures) == 0 && cache.bindGeneration == texture::current_bind_generation();
   if (!bindGroupsValid) {
+    ZoneScopedN("build bind groups");
+    const CpuZoneScope build{CpuZoneBindGroupBuild};
     const auto prevBindGroup = cache.bindGroups.textureBindGroup;
     resolve_sampled_textures(cache.shaderInfo);
     cache.bindGroups = build_bind_groups(cache.shaderInfo);
@@ -448,13 +495,18 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
 
   const bool uniformValid = (state.dirty & DirtyUniform) == 0 && cache.uniformRange.size != 0;
   if (!uniformValid) {
+    ZoneScopedN("build uniform");
+    const CpuZoneScope build{CpuZoneUniformBuild};
     cache.uniformRange = build_uniform(cache.shaderInfo);
     state.dirty &= ~DirtyUniform;
   }
   if (cache.config.shaderConfig.fogRangeEnabled) {
     const auto key = fog_range_lut_key();
     if (!cache.hasFogRange || cache.fogRangeKey != key) {
+      ZoneScopedN("push fog range lut");
+      const CpuZoneScope build{CpuZoneFogLut};
       cache.fogRange = push_fog_range_lut(key);
+      bump(g_cpuFogLutBytes, cache.fogRange.size);
       cache.fogRangeKey = key;
       cache.hasFogRange = true;
     }
@@ -850,6 +902,24 @@ DrawRouteStats draw_route_stats() noexcept {
       .mergeBreaks = g_mergeBreaks.load(std::memory_order_relaxed),
       .substituted = g_substituted.load(std::memory_order_relaxed),
   };
+}
+
+CpuZoneStats cpu_zone_stats() noexcept {
+  CpuZoneStats stats;
+  for (size_t zone = 0; zone < CpuZoneCount; ++zone) {
+    stats.calls[zone] = g_cpuZoneCalls[zone].load(std::memory_order_relaxed);
+    stats.ns[zone] = g_cpuZoneNs[zone].load(std::memory_order_relaxed);
+  }
+  stats.arrayBytes = g_cpuArrayBytes.load(std::memory_order_relaxed);
+  stats.fogLutBytes = g_cpuFogLutBytes.load(std::memory_order_relaxed);
+  return stats;
+}
+
+void set_cpu_zone_timing(uint32_t timing) noexcept {
+  constexpr uint32_t drawZones = ((1u << CpuZoneCount) - 1u) & ~(1u << CpuZoneProcess);
+  g_cpuZoneTimed.store(((timing & CpuZoneTimingFifo) != 0 ? 1u << CpuZoneProcess : 0u) |
+                           ((timing & CpuZoneTimingDraws) != 0 ? drawZones : 0u),
+                       std::memory_order_relaxed);
 }
 
 namespace testing {

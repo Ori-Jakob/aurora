@@ -96,6 +96,17 @@ bool apply_gpu_timings(Options& options, std::string_view) {
   return true;
 }
 
+bool apply_cpu_zones(Options& options, std::string_view) {
+  options.cpuZones = true;
+  return true;
+}
+
+bool apply_cpu_draw_zones(Options& options, std::string_view) {
+  options.cpuZones = true;
+  options.cpuDrawZones = true;
+  return true;
+}
+
 bool apply_allow_incomplete(Options& options, std::string_view) {
   options.allowIncomplete = true;
   return true;
@@ -175,7 +186,7 @@ struct Flag {
   bool (*apply)(Options& options, std::string_view value);
 };
 
-constexpr std::array<Flag, 25> Flags{{
+constexpr std::array<Flag, 27> Flags{{
     {"--out", true, apply_out},
     {"--backend", true, apply_backend},
     {"--profile", true, apply_profile},
@@ -183,6 +194,8 @@ constexpr std::array<Flag, 25> Flags{{
     {"--repeat", true, apply_repeat},
     {"--no-png", false, apply_no_png},
     {"--gpu-timings", false, apply_gpu_timings},
+    {"--cpu-zones", false, apply_cpu_zones},
+    {"--cpu-draw-zones", false, apply_cpu_draw_zones},
     {"--replacements", true, apply_replacements},
     {"--data-dir", true, apply_data_dir},
     {"--allow-incomplete", false, apply_allow_incomplete},
@@ -338,6 +351,8 @@ std::string_view usage() noexcept {
          "  --repeat N                replay N times and require identical frames\n"
          "  --no-png                  skip PNG output\n"
          "  --gpu-timings             write gpu_timing.json with per-pass GPU times (needs TimestampQuery)\n"
+         "  --cpu-zones               write cpu_zones.json with per-frame FIFO decode time and draw-work counts\n"
+         "  --cpu-draw-zones          also time each draw and its rebuild steps, and count unique array bytes\n"
          "  --replacements DIR        load a texture replacement directory\n"
          "  --data-dir DIR            user and cache directory (defaults to <out>/.aurora)\n"
          "  --allow-incomplete        replay the complete frames of an aborted or unfinished trace\n"

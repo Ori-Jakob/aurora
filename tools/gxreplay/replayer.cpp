@@ -43,6 +43,39 @@ double elapsed_ms(Clock::time_point start, Clock::time_point end) {
   return std::chrono::duration<double, std::milli>{end - start}.count();
 }
 
+CpuFrameZones frame_zones(uint32_t run, uint32_t frame, const gx::fifo::CpuZoneStats& before,
+                          const gx::fifo::CpuZoneStats& after, uint64_t resolves, uint64_t uniqueArrayBytes,
+                          const AuroraStats& stats) {
+  const auto ms = [&](gx::fifo::CpuZone zone) { return static_cast<double>(after.ns[zone] - before.ns[zone]) / 1e6; };
+  const auto calls = [&](gx::fifo::CpuZone zone) { return after.calls[zone] - before.calls[zone]; };
+  return {
+      .run = run,
+      .frame = frame,
+      .fifoMs = ms(gx::fifo::CpuZoneProcess),
+      .pushDrawMs = ms(gx::fifo::CpuZonePushDraw),
+      .arraysMs = ms(gx::fifo::CpuZoneArrays),
+      .pipelineBuildMs = ms(gx::fifo::CpuZonePipelineBuild),
+      .bindGroupBuildMs = ms(gx::fifo::CpuZoneBindGroupBuild),
+      .uniformBuildMs = ms(gx::fifo::CpuZoneUniformBuild),
+      .fogLutMs = ms(gx::fifo::CpuZoneFogLut),
+      .fifoCalls = calls(gx::fifo::CpuZoneProcess),
+      .pushDraws = calls(gx::fifo::CpuZonePushDraw),
+      .arrayMisses = calls(gx::fifo::CpuZoneArrays),
+      .arrayBytes = after.arrayBytes - before.arrayBytes,
+      .pipelineBuilds = calls(gx::fifo::CpuZonePipelineBuild),
+      .bindGroupBuilds = calls(gx::fifo::CpuZoneBindGroupBuild),
+      .uniformBuilds = calls(gx::fifo::CpuZoneUniformBuild),
+      .fogLutPushes = calls(gx::fifo::CpuZoneFogLut),
+      .fogLutBytes = after.fogLutBytes - before.fogLutBytes,
+      .resolves = resolves,
+      .uniqueArrayBytes = uniqueArrayBytes,
+      .vertBytes = stats.lastVertSize,
+      .indexBytes = stats.lastIndexSize,
+      .uniformBytes = stats.lastUniformSize,
+      .storageBytes = stats.lastStorageSize,
+  };
+}
+
 void log_callback(AuroraLogLevel level, const char* module, const char* message, unsigned int len) {
   const char* name = "INFO";
   FILE* out = stdout;
@@ -181,6 +214,10 @@ ExitCode bring_up_aurora(int argc, char* argv[], const Options& options, const t
   if (options.gpuTimings) {
     webgpu::gpu_prof::set_always(true);
   }
+  if (options.cpuZones) {
+    gx::fifo::set_cpu_zone_timing(gx::fifo::CpuZoneTimingFifo |
+                                  (options.cpuDrawZones ? gx::fifo::CpuZoneTimingDraws : 0u));
+  }
   if (!options.replacementsDir.empty()) {
     aurora::texture::load_replacement_directory(options.replacementsDir);
     gfx::texture_replacement::set_synchronous_loads(true);
@@ -189,7 +226,19 @@ ExitCode bring_up_aurora(int argc, char* argv[], const Options& options, const t
 }
 
 Replayer::Replayer(const Options& options, trace::TraceReader& reader, bool keepImages, bool keepRecords)
-: m_options(options), m_reader(reader), m_keepImages(keepImages), m_keepRecords(keepRecords) {}
+: m_options(options), m_reader(reader), m_keepImages(keepImages), m_keepRecords(keepRecords) {
+  m_countingHooks = {.resolve = &Replayer::resolve_counting, .userData = this};
+}
+
+std::span<const uint8_t> Replayer::resolve_counting(void* userData, gx::guest_memory::Kind kind, uint64_t address,
+                                                    size_t size) noexcept {
+  auto& self = *static_cast<Replayer*>(userData);
+  if (kind == gx::guest_memory::Kind::VertexArray && size != 0 && self.m_frameArrays.emplace(address, size).second) {
+    self.m_uniqueArrayBytes += size;
+  }
+  const auto* hooks = self.m_store.hooks();
+  return hooks->resolve(hooks->userData, kind, address, size);
+}
 
 bool Replayer::fail(ExitCode code, std::string message, std::string& error) {
   m_exitCode = code;
@@ -231,7 +280,8 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
     return fail(ExitTrace, "the trace contains no frames", error);
   }
 
-  const ScopedStoreHooks hooks{m_store.hooks()};
+  // Unique bytes cost a set insert per array read, so only the diagnostic mode counts them
+  const ScopedStoreHooks hooks{m_options.cpuDrawZones ? &m_countingHooks : m_store.hooks()};
   std::vector<uint8_t> rgba;
   uint32_t width = 0;
   uint32_t height = 0;
@@ -262,6 +312,10 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
     gx::fifo::begin_frame();
 
     const uint64_t missesBefore = m_store.misses();
+    const auto zonesBefore = gx::fifo::cpu_zone_stats();
+    const uint64_t resolvesBefore = m_store.resolves();
+    m_frameArrays.clear();
+    m_uniqueArrayBytes = 0;
     const uint64_t hintBytesBefore = gx::hints::total_bytes();
     uint64_t fifoBytes = 0;
     uint32_t mapRecords = 0;
@@ -309,6 +363,8 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
     }
     const auto processEnd = Clock::now();
     const uint64_t hintBytes = gx::hints::total_bytes() - hintBytesBefore;
+    const auto zonesAfter = gx::fifo::cpu_zone_stats();
+    const uint64_t resolvesAfter = m_store.resolves();
 
     const bool frameOk = end_frame(output && recordsOk, rgba, width, height, error);
     if (!frameOk || !recordsOk) {
@@ -338,6 +394,10 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
           .gpuWaitMs = m_gpuWaitMs,
           .totalMs = elapsed_ms(frameStart, frameEnd),
       });
+      if (m_options.cpuZones) {
+        out.cpuZones.push_back(frame_zones(run, index, zonesBefore, zonesAfter, resolvesAfter - resolvesBefore,
+                                           m_uniqueArrayBytes, *aurora_get_stats()));
+      }
       if (m_options.gpuTimings) {
         collect_gpu_timing(run, index, out);
       }

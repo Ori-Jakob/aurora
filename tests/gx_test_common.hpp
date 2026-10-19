@@ -157,6 +157,27 @@ protected:
   aurora::gx::GXState& gxState() { return aurora::gx::g_gxState; }
 };
 
+struct ScopedCpuZoneTiming {
+  explicit ScopedCpuZoneTiming(uint32_t timing) { aurora::gx::fifo::set_cpu_zone_timing(timing); }
+  ~ScopedCpuZoneTiming() { aurora::gx::fifo::set_cpu_zone_timing(0); }
+  ScopedCpuZoneTiming(const ScopedCpuZoneTiming&) = delete;
+  ScopedCpuZoneTiming& operator=(const ScopedCpuZoneTiming&) = delete;
+};
+
+struct CpuZoneDelta {
+  aurora::gx::fifo::CpuZoneStats before = aurora::gx::fifo::cpu_zone_stats();
+
+  [[nodiscard]] uint64_t calls(aurora::gx::fifo::CpuZone zone) const {
+    return aurora::gx::fifo::cpu_zone_stats().calls[zone] - before.calls[zone];
+  }
+  [[nodiscard]] uint64_t ns(aurora::gx::fifo::CpuZone zone) const {
+    return aurora::gx::fifo::cpu_zone_stats().ns[zone] - before.ns[zone];
+  }
+  [[nodiscard]] uint64_t array_bytes() const {
+    return aurora::gx::fifo::cpu_zone_stats().arrayBytes - before.arrayBytes;
+  }
+};
+
 template <typename T>
 inline bool same_bits(const T& lhs, const T& rhs) {
   return std::memcmp(&lhs, &rhs, sizeof(T)) == 0;

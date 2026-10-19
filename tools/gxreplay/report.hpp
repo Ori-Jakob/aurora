@@ -44,6 +44,33 @@ struct GpuFrameTiming {
   std::vector<GpuPassTiming> passes;
 };
 
+struct CpuFrameZones {
+  uint32_t run = 0;
+  uint32_t frame = 0;
+  double fifoMs = 0.0;
+  double pushDrawMs = 0.0;
+  double arraysMs = 0.0;
+  double pipelineBuildMs = 0.0;
+  double bindGroupBuildMs = 0.0;
+  double uniformBuildMs = 0.0;
+  double fogLutMs = 0.0;
+  uint64_t fifoCalls = 0;
+  uint64_t pushDraws = 0;
+  uint64_t arrayMisses = 0;
+  uint64_t arrayBytes = 0;
+  uint64_t pipelineBuilds = 0;
+  uint64_t bindGroupBuilds = 0;
+  uint64_t uniformBuilds = 0;
+  uint64_t fogLutPushes = 0;
+  uint64_t fogLutBytes = 0;
+  uint64_t resolves = 0;
+  uint64_t uniqueArrayBytes = 0;
+  uint32_t vertBytes = 0;
+  uint32_t indexBytes = 0;
+  uint32_t uniformBytes = 0;
+  uint32_t storageBytes = 0;
+};
+
 struct ReportContext {
   std::string traceFile;
   std::string traceVersion;
@@ -68,6 +95,8 @@ std::string format_classify_draw_line(uint32_t frame, const render::scene::Class
 std::string format_classify_summary(std::span<const ClassifyFrame> frames, uint64_t malformedHints);
 std::string format_timing_json(std::span<const FrameTiming> timings);
 std::string format_gpu_timing_json(bool supported, std::span<const GpuFrameTiming> timings);
+std::string format_cpu_zones_json(bool drawZones, std::span<const CpuFrameZones> frames);
+bool check_cpu_zones(std::span<const CpuFrameZones> frames, size_t framesPerRun, bool drawZones, std::string& error);
 std::string json_escape(std::string_view text);
 std::string hex64(uint64_t value);
 } // namespace aurora::gxreplay

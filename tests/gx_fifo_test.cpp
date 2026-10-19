@@ -128,6 +128,36 @@ TEST_F(GXFifoTest, AutoSizedDrawPublishesAfterLengthPatch) {
   EXPECT_EQ(aurora::gfx::g_testDrawCount, 1u);
 }
 
+TEST_F(GXFifoTest, CpuZonesCountWorkerDecode) {
+  namespace fifo = aurora::gx::fifo;
+  const CpuZoneDelta zones;
+  const ScopedCpuZoneTiming timing{fifo::CpuZoneTimingFifo | fifo::CpuZoneTimingDraws};
+  fifo::init();
+  fifo::begin_frame();
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_U8, 0);
+  aurora::gfx::g_testDrawCount = 0;
+
+  GXBegin(GX_TRIANGLES, GX_VTXFMT0, GX_AUTO);
+  GXPosition3u8(0, 1, 2);
+  GXPosition3u8(3, 4, 5);
+  GXPosition3u8(6, 7, 8);
+  GXEnd();
+  fifo::drain();
+  const uint64_t pushDraws = zones.calls(fifo::CpuZonePushDraw);
+  const uint64_t processCalls = zones.calls(fifo::CpuZoneProcess);
+  const uint64_t pushDrawNs = zones.ns(fifo::CpuZonePushDraw);
+  const uint64_t processNs = zones.ns(fifo::CpuZoneProcess);
+  fifo::end_frame();
+  fifo::shutdown();
+
+  EXPECT_EQ(pushDraws, 1u);
+  EXPECT_EQ(aurora::gfx::g_testDrawCount, 1u);
+  EXPECT_GE(processCalls, 1u);
+  EXPECT_LE(pushDrawNs, processNs);
+}
+
 TEST_F(GXFifoTest, CommandsAfterFinalDrawRemainPendingUntilDrain) {
   aurora::gx::fifo::init();
   aurora::gx::fifo::begin_frame();
@@ -2296,6 +2326,38 @@ TEST_F(GXFifoTest, GuestMemory_IndexedArrayUploadIsObserved) {
   EXPECT_EQ(sGuestReads[0].kind, aurora::gx::guest_memory::Kind::VertexArray);
   EXPECT_EQ(sGuestReads[0].address, address_of(positions.data()));
   EXPECT_EQ(sGuestReads[0].size, sizeof(positions));
+}
+
+TEST_F(GXFifoTest, CpuZonesSkipCachedArrayUpload) {
+  namespace fifo = aurora::gx::fifo;
+  std::array<f32, 9> positions{0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f, 0.f};
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  GXSetArray(GX_VA_POS, positions.data(), sizeof(positions), 12, false);
+  const auto state = flush_and_capture();
+
+  GXBegin(GX_TRIANGLES, GX_VTXFMT0, 3);
+  GXPosition1x8(0);
+  GXPosition1x8(1);
+  GXPosition1x8(2);
+  GXEnd();
+  const auto draw = capture_fifo();
+
+  reset_gx_state();
+  ScopedGuestHooks hooks{false};
+  decode_fifo(state);
+  const CpuZoneDelta zones;
+  decode_fifo(draw);
+  EXPECT_EQ(zones.calls(fifo::CpuZoneArrays), 1u);
+  EXPECT_EQ(zones.array_bytes(), 36u);
+
+  gxState().arrays[GX_VA_POS].cachedRange = {.offset = 0, .size = 36};
+  decode_fifo(draw);
+  EXPECT_EQ(zones.calls(fifo::CpuZoneArrays), 1u);
+  EXPECT_EQ(zones.array_bytes(), 36u);
+  EXPECT_EQ(zones.calls(fifo::CpuZonePushDraw), 2u);
+  EXPECT_EQ(sGuestReads.size(), 1u);
 }
 
 TEST_F(GXFifoTest, LoadIdentity_RecognizesBothTextureMatrixSizes) {

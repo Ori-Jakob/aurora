@@ -417,4 +417,196 @@ std::string format_gpu_timing_json(bool supported, std::span<const GpuFrameTimin
   out += "}\n";
   return out;
 }
+
+namespace {
+constexpr std::array<std::string_view, 7> CpuZoneMsNames{
+    "fifoMs", "pushDrawMs", "arraysMs", "pipelineBuildMs", "bindGroupBuildMs", "uniformBuildMs", "fogLutMs",
+};
+constexpr std::array<std::string_view, 5> CpuSectionNames{"arrays", "pipelineBuild", "bindGroupBuild", "uniformBuild",
+                                                          "fogLut"};
+constexpr size_t FirstSectionMs = 2;
+constexpr std::array<std::string_view, 15> CpuZoneCountNames{
+    "fifoCalls",        "pushDraws",     "arrayMisses",  "arrayBytes",   "pipelineBuilds",
+    "bindGroupBuilds",  "uniformBuilds", "fogLutPushes", "fogLutBytes",  "resolves",
+    "uniqueArrayBytes", "vertBytes",     "indexBytes",   "uniformBytes", "storageBytes",
+};
+
+std::array<double, CpuZoneMsNames.size()> cpu_zone_ms(const CpuFrameZones& frame) {
+  return {frame.fifoMs,           frame.pushDrawMs,     frame.arraysMs, frame.pipelineBuildMs,
+          frame.bindGroupBuildMs, frame.uniformBuildMs, frame.fogLutMs};
+}
+
+std::array<uint64_t, CpuZoneCountNames.size()> cpu_zone_counts(const CpuFrameZones& frame) {
+  return {frame.fifoCalls,        frame.pushDraws,     frame.arrayMisses,  frame.arrayBytes,   frame.pipelineBuilds,
+          frame.bindGroupBuilds,  frame.uniformBuilds, frame.fogLutPushes, frame.fogLutBytes,  frame.resolves,
+          frame.uniqueArrayBytes, frame.vertBytes,     frame.indexBytes,   frame.uniformBytes, frame.storageBytes};
+}
+
+std::string cpu_zone_row(const CpuFrameZones& frame) {
+  std::string out = fmt::format("{{\"frame\": {}", frame.frame);
+  const auto ms = cpu_zone_ms(frame);
+  for (size_t i = 0; i < ms.size(); ++i) {
+    out += fmt::format(", \"{}\": {:.3f}", CpuZoneMsNames[i], ms[i]);
+  }
+  const auto counts = cpu_zone_counts(frame);
+  for (size_t i = 0; i < counts.size(); ++i) {
+    out += fmt::format(", \"{}\": {}", CpuZoneCountNames[i], counts[i]);
+  }
+  return out + "}";
+}
+
+std::string warm_cpu_zones(bool drawZones, std::span<const CpuFrameZones> frames, const std::vector<uint32_t>& runs) {
+  // Run 0 pays blocking pipeline compiles and frame 0 re-decodes every texture, so warm leaves both out
+  const uint32_t coldRun = *std::min_element(runs.begin(), runs.end());
+  std::vector<const CpuFrameZones*> warm;
+  std::vector<uint32_t> warmRuns;
+  for (const auto& frame : frames) {
+    if (frame.run != coldRun && frame.frame != 0) {
+      warm.push_back(&frame);
+      if (std::find(warmRuns.begin(), warmRuns.end(), frame.run) == warmRuns.end()) {
+        warmRuns.push_back(frame.run);
+      }
+    }
+  }
+  if (warm.empty()) {
+    return "null";
+  }
+
+  const auto count = static_cast<double>(warm.size());
+  std::vector<double> fifoMs;
+  std::vector<double> pushDrawMs;
+  std::array<double, CpuZoneMsNames.size()> msSums{};
+  std::array<double, CpuZoneCountNames.size()> countSums{};
+  double ratioSum = 0.0;
+  double ratioMax = 0.0;
+  size_t ratioRows = 0;
+  for (const CpuFrameZones* frame : warm) {
+    fifoMs.push_back(frame->fifoMs);
+    pushDrawMs.push_back(frame->pushDrawMs);
+    const auto ms = cpu_zone_ms(*frame);
+    for (size_t i = 0; i < ms.size(); ++i) {
+      msSums[i] += ms[i];
+    }
+    const auto counts = cpu_zone_counts(*frame);
+    for (size_t i = 0; i < counts.size(); ++i) {
+      countSums[i] += static_cast<double>(counts[i]);
+    }
+    if (frame->uniqueArrayBytes != 0) {
+      const double ratio = (static_cast<double>(frame->storageBytes) - static_cast<double>(frame->fogLutBytes)) /
+                           static_cast<double>(frame->uniqueArrayBytes);
+      ratioSum += ratio;
+      ratioMax = ratioRows == 0 ? ratio : std::max(ratioMax, ratio);
+      ++ratioRows;
+    }
+  }
+  const Summary fifo = summarize(std::move(fifoMs));
+  const Summary pushDraw = summarize(std::move(pushDrawMs));
+
+  std::string sections = "{";
+  for (size_t i = 0; i < CpuSectionNames.size(); ++i) {
+    sections +=
+        fmt::format("{}\"{}\": {:.3f}", i == 0 ? "" : ", ", CpuSectionNames[i], msSums[FirstSectionMs + i] / count);
+  }
+  sections += "}";
+  std::string means = "{";
+  for (size_t i = 0; i < CpuZoneCountNames.size(); ++i) {
+    means += fmt::format("{}\"{}\": {:.1f}", i == 0 ? "" : ", ", CpuZoneCountNames[i], countSums[i] / count);
+  }
+  means += "}";
+  const std::string storageRatio =
+      drawZones && ratioRows != 0
+          ? fmt::format("{{\"mean\": {:.3f}, \"max\": {:.3f}}}", ratioSum / static_cast<double>(ratioRows), ratioMax)
+          : std::string{"null"};
+
+  std::string out = "{\n";
+  out += fmt::format("    \"firstRun\": {},\n", *std::min_element(warmRuns.begin(), warmRuns.end()));
+  out += fmt::format("    \"runs\": {},\n", warmRuns.size());
+  out += fmt::format("    \"frames\": {},\n", warm.size());
+  out += fmt::format("    \"meanFifoMs\": {:.3f},\n", fifo.mean);
+  out += fmt::format("    \"p95FifoMs\": {:.3f},\n", fifo.p95);
+  out += fmt::format("    \"meanPushDrawMs\": {:.3f},\n", pushDraw.mean);
+  out += fmt::format("    \"p95PushDrawMs\": {:.3f},\n", pushDraw.p95);
+  out += fmt::format("    \"sectionMeanMs\": {},\n", sections);
+  out += fmt::format("    \"storageRatio\": {},\n", storageRatio);
+  out += fmt::format("    \"means\": {}\n", means);
+  out += "  }";
+  return out;
+}
+} // namespace
+
+std::string format_cpu_zones_json(bool drawZones, std::span<const CpuFrameZones> frames) {
+  const std::vector<uint32_t> runs = run_ids(frames);
+  if (runs.empty()) {
+    return fmt::format("{{\"drawZones\": {}, \"runs\": [], \"warm\": null}}\n", drawZones);
+  }
+
+  std::string out;
+  out += "{\n";
+  out += fmt::format("  \"drawZones\": {},\n", drawZones);
+  out += "  \"runs\": [\n";
+  for (size_t r = 0; r < runs.size(); ++r) {
+    std::vector<const CpuFrameZones*> rows;
+    std::vector<double> fifoMs;
+    std::vector<double> pushDrawMs;
+    for (const auto& frame : frames) {
+      if (frame.run == runs[r]) {
+        rows.push_back(&frame);
+        fifoMs.push_back(frame.fifoMs);
+        pushDrawMs.push_back(frame.pushDrawMs);
+      }
+    }
+    out += "    {\n";
+    out += fmt::format("      \"run\": {},\n", runs[r]);
+    out += "      \"frames\": [\n";
+    for (size_t i = 0; i < rows.size(); ++i) {
+      out += fmt::format("        {}{}\n", cpu_zone_row(*rows[i]), i + 1 == rows.size() ? "" : ",");
+    }
+    out += "      ],\n";
+    const Summary fifo = summarize(std::move(fifoMs));
+    const Summary pushDraw = summarize(std::move(pushDrawMs));
+    out += fmt::format("      \"meanFifoMs\": {:.3f},\n", fifo.mean);
+    out += fmt::format("      \"p95FifoMs\": {:.3f},\n", fifo.p95);
+    out += fmt::format("      \"meanPushDrawMs\": {:.3f},\n", pushDraw.mean);
+    out += fmt::format("      \"p95PushDrawMs\": {:.3f}\n", pushDraw.p95);
+    out += r + 1 == runs.size() ? "    }\n" : "    },\n";
+  }
+  out += "  ],\n";
+  out += fmt::format("  \"warm\": {}\n", warm_cpu_zones(drawZones, frames, runs));
+  out += "}\n";
+  return out;
+}
+
+bool check_cpu_zones(std::span<const CpuFrameZones> frames, size_t framesPerRun, bool drawZones, std::string& error) {
+  if (frames.empty()) {
+    error = "cpu zones: no frame rows";
+    return false;
+  }
+  for (const uint32_t run : run_ids(frames)) {
+    const auto rows = static_cast<size_t>(
+        std::count_if(frames.begin(), frames.end(), [run](const CpuFrameZones& frame) { return frame.run == run; }));
+    if (rows != framesPerRun) {
+      error = fmt::format("cpu zones: run {} has {} rows instead of {}", run, rows, framesPerRun);
+      return false;
+    }
+  }
+  double fifoMs = 0.0;
+  double pushDrawMs = 0.0;
+  for (const auto& frame : frames) {
+    if (frame.fifoCalls == 0) {
+      error = fmt::format("cpu zones: run {} frame {} has no FIFO calls", frame.run, frame.frame);
+      return false;
+    }
+    fifoMs += frame.fifoMs;
+    pushDrawMs += frame.pushDrawMs;
+  }
+  if (fifoMs == 0.0) {
+    error = "cpu zones: no FIFO time was measured";
+    return false;
+  }
+  if (drawZones != (pushDrawMs != 0.0)) {
+    error = drawZones ? "cpu zones: no draw time was measured" : "cpu zones: draw time was measured without draw zones";
+    return false;
+  }
+  return true;
+}
 } // namespace aurora::gxreplay

@@ -10,7 +10,8 @@ add_executable(aurora_gxreplay
 )
 target_include_directories(aurora_gxreplay PRIVATE ../../lib ../../lib/dolphin/gx)
 target_compile_definitions(aurora_gxreplay PRIVATE AURORA_ENABLE_RENDER=$<BOOL:${AURORA_ENABLE_RENDER}>)
-target_link_libraries(aurora_gxreplay PRIVATE aurora::core aurora::gx aurora::vi aurora::main absl::flat_hash_map)
+target_link_libraries(aurora_gxreplay PRIVATE aurora::core aurora::gx aurora::vi aurora::main absl::flat_hash_map
+  absl::flat_hash_set)
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_link_libraries(aurora_gxreplay PRIVATE $<LINK_GROUP:RESCAN,aurora::gx,aurora::vi,aurora::core>)
 endif ()

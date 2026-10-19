@@ -40,6 +40,8 @@ TEST(GxReplayOptions, Defaults) {
   EXPECT_FALSE(defaults.showWindow);
   EXPECT_FALSE(defaults.verbose);
   EXPECT_FALSE(defaults.gpuTimings);
+  EXPECT_FALSE(defaults.cpuZones);
+  EXPECT_FALSE(defaults.cpuDrawZones);
   EXPECT_FALSE(defaults.help);
 
   const auto parsed = parse({"demo.gxtrace", "--out", "out"});
@@ -297,6 +299,154 @@ TEST(GxReplayReport, GpuTimingUnsupported) {
   const GpuFrameTiming timings[]{{.run = 0, .frame = 0, .frameMs = 1.0}};
   EXPECT_EQ(format_gpu_timing_json(false, timings), "{\"supported\": false, \"runs\": []}\n");
   EXPECT_EQ(format_gpu_timing_json(true, {}), "{\"supported\": true, \"runs\": []}\n");
+}
+
+TEST(GxReplayOptions, CpuZoneFlags) {
+  const auto zones = parse({"demo.gxtrace", "--out", "o", "--cpu-zones"});
+  ASSERT_TRUE(zones);
+  EXPECT_TRUE(zones->cpuZones);
+  EXPECT_FALSE(zones->cpuDrawZones);
+  const auto drawZones = parse({"demo.gxtrace", "--out", "o", "--cpu-draw-zones", "--no-png"});
+  ASSERT_TRUE(drawZones);
+  EXPECT_TRUE(drawZones->cpuZones);
+  EXPECT_TRUE(drawZones->cpuDrawZones);
+  EXPECT_FALSE(drawZones->writePng);
+  EXPECT_NE(usage().find("--cpu-zones "), std::string_view::npos);
+  EXPECT_NE(usage().find("--cpu-draw-zones "), std::string_view::npos);
+}
+
+namespace {
+CpuFrameZones zone_row(uint32_t run, uint32_t frame, double fifoMs) {
+  return {.run = run, .frame = frame, .fifoMs = fifoMs, .fifoCalls = 1};
+}
+
+std::vector<CpuFrameZones> zone_rows() {
+  CpuFrameZones first{
+      .run = 0,
+      .frame = 0,
+      .fifoMs = 10.0,
+      .pushDrawMs = 4.0,
+      .arraysMs = 0.5,
+      .pipelineBuildMs = 0.25,
+      .bindGroupBuildMs = 0.125,
+      .uniformBuildMs = 1.0,
+      .fogLutMs = 0.0,
+      .fifoCalls = 3,
+      .pushDraws = 365,
+      .arrayMisses = 115,
+      .arrayBytes = 880000,
+      .pipelineBuilds = 12,
+      .bindGroupBuilds = 40,
+      .uniformBuilds = 200,
+      .fogLutPushes = 1,
+      .fogLutBytes = 17204,
+      .resolves = 130,
+      .uniqueArrayBytes = 455404,
+      .vertBytes = 1000,
+      .indexBytes = 2000,
+      .uniformBytes = 3000,
+      .storageBytes = 900000,
+  };
+  CpuFrameZones warmA = zone_row(1, 1, 1.0);
+  warmA.arraysMs = 0.5;
+  warmA.pushDraws = 10;
+  warmA.storageBytes = 1000;
+  warmA.fogLutBytes = 100;
+  warmA.uniqueArrayBytes = 450;
+  CpuFrameZones warmB = zone_row(1, 2, 3.0);
+  warmB.arraysMs = 1.5;
+  warmB.pushDraws = 21;
+  warmB.storageBytes = 600;
+  warmB.fogLutBytes = 100;
+  warmB.uniqueArrayBytes = 400;
+  return {first, zone_row(0, 1, 9.0), zone_row(1, 0, 50.0), warmA, warmB};
+}
+} // namespace
+
+TEST(GxReplayReport, CpuZonesJsonFormat) {
+  const std::vector<CpuFrameZones> rows = zone_rows();
+  const std::string json = format_cpu_zones_json(false, rows);
+  EXPECT_EQ(json.find("{\n  \"drawZones\": false,\n  \"runs\": [\n"), 0u) << json;
+  EXPECT_NE(
+      json.find("        {\"frame\": 0, \"fifoMs\": 10.000, \"pushDrawMs\": 4.000, \"arraysMs\": 0.500, "
+                "\"pipelineBuildMs\": 0.250, \"bindGroupBuildMs\": 0.125, \"uniformBuildMs\": 1.000, "
+                "\"fogLutMs\": 0.000, \"fifoCalls\": 3, \"pushDraws\": 365, \"arrayMisses\": 115, "
+                "\"arrayBytes\": 880000, \"pipelineBuilds\": 12, \"bindGroupBuilds\": 40, \"uniformBuilds\": 200, "
+                "\"fogLutPushes\": 1, \"fogLutBytes\": 17204, \"resolves\": 130, \"uniqueArrayBytes\": 455404, "
+                "\"vertBytes\": 1000, \"indexBytes\": 2000, \"uniformBytes\": 3000, \"storageBytes\": 900000},\n"),
+      std::string::npos)
+      << json;
+  EXPECT_NE(json.find("      \"meanFifoMs\": 18.000,\n      \"p95FifoMs\": 50.000,\n"), std::string::npos) << json;
+  EXPECT_NE(json.find("  \"warm\": {\n    \"firstRun\": 1,\n    \"runs\": 1,\n    \"frames\": 2,\n"
+                      "    \"meanFifoMs\": 2.000,\n    \"p95FifoMs\": 3.000,\n"),
+            std::string::npos)
+      << json;
+  EXPECT_NE(json.find("\"pushDraws\": 15.5"), std::string::npos) << json;
+  EXPECT_NE(json.find("\"sectionMeanMs\": {\"arrays\": 1.000, "), std::string::npos) << json;
+  EXPECT_NE(json.find("\"storageRatio\": null,"), std::string::npos) << json;
+  EXPECT_TRUE(json.ends_with("\"storageBytes\": 800.0}\n  }\n}\n")) << json;
+
+  const std::string drawZones = format_cpu_zones_json(true, rows);
+  EXPECT_EQ(drawZones.find("{\n  \"drawZones\": true,\n"), 0u) << drawZones;
+  EXPECT_NE(drawZones.find("\"storageRatio\": {\"mean\": 1.625, \"max\": 2.000},"), std::string::npos) << drawZones;
+}
+
+TEST(GxReplayReport, CpuZonesWarmNeedsTwoRuns) {
+  const CpuFrameZones oneRun[]{zone_row(0, 0, 1.0), zone_row(0, 1, 1.0), zone_row(0, 2, 1.0)};
+  EXPECT_TRUE(format_cpu_zones_json(false, oneRun).ends_with("  ],\n  \"warm\": null\n}\n"));
+  const CpuFrameZones coldOnly[]{zone_row(0, 0, 1.0), zone_row(0, 1, 1.0), zone_row(1, 0, 1.0)};
+  EXPECT_TRUE(format_cpu_zones_json(true, coldOnly).ends_with("  ],\n  \"warm\": null\n}\n"));
+}
+
+TEST(GxReplayReport, CpuZonesJsonEmpty) {
+  EXPECT_EQ(format_cpu_zones_json(false, {}), "{\"drawZones\": false, \"runs\": [], \"warm\": null}\n");
+  EXPECT_EQ(format_cpu_zones_json(true, {}), "{\"drawZones\": true, \"runs\": [], \"warm\": null}\n");
+}
+
+TEST(GxReplayReport, CpuZonesCheck) {
+  std::vector<CpuFrameZones> rows{zone_row(0, 0, 1.0), zone_row(0, 1, 0.0), zone_row(1, 0, 1.0), zone_row(1, 1, 1.0)};
+  std::string error = "untouched";
+  EXPECT_TRUE(check_cpu_zones(rows, 2, false, error));
+  EXPECT_EQ(error, "untouched");
+
+  EXPECT_FALSE(check_cpu_zones({}, 2, false, error));
+  EXPECT_NE(error, "untouched");
+  error.clear();
+  EXPECT_FALSE(check_cpu_zones(rows, 3, false, error));
+  EXPECT_FALSE(error.empty());
+
+  std::vector<CpuFrameZones> uneven = rows;
+  uneven.pop_back();
+  error.clear();
+  EXPECT_FALSE(check_cpu_zones(uneven, 2, false, error));
+  EXPECT_FALSE(error.empty());
+
+  std::vector<CpuFrameZones> noCalls = rows;
+  noCalls[2].fifoCalls = 0;
+  error.clear();
+  EXPECT_FALSE(check_cpu_zones(noCalls, 2, false, error));
+  EXPECT_FALSE(error.empty());
+
+  std::vector<CpuFrameZones> untimed = rows;
+  for (auto& row : untimed) {
+    row.fifoMs = 0.0;
+  }
+  error.clear();
+  EXPECT_FALSE(check_cpu_zones(untimed, 2, false, error));
+  EXPECT_FALSE(error.empty());
+
+  error.clear();
+  EXPECT_FALSE(check_cpu_zones(rows, 2, true, error));
+  EXPECT_FALSE(error.empty());
+
+  std::vector<CpuFrameZones> drawTimed = rows;
+  drawTimed[1].pushDrawMs = 0.5;
+  error = "untouched";
+  EXPECT_TRUE(check_cpu_zones(drawTimed, 2, true, error));
+  EXPECT_EQ(error, "untouched");
+  error.clear();
+  EXPECT_FALSE(check_cpu_zones(drawTimed, 2, false, error));
+  EXPECT_FALSE(error.empty());
 }
 
 TEST(GxReplayOptions, ParsesDebugView) {

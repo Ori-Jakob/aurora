@@ -445,6 +445,77 @@ TEST_F(GXDrawRouteTest, InvalidateDrawCacheForcesRebuild) {
   EXPECT_EQ(g_testUniformBuildCount, 2u);
 }
 
+TEST_F(GXDrawRouteTest, CpuZonesCountDrawWork) {
+  const CpuZoneDelta zones;
+  triangle();
+  decode();
+  fifo::invalidate_draw_cache();
+  triangle();
+  decode();
+  EXPECT_EQ(zones.calls(fifo::CpuZoneProcess), 2u);
+  EXPECT_EQ(zones.calls(fifo::CpuZonePushDraw), 2u);
+  EXPECT_EQ(gfx::g_testDrawCount, 2u);
+  EXPECT_EQ(zones.calls(fifo::CpuZonePipelineBuild), 2u);
+  EXPECT_EQ(g_testPipelineBuildCount, 2u);
+  EXPECT_EQ(zones.calls(fifo::CpuZoneUniformBuild), 2u);
+  EXPECT_EQ(g_testUniformBuildCount, 2u);
+  EXPECT_EQ(zones.calls(fifo::CpuZoneBindGroupBuild), 2u);
+  EXPECT_EQ(zones.calls(fifo::CpuZoneArrays), 0u);
+  EXPECT_EQ(zones.calls(fifo::CpuZoneFogLut), 0u);
+  for (uint8_t zone = 0; zone < fifo::CpuZoneCount; ++zone) {
+    EXPECT_EQ(zones.ns(static_cast<fifo::CpuZone>(zone)), 0u) << static_cast<int>(zone);
+  }
+}
+
+TEST_F(GXDrawRouteTest, CpuZonesSkipCachedDrawState) {
+  gfx::g_testMergeDraws = false;
+  const CpuZoneDelta zones;
+  triangle();
+  triangle();
+  triangle();
+  decode();
+  EXPECT_EQ(zones.calls(fifo::CpuZonePushDraw), 3u);
+  EXPECT_EQ(zones.calls(fifo::CpuZonePipelineBuild), 1u);
+  EXPECT_EQ(zones.calls(fifo::CpuZoneBindGroupBuild), 1u);
+  EXPECT_EQ(zones.calls(fifo::CpuZoneUniformBuild), 1u);
+  EXPECT_EQ(g_gxState.dirty, 0u);
+}
+
+TEST_F(GXDrawRouteTest, CpuZoneTimingNests) {
+  const ScopedCpuZoneTiming timing{fifo::CpuZoneTimingFifo | fifo::CpuZoneTimingDraws};
+  const CpuZoneDelta zones;
+  uint64_t iterations = 0;
+  while (iterations < 100000 && (zones.ns(fifo::CpuZoneProcess) == 0 || zones.ns(fifo::CpuZonePushDraw) == 0)) {
+    fifo::invalidate_draw_cache();
+    triangle();
+    decode();
+    ++iterations;
+  }
+  EXPECT_GT(zones.ns(fifo::CpuZoneProcess), 0u);
+  EXPECT_GT(zones.ns(fifo::CpuZonePushDraw), 0u);
+  EXPECT_EQ(zones.calls(fifo::CpuZoneProcess), iterations);
+  EXPECT_EQ(zones.calls(fifo::CpuZonePushDraw), iterations);
+  const uint64_t builds = zones.ns(fifo::CpuZonePipelineBuild) + zones.ns(fifo::CpuZoneBindGroupBuild) +
+                          zones.ns(fifo::CpuZoneUniformBuild);
+  EXPECT_LE(builds, zones.ns(fifo::CpuZonePushDraw));
+  EXPECT_LE(zones.ns(fifo::CpuZonePushDraw), zones.ns(fifo::CpuZoneProcess));
+}
+
+TEST_F(GXDrawRouteTest, CpuZoneTimingFifoOnly) {
+  const ScopedCpuZoneTiming timing{fifo::CpuZoneTimingFifo};
+  const CpuZoneDelta zones;
+  for (uint32_t i = 0; i < 100000 && zones.ns(fifo::CpuZoneProcess) == 0; ++i) {
+    fifo::invalidate_draw_cache();
+    triangle();
+    decode();
+  }
+  EXPECT_GT(zones.ns(fifo::CpuZoneProcess), 0u);
+  for (uint8_t zone = fifo::CpuZonePushDraw; zone < fifo::CpuZoneCount; ++zone) {
+    EXPECT_EQ(zones.ns(static_cast<fifo::CpuZone>(zone)), 0u) << static_cast<int>(zone);
+  }
+  EXPECT_EQ(zones.calls(fifo::CpuZonePushDraw), gfx::g_testDrawCount);
+}
+
 TEST_F(GXDrawRouteTest, RouterSeesEveryDrawOnce) {
   set_vertex_format(GX_VTXFMT1);
   alignas(32) std::array<u8, 128> storage{};
