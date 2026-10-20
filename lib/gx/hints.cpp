@@ -1,5 +1,7 @@
 #include "hints.hpp"
 
+#include "command_processor.hpp"
+
 #include <dolphin/gx/GXCommandList.h>
 
 #include <array>
@@ -486,6 +488,39 @@ bool decode(const Sink& sink, uint16_t id, Decoder& decoder) noexcept {
     return false;
   }
 }
+
+bool decode_core(uint16_t id, Decoder& decoder) noexcept {
+  ByteReader& in = decoder.in();
+  uint16_t version = 0;
+  if (!decoder.version(id_info(id).version, version)) {
+    return false;
+  }
+  if (id == GX_AURORA_SET_ARRAY_IMMUTABLE) {
+    if (!decoder.size(wire::SetArrayImmutableV1)) {
+      return false;
+    }
+    const uint64_t address = in.read<uint64_t>();
+    const uint32_t size = in.read<uint32_t>();
+    const uint8_t le = in.read<uint8_t>();
+    const uint32_t generation = in.read<uint32_t>();
+    if (!decoder.value(le <= 1, "endianness", le) ||
+        !decoder.value(address != 0 && address <= UINTPTR_MAX, "address", address) ||
+        !decoder.value(size != 0, "size", size)) {
+      return false;
+    }
+    add(id, Decoded);
+    fifo::set_array_immutable(address, size, le == 1, generation);
+    return true;
+  }
+  if (!decoder.size(wire::ReleaseArrayImmutableV1)) {
+    return false;
+  }
+  const uint64_t address = in.read<uint64_t>();
+  const uint32_t generation = in.read<uint32_t>();
+  add(id, Decoded);
+  fifo::release_array_immutable(address, generation);
+  return true;
+}
 } // namespace
 
 void set_sink(const Sink* sink) noexcept { g_sink.store(sink, std::memory_order_release); }
@@ -493,6 +528,7 @@ void set_sink(const Sink* sink) noexcept { g_sink.store(sink, std::memory_order_
 const Sink* sink() noexcept { return g_sink.load(std::memory_order_acquire); }
 
 void reset_state() noexcept {
+  fifo::reset_immutable_arrays();
   if (const Sink* current = sink(); current != nullptr && current->reset != nullptr) {
     current->reset(current->userData);
   }
@@ -506,6 +542,16 @@ void handle(uint16_t id, ByteReader& reader) noexcept {
                 reader.remaining());
   const auto payload = reader.take(payloadSize);
   add(id, Bytes, GX_AURORA_HINT_HEADER_SIZE + payloadSize);
+
+  // Core hints act without the render module, which may be off or compiled out
+  if (id == GX_AURORA_SET_ARRAY_IMMUTABLE || id == GX_AURORA_RELEASE_ARRAY_IMMUTABLE) {
+    Decoder decoder{payload};
+    if (!decode_core(id, decoder)) {
+      add(id, Malformed);
+      warn_rejected(id, decoder.fault());
+    }
+    return;
+  }
 
   const Sink* current = g_sink.load(std::memory_order_acquire);
   if (current == nullptr || !sink_handles(*current, id)) {

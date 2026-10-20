@@ -27,6 +27,24 @@ struct ArrayUploadStats {
   uint64_t changed = 0;
 };
 
+enum class ImmutableArrayMode : uint8_t { Off, On, Validate };
+
+struct ImmutableArrayStats {
+  uint64_t entries = 0;
+  uint64_t hits = 0;
+  uint64_t stages = 0;
+  uint64_t stageBytes = 0;
+  uint64_t resets = 0;
+  uint64_t epochs = 0;
+  uint64_t staleReleases = 0;
+  uint64_t overlapEvictions = 0;
+  uint64_t sizeMismatches = 0;
+  uint64_t arenaFull = 0;
+  uint64_t violations = 0;
+  uint64_t used = 0;
+  uint64_t live = 0;
+};
+
 enum CpuZone : uint8_t {
   CpuZoneProcess,
   CpuZonePushDraw,
@@ -58,10 +76,18 @@ ArrayUploadStats array_upload_stats() noexcept;
 CpuZoneStats cpu_zone_stats() noexcept;
 // Fifo times only process(), so the yardstick reads the clock a few times per frame instead of per draw
 void set_cpu_zone_timing(uint32_t timing) noexcept;
+void set_array_immutable(uint64_t address, uint32_t size, bool le, uint32_t generation) noexcept;
+void release_array_immutable(uint64_t address, uint32_t generation) noexcept;
+// Only while the FIFO is drained
+void reset_immutable_arrays() noexcept;
+void init_immutable_arrays() noexcept;
+ImmutableArrayStats immutable_array_stats() noexcept;
 
 namespace testing {
 void reset_draw_route_stats() noexcept;
 void reset_array_upload_stats() noexcept;
+void set_immutable_array_mode(ImmutableArrayMode mode) noexcept;
+void reset_immutable_array_stats() noexcept;
 } // namespace testing
 
 } // namespace aurora::gx::fifo

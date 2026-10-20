@@ -17,6 +17,7 @@
 #include "internal.hpp"
 #include "webgpu/gpu.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -30,7 +31,15 @@ AuroraConfig g_config{};
 
 // --- aurora::log_internal ---
 namespace aurora {
+std::atomic_uint32_t g_testLogWarnings{0};
+std::atomic_uint32_t g_testLogErrors{0};
+
 void log_internal(AuroraLogLevel level, const char* module, const char* message, unsigned int len) noexcept {
+  if (level == LOG_WARNING) {
+    g_testLogWarnings.fetch_add(1, std::memory_order_relaxed);
+  } else if (level == LOG_ERROR) {
+    g_testLogErrors.fetch_add(1, std::memory_order_relaxed);
+  }
   fprintf(stderr, "[%d] %s: %.*s\n", static_cast<int>(level), module, len, message);
 }
 } // namespace aurora
@@ -170,13 +179,23 @@ bool g_testStorageRanges = false;
 std::vector<uint8_t> g_testStorage;
 // Runs once a push has copied, so a test can rewrite guest memory mid-upload as the game thread can
 void (*g_testAfterStoragePush)() = nullptr;
+ResidentStorage g_testResidentStorage{};
+std::vector<detail::ResidentCopy> g_testResidentCopies;
+uint64_t g_testResidentRequest = 0;
 
 namespace testing {
+void reset_resident_stubs() noexcept {
+  g_testResidentStorage = {};
+  g_testResidentCopies.clear();
+  g_testResidentRequest = 0;
+}
+
 void reset_stub_ranges() noexcept {
   s_vertCursor = 0;
   s_idxCursor = 0;
   s_storageCursor = StorageBase;
   g_testStorage.clear();
+  reset_resident_stubs();
 }
 } // namespace testing
 
@@ -204,6 +223,13 @@ Range push_storage(const uint8_t* data, size_t length) {
     g_testAfterStoragePush();
   }
   return range;
+}
+ResidentStorage resident_storage() noexcept { return g_testResidentStorage; }
+void copy_to_resident(Range staged, uint32_t offset, uint32_t blockSize) noexcept {
+  g_testResidentCopies.push_back({staged.offset, offset, AURORA_ALIGN(staged.size, 4u), blockSize});
+}
+void request_resident_capacity(uint64_t bytes) noexcept {
+  g_testResidentRequest = std::max(g_testResidentRequest, bytes);
 }
 
 Vec2<uint32_t> get_render_target_size() noexcept { return {640, 480}; }

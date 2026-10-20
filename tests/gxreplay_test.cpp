@@ -346,6 +346,8 @@ std::vector<CpuFrameZones> zone_rows() {
       .indexBytes = 2000,
       .uniformBytes = 3000,
       .storageBytes = 900000,
+      .residentHits = 7,
+      .residentStages = 3,
   };
   CpuFrameZones warmA = zone_row(1, 1, 1.0);
   warmA.arraysMs = 0.5;
@@ -353,12 +355,14 @@ std::vector<CpuFrameZones> zone_rows() {
   warmA.storageBytes = 1000;
   warmA.fogLutBytes = 100;
   warmA.uniqueArrayBytes = 450;
+  warmA.residentHits = 3;
   CpuFrameZones warmB = zone_row(1, 2, 3.0);
   warmB.arraysMs = 1.5;
   warmB.pushDraws = 21;
   warmB.storageBytes = 600;
   warmB.fogLutBytes = 100;
   warmB.uniqueArrayBytes = 400;
+  warmB.residentHits = 5;
   return {first, zone_row(0, 1, 9.0), zone_row(1, 0, 50.0), warmA, warmB};
 }
 } // namespace
@@ -373,7 +377,8 @@ TEST(GxReplayReport, CpuZonesJsonFormat) {
                 "\"fogLutMs\": 0.000, \"fifoCalls\": 3, \"pushDraws\": 365, \"arrayMisses\": 115, "
                 "\"arrayBytes\": 880000, \"pipelineBuilds\": 12, \"bindGroupBuilds\": 40, \"uniformBuilds\": 200, "
                 "\"fogLutPushes\": 1, \"fogLutBytes\": 17204, \"resolves\": 130, \"uniqueArrayBytes\": 455404, "
-                "\"vertBytes\": 1000, \"indexBytes\": 2000, \"uniformBytes\": 3000, \"storageBytes\": 900000},\n"),
+                "\"vertBytes\": 1000, \"indexBytes\": 2000, \"uniformBytes\": 3000, \"storageBytes\": 900000, "
+                "\"residentHits\": 7, \"residentStages\": 3},\n"),
       std::string::npos)
       << json;
   EXPECT_NE(json.find("      \"meanFifoMs\": 18.000,\n      \"p95FifoMs\": 50.000,\n"), std::string::npos) << json;
@@ -384,7 +389,8 @@ TEST(GxReplayReport, CpuZonesJsonFormat) {
   EXPECT_NE(json.find("\"pushDraws\": 15.5"), std::string::npos) << json;
   EXPECT_NE(json.find("\"sectionMeanMs\": {\"arrays\": 1.000, "), std::string::npos) << json;
   EXPECT_NE(json.find("\"storageRatio\": null,"), std::string::npos) << json;
-  EXPECT_TRUE(json.ends_with("\"storageBytes\": 800.0}\n  }\n}\n")) << json;
+  EXPECT_TRUE(json.ends_with("\"storageBytes\": 800.0, \"residentHits\": 4.0, \"residentStages\": 0.0}\n  }\n}\n"))
+      << json;
 
   const std::string drawZones = format_cpu_zones_json(true, rows);
   EXPECT_EQ(drawZones.find("{\n  \"drawZones\": true,\n"), 0u) << drawZones;

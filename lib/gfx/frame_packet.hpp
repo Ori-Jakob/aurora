@@ -189,6 +189,13 @@ struct FrameOp {
 
 using RenderPassList = std::deque<RenderPass>;
 
+struct ResidentCopy {
+  uint32_t src;
+  uint32_t dst;
+  uint32_t copySize;
+  uint32_t blockSize;
+};
+
 struct FramePacket {
   RenderPassList renderPasses;
   std::deque<TextureCopy> textureCopies;
@@ -206,11 +213,15 @@ struct FramePacket {
   ByteBuffer textureUpload;
   wgpu::CommandEncoder encoder;
   std::vector<AfterSubmitCallback> afterSubmitCallbacks;
+  std::vector<ResidentCopy> residentCopies;
   std::shared_ptr<const render::detail::FrameState> renderState;
   uint64_t frameId = 0;
   uint32_t frameIndex = 0;
   size_t stagingBuffer = 0;
   StreamingSizes sizes;
+  uint32_t residentCapacity = 0;
+  uint32_t residentLimit = 0;
+  uint32_t residentEpoch = 0;
   StagingHighWater copied;
   AuroraStats stats{};
 };

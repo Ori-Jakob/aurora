@@ -387,12 +387,13 @@ HintTally demo_tally(u32 frames, bool captureOnlyBox) {
   return tally;
 }
 
-// What M3 aurora reports: the module decodes CAMERA through WIND_SOURCES and skips the rest
+// What M4 aurora reports: core hints always decode, the module decodes CAMERA through WIND_SOURCES, the rest skip
 FakeCounters observe(const HintTally& tally, bool decoding) {
   FakeCounters counters;
   for (u32 id = FirstHintId; id <= LastHintId; ++id) {
     const auto hint = static_cast<u16>(id);
-    const bool decoded = decoding && hint >= GX_AURORA_RENDER_CAMERA && hint <= GX_AURORA_RENDER_WIND_SOURCES;
+    const bool decoded = hint <= GX_AURORA_HINT_CORE_LAST ||
+                         (decoding && hint >= GX_AURORA_RENDER_CAMERA && hint <= GX_AURORA_RENDER_WIND_SOURCES);
     (decoded ? counters[hint].decoded : counters[hint].skipped) = tally.at(hint);
   }
   return counters;
@@ -494,11 +495,20 @@ TEST(RenderDemoHints, CheckIgnoresLaterMilestoneDecodes) {
   counters[GX_AURORA_SET_ARRAY_IMMUTABLE] = {.decoded = 12};
   counters[GX_AURORA_RENDER_FOG_VOLUMES] = {.decoded = 4};
   EXPECT_EQ(check(tally, true, counters, 4), std::nullopt);
-  // Decoding off still means nothing decodes, later milestones included
+  // Decoding off still means no module hint decodes, later milestones included
   const HintTally skipped = demo_tally(4, false);
   FakeCounters skippedCounters = observe(skipped, false);
   skippedCounters[GX_AURORA_RENDER_FOG_VOLUMES] = {.decoded = 4};
   EXPECT_EQ(check(skipped, false, skippedCounters, 0), "FOG_VOLUMES (0x0110): decoded with decoding off 4, emitted 4");
+}
+
+TEST(RenderDemoHints, CoreHintsDecodeWithDecodingOff) {
+  const HintTally tally = demo_tally(4, false);
+  FakeCounters counters = observe(tally, false);
+  EXPECT_EQ(counters[GX_AURORA_SET_ARRAY_IMMUTABLE].decoded, 12u);
+  EXPECT_EQ(check(tally, false, counters, 0), std::nullopt);
+  counters[GX_AURORA_SET_ARRAY_IMMUTABLE] = {.skipped = 12};
+  EXPECT_EQ(check(tally, false, counters, 0), "SET_ARRAY_IMMUTABLE (0x0050): decoded 0, emitted 12");
 }
 
 TEST(RenderDemoHints, NamesFollowTheCatalogue) {

@@ -107,12 +107,14 @@ std::optional<std::string> check_hints(const HintTally& tally, bool decoding, Co
     if (seen.decoded + seen.skipped != emitted) {
       return failure(id, "decoded + skipped", seen.decoded + seen.skipped, emitted);
     }
+    // Core hints decode without the render module
+    const bool core = id <= GX_AURORA_HINT_CORE_LAST;
     // Only the M3 decoders are pinned, so a later milestone that starts decoding another ID keeps this passing
     const bool decodedInM3 = id >= GX_AURORA_RENDER_CAMERA && id <= GX_AURORA_RENDER_WIND_SOURCES;
-    if (decoding && decodedInM3 && seen.decoded != emitted) {
+    if ((core || (decoding && decodedInM3)) && seen.decoded != emitted) {
       return failure(id, "decoded", seen.decoded, emitted);
     }
-    if (!decoding && seen.decoded != 0) {
+    if (!decoding && !core && seen.decoded != 0) {
       return failure(id, "decoded with decoding off", seen.decoded, emitted);
     }
   }

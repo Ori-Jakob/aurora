@@ -6,6 +6,8 @@
 
 #include "gx_test_common.hpp"
 #include "__gx.h"
+#include "gfx/frame_packet.hpp"
+#include "gfx/recording.hpp"
 #include "gx/guest_memory.hpp"
 #include "gx/pipeline.hpp"
 #include "gx/regs.hpp"
@@ -18,6 +20,11 @@
 #include <thread>
 
 using aurora::gx::g_gxState;
+
+namespace aurora {
+extern std::atomic_uint32_t g_testLogWarnings;
+extern std::atomic_uint32_t g_testLogErrors;
+} // namespace aurora
 
 namespace aurora::gx {
 extern uint32_t g_testPipelineBuildCount;
@@ -33,6 +40,10 @@ extern uint32_t g_testStoragePushes;
 extern bool g_testStorageRanges;
 extern std::vector<uint8_t> g_testStorage;
 extern void (*g_testAfterStoragePush)();
+extern uint32_t g_testMergedDrawCount;
+extern ResidentStorage g_testResidentStorage;
+extern std::vector<detail::ResidentCopy> g_testResidentCopies;
+extern uint64_t g_testResidentRequest;
 namespace testing {
 extern std::atomic<uint32_t> beginOffscreenCount;
 extern std::atomic<uint32_t> endOffscreenCount;
@@ -2662,6 +2673,591 @@ TEST_F(GXArrayUploadTest, UnrecordedPushIsNotKept) {
   EXPECT_EQ(array_start(GX_VA_POS), 256u);
   expect_uploaded(GX_VA_POS, a.data(), sizeof(a));
   EXPECT_EQ(aurora::gx::fifo::array_upload_stats().reused, 0u);
+}
+
+namespace {
+constexpr u32 ResidentBase = 1u << 20;
+constexpr aurora::gfx::ResidentStorage kResidentStorage{
+    .frameId = 1, .base = ResidentBase, .capacity = 1u << 20, .limit = 4u << 20, .blockAlign = 256, .epoch = 1};
+
+uint32_t sResolvedArrays = 0;
+
+std::span<const uint8_t> resolve_in_place(void*, aurora::gx::guest_memory::Kind kind, uint64_t address,
+                                          size_t size) noexcept {
+  if (kind == aurora::gx::guest_memory::Kind::VertexArray) {
+    ++sResolvedArrays;
+  }
+  return {reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(address)), size};
+}
+} // namespace
+
+class GXImmutableArrayTest : public GXArrayUploadTest {
+protected:
+  void SetUp() override {
+    GXArrayUploadTest::SetUp();
+    aurora::gfx::g_testResidentStorage = kResidentStorage;
+    warningsBefore = aurora::g_testLogWarnings.load();
+    errorsBefore = aurora::g_testLogErrors.load();
+  }
+
+  void TearDown() override {
+    aurora::gx::guest_memory::set_hooks(nullptr);
+    aurora::gx::fifo::reset_immutable_arrays();
+    aurora::gx::fifo::testing::set_immutable_array_mode(aurora::gx::fifo::ImmutableArrayMode::On);
+    aurora::gfx::testing::reset_resident_stubs();
+    GXArrayUploadTest::TearDown();
+  }
+
+  void next_frame() {
+    aurora::gx::fifo::clear_draw_cache();
+    for (auto& array : gxState().arrays) {
+      array.cachedRange = {};
+    }
+    ++aurora::gfx::g_testResidentStorage.frameId;
+  }
+
+  void declare(const void* data, u32 size, u32 generation = 1, bool le = false) {
+    GXAuroraSetArrayImmutable(data, size, le ? GX_TRUE : GX_FALSE, generation);
+    decode_fifo(capture_fifo());
+  }
+
+  void release(const void* data, u32 generation = 1) {
+    GXAuroraReleaseArrayImmutable(data, generation);
+    decode_fifo(capture_fifo());
+  }
+
+  void bind(const void* data, u32 size = sizeof(Positions)) {
+    GXSetArray(GX_VA_POS, data, size, 12, false);
+    decode_fifo(capture_fifo());
+  }
+
+  static aurora::gx::fifo::ImmutableArrayStats stats() { return aurora::gx::fifo::immutable_array_stats(); }
+  static const std::vector<aurora::gfx::detail::ResidentCopy>& copies() { return aurora::gfx::g_testResidentCopies; }
+  [[nodiscard]] uint32_t warnings() const { return aurora::g_testLogWarnings.load() - warningsBefore; }
+  [[nodiscard]] uint32_t errors() const { return aurora::g_testLogErrors.load() - errorsBefore; }
+
+  uint32_t warningsBefore = 0;
+  uint32_t errorsBefore = 0;
+};
+
+TEST_F(GXImmutableArrayTest, ResidentNextFrame) {
+  const Positions a = kArrayA;
+  declare(a.data(), sizeof(a));
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  const u32 streamed = array_start(GX_VA_POS);
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 1u);
+  expect_uploaded(GX_VA_POS, a.data(), sizeof(a));
+  ASSERT_EQ(copies().size(), 1u);
+  EXPECT_EQ(copies()[0].src, streamed);
+  EXPECT_EQ(copies()[0].dst, 0u);
+  EXPECT_EQ(copies()[0].copySize, 36u);
+  EXPECT_EQ(copies()[0].blockSize, 256u);
+  EXPECT_EQ(stats().stages, 1u);
+  EXPECT_EQ(stats().hits, 0u);
+
+  next_frame();
+  const aurora::gx::guest_memory::Hooks hooks{.resolve = resolve_in_place};
+  aurora::gx::guest_memory::set_hooks(&hooks);
+  sResolvedArrays = 0;
+  declare(a.data(), sizeof(a));
+  draw();
+  aurora::gx::guest_memory::set_hooks(nullptr);
+  EXPECT_EQ(sResolvedArrays, 0u);
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 1u);
+  EXPECT_EQ(array_start(GX_VA_POS), ResidentBase);
+  EXPECT_EQ(gxState().arrays[GX_VA_POS].cachedRange.size, sizeof(a));
+  EXPECT_EQ(storage_at(copies()[0].src, sizeof(a)), bytes_of(a.data(), sizeof(a)));
+  EXPECT_EQ(copies().size(), 1u);
+  EXPECT_EQ(stats().hits, 1u);
+  EXPECT_EQ(stats().stages, 1u);
+  EXPECT_EQ(stats().used, 256u);
+  EXPECT_EQ(stats().live, 256u);
+  EXPECT_EQ(aurora::gfx::g_testDrawCount, 2u);
+}
+
+TEST_F(GXImmutableArrayTest, NoSetThisFrameStreams) {
+  const Positions a = kArrayA;
+  declare(a.data(), sizeof(a));
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  ASSERT_EQ(copies().size(), 1u);
+
+  next_frame();
+  draw();
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 2u);
+  EXPECT_NE(array_start(GX_VA_POS), ResidentBase);
+  expect_uploaded(GX_VA_POS, a.data(), sizeof(a));
+  EXPECT_EQ(stats().hits, 0u);
+
+  next_frame();
+  declare(a.data(), sizeof(a));
+  draw();
+  EXPECT_EQ(array_start(GX_VA_POS), ResidentBase + copies()[0].dst);
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 2u);
+  EXPECT_EQ(copies().size(), 1u);
+  EXPECT_EQ(stats().hits, 1u);
+}
+
+TEST_F(GXImmutableArrayTest, GenBumpMidFrameStagesFreshBytes) {
+  Positions a = kArrayA;
+  const Positions b = kArrayB;
+  declare(a.data(), sizeof(a), 1);
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  ASSERT_EQ(copies().size(), 1u);
+  a[0] = 5.f;
+  declare(a.data(), sizeof(a), 2);
+  bind_and_draw(GX_VA_POS, b.data(), sizeof(b));
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  ASSERT_EQ(copies().size(), 2u);
+  EXPECT_EQ(copies()[1].src, array_start(GX_VA_POS));
+  EXPECT_EQ(copies()[1].dst, 0u);
+  expect_uploaded(GX_VA_POS, a.data(), sizeof(a));
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 3u);
+  EXPECT_EQ(stats().stages, 2u);
+
+  next_frame();
+  declare(a.data(), sizeof(a), 2);
+  draw();
+  EXPECT_EQ(array_start(GX_VA_POS), ResidentBase);
+  EXPECT_EQ(stats().hits, 1u);
+  EXPECT_EQ(storage_at(copies()[1].src, sizeof(a)), bytes_of(a.data(), sizeof(a)));
+}
+
+TEST_F(GXImmutableArrayTest, GenerationBumpReuploads) {
+  Positions a = kArrayA;
+  declare(a.data(), sizeof(a), 1);
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  next_frame();
+  declare(a.data(), sizeof(a), 1);
+  draw();
+  EXPECT_EQ(array_start(GX_VA_POS), ResidentBase);
+  EXPECT_EQ(stats().hits, 1u);
+
+  a[0] = 6.f;
+  next_frame();
+  declare(a.data(), sizeof(a), 2);
+  draw();
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 2u);
+  expect_uploaded(GX_VA_POS, a.data(), sizeof(a));
+  ASSERT_EQ(copies().size(), 2u);
+  EXPECT_EQ(copies()[1].src, array_start(GX_VA_POS));
+  EXPECT_EQ(copies()[1].dst, 0u);
+  EXPECT_EQ(stats().stages, 2u);
+  EXPECT_EQ(stats().used, 256u);
+  EXPECT_EQ(stats().live, 256u);
+  EXPECT_EQ(stats().entries, 1u);
+
+  next_frame();
+  declare(a.data(), sizeof(a), 2);
+  draw();
+  EXPECT_EQ(array_start(GX_VA_POS), ResidentBase);
+  EXPECT_EQ(storage_at(copies()[1].src, sizeof(a)), bytes_of(a.data(), sizeof(a)));
+  EXPECT_EQ(stats().hits, 2u);
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 2u);
+}
+
+TEST_F(GXImmutableArrayTest, IdenticalResendIsNoOp) {
+  const Positions a = kArrayA;
+  const Positions b = kArrayB;
+  declare(a.data(), sizeof(a));
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  declare(a.data(), sizeof(a));
+  bind_and_draw(GX_VA_POS, b.data(), sizeof(b));
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 2u);
+  EXPECT_EQ(aurora::gx::fifo::array_upload_stats().reused, 1u);
+  expect_uploaded(GX_VA_POS, a.data(), sizeof(a));
+
+  for (int frame = 0; frame < 3; ++frame) {
+    next_frame();
+    declare(a.data(), sizeof(a));
+    declare(a.data(), sizeof(a));
+    draw();
+    EXPECT_EQ(array_start(GX_VA_POS), ResidentBase) << frame;
+  }
+  EXPECT_EQ(stats().stages, 1u);
+  EXPECT_EQ(stats().hits, 3u);
+  EXPECT_EQ(stats().entries, 1u);
+  EXPECT_EQ(copies().size(), 1u);
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 2u);
+}
+
+TEST_F(GXImmutableArrayTest, ReleaseEvictsAnyGeneration) {
+  const Positions a = kArrayA;
+  const Positions b = kArrayB;
+  declare(a.data(), sizeof(a), 1);
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+
+  next_frame();
+  declare(a.data(), sizeof(a), 1);
+  release(a.data(), 2);
+  EXPECT_EQ(stats().entries, 0u);
+  EXPECT_EQ(stats().staleReleases, 1u);
+  EXPECT_EQ(stats().used, 0u);
+  EXPECT_EQ(warnings(), 1u);
+  draw();
+  EXPECT_NE(array_start(GX_VA_POS), ResidentBase);
+  EXPECT_EQ(stats().hits, 0u);
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 2u);
+
+  declare(a.data(), sizeof(a), 1);
+  EXPECT_EQ(stats().entries, 1u);
+  release(reinterpret_cast<const u8*>(a.data()) + 12, 1);
+  EXPECT_EQ(stats().entries, 0u);
+  EXPECT_EQ(stats().staleReleases, 1u);
+
+  release(b.data(), 1);
+  EXPECT_EQ(stats().staleReleases, 2u);
+  EXPECT_EQ(warnings(), 1u);
+}
+
+TEST_F(GXImmutableArrayTest, FreeListReuse) {
+  const Positions a = kArrayA;
+  const Positions b = kArrayB;
+  const Positions c = kArrayA;
+  declare(a.data(), sizeof(a));
+  declare(b.data(), sizeof(b));
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  bind_and_draw(GX_VA_POS, b.data(), sizeof(b));
+  ASSERT_EQ(copies().size(), 2u);
+  EXPECT_EQ(copies()[0].dst, 0u);
+  EXPECT_EQ(copies()[1].dst, 256u);
+  release(a.data());
+
+  next_frame();
+  declare(b.data(), sizeof(b));
+  declare(c.data(), sizeof(c));
+  bind_and_draw(GX_VA_POS, c.data(), sizeof(c));
+  ASSERT_EQ(copies().size(), 3u);
+  EXPECT_EQ(copies()[2].dst, copies()[0].dst);
+  EXPECT_EQ(stats().resets, 0u);
+  EXPECT_EQ(aurora::gfx::g_testResidentRequest, 0u);
+  EXPECT_EQ(stats().used, 512u);
+  EXPECT_EQ(stats().live, 512u);
+}
+
+TEST_F(GXImmutableArrayTest, OverlapEvictsAndWarnsOnce) {
+  std::array<f32, 18> shared{};
+  for (size_t i = 0; i < shared.size(); ++i) {
+    shared[i] = static_cast<f32>(i);
+  }
+  const f32* a = shared.data();
+  const f32* b = shared.data() + 3;
+  declare(a, sizeof(Positions));
+  bind_and_draw(GX_VA_POS, a, sizeof(Positions));
+  declare(b, sizeof(Positions));
+  EXPECT_EQ(stats().overlapEvictions, 1u);
+  EXPECT_EQ(stats().entries, 1u);
+  EXPECT_EQ(stats().used, 0u);
+  EXPECT_EQ(warnings(), 1u);
+
+  next_frame();
+  declare(b, sizeof(Positions));
+  draw();
+  EXPECT_NE(array_start(GX_VA_POS), ResidentBase);
+  expect_uploaded(GX_VA_POS, a, sizeof(Positions));
+  EXPECT_EQ(stats().hits, 0u);
+  EXPECT_EQ(stats().stages, 1u);
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 2u);
+
+  declare(a, sizeof(Positions));
+  EXPECT_EQ(stats().overlapEvictions, 2u);
+  EXPECT_EQ(stats().entries, 1u);
+  EXPECT_EQ(warnings(), 1u);
+}
+
+TEST_F(GXImmutableArrayTest, MismatchFallsBack) {
+  const Positions a = kArrayA;
+  declare(a.data(), sizeof(a), 1, false);
+  bind_and_draw(GX_VA_POS, a.data(), 24);
+  EXPECT_EQ(stats().sizeMismatches, 1u);
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 1u);
+
+  next_frame();
+  declare(a.data(), sizeof(a), 1, false);
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a), true);
+  EXPECT_EQ(stats().sizeMismatches, 2u);
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 2u);
+  expect_uploaded(GX_VA_POS, a.data(), sizeof(a));
+
+  next_frame();
+  declare(a.data(), sizeof(a), 1, false);
+  bind_and_draw(GX_VA_POS, a.data(), 24);
+  EXPECT_EQ(stats().sizeMismatches, 3u);
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 3u);
+  EXPECT_NE(array_start(GX_VA_POS), ResidentBase);
+  EXPECT_EQ(stats().hits, 0u);
+  EXPECT_EQ(stats().stages, 0u);
+  EXPECT_TRUE(copies().empty());
+}
+
+TEST_F(GXImmutableArrayTest, CapacityAndEpoch) {
+  const Positions a = kArrayA;
+  aurora::gfx::g_testResidentStorage.capacity = 0;
+  declare(a.data(), sizeof(a));
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  EXPECT_GE(aurora::gfx::g_testResidentRequest, 256u);
+  EXPECT_TRUE(copies().empty());
+  EXPECT_EQ(stats().stages, 0u);
+  expect_uploaded(GX_VA_POS, a.data(), sizeof(a));
+
+  next_frame();
+  aurora::gfx::g_testResidentStorage.capacity = 1u << 20;
+  aurora::gfx::g_testResidentStorage.epoch = 2;
+  declare(a.data(), sizeof(a));
+  draw();
+  ASSERT_EQ(copies().size(), 1u);
+  EXPECT_EQ(copies()[0].dst, 0u);
+
+  next_frame();
+  declare(a.data(), sizeof(a));
+  draw();
+  EXPECT_EQ(array_start(GX_VA_POS), ResidentBase);
+  const uint64_t epochs = stats().epochs;
+
+  next_frame();
+  aurora::gfx::g_testResidentStorage.epoch = 3;
+  declare(a.data(), sizeof(a));
+  draw();
+  EXPECT_EQ(stats().epochs, epochs + 1);
+  ASSERT_EQ(copies().size(), 2u);
+  EXPECT_EQ(copies()[1].dst, 0u);
+  EXPECT_EQ(copies()[1].src, array_start(GX_VA_POS));
+  EXPECT_EQ(stats().stages, 2u);
+  EXPECT_EQ(stats().used, 256u);
+}
+
+TEST_F(GXImmutableArrayTest, GrowBeforeReset) {
+  const Positions a = kArrayA;
+  const Positions b = kArrayB;
+  const Positions c = kArrayA;
+  const Positions e = kArrayB;
+  std::array<f32, 75> d{};
+  aurora::gfx::g_testResidentStorage.capacity = 512;
+  declare(a.data(), sizeof(a));
+  declare(b.data(), sizeof(b));
+  declare(c.data(), sizeof(c));
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  bind_and_draw(GX_VA_POS, b.data(), sizeof(b));
+  bind_and_draw(GX_VA_POS, c.data(), sizeof(c));
+  EXPECT_EQ(copies().size(), 2u);
+  EXPECT_EQ(aurora::gfx::g_testResidentRequest, 768u);
+  EXPECT_EQ(stats().resets, 0u);
+
+  next_frame();
+  aurora::gfx::g_testResidentStorage.capacity = 1024;
+  aurora::gfx::g_testResidentStorage.limit = 1024;
+  aurora::gfx::g_testResidentStorage.epoch = 2;
+  for (const auto* array : {&a, &b, &c, &e}) {
+    declare(array->data(), sizeof(Positions));
+  }
+  for (const auto* array : {&a, &b, &c, &e}) {
+    bind_and_draw(GX_VA_POS, array->data(), sizeof(Positions));
+  }
+  ASSERT_EQ(copies().size(), 6u);
+  EXPECT_EQ(stats().used, 1024u);
+  release(a.data());
+  release(c.data());
+  EXPECT_EQ(stats().live, 512u);
+
+  next_frame();
+  declare(b.data(), sizeof(b));
+  declare(e.data(), sizeof(e));
+  declare(d.data(), sizeof(d));
+  bind_and_draw(GX_VA_POS, d.data(), sizeof(d));
+  EXPECT_EQ(stats().resets, 1u);
+  EXPECT_EQ(aurora::gfx::g_testResidentRequest, 768u);
+  EXPECT_EQ(copies().size(), 6u);
+
+  next_frame();
+  declare(b.data(), sizeof(b));
+  declare(e.data(), sizeof(e));
+  declare(d.data(), sizeof(d));
+  bind_and_draw(GX_VA_POS, b.data(), sizeof(b));
+  bind_and_draw(GX_VA_POS, e.data(), sizeof(e));
+  bind_and_draw(GX_VA_POS, d.data(), sizeof(d));
+  ASSERT_EQ(copies().size(), 9u);
+  EXPECT_EQ(copies()[6].dst, 0u);
+  EXPECT_EQ(copies()[7].dst, 256u);
+  EXPECT_EQ(copies()[8].dst, 512u);
+  EXPECT_EQ(copies()[8].blockSize, 512u);
+  EXPECT_EQ(stats().arenaFull, 0u);
+}
+
+TEST_F(GXImmutableArrayTest, CaptureObserverBypasses) {
+  const Positions a = kArrayA;
+  declare(a.data(), sizeof(a));
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  ASSERT_EQ(copies().size(), 1u);
+  {
+    next_frame();
+    ScopedGuestHooks hooks{false};
+    declare(a.data(), sizeof(a));
+    draw();
+    next_frame();
+    declare(a.data(), sizeof(a));
+    draw();
+    EXPECT_NE(array_start(GX_VA_POS), ResidentBase);
+    expect_uploaded(GX_VA_POS, a.data(), sizeof(a));
+    ASSERT_EQ(sGuestReads.size(), 2u);
+    for (const auto& read : sGuestReads) {
+      EXPECT_EQ(read.kind, aurora::gx::guest_memory::Kind::VertexArray);
+      EXPECT_EQ(read.address, address_of(a.data()));
+    }
+  }
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 3u);
+  EXPECT_EQ(stats().hits, 0u);
+  EXPECT_EQ(copies().size(), 1u);
+
+  const uint64_t epochs = stats().epochs;
+  next_frame();
+  declare(a.data(), sizeof(a));
+  draw();
+  EXPECT_EQ(stats().epochs, epochs + 1);
+  ASSERT_EQ(copies().size(), 2u);
+  EXPECT_EQ(copies()[1].dst, 0u);
+
+  next_frame();
+  declare(a.data(), sizeof(a));
+  draw();
+  EXPECT_EQ(array_start(GX_VA_POS), ResidentBase);
+  EXPECT_EQ(stats().hits, 1u);
+}
+
+TEST_F(GXImmutableArrayTest, SurvivesInvalidateVtxCache) {
+  const Positions a = kArrayA;
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  const auto run = [&](bool declared) {
+    std::vector<u32> dirty;
+    for (int frame = 0; frame < 2; ++frame) {
+      next_frame();
+      if (declared) {
+        declare(a.data(), sizeof(a));
+      }
+      bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+      GXInvalidateVtxCache();
+      decode_fifo(capture_fifo());
+      dirty.push_back(gxState().dirty);
+      draw();
+      dirty.push_back(gxState().dirty);
+    }
+    return dirty;
+  };
+  const auto plain = run(false);
+  const auto declared = run(true);
+  EXPECT_EQ(declared, plain);
+  EXPECT_EQ(array_start(GX_VA_POS), ResidentBase);
+  EXPECT_EQ(stats().hits, 2u);
+}
+
+TEST_F(GXImmutableArrayTest, MatchesUndeclaredStream) {
+  aurora::gfx::g_testMergeDraws = true;
+  const Positions a = kArrayA;
+  const Positions b = kArrayB;
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  const auto run = [&](bool declared) {
+    std::vector<u32> seen;
+    aurora::gfx::g_testDrawCount = 0;
+    aurora::gfx::g_testMergedDrawCount = 0;
+    const auto step = [&](const void* data) {
+      if (data != nullptr) {
+        bind(data);
+      }
+      seen.push_back(gxState().dirty);
+      draw();
+    };
+    for (int frame = 0; frame < 3; ++frame) {
+      next_frame();
+      if (declared) {
+        declare(a.data(), sizeof(a));
+        declare(b.data(), sizeof(b));
+      }
+      step(a.data());
+      step(nullptr);
+      step(b.data());
+      step(a.data());
+      GXInvalidateVtxCache();
+      decode_fifo(capture_fifo());
+      step(nullptr);
+    }
+    seen.push_back(aurora::gfx::g_testDrawCount);
+    seen.push_back(aurora::gfx::g_testMergedDrawCount);
+    return seen;
+  };
+  const auto plain = run(false);
+  const auto declared = run(true);
+  EXPECT_EQ(declared, plain);
+  EXPECT_GT(stats().hits, 0u);
+  EXPECT_GT(aurora::gfx::g_testMergedDrawCount, 0u);
+}
+
+TEST_F(GXImmutableArrayTest, ModeOffUsesStreaming) {
+  aurora::gx::fifo::testing::set_immutable_array_mode(aurora::gx::fifo::ImmutableArrayMode::Off);
+  const Positions a = kArrayA;
+  declare(a.data(), sizeof(a));
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  next_frame();
+  declare(a.data(), sizeof(a));
+  draw();
+  expect_uploaded(GX_VA_POS, a.data(), sizeof(a));
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 2u);
+  EXPECT_TRUE(copies().empty());
+  EXPECT_EQ(stats().hits, 0u);
+  EXPECT_EQ(stats().stages, 0u);
+  EXPECT_EQ(aurora::gfx::g_testResidentRequest, 0u);
+}
+
+TEST_F(GXImmutableArrayTest, ValidateDetectsMutation) {
+  aurora::gx::fifo::testing::set_immutable_array_mode(aurora::gx::fifo::ImmutableArrayMode::Validate);
+  Positions a = kArrayA;
+  declare(a.data(), sizeof(a));
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  next_frame();
+  declare(a.data(), sizeof(a));
+  draw();
+  EXPECT_EQ(stats().hits, 1u);
+  EXPECT_EQ(stats().violations, 0u);
+  EXPECT_EQ(errors(), 0u);
+
+  next_frame();
+  declare(a.data(), sizeof(a));
+  a[0] = 4.f;
+  draw();
+  EXPECT_EQ(array_start(GX_VA_POS), ResidentBase);
+  EXPECT_EQ(stats().violations, 1u);
+  EXPECT_EQ(errors(), 1u);
+
+  next_frame();
+  declare(a.data(), sizeof(a));
+  draw();
+  EXPECT_EQ(array_start(GX_VA_POS), ResidentBase);
+  EXPECT_EQ(stats().violations, 2u);
+  EXPECT_EQ(errors(), 1u);
+  EXPECT_EQ(stats().hits, 3u);
+}
+
+TEST_F(GXImmutableArrayTest, OutsideRecording) {
+  const Positions a = kArrayA;
+  aurora::gfx::g_testResidentStorage.frameId = 0;
+  declare(a.data(), sizeof(a));
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  aurora::gx::fifo::clear_draw_cache();
+  gxState().arrays[GX_VA_POS].cachedRange = {};
+  declare(a.data(), sizeof(a));
+  draw();
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 2u);
+  expect_uploaded(GX_VA_POS, a.data(), sizeof(a));
+
+  aurora::gfx::g_testResidentStorage.frameId = 5;
+  aurora::gfx::g_testStorageRanges = false;
+  next_frame();
+  declare(a.data(), sizeof(a));
+  draw();
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 3u);
+  EXPECT_EQ(gxState().arrays[GX_VA_POS].cachedRange.size, 0u);
+  EXPECT_TRUE(copies().empty());
+  EXPECT_EQ(aurora::gfx::g_testResidentRequest, 0u);
+  EXPECT_EQ(stats().stages, 0u);
+  EXPECT_EQ(stats().hits, 0u);
 }
 
 TEST_F(GXFifoTest, LoadIdentity_RecognizesBothTextureMatrixSizes) {

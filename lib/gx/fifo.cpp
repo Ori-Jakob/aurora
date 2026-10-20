@@ -146,6 +146,8 @@ void init() {
   sProcessed.store(0, std::memory_order_relaxed);
   sWorkerWake.store(0, std::memory_order_relaxed);
 
+  reset_immutable_arrays();
+  init_immutable_arrays();
   start_worker();
 }
 

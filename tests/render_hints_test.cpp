@@ -238,7 +238,8 @@ TEST_F(RenderHintsTest, EveryIdCountedOnce) {
   for (const auto& [id, bytes] : hints) {
     const HintCounters counters = hint_counters(id);
     const bool decodes =
-        AURORA_ENABLE_RENDER != 0 && id >= GX_AURORA_RENDER_CAMERA && id <= GX_AURORA_RENDER_WIND_SOURCES;
+        id == GX_AURORA_SET_ARRAY_IMMUTABLE || id == GX_AURORA_RELEASE_ARRAY_IMMUTABLE ||
+        (AURORA_ENABLE_RENDER != 0 && id >= GX_AURORA_RENDER_CAMERA && id <= GX_AURORA_RENDER_WIND_SOURCES);
     EXPECT_EQ(counters.decoded, decodes ? 1u : 0u) << std::hex << id;
     EXPECT_EQ(counters.skipped, decodes ? 0u : 1u) << std::hex << id;
     EXPECT_EQ(counters.malformed, 0u) << std::hex << id;

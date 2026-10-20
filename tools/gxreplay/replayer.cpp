@@ -44,8 +44,9 @@ double elapsed_ms(Clock::time_point start, Clock::time_point end) {
 }
 
 CpuFrameZones frame_zones(uint32_t run, uint32_t frame, const gx::fifo::CpuZoneStats& before,
-                          const gx::fifo::CpuZoneStats& after, uint64_t resolves, uint64_t uniqueArrayBytes,
-                          const AuroraStats& stats) {
+                          const gx::fifo::CpuZoneStats& after, const gx::fifo::ImmutableArrayStats& residentBefore,
+                          const gx::fifo::ImmutableArrayStats& residentAfter, uint64_t resolves,
+                          uint64_t uniqueArrayBytes, const AuroraStats& stats) {
   const auto ms = [&](gx::fifo::CpuZone zone) { return static_cast<double>(after.ns[zone] - before.ns[zone]) / 1e6; };
   const auto calls = [&](gx::fifo::CpuZone zone) { return after.calls[zone] - before.calls[zone]; };
   return {
@@ -73,6 +74,8 @@ CpuFrameZones frame_zones(uint32_t run, uint32_t frame, const gx::fifo::CpuZoneS
       .indexBytes = stats.lastIndexSize,
       .uniformBytes = stats.lastUniformSize,
       .storageBytes = stats.lastStorageSize,
+      .residentHits = residentAfter.hits - residentBefore.hits,
+      .residentStages = residentAfter.stages - residentBefore.stages,
   };
 }
 
@@ -255,6 +258,7 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
   gx::hints::reset_state();
   gx::reset_texture_caches();
   m_store.reset();
+  const auto residentStart = gx::fifo::immutable_array_stats();
   if (!m_reader.rewind(error)) {
     return fail(ExitTrace, error, error);
   }
@@ -313,6 +317,7 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
 
     const uint64_t missesBefore = m_store.misses();
     const auto zonesBefore = gx::fifo::cpu_zone_stats();
+    const auto residentBefore = gx::fifo::immutable_array_stats();
     const uint64_t resolvesBefore = m_store.resolves();
     m_frameArrays.clear();
     m_uniqueArrayBytes = 0;
@@ -364,6 +369,7 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
     const auto processEnd = Clock::now();
     const uint64_t hintBytes = gx::hints::total_bytes() - hintBytesBefore;
     const auto zonesAfter = gx::fifo::cpu_zone_stats();
+    const auto residentAfter = gx::fifo::immutable_array_stats();
     const uint64_t resolvesAfter = m_store.resolves();
 
     const bool frameOk = end_frame(output && recordsOk, rgba, width, height, error);
@@ -395,8 +401,8 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
           .totalMs = elapsed_ms(frameStart, frameEnd),
       });
       if (m_options.cpuZones) {
-        out.cpuZones.push_back(frame_zones(run, index, zonesBefore, zonesAfter, resolvesAfter - resolvesBefore,
-                                           m_uniqueArrayBytes, *aurora_get_stats()));
+        out.cpuZones.push_back(frame_zones(run, index, zonesBefore, zonesAfter, residentBefore, residentAfter,
+                                           resolvesAfter - resolvesBefore, m_uniqueArrayBytes, *aurora_get_stats()));
       }
       if (m_options.gpuTimings) {
         collect_gpu_timing(run, index, out);
@@ -461,6 +467,16 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
     }
   }
   out.malformedHints = malformed_hints() - malformedBefore;
+  const auto residentEnd = gx::fifo::immutable_array_stats();
+  out.residentRuns.push_back({
+      .run = run,
+      .stages = residentEnd.stages - residentStart.stages,
+      .hits = residentEnd.hits - residentStart.hits,
+      .resets = residentEnd.resets - residentStart.resets,
+      .epochs = residentEnd.epochs - residentStart.epochs,
+      .mismatches = residentEnd.sizeMismatches - residentStart.sizeMismatches,
+      .violations = residentEnd.violations - residentStart.violations,
+  });
   return true;
 }
 

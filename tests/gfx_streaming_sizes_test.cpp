@@ -91,5 +91,38 @@ TEST(StreamingSizesTest, VertexAndIndexIndependent) {
   EXPECT_EQ(growth.sizes.index, IndexBufferSize);
   EXPECT_EQ(growth.sizes.storage, StorageBufferSize);
 }
+
+TEST(ResidentCapacityTest, NoRequestKeepsCapacity) {
+  EXPECT_EQ(next_resident_capacity(0, 0, 8 * MiB, 128 * MiB), 0u);
+  EXPECT_EQ(next_resident_capacity(2 * MiB, 0, 8 * MiB, 128 * MiB), 2 * MiB);
+  EXPECT_EQ(next_resident_capacity(2 * MiB, 2 * MiB, 8 * MiB, 128 * MiB), 2 * MiB);
+}
+
+TEST(ResidentCapacityTest, GrowsToAtLeastOneMiB) {
+  EXPECT_EQ(next_resident_capacity(0, 256, 8 * MiB, 128 * MiB), 1 * MiB);
+}
+
+TEST(ResidentCapacityTest, GrowsToTwiceTheRequestRoundedUp) {
+  EXPECT_EQ(next_resident_capacity(0, 3 * MiB, 8 * MiB, 128 * MiB), 8 * MiB);
+  EXPECT_EQ(next_resident_capacity(1 * MiB, 1 * MiB + 1, 8 * MiB, 128 * MiB), 4 * MiB);
+}
+
+TEST(ResidentCapacityTest, CappedAtAQuarterOfTheBound) {
+  EXPECT_EQ(next_resident_capacity(0, 3 * MiB, 1 * MiB, 16 * MiB), 4 * MiB);
+}
+
+TEST(ResidentCapacityTest, CappedByTheStreamingRange) {
+  EXPECT_EQ(next_resident_capacity(0, 3 * MiB, 126 * MiB, 128 * MiB), 2 * MiB);
+}
+
+TEST(ResidentCapacityTest, CappedByThirtyTwoBitOffsets) {
+  constexpr uint64_t streaming = 4 * GiB - 2 * MiB;
+  EXPECT_EQ(next_resident_capacity(0, 3 * MiB, streaming, 64 * GiB), UINT32_MAX - streaming);
+}
+
+TEST(ResidentCapacityTest, NeverShrinks) {
+  EXPECT_EQ(next_resident_capacity(8 * MiB, 9 * MiB, 124 * MiB, 128 * MiB), 8 * MiB);
+  EXPECT_EQ(next_resident_capacity(16 * MiB, 10 * MiB, 8 * MiB, 128 * MiB), 16 * MiB);
+}
 } // namespace
 } // namespace aurora::gfx::detail

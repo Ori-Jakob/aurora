@@ -1,6 +1,7 @@
 #include "command_processor.hpp"
 
 #include "../gfx/depth_peek.hpp"
+#include "../gfx/hash.hpp"
 #include "../gfx/recording.hpp"
 #include "../internal.hpp"
 #include "dolphin/gd/GDGeometry.h"
@@ -14,6 +15,8 @@
 #include "shader_info.hpp"
 #include "texture.hpp"
 
+#include <SDL3/SDL_stdinc.h>
+#include <absl/container/btree_map.h>
 #include <absl/container/flat_hash_map.h>
 #include <tracy/Tracy.hpp>
 
@@ -24,7 +27,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
+#include <optional>
 #include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -156,6 +162,38 @@ struct DrawCache {
 };
 DrawCache sDrawCache;
 
+// FIFO thread only; copies run at the end of the frame that staged them, so a freed block can be reused at once
+struct ImmutableArray {
+  u32 size = 0;
+  bool le = false;
+  u32 generation = 0;
+  u64 setFrame = 0;
+  u32 offset = 0;
+  u32 blockSize = 0;
+  u32 epoch = 0;
+  u64 stagedFrame = 0;
+  HashType hash = 0;
+  bool warned = false;
+};
+absl::btree_map<uintptr_t, ImmutableArray> g_immutableArrays;
+struct Arena {
+  u64 frameId = 0;
+  u32 gfxEpoch = 0;
+  u32 epoch = 1;
+  u32 base = 0;
+  u32 capacity = 0;
+  u32 limit = 0;
+  u32 blockAlign = 0;
+  u32 used = 0;
+  u32 live = 0;
+  absl::btree_map<u32, u32> free;
+  bool bypass = false;
+  bool reset = false;
+} g_arena;
+ImmutableArrayMode g_immutableMode = ImmutableArrayMode::On;
+bool g_warnedOverlap = false;
+bool g_warnedStaleRelease = false;
+
 std::atomic<uint64_t> g_routed{0};
 std::atomic<uint64_t> g_suppressed{0};
 std::atomic<uint64_t> g_mergeBreaks{0};
@@ -168,6 +206,16 @@ std::atomic_uint64_t g_cpuFogLutBytes{0};
 std::atomic_uint64_t g_arrayReused{0};
 std::atomic_uint64_t g_arrayReusedBytes{0};
 std::atomic_uint64_t g_arrayChanged{0};
+std::atomic_uint64_t g_residentHits{0};
+std::atomic_uint64_t g_residentStages{0};
+std::atomic_uint64_t g_residentStageBytes{0};
+std::atomic_uint64_t g_residentResets{0};
+std::atomic_uint64_t g_residentEpochs{0};
+std::atomic_uint64_t g_staleReleases{0};
+std::atomic_uint64_t g_overlapEvictions{0};
+std::atomic_uint64_t g_sizeMismatches{0};
+std::atomic_uint64_t g_arenaFull{0};
+std::atomic_uint64_t g_residentViolations{0};
 
 // Only the decoding thread writes these, so a plain add keeps lock prefixes off the per-draw path
 inline void bump(std::atomic_uint64_t& counter, uint64_t n = 1) noexcept {
@@ -260,7 +308,7 @@ absl::flat_hash_map<std::pair<const void*, u32>, ArrayUpload> sArrayUploads;
 // Staging memory is write-combined, so reuse is checked against a CPU copy of the pushed bytes
 std::vector<u8> sArrayShadow;
 
-gfx::Range upload_array(const AttrArray& array) noexcept {
+gfx::Range push_array(const AttrArray& array, std::span<const u8>* pushed = nullptr) noexcept {
   const auto bytes = guest_memory::read(guest_memory::Kind::VertexArray, array.data, array.size);
   if (bytes.empty()) {
     return gfx::push_storage(bytes.data(), bytes.size());
@@ -292,6 +340,183 @@ gfx::Range upload_array(const AttrArray& array) noexcept {
     return range;
   }
   upload.range = range;
+  if (pushed != nullptr) {
+    *pushed = {sArrayShadow.data() + upload.shadowOffset, bytes.size()};
+  }
+  return range;
+}
+
+// A cached upload may hold an earlier generation's bytes, so a stage always takes a fresh read
+gfx::Range push_array_fresh(const AttrArray& array, std::span<const u8>& pushed) noexcept {
+  sArrayUploads.erase(std::pair<const void*, u32>{array.data, array.size});
+  return push_array(array, &pushed);
+}
+
+void erase_uploads_overlapping(uintptr_t begin, uintptr_t end) noexcept {
+  absl::erase_if(sArrayUploads, [begin, end](const auto& upload) {
+    const auto data = reinterpret_cast<uintptr_t>(upload.first.first);
+    return data < end && begin < data + upload.first.second;
+  });
+}
+
+std::optional<u32> arena_alloc(u32 size) noexcept {
+  auto best = g_arena.free.end();
+  for (auto it = g_arena.free.begin(); it != g_arena.free.end(); ++it) {
+    if (it->second >= size && (best == g_arena.free.end() || it->second < best->second)) {
+      best = it;
+    }
+  }
+  if (best != g_arena.free.end()) {
+    const u32 offset = best->first;
+    const u32 remainder = best->second - size;
+    g_arena.free.erase(best);
+    if (remainder != 0) {
+      g_arena.free.emplace(offset + size, remainder);
+    }
+    return offset;
+  }
+  if (u64{g_arena.used} + size > g_arena.capacity) {
+    return std::nullopt;
+  }
+  const u32 offset = g_arena.used;
+  g_arena.used += size;
+  return offset;
+}
+
+void arena_free(u32 offset, u32 size) noexcept {
+  g_arena.live -= size;
+  auto next = g_arena.free.lower_bound(offset);
+  if (next != g_arena.free.end() && offset + size == next->first) {
+    size += next->second;
+    next = g_arena.free.erase(next);
+  }
+  if (next != g_arena.free.begin()) {
+    const auto prev = std::prev(next);
+    if (prev->first + prev->second == offset) {
+      offset = prev->first;
+      size += prev->second;
+      g_arena.free.erase(prev);
+    }
+  }
+  if (offset + size == g_arena.used) {
+    g_arena.used = offset;
+  } else {
+    g_arena.free.emplace(offset, size);
+  }
+}
+
+using ImmutableArrayIt = absl::btree_map<uintptr_t, ImmutableArray>::iterator;
+
+ImmutableArrayIt evict_immutable(ImmutableArrayIt it) noexcept {
+  const ImmutableArray& entry = it->second;
+  if (entry.epoch == g_arena.epoch) {
+    arena_free(entry.offset, entry.blockSize);
+  }
+  erase_uploads_overlapping(it->first, it->first + entry.size);
+  return g_immutableArrays.erase(it);
+}
+
+void sync_arena() noexcept {
+  const auto storage = gfx::resident_storage();
+  if (storage.frameId == g_arena.frameId) {
+    return;
+  }
+  g_arena.frameId = storage.frameId;
+  if (storage.frameId == 0) {
+    return;
+  }
+  const auto* hooks = guest_memory::g_hooks.load(std::memory_order_acquire);
+  const bool bypass = hooks != nullptr && hooks->observe != nullptr;
+  if (storage.epoch != g_arena.gfxEpoch || g_arena.reset || bypass != g_arena.bypass) {
+    ++g_arena.epoch;
+    g_arena.used = 0;
+    g_arena.live = 0;
+    g_arena.free.clear();
+    g_arena.reset = false;
+    bump(g_residentEpochs);
+  }
+  g_arena.gfxEpoch = storage.epoch;
+  g_arena.bypass = bypass;
+  g_arena.base = storage.base;
+  g_arena.capacity = storage.capacity;
+  g_arena.limit = storage.limit;
+  g_arena.blockAlign = storage.blockAlign;
+}
+
+void stage(ImmutableArray& entry, gfx::Range range, std::span<const u8> bytes) noexcept {
+  const u32 blockSize = AURORA_ALIGN(entry.size, g_arena.blockAlign);
+  if (const auto offset = arena_alloc(blockSize)) {
+    gfx::copy_to_resident(range, *offset, blockSize);
+    entry.offset = *offset;
+    entry.blockSize = blockSize;
+    entry.epoch = g_arena.epoch;
+    entry.stagedFrame = g_arena.frameId;
+    bump(g_residentStages);
+    bump(g_residentStageBytes, entry.size);
+    g_arena.live += blockSize;
+    if (g_immutableMode == ImmutableArrayMode::Validate) {
+      entry.hash = xxh3_hash_s(bytes.data(), bytes.size());
+      entry.warned = false;
+    }
+    return;
+  }
+  const u64 need = u64{g_arena.live} + blockSize;
+  if (2 * need > g_arena.capacity && g_arena.capacity < g_arena.limit) {
+    gfx::request_resident_capacity(need);
+  } else if (need <= g_arena.capacity) {
+    g_arena.reset = true;
+    bump(g_residentResets);
+  } else {
+    bump(g_arenaFull);
+  }
+}
+
+void validate_resident(const AttrArray& array, ImmutableArray& entry) noexcept {
+  const auto bytes = guest_memory::read(guest_memory::Kind::VertexArray, array.data, array.size);
+  if (xxh3_hash_s(bytes.data(), bytes.size()) == entry.hash) {
+    return;
+  }
+  bump(g_residentViolations);
+  if (!std::exchange(entry.warned, true)) {
+    Log.error("immutable array 0x{:X} ({} bytes, generation {}) changed without a new generation",
+              reinterpret_cast<uintptr_t>(array.data), array.size, entry.generation);
+  }
+}
+
+gfx::Range upload_array(const AttrArray& array) noexcept {
+  if (g_immutableMode == ImmutableArrayMode::Off || g_immutableArrays.empty()) {
+    return push_array(array);
+  }
+  sync_arena();
+  const auto it =
+      g_arena.frameId == 0 ? g_immutableArrays.end() : g_immutableArrays.find(reinterpret_cast<uintptr_t>(array.data));
+  // A declaration is trusted only in a frame that sent it, so a missed release can never serve freed memory
+  if (it == g_immutableArrays.end() || it->second.setFrame != g_arena.frameId) {
+    return push_array(array);
+  }
+  auto& entry = it->second;
+  if (entry.size != array.size || entry.le != array.le) {
+    bump(g_sizeMismatches);
+    return push_array(array);
+  }
+  if (g_arena.bypass) {
+    return push_array(array);
+  }
+  if (entry.epoch == g_arena.epoch) {
+    if (entry.stagedFrame != g_arena.frameId) {
+      bump(g_residentHits);
+      if (g_immutableMode == ImmutableArrayMode::Validate) {
+        validate_resident(array, entry);
+      }
+      return {g_arena.base + entry.offset, array.size};
+    }
+    return push_array(array);
+  }
+  std::span<const u8> pushed;
+  const auto range = push_array_fresh(array, pushed);
+  if (range.size != 0) {
+    stage(entry, range, pushed);
+  }
   return range;
 }
 
@@ -983,6 +1208,89 @@ void set_cpu_zone_timing(uint32_t timing) noexcept {
                        std::memory_order_relaxed);
 }
 
+void set_array_immutable(uint64_t address, uint32_t size, bool le, uint32_t generation) noexcept {
+  const auto begin = static_cast<uintptr_t>(address);
+  const u64 frameId = gfx::resident_storage().frameId;
+  if (const auto it = g_immutableArrays.find(begin); it != g_immutableArrays.end()) {
+    auto& entry = it->second;
+    if (entry.size == size && entry.le == le && entry.generation == generation) {
+      entry.setFrame = frameId;
+      return;
+    }
+    evict_immutable(it);
+  }
+  const uintptr_t end = begin + size;
+  auto it = g_immutableArrays.lower_bound(begin);
+  if (it != g_immutableArrays.begin() && std::prev(it)->first + std::prev(it)->second.size > begin) {
+    it = std::prev(it);
+  }
+  while (it != g_immutableArrays.end() && it->first < end) {
+    bump(g_overlapEvictions);
+    if (!std::exchange(g_warnedOverlap, true)) {
+      Log.warn("Immutable array 0x{:X} ({} bytes) overlaps the one declared at 0x{:X} ({} bytes); evicting it", begin,
+               size, it->first, it->second.size);
+    }
+    it = evict_immutable(it);
+  }
+  erase_uploads_overlapping(begin, end);
+  g_immutableArrays.emplace(begin,
+                            ImmutableArray{.size = size, .le = le, .generation = generation, .setFrame = frameId});
+}
+
+void release_array_immutable(uint64_t address, uint32_t generation) noexcept {
+  const auto at = static_cast<uintptr_t>(address);
+  auto it = g_immutableArrays.upper_bound(at);
+  if (it == g_immutableArrays.begin() || at >= std::prev(it)->first + std::prev(it)->second.size) {
+    bump(g_staleReleases);
+    return;
+  }
+  --it;
+  if (it->second.generation != generation) {
+    bump(g_staleReleases);
+    if (!std::exchange(g_warnedStaleRelease, true)) {
+      Log.warn("Immutable array 0x{:X} released as generation {} while generation {} is declared; evicting it", at,
+               generation, it->second.generation);
+    }
+  }
+  evict_immutable(it);
+}
+
+void reset_immutable_arrays() noexcept {
+  g_immutableArrays.clear();
+  g_arena.reset = true;
+  g_arena.frameId = 0;
+}
+
+void init_immutable_arrays() noexcept {
+  const char* value = SDL_getenv("AURORA_IMMUTABLE_ARRAYS");
+  const std::string_view mode = value != nullptr ? value : "";
+  if (mode == "0") {
+    g_immutableMode = ImmutableArrayMode::Off;
+  } else if (mode == "validate") {
+    g_immutableMode = ImmutableArrayMode::Validate;
+  } else {
+    g_immutableMode = ImmutableArrayMode::On;
+  }
+}
+
+ImmutableArrayStats immutable_array_stats() noexcept {
+  return {
+      .entries = g_immutableArrays.size(),
+      .hits = g_residentHits.load(std::memory_order_relaxed),
+      .stages = g_residentStages.load(std::memory_order_relaxed),
+      .stageBytes = g_residentStageBytes.load(std::memory_order_relaxed),
+      .resets = g_residentResets.load(std::memory_order_relaxed),
+      .epochs = g_residentEpochs.load(std::memory_order_relaxed),
+      .staleReleases = g_staleReleases.load(std::memory_order_relaxed),
+      .overlapEvictions = g_overlapEvictions.load(std::memory_order_relaxed),
+      .sizeMismatches = g_sizeMismatches.load(std::memory_order_relaxed),
+      .arenaFull = g_arenaFull.load(std::memory_order_relaxed),
+      .violations = g_residentViolations.load(std::memory_order_relaxed),
+      .used = g_arena.used,
+      .live = g_arena.live,
+  };
+}
+
 namespace testing {
 void reset_draw_route_stats() noexcept {
   g_routed.store(0, std::memory_order_relaxed);
@@ -995,6 +1303,18 @@ void reset_array_upload_stats() noexcept {
   g_arrayReused.store(0, std::memory_order_relaxed);
   g_arrayReusedBytes.store(0, std::memory_order_relaxed);
   g_arrayChanged.store(0, std::memory_order_relaxed);
+}
+
+void set_immutable_array_mode(ImmutableArrayMode mode) noexcept { g_immutableMode = mode; }
+
+void reset_immutable_array_stats() noexcept {
+  for (auto* counter :
+       {&g_residentHits, &g_residentStages, &g_residentStageBytes, &g_residentResets, &g_residentEpochs,
+        &g_staleReleases, &g_overlapEvictions, &g_sizeMismatches, &g_arenaFull, &g_residentViolations}) {
+    counter->store(0, std::memory_order_relaxed);
+  }
+  g_warnedOverlap = false;
+  g_warnedStaleRelease = false;
 }
 } // namespace testing
 

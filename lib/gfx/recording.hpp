@@ -22,6 +22,7 @@ void begin_recording(FramePacket& packet, size_t frameSlot);
 RecordedFrame end_recording();
 void shutdown_recording();
 void increment_merged_draw_count() noexcept;
+uint64_t take_resident_request() noexcept;
 
 namespace testing {
 struct OffscreenCacheStats {
@@ -103,6 +104,17 @@ template <typename T>
 Range push_storage(const T& data) {
   return push_storage(reinterpret_cast<const uint8_t*>(&data), sizeof(T));
 }
+struct ResidentStorage {
+  uint64_t frameId = 0;
+  uint32_t base = 0;
+  uint32_t capacity = 0;
+  uint32_t limit = 0;
+  uint32_t blockAlign = 0;
+  uint32_t epoch = 0;
+};
+ResidentStorage resident_storage() noexcept;
+void copy_to_resident(Range staged, uint32_t offset, uint32_t blockSize) noexcept;
+void request_resident_capacity(uint64_t bytes) noexcept;
 Range push_texture_data(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage);
 
 template <typename DrawData>

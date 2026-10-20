@@ -77,6 +77,17 @@ u32 header_size(const std::vector<u8>& hint) {
   return static_cast<u32>(hint[3]) << 24 | static_cast<u32>(hint[4]) << 16 | static_cast<u32>(hint[5]) << 8 | hint[6];
 }
 
+std::vector<u8> set_array_payload(u16 version, u64 address, u32 size, u8 le) {
+  std::vector<u8> out(wire::SetArrayImmutableV1);
+  wire::Writer writer{out};
+  writer.u16(version);
+  writer.u64(address);
+  writer.u32(size);
+  writer.u8(le);
+  writer.u32(1);
+  return out;
+}
+
 std::vector<AuroraLight> make_lights(size_t count) {
   std::vector<AuroraLight> lights(count);
   for (size_t i = 0; i < count; ++i) {
@@ -244,6 +255,13 @@ protected:
     EXPECT_TRUE(recorder.events.empty());
     EXPECT_EQ(hints::counters(id).malformed, times);
     EXPECT_EQ(hints::counters(id).decoded, 0u);
+  }
+
+  void expect_core_malformed(u16 id, const std::vector<u8>& payload) {
+    const uint32_t warnings = hints::testing::warnings();
+    expect_malformed(id, payload);
+    EXPECT_EQ(hints::testing::warnings(), warnings + 1);
+    EXPECT_EQ(aurora::gx::fifo::immutable_array_stats().entries, 0u);
   }
 
   HintRecorder recorder;
@@ -598,8 +616,14 @@ TEST_F(GXHintTest, ArrayImmutable_RoundTrip) {
   install();
   decode_fifo(set);
   EXPECT_TRUE(recorder.events.empty());
-  EXPECT_EQ(hints::counters(GX_AURORA_SET_ARRAY_IMMUTABLE).skipped, 1u);
+  EXPECT_EQ(hints::counters(GX_AURORA_SET_ARRAY_IMMUTABLE).decoded, 1u);
+  EXPECT_EQ(hints::counters(GX_AURORA_SET_ARRAY_IMMUTABLE).skipped, 0u);
   EXPECT_EQ(hints::counters(GX_AURORA_SET_ARRAY_IMMUTABLE).bytes, 26u);
+  EXPECT_EQ(aurora::gx::fifo::immutable_array_stats().entries, 1u);
+  decode_fifo(release);
+  EXPECT_EQ(hints::counters(GX_AURORA_RELEASE_ARRAY_IMMUTABLE).decoded, 1u);
+  EXPECT_EQ(aurora::gx::fifo::immutable_array_stats().entries, 0u);
+  EXPECT_EQ(aurora::gx::fifo::immutable_array_stats().staleReleases, 0u);
 }
 
 TEST_F(GXHintTest, GrassPatches_RoundTrip) {
@@ -739,8 +763,9 @@ TEST_F(GXHintTest, NoSinkSkipsEverything) {
   EXPECT_EQ(g_gxState.dirty, 0u);
   EXPECT_EQ(aurora::gfx::g_testDrawCount, 0u);
   for (const auto& emitter : emitter_cases()) {
-    EXPECT_EQ(hints::counters(emitter.id).skipped, 1u) << emitter.id;
-    EXPECT_EQ(hints::counters(emitter.id).decoded, 0u) << emitter.id;
+    const bool core = emitter.id <= GX_AURORA_HINT_CORE_LAST;
+    EXPECT_EQ(hints::counters(emitter.id).skipped, core ? 0u : 1u) << emitter.id;
+    EXPECT_EQ(hints::counters(emitter.id).decoded, core ? 1u : 0u) << emitter.id;
   }
 }
 
@@ -867,6 +892,38 @@ TEST_F(GXHintTest, Malformed_WarnsOncePerId) {
   const uint32_t warnings = hints::testing::warnings();
   expect_malformed(GX_AURORA_RENDER_CAMERA, hex("00 01 05"), 2);
   EXPECT_EQ(hints::testing::warnings(), warnings + 1);
+}
+
+TEST_F(GXHintTest, Malformed_SetArrayShort) {
+  auto payload = set_array_payload(1, 0x80200000, 0x90, 1);
+  payload.pop_back();
+  expect_core_malformed(GX_AURORA_SET_ARRAY_IMMUTABLE, payload);
+}
+
+TEST_F(GXHintTest, Malformed_SetArrayVersion) {
+  expect_core_malformed(GX_AURORA_SET_ARRAY_IMMUTABLE, set_array_payload(2, 0x80200000, 0x90, 1));
+}
+
+TEST_F(GXHintTest, Malformed_SetArrayEndian) {
+  expect_core_malformed(GX_AURORA_SET_ARRAY_IMMUTABLE, set_array_payload(1, 0x80200000, 0x90, 2));
+}
+
+TEST_F(GXHintTest, Malformed_SetArrayNullAddress) {
+  expect_core_malformed(GX_AURORA_SET_ARRAY_IMMUTABLE, set_array_payload(1, 0, 0x90, 1));
+}
+
+TEST_F(GXHintTest, Malformed_SetArrayEmpty) {
+  expect_core_malformed(GX_AURORA_SET_ARRAY_IMMUTABLE, set_array_payload(1, 0x80200000, 0, 1));
+}
+
+TEST_F(GXHintTest, Malformed_ReleaseArrayShort) {
+  std::vector<u8> payload(wire::ReleaseArrayImmutableV1);
+  wire::Writer writer{payload};
+  writer.u16(1);
+  writer.u64(0x80200000);
+  writer.u32(1);
+  payload.pop_back();
+  expect_core_malformed(GX_AURORA_RELEASE_ARRAY_IMMUTABLE, payload);
 }
 
 TEST_F(GXHintTest, SelfTestGarbageIsRejected) {

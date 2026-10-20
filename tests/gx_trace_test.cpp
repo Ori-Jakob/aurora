@@ -684,7 +684,10 @@ TEST_F(GXFifoTest, SelfTestTrace_ValidHintsDecode) {
        {u16{GX_AURORA_RENDER_GRASS_PATCHES}, u16{GX_AURORA_RENDER_SKY}, u16{GX_AURORA_RENDER_FOG_VOLUMES}}) {
     EXPECT_EQ(aurora::gx::hints::counters(id).skipped, Frames) << "hint 0x" << std::hex << id;
   }
-  EXPECT_EQ(aurora::gx::hints::counters(GX_AURORA_SET_ARRAY_IMMUTABLE).skipped, 5 * Frames);
+  for (const u16 id : {u16{GX_AURORA_SET_ARRAY_IMMUTABLE}, u16{GX_AURORA_RELEASE_ARRAY_IMMUTABLE}}) {
+    EXPECT_EQ(aurora::gx::hints::counters(id).decoded, Frames) << "hint 0x" << std::hex << id;
+    EXPECT_EQ(aurora::gx::hints::counters(id).malformed, 4 * Frames) << "hint 0x" << std::hex << id;
+  }
 
   ASSERT_EQ(recorder.objects.size(), 3 * Frames);
   ASSERT_EQ(recorder.stages.size(), 6 * Frames);

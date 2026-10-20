@@ -34,6 +34,7 @@ struct ReplayResult {
   std::vector<FrameTiming> timings;
   std::vector<GpuFrameTiming> gpuTimings;
   std::vector<CpuFrameZones> cpuZones;
+  std::vector<ResidentRun> residentRuns;
   uint64_t misses = 0;
   std::vector<std::vector<uint8_t>> images;
   std::vector<ClassifyFrame> classify;

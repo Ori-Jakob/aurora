@@ -480,7 +480,7 @@ if (TARGET render_demo)
             --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_smoke/streaming)
   set_tests_properties(render_demo_smoke_streaming_growth PROPERTIES LABELS smoke TIMEOUT 180
     ENVIRONMENT "AURORA_TEST_STREAMING_GROWTH=30"
-    PASS_REGULAR_EXPRESSION "Streaming buffers resized"
+    PASS_REGULAR_EXPRESSION "Streaming buffers resized: .*storage 16 MiB"
     FAIL_REGULAR_EXPRESSION "\\[(ERROR|FATAL): ")
 
   if (AURORA_ENABLE_RENDER)
@@ -519,7 +519,7 @@ if (TARGET render_demo)
       COMMAND $<TARGET_FILE:render_demo> --backend null --profile ${_profile} --frames 120 --timeout 60
               --fail-on-error --check-hints --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_hints/${_profile})
     set_tests_properties(render_demo_hints_${_profile} PROPERTIES LABELS smoke TIMEOUT 180
-      ENVIRONMENT "AURORA_RENDER_HINTS=1")
+      ENVIRONMENT "AURORA_RENDER_HINTS=1;AURORA_IMMUTABLE_ARRAYS=validate")
   endforeach ()
   add_test(NAME render_demo_hints_disabled
     COMMAND $<TARGET_FILE:render_demo> --backend null --frames 120 --timeout 60 --fail-on-error --check-hints
@@ -535,7 +535,7 @@ if (TARGET render_demo)
       COMMAND $<TARGET_FILE:render_demo> --backend null --frames 120 --timeout 60 --fail-on-error --check-hints
               --vignette --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_hints/vignette)
     set_tests_properties(render_demo_hints_vignette PROPERTIES LABELS smoke TIMEOUT 180
-      ENVIRONMENT "AURORA_RENDER_HINTS=1")
+      ENVIRONMENT "AURORA_RENDER_HINTS=1;AURORA_IMMUTABLE_ARRAYS=validate")
   endif ()
 endif ()
 
@@ -567,12 +567,19 @@ if (TARGET aurora_gxreplay)
               --data-dir ${_gxreplay_dir}/demo_data --trace ${_gxreplay_dir}/render_demo.gxtrace
               --trace-start 2 --trace-frames 4 --check-hints)
     set_tests_properties(gxreplay_render_demo_capture PROPERTIES LABELS smoke TIMEOUT 180
-      ENVIRONMENT "AURORA_RENDER_HINTS=1" FIXTURES_SETUP gxreplay_demo_trace)
+      ENVIRONMENT "AURORA_RENDER_HINTS=1;AURORA_IMMUTABLE_ARRAYS=validate" FIXTURES_SETUP gxreplay_demo_trace)
     add_test(NAME gxreplay_render_demo_replay
       COMMAND $<TARGET_FILE:aurora_gxreplay> ${_gxreplay_dir}/render_demo.gxtrace --backend null --repeat 2
               --no-png --out ${_gxreplay_dir}/render_demo_replay)
     set_tests_properties(gxreplay_render_demo_replay PROPERTIES LABELS smoke TIMEOUT 180
       ENVIRONMENT "AURORA_RENDER_HINTS=1" FIXTURES_REQUIRED gxreplay_demo_trace)
+    add_test(NAME gxreplay_render_demo_resident
+      COMMAND $<TARGET_FILE:aurora_gxreplay> ${_gxreplay_dir}/render_demo.gxtrace --backend null --repeat 2
+              --no-png --out ${_gxreplay_dir}/render_demo_resident)
+    set_tests_properties(gxreplay_render_demo_resident PROPERTIES LABELS smoke TIMEOUT 180
+      ENVIRONMENT "AURORA_RENDER_HINTS=1;AURORA_IMMUTABLE_ARRAYS=validate" FIXTURES_REQUIRED gxreplay_demo_trace
+      PASS_REGULAR_EXPRESSION "resident arrays: run 1, stages [1-9][0-9]*, hits [1-9]"
+      FAIL_REGULAR_EXPRESSION "\\[(ERROR|FATAL): |violations [1-9]")
   endif ()
   if (AURORA_ENABLE_RENDER)
     set(_classify_trace ${_gxreplay_dir}/classify/self_test_hints.gxtrace)
@@ -607,6 +614,11 @@ if (TARGET aurora_gxreplay)
               --trace ${_gxreplay_dir}/render_demo_off.gxtrace)
     set_tests_properties(gxreplay_render_demo_off_capture PROPERTIES LABELS smoke TIMEOUT 180
       ENVIRONMENT "AURORA_RENDER_HINTS=0" FIXTURES_SETUP gxreplay_demo_off_trace)
+    add_test(NAME gxreplay_render_demo_plain_resident
+      COMMAND $<TARGET_FILE:aurora_gxreplay> ${_gxreplay_dir}/render_demo_plain.gxtrace --backend null --no-png
+              --out ${_gxreplay_dir}/render_demo_plain_resident)
+    set_tests_properties(gxreplay_render_demo_plain_resident PROPERTIES LABELS smoke TIMEOUT 180
+      FIXTURES_REQUIRED gxreplay_demo_plain_trace PASS_REGULAR_EXPRESSION "resident arrays: run 0, stages 0, hits 0")
 
     set(_demo_ab ${_gxreplay_dir}/hints_ab)
     add_test(NAME gxreplay_render_demo_hints_ab_replay

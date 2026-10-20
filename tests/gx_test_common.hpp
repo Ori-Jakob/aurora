@@ -19,6 +19,9 @@ extern "C" void __GXSetDirtyState();
 
 namespace aurora::gfx {
 extern uint32_t g_testDrawCount;
+namespace testing {
+void reset_resident_stubs() noexcept;
+} // namespace testing
 } // namespace aurora::gfx
 
 // Records every decoded hint with the draw count at the time, so tests can check stream order
@@ -126,6 +129,10 @@ protected:
     aurora::gx::fifo::clear_buffer();
     aurora::gx::g_gxState = aurora::gx::GXState{};
     aurora::gfx::depth_peek::testing::reset();
+    aurora::gx::fifo::reset_immutable_arrays();
+    aurora::gx::fifo::testing::set_immutable_array_mode(aurora::gx::fifo::ImmutableArrayMode::On);
+    aurora::gx::fifo::testing::reset_immutable_array_stats();
+    aurora::gfx::testing::reset_resident_stubs();
   }
 
   void TearDown() override { aurora::gx::fifo::shutdown(); }

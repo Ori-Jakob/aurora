@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -78,6 +79,7 @@ struct FrameRecorder {
 
 FrameRecorder g_recorder;
 uint32_t g_lastRecordedUniformSize = 0;
+std::atomic_uint64_t g_residentRequest{0};
 
 std::string pass_label(std::string_view kind) {
 #ifdef AURORA_GFX_DEBUG_GROUPS
@@ -903,6 +905,8 @@ void increment_merged_draw_count() noexcept {
   }
 }
 
+uint64_t take_resident_request() noexcept { return g_residentRequest.exchange(0, std::memory_order_relaxed); }
+
 } // namespace detail
 
 void queue_texture_upload(TextureUpload upload) {
@@ -1489,6 +1493,38 @@ Range push_storage(const uint8_t* data, size_t length) {
     return {};
   }
   return push(current_frame_packet().storage, data, length, resources().limits.minStorageBufferOffsetAlignment);
+}
+
+ResidentStorage resident_storage() noexcept {
+  if (!g_recorder.active()) {
+    return {};
+  }
+  const FramePacket& frame = current_frame_packet();
+  return {
+      .frameId = frame.frameId,
+      .base = static_cast<uint32_t>(frame.sizes.storage),
+      .capacity = frame.residentCapacity,
+      .limit = frame.residentLimit,
+      .blockAlign = resources().limits.minStorageBufferOffsetAlignment,
+      .epoch = frame.residentEpoch,
+  };
+}
+
+void copy_to_resident(Range staged, uint32_t offset, uint32_t blockSize) noexcept {
+  if (!g_recorder.active()) {
+    return;
+  }
+  current_frame_packet().residentCopies.push_back({
+      .src = staged.offset,
+      .dst = offset,
+      .copySize = AURORA_ALIGN(staged.size, 4u),
+      .blockSize = blockSize,
+  });
+}
+
+void request_resident_capacity(uint64_t bytes) noexcept {
+  uint64_t current = g_residentRequest.load(std::memory_order_relaxed);
+  while (current < bytes && !g_residentRequest.compare_exchange_weak(current, bytes, std::memory_order_relaxed)) {}
 }
 
 Range push_texture_data(const uint8_t* data, u32 bytesPerRow, u32 rowsPerImage) {

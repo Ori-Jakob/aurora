@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -66,6 +67,9 @@ std::array<std::atomic<BufferMapState>, StagingBufferCount> g_mappingStates;
 std::array<StreamingSizes, StagingBufferCount> g_stagingSizes;
 StreamingSizes g_targetSizes;
 StreamingSizes g_requestedSizes;
+uint32_t g_residentCapacity = 0;
+uint32_t g_residentEpoch = 0;
+std::pair<uint64_t, uint32_t> g_lastResidentLayout{};
 uint32_t g_testGrowthFrame = 0;
 bool g_loggedStagingCap = false;
 uint32_t g_frameIndex = UINT32_MAX;
@@ -330,7 +334,7 @@ void create_static_bind_group() {
 }
 
 // Worker only, between the previous frame's submit and this frame's first encode
-void ensure_device_buffers(const StreamingSizes& sizes) {
+void ensure_device_buffers(const StreamingSizes& sizes, uint32_t residentCapacity) {
   auto& current = g_resources.deviceSizes;
   bool rebuildStaticGroup = false;
   bool resized = false;
@@ -338,31 +342,49 @@ void ensure_device_buffers(const StreamingSizes& sizes) {
     create_buffer(g_resources.vertexBuffer, VertexBufferUsage, sizes.vertex, "Shared Vertex Buffer");
     current.vertex = sizes.vertex;
     rebuildStaticGroup = true;
+    resized = true;
   }
   if (current.index < sizes.index) {
     create_buffer(g_resources.indexBuffer, IndexBufferUsage, sizes.index, "Shared Index Buffer");
     current.index = sizes.index;
     resized = true;
   }
-  if (current.storage < sizes.storage) {
-    create_buffer(g_resources.storageBuffer, StorageBufferUsage, sizes.storage, "Shared Storage Buffer");
+  if (current.storage < sizes.storage || g_resources.residentCapacity < residentCapacity) {
+    resized = resized || current.storage < sizes.storage;
+    create_buffer(g_resources.storageBuffer, StorageBufferUsage, sizes.storage + residentCapacity,
+                  "Shared Storage Buffer");
     current.storage = sizes.storage;
+    g_resources.residentCapacity = residentCapacity;
     rebuildStaticGroup = true;
   }
   if (rebuildStaticGroup) {
     create_static_bind_group();
   }
-  if (rebuildStaticGroup || resized) {
+  if (resized) {
     Log.info("Streaming buffers resized: vertex {} MiB, index {} MiB, storage {} MiB", current.vertex / MiB,
              current.index / MiB, current.storage / MiB);
+  } else if (rebuildStaticGroup) {
+    Log.info("Resident arena resized: {} MiB", g_resources.residentCapacity / MiB);
   }
 }
 
-StreamingLimits streaming_limits() noexcept {
+// Vertex and storage are bound whole in the static group; stream-out binds the index buffer whole
+uint64_t buffer_bound() noexcept {
   const auto& limits = g_resources.limits;
-  // Vertex and storage are bound whole in the static group; stream-out binds the index buffer whole
-  const uint64_t bound = std::min(limits.maxBufferSize, limits.maxStorageBufferBindingSize);
-  return {.vertex = bound, .index = bound, .storage = bound, .staging = limits.maxBufferSize};
+  return std::min(limits.maxBufferSize, limits.maxStorageBufferBindingSize);
+}
+
+uint64_t resident_limit(uint64_t streamingStorage, uint64_t bound) noexcept {
+  const auto room = [](uint64_t total, uint64_t used) { return total > used ? total - used : 0; };
+  return std::min({bound / 4, room(bound, streamingStorage), room(UINT32_MAX, streamingStorage)});
+}
+
+StreamingLimits streaming_limits() noexcept {
+  const uint64_t bound = buffer_bound();
+  return {.vertex = bound,
+          .index = bound,
+          .storage = bound - g_residentCapacity,
+          .staging = g_resources.limits.maxBufferSize};
 }
 
 uint32_t read_test_growth_frame() noexcept {
@@ -427,6 +449,15 @@ StreamingGrowth next_streaming_sizes(const StreamingSizes& current, const Aurora
     }
   }
   return growth;
+}
+
+uint32_t next_resident_capacity(uint32_t current, uint64_t request, uint64_t streamingStorage,
+                                uint64_t bound) noexcept {
+  if (request <= current) {
+    return current;
+  }
+  const uint64_t wanted = std::bit_ceil(std::max<uint64_t>(2 * request, MiB));
+  return static_cast<uint32_t>(std::max<uint64_t>(current, std::min(wanted, resident_limit(streamingStorage, bound))));
 }
 
 std::optional<RegisteredDrawType> find_runtime_draw_type(DrawTypeId id) {
@@ -595,6 +626,7 @@ void initialize() {
   create_buffer(g_resources.indexBuffer, IndexBufferUsage, g_targetSizes.index, "Shared Index Buffer");
   create_buffer(g_resources.storageBuffer, StorageBufferUsage, g_targetSizes.storage, "Shared Storage Buffer");
   g_resources.deviceSizes = g_targetSizes;
+  ++g_residentEpoch;
   for (size_t i = 0; i < g_stagingBuffers.size(); ++i) {
     create_staging_buffer(i, false);
   }
@@ -686,10 +718,13 @@ void shutdown() {
   g_resources.indexBuffer = {};
   g_resources.storageBuffer = {};
   g_resources.deviceSizes = {};
+  g_resources.residentCapacity = 0;
   g_stagingBuffers.fill({});
   g_stagingSizes.fill({});
   g_targetSizes = {};
   g_requestedSizes = {};
+  g_residentCapacity = 0;
+  take_resident_request();
   g_loggedStagingCap = false;
   for (auto& packet : g_framePackets) {
     packet = {};
@@ -773,6 +808,13 @@ bool begin_frame() {
   frame.frameIndex = g_frameIndex;
   frame.stagingBuffer = *stagingSlot;
   frame.sizes = g_targetSizes;
+  frame.residentCapacity = g_residentCapacity;
+  frame.residentLimit = static_cast<uint32_t>(resident_limit(g_targetSizes.storage, buffer_bound()));
+  if (const std::pair layout{g_targetSizes.storage, g_residentCapacity}; layout != g_lastResidentLayout) {
+    g_lastResidentLayout = layout;
+    ++g_residentEpoch;
+  }
+  frame.residentEpoch = g_residentEpoch;
   frame.renderState = render::detail::latch_frame();
   size_t bufferOffset = 0;
   const auto& stagingBuf = g_stagingBuffers[*stagingSlot];
@@ -793,14 +835,15 @@ bool begin_frame() {
 
   begin_recording(frame, frameSlot);
   begin_pipeline_frame();
-  render_worker::enqueue_begin_frame(
-      frame.frameId, [frameSlot, frameId = frame.frameId, sizes = frame.sizes, renderState = frame.renderState] {
-        ensure_device_buffers(sizes);
-        render::detail::on_worker_frame_begin(frameId, renderState.get());
-        constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "Redraw encoder"};
-        g_framePackets[frameSlot].encoder = g_device.CreateCommandEncoder(&EncoderDescriptor);
-        webgpu::gpu_prof::frame_begin(g_framePackets[frameSlot].encoder);
-      });
+  render_worker::enqueue_begin_frame(frame.frameId, [frameSlot, frameId = frame.frameId, sizes = frame.sizes,
+                                                     residentCapacity = frame.residentCapacity,
+                                                     renderState = frame.renderState] {
+    ensure_device_buffers(sizes, residentCapacity);
+    render::detail::on_worker_frame_begin(frameId, renderState.get());
+    constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "Redraw encoder"};
+    g_framePackets[frameSlot].encoder = g_device.CreateCommandEncoder(&EncoderDescriptor);
+    webgpu::gpu_prof::frame_begin(g_framePackets[frameSlot].encoder);
+  });
   g_cpuFrameStart = PresentClock::now();
   return true;
 }
@@ -826,6 +869,8 @@ void end_frame(EndFrameCallback callback) {
   }
   const auto growth = next_streaming_sizes(g_targetSizes, frame.stats, g_requestedSizes, streaming_limits());
   g_targetSizes = growth.sizes;
+  g_residentCapacity =
+      next_resident_capacity(g_residentCapacity, take_resident_request(), g_targetSizes.storage, buffer_bound());
   if (growth.stagingCapped && !std::exchange(g_loggedStagingCap, true)) {
     Log.warn("Streaming buffer growth capped: a staging slot would exceed maxBufferSize ({} MiB)",
              g_resources.limits.maxBufferSize / MiB);
@@ -836,6 +881,15 @@ void end_frame(EndFrameCallback callback) {
     auto& packet = g_framePackets[frameSlot];
     g_stagingBuffers[stagingSlot].Unmap();
     g_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
+    const uint64_t stagedStorage = staging_layout(packet.sizes).storage;
+    for (const auto& copy : packet.residentCopies) {
+      const uint64_t dst = packet.sizes.storage + copy.dst;
+      packet.encoder.CopyBufferToBuffer(g_stagingBuffers[stagingSlot], stagedStorage + copy.src,
+                                        g_resources.storageBuffer, dst, copy.copySize);
+      if (copy.blockSize > copy.copySize) {
+        packet.encoder.ClearBuffer(g_resources.storageBuffer, dst + copy.copySize, copy.blockSize - copy.copySize);
+      }
+    }
     auto encoder = std::move(packet.encoder);
     const auto stats = packet.stats;
     auto afterSubmitCallbacks = std::move(packet.afterSubmitCallbacks);

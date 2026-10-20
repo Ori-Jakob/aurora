@@ -60,6 +60,7 @@ struct StreamingGrowth {
 
 StreamingGrowth next_streaming_sizes(const StreamingSizes& current, const AuroraStats& lastFrame,
                                      const StreamingSizes& requested, const StreamingLimits& limits) noexcept;
+uint32_t next_resident_capacity(uint32_t current, uint64_t request, uint64_t streamingStorage, uint64_t bound) noexcept;
 
 struct Resources {
   wgpu::Buffer vertexBuffer;
@@ -73,6 +74,7 @@ struct Resources {
   wgpu::Limits limits;
   AuroraStats stats{};
   StreamingSizes deviceSizes;
+  uint32_t residentCapacity = 0;
 };
 
 Resources& resources() noexcept;

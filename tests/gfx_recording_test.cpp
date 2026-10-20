@@ -321,6 +321,53 @@ TEST_F(GfxRecordingTest, SubmitHooksWithoutStateAreNoOps) {
   gfx::after_frame();
 }
 
+TEST_F(GfxRecordingTest, ResidentStorageDescribesTheRecordingFrame) {
+  auto& limits = detail::resources().limits;
+  const uint32_t alignment = limits.minStorageBufferOffsetAlignment;
+  limits.minStorageBufferOffsetAlignment = 256;
+  frame.frameId = 7;
+  frame.sizes.storage = 8u << 20;
+  frame.residentCapacity = 1u << 20;
+  frame.residentLimit = 4u << 20;
+  frame.residentEpoch = 3;
+  const ResidentStorage storage = resident_storage();
+  EXPECT_EQ(storage.frameId, 7u);
+  EXPECT_EQ(storage.base, 8u << 20);
+  EXPECT_EQ(storage.capacity, 1u << 20);
+  EXPECT_EQ(storage.limit, 4u << 20);
+  EXPECT_EQ(storage.blockAlign, 256u);
+  EXPECT_EQ(storage.epoch, 3u);
+
+  copy_to_resident({.offset = 512, .size = 37}, 256, 512);
+  ASSERT_EQ(frame.residentCopies.size(), 1u);
+  EXPECT_EQ(frame.residentCopies[0].src, 512u);
+  EXPECT_EQ(frame.residentCopies[0].dst, 256u);
+  EXPECT_EQ(frame.residentCopies[0].copySize, 40u);
+  EXPECT_EQ(frame.residentCopies[0].blockSize, 512u);
+
+  finish();
+  detail::end_recording();
+  recordingActive = false;
+  const ResidentStorage outside = resident_storage();
+  EXPECT_EQ(outside.frameId, 0u);
+  EXPECT_EQ(outside.base, 0u);
+  EXPECT_EQ(outside.capacity, 0u);
+  EXPECT_EQ(outside.epoch, 0u);
+  copy_to_resident({.offset = 0, .size = 4}, 0, 256);
+  EXPECT_EQ(frame.residentCopies.size(), 1u);
+  limits.minStorageBufferOffsetAlignment = alignment;
+}
+
+TEST_F(GfxRecordingTest, ResidentRequestKeepsTheLargest) {
+  detail::take_resident_request();
+  request_resident_capacity(4096);
+  request_resident_capacity(1024);
+  request_resident_capacity(8192);
+  request_resident_capacity(2048);
+  EXPECT_EQ(detail::take_resident_request(), 8192u);
+  EXPECT_EQ(detail::take_resident_request(), 0u);
+}
+
 #if AURORA_ENABLE_RENDER
 using render::Stage;
 

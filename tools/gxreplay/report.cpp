@@ -425,10 +425,10 @@ constexpr std::array<std::string_view, 7> CpuZoneMsNames{
 constexpr std::array<std::string_view, 5> CpuSectionNames{"arrays", "pipelineBuild", "bindGroupBuild", "uniformBuild",
                                                           "fogLut"};
 constexpr size_t FirstSectionMs = 2;
-constexpr std::array<std::string_view, 15> CpuZoneCountNames{
-    "fifoCalls",        "pushDraws",     "arrayMisses",  "arrayBytes",   "pipelineBuilds",
-    "bindGroupBuilds",  "uniformBuilds", "fogLutPushes", "fogLutBytes",  "resolves",
-    "uniqueArrayBytes", "vertBytes",     "indexBytes",   "uniformBytes", "storageBytes",
+constexpr std::array<std::string_view, 17> CpuZoneCountNames{
+    "fifoCalls",     "pushDraws",    "arrayMisses",  "arrayBytes",   "pipelineBuilds",   "bindGroupBuilds",
+    "uniformBuilds", "fogLutPushes", "fogLutBytes",  "resolves",     "uniqueArrayBytes", "vertBytes",
+    "indexBytes",    "uniformBytes", "storageBytes", "residentHits", "residentStages",
 };
 
 std::array<double, CpuZoneMsNames.size()> cpu_zone_ms(const CpuFrameZones& frame) {
@@ -439,7 +439,8 @@ std::array<double, CpuZoneMsNames.size()> cpu_zone_ms(const CpuFrameZones& frame
 std::array<uint64_t, CpuZoneCountNames.size()> cpu_zone_counts(const CpuFrameZones& frame) {
   return {frame.fifoCalls,        frame.pushDraws,     frame.arrayMisses,  frame.arrayBytes,   frame.pipelineBuilds,
           frame.bindGroupBuilds,  frame.uniformBuilds, frame.fogLutPushes, frame.fogLutBytes,  frame.resolves,
-          frame.uniqueArrayBytes, frame.vertBytes,     frame.indexBytes,   frame.uniformBytes, frame.storageBytes};
+          frame.uniqueArrayBytes, frame.vertBytes,     frame.indexBytes,   frame.uniformBytes, frame.storageBytes,
+          frame.residentHits,     frame.residentStages};
 }
 
 std::string cpu_zone_row(const CpuFrameZones& frame) {

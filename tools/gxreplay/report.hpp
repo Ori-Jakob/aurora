@@ -69,6 +69,18 @@ struct CpuFrameZones {
   uint32_t indexBytes = 0;
   uint32_t uniformBytes = 0;
   uint32_t storageBytes = 0;
+  uint64_t residentHits = 0;
+  uint64_t residentStages = 0;
+};
+
+struct ResidentRun {
+  uint32_t run = 0;
+  uint64_t stages = 0;
+  uint64_t hits = 0;
+  uint64_t resets = 0;
+  uint64_t epochs = 0;
+  uint64_t mismatches = 0;
+  uint64_t violations = 0;
 };
 
 struct ReportContext {
