@@ -7,6 +7,7 @@
 #include "gx_test_common.hpp"
 #include "__gx.h"
 #include "gx/guest_memory.hpp"
+#include "gx/pipeline.hpp"
 #include "gx/regs.hpp"
 
 #include <algorithm>
@@ -18,15 +19,27 @@
 
 using aurora::gx::g_gxState;
 
+namespace aurora::gx {
+extern uint32_t g_testPipelineBuildCount;
+} // namespace aurora::gx
+
 namespace aurora::gfx {
 extern uint32_t g_testDrawCount;
 extern std::atomic<uint32_t> g_testProcessedDrawCount;
+extern gx::DrawData g_testLastDraw;
+extern bool g_testMergeDraws;
+extern uint64_t g_testPushedStorageBytes;
+extern uint32_t g_testStoragePushes;
+extern bool g_testStorageRanges;
+extern std::vector<uint8_t> g_testStorage;
+extern void (*g_testAfterStoragePush)();
 namespace testing {
 extern std::atomic<uint32_t> beginOffscreenCount;
 extern std::atomic<uint32_t> endOffscreenCount;
 extern std::atomic<uint32_t> resolvePassCount;
 extern std::atomic<uint32_t> offscreenWidth;
 extern std::atomic<uint32_t> offscreenHeight;
+void reset_stub_ranges() noexcept;
 } // namespace testing
 } // namespace aurora::gfx
 
@@ -2358,6 +2371,297 @@ TEST_F(GXFifoTest, CpuZonesSkipCachedArrayUpload) {
   EXPECT_EQ(zones.array_bytes(), 36u);
   EXPECT_EQ(zones.calls(fifo::CpuZonePushDraw), 2u);
   EXPECT_EQ(sGuestReads.size(), 1u);
+}
+
+namespace {
+using Positions = std::array<f32, 9>;
+constexpr Positions kArrayA{0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f, 0.f};
+constexpr Positions kArrayB{2.f, 2.f, 2.f, 3.f, 2.f, 2.f, 2.f, 3.f, 2.f};
+
+Positions* sRacing = nullptr;
+bool sRacingRewritten = false;
+
+std::vector<u8> bytes_of(const void* data, size_t size) {
+  const auto* bytes = static_cast<const u8*>(data);
+  return {bytes, bytes + size};
+}
+
+void pos_index_triangle() {
+  GXBegin(GX_TRIANGLES, GX_VTXFMT0, 3);
+  GXPosition1x8(0);
+  GXPosition1x8(1);
+  GXPosition1x8(2);
+  GXEnd();
+}
+} // namespace
+
+class GXArrayUploadTest : public GXFifoTest {
+protected:
+  void SetUp() override {
+    GXFifoTest::SetUp();
+    aurora::gfx::g_testStorageRanges = true;
+    aurora::gfx::g_testMergeDraws = false;
+    aurora::gfx::g_testAfterStoragePush = nullptr;
+    aurora::gfx::testing::reset_stub_ranges();
+    aurora::gx::fifo::invalidate_draw_cache();
+    aurora::gx::fifo::testing::reset_array_upload_stats();
+
+    GXClearVtxDesc();
+    GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+    GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+    decode_fifo(flush_and_capture());
+
+    aurora::gfx::g_testPushedStorageBytes = 0;
+    aurora::gfx::g_testStoragePushes = 0;
+    aurora::gfx::g_testDrawCount = 0;
+    zones = CpuZoneDelta{};
+  }
+
+  void TearDown() override {
+    aurora::gfx::g_testStorageRanges = false;
+    aurora::gfx::g_testMergeDraws = false;
+    aurora::gfx::g_testAfterStoragePush = nullptr;
+    aurora::gx::fifo::invalidate_draw_cache();
+    GXFifoTest::TearDown();
+  }
+
+  void bind_and_draw(GXAttr attr, const void* data, u32 size, bool le = false) {
+    GXSetArray(attr, data, size, 12, le);
+    pos_index_triangle();
+    decode_fifo(capture_fifo());
+  }
+
+  void draw() {
+    pos_index_triangle();
+    decode_fifo(capture_fifo());
+  }
+
+  static u32 array_start(GXAttr attr) { return aurora::gfx::g_testLastDraw.immediateData.arrayStart[attr - GX_VA_POS]; }
+
+  static std::vector<u8> storage_at(size_t offset, size_t size) {
+    const auto& storage = aurora::gfx::g_testStorage;
+    if (offset + size > storage.size()) {
+      return {};
+    }
+    return bytes_of(storage.data() + offset, size);
+  }
+
+  static std::vector<u8> uploaded(GXAttr attr, size_t size) { return storage_at(array_start(attr), size); }
+
+  void expect_uploaded(GXAttr attr, const void* data, u32 size) {
+    EXPECT_EQ(gxState().arrays[attr].cachedRange.size, size);
+    EXPECT_EQ(uploaded(attr, size), bytes_of(data, size));
+  }
+
+  CpuZoneDelta zones;
+};
+
+TEST_F(GXArrayUploadTest, ReboundArrayReusesItsUpload) {
+  aurora::gfx::g_testMergeDraws = true;
+  const Positions a = kArrayA;
+  const Positions b = kArrayB;
+
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  EXPECT_EQ(array_start(GX_VA_POS), 256u);
+  bind_and_draw(GX_VA_POS, b.data(), sizeof(b));
+  EXPECT_EQ(array_start(GX_VA_POS), 512u);
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  EXPECT_EQ(array_start(GX_VA_POS), 256u);
+  expect_uploaded(GX_VA_POS, a.data(), sizeof(a));
+
+  const auto stats = aurora::gx::fifo::array_upload_stats();
+  EXPECT_EQ(stats.reused, 1u);
+  EXPECT_EQ(stats.reusedBytes, 36u);
+  EXPECT_EQ(stats.changed, 0u);
+  EXPECT_EQ(aurora::gfx::g_testPushedStorageBytes, 72u);
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 2u);
+  EXPECT_EQ(zones.array_bytes(), 72u);
+  EXPECT_EQ(zones.calls(aurora::gx::fifo::CpuZoneArrays), 3u);
+  EXPECT_EQ(aurora::gfx::g_testDrawCount, 3u);
+}
+
+TEST_F(GXArrayUploadTest, RewrittenArrayUploadsAgain) {
+  Positions a = kArrayA;
+  const Positions b = kArrayB;
+
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  bind_and_draw(GX_VA_POS, b.data(), sizeof(b));
+  a[0] = 9.f;
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  EXPECT_EQ(array_start(GX_VA_POS), 768u);
+  EXPECT_EQ(uploaded(GX_VA_POS, sizeof(a)), bytes_of(a.data(), sizeof(a)));
+  EXPECT_EQ(aurora::gfx::g_testPushedStorageBytes, 108u);
+  EXPECT_EQ(aurora::gx::fifo::array_upload_stats().changed, 1u);
+  EXPECT_EQ(aurora::gx::fifo::array_upload_stats().reused, 0u);
+
+  bind_and_draw(GX_VA_POS, b.data(), sizeof(b));
+  EXPECT_EQ(array_start(GX_VA_POS), 512u);
+  expect_uploaded(GX_VA_POS, b.data(), sizeof(b));
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  EXPECT_EQ(array_start(GX_VA_POS), 768u);
+  expect_uploaded(GX_VA_POS, a.data(), sizeof(a));
+
+  const auto stats = aurora::gx::fifo::array_upload_stats();
+  EXPECT_EQ(stats.reused, 2u);
+  EXPECT_EQ(stats.changed, 1u);
+  EXPECT_EQ(aurora::gfx::g_testPushedStorageBytes, 108u);
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 3u);
+}
+
+TEST_F(GXArrayUploadTest, RacingRewriteAfterUploadIsNotReused) {
+  Positions racing = kArrayA;
+  const Positions original = racing;
+  const Positions b = kArrayB;
+  sRacing = &racing;
+  sRacingRewritten = false;
+  aurora::gfx::g_testAfterStoragePush = [] {
+    if (!sRacingRewritten) {
+      sRacingRewritten = true;
+      (*sRacing)[0] = 7.f;
+    }
+  };
+
+  bind_and_draw(GX_VA_POS, racing.data(), sizeof(racing));
+  EXPECT_EQ(array_start(GX_VA_POS), 256u);
+  bind_and_draw(GX_VA_POS, b.data(), sizeof(b));
+  bind_and_draw(GX_VA_POS, racing.data(), sizeof(racing));
+  EXPECT_EQ(array_start(GX_VA_POS), 768u);
+  sRacing = nullptr;
+
+  const auto stats = aurora::gx::fifo::array_upload_stats();
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 3u);
+  EXPECT_EQ(stats.changed, 1u);
+  EXPECT_EQ(stats.reused, 0u);
+  EXPECT_EQ(storage_at(256, sizeof(original)), bytes_of(original.data(), sizeof(original)));
+  EXPECT_EQ(storage_at(768, sizeof(racing)), bytes_of(racing.data(), sizeof(racing)));
+  EXPECT_NE(original[0], racing[0]);
+}
+
+TEST_F(GXArrayUploadTest, RebindStillReadsGuestMemory) {
+  const Positions a = kArrayA;
+  const Positions b = kArrayB;
+  ScopedGuestHooks hooks{false};
+
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  bind_and_draw(GX_VA_POS, b.data(), sizeof(b));
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  expect_uploaded(GX_VA_POS, a.data(), sizeof(a));
+
+  ASSERT_EQ(sGuestReads.size(), 3u);
+  const std::array<const void*, 3> expected{a.data(), b.data(), a.data()};
+  for (size_t i = 0; i < expected.size(); ++i) {
+    EXPECT_EQ(sGuestReads[i].kind, aurora::gx::guest_memory::Kind::VertexArray) << i;
+    EXPECT_EQ(sGuestReads[i].address, address_of(expected[i])) << i;
+    EXPECT_EQ(sGuestReads[i].size, 36u) << i;
+  }
+  EXPECT_EQ(aurora::gfx::g_testPushedStorageBytes, 72u);
+}
+
+TEST_F(GXArrayUploadTest, InvalidateRereadsButKeepsMatchingUpload) {
+  const Positions a = kArrayA;
+  ScopedGuestHooks hooks{false};
+
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  EXPECT_EQ(array_start(GX_VA_POS), 256u);
+  GXInvalidateVtxCache();
+  draw();
+  EXPECT_EQ(array_start(GX_VA_POS), 256u);
+  expect_uploaded(GX_VA_POS, a.data(), sizeof(a));
+
+  EXPECT_EQ(sGuestReads.size(), 2u);
+  EXPECT_EQ(aurora::gfx::g_testPushedStorageBytes, 36u);
+  EXPECT_EQ(aurora::gx::fifo::array_upload_stats().reused, 1u);
+}
+
+TEST_F(GXArrayUploadTest, DrawCacheResetDropsUploads) {
+  const Positions a = kArrayA;
+
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  EXPECT_EQ(array_start(GX_VA_POS), 256u);
+  aurora::gx::fifo::clear_draw_cache();
+  GXInvalidateVtxCache();
+  draw();
+  EXPECT_EQ(array_start(GX_VA_POS), 512u);
+  EXPECT_EQ(uploaded(GX_VA_POS, sizeof(a)), bytes_of(a.data(), sizeof(a)));
+
+  EXPECT_EQ(aurora::gfx::g_testPushedStorageBytes, 72u);
+  EXPECT_EQ(aurora::gx::fifo::array_upload_stats().reused, 0u);
+}
+
+TEST_F(GXArrayUploadTest, SameBytesUnderEitherEndianShareUpload) {
+  const Positions a = kArrayA;
+
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a), false);
+  EXPECT_EQ(array_start(GX_VA_POS), 256u);
+  const uint32_t pipelineBuilds = aurora::gx::g_testPipelineBuildCount;
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a), true);
+  EXPECT_EQ(array_start(GX_VA_POS), 256u);
+  expect_uploaded(GX_VA_POS, a.data(), sizeof(a));
+
+  EXPECT_EQ(aurora::gx::g_testPipelineBuildCount, pipelineBuilds + 1);
+  EXPECT_EQ(aurora::gfx::g_testPushedStorageBytes, 36u);
+  EXPECT_EQ(aurora::gx::fifo::array_upload_stats().reused, 1u);
+}
+
+TEST_F(GXArrayUploadTest, SharedArrayUploadsOnce) {
+  const std::array<f32, 6> st{0.f, 0.f, 1.f, 0.f, 0.f, 1.f};
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  GXSetVtxDesc(GX_VA_TEX0, GX_INDEX8);
+  GXSetVtxDesc(GX_VA_TEX1, GX_INDEX8);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX1, GX_TEX_ST, GX_F32, 0);
+  GXSetArray(GX_VA_TEX0, st.data(), sizeof(st), 8, false);
+  GXSetArray(GX_VA_TEX1, st.data(), sizeof(st), 8, false);
+  decode_fifo(flush_and_capture());
+
+  GXBegin(GX_TRIANGLES, GX_VTXFMT0, 3);
+  for (u8 i = 0; i < 3; ++i) {
+    GXPosition3f32(static_cast<f32>(i), 0.f, 0.f);
+    GXTexCoord1x8(i);
+    GXTexCoord1x8(i);
+  }
+  GXEnd();
+  decode_fifo(capture_fifo());
+
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 1u);
+  EXPECT_EQ(aurora::gfx::g_testPushedStorageBytes, 24u);
+  EXPECT_EQ(array_start(GX_VA_TEX0), 256u);
+  EXPECT_EQ(array_start(GX_VA_TEX1), 256u);
+  expect_uploaded(GX_VA_TEX1, st.data(), sizeof(st));
+  EXPECT_EQ(aurora::gx::fifo::array_upload_stats().reused, 1u);
+}
+
+TEST_F(GXArrayUploadTest, ZeroSizeArrayIsNeverKept) {
+  const Positions a = kArrayA;
+
+  bind_and_draw(GX_VA_POS, a.data(), 0);
+  draw();
+
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 2u);
+  EXPECT_EQ(zones.array_bytes(), 0u);
+  EXPECT_EQ(aurora::gx::fifo::array_upload_stats().reused, 0u);
+  EXPECT_EQ(aurora::gfx::g_testDrawCount, 2u);
+}
+
+TEST_F(GXArrayUploadTest, UnrecordedPushIsNotKept) {
+  const Positions a = kArrayA;
+  const Positions b = kArrayB;
+
+  aurora::gfx::g_testStorageRanges = false;
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  bind_and_draw(GX_VA_POS, b.data(), sizeof(b));
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  EXPECT_EQ(aurora::gfx::g_testPushedStorageBytes, 108u);
+  EXPECT_EQ(aurora::gx::fifo::array_upload_stats().reused, 0u);
+  EXPECT_EQ(zones.array_bytes(), 108u);
+
+  aurora::gfx::g_testStorageRanges = true;
+  bind_and_draw(GX_VA_POS, a.data(), sizeof(a));
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 4u);
+  EXPECT_EQ(array_start(GX_VA_POS), 256u);
+  expect_uploaded(GX_VA_POS, a.data(), sizeof(a));
+  EXPECT_EQ(aurora::gx::fifo::array_upload_stats().reused, 0u);
 }
 
 TEST_F(GXFifoTest, LoadIdentity_RecognizesBothTextureMatrixSizes) {

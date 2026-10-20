@@ -20,6 +20,13 @@ struct DrawRouteStats {
   uint64_t substituted = 0;
 };
 
+struct ArrayUploadStats {
+  uint64_t reused = 0;
+  uint64_t reusedBytes = 0;
+  // Rebinds whose bytes no longer matched the upload they would have reused
+  uint64_t changed = 0;
+};
+
 enum CpuZone : uint8_t {
   CpuZoneProcess,
   CpuZonePushDraw,
@@ -46,6 +53,7 @@ void break_draw_merge() noexcept;
 // Recording thread only: the next draw rebuilds its pipeline, bindings and uniform and cannot merge
 void invalidate_draw_cache() noexcept;
 DrawRouteStats draw_route_stats() noexcept;
+ArrayUploadStats array_upload_stats() noexcept;
 // Totals since startup; readers take deltas, so nothing resets them
 CpuZoneStats cpu_zone_stats() noexcept;
 // Fifo times only process(), so the yardstick reads the clock a few times per frame instead of per draw
@@ -53,6 +61,7 @@ void set_cpu_zone_timing(uint32_t timing) noexcept;
 
 namespace testing {
 void reset_draw_route_stats() noexcept;
+void reset_array_upload_stats() noexcept;
 } // namespace testing
 
 } // namespace aurora::gx::fifo

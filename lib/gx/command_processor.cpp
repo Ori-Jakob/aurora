@@ -14,6 +14,7 @@
 #include "shader_info.hpp"
 #include "texture.hpp"
 
+#include <absl/container/flat_hash_map.h>
 #include <tracy/Tracy.hpp>
 
 #include <algorithm>
@@ -22,7 +23,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace aurora::gx::fifo {
@@ -162,6 +165,9 @@ std::array<std::atomic_uint64_t, CpuZoneCount> g_cpuZoneCalls{};
 std::array<std::atomic_uint64_t, CpuZoneCount> g_cpuZoneNs{};
 std::atomic_uint64_t g_cpuArrayBytes{0};
 std::atomic_uint64_t g_cpuFogLutBytes{0};
+std::atomic_uint64_t g_arrayReused{0};
+std::atomic_uint64_t g_arrayReusedBytes{0};
+std::atomic_uint64_t g_arrayChanged{0};
 
 // Only the decoding thread writes these, so a plain add keeps lock prefixes off the per-draw path
 inline void bump(std::atomic_uint64_t& counter, uint64_t n = 1) noexcept {
@@ -243,6 +249,50 @@ const std::vector<f32>& resolve_fog_range_lut(const FogRangeLutKey& key) {
 gfx::Range push_fog_range_lut(const FogRangeLutKey& key) {
   const auto& lut = resolve_fog_range_lut(key);
   return gfx::push_storage(reinterpret_cast<const u8*>(lut.data()), lut.size() * sizeof(f32));
+}
+
+struct ArrayUpload {
+  gfx::Range range;
+  size_t shadowOffset = 0;
+};
+// Ranges index this frame's storage buffer, so they are dropped with the rest of the draw cache
+absl::flat_hash_map<std::pair<const void*, u32>, ArrayUpload> sArrayUploads;
+// Staging memory is write-combined, so reuse is checked against a CPU copy of the pushed bytes
+std::vector<u8> sArrayShadow;
+
+gfx::Range upload_array(const AttrArray& array) noexcept {
+  const auto bytes = guest_memory::read(guest_memory::Kind::VertexArray, array.data, array.size);
+  if (bytes.empty()) {
+    return gfx::push_storage(bytes.data(), bytes.size());
+  }
+  auto [it, inserted] = sArrayUploads.try_emplace(std::pair<const void*, u32>{array.data, array.size});
+  auto& upload = it->second;
+  if (inserted) {
+    upload.shadowOffset = sArrayShadow.size();
+    sArrayShadow.insert(sArrayShadow.end(), bytes.begin(), bytes.end());
+  } else {
+    u8* shadow = sArrayShadow.data() + upload.shadowOffset;
+    // The game may rewrite an array between binds, so only identical bytes reuse the earlier upload
+    if (std::memcmp(shadow, bytes.data(), bytes.size()) == 0) {
+      bump(g_arrayReused);
+      bump(g_arrayReusedBytes, bytes.size());
+      return upload.range;
+    }
+    bump(g_arrayChanged);
+    std::memcpy(shadow, bytes.data(), bytes.size());
+  }
+  // Live reads alias game memory, so the upload copies the shadow to stay identical to what later binds compare
+  const auto range = gfx::push_storage(sArrayShadow.data() + upload.shadowOffset, bytes.size());
+  bump(g_cpuArrayBytes, bytes.size());
+  if (range.size == 0) {
+    if (inserted) {
+      sArrayShadow.resize(upload.shadowOffset);
+    }
+    sArrayUploads.erase(it);
+    return range;
+  }
+  upload.range = range;
+  return range;
 }
 
 u8 line_mode_for_prim(GXPrimitive prim) noexcept {
@@ -446,9 +496,7 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     if (array.cachedRange.size == 0) {
       ZoneScopedN("upload array");
       const CpuZoneScope arrays{CpuZoneArrays};
-      const auto bytes = guest_memory::read(guest_memory::Kind::VertexArray, array.data, array.size);
-      array.cachedRange = gfx::push_storage(bytes.data(), bytes.size());
-      bump(g_cpuArrayBytes, bytes.size());
+      array.cachedRange = upload_array(array);
     }
     immediates.arrayStart[i - GX_VA_POS] = array.cachedRange.offset;
   }
@@ -884,6 +932,11 @@ void clear_draw_cache() noexcept {
   sDrawCache.uniformRange = {};
   sDrawCache.fogRange = {};
   sDrawCache.hasFogRange = false;
+  // clear() frees large tables, so reserving last frame's size regrows them once
+  const size_t uploads = sArrayUploads.size();
+  sArrayUploads.clear();
+  sArrayUploads.reserve(uploads);
+  sArrayShadow.clear();
 }
 
 // Failing the format check fails the whole merge test, and only push_gx_draw re-arms it
@@ -901,6 +954,14 @@ DrawRouteStats draw_route_stats() noexcept {
       .suppressed = g_suppressed.load(std::memory_order_relaxed),
       .mergeBreaks = g_mergeBreaks.load(std::memory_order_relaxed),
       .substituted = g_substituted.load(std::memory_order_relaxed),
+  };
+}
+
+ArrayUploadStats array_upload_stats() noexcept {
+  return {
+      .reused = g_arrayReused.load(std::memory_order_relaxed),
+      .reusedBytes = g_arrayReusedBytes.load(std::memory_order_relaxed),
+      .changed = g_arrayChanged.load(std::memory_order_relaxed),
   };
 }
 
@@ -928,6 +989,12 @@ void reset_draw_route_stats() noexcept {
   g_suppressed.store(0, std::memory_order_relaxed);
   g_mergeBreaks.store(0, std::memory_order_relaxed);
   g_substituted.store(0, std::memory_order_relaxed);
+}
+
+void reset_array_upload_stats() noexcept {
+  g_arrayReused.store(0, std::memory_order_relaxed);
+  g_arrayReusedBytes.store(0, std::memory_order_relaxed);
+  g_arrayChanged.store(0, std::memory_order_relaxed);
 }
 } // namespace testing
 

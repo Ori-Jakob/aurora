@@ -19,7 +19,9 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <fmt/format.h>
+#include <vector>
 
 // --- aurora::g_config ---
 namespace aurora {
@@ -142,6 +144,9 @@ namespace {
 // Offsets advance like the real frame buffers, so the merge contiguity CHECKs compare real ranges
 size_t s_vertCursor = 0;
 size_t s_idxCursor = 0;
+// An empty Range has offset 0 too, so real uploads start past it
+constexpr size_t StorageBase = 256;
+size_t s_storageCursor = StorageBase;
 
 Range push_range(size_t& cursor, size_t length, size_t alignment) {
   const size_t offset = alignment != 0 ? AURORA_ALIGN(cursor, alignment) : cursor;
@@ -157,11 +162,21 @@ ClipRect s_scissor{};
 
 uint64_t g_testPushedVertexBytes = 0;
 uint64_t g_testPushedIndexBytes = 0;
+uint64_t g_testPushedStorageBytes = 0;
+uint32_t g_testStoragePushes = 0;
+// Off by default, so older tests still read and upload every indexed array on every draw
+bool g_testStorageRanges = false;
+// Mirrors what storage pushes copied, so a test can check the bytes behind a draw's arrayStart
+std::vector<uint8_t> g_testStorage;
+// Runs once a push has copied, so a test can rewrite guest memory mid-upload as the game thread can
+void (*g_testAfterStoragePush)() = nullptr;
 
 namespace testing {
 void reset_stub_ranges() noexcept {
   s_vertCursor = 0;
   s_idxCursor = 0;
+  s_storageCursor = StorageBase;
+  g_testStorage.clear();
 }
 } // namespace testing
 
@@ -174,7 +189,22 @@ Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
   return push_range(s_idxCursor, length, alignment);
 }
 Range push_uniform(const uint8_t* data, size_t length) { return {}; }
-Range push_storage(const uint8_t* data, size_t length) { return {}; }
+Range push_storage(const uint8_t* data, size_t length) {
+  g_testPushedStorageBytes += length;
+  ++g_testStoragePushes;
+  if (!g_testStorageRanges) {
+    return {};
+  }
+  const auto range = push_range(s_storageCursor, length, 256);
+  g_testStorage.resize(s_storageCursor);
+  if (length != 0) {
+    std::memcpy(g_testStorage.data() + range.offset, data, length);
+  }
+  if (g_testAfterStoragePush != nullptr) {
+    g_testAfterStoragePush();
+  }
+  return range;
+}
 
 Vec2<uint32_t> get_render_target_size() noexcept { return {640, 480}; }
 // The recorder appends a command only when the value changes
