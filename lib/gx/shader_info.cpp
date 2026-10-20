@@ -1,8 +1,12 @@
 #include "shader_info.hpp"
 
+#include "../gfx/frame.hpp"
 #include "../gfx/recording.hpp"
 
+#include <array>
 #include <cmath>
+#include <cstring>
+#include <utility>
 
 #include <tracy/Tracy.hpp>
 
@@ -498,5 +502,56 @@ gfx::Range build_uniform(const ShaderInfo& info) noexcept {
   buf.clear();
   fill_uniform(buf, info);
   return gfx::push_uniform(buf.data(), buf.size());
+}
+
+namespace {
+struct DrawUniform {
+  ByteBuffer bytes;
+  gfx::Range range;
+  uint32_t frame = 0;
+};
+std::array<DrawUniform, DrawUniformReuseDepth> g_drawUniforms;
+ByteBuffer g_nextDrawUniform;
+size_t g_drawUniformVictim = 0;
+
+// Draws of one model share every matrix and draws of one material share the tail, so those decide most misses early
+bool same_uniform(const uint8_t* a, const uint8_t* b, size_t size, size_t matrices, size_t tail) noexcept {
+  return std::memcmp(a + matrices, b + matrices, sizeof(Mat3x4<float>)) == 0 &&
+         std::memcmp(a + tail, b + tail, size - tail) == 0 && std::memcmp(a, b, tail) == 0;
+}
+} // namespace
+
+gfx::Range build_draw_uniform(const ShaderInfo& info) noexcept {
+  ZoneScoped;
+  g_nextDrawUniform.clear();
+  fill_uniform(g_nextDrawUniform, info);
+  const size_t size = g_nextDrawUniform.size();
+  const uint32_t frame = gfx::current_frame();
+  const size_t matrices = 4 * sizeof(f32) + (info.lineMode != 0 ? 4 * sizeof(f32) : 0) + sizeof(g_gxState.proj);
+  const size_t tail = matrices + sizeof(Mat3x4<float>) * (2 * MaxPnMtx + MaxTexMtx);
+  for (size_t i = 1; i <= DrawUniformReuseDepth; ++i) {
+    const DrawUniform& entry =
+        g_drawUniforms[(g_drawUniformVictim + DrawUniformReuseDepth - i) % DrawUniformReuseDepth];
+    if (entry.range.size == size && entry.frame == frame &&
+        same_uniform(entry.bytes.data(), g_nextDrawUniform.data(), size, matrices, tail)) {
+      // Pushed blocks are never patched, so a later draw may share an earlier block's offset
+      return entry.range;
+    }
+  }
+  const gfx::Range range = gfx::push_uniform(g_nextDrawUniform.data(), size);
+  if (range.size != 0) {
+    DrawUniform& victim = g_drawUniforms[g_drawUniformVictim];
+    std::swap(victim.bytes, g_nextDrawUniform);
+    victim.range = range;
+    victim.frame = frame;
+    g_drawUniformVictim = (g_drawUniformVictim + 1) % DrawUniformReuseDepth;
+  }
+  return range;
+}
+
+void clear_draw_uniforms() noexcept {
+  for (auto& entry : g_drawUniforms) {
+    entry.range = {};
+  }
 }
 } // namespace aurora::gx

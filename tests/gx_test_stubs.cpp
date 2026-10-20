@@ -140,10 +140,11 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
 }
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept { return {}; }
 ShaderInfo build_shader_info(const ShaderConfig& config) noexcept { return {}; }
-gfx::Range build_uniform(const ShaderInfo& info) noexcept {
+gfx::Range build_draw_uniform(const ShaderInfo&) noexcept {
   ++g_testUniformBuildCount;
   return {.size = 1};
 }
+void clear_draw_uniforms() noexcept {}
 void resolve_sampled_textures(const ShaderInfo& info) noexcept {}
 } // namespace aurora::gx
 

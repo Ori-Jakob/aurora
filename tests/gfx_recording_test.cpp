@@ -7,6 +7,8 @@
 #include "gfx/texture.hpp"
 #if AURORA_ENABLE_RENDER
 #include "gfx/resources.hpp"
+#include "gx/command_processor.hpp"
+#include "gx/fifo.hpp"
 #include "gx/gx.hpp"
 #include "gx/pipeline.hpp"
 #include "gx/shader_info.hpp"
@@ -1987,6 +1989,185 @@ TEST_F(RenderViewUniform, FullUniformBufferRefusesTheView) {
   EXPECT_EQ(counts.uniformBytes, 0u);
   EXPECT_EQ(frame.uniforms.size(), 0u);
   frame.uniforms = ByteBuffer{};
+}
+
+TEST_F(RenderViewUniform, ReuseNeedsTheSameSourcePipeline) {
+  render::debug::testing::assume_variants_ready(true);
+  const gx::PipelineConfig config = pass_through_config();
+  const gx::ShaderInfo info = gx::build_shader_info(config.shaderConfig);
+  render::debug::begin_view_frame(frame_with_view(static_cast<uint16_t>(render::debug::ClassView::Role)));
+  const Range source = gx::build_uniform(info);
+  const render::scene::DrawClass cls = span_draw();
+  gx::DrawData first{};
+  first.pipeline = 77;
+  first.uniformRange = source;
+  ASSERT_TRUE(render::debug::push_view(first, config, info, cls));
+  gx::DrawData second{};
+  second.pipeline = 78;
+  second.uniformRange = source;
+  ASSERT_TRUE(render::debug::push_view(second, config, info, cls));
+  EXPECT_EQ(first.pipeline, FixedVariant);
+  EXPECT_EQ(second.pipeline, FixedVariant);
+  EXPECT_NE(second.uniformRange, first.uniformRange);
+  const render::scene::ViewCounts& counts = render::scene::view_counts();
+  EXPECT_EQ(counts.substituted, 2u);
+  EXPECT_EQ(counts.uniformBytes, 2 * align_uniform(first.uniformRange.size));
+}
+
+class GxDrawUniform : public RenderViewUniform {
+protected:
+  void SetUp() override {
+    RenderViewUniform::SetUp();
+    gx::clear_draw_uniforms();
+  }
+
+  void TearDown() override {
+    gx::clear_draw_uniforms();
+    RenderViewUniform::TearDown();
+  }
+
+  static gx::ShaderInfo draw_info() { return gx::build_shader_info(pass_through_config().shaderConfig); }
+
+  bool matches_fresh_build(Range range, const gx::ShaderInfo& info) {
+    const Range expected = gx::build_uniform(info);
+    return range.size == expected.size &&
+           std::memcmp(uniform_bytes(range), uniform_bytes(expected), expected.size) == 0;
+  }
+
+  size_t pushed_bytes() const { return frame.uniforms.size(); }
+};
+
+TEST_F(GxDrawUniform, IdenticalBytesShareOneBlock) {
+  const gx::ShaderInfo info = draw_info();
+  const Range first = gx::build_draw_uniform(info);
+  ASSERT_NE(first.size, 0u);
+  const std::array<uint8_t, 16> unrelated{1, 2, 3, 4};
+  push_uniform(unrelated.data(), unrelated.size());
+  const size_t before = pushed_bytes();
+  EXPECT_EQ(gx::build_draw_uniform(info), first);
+  EXPECT_EQ(pushed_bytes(), before);
+}
+
+TEST_F(GxDrawUniform, ChangedBytesPushAgain) {
+  const gx::ShaderInfo info = draw_info();
+  const Range first = gx::build_draw_uniform(info);
+  gx::g_gxState.pnMtx[0].pos.m0[1] += 1.f;
+  const size_t before = pushed_bytes();
+  const Range second = gx::build_draw_uniform(info);
+  EXPECT_NE(second, first);
+  EXPECT_GT(pushed_bytes(), before);
+  EXPECT_TRUE(matches_fresh_build(second, info));
+}
+
+TEST_F(GxDrawUniform, EarlierBlockInRingIsReused) {
+  if constexpr (gx::DrawUniformReuseDepth < 2) {
+    GTEST_SKIP() << "the ring holds only the newest block";
+  }
+  const gx::ShaderInfo info = draw_info();
+  const Range a = gx::build_draw_uniform(info);
+  gx::g_gxState.pnMtx[0].pos.m0[1] += 1.f;
+  const Range b = gx::build_draw_uniform(info);
+  gx::g_gxState.pnMtx[0].pos.m0[1] -= 1.f;
+  ASSERT_NE(b, a);
+  const size_t before = pushed_bytes();
+  EXPECT_EQ(gx::build_draw_uniform(info), a);
+  EXPECT_EQ(pushed_bytes(), before);
+}
+
+TEST_F(GxDrawUniform, RingIsBounded) {
+  const gx::ShaderInfo info = draw_info();
+  std::vector<Range> ranges;
+  for (size_t i = 0; i <= gx::DrawUniformReuseDepth; ++i) {
+    gx::g_gxState.pnMtx[0].pos.m0[1] = static_cast<float>(i);
+    const size_t before = pushed_bytes();
+    ranges.push_back(gx::build_draw_uniform(info));
+    EXPECT_GT(pushed_bytes(), before) << "block " << i;
+  }
+  gx::g_gxState.pnMtx[0].pos.m0[1] = 0.f;
+  const size_t before = pushed_bytes();
+  const Range again = gx::build_draw_uniform(info);
+  EXPECT_GT(pushed_bytes(), before);
+  EXPECT_TRUE(std::ranges::find(ranges, again) == ranges.end());
+  EXPECT_TRUE(matches_fresh_build(again, info));
+}
+
+TEST_F(GxDrawUniform, ClearDrawCacheForgetsBlocks) {
+  const gx::ShaderInfo info = draw_info();
+  const Range first = gx::build_draw_uniform(info);
+  gx::fifo::clear_draw_cache();
+  const size_t before = pushed_bytes();
+  EXPECT_NE(gx::build_draw_uniform(info), first);
+  EXPECT_GT(pushed_bytes(), before);
+}
+
+TEST_F(GxDrawUniform, InvalidateDrawCacheForgetsBlocks) {
+  const gx::ShaderInfo info = draw_info();
+  const Range first = gx::build_draw_uniform(info);
+  gx::fifo::invalidate_draw_cache();
+  const size_t before = pushed_bytes();
+  EXPECT_NE(gx::build_draw_uniform(info), first);
+  EXPECT_GT(pushed_bytes(), before);
+}
+
+TEST_F(GxDrawUniform, FrameEndStartsTheNextPacketClean) {
+  const gx::ShaderInfo info = draw_info();
+  const std::vector<uint8_t> filler(512, 0xAB);
+  push_uniform(filler.data(), filler.size());
+  const Range first = gx::build_draw_uniform(info);
+  ASSERT_GE(first.offset, 512u);
+  gx::fifo::end_frame();
+  next_frame();
+  const uint32_t begin = align_uniform(static_cast<uint32_t>(pushed_bytes()));
+  const Range second = gx::build_draw_uniform(info);
+  EXPECT_EQ(second.offset, begin);
+  EXPECT_EQ(second.size, first.size);
+  EXPECT_TRUE(matches_fresh_build(second, info));
+}
+
+TEST_F(GxDrawUniform, EveryRegionIsCompared) {
+  const gx::ShaderInfo info = draw_info();
+  const Range base = gx::build_draw_uniform(info);
+  const auto expect_push = [&](const char* region) {
+    const size_t before = pushed_bytes();
+    const Range changed = gx::build_draw_uniform(info);
+    EXPECT_NE(changed, base) << region;
+    EXPECT_GT(pushed_bytes(), before) << region;
+  };
+  gx::g_gxState.logicalViewport.width += 1.f;
+  expect_push("header");
+  gx::g_gxState.logicalViewport.width -= 1.f;
+  gx::g_gxState.pnMtx[9].nrm.m2[3] += 1.f;
+  expect_push("matrices");
+  gx::g_gxState.pnMtx[9].nrm.m2[3] -= 1.f;
+  ++gx::g_gxState.texCoordScales[7].scaleS;
+  expect_push("tail");
+}
+
+TEST_F(GxDrawUniform, DifferentLayoutDoesNotMatch) {
+  const gx::ShaderInfo info = draw_info();
+  const Range first = gx::build_draw_uniform(info);
+  gx::ShaderInfo konst = info;
+  konst.sampledKColors.set(0);
+  const size_t before = pushed_bytes();
+  const Range second = gx::build_draw_uniform(konst);
+  EXPECT_EQ(second.size, first.size + sizeof(Vec4<float>));
+  EXPECT_GT(pushed_bytes(), before);
+  EXPECT_TRUE(matches_fresh_build(second, konst));
+}
+
+TEST_F(GxDrawUniform, OutsideRecordingIsNotCached) {
+  const gx::ShaderInfo info = draw_info();
+  finish();
+  detail::end_recording();
+  EXPECT_EQ(gx::build_draw_uniform(info), Range{});
+  frame = {};
+  detail::begin_recording(frame, 0);
+  const Range first = gx::build_draw_uniform(info);
+  EXPECT_NE(first.size, 0u);
+  EXPECT_GT(pushed_bytes(), 0u);
+  const size_t before = pushed_bytes();
+  EXPECT_EQ(gx::build_draw_uniform(info), first);
+  EXPECT_EQ(pushed_bytes(), before);
 }
 #endif
 

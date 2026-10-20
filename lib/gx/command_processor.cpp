@@ -770,7 +770,7 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
   if (!uniformValid) {
     ZoneScopedN("build uniform");
     const CpuZoneScope build{CpuZoneUniformBuild};
-    cache.uniformRange = build_uniform(cache.shaderInfo);
+    cache.uniformRange = build_draw_uniform(cache.shaderInfo);
     state.dirty &= ~DirtyUniform;
   }
   if (cache.config.shaderConfig.fogRangeEnabled) {
@@ -1155,6 +1155,7 @@ void handle_aurora(ByteReader& reader) noexcept {
 void clear_draw_cache() noexcept {
   sDrawCache.bindGeneration = 0;
   sDrawCache.uniformRange = {};
+  clear_draw_uniforms();
   sDrawCache.fogRange = {};
   sDrawCache.hasFogRange = false;
   // clear() frees large tables, so reserving last frame's size regrows them once

@@ -28,8 +28,9 @@ struct Variant {
   bool ready = false;
 };
 
-// A draw that repeats the previous one's uniform, variant and colour reuses its patched uniform
+// A draw that repeats the previous one's pipeline, uniform, variant and colour reuses its patched uniform
 struct UniformReuse {
+  gfx::PipelineRef sourcePipeline = 0;
   gfx::Range source;
   gfx::PipelineRef pipeline = 0;
   Rgb8 color;
@@ -169,8 +170,8 @@ bool push_view(gx::DrawData& draw, const gx::PipelineConfig& config, const gx::S
   }
 
   const Rgb8 color = view_color(g_view, g_activeBit, cls);
-  const bool reuse = g_reuse.valid && g_reuse.source == draw.uniformRange && g_reuse.pipeline == variant.pipeline &&
-                     g_reuse.color == color;
+  const bool reuse = g_reuse.valid && g_reuse.sourcePipeline == draw.pipeline && g_reuse.source == draw.uniformRange &&
+                     g_reuse.pipeline == variant.pipeline && g_reuse.color == color;
   if (!reuse) {
     if (counts.uniformBytes + gfx::align_uniform(variant.info.uniformSize) > g_budget) {
       ++counts.overBudget;
@@ -193,8 +194,12 @@ bool push_view(gx::DrawData& draw, const gx::PipelineConfig& config, const gx::S
     const gfx::Range range = gx::build_uniform(variant.info);
     kcolor = saved;
     counts.uniformBytes += gfx::align_uniform(range.size);
-    g_reuse = {
-        .source = draw.uniformRange, .pipeline = variant.pipeline, .color = color, .range = range, .valid = true};
+    g_reuse = {.sourcePipeline = draw.pipeline,
+               .source = draw.uniformRange,
+               .pipeline = variant.pipeline,
+               .color = color,
+               .range = range,
+               .valid = true};
   }
   draw.pipeline = variant.pipeline;
   draw.uniformRange = g_reuse.range;
