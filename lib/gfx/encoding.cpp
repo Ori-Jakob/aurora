@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -108,7 +109,15 @@ void execute_encoder_task(wgpu::CommandEncoder& cmd, FramePacket& frame, const E
 
 void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, RenderPass& passInfo) {
   ZoneScoped;
-  g_currentPipeline = nullptr;
+  const auto encodeStart = std::chrono::steady_clock::now();
+  DrawEncoder lastEncoder = nullptr;
+  // Everything the encoders skip as already bound must be bound again once other code may have changed it
+  const auto reset_encoder_state = [&] {
+    g_currentPipeline = nullptr;
+    lastEncoder = nullptr;
+    gx::reset_pass_bindings();
+  };
+  reset_encoder_state();
 #ifdef AURORA_GFX_DEBUG_GROUPS
   std::vector<std::string> lastDebugGroupStack;
 #endif
@@ -156,12 +165,16 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
     case CommandType::Draw: {
       auto& draw = cmd.data.draw;
       if (draw.encoder != nullptr) {
+        if (draw.encoder != lastEncoder) {
+          gx::reset_pass_bindings();
+          lastEncoder = draw.encoder;
+        }
         draw.encoder(draw.payload.data(), pass, passInfo);
       }
     } break;
     case CommandType::CustomDraw: {
       render_custom_draw(cmd.data.customDraw, pass, passInfo);
-      g_currentPipeline = nullptr;
+      reset_encoder_state();
       pass.SetBindGroup(0, resources().staticBindGroup);
       pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
       if (hasViewport) {
@@ -184,6 +197,8 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
     pass.PopDebugGroup();
   }
 #endif
+  gx::add_encode_ns(static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - encodeStart).count()));
 }
 
 void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo, uint32_t passIndex) {

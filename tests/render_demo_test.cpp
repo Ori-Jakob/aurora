@@ -351,6 +351,17 @@ TEST(RenderDemoOptions, ParsesHintFlags) {
   EXPECT_TRUE(parse({"--no-hints", "--check-hints", "--vignette", "--depth-check"}));
 }
 
+TEST(RenderDemoOptions, ParsesCustomDrawProbe) {
+  const auto defaults = parse({});
+  ASSERT_TRUE(defaults);
+  EXPECT_FALSE(defaults->customDrawProbe);
+  const auto probe = parse({"--custom-draw-probe"});
+  ASSERT_TRUE(probe);
+  EXPECT_TRUE(probe->customDrawProbe);
+  EXPECT_EQ(parse_error({"--custom-draw-probe", "--trace", "x"}), "custom draws cannot be traced");
+  EXPECT_NE(usage().find("--custom-draw-probe "), std::string_view::npos);
+}
+
 namespace {
 constexpr size_t HintIdCount = LastHintId + 1 - FirstHintId;
 

@@ -44,6 +44,12 @@ struct PipelineOptions {
 
 gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout);
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass);
+struct BindCounts {
+  uint64_t draws, texturedDraws, uniformBinds, textureBinds, indexBinds, encodeNs;
+};
+void reset_pass_bindings() noexcept;
+void add_encode_ns(uint64_t ns) noexcept;
+BindCounts bind_counts() noexcept;
 
 void queue_surface(const u8* dlStart, uint32_t dlSize, bool bigEndian) noexcept;
 } // namespace aurora::gx

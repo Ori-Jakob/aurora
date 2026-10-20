@@ -11,6 +11,7 @@
 #include "gx/guest_memory.hpp"
 #include "gx/gx.hpp"
 #include "gx/hints.hpp"
+#include "gx/pipeline.hpp"
 #include "gx/texture.hpp"
 #include "io.hpp"
 #if AURORA_ENABLE_RENDER
@@ -45,8 +46,9 @@ double elapsed_ms(Clock::time_point start, Clock::time_point end) {
 
 CpuFrameZones frame_zones(uint32_t run, uint32_t frame, const gx::fifo::CpuZoneStats& before,
                           const gx::fifo::CpuZoneStats& after, const gx::fifo::ImmutableArrayStats& residentBefore,
-                          const gx::fifo::ImmutableArrayStats& residentAfter, uint64_t resolves,
-                          uint64_t uniqueArrayBytes, const AuroraStats& stats) {
+                          const gx::fifo::ImmutableArrayStats& residentAfter, const gx::BindCounts& bindsBefore,
+                          const gx::BindCounts& bindsAfter, uint64_t resolves, uint64_t uniqueArrayBytes,
+                          const AuroraStats& stats) {
   const auto ms = [&](gx::fifo::CpuZone zone) { return static_cast<double>(after.ns[zone] - before.ns[zone]) / 1e6; };
   const auto calls = [&](gx::fifo::CpuZone zone) { return after.calls[zone] - before.calls[zone]; };
   return {
@@ -76,6 +78,12 @@ CpuFrameZones frame_zones(uint32_t run, uint32_t frame, const gx::fifo::CpuZoneS
       .storageBytes = stats.lastStorageSize,
       .residentHits = residentAfter.hits - residentBefore.hits,
       .residentStages = residentAfter.stages - residentBefore.stages,
+      .encodedDraws = bindsAfter.draws - bindsBefore.draws,
+      .texturedDraws = bindsAfter.texturedDraws - bindsBefore.texturedDraws,
+      .uniformBinds = bindsAfter.uniformBinds - bindsBefore.uniformBinds,
+      .textureBinds = bindsAfter.textureBinds - bindsBefore.textureBinds,
+      .indexBinds = bindsAfter.indexBinds - bindsBefore.indexBinds,
+      .encodeMs = static_cast<double>(bindsAfter.encodeNs - bindsBefore.encodeNs) / 1e6,
   };
 }
 
@@ -305,6 +313,7 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
   for (uint32_t index = 0; index < m_options.frames.last;) {
     SDL_PumpEvents();
     SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+    const auto bindsBefore = gx::bind_counts();
     const auto frameStart = Clock::now();
     const bool output = m_options.frames.contains(index);
     if (!apply_render_config(frame.config, error)) {
@@ -402,7 +411,8 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
       });
       if (m_options.cpuZones) {
         out.cpuZones.push_back(frame_zones(run, index, zonesBefore, zonesAfter, residentBefore, residentAfter,
-                                           resolvesAfter - resolvesBefore, m_uniqueArrayBytes, *aurora_get_stats()));
+                                           bindsBefore, gx::bind_counts(), resolvesAfter - resolvesBefore,
+                                           m_uniqueArrayBytes, *aurora_get_stats()));
       }
       if (m_options.gpuTimings) {
         collect_gpu_timing(run, index, out);

@@ -482,6 +482,10 @@ if (TARGET render_demo)
     ENVIRONMENT "AURORA_TEST_STREAMING_GROWTH=30"
     PASS_REGULAR_EXPRESSION "Streaming buffers resized: .*storage 16 MiB"
     FAIL_REGULAR_EXPRESSION "\\[(ERROR|FATAL): ")
+  add_test(NAME render_demo_custom_draw_probe_compat
+    COMMAND $<TARGET_FILE:render_demo> --backend null --profile compat --frames 30 --timeout 60 --fail-on-error
+            --custom-draw-probe --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_smoke/custom_draw_probe)
+  set_tests_properties(render_demo_custom_draw_probe_compat PROPERTIES LABELS smoke TIMEOUT 180)
 
   if (AURORA_ENABLE_RENDER)
     foreach (_profile IN ITEMS full compat metal metal32)

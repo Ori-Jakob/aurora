@@ -425,10 +425,11 @@ constexpr std::array<std::string_view, 7> CpuZoneMsNames{
 constexpr std::array<std::string_view, 5> CpuSectionNames{"arrays", "pipelineBuild", "bindGroupBuild", "uniformBuild",
                                                           "fogLut"};
 constexpr size_t FirstSectionMs = 2;
-constexpr std::array<std::string_view, 17> CpuZoneCountNames{
+constexpr std::array<std::string_view, 22> CpuZoneCountNames{
     "fifoCalls",     "pushDraws",    "arrayMisses",  "arrayBytes",   "pipelineBuilds",   "bindGroupBuilds",
     "uniformBuilds", "fogLutPushes", "fogLutBytes",  "resolves",     "uniqueArrayBytes", "vertBytes",
-    "indexBytes",    "uniformBytes", "storageBytes", "residentHits", "residentStages",
+    "indexBytes",    "uniformBytes", "storageBytes", "residentHits", "residentStages",   "encodedDraws",
+    "texturedDraws", "uniformBinds", "textureBinds", "indexBinds",
 };
 
 std::array<double, CpuZoneMsNames.size()> cpu_zone_ms(const CpuFrameZones& frame) {
@@ -437,10 +438,11 @@ std::array<double, CpuZoneMsNames.size()> cpu_zone_ms(const CpuFrameZones& frame
 }
 
 std::array<uint64_t, CpuZoneCountNames.size()> cpu_zone_counts(const CpuFrameZones& frame) {
-  return {frame.fifoCalls,        frame.pushDraws,     frame.arrayMisses,  frame.arrayBytes,   frame.pipelineBuilds,
-          frame.bindGroupBuilds,  frame.uniformBuilds, frame.fogLutPushes, frame.fogLutBytes,  frame.resolves,
-          frame.uniqueArrayBytes, frame.vertBytes,     frame.indexBytes,   frame.uniformBytes, frame.storageBytes,
-          frame.residentHits,     frame.residentStages};
+  return {frame.fifoCalls,        frame.pushDraws,      frame.arrayMisses,  frame.arrayBytes,    frame.pipelineBuilds,
+          frame.bindGroupBuilds,  frame.uniformBuilds,  frame.fogLutPushes, frame.fogLutBytes,   frame.resolves,
+          frame.uniqueArrayBytes, frame.vertBytes,      frame.indexBytes,   frame.uniformBytes,  frame.storageBytes,
+          frame.residentHits,     frame.residentStages, frame.encodedDraws, frame.texturedDraws, frame.uniformBinds,
+          frame.textureBinds,     frame.indexBinds};
 }
 
 std::string cpu_zone_row(const CpuFrameZones& frame) {
@@ -453,7 +455,7 @@ std::string cpu_zone_row(const CpuFrameZones& frame) {
   for (size_t i = 0; i < counts.size(); ++i) {
     out += fmt::format(", \"{}\": {}", CpuZoneCountNames[i], counts[i]);
   }
-  return out + "}";
+  return out + fmt::format(", \"encodeMs\": {:.3f}}}", frame.encodeMs);
 }
 
 std::string warm_cpu_zones(bool drawZones, std::span<const CpuFrameZones> frames, const std::vector<uint32_t>& runs) {
@@ -478,6 +480,7 @@ std::string warm_cpu_zones(bool drawZones, std::span<const CpuFrameZones> frames
   std::vector<double> pushDrawMs;
   std::array<double, CpuZoneMsNames.size()> msSums{};
   std::array<double, CpuZoneCountNames.size()> countSums{};
+  double encodeMsSum = 0.0;
   double ratioSum = 0.0;
   double ratioMax = 0.0;
   size_t ratioRows = 0;
@@ -492,6 +495,7 @@ std::string warm_cpu_zones(bool drawZones, std::span<const CpuFrameZones> frames
     for (size_t i = 0; i < counts.size(); ++i) {
       countSums[i] += static_cast<double>(counts[i]);
     }
+    encodeMsSum += frame->encodeMs;
     if (frame->uniqueArrayBytes != 0) {
       const double ratio = (static_cast<double>(frame->storageBytes) - static_cast<double>(frame->fogLutBytes)) /
                            static_cast<double>(frame->uniqueArrayBytes);
@@ -527,6 +531,7 @@ std::string warm_cpu_zones(bool drawZones, std::span<const CpuFrameZones> frames
   out += fmt::format("    \"p95FifoMs\": {:.3f},\n", fifo.p95);
   out += fmt::format("    \"meanPushDrawMs\": {:.3f},\n", pushDraw.mean);
   out += fmt::format("    \"p95PushDrawMs\": {:.3f},\n", pushDraw.p95);
+  out += fmt::format("    \"meanEncodeMs\": {:.3f},\n", encodeMsSum / count);
   out += fmt::format("    \"sectionMeanMs\": {},\n", sections);
   out += fmt::format("    \"storageRatio\": {},\n", storageRatio);
   out += fmt::format("    \"means\": {}\n", means);

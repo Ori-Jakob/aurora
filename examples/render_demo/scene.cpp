@@ -519,6 +519,9 @@ void draw_scene(u32 frame, const SceneOptions& options) {
   hint_material(GroundMaterial);
   draw_ground(view);
   end_object();
+  if (options.customDrawProbe != aurora::gfx::InvalidDrawType) {
+    aurora::gfx::push_custom_draw(options.customDrawProbe, nullptr, 0);
+  }
   draw_boxes(view, t);
 
   Mtx bones[TentacleBones];

@@ -71,6 +71,12 @@ struct CpuFrameZones {
   uint32_t storageBytes = 0;
   uint64_t residentHits = 0;
   uint64_t residentStages = 0;
+  uint64_t encodedDraws = 0;
+  uint64_t texturedDraws = 0;
+  uint64_t uniformBinds = 0;
+  uint64_t textureBinds = 0;
+  uint64_t indexBinds = 0;
+  double encodeMs = 0.0;
 };
 
 struct ResidentRun {

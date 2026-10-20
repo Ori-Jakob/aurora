@@ -8,9 +8,30 @@
 #include "gx_fmt.hpp"
 #include "shader_info.hpp"
 
+#include <atomic>
+
 #include <tracy/Tracy.hpp>
 
 namespace aurora::gx {
+namespace {
+constexpr Module Log{"aurora::gx"};
+
+// Render worker only; render_pass resets it whenever other code may have rebound these slots
+struct BoundState {
+  uint32_t uniformOffset = UINT32_MAX;
+  gfx::BindGroupRef textureGroup = 0;
+  bool indexBuffer = false;
+};
+BoundState g_bound;
+
+struct Counters {
+  std::atomic_uint64_t draws, texturedDraws, uniformBinds, textureBinds, indexBinds, encodeNs;
+} g_counts;
+
+inline void count(std::atomic_uint64_t& c, uint64_t n = 1) noexcept {
+  c.store(c.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
+}
+} // namespace
 
 gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout) {
   ZoneScoped;
@@ -63,13 +84,34 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     return;
   }
   const auto& resources = gfx::detail::resources();
+  count(g_counts.draws);
   pass.SetImmediates(0, &data.immediateData, sizeof(data.immediateData));
-  const std::array offsets{data.uniformRange.offset};
-  pass.SetBindGroup(1, resources.uniformBindGroup, offsets.size(), offsets.data());
-  if (data.bindGroups.textureBindGroup) {
-    pass.SetBindGroup(2, gfx::find_bind_group(data.bindGroups.textureBindGroup));
+  if (data.uniformRange.offset != g_bound.uniformOffset) {
+    const std::array offsets{data.uniformRange.offset};
+    pass.SetBindGroup(1, resources.uniformBindGroup, offsets.size(), offsets.data());
+    g_bound.uniformOffset = data.uniformRange.offset;
+    count(g_counts.uniformBinds);
   }
-  pass.SetIndexBuffer(resources.indexBuffer, wgpu::IndexFormat::Uint16, data.idxRange.offset, data.idxRange.size);
+  if (const auto group = data.bindGroups.textureBindGroup; group != 0) {
+    count(g_counts.texturedDraws);
+    if (group != g_bound.textureGroup) {
+      pass.SetBindGroup(2, gfx::find_bind_group(group));
+      g_bound.textureGroup = group;
+      count(g_counts.textureBinds);
+    }
+  }
+  if (data.indexCount != 0) {
+    // The whole buffer is bound, so nothing else bounds the read in builds that skip validation
+    AURORA_ASSERT(data.idxRange.offset % sizeof(uint16_t) == 0 &&
+                      data.indexCount <= data.idxRange.size / sizeof(uint16_t),
+                  "GX draw index range offset {} size {} does not hold {} indices", data.idxRange.offset,
+                  data.idxRange.size, data.indexCount);
+    if (!g_bound.indexBuffer) {
+      pass.SetIndexBuffer(resources.indexBuffer, wgpu::IndexFormat::Uint16);
+      g_bound.indexBuffer = true;
+      count(g_counts.indexBinds);
+    }
+  }
   if (data.dstAlpha != UINT32_MAX) {
     const wgpu::Color color{0.f, 0.f, 0.f, data.dstAlpha / 255.f};
     pass.SetBlendConstant(&color);
@@ -78,7 +120,8 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     if (data.indexCount == 0) {
       pass.Draw(data.vtxCount, data.instanceCount);
     } else {
-      pass.DrawIndexed(data.indexCount, data.instanceCount);
+      pass.DrawIndexed(data.indexCount, data.instanceCount,
+                       static_cast<uint32_t>(data.idxRange.offset / sizeof(uint16_t)));
     }
   };
   if (pipeline.prepass) {
@@ -87,6 +130,21 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   }
   gfx::bind_pipeline(pipeline.main, pass);
   draw();
+}
+
+void reset_pass_bindings() noexcept { g_bound = {}; }
+
+void add_encode_ns(uint64_t ns) noexcept { count(g_counts.encodeNs, ns); }
+
+BindCounts bind_counts() noexcept {
+  return {
+      .draws = g_counts.draws.load(std::memory_order_relaxed),
+      .texturedDraws = g_counts.texturedDraws.load(std::memory_order_relaxed),
+      .uniformBinds = g_counts.uniformBinds.load(std::memory_order_relaxed),
+      .textureBinds = g_counts.textureBinds.load(std::memory_order_relaxed),
+      .indexBinds = g_counts.indexBinds.load(std::memory_order_relaxed),
+      .encodeNs = g_counts.encodeNs.load(std::memory_order_relaxed),
+  };
 }
 
 } // namespace aurora::gx

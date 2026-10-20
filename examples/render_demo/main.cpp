@@ -149,6 +149,48 @@ void print_hint_summary(const render_demo::HintTally& tally, const HintCounterSn
       static_cast<unsigned long long>(total.late), static_cast<unsigned long long>(total.bytes),
       static_cast<unsigned long long>(snapshot.suppressedDraws));
 }
+
+constexpr uint64_t CustomDrawProbeUniformBytes = 256;
+
+struct CustomDrawProbe {
+  aurora::gfx::DrawTypeId type = aurora::gfx::InvalidDrawType;
+  wgpu::BindGroupLayout layout;
+  wgpu::Buffer uniformBuffer;
+  wgpu::BindGroup group;
+};
+CustomDrawProbe g_customDrawProbe;
+
+// Leaves foreign bindings behind, so a GX draw after it fails validation unless the encoder rebinds
+void draw_custom_draw_probe(const aurora::gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass, const void*,
+                            size_t, void* userdata) {
+  auto& probe = *static_cast<CustomDrawProbe*>(userdata);
+  if (!probe.layout) {
+    const wgpu::BindGroupLayoutEntry entry{
+        .binding = 0,
+        .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
+        .buffer = {.type = wgpu::BufferBindingType::Uniform},
+    };
+    const wgpu::BindGroupLayoutDescriptor descriptor{
+        .label = "render_demo custom draw probe",
+        .entryCount = 1,
+        .entries = &entry,
+    };
+    probe.layout = ctx.device.CreateBindGroupLayout(&descriptor);
+  }
+  if (probe.uniformBuffer.Get() != ctx.uniformBuffer.Get()) {
+    const wgpu::BindGroupEntry entry{.binding = 0, .buffer = ctx.uniformBuffer, .size = CustomDrawProbeUniformBytes};
+    const wgpu::BindGroupDescriptor descriptor{
+        .label = "render_demo custom draw probe",
+        .layout = probe.layout,
+        .entryCount = 1,
+        .entries = &entry,
+    };
+    probe.group = ctx.device.CreateBindGroup(&descriptor);
+    probe.uniformBuffer = ctx.uniformBuffer;
+  }
+  pass.SetIndexBuffer(ctx.indexBuffer, wgpu::IndexFormat::Uint32, 0, 4);
+  pass.SetBindGroup(1, probe.group);
+}
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -196,9 +238,19 @@ int main(int argc, char* argv[]) {
     aurora_shutdown();
     return ExitBackendMismatch;
   }
+  if (options.customDrawProbe) {
+    g_customDrawProbe.type = aurora::gfx::register_draw_type(
+        {.label = "render_demo custom draw probe", .draw = draw_custom_draw_probe, .userdata = &g_customDrawProbe});
+    if (g_customDrawProbe.type == aurora::gfx::InvalidDrawType) {
+      std::fprintf(stderr, "render_demo: custom draw probe registration failed\n");
+      aurora_shutdown();
+      return ExitSceneInit;
+    }
+  }
   // The receiver is installed once at initialisation, so the answer is fixed for the whole run
   const bool decoding = aurora::render::hints_enabled();
-  const render_demo::SceneOptions sceneOptions{.hints = options.hints, .captureOnlyBox = options.hints && decoding};
+  const render_demo::SceneOptions sceneOptions{
+      .hints = options.hints, .captureOnlyBox = options.hints && decoding, .customDrawProbe = g_customDrawProbe.type};
   bool decodingChanged = false;
 
   GXInit(nullptr, 0);
@@ -277,6 +329,10 @@ int main(int argc, char* argv[]) {
   const auto graphReport = render_demo::graph_pass_report();
   HintCounterSnapshot hintCounters = read_hint_counters();
   render_demo::unregister_graph_passes();
+  if (g_customDrawProbe.type != aurora::gfx::InvalidDrawType) {
+    aurora::gfx::unregister_draw_type(g_customDrawProbe.type);
+    g_customDrawProbe = {};
+  }
   render_demo::shutdown_scene();
   aurora_shutdown();
   const auto traceStatus = aurora::trace::capture_status();

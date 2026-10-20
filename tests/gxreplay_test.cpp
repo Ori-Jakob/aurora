@@ -348,6 +348,12 @@ std::vector<CpuFrameZones> zone_rows() {
       .storageBytes = 900000,
       .residentHits = 7,
       .residentStages = 3,
+      .encodedDraws = 365,
+      .texturedDraws = 300,
+      .uniformBinds = 330,
+      .textureBinds = 150,
+      .indexBinds = 6,
+      .encodeMs = 0.75,
   };
   CpuFrameZones warmA = zone_row(1, 1, 1.0);
   warmA.arraysMs = 0.5;
@@ -356,6 +362,8 @@ std::vector<CpuFrameZones> zone_rows() {
   warmA.fogLutBytes = 100;
   warmA.uniqueArrayBytes = 450;
   warmA.residentHits = 3;
+  warmA.indexBinds = 4;
+  warmA.encodeMs = 0.5;
   CpuFrameZones warmB = zone_row(1, 2, 3.0);
   warmB.arraysMs = 1.5;
   warmB.pushDraws = 21;
@@ -363,6 +371,8 @@ std::vector<CpuFrameZones> zone_rows() {
   warmB.fogLutBytes = 100;
   warmB.uniqueArrayBytes = 400;
   warmB.residentHits = 5;
+  warmB.indexBinds = 6;
+  warmB.encodeMs = 1.0;
   return {first, zone_row(0, 1, 9.0), zone_row(1, 0, 50.0), warmA, warmB};
 }
 } // namespace
@@ -378,7 +388,8 @@ TEST(GxReplayReport, CpuZonesJsonFormat) {
                 "\"arrayBytes\": 880000, \"pipelineBuilds\": 12, \"bindGroupBuilds\": 40, \"uniformBuilds\": 200, "
                 "\"fogLutPushes\": 1, \"fogLutBytes\": 17204, \"resolves\": 130, \"uniqueArrayBytes\": 455404, "
                 "\"vertBytes\": 1000, \"indexBytes\": 2000, \"uniformBytes\": 3000, \"storageBytes\": 900000, "
-                "\"residentHits\": 7, \"residentStages\": 3},\n"),
+                "\"residentHits\": 7, \"residentStages\": 3, \"encodedDraws\": 365, \"texturedDraws\": 300, "
+                "\"uniformBinds\": 330, \"textureBinds\": 150, \"indexBinds\": 6, \"encodeMs\": 0.750},\n"),
       std::string::npos)
       << json;
   EXPECT_NE(json.find("      \"meanFifoMs\": 18.000,\n      \"p95FifoMs\": 50.000,\n"), std::string::npos) << json;
@@ -386,10 +397,16 @@ TEST(GxReplayReport, CpuZonesJsonFormat) {
                       "    \"meanFifoMs\": 2.000,\n    \"p95FifoMs\": 3.000,\n"),
             std::string::npos)
       << json;
+  EXPECT_NE(json.find("    \"p95PushDrawMs\": 0.000,\n    \"meanEncodeMs\": 0.750,\n    \"sectionMeanMs\": "),
+            std::string::npos)
+      << json;
   EXPECT_NE(json.find("\"pushDraws\": 15.5"), std::string::npos) << json;
   EXPECT_NE(json.find("\"sectionMeanMs\": {\"arrays\": 1.000, "), std::string::npos) << json;
   EXPECT_NE(json.find("\"storageRatio\": null,"), std::string::npos) << json;
-  EXPECT_TRUE(json.ends_with("\"storageBytes\": 800.0, \"residentHits\": 4.0, \"residentStages\": 0.0}\n  }\n}\n"))
+  EXPECT_TRUE(
+      json.ends_with("\"storageBytes\": 800.0, \"residentHits\": 4.0, \"residentStages\": 0.0, "
+                     "\"encodedDraws\": 0.0, \"texturedDraws\": 0.0, \"uniformBinds\": 0.0, "
+                     "\"textureBinds\": 0.0, \"indexBinds\": 5.0}\n  }\n}\n"))
       << json;
 
   const std::string drawZones = format_cpu_zones_json(true, rows);

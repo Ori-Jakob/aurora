@@ -175,13 +175,18 @@ bool apply_check_hints(Options& options, std::string_view) {
   return true;
 }
 
+bool apply_custom_draw_probe(Options& options, std::string_view) {
+  options.customDrawProbe = true;
+  return true;
+}
+
 struct Flag {
   std::string_view name;
   bool takesValue;
   bool (*apply)(Options& options, std::string_view value);
 };
 
-constexpr std::array<Flag, 19> Flags{{
+constexpr std::array<Flag, 20> Flags{{
     {"--frames", true, apply_frames},
     {"--timeout", true, apply_timeout},
     {"--backend", true, apply_backend},
@@ -199,6 +204,7 @@ constexpr std::array<Flag, 19> Flags{{
     {"--depth-check", false, apply_depth_check},
     {"--no-hints", false, apply_no_hints},
     {"--check-hints", false, apply_check_hints},
+    {"--custom-draw-probe", false, apply_custom_draw_probe},
     {"-h", false, apply_help},
     {"--help", false, apply_help},
 }};
@@ -278,9 +284,13 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
     error = "--expect-anchor-warnings needs --vignette";
     return std::nullopt;
   }
-  // Graph passes record GPU work outside the GX FIFO, so the capture would be discarded
+  // Graph passes and custom draws record GPU work outside the GX FIFO, so the capture would be discarded
   if ((options.vignette || options.depthCheck) && !options.tracePath.empty()) {
     error = "render graph passes cannot be traced";
+    return std::nullopt;
+  }
+  if (options.customDrawProbe && !options.tracePath.empty()) {
+    error = "custom draws cannot be traced";
     return std::nullopt;
   }
   // The probe reads frame 30 at the earliest, and the rest leave room for its readback to land
@@ -314,6 +324,7 @@ std::string_view usage() noexcept {
          "                      (needs at least 40 frames)\n"
          "  --no-hints          emit no render hints and no capture-only draw\n"
          "  --check-hints       exit with code 8 unless aurora decoded or skipped every emitted hint as expected\n"
+         "  --custom-draw-probe record a custom draw that leaves foreign bindings behind between GX draws\n"
          "  -h, --help          show this message\n";
 }
 } // namespace render_demo
