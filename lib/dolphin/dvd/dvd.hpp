@@ -27,6 +27,8 @@ struct FSTEntry {
   void* overlayData = nullptr;
   bool isOverlay = false;
   s32 origEntryNum = 0;
+  // Base disc file a non-overlay file reads from: origEntryNum, or the source of a base alias.
+  s32 discEntryNum = 0;
 };
 
 struct IterateNode {
@@ -36,13 +38,14 @@ struct IterateNode {
   u32 size;
   void* overlayData;
   bool isOverlay;
+  s32 discEntryNum;
   std::vector<std::shared_ptr<IterateNode>> children;
 
   IterateNode(std::string name, bool isDir, u32 size, s32 originalEntryNum, void* overlayData)
-  : name(std::move(name)), isDir(isDir), size(size), originalEntryNum(originalEntryNum), overlayData(overlayData), isOverlay(true) {}
+  : name(std::move(name)), isDir(isDir), size(size), originalEntryNum(originalEntryNum), overlayData(overlayData), isOverlay(true), discEntryNum(originalEntryNum) {}
 
   IterateNode(std::string name, bool isDir, u32 size, s32 originalEntryNum)
-  : name(std::move(name)), isDir(isDir), size(size), originalEntryNum(originalEntryNum), overlayData(nullptr), isOverlay(false) {}
+  : name(std::move(name)), isDir(isDir), size(size), originalEntryNum(originalEntryNum), overlayData(nullptr), isOverlay(false), discEntryNum(originalEntryNum) {}
 };
 
 struct IterateContext {
@@ -57,6 +60,8 @@ extern std::vector<FSTEntry> s_fstEntries;
 // Unfilled spots are given the k_invalidFstEntry value.
 extern std::vector<FstIndex> s_entryNumToFstIndex;
 extern s32 s_baseEntryCount;
+// Size of each base disc entry by EntryNum, -1 for directories.
+extern std::vector<s64> s_baseFileSizes;
 extern FstIndex s_currentDir;
 extern std::string s_currentPath;
 extern BOOL s_autoInvalidation;

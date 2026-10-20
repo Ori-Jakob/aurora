@@ -32,10 +32,29 @@ void aurora_dvd_close(void);
  */
 
 /**
+ * \brief How an overlay file is served.
+ */
+typedef enum AuroraOverlayFileKind {
+  /**
+   * \brief Served through the overlay callbacks.
+   */
+  AURORA_OVERLAY_FILE_NORMAL = 0,
+
+  /**
+   * \brief Served from the base disc file baseEntryNum, under a path of its own.
+   *
+   * userData is unused and the size is taken from the base disc file.
+   */
+  AURORA_OVERLAY_FILE_BASE_ALIAS = 1,
+} AuroraOverlayFileKind;
+
+/**
  * \brief A single file to be overlaid over the DVD files.
  *
  * You do not need to concern yourself with providing entries for directories. They are automatically merged
  * and created where necessary.
+ *
+ * Zero-initialized fields after size keep the plain callback behavior.
  */
 typedef struct AuroraOverlayFile {
   /**
@@ -56,6 +75,16 @@ typedef struct AuroraOverlayFile {
    * While this is of type size_t, file sizes larger than u32 are not currently supported.
    */
   size_t size;
+
+  /**
+   * \brief An AuroraOverlayFileKind.
+   */
+  uint32_t kind;
+
+  /**
+   * \brief For AURORA_OVERLAY_FILE_BASE_ALIAS: EntryNum of the base disc file to serve (see aurora_dvd_base_entry_num).
+   */
+  int32_t baseEntryNum;
 
 } AuroraOverlayFile;
 
@@ -121,6 +150,28 @@ void aurora_dvd_overlay_files(const AuroraOverlayFile* files, size_t nFiles, s32
  * This does not take overlay files into account.
  */
 s32 aurora_dvd_base_entry_count();
+
+/**
+ * \brief Gets the EntryNum of the file at an absolute path on the loaded game disc, ignoring overlays.
+ *
+ * Returns -1 if the disc has no file at that path.
+ */
+s32 aurora_dvd_base_entry_num(const char* path);
+
+/**
+ * \brief Gets the size in bytes of a file on the loaded game disc, ignoring overlays.
+ *
+ * Returns -1 if baseEntryNum is not a file on the disc.
+ */
+int64_t aurora_dvd_base_file_size(s32 baseEntryNum);
+
+/**
+ * \brief Reads from a file on the loaded game disc, ignoring overlays.
+ *
+ * May be called from any thread. Returns the number of bytes read (less than len at the end of the file), or -1 on
+ * error.
+ */
+int64_t aurora_dvd_read_base_file(s32 baseEntryNum, void* buf, size_t len, uint64_t offset);
 
 #ifdef __cplusplus
 }

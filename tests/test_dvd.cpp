@@ -160,6 +160,14 @@ TEST(DVDNoDisc, GetCurrentDir) {
   EXPECT_STREQ(buf, "/");
 }
 
+TEST(DVDNoDisc, BaseFiles) {
+  u8 buf[4] = {};
+  EXPECT_EQ(aurora_dvd_base_entry_num("/anything"), -1);
+  EXPECT_EQ(aurora_dvd_base_entry_num(nullptr), -1);
+  EXPECT_EQ(aurora_dvd_base_file_size(1), -1);
+  EXPECT_EQ(aurora_dvd_read_base_file(1, buf, sizeof(buf), 0), -1);
+}
+
 // =============================================================================
 // Tests that require a disc image (conditionally compiled)
 // =============================================================================
@@ -242,6 +250,8 @@ TEST_F(DVDDiscTest, ConvertEntrynumToPathOverlay) {
       .fileName = "/__aurora_dvd_test__/nested/file.bin",
       .userData = nullptr,
       .size = 0,
+      .kind = AURORA_OVERLAY_FILE_NORMAL,
+      .baseEntryNum = -1,
   };
   s32 fileEntryNum = -1;
   aurora_dvd_overlay_files(&overlay, 1, &fileEntryNum);
@@ -258,6 +268,63 @@ TEST_F(DVDDiscTest, ConvertEntrynumToPathOverlay) {
   ASSERT_GE(dirEntryNum, 0);
   EXPECT_EQ(DVDConvertEntrynumToPath(dirEntryNum, path, sizeof(path)), TRUE);
   EXPECT_STREQ(path, "/__aurora_dvd_test__/nested/");
+}
+
+TEST_F(DVDDiscTest, BaseAliasAndBaseRead) {
+  char fileName[256] = {};
+  const s32 fileEntry = findFirstRootFile(fileName, sizeof(fileName));
+  if (fileEntry < 0) {
+    GTEST_SKIP() << "No files in root directory";
+  }
+  ASSERT_EQ(aurora_dvd_base_entry_num(fileName), fileEntry);
+  const int64_t baseSize = aurora_dvd_base_file_size(fileEntry);
+  ASSERT_GT(baseSize, 0);
+  const size_t readSize = baseSize < 64 ? static_cast<size_t>(baseSize) : 64;
+  std::vector<u8> base(readSize);
+  ASSERT_EQ(aurora_dvd_read_base_file(fileEntry, base.data(), readSize, 0), static_cast<int64_t>(readSize));
+
+  const AuroraOverlayCallbacks callbacks{
+      .open = [](void*) -> void* { return new int(0); },
+      .close = [](void* handle) { delete static_cast<int*>(handle); },
+      .read = [](void*, uint8_t* buf, size_t len) -> int64_t {
+        std::memset(buf, 0xAA, len);
+        return static_cast<int64_t>(len);
+      },
+      .seek = [](void*, int64_t offset, int32_t) -> int64_t { return offset; },
+  };
+  aurora_dvd_overlay_callbacks(&callbacks);
+
+  // The disc file itself is overlaid while an alias still serves the disc bytes.
+  const AuroraOverlayFile overlays[] = {
+      {.fileName = fileName, .userData = nullptr, .size = readSize, .kind = AURORA_OVERLAY_FILE_NORMAL,
+       .baseEntryNum = -1},
+      {.fileName = "/__aurora_dvd_test__/alias.bin", .userData = nullptr, .size = 0,
+       .kind = AURORA_OVERLAY_FILE_BASE_ALIAS, .baseEntryNum = fileEntry},
+      {.fileName = "/__aurora_dvd_test__/bad_alias.bin", .userData = nullptr, .size = 0,
+       .kind = AURORA_OVERLAY_FILE_BASE_ALIAS, .baseEntryNum = 0},
+  };
+  s32 entryNums[3] = {-1, -1, -1};
+  aurora_dvd_overlay_files(overlays, 3, entryNums);
+  struct OverlayReset {
+    ~OverlayReset() { aurora_dvd_overlay_files(nullptr, 0, nullptr); }
+  } overlayReset;
+
+  EXPECT_EQ(entryNums[0], fileEntry);
+  ASSERT_GE(entryNums[1], aurora_dvd_base_entry_count());
+  EXPECT_EQ(entryNums[2], -1);
+  EXPECT_EQ(aurora_dvd_base_entry_num("/__aurora_dvd_test__/alias.bin"), -1);
+
+  DVDFileInfo fi{};
+  ASSERT_EQ(DVDOpen("/__aurora_dvd_test__/alias.bin", &fi), TRUE);
+  EXPECT_EQ(fi.length, static_cast<u32>(baseSize));
+  std::vector<u8> aliased(readSize);
+  EXPECT_EQ(DVDReadPrio(&fi, aliased.data(), static_cast<s32>(readSize), 0, 2), static_cast<s32>(readSize));
+  DVDClose(&fi);
+  EXPECT_EQ(aliased, base);
+
+  std::vector<u8> underOverlay(readSize);
+  EXPECT_EQ(aurora_dvd_read_base_file(fileEntry, underOverlay.data(), readSize, 0), static_cast<int64_t>(readSize));
+  EXPECT_EQ(underOverlay, base);
 }
 
 TEST_F(DVDDiscTest, OpenDirRoot) {

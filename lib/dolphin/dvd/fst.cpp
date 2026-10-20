@@ -14,7 +14,13 @@ struct OverlayFileEntry {
   u32 size;
   s32 entryNum = k_invalidFstEntry;
   size_t sourceIndex = 0;
+  u32 kind = AURORA_OVERLAY_FILE_NORMAL;
+  s32 baseEntryNum = k_invalidFstEntry;
 };
+
+bool isBaseFile(s32 entryNum) {
+  return entryNum > 0 && static_cast<size_t>(entryNum) < s_baseFileSizes.size() && s_baseFileSizes[entryNum] >= 0;
+}
 
 std::vector<OverlayFileEntry> s_overlayFiles;
 std::unordered_map<std::string, s32> s_overlayEntryNums;
@@ -87,6 +93,11 @@ u32 fstCallback(u32 index, NodNodeKind kind, const char* name, u32 size, void* u
     size,
     index);
 
+  if (s_baseFileSizes.size() <= index) {
+    s_baseFileSizes.resize(index + 1, -1);
+  }
+  s_baseFileSizes[index] = newEntry->isDir ? -1 : static_cast<s64>(size);
+
   const auto& curDir = ctx->dirStack.back().first;
   curDir->children.push_back(newEntry);
 
@@ -111,6 +122,13 @@ void mergeOverlayFileIntoContext(const IterateContext& context, OverlayFileEntry
   IterateNode* node = context.root.get();
   std::string_view filePath = overlayFile.fileName;
   std::string currentPath;
+
+  const bool isAlias = overlayFile.kind == AURORA_OVERLAY_FILE_BASE_ALIAS;
+  if (isAlias && !isBaseFile(overlayFile.baseEntryNum)) {
+    Log.error("Overlay file {} aliases entry {}, which is not a file on the disc!", overlayFile.fileName,
+              overlayFile.baseEntryNum);
+    return;
+  }
 
   assert(filePath.starts_with('/'));
   filePath = filePath.substr(1);
@@ -148,6 +166,11 @@ void mergeOverlayFileIntoContext(const IterateContext& context, OverlayFileEntry
   fullFilePath.append(filePath);
 
   auto newNode = IterateNode(std::string(filePath), false, overlayFile.size, k_invalidFstEntry, overlayFile.userData);
+  if (isAlias) {
+    newNode = IterateNode(std::string(filePath), false, static_cast<u32>(s_baseFileSizes[overlayFile.baseEntryNum]),
+                          k_invalidFstEntry);
+    newNode.discEntryNum = overlayFile.baseEntryNum;
+  }
   const auto existingNode = findNode(*node, filePath);
   if (existingNode) {
     if (existingNode->isDir) {
@@ -194,14 +217,16 @@ void makeFstRecursive(IterateNode& node, FstIndex parent) {
     assert(node.children.empty());
     assert(node.originalEntryNum != k_invalidFstEntry);
 
-    s_fstEntries.emplace_back(node.name, false, parent, node.size, node.overlayData, node.isOverlay, node.originalEntryNum);
+    s_fstEntries.emplace_back(node.name, false, parent, node.size, node.overlayData, node.isOverlay,
+                              node.originalEntryNum, node.discEntryNum);
     return;
   }
 
   std::ranges::sort(node.children, [](const auto& a, const auto& b) { return a->name < b->name; });
 
   const FstIndex ourIndex = static_cast<FstIndex>(s_fstEntries.size());
-  s_fstEntries.emplace_back(node.name, true, parent, 0, node.overlayData, node.isOverlay, node.originalEntryNum);
+  s_fstEntries.emplace_back(node.name, true, parent, 0, node.overlayData, node.isOverlay, node.originalEntryNum,
+                            node.discEntryNum);
 
   for (const auto& child : node.children) {
     makeFstRecursive(*child, ourIndex);
@@ -237,6 +262,11 @@ bool validateOverlayFile(const AuroraOverlayFile& file) {
     return false;
   }
 
+  if (file.kind != AURORA_OVERLAY_FILE_NORMAL && file.kind != AURORA_OVERLAY_FILE_BASE_ALIAS) {
+    Log.error("Overlay file {} has unknown kind {}", name, file.kind);
+    return false;
+  }
+
   return true;
 }
 
@@ -261,6 +291,7 @@ bool rebuildFST() {
 
   s_fstEntries.clear();
   s_entryNumToFstIndex.clear();
+  s_baseFileSizes.assign(1, -1);
   IterateContext ctx;
   ctx.root = std::make_shared<IterateNode>(""s, true, 0, 0);
   ctx.dirStack.emplace_back(ctx.root, std::numeric_limits<u32>::max());
@@ -316,6 +347,55 @@ s32 aurora_dvd_base_entry_count() {
   return s_baseEntryCount;
 }
 
+s32 aurora_dvd_base_entry_num(const char* path) {
+  if (path == nullptr || path[0] != '/') {
+    return k_invalidFstEntry;
+  }
+  // Disc files keep their EntryNum under overlays, so the current tree finds them.
+  const s32 entryNum = DVDConvertPathToEntrynum(path);
+  std::lock_guard lock(s_fstLock);
+  return isBaseFile(entryNum) ? entryNum : k_invalidFstEntry;
+}
+
+int64_t aurora_dvd_base_file_size(s32 baseEntryNum) {
+  std::lock_guard lock(s_fstLock);
+  return isBaseFile(baseEntryNum) ? s_baseFileSizes[baseEntryNum] : -1;
+}
+
+int64_t aurora_dvd_read_base_file(s32 baseEntryNum, void* buf, size_t len, uint64_t offset) {
+  if (buf == nullptr && len != 0) {
+    return -1;
+  }
+
+  NodHandle* handle = nullptr;
+  {
+    std::lock_guard lock(s_fstLock);
+    if (s_partition == nullptr || !isBaseFile(baseEntryNum) ||
+        nod_partition_open_file(s_partition, baseEntryNum, &handle) != NOD_RESULT_OK || handle == nullptr) {
+      return -1;
+    }
+  }
+
+  int64_t total = 0;
+  if (offset > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+      nod_seek(handle, static_cast<int64_t>(offset), 0) < 0) {
+    total = -1;
+  }
+  auto* out = static_cast<uint8_t*>(buf);
+  while (total >= 0 && static_cast<size_t>(total) < len) {
+    const int64_t read = nod_read(handle, out + total, len - static_cast<size_t>(total));
+    if (read < 0) {
+      total = -1;
+    } else if (read == 0) {
+      break;
+    } else {
+      total += read;
+    }
+  }
+  nod_free(handle);
+  return total;
+}
+
 void aurora_dvd_overlay_files(const AuroraOverlayFile* files, size_t nFiles, s32* outEntryNums) {
   if (!s_overlayCallbacksSet) {
     Log.fatal("aurora_dvd_overlay_callbacks not called before aurora_dvd_overlay_files!");
@@ -333,7 +413,8 @@ void aurora_dvd_overlay_files(const AuroraOverlayFile* files, size_t nFiles, s32
       continue;
     }
 
-    s_overlayFiles.emplace_back(file.fileName, file.userData, static_cast<u32>(file.size), k_invalidFstEntry, i);
+    s_overlayFiles.emplace_back(file.fileName, file.userData, static_cast<u32>(file.size), k_invalidFstEntry, i,
+                                file.kind, file.baseEntryNum);
   }
 
   rebuildFST();

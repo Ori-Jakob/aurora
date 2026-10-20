@@ -35,6 +35,7 @@ namespace aurora::dvd::impl {
   // Unfilled spots are given the k_invalidFstEntry value.
   std::vector<FstIndex> s_entryNumToFstIndex;
   s32 s_baseEntryCount = 0;
+  std::vector<s64> s_baseFileSizes;
   FstIndex s_currentDir = 0;
   std::string s_currentPath = "/";
   BOOL s_autoInvalidation = FALSE;
@@ -104,6 +105,7 @@ void clearState() {
   s_fstEntries.clear();
   s_entryNumToFstIndex.clear();
   s_baseEntryCount = 0;
+  s_baseFileSizes.clear();
   s_currentDir = 0;
   s_currentPath = "/";
   s_diskID = {};
@@ -1087,7 +1089,7 @@ BOOL DVDFastOpen(s32 entrynum, DVDFileInfo* fileInfo) {
     fileInfo->cb.userData = new CommandDataOverlay(handle);
   } else {
     NodHandle* handle = nullptr;
-    NodResult result = nod_partition_open_file(s_partition, entry.origEntryNum, &handle);
+    NodResult result = nod_partition_open_file(s_partition, entry.discEntryNum, &handle);
     if (result != NOD_RESULT_OK || handle == nullptr) {
       return FALSE;
     }
