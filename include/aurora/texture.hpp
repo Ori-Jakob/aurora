@@ -97,6 +97,17 @@ void reload_replacement_directory(const std::filesystem::path& root, Replacement
 
 bool has_replacement(const GXTexObj* obj, const GXTlutObj* tlut = nullptr);
 
+enum class ReplacementSource : uint8_t {
+  None,
+  /// Matched by the texel-data pointer.
+  Pointer,
+  /// Matched by content (TextureSourceKey, wildcards included).
+  Source,
+};
+
+/// Which key a replacement for this texture resolves by, checked in the renderer's order: pointer first.
+ReplacementSource find_replacement_source(const GXTexObj* obj, const GXTlutObj* tlut = nullptr);
+
 } // namespace aurora::texture
 
 #endif

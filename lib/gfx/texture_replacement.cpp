@@ -1696,6 +1696,14 @@ bool has_replacement(const GXTexObj* obj, const GXTlutObj* tlut) {
   }
   return gfx::texture_replacement::has_replacement(*obj_);
 }
+
+ReplacementSource find_replacement_source(const GXTexObj* obj, const GXTlutObj* tlut) {
+  if (obj == nullptr) {
+    return ReplacementSource::None;
+  }
+  return gfx::texture_replacement::replacement_source(*reinterpret_cast<const GXTexObj_*>(obj),
+                                                      reinterpret_cast<const GXTlutObj_*>(tlut));
+}
 } // namespace aurora::texture
 
 namespace aurora::gfx::texture_replacement {
@@ -1888,6 +1896,29 @@ bool has_replacement(const GXTexObj_& obj, const GXTlutObj_& tlut) noexcept {
   }
 
   return find_source_replacement_key_locked(build_source_key(obj, tlut)).has_value();
+}
+
+aurora::texture::ReplacementSource replacement_source(const GXTexObj_& obj, const GXTlutObj_* tlut) noexcept {
+  using aurora::texture::ReplacementSource;
+  std::lock_guard lk(s_registryMutex);
+  if (s_entriesByKey.empty()) {
+    return ReplacementSource::None;
+  }
+
+  if (obj.data != nullptr) {
+    ReplacementKey pointerKey{TexturePointerKey{.data = obj.data}};
+    if (s_entriesByKey.contains(pointerKey)) {
+      return ReplacementSource::Pointer;
+    }
+  }
+
+  if (s_sourceEntryCount == 0 || obj.data == nullptr) {
+    return ReplacementSource::None;
+  }
+
+  const auto sourceKey = tlut != nullptr ? build_source_key(obj, *tlut) : build_source_key(obj);
+  return find_source_replacement_key_locked(sourceKey).has_value() ? ReplacementSource::Source
+                                                                   : ReplacementSource::None;
 }
 
 std::string build_texture_replacement_name(const GXTexObj_& obj) noexcept {
