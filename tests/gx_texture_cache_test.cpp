@@ -744,5 +744,153 @@ TEST_F(GxTextureCacheTest, ResetTextureCachesRereadsObjectAndTlutSources) {
   EXPECT_TRUE(has_read(guest_memory::Kind::Texture, pixels.data(), pixels.size()));
   EXPECT_TRUE(has_read(guest_memory::Kind::Tlut, palette.data(), palette.size()));
 }
+
+using Palette = std::array<uint8_t, 512>;
+
+void load_copy_palette_texture(u32 slot, const void* destination, u32 texObjId, GXTlut tlut) {
+  g_gxState.loadedTextures[slot] = make_texture(destination, texObjId, GX_TF_C8, 4, 4);
+  g_gxState.loadedTextures[slot].tlut = tlut;
+}
+
+ShaderInfo sampling(u32 slot) {
+  ShaderInfo info{};
+  info.sampledTextures.set(slot);
+  return info;
+}
+
+void bump_tlut(u32 slot, Palette& palette) {
+  ++palette[1];
+  ++g_gxState.loadedTluts[slot].tlutDataVersion;
+  texture::invalidate_bindings();
+}
+
+class GxDynamicPaletteTest : public GxTextureCacheTest {
+protected:
+  void SetUp() override {
+    GxTextureCacheTest::SetUp();
+    copy_texture(&destination, 4, 4, GX_TF_I8);
+    load_copy_palette_texture(0, &destination, 1, GX_TLUT0);
+    g_gxState.loadedTluts[0] = make_tlut(palette.data(), 1, 256);
+  }
+
+  uint8_t destination{};
+  Palette palette{};
+};
+
+TEST_F(GxDynamicPaletteTest, TlutBumpInLaterFrameReusesDynamicPaletteTarget) {
+  ScopedGuestHooks hooks{false};
+  resolve_sampled_textures(sampling(0));
+  const auto first = g_gxState.textures[0].ref;
+  const uint64_t copies = testing::copy_allocations();
+  const uint64_t textures = testing::texture_allocations();
+  ASSERT_EQ(count_reads(guest_memory::Kind::Tlut), 1u);
+
+  texture::end_frame();
+  bump_tlut(0, palette);
+  copy_texture(&destination, 4, 4, GX_TF_I8);
+  resolve_sampled_textures(sampling(0));
+
+  EXPECT_EQ(g_gxState.textures[0].ref, first);
+  EXPECT_EQ(testing::palette_conversions(), 2);
+  EXPECT_EQ(testing::copy_allocations(), copies);
+  EXPECT_EQ(testing::texture_allocations(), textures + 1);
+  EXPECT_EQ(count_reads(guest_memory::Kind::Tlut), 2u);
+}
+
+TEST_F(GxDynamicPaletteTest, TlutBumpWithoutCopyInLaterFrameReconvertsKeptTarget) {
+  resolve_sampled_textures(sampling(0));
+  const auto first = g_gxState.textures[0].ref;
+  const uint64_t copies = testing::copy_allocations();
+
+  texture::end_frame();
+  bump_tlut(0, palette);
+  resolve_sampled_textures(sampling(0));
+
+  EXPECT_EQ(g_gxState.textures[0].ref, first);
+  EXPECT_EQ(testing::palette_conversions(), 2);
+  EXPECT_EQ(testing::copy_allocations(), copies);
+}
+
+TEST_F(GxDynamicPaletteTest, TlutBumpInSameFrameKeepsSeparateDynamicPaletteTargets) {
+  resolve_sampled_textures(sampling(0));
+  const auto first = g_gxState.textures[0].ref;
+  const uint64_t copies = testing::copy_allocations();
+
+  bump_tlut(0, palette);
+  resolve_sampled_textures(sampling(0));
+
+  EXPECT_NE(g_gxState.textures[0].ref, first);
+  EXPECT_EQ(testing::copy_allocations(), copies + 1);
+  EXPECT_EQ(testing::palette_conversions(), 2);
+}
+
+TEST_F(GxDynamicPaletteTest, TlutBumpAfterTouchInSameFrameKeepsSeparateTargets) {
+  resolve_sampled_textures(sampling(0));
+  const auto first = g_gxState.textures[0].ref;
+
+  texture::end_frame();
+  resolve_sampled_textures(sampling(0));
+  ASSERT_EQ(g_gxState.textures[0].ref, first);
+  ASSERT_EQ(testing::palette_conversions(), 1);
+  bump_tlut(0, palette);
+  resolve_sampled_textures(sampling(0));
+
+  EXPECT_NE(g_gxState.textures[0].ref, first);
+}
+
+TEST_F(GxDynamicPaletteTest, StaleTlutSlotBindingBlocksReuse) {
+  Palette other{};
+  g_gxState.loadedTluts[1] = make_tlut(other.data(), 2, 256);
+  resolve_sampled_textures(sampling(0));
+  const auto first = g_gxState.textures[0].ref;
+
+  texture::end_frame();
+  // GXInitTexObjTlut moves the object to another slot without changing its id or data version
+  g_gxState.loadedTextures[0].tlut = GX_TLUT1;
+  resolve_sampled_textures(sampling(0));
+  ASSERT_EQ(g_gxState.textures[0].ref, first);
+  g_gxState.loadedTextures[0].tlut = GX_TLUT0;
+  bump_tlut(0, palette);
+  resolve_sampled_textures(sampling(0));
+
+  EXPECT_NE(g_gxState.textures[0].ref, first);
+}
+
+TEST_F(GxDynamicPaletteTest, MatchingTouchDoesNotBlockReuse) {
+  uint8_t otherDestination{};
+  Palette other{};
+  copy_texture(&otherDestination, 4, 4, GX_TF_I8);
+  load_copy_palette_texture(1, &otherDestination, 2, GX_TLUT1);
+  g_gxState.loadedTluts[1] = make_tlut(other.data(), 2, 256);
+  ShaderInfo both = sampling(0);
+  both.sampledTextures.set(1);
+  resolve_sampled_textures(both);
+  const auto first = g_gxState.textures[0].ref;
+
+  texture::end_frame();
+  resolve_sampled_textures(sampling(1));
+  bump_tlut(0, palette);
+  resolve_sampled_textures(sampling(0));
+
+  EXPECT_EQ(g_gxState.textures[0].ref, first);
+  EXPECT_EQ(testing::palette_conversions(), 3);
+}
+
+TEST_F(GxDynamicPaletteTest, LiveBindingFromEarlierFrameKeepsItsTarget) {
+  // Two slots hold one TLUT object at two data versions, and both textures sample the same copy
+  g_gxState.loadedTluts[1] = g_gxState.loadedTluts[0];
+  ++g_gxState.loadedTluts[1].tlutDataVersion;
+  g_gxState.loadedTextures[0].tlut = GX_TLUT1;
+  load_copy_palette_texture(1, &destination, 2, GX_TLUT0);
+  resolve_sampled_textures(sampling(0));
+  const auto first = g_gxState.textures[0].ref;
+
+  texture::end_frame();
+  resolve_sampled_textures(sampling(1));
+
+  EXPECT_NE(g_gxState.textures[1].ref, first);
+  EXPECT_EQ(g_gxState.textures[0].ref, first);
+  EXPECT_EQ(testing::palette_conversions(), 2);
+}
 } // namespace
 } // namespace aurora::gx

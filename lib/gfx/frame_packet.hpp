@@ -127,7 +127,30 @@ struct RenderPass {
   }
 };
 
+struct RenderTargetLayoutMemo {
+  bool valid = false;
+  uint32_t colorAttachmentCount = 0;
+  std::array<ColorAttachmentSemantic, MaxColorAttachments> semantics{};
+  std::array<wgpu::TextureFormat, MaxColorAttachments> formats{};
+  wgpu::TextureFormat depthStencilFormat = wgpu::TextureFormat::Undefined;
+  uint32_t sampleCount = 0;
+  uint64_t key = 0;
+};
+
 inline void finalize_render_target_layout(RenderTargetLayout& layout) noexcept {
+  // Every draw asks for its pass layout, so equal hashed fields reuse the last key
+  thread_local RenderTargetLayoutMemo memo;
+  bool same = memo.valid && memo.colorAttachmentCount == layout.colorAttachmentCount &&
+              memo.depthStencilFormat == layout.depthStencilFormat && memo.sampleCount == layout.sampleCount;
+  for (uint32_t i = 0; same && i < layout.colorAttachmentCount; ++i) {
+    same = memo.semantics[i] == layout.colorAttachments[i].semantic &&
+           memo.formats[i] == layout.colorAttachments[i].format;
+  }
+  if (same) {
+    layout.key = memo.key;
+    return;
+  }
+
   Hasher hasher{};
   hasher.update(layout.colorAttachmentCount);
   for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
@@ -137,6 +160,16 @@ inline void finalize_render_target_layout(RenderTargetLayout& layout) noexcept {
   hasher.update(static_cast<uint32_t>(layout.depthStencilFormat));
   hasher.update(layout.sampleCount);
   layout.key = hasher.digest();
+
+  memo.valid = true;
+  memo.colorAttachmentCount = layout.colorAttachmentCount;
+  for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
+    memo.semantics[i] = layout.colorAttachments[i].semantic;
+    memo.formats[i] = layout.colorAttachments[i].format;
+  }
+  memo.depthStencilFormat = layout.depthStencilFormat;
+  memo.sampleCount = layout.sampleCount;
+  memo.key = layout.key;
 }
 
 inline RenderTargetLayout RenderPass::target_layout() const noexcept {

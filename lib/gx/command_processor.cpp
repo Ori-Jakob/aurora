@@ -147,6 +147,8 @@ std::vector<FogRangeLutEntry> sFogRangeLuts;
 struct DrawCache {
   uint64_t targetLayoutKey = 0;
   PipelineConfig config{};
+  PipelineConfig nextConfig{};
+  bool lookupBlocking = false;
   ShaderInfo shaderInfo{};
   gfx::PipelineRef pipelineRef{};
   GXBindGroups bindGroups{};
@@ -736,9 +738,16 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     const bool hadPipeline = cache.hasPipeline;
     const auto prevSampledTextures = cache.shaderInfo.sampledTextures;
     const auto prevSampledIndTextures = cache.shaderInfo.sampledIndTextures;
-    populate_pipeline_config(cache.config, prim, fmt);
-    cache.shaderInfo = build_shader_info(cache.config.shaderConfig);
-    cache.pipelineRef = gfx::pipeline_ref(cache.config);
+    populate_pipeline_config(cache.nextConfig, prim, fmt);
+    const bool lookupBlocking = gfx::blocking_pipelines();
+    // A byte-equal config under the same layout and lookup mode resolves to the same pipeline
+    if (!hadPipeline || cache.targetLayoutKey != targetLayoutKey || cache.lookupBlocking != lookupBlocking ||
+        std::memcmp(&cache.nextConfig, &cache.config, sizeof(PipelineConfig)) != 0) {
+      cache.config = cache.nextConfig;
+      cache.shaderInfo = build_shader_info(cache.config.shaderConfig);
+      cache.pipelineRef = gfx::pipeline_ref(cache.config);
+      cache.lookupBlocking = lookupBlocking;
+    }
     cache.targetLayoutKey = targetLayoutKey;
     cache.fmt = fmt;
     cache.lineMode = lineMode;

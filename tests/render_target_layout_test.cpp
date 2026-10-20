@@ -4,6 +4,11 @@
 
 #include "gfx/clear.hpp"
 #include "gfx/frame_packet.hpp"
+#include "gfx/hash.hpp"
+
+#include <array>
+#include <cstdint>
+#include <vector>
 
 namespace aurora::gfx {
 namespace {
@@ -69,6 +74,56 @@ TEST(RenderTargetLayoutTest, RenderPassDerivesLayoutFromAttachmentState) {
 
   pass.colorAttachments[1].format = wgpu::TextureFormat::RG16Float;
   EXPECT_NE(pass.target_layout().key, initial.key);
+}
+
+uint64_t reference_key(const RenderTargetLayout& layout) {
+  Hasher hasher{};
+  hasher.update(layout.colorAttachmentCount);
+  for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
+    hasher.update(layout.colorAttachments[i].semantic);
+    hasher.update(layout.colorAttachments[i].format);
+  }
+  hasher.update(static_cast<uint32_t>(layout.depthStencilFormat));
+  hasher.update(layout.sampleCount);
+  return hasher.digest();
+}
+
+TEST(RenderTargetLayoutTest, KeyMemoMatchesUncachedHash) {
+  const auto base = base_layout();
+  auto format = base;
+  format.colorAttachments[SceneColorAttachmentIndex].format = wgpu::TextureFormat::BGRA8Unorm;
+  auto count = base;
+  count.colorAttachmentCount = 2;
+  count.colorAttachments[1] = {ColorAttachmentSemantic::Normal, wgpu::TextureFormat::RGBA16Float};
+  auto depth = base;
+  depth.depthStencilFormat = wgpu::TextureFormat::Depth32Float;
+  auto samples = base;
+  samples.sampleCount = 1;
+  auto size = base;
+  size.colorAttachments[SceneColorAttachmentIndex].width = 64;
+  size.colorAttachments[SceneColorAttachmentIndex].height = 32;
+  auto secondSemantic = count;
+  secondSemantic.colorAttachments[1].semantic = ColorAttachmentSemantic::Auxiliary;
+  auto secondFormat = count;
+  secondFormat.colorAttachments[1].format = wgpu::TextureFormat::RG16Float;
+
+  // Each variant runs right after the layout it differs from, so the memo still holds that layout
+  const std::array sequence{base, format, base, count, base,           depth, base,         samples,
+                            base, size,   base, count, secondSemantic, count, secondFormat, count};
+  std::vector<uint64_t> keys;
+  for (size_t i = 0; i < sequence.size(); ++i) {
+    auto layout = sequence[i];
+    layout.key = 0;
+    detail::finalize_render_target_layout(layout);
+    EXPECT_EQ(layout.key, reference_key(layout)) << i;
+    keys.push_back(layout.key);
+  }
+  EXPECT_EQ(keys[9], keys[0]);
+  for (const size_t variant : {1u, 3u, 5u, 7u}) {
+    EXPECT_NE(keys[variant], keys[0]) << variant;
+  }
+  EXPECT_NE(keys[12], keys[11]);
+  EXPECT_NE(keys[14], keys[11]);
 }
 
 } // namespace

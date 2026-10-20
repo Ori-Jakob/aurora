@@ -127,6 +127,7 @@ gfx::LruCache<GXState::CopyTextureKey, GXState::CopyTextureRef> s_copyCache{
     retire_copy_texture,
 };
 uint64_t s_frameCount = 0;
+uint64_t s_dynamicReuseBlockedFrame = UINT64_MAX;
 uint64_t s_bindGeneration = 1;
 std::atomic<uint64_t> s_pendingInvalidations = 0;
 std::atomic<uint64_t> s_pendingCacheClears = 0;
@@ -360,6 +361,13 @@ TextureKeys hash_texture_source(const GXTexObj_& obj, const GXTlutObj_* tlut, bo
   return keys;
 }
 
+// A binding still valid from an earlier frame samples without a resolve, so it must keep the old conversion
+bool has_live_binding(const gfx::TextureHandle& handle) noexcept {
+  return std::any_of(g_gxState.textures.begin(), g_gxState.textures.end(), [&](const gfx::TextureBind& bind) {
+    return bind.generation == s_bindGeneration && bind.ref == handle;
+  });
+}
+
 gfx::TextureHandle get_tlut_texture(const GXTlutObj_& tlut) {
   if (tlut.tlutObjId != 0) {
     auto& cache = s_tlutObjectCaches[tlut.tlutObjId];
@@ -367,7 +375,14 @@ gfx::TextureHandle get_tlut_texture(const GXTlutObj_& tlut) {
     if (cache.tlutTexture.handle && cache.tlutTexture.tlutDataVersion == tlut.tlutDataVersion) {
       return cache.tlutTexture.handle;
     }
-    cache.dynamicPaletteTextures.clear();
+    if (s_dynamicReuseBlockedFrame == s_frameCount) {
+      cache.dynamicPaletteTextures.clear();
+    } else {
+      // Conversions run at the start of their pass, so only a target this frame already sampled needs a fresh texture
+      absl::erase_if(cache.dynamicPaletteTextures, [](const auto& entry) {
+        return entry.second.lastUsedFrame == s_frameCount || has_live_binding(entry.second.handle);
+      });
+    }
     for (const u32 texObjId : cache.staticTextureUsers) {
       if (const auto textureIt = s_textureObjectCaches.find(texObjId); textureIt != s_textureObjectCaches.end()) {
         const uint64_t replacementId = textureIt->second.replacementId;
@@ -429,7 +444,7 @@ u32 resolved_format_for_handle(const gfx::TextureHandle& handle) {
   return GX_TF_RGBA8_PC;
 }
 
-void touch_bound_texture(const GXTexObj_& obj) {
+void touch_bound_texture(const GXTexObj_& obj, const gfx::TextureHandle& bound) {
   if (auto it = s_textureObjectCaches.find(obj.texObjId); it != s_textureObjectCaches.end()) {
     it->second.lastUsedFrame = s_frameCount;
     if (it->second.tlutObjId != 0) {
@@ -439,20 +454,28 @@ void touch_bound_texture(const GXTexObj_& obj) {
     }
   }
 
-  if (!is_palette_format(obj.format()) || obj.tlut >= g_gxState.loadedTluts.size()) {
+  if (!is_palette_format(obj.format())) {
     return;
   }
   const auto copyIt = g_gxState.copyTextures.find(obj.data);
   if (copyIt == g_gxState.copyTextures.end()) {
     return;
   }
-  const auto& tlut = g_gxState.loadedTluts[obj.tlut];
-  if (auto tlutIt = s_tlutObjectCaches.find(tlut.tlutObjId); tlutIt != s_tlutObjectCaches.end()) {
-    tlutIt->second.lastUsedFrame = s_frameCount;
-    if (auto dynamicIt = tlutIt->second.dynamicPaletteTextures.find(make_dynamic_palette_key(obj, copyIt->second));
-        dynamicIt != tlutIt->second.dynamicPaletteTextures.end()) {
-      dynamicIt->second.lastUsedFrame = s_frameCount;
+  bool confirmed = false;
+  if (obj.tlut < g_gxState.loadedTluts.size()) {
+    const auto& tlut = g_gxState.loadedTluts[obj.tlut];
+    if (auto tlutIt = s_tlutObjectCaches.find(tlut.tlutObjId); tlutIt != s_tlutObjectCaches.end()) {
+      tlutIt->second.lastUsedFrame = s_frameCount;
+      if (auto dynamicIt = tlutIt->second.dynamicPaletteTextures.find(make_dynamic_palette_key(obj, copyIt->second));
+          dynamicIt != tlutIt->second.dynamicPaletteTextures.end()) {
+        dynamicIt->second.lastUsedFrame = s_frameCount;
+        confirmed = dynamicIt->second.handle == bound;
+      }
     }
+  }
+  // A binding can outlive a TLUT slot change, so an unconfirmed target blocks reuse for the rest of the frame
+  if (!confirmed && bound) {
+    s_dynamicReuseBlockedFrame = s_frameCount;
   }
 }
 
@@ -759,6 +782,7 @@ void shutdown() noexcept {
   s_sourceKeyCache.clear();
   s_contentCache.set_budget(ContentCacheBudgetBytes);
   s_frameCount = 0;
+  s_dynamicReuseBlockedFrame = UINT64_MAX;
   s_bindGeneration = 1;
   s_pendingInvalidations.store(0, std::memory_order_release);
   s_pendingCacheClears.store(0, std::memory_order_release);
@@ -850,7 +874,7 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
     auto& textureBind = g_gxState.textures[i];
     if (textureBind.generation == s_bindGeneration && obj.texObjId != 0 &&
         obj.texObjId == textureBind.texObj.texObjId && obj.texDataVersion == textureBind.texObj.texDataVersion) {
-      touch_bound_texture(obj);
+      touch_bound_texture(obj, textureBind.ref);
       continue;
     }
 

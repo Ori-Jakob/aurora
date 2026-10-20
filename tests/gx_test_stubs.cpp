@@ -134,12 +134,21 @@ void set_render_scissor(const gfx::ClipRect& scissor) noexcept {
 // --- Shader/pipeline stubs ---
 namespace aurora::gx {
 uint32_t g_testPipelineBuildCount = 0;
+uint32_t g_testShaderInfoCount = 0;
 uint32_t g_testUniformBuildCount = 0;
+// Written into every populated config, so a test can make a rebuild produce a different config
+GXCompare g_testPopulateDepthFunc = GX_NEVER;
+u32 g_testPopulateTevStageCount = 0;
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
   ++g_testPipelineBuildCount;
+  config.depthFunc = g_testPopulateDepthFunc;
+  config.shaderConfig.tevStageCount = g_testPopulateTevStageCount;
 }
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept { return {}; }
-ShaderInfo build_shader_info(const ShaderConfig& config) noexcept { return {}; }
+ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
+  ++g_testShaderInfoCount;
+  return {};
+}
 gfx::Range build_draw_uniform(const ShaderInfo&) noexcept {
   ++g_testUniformBuildCount;
   return {.size = 1};
@@ -276,10 +285,15 @@ template <>
 void push_draw_command<clear::DrawData>(clear::DrawData data) {
   s_lastCommandIsGxDraw = false;
 }
+uint32_t g_testPipelineRefCount = 0;
 template <>
 PipelineRef pipeline_ref<gx::PipelineConfig>(const gx::PipelineConfig& config) {
+  ++g_testPipelineRefCount;
   return 0;
 }
+bool g_testBlockingPipelines = false;
+void set_blocking_pipelines(bool blocking) noexcept { g_testBlockingPipelines = blocking; }
+bool blocking_pipelines() noexcept { return g_testBlockingPipelines; }
 gx::DrawData g_testLastDraw{};
 uint32_t g_testDrawCount = 0;
 std::atomic<uint32_t> g_testProcessedDrawCount{0};

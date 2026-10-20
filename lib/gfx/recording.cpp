@@ -481,6 +481,13 @@ void suspend_efb() {
 
   auto& currentPass = current_render_passes()[g_recorder.currentRenderPass];
   if (!currentPass.has_consumer()) {
+    // Offscreen passes encode before this one, so they would sample its palette targets before conversion
+    if (!currentPass.paletteConvs.empty()) {
+      static bool warned = false;
+      if (!std::exchange(warned, true)) {
+        Log.warn("Suspended an EFB pass with pending palette conversions");
+      }
+    }
     g_recorder.suspendedEfbPass = std::move(currentPass);
     current_render_passes().pop_back();
     --g_recorder.currentRenderPass;

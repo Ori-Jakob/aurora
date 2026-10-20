@@ -9,12 +9,17 @@
 
 namespace aurora::gx {
 extern uint32_t g_testPipelineBuildCount;
+extern uint32_t g_testShaderInfoCount;
 extern uint32_t g_testUniformBuildCount;
+extern GXCompare g_testPopulateDepthFunc;
+extern u32 g_testPopulateTevStageCount;
 } // namespace aurora::gx
 
 namespace aurora::gfx {
 extern gx::DrawData g_testLastDraw;
 extern bool g_testMergeDraws;
+extern bool g_testNormalAttachment;
+extern uint32_t g_testPipelineRefCount;
 extern uint32_t g_testMergedDrawCount;
 extern uint64_t g_testPushedVertexBytes;
 extern uint64_t g_testPushedIndexBytes;
@@ -29,6 +34,9 @@ namespace hints = aurora::gx::hints;
 namespace route = aurora::gx::draw_route;
 using aurora::gx::g_gxState;
 using aurora::gx::g_testPipelineBuildCount;
+using aurora::gx::g_testPopulateDepthFunc;
+using aurora::gx::g_testPopulateTevStageCount;
+using aurora::gx::g_testShaderInfoCount;
 using aurora::gx::g_testUniformBuildCount;
 
 namespace {
@@ -98,7 +106,9 @@ protected:
     gfx::g_testMergedDrawCount = 0;
     gfx::g_testPushedVertexBytes = 0;
     gfx::g_testPushedIndexBytes = 0;
+    gfx::g_testPipelineRefCount = 0;
     g_testPipelineBuildCount = 0;
+    g_testShaderInfoCount = 0;
     g_testUniformBuildCount = 0;
   }
 
@@ -107,7 +117,25 @@ protected:
     hints::set_sink(nullptr);
     hints::testing::reset_counters();
     gfx::g_testMergeDraws = false;
+    gfx::g_testNormalAttachment = false;
+    gfx::set_blocking_pipelines(false);
+    g_testPopulateDepthFunc = GX_NEVER;
+    g_testPopulateTevStageCount = 0;
     GXFifoTest::TearDown();
+  }
+
+  // The first draw looks the pipeline up; the second rebuilds after the change and must look up again
+  void expect_rebuild_looks_up(void (*change)()) {
+    gfx::g_testMergeDraws = false;
+    triangle();
+    decode();
+    change();
+    triangle();
+    decode();
+    EXPECT_EQ(g_testPipelineBuildCount, 2u);
+    EXPECT_EQ(gfx::g_testPipelineRefCount, 2u);
+    EXPECT_EQ(g_testShaderInfoCount, 2u);
+    EXPECT_EQ(g_gxState.dirty, 0u);
   }
 
   void install_router(bool withPush = false) {
@@ -443,6 +471,53 @@ TEST_F(GXDrawRouteTest, InvalidateDrawCacheForcesRebuild) {
   EXPECT_EQ(gfx::g_testMergedDrawCount, 0u);
   EXPECT_EQ(g_testPipelineBuildCount, 2u);
   EXPECT_EQ(g_testUniformBuildCount, 2u);
+}
+
+TEST_F(GXDrawRouteTest, PipelineRebuildWithSameConfigSkipsLookup) {
+  const CpuZoneDelta zones;
+  triangle();
+  decode();
+  g_gxState.dirty |= aurora::gx::DirtyPipeline;
+  triangle();
+  decode();
+  EXPECT_EQ(zones.calls(fifo::CpuZonePipelineBuild), 2u);
+  EXPECT_EQ(g_testPipelineBuildCount, 2u);
+  EXPECT_EQ(gfx::g_testPipelineRefCount, 1u);
+  EXPECT_EQ(g_testShaderInfoCount, 1u);
+  // A rebuild still forces the uniform, as a lookup does
+  EXPECT_EQ(zones.calls(fifo::CpuZoneUniformBuild), 2u);
+  EXPECT_EQ(g_testUniformBuildCount, 2u);
+  EXPECT_EQ(gfx::g_testDrawCount, 2u);
+  EXPECT_EQ(g_gxState.dirty, 0u);
+}
+
+TEST_F(GXDrawRouteTest, PipelineRebuildWithChangedConfigLooksUp) {
+  expect_rebuild_looks_up([] {
+    g_testPopulateDepthFunc = GX_LEQUAL;
+    g_gxState.dirty |= aurora::gx::DirtyPipeline;
+  });
+}
+
+TEST_F(GXDrawRouteTest, PipelineRebuildWithChangedShaderConfigLooksUp) {
+  expect_rebuild_looks_up([] {
+    g_testPopulateTevStageCount = 2;
+    g_gxState.dirty |= aurora::gx::DirtyPipeline;
+  });
+}
+
+TEST_F(GXDrawRouteTest, PipelineRebuildAfterLayoutChangeLooksUp) {
+  expect_rebuild_looks_up([] { gfx::g_testNormalAttachment = true; });
+}
+
+TEST_F(GXDrawRouteTest, PipelineRebuildAfterBlockingFlipLooksUp) {
+  expect_rebuild_looks_up([] {
+    gfx::set_blocking_pipelines(true);
+    g_gxState.dirty |= aurora::gx::DirtyPipeline;
+  });
+}
+
+TEST_F(GXDrawRouteTest, PipelineRebuildAfterInvalidateDrawCacheLooksUp) {
+  expect_rebuild_looks_up([] { fifo::invalidate_draw_cache(); });
 }
 
 TEST_F(GXDrawRouteTest, CpuZonesCountDrawWork) {
