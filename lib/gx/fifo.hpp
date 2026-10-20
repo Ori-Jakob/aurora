@@ -122,4 +122,18 @@ const uint8_t* get_buffer_data();
 uint32_t get_buffer_size();
 void clear_buffer();
 
+struct FifoStats {
+  uint64_t frames = 0, publishes = 0, wakeCalls = 0, parks = 0, chunks = 0, notifies = 0;
+  uint64_t drainsReady = 0, drainsSpun = 0, drainsSlept = 0, drainWaitNs = 0, drainWaitMaxNs = 0;
+};
+FifoStats stats() noexcept;
+
+namespace testing {
+enum class ParkStep : uint8_t { BeforeFlag, AfterFlag };
+using ParkHook = void (*)(ParkStep step);
+void set_park_hook(ParkHook hook) noexcept;
+bool worker_parked() noexcept;
+uint32_t spin_before_sleep_ns() noexcept;
+} // namespace testing
+
 } // namespace aurora::gx::fifo

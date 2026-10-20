@@ -162,7 +162,7 @@ if (AURORA_ENABLE_GX)
     target_link_libraries(gx_fifo_tests PRIVATE zstd::libzstd)
   endif ()
 
-  gtest_discover_tests(gx_fifo_tests)
+  gtest_discover_tests(gx_fifo_tests PROPERTIES TIMEOUT 60)
 
   add_executable(gx_texture_cache_tests
     gx_texture_cache_test.cpp
