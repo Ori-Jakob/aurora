@@ -189,6 +189,10 @@ bool g_testStorageRanges = false;
 std::vector<uint8_t> g_testStorage;
 // Runs once a push has copied, so a test can rewrite guest memory mid-upload as the game thread can
 void (*g_testAfterStoragePush)() = nullptr;
+// Runs before a push copies, so a test can rewrite guest memory between the shadow fill and the upload
+void (*g_testBeforeStoragePush)() = nullptr;
+// Without guest hooks a read aliases guest memory, so only the source pointer shows what a push copied from
+const uint8_t* g_testLastStorageSource = nullptr;
 ResidentStorage g_testResidentStorage{};
 std::vector<detail::ResidentCopy> g_testResidentCopies;
 uint64_t g_testResidentRequest = 0;
@@ -221,8 +225,12 @@ Range push_uniform(const uint8_t* data, size_t length) { return {}; }
 Range push_storage(const uint8_t* data, size_t length) {
   g_testPushedStorageBytes += length;
   ++g_testStoragePushes;
+  g_testLastStorageSource = data;
   if (!g_testStorageRanges) {
     return {};
+  }
+  if (g_testBeforeStoragePush != nullptr) {
+    g_testBeforeStoragePush();
   }
   const auto range = push_range(s_storageCursor, length, 256);
   g_testStorage.resize(s_storageCursor);
