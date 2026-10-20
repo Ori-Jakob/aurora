@@ -62,6 +62,15 @@ StreamingGrowth next_streaming_sizes(const StreamingSizes& current, const Aurora
                                      const StreamingSizes& requested, const StreamingLimits& limits) noexcept;
 uint32_t next_resident_capacity(uint32_t current, uint64_t request, uint64_t streamingStorage, uint64_t bound) noexcept;
 
+struct ResidentLayout {
+  uint64_t streamingStorage = 0;
+  uint32_t capacity = 0;
+  uint32_t epoch = 0;
+};
+
+ResidentLayout next_resident_layout(const ResidentLayout& last, uint64_t streamingStorage, uint32_t capacity) noexcept;
+uint64_t streaming_storage_limit(uint64_t bound, uint32_t residentCapacity) noexcept;
+
 struct Resources {
   wgpu::Buffer vertexBuffer;
   wgpu::Buffer uniformBuffer;

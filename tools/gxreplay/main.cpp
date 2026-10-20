@@ -424,11 +424,11 @@ int run_replay(int argc, char* argv[], const Options& options) {
     for (const auto& resident : result.residentRuns) {
       std::printf(
           "aurora_gxreplay: resident arrays: run %u, stages %llu, hits %llu, resets %llu, epochs %llu, "
-          "mismatches %llu, violations %llu\n",
+          "mismatches %llu, violations %llu, arena full %llu\n",
           resident.run, static_cast<unsigned long long>(resident.stages),
           static_cast<unsigned long long>(resident.hits), static_cast<unsigned long long>(resident.resets),
           static_cast<unsigned long long>(resident.epochs), static_cast<unsigned long long>(resident.mismatches),
-          static_cast<unsigned long long>(resident.violations));
+          static_cast<unsigned long long>(resident.violations), static_cast<unsigned long long>(resident.arenaFull));
     }
   }
   // Frames before --frames are still decoded, so their unresolved reads count too

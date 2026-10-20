@@ -95,7 +95,11 @@ TEST(StreamingSizesTest, VertexAndIndexIndependent) {
 TEST(ResidentCapacityTest, NoRequestKeepsCapacity) {
   EXPECT_EQ(next_resident_capacity(0, 0, 8 * MiB, 128 * MiB), 0u);
   EXPECT_EQ(next_resident_capacity(2 * MiB, 0, 8 * MiB, 128 * MiB), 2 * MiB);
-  EXPECT_EQ(next_resident_capacity(2 * MiB, 2 * MiB, 8 * MiB, 128 * MiB), 2 * MiB);
+}
+
+TEST(ResidentCapacityTest, RequestWithinCapacityStillGrows) {
+  EXPECT_EQ(next_resident_capacity(2 * MiB, 2 * MiB, 8 * MiB, 128 * MiB), 4 * MiB);
+  EXPECT_EQ(next_resident_capacity(1 * MiB, 1000 * 1024, 8 * MiB, 128 * MiB), 2 * MiB);
 }
 
 TEST(ResidentCapacityTest, GrowsToAtLeastOneMiB) {
@@ -122,7 +126,33 @@ TEST(ResidentCapacityTest, CappedByThirtyTwoBitOffsets) {
 
 TEST(ResidentCapacityTest, NeverShrinks) {
   EXPECT_EQ(next_resident_capacity(8 * MiB, 9 * MiB, 124 * MiB, 128 * MiB), 8 * MiB);
-  EXPECT_EQ(next_resident_capacity(16 * MiB, 10 * MiB, 8 * MiB, 128 * MiB), 16 * MiB);
+  EXPECT_EQ(next_resident_capacity(16 * MiB, 5 * MiB, 8 * MiB, 128 * MiB), 16 * MiB);
+}
+
+TEST(ResidentLayoutTest, StreamingGrowthBumpsTheEpoch) {
+  const ResidentLayout last{.streamingStorage = 8 * MiB, .capacity = 1 * MiB, .epoch = 3};
+  const auto next = next_resident_layout(last, 16 * MiB, 1 * MiB);
+  EXPECT_EQ(next.epoch, 4u);
+  EXPECT_EQ(next.streamingStorage, 16 * MiB);
+  EXPECT_EQ(next.capacity, 1 * MiB);
+}
+
+TEST(ResidentLayoutTest, ArenaGrowthBumpsTheEpoch) {
+  const ResidentLayout last{.streamingStorage = 8 * MiB, .capacity = 1 * MiB, .epoch = 3};
+  const auto next = next_resident_layout(last, 8 * MiB, 2 * MiB);
+  EXPECT_EQ(next.epoch, 4u);
+  EXPECT_EQ(next.capacity, 2 * MiB);
+  EXPECT_EQ(next_resident_layout(next, 8 * MiB, 2 * MiB).epoch, 4u);
+}
+
+TEST(ResidentLayoutTest, UnchangedLayoutKeepsTheEpoch) {
+  const ResidentLayout last{.streamingStorage = 8 * MiB, .capacity = 1 * MiB, .epoch = 3};
+  EXPECT_EQ(next_resident_layout(last, 8 * MiB, 1 * MiB).epoch, 3u);
+}
+
+TEST(ResidentLayoutTest, StreamingStorageLeavesRoomForTheArena) {
+  EXPECT_EQ(streaming_storage_limit(128 * MiB, 8 * MiB), 120 * MiB);
+  EXPECT_EQ(streaming_storage_limit(128 * MiB, 0), 128 * MiB);
 }
 } // namespace
 } // namespace aurora::gfx::detail

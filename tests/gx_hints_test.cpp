@@ -916,6 +916,14 @@ TEST_F(GXHintTest, Malformed_SetArrayEmpty) {
   expect_core_malformed(GX_AURORA_SET_ARRAY_IMMUTABLE, set_array_payload(1, 0x80200000, 0, 1));
 }
 
+TEST_F(GXHintTest, Malformed_SetArrayWraps) {
+  expect_core_malformed(GX_AURORA_SET_ARRAY_IMMUTABLE, set_array_payload(1, 0xFFFFFFFFFFFFFF00ull, 0x200, 1));
+}
+
+TEST_F(GXHintTest, Malformed_SetArrayEndsPastTheTop) {
+  expect_core_malformed(GX_AURORA_SET_ARRAY_IMMUTABLE, set_array_payload(1, 0xFFFFFFFFFFFFFF00ull, 0x100, 1));
+}
+
 TEST_F(GXHintTest, Malformed_ReleaseArrayShort) {
   std::vector<u8> payload(wire::ReleaseArrayImmutableV1);
   wire::Writer writer{payload};

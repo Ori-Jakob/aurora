@@ -68,8 +68,7 @@ std::array<StreamingSizes, StagingBufferCount> g_stagingSizes;
 StreamingSizes g_targetSizes;
 StreamingSizes g_requestedSizes;
 uint32_t g_residentCapacity = 0;
-uint32_t g_residentEpoch = 0;
-std::pair<uint64_t, uint32_t> g_lastResidentLayout{};
+ResidentLayout g_residentLayout{};
 uint32_t g_testGrowthFrame = 0;
 bool g_loggedStagingCap = false;
 uint32_t g_frameIndex = UINT32_MAX;
@@ -383,7 +382,7 @@ StreamingLimits streaming_limits() noexcept {
   const uint64_t bound = buffer_bound();
   return {.vertex = bound,
           .index = bound,
-          .storage = bound - g_residentCapacity,
+          .storage = streaming_storage_limit(bound, g_residentCapacity),
           .staging = g_resources.limits.maxBufferSize};
 }
 
@@ -453,11 +452,23 @@ StreamingGrowth next_streaming_sizes(const StreamingSizes& current, const Aurora
 
 uint32_t next_resident_capacity(uint32_t current, uint64_t request, uint64_t streamingStorage,
                                 uint64_t bound) noexcept {
-  if (request <= current) {
+  // A fragmented arena can ask for less than it has, and only growing it bumps the epoch that compacts it
+  if (request == 0) {
     return current;
   }
   const uint64_t wanted = std::bit_ceil(std::max<uint64_t>(2 * request, MiB));
   return static_cast<uint32_t>(std::max<uint64_t>(current, std::min(wanted, resident_limit(streamingStorage, bound))));
+}
+
+ResidentLayout next_resident_layout(const ResidentLayout& last, uint64_t streamingStorage, uint32_t capacity) noexcept {
+  if (streamingStorage == last.streamingStorage && capacity == last.capacity) {
+    return last;
+  }
+  return {.streamingStorage = streamingStorage, .capacity = capacity, .epoch = last.epoch + 1};
+}
+
+uint64_t streaming_storage_limit(uint64_t bound, uint32_t residentCapacity) noexcept {
+  return bound - residentCapacity;
 }
 
 std::optional<RegisteredDrawType> find_runtime_draw_type(DrawTypeId id) {
@@ -626,7 +637,7 @@ void initialize() {
   create_buffer(g_resources.indexBuffer, IndexBufferUsage, g_targetSizes.index, "Shared Index Buffer");
   create_buffer(g_resources.storageBuffer, StorageBufferUsage, g_targetSizes.storage, "Shared Storage Buffer");
   g_resources.deviceSizes = g_targetSizes;
-  ++g_residentEpoch;
+  ++g_residentLayout.epoch;
   for (size_t i = 0; i < g_stagingBuffers.size(); ++i) {
     create_staging_buffer(i, false);
   }
@@ -810,11 +821,8 @@ bool begin_frame() {
   frame.sizes = g_targetSizes;
   frame.residentCapacity = g_residentCapacity;
   frame.residentLimit = static_cast<uint32_t>(resident_limit(g_targetSizes.storage, buffer_bound()));
-  if (const std::pair layout{g_targetSizes.storage, g_residentCapacity}; layout != g_lastResidentLayout) {
-    g_lastResidentLayout = layout;
-    ++g_residentEpoch;
-  }
-  frame.residentEpoch = g_residentEpoch;
+  g_residentLayout = next_resident_layout(g_residentLayout, g_targetSizes.storage, g_residentCapacity);
+  frame.residentEpoch = g_residentLayout.epoch;
   frame.renderState = render::detail::latch_frame();
   size_t bufferOffset = 0;
   const auto& stagingBuf = g_stagingBuffers[*stagingSlot];

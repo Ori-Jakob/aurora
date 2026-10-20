@@ -486,6 +486,7 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
       .epochs = residentEnd.epochs - residentStart.epochs,
       .mismatches = residentEnd.sizeMismatches - residentStart.sizeMismatches,
       .violations = residentEnd.violations - residentStart.violations,
+      .arenaFull = residentEnd.arenaFull - residentStart.arenaFull,
   });
   return true;
 }

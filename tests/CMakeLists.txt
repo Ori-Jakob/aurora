@@ -577,13 +577,25 @@ if (TARGET aurora_gxreplay)
               --no-png --out ${_gxreplay_dir}/render_demo_replay)
     set_tests_properties(gxreplay_render_demo_replay PROPERTIES LABELS smoke TIMEOUT 180
       ENVIRONMENT "AURORA_RENDER_HINTS=1" FIXTURES_REQUIRED gxreplay_demo_trace)
+    # PASS_REGULAR_EXPRESSION hides the exit code, so the failure messages are matched instead
+    set(_resident_fail "\\[(ERROR|FATAL): |violations [1-9]|is not bit-identical|guest reads were not resolved")
     add_test(NAME gxreplay_render_demo_resident
       COMMAND $<TARGET_FILE:aurora_gxreplay> ${_gxreplay_dir}/render_demo.gxtrace --backend null --repeat 2
               --no-png --out ${_gxreplay_dir}/render_demo_resident)
     set_tests_properties(gxreplay_render_demo_resident PROPERTIES LABELS smoke TIMEOUT 180
       ENVIRONMENT "AURORA_RENDER_HINTS=1;AURORA_IMMUTABLE_ARRAYS=validate" FIXTURES_REQUIRED gxreplay_demo_trace
       PASS_REGULAR_EXPRESSION "resident arrays: run 1, stages [1-9][0-9]*, hits [1-9]"
-      FAIL_REGULAR_EXPRESSION "\\[(ERROR|FATAL): |violations [1-9]")
+      FAIL_REGULAR_EXPRESSION "${_resident_fail}")
+    # Growth after the first stage recreates the storage buffer, so every array must stage again in a new epoch
+    string(CONCAT _resident_growth "resident arrays: run 0, stages 6, hits 3, resets 0, epochs 3, mismatches 0, "
+                                   "violations 0, arena full 0")
+    add_test(NAME gxreplay_render_demo_resident_growth
+      COMMAND $<TARGET_FILE:aurora_gxreplay> ${_gxreplay_dir}/render_demo.gxtrace --backend null --no-png
+              --out ${_gxreplay_dir}/render_demo_resident_growth)
+    set_tests_properties(gxreplay_render_demo_resident_growth PROPERTIES LABELS smoke TIMEOUT 180
+      ENVIRONMENT "AURORA_RENDER_HINTS=1;AURORA_IMMUTABLE_ARRAYS=validate;AURORA_TEST_STREAMING_GROWTH=2"
+      FIXTURES_REQUIRED gxreplay_demo_trace PASS_REGULAR_EXPRESSION "${_resident_growth}"
+      FAIL_REGULAR_EXPRESSION "${_resident_fail}")
   endif ()
   if (AURORA_ENABLE_RENDER)
     set(_classify_trace ${_gxreplay_dir}/classify/self_test_hints.gxtrace)
@@ -622,7 +634,8 @@ if (TARGET aurora_gxreplay)
       COMMAND $<TARGET_FILE:aurora_gxreplay> ${_gxreplay_dir}/render_demo_plain.gxtrace --backend null --no-png
               --out ${_gxreplay_dir}/render_demo_plain_resident)
     set_tests_properties(gxreplay_render_demo_plain_resident PROPERTIES LABELS smoke TIMEOUT 180
-      FIXTURES_REQUIRED gxreplay_demo_plain_trace PASS_REGULAR_EXPRESSION "resident arrays: run 0, stages 0, hits 0")
+      FIXTURES_REQUIRED gxreplay_demo_plain_trace PASS_REGULAR_EXPRESSION "resident arrays: run 0, stages 0, hits 0"
+      FAIL_REGULAR_EXPRESSION "${_resident_fail}")
 
     set(_demo_ab ${_gxreplay_dir}/hints_ab)
     add_test(NAME gxreplay_render_demo_hints_ab_replay

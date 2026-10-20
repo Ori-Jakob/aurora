@@ -87,6 +87,7 @@ struct ResidentRun {
   uint64_t epochs = 0;
   uint64_t mismatches = 0;
   uint64_t violations = 0;
+  uint64_t arenaFull = 0;
 };
 
 struct ReportContext {

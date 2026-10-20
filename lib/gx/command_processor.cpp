@@ -174,6 +174,7 @@ struct ImmutableArray {
   u32 blockSize = 0;
   u32 epoch = 0;
   u64 stagedFrame = 0;
+  u64 failedFrame = 0;
   HashType hash = 0;
   bool warned = false;
 };
@@ -188,6 +189,7 @@ struct Arena {
   u32 blockAlign = 0;
   u32 used = 0;
   u32 live = 0;
+  u64 shortfall = 0;
   absl::btree_map<u32, u32> free;
   bool bypass = false;
   bool reset = false;
@@ -195,6 +197,7 @@ struct Arena {
 ImmutableArrayMode g_immutableMode = ImmutableArrayMode::On;
 bool g_warnedOverlap = false;
 bool g_warnedStaleRelease = false;
+bool g_warnedArenaFull = false;
 
 std::atomic<uint64_t> g_routed{0};
 std::atomic<uint64_t> g_suppressed{0};
@@ -326,6 +329,9 @@ gfx::Range push_array(const AttrArray& array, std::span<const u8>* pushed = null
     if (std::memcmp(shadow, bytes.data(), bytes.size()) == 0) {
       bump(g_arrayReused);
       bump(g_arrayReusedBytes, bytes.size());
+      if (pushed != nullptr) {
+        *pushed = {shadow, bytes.size()};
+      }
       return upload.range;
     }
     bump(g_arrayChanged);
@@ -348,7 +354,7 @@ gfx::Range push_array(const AttrArray& array, std::span<const u8>* pushed = null
   return range;
 }
 
-// A cached upload may hold an earlier generation's bytes, so a stage always takes a fresh read
+// A stage takes a push of its own, so the block's copy source and Validate's hash come from the same fresh read
 gfx::Range push_array_fresh(const AttrArray& array, std::span<const u8>& pushed) noexcept {
   sArrayUploads.erase(std::pair<const void*, u32>{array.data, array.size});
   return push_array(array, &pushed);
@@ -424,6 +430,7 @@ void sync_arena() noexcept {
     return;
   }
   g_arena.frameId = storage.frameId;
+  g_arena.shortfall = 0;
   if (storage.frameId == 0) {
     return;
   }
@@ -462,14 +469,22 @@ void stage(ImmutableArray& entry, gfx::Range range, std::span<const u8> bytes) n
     }
     return;
   }
-  const u64 need = u64{g_arena.live} + blockSize;
+  // An entry fails once a frame at most, so one growth step can cover every block this frame could not place
+  entry.failedFrame = g_arena.frameId;
+  g_arena.shortfall += blockSize;
+  const u64 need = u64{g_arena.live} + g_arena.shortfall;
   if (2 * need > g_arena.capacity && g_arena.capacity < g_arena.limit) {
     gfx::request_resident_capacity(need);
-  } else if (need <= g_arena.capacity) {
+  } else if (u64{g_arena.live} + blockSize <= g_arena.capacity) {
+    // Only this block has to fit once compacted, so an array too big for the cap cannot hold back a reset
     g_arena.reset = true;
     bump(g_residentResets);
   } else {
     bump(g_arenaFull);
+    if (!std::exchange(g_warnedArenaFull, true)) {
+      Log.warn("Resident arena full: declared arrays need {} bytes but it is capped at {}; the rest stream", need,
+               g_arena.capacity);
+    }
   }
 }
 
@@ -512,6 +527,10 @@ gfx::Range upload_array(const AttrArray& array) noexcept {
       }
       return {g_arena.base + entry.offset, array.size};
     }
+    return push_array(array);
+  }
+  // A block that could not be placed waits for the next frame, so rebinds keep W1's reuse instead of pushing fresh
+  if (entry.failedFrame == g_arena.frameId) {
     return push_array(array);
   }
   std::span<const u8> pushed;
@@ -1219,6 +1238,10 @@ void set_cpu_zone_timing(uint32_t timing) noexcept {
 }
 
 void set_array_immutable(uint64_t address, uint32_t size, bool le, uint32_t generation) noexcept {
+  // Off is the W1 baseline, so a declaration must not erase W1's uploads or fill the table
+  if (g_immutableMode == ImmutableArrayMode::Off) {
+    return;
+  }
   const auto begin = static_cast<uintptr_t>(address);
   const u64 frameId = gfx::resident_storage().frameId;
   if (const auto it = g_immutableArrays.find(begin); it != g_immutableArrays.end()) {
@@ -1248,6 +1271,9 @@ void set_array_immutable(uint64_t address, uint32_t size, bool le, uint32_t gene
 }
 
 void release_array_immutable(uint64_t address, uint32_t generation) noexcept {
+  if (g_immutableMode == ImmutableArrayMode::Off) {
+    return;
+  }
   const auto at = static_cast<uintptr_t>(address);
   auto it = g_immutableArrays.upper_bound(at);
   if (it == g_immutableArrays.begin() || at >= std::prev(it)->first + std::prev(it)->second.size) {
@@ -1325,6 +1351,7 @@ void reset_immutable_array_stats() noexcept {
   }
   g_warnedOverlap = false;
   g_warnedStaleRelease = false;
+  g_warnedArenaFull = false;
 }
 } // namespace testing
 

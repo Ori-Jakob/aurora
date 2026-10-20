@@ -505,7 +505,7 @@ bool decode_core(uint16_t id, Decoder& decoder) noexcept {
     const uint32_t generation = in.read<uint32_t>();
     if (!decoder.value(le <= 1, "endianness", le) ||
         !decoder.value(address != 0 && address <= UINTPTR_MAX, "address", address) ||
-        !decoder.value(size != 0, "size", size)) {
+        !decoder.value(size != 0 && size <= UINTPTR_MAX - address, "size", size)) {
       return false;
     }
     add(id, Decoded);
