@@ -627,11 +627,58 @@ TEST_F(GXFifoTest, BusyWorkerTakesNoWakePerPublish) {
   }
   EXPECT_EQ(fifo::stats().wakeCalls, before.wakeCalls);
   sBlockingCallbackMayReturn.store(true, std::memory_order_release);
+  if (!wait_until([] { return fifo::testing::worker_parked(); })) {
+    fail_hard("the released worker did not park");
+  }
+  EXPECT_EQ(fifo::stats().notifies, before.notifies);
   run_or_die("drain after the busy worker was released did not return", [] { fifo::drain(); });
   const auto after = fifo::stats();
   EXPECT_EQ(after.wakeCalls, before.wakeCalls);
   EXPECT_LE(after.chunks - before.chunks, 2u);
+  EXPECT_EQ(after.drainsReady, before.drainsReady + 1);
   EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41123456u);
+
+  GXSetDrawDoneCallback(nullptr);
+  fifo::end_frame();
+  fifo::shutdown();
+}
+
+TEST_F(GXFifoTest, DrainSleepsOnBusyWorker) {
+  namespace fifo = aurora::gx::fifo;
+  sBlockingCallbackEntered.store(false, std::memory_order_relaxed);
+  sBlockingCallbackMayReturn.store(false, std::memory_order_relaxed);
+  sBlockingCallbackReturned.store(false, std::memory_order_relaxed);
+  std::atomic<bool> drainStarted{false};
+  std::atomic<bool> drainReturned{false};
+
+  fifo::init();
+  fifo::begin_frame();
+  GXSetDrawDoneCallback(blocking_draw_done_callback);
+  GXSetDrawDone();
+  if (!wait_for(sBlockingCallbackEntered, true)) {
+    fail_hard("the draw-done callback did not begin");
+  }
+  const auto before = fifo::stats();
+  std::thread drainThread{[&] {
+    drainStarted.store(true, std::memory_order_release);
+    fifo::drain();
+    drainReturned.store(true, std::memory_order_release);
+  }};
+  if (!wait_for(drainStarted, true)) {
+    fail_hard("the drain thread did not start");
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  sBlockingCallbackMayReturn.store(true, std::memory_order_release);
+  if (!wait_for(drainReturned, true)) {
+    fail_hard("drain did not return after the busy worker was released");
+  }
+  drainThread.join();
+  const auto after = fifo::stats();
+  EXPECT_EQ(after.drainsSlept, before.drainsSlept + 1);
+  EXPECT_EQ(after.drainsReady, before.drainsReady);
+  EXPECT_EQ(after.drainsSpun, before.drainsSpun);
+  // The worker counts its notify after the store that let the drain return
+  EXPECT_TRUE(wait_until([&] { return fifo::stats().notifies > before.notifies; }));
 
   GXSetDrawDoneCallback(nullptr);
   fifo::end_frame();
@@ -674,15 +721,25 @@ TEST_F(GXFifoTest, SynchronousPublishWaitsForBusyWorker) {
   fifo::shutdown();
 }
 
-TEST_F(GXFifoTest, PublishWakeStress) {
-  namespace fifo = aurora::gx::fifo;
-  const uint32_t edge = fifo::testing::spin_before_sleep_ns();
+static std::vector<uint32_t> publish_wake_gaps() {
+  const uint32_t edge = aurora::gx::fifo::testing::spin_before_sleep_ns();
   std::vector<uint32_t> gaps;
   for (uint32_t gap = edge > 5000 ? edge - 5000 : 0; gap <= edge + 5000; gap += 250) {
     gaps.insert(gaps.end(), 10, gap);
   }
   gaps.insert(gaps.end(), 10, 1'000'000);
   gaps.insert(gaps.end(), 10, 0);
+  return gaps;
+}
+
+static void spin_for(uint32_t ns) {
+  const auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds{ns};
+  while (std::chrono::steady_clock::now() < until) {}
+}
+
+TEST_F(GXFifoTest, PublishWakeStress) {
+  namespace fifo = aurora::gx::fifo;
+  const std::vector<uint32_t> gaps = publish_wake_gaps();
   sDrawDoneCount.store(0, std::memory_order_relaxed);
 
   fifo::init();
@@ -691,10 +748,39 @@ TEST_F(GXFifoTest, PublishWakeStress) {
   const uint64_t parks = fifo::stats().parks;
   for (const uint32_t gap : gaps) {
     GXSetDrawDone();
-    const auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds{gap};
-    while (std::chrono::steady_clock::now() < until) {}
+    spin_for(gap);
   }
   run_or_die("drain after the publish sweep did not return", [] { fifo::drain(); });
+  EXPECT_EQ(sDrawDoneCount.load(std::memory_order_acquire), gaps.size());
+  EXPECT_GT(fifo::stats().parks, parks);
+
+  GXSetDrawDoneCallback(nullptr);
+  fifo::end_frame();
+  fifo::shutdown();
+}
+
+// Waiting out each publish leaves no later one to rescue a lost wake; that raises the odds of catching one, no more
+TEST_F(GXFifoTest, PublishWakeStressPerPublish) {
+  namespace fifo = aurora::gx::fifo;
+  const std::vector<uint32_t> gaps = publish_wake_gaps();
+  sDrawDoneCount.store(0, std::memory_order_relaxed);
+
+  fifo::init();
+  fifo::begin_frame();
+  GXSetDrawDoneCallback(counting_draw_done_callback);
+  const uint64_t parks = fifo::stats().parks;
+  const uint32_t base = sDrawDoneCount.load(std::memory_order_acquire);
+  for (uint32_t i = 0; i < gaps.size(); ++i) {
+    GXSetDrawDone();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    while (sDrawDoneCount.load(std::memory_order_acquire) != base + i + 1) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        fail_hard("a publish in the gap sweep lost its wake");
+      }
+    }
+    spin_for(gaps[i]);
+  }
+  run_or_die("drain after the per-publish sweep did not return", [] { fifo::drain(); });
   EXPECT_EQ(sDrawDoneCount.load(std::memory_order_acquire), gaps.size());
   EXPECT_GT(fifo::stats().parks, parks);
 

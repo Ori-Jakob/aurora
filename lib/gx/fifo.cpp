@@ -50,6 +50,7 @@ struct alignas(64) GameCounters {
   std::array<std::atomic<uint64_t>, 3> drains{};
   std::atomic<uint64_t> drainWaitNs{0}, drainWaitMaxNs{0};
   uint64_t frameDrainNs = 0;
+  uint64_t processNsBase = 0;
 };
 struct alignas(64) WorkerCounters {
   std::atomic<uint64_t> parks{0}, chunks{0}, notifies{0};
@@ -254,7 +255,7 @@ void log_stats() noexcept {
   const auto perFrame = [&s](uint64_t value) { return static_cast<double>(value) / static_cast<double>(s.frames); };
   const uint64_t drains = s.drainsReady + s.drainsSpun + s.drainsSlept;
   const double drainMeanUs = drains != 0 ? static_cast<double>(s.drainWaitNs) / static_cast<double>(drains) / 1e3 : 0.0;
-  const uint64_t processNs = cpu_zone_stats().ns[CpuZoneProcess];
+  const uint64_t processNs = cpu_zone_stats().ns[CpuZoneProcess] - sGame.processNsBase;
   const std::string process =
       processNs != 0 ? fmt::format(", process {:.3f} ms/frame", perFrame(processNs) / 1e6) : std::string{};
   Log.info(
@@ -299,6 +300,8 @@ void init() {
     drains.store(0, std::memory_order_relaxed);
   }
   sGame.frameDrainNs = 0;
+  // Zone totals run since startup, and the stats line covers only this session's frames
+  sGame.processNsBase = cpu_zone_stats().ns[CpuZoneProcess];
   sDrainWaitUs.fill(0);
   sFrameDrainUs.fill(0);
   // Live runs have no replay flag, so an environment switch times process()
