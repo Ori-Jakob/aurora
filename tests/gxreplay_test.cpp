@@ -472,6 +472,35 @@ TEST(GxReplayReport, CpuZonesCheck) {
   EXPECT_FALSE(error.empty());
 }
 
+TEST(GxReplayReport, CpuZonesCheckNeedsTextureBinds) {
+  std::vector<CpuFrameZones> rows{zone_row(0, 0, 1.0), zone_row(0, 1, 1.0), zone_row(1, 0, 1.0), zone_row(1, 1, 1.0)};
+  for (auto& row : rows) {
+    row.encodedDraws = 4;
+    row.texturedDraws = 3;
+    row.textureBinds = 1;
+  }
+  std::string error = "untouched";
+  EXPECT_TRUE(check_cpu_zones(rows, 2, false, error));
+  EXPECT_EQ(error, "untouched");
+
+  rows[3].textureBinds = 0;
+  EXPECT_FALSE(check_cpu_zones(rows, 2, false, error));
+  EXPECT_EQ(error, "cpu zones: run 1 frame 1 has 3 textured draws but no texture binds");
+
+  // The bind counts come with plain --cpu-zones, so draw zones must not gate the check
+  for (auto& row : rows) {
+    row.pushDrawMs = 0.5;
+  }
+  error.clear();
+  EXPECT_FALSE(check_cpu_zones(rows, 2, true, error));
+  EXPECT_EQ(error, "cpu zones: run 1 frame 1 has 3 textured draws but no texture binds");
+
+  rows[3].texturedDraws = 0;
+  error = "untouched";
+  EXPECT_TRUE(check_cpu_zones(rows, 2, true, error));
+  EXPECT_EQ(error, "untouched");
+}
+
 TEST(GxReplayOptions, ParsesDebugView) {
   const auto role = parse({"demo.gxtrace", "--out", "o", "--debug-view", "role"});
   ASSERT_TRUE(role);

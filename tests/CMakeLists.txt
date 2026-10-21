@@ -577,6 +577,18 @@ if (TARGET aurora_gxreplay)
               --no-png --out ${_gxreplay_dir}/render_demo_replay)
     set_tests_properties(gxreplay_render_demo_replay PROPERTIES LABELS smoke TIMEOUT 180
       ENVIRONMENT "AURORA_RENDER_HINTS=1" FIXTURES_REQUIRED gxreplay_demo_trace)
+    add_test(NAME gxreplay_render_demo_bind_counts
+      COMMAND $<TARGET_FILE:aurora_gxreplay> ${_gxreplay_dir}/render_demo.gxtrace --backend null --repeat 2
+              --no-png --cpu-zones --out ${_gxreplay_dir}/render_demo_binds)
+    set_tests_properties(gxreplay_render_demo_bind_counts PROPERTIES LABELS smoke TIMEOUT 180
+      ENVIRONMENT "AURORA_RENDER_HINTS=1" FIXTURES_REQUIRED gxreplay_demo_trace FIXTURES_SETUP gxreplay_demo_binds)
+    # Only exact counts catch a skip that compares the wrong field; the self-test check needs just one bind
+    add_test(NAME gxreplay_render_demo_bind_counts_check
+      COMMAND ${CMAKE_COMMAND} -DZONES=${_gxreplay_dir}/render_demo_binds/cpu_zones.json
+              -DCOUNTS=encodedDraws=13,texturedDraws=1,uniformBinds=13,textureBinds=1,indexBinds=1
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/check_cpu_zone_counts.cmake)
+    set_tests_properties(gxreplay_render_demo_bind_counts_check PROPERTIES LABELS smoke TIMEOUT 60
+      FIXTURES_REQUIRED gxreplay_demo_binds)
     # PASS_REGULAR_EXPRESSION hides the exit code, so the failure messages are matched instead
     set(_resident_fail "\\[(ERROR|FATAL): |violations [1-9]|is not bit-identical|guest reads were not resolved")
     add_test(NAME gxreplay_render_demo_resident

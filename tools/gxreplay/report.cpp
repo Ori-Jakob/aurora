@@ -602,6 +602,12 @@ bool check_cpu_zones(std::span<const CpuFrameZones> frames, size_t framesPerRun,
       error = fmt::format("cpu zones: run {} frame {} has no FIFO calls", frame.run, frame.frame);
       return false;
     }
+    // Every pass resets the bind trackers, so a frame with textured draws binds group 2 at least once
+    if (frame.texturedDraws != 0 && frame.textureBinds == 0) {
+      error = fmt::format("cpu zones: run {} frame {} has {} textured draws but no texture binds", frame.run,
+                          frame.frame, frame.texturedDraws);
+      return false;
+    }
     fifoMs += frame.fifoMs;
     pushDrawMs += frame.pushDrawMs;
   }
