@@ -81,6 +81,8 @@ constexpr bool binds(Access access) noexcept {
          access == Access::StorageWrite || access == Access::StorageRW;
 }
 
+wgpu::BufferUsage buffer_usage(Access access) noexcept;
+
 enum class PassClass : uint8_t { Required, Optional, Diagnostic };
 enum class Owner : uint8_t { Dawn, NativeD3D12 };
 enum class ResourceKind : uint8_t { Transient, History, Persistent, Gx, External };

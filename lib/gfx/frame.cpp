@@ -824,6 +824,8 @@ bool begin_frame() {
   g_residentLayout = next_resident_layout(g_residentLayout, g_targetSizes.storage, g_residentCapacity);
   frame.residentEpoch = g_residentLayout.epoch;
   frame.renderState = render::detail::latch_frame();
+  // After latch_frame, so blocks made while latching land in this frame, and before the begin item is queued
+  render::detail::on_frame_recording(frame.frameId);
   size_t bufferOffset = 0;
   const auto& stagingBuf = g_stagingBuffers[*stagingSlot];
   const auto mapBuffer = [&](ByteBuffer& buf, uint64_t size) {

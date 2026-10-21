@@ -732,6 +732,15 @@ TEST_F(RenderGraph, DeclarationErrors) {
                          }}},
                    "p",
                    CullReason::InvalidDeclaration});
+  for (const Access read : {Access::Indirect, Access::Index, Access::Vertex}) {
+    cases.push_back(
+        {"white " + std::string{access_name(read)} + " read",
+         {{.name = "p",
+           .kind = PassKind::Encoder,
+           .body = [read](InternalPassBuilder& b) { b.use_buffer("x.args", read, Missing::BindDummyWhite); }}},
+         "p",
+         CullReason::InvalidDeclaration});
+  }
 
   for (const DeclarationCase& test : cases) {
     SCOPED_TRACE(test.label);
@@ -746,7 +755,19 @@ TEST_F(RenderGraph, DeclarationErrors) {
       EXPECT_EQ(resource(*graph, "p").tex.format, TextureFormat::RGBA8Unorm);
       EXPECT_TRUE(active(*graph, "one"));
     }
+    if (test.label.starts_with("white")) {
+      EXPECT_NE(diagnostics[0].message.find("binds a white dummy for 'x.args'"), std::string::npos)
+          << diagnostics[0].message;
+    }
   }
+
+  const auto black = compile({{.name = "black", .kind = PassKind::Encoder, .body = [](InternalPassBuilder& b) {
+                                 b.use_buffer("x.indirect", Access::Indirect, Missing::BindDummyBlack);
+                                 b.use_buffer("x.index", Access::Index, Missing::BindDummyBlack);
+                                 b.use_buffer("x.vertex", Access::Vertex, Missing::BindDummyBlack);
+                               }}});
+  EXPECT_TRUE(declaration_diagnostics(*black).empty());
+  EXPECT_TRUE(active(*black, "black"));
 }
 
 TEST_F(RenderGraph, SkipDiscardsDeclarations) {
@@ -1473,6 +1494,28 @@ TEST_F(RenderGraph, GxReadDeclarationsAreValidated) {
   EXPECT_EQ(graph->resources[uses.back().resource].name, "ok.args");
   EXPECT_EQ(uses.back().access, Access::Indirect);
   EXPECT_EQ(graph->find_resource("own"), InvalidResource);
+}
+
+void declare_white_gx_read(InternalPassBuilder& builder, const PassSetup&, const void*) {
+  builder.use_buffer("x.args", Access::Indirect, Missing::BindDummyWhite);
+  builder.use_buffer("x.black", Access::Indirect, Missing::BindDummyBlack);
+}
+
+TEST_F(RenderGraph, GxReadWhiteBufferRejected) {
+  GraphInputs inputs = test_inputs();
+  const std::vector<GxReadDesc> reads{{.node = "gx@OpaqueDone", .declare = declare_white_gx_read}};
+  inputs.gxReads = reads;
+  const auto graph = compile_graph(inputs);
+  const auto diagnostics = declaration_diagnostics(*graph);
+  ASSERT_EQ(diagnostics.size(), 1u);
+  EXPECT_EQ(diagnostics[0].reason, CullReason::InvalidDeclaration);
+  EXPECT_NE(diagnostics[0].message.find("binds a white dummy for 'x.args' read as Indirect"), std::string::npos)
+      << diagnostics[0].message;
+  EXPECT_EQ(node(*graph, "gx@OpaqueDone").status, CullReason::None);
+  const auto uses = graph->node_uses(graph->find_node("gx@OpaqueDone"));
+  ASSERT_EQ(uses.size(), GxResourceCount + 1);
+  EXPECT_EQ(graph->resources[uses.back().resource].name, "x.black");
+  EXPECT_EQ(uses.back().missing, Missing::BindDummyBlack);
 }
 
 struct PlannedGraph {

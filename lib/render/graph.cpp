@@ -331,6 +331,10 @@ constexpr bool buffer_only(Access access) noexcept {
   return access == Access::Uniform || access == Access::Vertex || access == Access::Index || access == Access::Indirect;
 }
 
+constexpr bool draw_read(Access access) noexcept {
+  return access == Access::Vertex || access == Access::Index || access == Access::Indirect;
+}
+
 constexpr bool creates(Access access) noexcept {
   return access == Access::StorageWrite || access == Access::ColorWrite || access == Access::DepthWrite ||
          access == Access::CopyDst;
@@ -384,29 +388,6 @@ wgpu::TextureUsage texture_usage(Access access) noexcept {
     return wgpu::TextureUsage::CopyDst;
   default:
     return wgpu::TextureUsage::None;
-  }
-}
-
-wgpu::BufferUsage buffer_usage(Access access) noexcept {
-  switch (access) {
-  case Access::Uniform:
-    return wgpu::BufferUsage::Uniform;
-  case Access::StorageRead:
-  case Access::StorageWrite:
-  case Access::StorageRW:
-    return wgpu::BufferUsage::Storage;
-  case Access::Vertex:
-    return wgpu::BufferUsage::Vertex;
-  case Access::Index:
-    return wgpu::BufferUsage::Index;
-  case Access::Indirect:
-    return wgpu::BufferUsage::Indirect;
-  case Access::CopySrc:
-    return wgpu::BufferUsage::CopySrc;
-  case Access::CopyDst:
-    return wgpu::BufferUsage::CopyDst;
-  default:
-    return wgpu::BufferUsage::None;
   }
 }
 
@@ -739,6 +720,29 @@ bool has_live_pass_named(const std::string& name) noexcept {
   return std::ranges::any_of(g_passSlots, [&](const Slot& slot) { return slot.pass && slot.pass->desc.name == name; });
 }
 } // namespace
+
+wgpu::BufferUsage buffer_usage(Access access) noexcept {
+  switch (access) {
+  case Access::Uniform:
+    return wgpu::BufferUsage::Uniform;
+  case Access::StorageRead:
+  case Access::StorageWrite:
+  case Access::StorageRW:
+    return wgpu::BufferUsage::Storage;
+  case Access::Vertex:
+    return wgpu::BufferUsage::Vertex;
+  case Access::Index:
+    return wgpu::BufferUsage::Index;
+  case Access::Indirect:
+    return wgpu::BufferUsage::Indirect;
+  case Access::CopySrc:
+    return wgpu::BufferUsage::CopySrc;
+  case Access::CopyDst:
+    return wgpu::BufferUsage::CopyDst;
+  default:
+    return wgpu::BufferUsage::None;
+  }
+}
 
 struct GraphBuild {
   struct DeclaredUse {
@@ -1275,6 +1279,10 @@ private:
     if (use.buffer ? texture_only(use.access) : buffer_only(use.access)) {
       return fmt::format("uses {} '{}' for {}", use.buffer ? "buffer" : "texture", use.name, access);
     }
+    if (use.buffer && draw_read(use.access) && use.options.missing == Missing::BindDummyWhite) {
+      return fmt::format("binds a white dummy for '{}' read as {}, which would be an out-of-range draw", use.name,
+                         access);
+    }
     if (!kind_allows(node.passKind, use.access)) {
       return fmt::format("is a {} pass and cannot use '{}' for {}", pass_kind_name(node.passKind), use.name, access);
     }
@@ -1347,6 +1355,9 @@ private:
     } else if (use.buffer ? texture_only(use.access) : buffer_only(use.access)) {
       problem =
           fmt::format("uses {} '{}' for {}", use.buffer ? "buffer" : "texture", use.name, access_name(use.access));
+    } else if (use.buffer && draw_read(use.access) && use.options.missing == Missing::BindDummyWhite) {
+      problem = fmt::format("binds a white dummy for '{}' read as {}, which would be an out-of-range draw", use.name,
+                            access_name(use.access));
     } else if (existing &&
                std::ranges::any_of(uses, [&](const CompiledUse& other) { return other.resource == known; })) {
       problem = fmt::format("uses '{}' twice", use.name);

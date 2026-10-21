@@ -4,6 +4,7 @@
 
 #include "gfx/pipeline_cache.hpp"
 #include "logging.hpp"
+#include "render/geometry/indirect.hpp"
 #include "render/graph_layout.hpp"
 #include "render/jobs.hpp"
 #include "render/shader_resolve.hpp"
@@ -307,6 +308,7 @@ TEST(ShaderEmbed, LibraryIdsAreValid) {
     EXPECT_FALSE(std::string_view{shader.id}.starts_with("test/")) << shader.id;
   }
   EXPECT_TRUE(ids.contains("aurora/frame"));
+  EXPECT_TRUE(ids.contains("aurora/indirect"));
 }
 
 struct LogLine {
@@ -859,10 +861,12 @@ struct GpuReadback {
   std::unique_ptr<test::TestDevice> device;
   std::unique_ptr<test::ScopedGlobalDevice> globals;
 
-  bool start() {
+  bool start(bool productionToggles = false, bool core = true) {
     const test::TestDeviceOptions options{
         .backend = test::parse_test_backend(std::getenv("AURORA_TEST_BACKEND")).value_or(wgpu::BackendType::Undefined),
+        .core = core,
         .allowCpu = true,
+        .productionToggles = productionToggles,
     };
     std::string error;
     device = test::create_test_device(options, error);
@@ -1012,6 +1016,94 @@ TEST(RenderShadersGpu, FrameUniformsMatchWgsl) {
   }
   EXPECT_EQ(values[12], 0x1234u);
   EXPECT_EQ(values[13], 0xBEEFu);
+}
+
+constexpr std::string_view IndirectDrawWgsl = R"(//#import aurora/indirect
+@group(0) @binding(0) var<storage, read_write> records: array<AuroraDrawArgs>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  let first_vertex = select((i * 13u) % 520u, 0xffffffffu - i, i % 7u == 0u);
+  let instance_capacity = select(1000u, AURORA_UNBOUNDED, i % 5u == 0u);
+  records[i] = aurora_draw_args((i * 37u) % 600u, (i * 331u) % 1500u, first_vertex, 512u, instance_capacity);
+}
+)";
+
+constexpr std::string_view IndirectDrawIndexedWgsl = R"(//#import aurora/indirect
+@group(0) @binding(0) var<storage, read_write> records: array<AuroraDrawIndexedArgs>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  let first_index = select((i * 101u) % 2100u, 0xfffffff0u + i % 16u, i % 13u == 0u);
+  let index_capacity = select(2048u, AURORA_UNBOUNDED, i % 11u == 0u);
+  records[i] = aurora_draw_indexed_args((i * 7919u) % 4096u, (i * 331u) % 1500u, first_index, i32(i) - 128,
+                                        index_capacity, 1000u);
+}
+)";
+
+constexpr std::string_view IndirectDispatchWgsl = R"(//#import aurora/indirect
+@group(0) @binding(0) var<storage, read_write> records: array<AuroraDispatchArgs>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  records[i] = aurora_dispatch_args((i * 977u) % 70000u, (i * 13u) % 70000u + 1u, select(1u, 65536u, i % 9u == 0u));
+}
+)";
+
+template <typename Record>
+void append_words(std::vector<uint32_t>& words, const Record& record) {
+  const size_t first = words.size();
+  words.resize(first + sizeof(Record) / sizeof(uint32_t));
+  std::memcpy(words.data() + first, &record, sizeof(Record));
+}
+
+TEST(RenderShadersGpu, IndirectArgsMatchCpu) {
+  constexpr uint32_t Count = 256;
+  std::vector<uint32_t> draws;
+  std::vector<uint32_t> indexed;
+  std::vector<uint32_t> dispatches;
+  for (uint32_t i = 0; i < Count; ++i) {
+    const uint32_t firstVertex = i % 7 == 0 ? 0xffffffffu - i : (i * 13) % 520;
+    const uint32_t instanceCapacity = i % 5 == 0 ? indirect::Unbounded : 1000;
+    append_words(draws, indirect::make_draw((i * 37) % 600, (i * 331) % 1500, firstVertex, 512, instanceCapacity));
+    const uint32_t firstIndex = i % 13 == 0 ? 0xfffffff0u + i % 16 : (i * 101) % 2100;
+    const uint32_t indexCapacity = i % 11 == 0 ? indirect::Unbounded : 2048;
+    append_words(indexed, indirect::make_draw_indexed((i * 7919) % 4096, (i * 331) % 1500, firstIndex,
+                                                      static_cast<int32_t>(i) - 128, indexCapacity, 1000));
+    append_words(dispatches, indirect::make_dispatch((i * 977) % 70000, (i * 13) % 70000 + 1, i % 9 == 0 ? 65536 : 1));
+  }
+  struct Kernel {
+    std::string_view id;
+    std::string_view source;
+    const std::vector<uint32_t>& expected;
+  };
+  const std::array<Kernel, 3> kernels{{
+      {"test/indirect_draw", IndirectDrawWgsl, draws},
+      {"test/indirect_draw_indexed", IndirectDrawIndexedWgsl, indexed},
+      {"test/indirect_dispatch", IndirectDispatchWgsl, dispatches},
+  }};
+  for (const auto [productionToggles, core] :
+       {std::pair{false, true}, std::pair{true, true}, std::pair{false, false}}) {
+    SCOPED_TRACE(std::string{core ? "core" : "compat"} + (productionToggles ? ", production toggles" : ""));
+    GpuReadback gpu;
+    if (!gpu.start(productionToggles, core)) {
+      GTEST_SKIP() << "no adapter";
+    }
+    if (gpu.device->adapterInfo.backendType == wgpu::BackendType::Null) {
+      GTEST_SKIP() << "the null backend runs no shaders";
+    }
+    for (const Kernel& kernel : kernels) {
+      SCOPED_TRACE(kernel.id);
+      ASSERT_TRUE(register_source(kernel.id, kernel.source));
+      const PipelineId id = request_compute({.shader = kernel.id});
+      ASSERT_EQ(wait(id, WaitNs), PipelineStatus::Ready);
+      const uint64_t size = kernel.expected.size() * sizeof(uint32_t);
+      const wgpu::Buffer output = gpu.buffer(size, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc);
+      const wgpu::ComputePipeline pipeline = compute_pipeline(id);
+      const std::array groups{gpu.group(pipeline, 0, output, size)};
+      EXPECT_EQ(gpu.run(pipeline, groups, Count / 64, output, size), kernel.expected);
+    }
+  }
 }
 } // namespace
 } // namespace aurora::render::shaders

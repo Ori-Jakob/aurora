@@ -272,6 +272,13 @@ std::unordered_map<uint32_t, PersistentRecord> g_persistent;
 std::unordered_map<uint32_t, PersistentHandle> g_heapHandles;
 uint32_t g_nextPersistentId = 1;
 
+struct RetiredBlock {
+  PersistentHandle handle;
+  gpu_heap::BlockHandle block = gpu_heap::BlockHandle::Invalid;
+};
+
+std::vector<RetiredBlock> g_retiredBlocks;
+
 // Requires g_persistentMutex held.
 PersistentHandle add_persistent_locked(PersistentRecord record) {
   CHECK(g_nextPersistentId < PersistentIdLimit, "render graph: persistent handles exhausted");
@@ -298,6 +305,13 @@ bool heap_pool_source(void* context, PersistentBuffer& out) {
   const gpu_heap::PoolBinding binding = gpu_heap::binding(pool);
   out = {.buffer = binding.buffer, .size = binding.size, .generation = binding.generation};
   return binding.buffer && binding.generation != 0;
+}
+
+bool heap_block_source(void* context, PersistentBuffer& out) {
+  const auto block = static_cast<gpu_heap::BlockHandle>(reinterpret_cast<uintptr_t>(context));
+  const gpu_heap::BlockView view = gpu_heap::block_view(block);
+  out = {.buffer = view.buffer, .offset = view.offset, .size = view.size, .generation = view.generation};
+  return view && view.buffer;
 }
 
 uint32_t persistent_generation(uint32_t id) {
@@ -568,9 +582,11 @@ Dummy create_dummy(const DummyKey& key) {
   const bool white = key.color == DummyColor::White;
   if (key.buffer) {
     const uint64_t size = std::max<uint64_t>(key.bufferSize, 16);
+    // Any buffer read can fall back here, and black words are empty draws, dispatches and index ranges
     const wgpu::BufferDescriptor descriptor{
         .label = "graph dummy",
-        .usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst,
+        .usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::Uniform | wgpu::BufferUsage::Vertex |
+                 wgpu::BufferUsage::Index | wgpu::BufferUsage::Indirect | wgpu::BufferUsage::CopyDst,
         .size = size,
         .mappedAtCreation = true,
     };
@@ -639,12 +655,60 @@ void bind_physical(const PhysicalTexture& physical, IdentityKind kind, BoundUse&
 
 enum class Resolution : uint8_t { Bound, Missing, Skip };
 
-Resolution resolve_persistent_use(const CompiledNode& node, const CompiledResource& resource, BoundUse& out) {
+constexpr bool writes_storage(Access access) noexcept {
+  return access == Access::StorageWrite || access == Access::StorageRW;
+}
+
+constexpr bool reads_only(Access access) noexcept {
+  return access == Access::StorageRead || access == Access::Uniform || access == Access::Vertex ||
+         access == Access::Index || access == Access::Indirect;
+}
+
+std::optional<std::pair<size_t, size_t>> scope_alias(const BoundPass& pass) noexcept {
+  const auto checked = [&](size_t index) {
+    const BoundUse& bound = pass.bound[index];
+    const Access access = pass.uses[index].access;
+    return bound.identity.kind == IdentityKind::Persistent && bound.buffer &&
+           (writes_storage(access) || reads_only(access));
+  };
+  for (size_t i = 0; i < pass.bound.size(); ++i) {
+    if (!checked(i)) {
+      continue;
+    }
+    for (size_t j = i + 1; j < pass.bound.size(); ++j) {
+      const BoundUse& a = pass.bound[i];
+      const BoundUse& b = pass.bound[j];
+      if (!checked(j) || a.buffer.Get() != b.buffer.Get()) {
+        continue;
+      }
+      const bool writesA = writes_storage(pass.uses[i].access);
+      const bool writesB = writes_storage(pass.uses[j].access);
+      if (writesA && writesB) {
+        if (a.offset < b.offset + b.size && b.offset < a.offset + a.size) {
+          return std::pair{i, j};
+        }
+      } else if (writesA || writesB) {
+        return writesA ? std::pair{i, j} : std::pair{j, i};
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+Resolution resolve_persistent_use(const CompiledNode& node, const CompiledResource& resource, Access access,
+                                  BoundUse& out) {
   const uint32_t id = resource.handle.id;
   if (resource.buffer) {
     PersistentBuffer buffer;
     if (!resolve_persistent(resource.handle, buffer)) {
       return Resolution::Missing;
+    }
+    const wgpu::BufferUsage needed = buffer_usage(access);
+    if (static_cast<wgpu::BufferUsage>(buffer.buffer.GetUsage() & needed) != needed) {
+      log_once(fmt::format("{}@{}@usage", node.name, resource.name),
+               fmt::format("render graph: '{}' imports '{}' as {}, but the buffer lacks that usage; skipped", node.name,
+                           resource.name, access_name(access)));
+      return Resolution::Skip;
     }
     note_generation(id, buffer.generation);
     out.buffer = buffer.buffer;
@@ -715,7 +779,7 @@ Resolution resolve_use(const StageData& stage, const CompiledGraph& graph, const
     return out.texture ? Resolution::Bound : Resolution::Missing;
   }
   case ResourceKind::Persistent:
-    return resolve_persistent_use(node, resource, out);
+    return resolve_persistent_use(node, resource, use.access, out);
   case ResourceKind::Gx: {
     const GxResolveFn resolve = gx_resolver(resource.gx);
     GxBinding binding;
@@ -822,6 +886,18 @@ bool bind_pass(const StageData& stage, BoundPass& pass) {
                    : fmt::format("render graph: '{}' needs '{}', which is not available; skipped", node.name, name));
     }
     return false;
+  }
+  // Manual passes set groups per dispatch and own their scopes; the rest share one scope per dispatch or render pass
+  if (!pass.plan->manual &&
+      (node.passKind == PassKind::Compute || node.passKind == PassKind::Render || node.passKind == PassKind::Encoder)) {
+    if (const auto alias = scope_alias(pass)) {
+      log_once(fmt::format("{}@alias", node.name),
+               fmt::format("render graph: '{}' binds one buffer writable through '{}' and read-only through '{}'; "
+                           "declare the read StorageRW or use another region; skipped",
+                           node.name, graph.resources[pass.uses[alias->first].resource].name,
+                           graph.resources[pass.uses[alias->second].resource].name));
+      return false;
+    }
   }
   pass.layout = pass.plan->layout ? pass.plan->layout : find_layout(*pass.plan);
   if (!pass.layout) {
@@ -990,6 +1066,7 @@ void shutdown_bindings() {
   std::lock_guard lock{g_persistentMutex};
   g_persistent.clear();
   g_heapHandles.clear();
+  g_retiredBlocks.clear();
 }
 
 PersistentHandle create_persistent(std::string_view name, PersistentKind kind) {
@@ -1083,6 +1160,43 @@ PersistentHandle heap_pool_handle(gpu_heap::PoolId pool) {
     g_heapHandles.emplace(raw, handle);
   }
   return handle;
+}
+
+HeapBlock create_heap_block(gpu_heap::Region region, uint64_t size, std::string_view name) {
+  const gpu_heap::BlockHandle block = gpu_heap::create_block(region, size);
+  if (block == gpu_heap::BlockHandle::Invalid) {
+    return {};
+  }
+  const PersistentHandle handle =
+      create_persistent_buffer_source(name, &heap_block_source, reinterpret_cast<void*>(static_cast<uintptr_t>(block)));
+  if (handle.id == 0) {
+    gpu_heap::destroy_block(block);
+    return {};
+  }
+  return {.block = block, .handle = handle};
+}
+
+void destroy_heap_block(HeapBlock& block) {
+  if (!block) {
+    return;
+  }
+  gpu_heap::destroy_block(block.block);
+  {
+    std::lock_guard lock{g_persistentMutex};
+    g_retiredBlocks.push_back({.handle = block.handle, .block = block.block});
+  }
+  block = {};
+}
+
+void retire_heap_blocks() {
+  std::lock_guard lock{g_persistentMutex};
+  std::erase_if(g_retiredBlocks, [](const RetiredBlock& retired) {
+    if (gpu_heap::block_state(retired.block) != gpu_heap::BlockState::Invalid) {
+      return false;
+    }
+    g_persistent.erase(retired.handle.id);
+    return true;
+  });
 }
 
 void register_gx_resolver(GxResource resource, GxResolveFn resolve) {

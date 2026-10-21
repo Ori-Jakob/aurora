@@ -56,6 +56,17 @@ bool resolve_persistent(PersistentHandle handle, PersistentBuffer& out);
 bool resolve_persistent(PersistentHandle handle, PersistentTexture& out);
 PersistentHandle heap_pool_handle(gpu_heap::PoolId pool);
 
+struct HeapBlock {
+  gpu_heap::BlockHandle block = gpu_heap::BlockHandle::Invalid;
+  PersistentHandle handle;
+
+  explicit operator bool() const noexcept { return handle.id != 0; }
+};
+
+HeapBlock create_heap_block(gpu_heap::Region region, uint64_t size, std::string_view name);
+void destroy_heap_block(HeapBlock& block);
+void retire_heap_blocks();
+
 struct GxBinding {
   wgpu::Texture texture;
   wgpu::TextureView sampleView;

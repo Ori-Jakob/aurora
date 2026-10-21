@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstring>
 #include <span>
 #include <string_view>
 #include <utility>
@@ -24,6 +25,8 @@ constexpr std::array OptionalFeatures{
     wgpu::FeatureName::TextureFormatsTier2,
     wgpu::FeatureName::RG11B10UfloatRenderable,
     wgpu::FeatureName::TextureCompressionBC,
+    wgpu::FeatureName::MultiDrawIndirect,
+    wgpu::FeatureName::IndirectFirstInstance,
 };
 
 std::string to_string(wgpu::StringView text) { return std::string{std::string_view{text}}; }
@@ -172,6 +175,28 @@ std::optional<wgpu::BackendType> parse_test_backend(const char* value) noexcept 
     }
   }
   return std::nullopt;
+}
+
+std::optional<std::vector<uint32_t>> read_buffer(TestDevice& device, const wgpu::Buffer& buffer, uint64_t offset,
+                                                 uint64_t size) {
+  const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+                                          .size = size};
+  const wgpu::Buffer readback = device.device.CreateBuffer(&descriptor);
+  const wgpu::CommandEncoder encoder = device.device.CreateCommandEncoder();
+  encoder.CopyBufferToBuffer(buffer, offset, readback, 0, size);
+  const wgpu::CommandBuffer commands = encoder.Finish();
+  device.queue.Submit(1, &commands);
+  bool mapped = false;
+  const wgpu::Future future = readback.MapAsync(
+      wgpu::MapMode::Read, 0, size, wgpu::CallbackMode::WaitAnyOnly,
+      [&](wgpu::MapAsyncStatus status, wgpu::StringView) { mapped = status == wgpu::MapAsyncStatus::Success; });
+  if (device.instance.WaitAny(future, WaitTimeoutNs) != wgpu::WaitStatus::Success || !mapped) {
+    return std::nullopt;
+  }
+  std::vector<uint32_t> words(size / sizeof(uint32_t));
+  std::memcpy(words.data(), readback.GetConstMappedRange(0, size), words.size() * sizeof(uint32_t));
+  readback.Unmap();
+  return words;
 }
 
 struct ScopedGlobalDevice::Saved {

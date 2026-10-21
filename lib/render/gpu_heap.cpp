@@ -69,6 +69,60 @@ std::atomic_uint32_t g_activePools{0};
 std::atomic_uint32_t g_growthSubmits{0};
 std::atomic<std::thread::id> g_owner;
 
+struct RegionInfo {
+  const char* name;
+  wgpu::BufferUsage usage;
+  uint64_t initialSize;
+};
+
+constexpr std::array<RegionInfo, RegionCount> Regions{{
+    {"heap.draw_args", wgpu::BufferUsage::Indirect | wgpu::BufferUsage::Storage, 64 * 1024},
+    {"heap.dispatch_args", wgpu::BufferUsage::Indirect | wgpu::BufferUsage::Storage, 16 * 1024},
+    {"heap.idx32", wgpu::BufferUsage::Index | wgpu::BufferUsage::Vertex | wgpu::BufferUsage::Storage, 1024 * 1024},
+}};
+
+constexpr uint32_t BlockIndexBits = 12;
+constexpr uint32_t BlockIndexMask = (1u << BlockIndexBits) - 1;
+constexpr uint32_t MaxBlockGeneration = UINT32_MAX >> BlockIndexBits;
+static_assert(MaxBlocks < 1u << BlockIndexBits);
+
+struct BlockSlot {
+  std::atomic<BlockState> state{BlockState::Invalid};
+  std::atomic_uint32_t id{0};
+  uint32_t slotGeneration = 1;
+  Region region = Region::DrawArgs;
+  uint64_t size = 0;
+  bool destroyQueued = false;
+  Tlsf::BlockId tlsfBlock = Tlsf::InvalidBlock;
+  uint64_t offset = 0;
+  uint32_t generation = 0;
+};
+
+struct Request {
+  enum Kind : uint8_t { Create, Destroy } kind;
+  uint32_t handle;
+  uint64_t stamp;
+};
+
+struct RegionCounters {
+  std::atomic_uint64_t clearedBytes{0};
+  std::atomic_uint32_t releases{0};
+  bool loggedCreateFailure = false;
+  bool loggedLimit = false;
+};
+
+std::array<BlockSlot, MaxBlocks> g_blocks;
+std::mutex g_blockMutex;
+std::vector<Request> g_requests;
+std::vector<uint32_t> g_retries;
+std::atomic_bool g_blockWork{false};
+std::atomic_uint64_t g_recordingFrame{0};
+std::atomic<std::thread::id> g_workerThread;
+std::atomic_uint64_t g_workerFrame{0};
+std::array<std::atomic<PoolId>, RegionCount> g_regions{};
+std::array<RegionCounters, RegionCount> g_regionCounters;
+std::atomic_uint32_t g_boundarySubmits{0};
+
 void check_owner() noexcept {
   const auto self = std::this_thread::get_id();
   auto owner = std::thread::id{};
@@ -161,7 +215,7 @@ bool fits_in_limit(const PoolSlot& slot, uint64_t size, uint64_t alignment) noex
   return rounded + padding <= slot.maxSize;
 }
 
-void grow(PoolSlot& slot) {
+void grow(PoolSlot& slot, const wgpu::CommandEncoder* shared = nullptr) {
   const uint64_t capacity = slot.tlsf->capacity();
   const wgpu::BufferDescriptor descriptor{
       .label = slot.name.c_str(),
@@ -169,7 +223,9 @@ void grow(PoolSlot& slot) {
       .size = slot.pendingCapacity,
   };
   wgpu::Buffer buffer = webgpu::g_device.CreateBuffer(&descriptor);
-  if (slot.tlsf->used() > 0) {
+  if (slot.tlsf->used() > 0 && shared != nullptr) {
+    shared->CopyBufferToBuffer(slot.buffer, 0, buffer, 0, capacity);
+  } else if (slot.tlsf->used() > 0) {
     // Its own submit, so the copy lands before this frame's WriteBuffer uploads instead of after them
     constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "gpu_heap growth"};
     const wgpu::CommandEncoder encoder = webgpu::g_device.CreateCommandEncoder(&EncoderDescriptor);
@@ -183,6 +239,224 @@ void grow(PoolSlot& slot) {
   ++slot.generation;
   ++slot.growths;
   Log.info("gpu_heap {}: grew to {:.2f} MiB", slot.name, static_cast<double>(slot.pendingCapacity) / MiB);
+}
+
+BlockSlot* find_block(BlockHandle block) noexcept {
+  const auto raw = static_cast<uint32_t>(block);
+  const uint32_t index = (raw & BlockIndexMask) - 1;
+  if (index >= MaxBlocks) {
+    return nullptr;
+  }
+  BlockSlot& slot = g_blocks[index];
+  return slot.id.load(std::memory_order_acquire) == raw ? &slot : nullptr;
+}
+
+BlockSlot& block_slot(uint32_t handle) noexcept { return g_blocks[(handle & BlockIndexMask) - 1]; }
+
+void reset_block(BlockSlot& slot) noexcept {
+  slot.state.store(BlockState::Invalid, std::memory_order_release);
+  slot.id.store(0, std::memory_order_release);
+  slot.slotGeneration = slot.slotGeneration % MaxBlockGeneration + 1;
+  slot.region = Region::DrawArgs;
+  slot.size = 0;
+  slot.destroyQueued = false;
+  slot.tlsfBlock = Tlsf::InvalidBlock;
+  slot.offset = 0;
+  slot.generation = 0;
+}
+
+uint64_t request_stamp() noexcept {
+  return std::this_thread::get_id() == g_workerThread.load(std::memory_order_relaxed)
+             ? g_workerFrame.load(std::memory_order_relaxed)
+             : g_recordingFrame.load(std::memory_order_acquire);
+}
+
+PoolSlot* region_pool(size_t region) noexcept {
+  return find_live_slot(g_regions[region].load(std::memory_order_acquire));
+}
+
+bool place_block(BlockSlot& slot, PoolSlot& pool) {
+  const auto block = pool.tlsf->allocate(slot.size);
+  if (!block) {
+    return false;
+  }
+  slot.tlsfBlock = block->block;
+  slot.offset = block->offset;
+  slot.generation = 1;
+  return true;
+}
+
+void apply_blocks(uint64_t frameId) {
+  std::vector<Request> due;
+  {
+    std::lock_guard lock{g_blockMutex};
+    const auto split = std::stable_partition(g_requests.begin(), g_requests.end(),
+                                             [&](const Request& request) { return request.stamp < frameId; });
+    due.assign(g_requests.begin(), split);
+    g_requests.erase(g_requests.begin(), split);
+  }
+
+  for (const Request& request : due) {
+    BlockSlot* slot = request.kind == Request::Destroy ? find_block(static_cast<BlockHandle>(request.handle)) : nullptr;
+    if (slot == nullptr) {
+      continue;
+    }
+    if (PoolSlot* pool = region_pool(static_cast<size_t>(slot->region));
+        pool != nullptr && slot->tlsfBlock != Tlsf::InvalidBlock) {
+      pool->tlsf->free(slot->tlsfBlock);
+    }
+    std::lock_guard lock{g_blockMutex};
+    reset_block(*slot);
+  }
+
+  std::vector<uint32_t> placing = std::exchange(g_retries, {});
+  for (const Request& request : due) {
+    if (request.kind == Request::Create) {
+      placing.push_back(request.handle);
+    }
+  }
+  std::erase_if(placing, [](uint32_t handle) { return find_block(static_cast<BlockHandle>(handle)) == nullptr; });
+
+  std::array<uint64_t, RegionCount> wanted{};
+  for (const uint32_t handle : placing) {
+    const BlockSlot& slot = block_slot(handle);
+    wanted[static_cast<size_t>(slot.region)] += slot.size;
+  }
+  for (size_t region = 0; region < RegionCount; ++region) {
+    if (wanted[region] == 0 || g_regions[region].load(std::memory_order_relaxed) != PoolId::Invalid) {
+      continue;
+    }
+    const RegionInfo& info = Regions[region];
+    const PoolId pool = create_pool({
+        .name = info.name,
+        .usage = info.usage,
+        .initialSize = std::max(info.initialSize, std::bit_ceil(wanted[region] + wanted[region] / 16)),
+        .granularity = RegionGranularity,
+        .gpuWrittenOnly = true,
+    });
+    if (pool == PoolId::Invalid) {
+      if (!std::exchange(g_regionCounters[region].loggedCreateFailure, true)) {
+        Log.error("gpu_heap {}: the region could not be created, so its blocks failed", info.name);
+      }
+      continue;
+    }
+    g_regions[region].store(pool, std::memory_order_release);
+  }
+
+  std::vector<uint32_t> placed;
+  std::vector<uint32_t> failed;
+  std::array<std::vector<uint32_t>, RegionCount> missed;
+  for (const uint32_t handle : placing) {
+    BlockSlot& slot = block_slot(handle);
+    const auto region = static_cast<size_t>(slot.region);
+    PoolSlot* pool = region_pool(region);
+    if (pool == nullptr) {
+      failed.push_back(handle);
+    } else if (place_block(slot, *pool)) {
+      placed.push_back(handle);
+    } else {
+      missed[region].push_back(handle);
+    }
+  }
+
+  wgpu::CommandEncoder encoder;
+  const auto shared_encoder = [&]() -> const wgpu::CommandEncoder& {
+    if (!encoder) {
+      constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "gpu_heap blocks"};
+      encoder = webgpu::g_device.CreateCommandEncoder(&EncoderDescriptor);
+    }
+    return encoder;
+  };
+  bool copied = false;
+  for (size_t region = 0; region < RegionCount; ++region) {
+    if (missed[region].empty()) {
+      continue;
+    }
+    PoolSlot& pool = *region_pool(region);
+    const uint64_t capacity = pool.tlsf->capacity();
+    if (capacity < pool.maxSize) {
+      uint64_t miss = 0;
+      for (const uint32_t handle : missed[region]) {
+        miss += block_slot(handle).size;
+      }
+      const uint64_t target = growth_target(pool, std::max(2 * capacity, capacity + miss + miss / 16));
+      pool.pendingCapacity = std::max(pool.pendingCapacity, target);
+      copied = copied || pool.tlsf->used() > 0;
+      grow(pool, &shared_encoder());
+      for (BlockSlot& slot : g_blocks) {
+        if (slot.state.load(std::memory_order_relaxed) == BlockState::Ready &&
+            static_cast<size_t>(slot.region) == region) {
+          slot.generation = slot.generation == UINT32_MAX ? 1 : slot.generation + 1;
+        }
+      }
+      std::erase_if(missed[region], [&](uint32_t handle) {
+        if (!place_block(block_slot(handle), pool)) {
+          return false;
+        }
+        placed.push_back(handle);
+        return true;
+      });
+    }
+    const bool atLimit = pool.tlsf->capacity() >= pool.maxSize;
+    for (const uint32_t handle : missed[region]) {
+      (atLimit ? failed : g_retries).push_back(handle);
+    }
+    if (atLimit && !missed[region].empty() && !std::exchange(g_regionCounters[region].loggedLimit, true)) {
+      Log.warn("gpu_heap {}: block of {} bytes failed at the {:.2f} MiB limit", pool.name,
+               block_slot(missed[region].front()).size, static_cast<double>(pool.maxSize) / MiB);
+    }
+  }
+
+  // After the growth copy, so a reused range is zero the first time a frame sees it
+  for (const uint32_t handle : placed) {
+    const BlockSlot& slot = block_slot(handle);
+    const auto region = static_cast<size_t>(slot.region);
+    shared_encoder().ClearBuffer(region_pool(region)->buffer, slot.offset, slot.size);
+    g_regionCounters[region].clearedBytes.fetch_add(slot.size, std::memory_order_relaxed);
+  }
+  if (encoder) {
+    const wgpu::CommandBuffer commands = encoder.Finish();
+    webgpu::g_queue.Submit(1, &commands);
+    g_boundarySubmits.fetch_add(1, std::memory_order_relaxed);
+    if (copied) {
+      g_growthSubmits.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  std::array<bool, RegionCount> live{};
+  {
+    std::lock_guard lock{g_blockMutex};
+    for (const uint32_t handle : placed) {
+      block_slot(handle).state.store(BlockState::Ready, std::memory_order_release);
+    }
+    for (const uint32_t handle : failed) {
+      block_slot(handle).state.store(BlockState::Failed, std::memory_order_release);
+    }
+    for (const BlockSlot& slot : g_blocks) {
+      const BlockState state = slot.state.load(std::memory_order_relaxed);
+      if (slot.id.load(std::memory_order_relaxed) != 0 &&
+          (state == BlockState::Ready || state == BlockState::Pending)) {
+        live[static_cast<size_t>(slot.region)] = true;
+      }
+    }
+    g_blockWork.store(!g_requests.empty() || !g_retries.empty(), std::memory_order_release);
+  }
+  for (size_t region = 0; region < RegionCount; ++region) {
+    const PoolId pool = g_regions[region].load(std::memory_order_relaxed);
+    if (pool == PoolId::Invalid) {
+      continue;
+    }
+    if (live[region]) {
+      if (PoolSlot* slot = region_pool(region)) {
+        publish(*slot);
+        publish_largest_free(*slot);
+      }
+      continue;
+    }
+    destroy_pool(pool);
+    g_regions[region].store(PoolId::Invalid, std::memory_order_release);
+    g_regionCounters[region].releases.fetch_add(1, std::memory_order_relaxed);
+  }
 }
 } // namespace
 
@@ -385,11 +659,118 @@ uint64_t total_bytes() noexcept {
 
 uint32_t growth_submits() noexcept { return g_growthSubmits.load(std::memory_order_relaxed); }
 
-void begin_frame_worker() {
-  if (g_activePools.load(std::memory_order_acquire) == 0) {
+void set_recording_frame(uint64_t frameId) noexcept { g_recordingFrame.store(frameId, std::memory_order_release); }
+
+BlockHandle create_block(Region region, uint64_t size) {
+  const DeviceLimits& limits = caps().limits;
+  const uint64_t limit =
+      std::min(limits.maxBufferSize, limits.maxStorageBufferBindingSize) & ~uint64_t{RegionGranularity - 1};
+  if (static_cast<size_t>(region) >= RegionCount || size == 0 || size > limit) {
+    Log.error("gpu_heap: block of {} bytes is outside the {} byte region limit", size, limit);
+    return BlockHandle::Invalid;
+  }
+  const uint64_t rounded = (size + RegionGranularity - 1) & ~uint64_t{RegionGranularity - 1};
+  std::lock_guard lock{g_blockMutex};
+  const auto it = std::ranges::find_if(
+      g_blocks, [](const BlockSlot& slot) { return slot.id.load(std::memory_order_relaxed) == 0; });
+  if (it == g_blocks.end()) {
+    Log.error("gpu_heap: all {} blocks are in use", MaxBlocks);
+    return BlockHandle::Invalid;
+  }
+  BlockSlot& slot = *it;
+  const auto index = static_cast<uint32_t>(it - g_blocks.begin());
+  const uint32_t id = slot.slotGeneration << BlockIndexBits | (index + 1);
+  slot.region = region;
+  slot.size = rounded;
+  slot.destroyQueued = false;
+  slot.state.store(BlockState::Pending, std::memory_order_release);
+  slot.id.store(id, std::memory_order_release);
+  g_requests.push_back({.kind = Request::Create, .handle = id, .stamp = request_stamp()});
+  g_blockWork.store(true, std::memory_order_release);
+  return static_cast<BlockHandle>(id);
+}
+
+void destroy_block(BlockHandle block) {
+  std::lock_guard lock{g_blockMutex};
+  BlockSlot* slot = find_block(block);
+  if (slot == nullptr || slot->destroyQueued) {
+    return;
+  }
+  slot->destroyQueued = true;
+  g_requests.push_back({.kind = Request::Destroy, .handle = static_cast<uint32_t>(block), .stamp = request_stamp()});
+  g_blockWork.store(true, std::memory_order_release);
+}
+
+BlockState block_state(BlockHandle block) noexcept {
+  const BlockSlot* slot = find_block(block);
+  if (slot == nullptr) {
+    return BlockState::Invalid;
+  }
+  const BlockState state = slot->state.load(std::memory_order_acquire);
+  return slot->id.load(std::memory_order_acquire) == static_cast<uint32_t>(block) ? state : BlockState::Invalid;
+}
+
+BlockView block_view(BlockHandle block) {
+  check_owner();
+  const BlockSlot* slot = find_block(block);
+  if (slot == nullptr || slot->state.load(std::memory_order_acquire) != BlockState::Ready) {
+    return {};
+  }
+  const PoolSlot* pool = region_pool(static_cast<size_t>(slot->region));
+  if (pool == nullptr) {
+    return {};
+  }
+  return {.buffer = pool->buffer, .offset = slot->offset, .size = slot->size, .generation = slot->generation};
+}
+
+RegionStats region_stats(Region region) noexcept {
+  const auto index = static_cast<size_t>(region);
+  if (index >= RegionCount) {
+    return {};
+  }
+  const PoolId pool = g_regions[index].load(std::memory_order_acquire);
+  RegionStats out{
+      .pool = stats(pool),
+      .created = pool != PoolId::Invalid,
+      .releases = g_regionCounters[index].releases.load(std::memory_order_relaxed),
+      .clearedBytes = g_regionCounters[index].clearedBytes.load(std::memory_order_relaxed),
+  };
+  std::lock_guard lock{g_blockMutex};
+  for (const BlockSlot& slot : g_blocks) {
+    if (slot.id.load(std::memory_order_relaxed) == 0 || slot.region != region) {
+      continue;
+    }
+    switch (slot.state.load(std::memory_order_relaxed)) {
+    case BlockState::Ready:
+      ++out.blocks;
+      break;
+    case BlockState::Pending:
+      ++out.pending;
+      break;
+    case BlockState::Failed:
+      ++out.failed;
+      break;
+    default:
+      break;
+    }
+  }
+  return out;
+}
+
+uint32_t boundary_submits() noexcept { return g_boundarySubmits.load(std::memory_order_relaxed); }
+
+void begin_frame_worker(uint64_t frameId) {
+  if (frameId != AllRequests) {
+    g_workerThread.store(std::this_thread::get_id(), std::memory_order_relaxed);
+    g_workerFrame.store(frameId, std::memory_order_relaxed);
+  }
+  if (g_activePools.load(std::memory_order_acquire) == 0 && !g_blockWork.load(std::memory_order_acquire)) {
     return;
   }
   check_owner();
+  if (g_blockWork.load(std::memory_order_acquire)) {
+    apply_blocks(frameId);
+  }
   for (auto& slot : g_slots) {
     const SlotState state = slot.state.load(std::memory_order_acquire);
     if (state == SlotState::Free) {
@@ -416,6 +797,29 @@ void begin_frame_worker() {
 }
 
 void shutdown() {
+  {
+    std::lock_guard lock{g_blockMutex};
+    for (auto& slot : g_blocks) {
+      if (slot.id.load(std::memory_order_relaxed) != 0) {
+        reset_block(slot);
+      }
+    }
+    g_requests.clear();
+  }
+  g_retries.clear();
+  for (size_t region = 0; region < RegionCount; ++region) {
+    g_regions[region].store(PoolId::Invalid, std::memory_order_release);
+    RegionCounters& counters = g_regionCounters[region];
+    counters.clearedBytes.store(0, std::memory_order_relaxed);
+    counters.releases.store(0, std::memory_order_relaxed);
+    counters.loggedCreateFailure = false;
+    counters.loggedLimit = false;
+  }
+  g_boundarySubmits.store(0, std::memory_order_relaxed);
+  g_blockWork.store(false, std::memory_order_release);
+  g_recordingFrame.store(0, std::memory_order_release);
+  g_workerFrame.store(0, std::memory_order_relaxed);
+  g_workerThread.store(std::thread::id{}, std::memory_order_relaxed);
   std::lock_guard lock{g_mutex};
   for (auto& slot : g_slots) {
     if (slot.state.load(std::memory_order_acquire) != SlotState::Free) {

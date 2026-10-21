@@ -106,9 +106,16 @@ void shutdown() noexcept {
 void on_worker_frame_begin([[maybe_unused]] uint64_t frameId, [[maybe_unused]] const FrameState* frame) {
 #if AURORA_ENABLE_RENDER
   // Heap generations bump here, before anything later in the frame compares them
-  gpu_heap::begin_frame_worker();
+  gpu_heap::begin_frame_worker(frameId);
+  retire_heap_blocks();
   transient_pool_tick(frame != nullptr ? frame->graph : nullptr, TransientPool::Clock::now());
   bind_cache_tick(frameId);
+#endif
+}
+
+void on_frame_recording([[maybe_unused]] uint64_t frameId) noexcept {
+#if AURORA_ENABLE_RENDER
+  gpu_heap::set_recording_frame(frameId);
 #endif
 }
 } // namespace detail

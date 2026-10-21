@@ -37,6 +37,8 @@ std::unique_ptr<TestDevice> create_test_device(const TestDeviceOptions& options,
 std::optional<std::string> pop_validation_error(TestDevice& device);
 std::vector<std::string> take_uncaptured_errors(TestDevice& device);
 std::optional<wgpu::BackendType> parse_test_backend(const char* value) noexcept;
+std::optional<std::vector<uint32_t>> read_buffer(TestDevice& device, const wgpu::Buffer& buffer, uint64_t offset,
+                                                 uint64_t size);
 
 class ScopedGlobalDevice {
 public:

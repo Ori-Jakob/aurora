@@ -5,6 +5,7 @@
 #include "gfx/resources.hpp"
 #include "logging.hpp"
 #include "render/frame_state.hpp"
+#include "render/geometry/indirect.hpp"
 #include "render/gpu_heap.hpp"
 #include "render/graph.hpp"
 #include "render/graph_bind.hpp"
@@ -15,8 +16,11 @@
 #include "render/settings.hpp"
 #include "render/shaders.hpp"
 #include "render/stage.hpp"
+#include "webgpu/caps.hpp"
 #include "webgpu/gpu.hpp"
 #include "webgpu/gpu_prof.hpp"
+
+#include <aurora/render_caps.hpp>
 
 #include <algorithm>
 #include <array>
@@ -237,6 +241,7 @@ protected:
       GTEST_SKIP() << "no null device: " << error;
     }
     m_globals = std::make_unique<test::ScopedGlobalDevice>(*m_device, m_options);
+    gpu_heap::shutdown();
     reset_module_state();
     {
       std::lock_guard lock{g_logMutex};
@@ -2034,6 +2039,693 @@ TEST_F(GraphBindTest, TimingZonesWrapCopyAndEncoderPasses) {
   gpu_prof::shutdown();
   for (const TestPass& pass : passes) {
     EXPECT_EQ(pass.calls, 2) << pass.name;
+  }
+}
+
+constexpr std::string_view WriteWordsWgsl = R"(
+@group(1) @binding(0) var<storage, read_write> first_words: array<u32>;
+@compute @workgroup_size(1)
+fn main() {
+  first_words[0] = aurora_frame.frame_index;
+}
+)";
+
+constexpr std::string_view WriteTwoWgsl = R"(
+@group(1) @binding(0) var<storage, read_write> first_words: array<u32>;
+@group(1) @binding(1) var<storage, read_write> second_words: array<u32>;
+@compute @workgroup_size(1)
+fn main() {
+  first_words[0] = first_words[0] + 1u;
+  second_words[0] = aurora_frame.frame_index;
+}
+)";
+
+constexpr std::string_view WhiteFragmentWgsl = R"(
+@fragment
+fn fs() -> @location(0) vec4<f32> {
+  return vec4<f32>(1.0);
+}
+)";
+
+TestPass import_pass(std::string name, PassKind kind, std::vector<std::pair<std::string, Access>> imports,
+                     std::vector<PersistentHandle> handles, uint16_t order = 0) {
+  return {
+      .name = std::move(name),
+      .kind = kind,
+      .order = order,
+      .declare =
+          [imports = std::move(imports), handles = std::move(handles)](InternalPassBuilder& b) {
+            for (size_t i = 0; i < imports.size(); ++i) {
+              b.import_persistent(imports[i].first, handles[i], imports[i].second);
+            }
+            b.side_effect();
+          },
+  };
+}
+
+TEST_F(GraphBindTest, HeapBlockBindsBlockRange) {
+  const HeapBlock written = create_heap_block(gpu_heap::Region::DrawArgs, 256, "hb.written");
+  const HeapBlock args = create_heap_block(gpu_heap::Region::DrawArgs, 512, "hb.args");
+  const HeapBlock indices = create_heap_block(gpu_heap::Region::Index32, 1 * KiB, "hb.indices");
+  ASSERT_TRUE(written);
+  ASSERT_TRUE(args);
+  ASSERT_TRUE(indices);
+  std::vector<TestPass> passes{
+      import_pass("hb.write", PassKind::Compute, {{"hb.written", Access::StorageWrite}}, {written.handle}),
+      {.name = "hb.draw",
+       .kind = PassKind::Render,
+       .order = 1,
+       .declare =
+           [&](InternalPassBuilder& b) {
+             b.create("hb.color", absolute(TextureFormat::RGBA8Unorm), Access::ColorWrite);
+             b.import_persistent("hb.args", args.handle, Access::Indirect);
+             b.import_persistent("hb.indices", indices.handle, Access::Index);
+             b.side_effect();
+           }},
+  };
+  std::vector<BufferView> bound;
+  passes[0].encode = [&](PassContext& ctx) { bound.push_back(ctx.buffer(BufRef{0})); };
+  passes[1].encode = [&](PassContext& ctx) {
+    bound.push_back(ctx.buffer(BufRef{1}));
+    bound.push_back(ctx.buffer(BufRef{2}));
+  };
+  const TestFrame frame{compile(passes)};
+  ASSERT_EQ(run_frame(frame, 1), std::nullopt);
+  ASSERT_EQ(bound.size(), 3u);
+  const std::array blocks{written.block, args.block, indices.block};
+  for (size_t i = 0; i < blocks.size(); ++i) {
+    const gpu_heap::BlockView view = gpu_heap::block_view(blocks[i]);
+    ASSERT_TRUE(view) << i;
+    EXPECT_EQ(bound[i].buffer.Get(), view.buffer.Get()) << i;
+    EXPECT_EQ(bound[i].offset, view.offset) << i;
+    EXPECT_EQ(bound[i].size, view.size) << i;
+  }
+  EXPECT_EQ(bound[0].buffer.Get(), bound[1].buffer.Get());
+  EXPECT_NE(bound[0].offset, bound[1].offset);
+  const auto identities = testing::last_identities(frame.node("hb.write"));
+  ASSERT_EQ(identities.size(), 1u);
+  EXPECT_EQ(identities[0].kind, IdentityKind::Persistent);
+  EXPECT_EQ(identities[0].value, uint64_t{written.handle.id} << 32 | 1);
+  EXPECT_TRUE(testing::last_identities(frame.node("hb.draw")).empty());
+}
+
+TEST_F(GraphBindTest, HeapBlockSkipsPassUntilMaterialized) {
+  gpu_heap::set_recording_frame(1);
+  const HeapBlock block = create_heap_block(gpu_heap::Region::DrawArgs, 256, "hs.block");
+  ASSERT_TRUE(block);
+  std::vector<TestPass> passes{
+      import_pass("hs.write", PassKind::Compute, {{"hs.block", Access::StorageWrite}}, {block.handle}),
+  };
+  const TestFrame frame{compile(passes)};
+  ASSERT_EQ(run_frame(frame, 1), std::nullopt);
+  EXPECT_EQ(passes[0].calls, 0);
+  EXPECT_EQ(gpu_heap::block_state(block.block), gpu_heap::BlockState::Pending);
+  EXPECT_EQ(count_logs(LOG_WARNING, "imports 'hs.block'"), 1u);
+
+  ASSERT_EQ(run_frame(frame, 2), std::nullopt);
+  EXPECT_EQ(passes[0].calls, 1);
+  const auto identities = testing::last_identities(frame.node("hs.write"));
+  ASSERT_EQ(identities.size(), 1u);
+  EXPECT_EQ(identities[0].value, uint64_t{block.handle.id} << 32 | 1);
+  ASSERT_EQ(run_frame(frame, 3), std::nullopt);
+  EXPECT_EQ(passes[0].calls, 2);
+  EXPECT_EQ(count_logs(LOG_WARNING, "imports 'hs.block'"), 1u);
+}
+
+TEST_F(GraphBindTest, HeapBlockGrowthRebinds) {
+  const HeapBlock block = create_heap_block(gpu_heap::Region::DrawArgs, 256, "hg.block");
+  std::vector<TestPass> passes{
+      import_pass("hg.read", PassKind::Compute, {{"hg.block", Access::StorageRead}}, {block.handle}),
+  };
+  BufferView bound;
+  passes[0].encode = [&](PassContext& ctx) { bound = ctx.buffer(BufRef{0}); };
+  const TestFrame frame{compile(passes)};
+  ASSERT_EQ(run_frame(frame, 1), std::nullopt);
+  EXPECT_EQ(bind_cache_stats().created, 1u);
+  const gpu_heap::BlockView before = gpu_heap::block_view(block.block);
+  EXPECT_EQ(bound.buffer.Get(), before.buffer.Get());
+
+  ASSERT_NE(gpu_heap::create_block(gpu_heap::Region::DrawArgs, 64 * KiB), gpu_heap::BlockHandle::Invalid);
+  on_worker_frame_begin(2, &frame.state);
+  const gpu_heap::BlockView after = gpu_heap::block_view(block.block);
+  ASSERT_EQ(after.generation, 2u);
+  ASSERT_NE(after.buffer.Get(), before.buffer.Get());
+  BindCacheStats stats = bind_cache_stats();
+  EXPECT_EQ(stats.evicted, 1u);
+  EXPECT_EQ(stats.staleEntries, 0u);
+
+  StageData stage = stage_for(frame, Stage::OpaqueDone, 2);
+  ASSERT_EQ(execute(stage), std::nullopt);
+  stats = bind_cache_stats();
+  EXPECT_EQ(stats.created, 2u);
+  EXPECT_EQ(stats.evicted, 1u);
+  EXPECT_EQ(bound.buffer.Get(), after.buffer.Get());
+  EXPECT_EQ(bound.offset, before.offset);
+  EXPECT_EQ(testing::last_identities(frame.node("hg.read")).at(0).value, uint64_t{block.handle.id} << 32 | 2);
+
+  ASSERT_EQ(run_frame(frame, 3), std::nullopt);
+  stats = bind_cache_stats();
+  EXPECT_EQ(stats.created, 2u);
+  EXPECT_EQ(stats.staleEntries, 0u);
+}
+
+TEST_F(GraphBindTest, DestroyedHeapBlockBindsUntilBoundary) {
+  HeapBlock block = create_heap_block(gpu_heap::Region::DrawArgs, 256, "hd.block");
+  const PersistentHandle handle = block.handle;
+  std::vector<TestPass> passes{
+      import_pass("hd.read", PassKind::Compute, {{"hd.block", Access::StorageRead}}, {handle}),
+  };
+  const TestFrame frame{compile(passes)};
+  ASSERT_EQ(run_frame(frame, 1), std::nullopt);
+  EXPECT_EQ(passes[0].calls, 1);
+
+  on_worker_frame_begin(2, &frame.state);
+  destroy_heap_block(block);
+  EXPECT_FALSE(block);
+  StageData stage = stage_for(frame, Stage::OpaqueDone, 2);
+  ASSERT_EQ(execute(stage), std::nullopt);
+  EXPECT_EQ(passes[0].calls, 2);
+  EXPECT_EQ(bind_cache_stats().entries, 1u);
+
+  ASSERT_EQ(run_frame(frame, 3), std::nullopt);
+  EXPECT_EQ(passes[0].calls, 2);
+  EXPECT_EQ(count_logs(LOG_WARNING, "imports 'hd.block'"), 1u);
+  const BindCacheStats stats = bind_cache_stats();
+  EXPECT_EQ(stats.entries, 0u);
+  EXPECT_EQ(stats.evicted, 1u);
+  PersistentBuffer resolved;
+  EXPECT_FALSE(resolve_persistent(handle, resolved));
+}
+
+TEST_F(GraphBindTest, ImportLackingUsageSkips) {
+  const HeapBlock args = create_heap_block(gpu_heap::Region::DrawArgs, 256, "lu.args");
+  const HeapBlock indices = create_heap_block(gpu_heap::Region::Index32, 256, "lu.indices");
+  std::vector<TestPass> passes{
+      import_pass("lu.vertex", PassKind::Encoder, {{"lu.args", Access::Vertex}}, {args.handle}, 0),
+      import_pass("lu.uniform", PassKind::Encoder, {{"lu.args", Access::Uniform}}, {args.handle}, 1),
+      import_pass("lu.indirect", PassKind::Compute, {{"lu.indices", Access::Indirect}}, {indices.handle}, 2),
+  };
+  const TestFrame frame{compile(passes)};
+  for (const TestPass& pass : passes) {
+    ASSERT_EQ(frame.graph->nodes[frame.node(pass.name)].status, CullReason::None) << pass.name;
+  }
+  ASSERT_EQ(run_frame(frame, 1), std::nullopt);
+  ASSERT_EQ(run_frame(frame, 2), std::nullopt);
+  for (const TestPass& pass : passes) {
+    EXPECT_EQ(pass.calls, 0) << pass.name;
+  }
+  EXPECT_EQ(count_logs(LOG_WARNING, "lacks that usage"), 3u);
+  EXPECT_EQ(count_logs(LOG_WARNING, "imports 'lu.args' as Vertex"), 1u);
+  EXPECT_EQ(count_logs(LOG_WARNING, "imports 'lu.args' as Uniform"), 1u);
+  EXPECT_EQ(count_logs(LOG_WARNING, "imports 'lu.indices' as Indirect"), 1u);
+}
+
+TEST_F(GraphBindTest, ReadAndWriteOfOneRegionSkips) {
+  std::vector<HeapBlock> blocks;
+  for (const char* name : {"rw.out", "rw.args", "rw.out2", "rw.in"}) {
+    blocks.push_back(create_heap_block(gpu_heap::Region::DrawArgs, 256, name));
+  }
+  std::vector<TestPass> passes{
+      import_pass("rw.indirect", PassKind::Compute, {{"rw.out", Access::StorageWrite}, {"rw.args", Access::Indirect}},
+                  {blocks[0].handle, blocks[1].handle}, 0),
+      import_pass("rw.read", PassKind::Compute, {{"rw.out2", Access::StorageWrite}, {"rw.in", Access::StorageRead}},
+                  {blocks[2].handle, blocks[3].handle}, 1),
+  };
+  const TestFrame frame{compile(passes)};
+  ASSERT_EQ(run_frame(frame, 1), std::nullopt);
+  ASSERT_EQ(run_frame(frame, 2), std::nullopt);
+  EXPECT_EQ(passes[0].calls, 0);
+  EXPECT_EQ(passes[1].calls, 0);
+  EXPECT_EQ(count_logs(LOG_WARNING, "binds one buffer writable"), 2u);
+  EXPECT_EQ(count_logs(LOG_WARNING, "writable through 'rw.out' and read-only through 'rw.args'"), 1u);
+  EXPECT_EQ(count_logs(LOG_WARNING, "writable through 'rw.out2' and read-only through 'rw.in'"), 1u);
+}
+
+TEST_F(GraphBindTest, WritableBlocksOfOneRegionBind) {
+  const HeapBlock first = create_heap_block(gpu_heap::Region::DrawArgs, 256, "wb.first");
+  const HeapBlock second = create_heap_block(gpu_heap::Region::DrawArgs, 256, "wb.second");
+  std::vector<TestPass> passes{
+      import_pass("wb.pass", PassKind::Compute, {{"wb.first", Access::StorageRW}, {"wb.second", Access::StorageWrite}},
+                  {first.handle, second.handle}),
+  };
+  const std::string source = frame_shader(WriteTwoWgsl);
+  passes[0].encode = [&](PassContext& ctx) {
+    const wgpu::ComputePipeline pipeline = compute_pipeline(ctx.pipeline_layout(), source);
+    const wgpu::ComputePassEncoder pass = ctx.begin_compute();
+    pass.SetPipeline(pipeline);
+    pass.DispatchWorkgroups(1);
+    pass.End();
+  };
+  const TestFrame frame{compile(passes)};
+  ASSERT_EQ(run_frame(frame, 1), std::nullopt);
+  EXPECT_EQ(passes[0].calls, 1);
+  EXPECT_EQ(count_logs(LOG_WARNING, "binds one buffer writable"), 0u);
+}
+
+TEST_F(GraphBindTest, DifferentRegionsBind) {
+  const HeapBlock out = create_heap_block(gpu_heap::Region::DrawArgs, 256, "dr.out");
+  const HeapBlock args = create_heap_block(gpu_heap::Region::DispatchArgs, 256, "dr.args");
+  std::vector<TestPass> passes{
+      import_pass("dr.pass", PassKind::Compute, {{"dr.out", Access::StorageWrite}, {"dr.args", Access::Indirect}},
+                  {out.handle, args.handle}),
+  };
+  const std::string source = frame_shader(WriteWordsWgsl);
+  bool dispatched = false;
+  passes[0].encode = [&](PassContext& ctx) {
+    const wgpu::ComputePipeline pipeline = compute_pipeline(ctx.pipeline_layout(), source);
+    const wgpu::ComputePassEncoder pass = ctx.begin_compute();
+    pass.SetPipeline(pipeline);
+    dispatched = indirect::dispatch(pass, ctx.buffer(BufRef{1}), 0);
+    pass.End();
+  };
+  const TestFrame frame{compile(passes)};
+  ASSERT_EQ(run_frame(frame, 1), std::nullopt);
+  EXPECT_EQ(passes[0].calls, 1);
+  EXPECT_TRUE(dispatched);
+  EXPECT_EQ(count_logs(LOG_WARNING, "binds one buffer writable"), 0u);
+}
+
+TEST_F(GraphBindTest, OverlappingWritableImportsSkip) {
+  const HeapBlock block = create_heap_block(gpu_heap::Region::DrawArgs, 256, "ov.a");
+  std::vector<TestPass> passes{
+      import_pass("ov.pass", PassKind::Compute, {{"ov.a", Access::StorageWrite}, {"ov.b", Access::StorageWrite}},
+                  {block.handle, block.handle}),
+  };
+  const TestFrame frame{compile(passes)};
+  ASSERT_EQ(frame.graph->nodes[frame.node("ov.pass")].status, CullReason::None);
+  ASSERT_EQ(run_frame(frame, 1), std::nullopt);
+  EXPECT_EQ(passes[0].calls, 0);
+  EXPECT_EQ(count_logs(LOG_WARNING, "binds one buffer writable"), 1u);
+}
+
+TEST_F(GraphBindTest, ManualComputePassIsExempt) {
+  const HeapBlock out = create_heap_block(gpu_heap::Region::DrawArgs, 256, "mx.out");
+  const HeapBlock args = create_heap_block(gpu_heap::Region::DrawArgs, 256, "mx.args");
+  std::vector<TestPass> passes{
+      {.name = "mx.pass",
+       .declare =
+           [&](InternalPassBuilder& b) {
+             b.import_persistent("mx.out", out.handle, Access::StorageWrite);
+             b.import_persistent("mx.args", args.handle, Access::Indirect);
+             b.manual_bindings();
+             b.side_effect();
+           }},
+  };
+  const std::string writeSource = frame_shader(WriteWordsWgsl);
+  const std::string frameSource = frame_shader(R"(
+@compute @workgroup_size(1)
+fn main() {
+  _ = aurora_frame.frame_index;
+}
+)");
+  bool dispatched = false;
+  passes[0].encode = [&](PassContext& ctx) {
+    const wgpu::BindGroupLayoutEntry entry{
+        .binding = 0,
+        .visibility = wgpu::ShaderStage::Compute,
+        .buffer = {.type = wgpu::BufferBindingType::Storage},
+    };
+    const wgpu::BindGroupLayoutDescriptor layoutDescriptor{.entryCount = 1, .entries = &entry};
+    const wgpu::BindGroupLayout own = ctx.device().CreateBindGroupLayout(&layoutDescriptor);
+    const std::array layouts{ctx.frame_layout(), own};
+    const wgpu::PipelineLayoutDescriptor pipelineLayoutDescriptor{.bindGroupLayoutCount = layouts.size(),
+                                                                  .bindGroupLayouts = layouts.data()};
+    const wgpu::ComputePipeline write =
+        compute_pipeline(ctx.device().CreatePipelineLayout(&pipelineLayoutDescriptor), writeSource);
+    const BufferView target = ctx.buffer(BufRef{0});
+    const wgpu::BindGroupEntry binding{
+        .binding = 0, .buffer = target.buffer, .offset = target.offset, .size = target.size};
+    const wgpu::BindGroupDescriptor groupDescriptor{.layout = own, .entryCount = 1, .entries = &binding};
+    const wgpu::ComputePassEncoder writePass = ctx.begin_compute();
+    writePass.SetPipeline(write);
+    writePass.SetBindGroup(1, ctx.device().CreateBindGroup(&groupDescriptor));
+    writePass.DispatchWorkgroups(1);
+    writePass.End();
+    const wgpu::ComputePassEncoder indirectPass = ctx.begin_compute();
+    indirectPass.SetPipeline(compute_pipeline(ctx.pipeline_layout(), frameSource));
+    dispatched = indirect::dispatch(indirectPass, ctx.buffer(BufRef{1}), 0);
+    indirectPass.End();
+  };
+  const TestFrame frame{compile(passes)};
+  ASSERT_EQ(run_frame(frame, 1), std::nullopt);
+  EXPECT_EQ(passes[0].calls, 1);
+  EXPECT_TRUE(dispatched);
+  EXPECT_EQ(count_logs(LOG_WARNING, "binds one buffer writable"), 0u);
+}
+
+TEST_F(GraphBindTest, EncoderPassChecksIndirectAgainstGroup) {
+  const HeapBlock out = create_heap_block(gpu_heap::Region::DrawArgs, 256, "ex.out");
+  const HeapBlock args = create_heap_block(gpu_heap::Region::DrawArgs, 256, "ex.args");
+  std::vector<TestPass> passes{
+      import_pass("ex.pass", PassKind::Encoder, {{"ex.out", Access::StorageWrite}, {"ex.args", Access::Indirect}},
+                  {out.handle, args.handle}),
+  };
+  const TestFrame frame{compile(passes)};
+  ASSERT_EQ(run_frame(frame, 1), std::nullopt);
+  EXPECT_EQ(passes[0].calls, 0);
+  EXPECT_EQ(count_logs(LOG_WARNING, "writable through 'ex.out' and read-only through 'ex.args'"), 1u);
+}
+
+TEST_F(GraphBindTest, IndirectDummyIsZeroAndValid) {
+  std::vector<TestPass> passes{
+      {.name = "id.draw",
+       .kind = PassKind::Render,
+       .declare =
+           [](InternalPassBuilder& b) {
+             b.create("id.color", absolute(TextureFormat::RGBA8Unorm), Access::ColorWrite);
+             b.use_buffer("id.args", Access::Indirect, UseOptions{.missing = Missing::BindDummyBlack, .dummySize = 16});
+             b.side_effect();
+           }},
+  };
+  const std::string source = frame_shader(std::string{WhiteFragmentWgsl} + std::string{FullscreenVertexWgsl});
+  BufferView args;
+  bool drew = false;
+  uint32_t indexedSlots = UINT32_MAX;
+  uint64_t rejected = 0;
+  passes[0].encode = [&](PassContext& ctx) {
+    args = ctx.buffer(BufRef{1});
+    const wgpu::RenderPipeline pipeline = render_pipeline(ctx.pipeline_layout(), source, TextureFormat::RGBA8Unorm);
+    const wgpu::RenderPassEncoder pass = ctx.begin_render();
+    pass.SetPipeline(pipeline);
+    drew = indirect::draw(pass, args, 0);
+    const uint64_t before = indirect::encode_stats().rejected;
+    indexedSlots = indirect::draw_indexed_slots(pass, args, 0, 1);
+    rejected = indirect::encode_stats().rejected - before;
+    pass.End();
+  };
+  const TestFrame frame{compile(passes)};
+  ASSERT_TRUE(frame.use("id.draw", 1).staticDummy);
+  ASSERT_EQ(run_frame(frame, 1), std::nullopt);
+  ASSERT_TRUE(args.buffer);
+  const auto draws = wgpu::BufferUsage::Vertex | wgpu::BufferUsage::Index | wgpu::BufferUsage::Indirect;
+  EXPECT_EQ(static_cast<wgpu::BufferUsage>(args.buffer.GetUsage() & draws), static_cast<wgpu::BufferUsage>(draws));
+  EXPECT_EQ(args.size, 16u);
+  EXPECT_TRUE(drew);
+  EXPECT_EQ(indexedSlots, 0u);
+  EXPECT_EQ(rejected, 1u);
+}
+
+wgpu::Buffer test_buffer(const test::TestDevice& device, wgpu::BufferUsage usage, uint64_t size) {
+  const wgpu::BufferDescriptor descriptor{.usage = usage, .size = size};
+  return device.device.CreateBuffer(&descriptor);
+}
+
+std::optional<std::string> encode_draws(test::TestDevice& device,
+                                        const std::function<void(const wgpu::RenderPassEncoder&)>& encode) {
+  const wgpu::TextureDescriptor targetDescriptor{
+      .usage = wgpu::TextureUsage::RenderAttachment,
+      .size = {4, 4, 1},
+      .format = TextureFormat::RGBA8Unorm,
+  };
+  const wgpu::Texture target = device.device.CreateTexture(&targetDescriptor);
+  const std::string source = std::string{WhiteFragmentWgsl} + std::string{FullscreenVertexWgsl};
+  const wgpu::RenderPipeline pipeline = render_pipeline({}, source, TextureFormat::RGBA8Unorm);
+  device.device.PushErrorScope(wgpu::ErrorFilter::Validation);
+  const wgpu::CommandEncoder encoder = device.device.CreateCommandEncoder();
+  const wgpu::RenderPassColorAttachment color{
+      .view = target.CreateView(),
+      .loadOp = wgpu::LoadOp::Clear,
+      .storeOp = wgpu::StoreOp::Store,
+  };
+  const wgpu::RenderPassDescriptor passDescriptor{.colorAttachmentCount = 1, .colorAttachments = &color};
+  const wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&passDescriptor);
+  pass.SetPipeline(pipeline);
+  encode(pass);
+  pass.End();
+  const wgpu::CommandBuffer commands = encoder.Finish();
+  device.queue.Submit(1, &commands);
+  return test::pop_validation_error(device);
+}
+
+TEST_F(GraphBindTest, IndirectHelpersRejectBadRanges) {
+  const wgpu::Buffer args = test_buffer(*m_device, wgpu::BufferUsage::Indirect | wgpu::BufferUsage::CopyDst, 80);
+  const wgpu::Buffer plain = test_buffer(*m_device, wgpu::BufferUsage::Storage, 80);
+  const wgpu::Buffer indices = test_buffer(*m_device, wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst, 64);
+  const BufferView view{.buffer = args, .size = 80};
+  EXPECT_EQ(indirect::capacity(view, indirect::Record::Draw), 5u);
+  EXPECT_EQ(indirect::capacity(view, indirect::Record::DrawIndexed), 4u);
+  EXPECT_EQ(indirect::capacity(view, indirect::Record::Dispatch), 6u);
+  const indirect::EncodeStats before = indirect::encode_stats();
+  const auto error = encode_draws(*m_device, [&](const wgpu::RenderPassEncoder& pass) {
+    EXPECT_TRUE(indirect::draw(pass, view, 4));
+    EXPECT_FALSE(indirect::draw(pass, view, 5));
+    EXPECT_FALSE(indirect::draw(pass, BufferView{.buffer = args, .offset = 2, .size = 64}, 0));
+    EXPECT_FALSE(indirect::draw(pass, BufferView{.buffer = plain, .size = 80}, 0));
+    EXPECT_FALSE(indirect::draw(pass, BufferView{}, 0));
+    EXPECT_EQ(indirect::draw_slots(pass, view, 0, 0), 0u);
+    EXPECT_EQ(indirect::draw_slots(pass, view, 3, 3), 0u);
+    EXPECT_TRUE(indirect::bind_indices(pass, BufferView{.buffer = indices, .size = 64}));
+    EXPECT_FALSE(indirect::bind_indices(pass, BufferView{.buffer = indices, .size = 6}));
+    EXPECT_FALSE(indirect::bind_indices(pass, BufferView{.buffer = args, .size = 64}));
+    EXPECT_TRUE(indirect::draw_indexed(pass, view, 3));
+    EXPECT_FALSE(indirect::draw_indexed(pass, view, 4));
+  });
+  EXPECT_EQ(error, std::nullopt);
+
+  push_validation_scope();
+  const wgpu::CommandEncoder encoder = m_device->device.CreateCommandEncoder();
+  const wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
+  pass.SetPipeline(compute_pipeline({}, "@compute @workgroup_size(1)\nfn main() {}\n"));
+  EXPECT_TRUE(indirect::dispatch(pass, view, 5));
+  EXPECT_FALSE(indirect::dispatch(pass, view, 6));
+  pass.End();
+  const wgpu::CommandBuffer commands = encoder.Finish();
+  m_device->queue.Submit(1, &commands);
+  EXPECT_EQ(pop_validation_scope(), std::nullopt);
+
+  const indirect::EncodeStats after = indirect::encode_stats();
+  EXPECT_EQ(after.rejected - before.rejected, 10u);
+  EXPECT_EQ(after.encoded - before.encoded, 3u);
+}
+
+TEST_F(GraphBindTest, DrawSlotsUseMultiDrawWhenAvailable) {
+  if (!caps().multiDrawIndirect) {
+    GTEST_SKIP() << "the device has no multi-draw indirect";
+  }
+  const wgpu::Buffer args = test_buffer(*m_device, wgpu::BufferUsage::Indirect, 8 * sizeof(indirect::DrawIndexedArgs));
+  const wgpu::Buffer indices = test_buffer(*m_device, wgpu::BufferUsage::Index, 64);
+  const BufferView view{.buffer = args, .size = args.GetSize()};
+  const indirect::EncodeStats before = indirect::encode_stats();
+  uint32_t draws = 0;
+  uint32_t indexed = 0;
+  const auto error = encode_draws(*m_device, [&](const wgpu::RenderPassEncoder& pass) {
+    draws = indirect::draw_slots(pass, view, 0, 8);
+    ASSERT_TRUE(indirect::bind_indices(pass, BufferView{.buffer = indices, .size = 64}));
+    indexed = indirect::draw_indexed_slots(pass, view, 0, 8);
+  });
+  EXPECT_EQ(error, std::nullopt);
+  EXPECT_EQ(draws, 1u);
+  EXPECT_EQ(indexed, 1u);
+  const indirect::EncodeStats after = indirect::encode_stats();
+  EXPECT_EQ(after.multiDraws - before.multiDraws, 2u);
+  EXPECT_EQ(after.loopDraws - before.loopDraws, 0u);
+  EXPECT_EQ(after.rejected - before.rejected, 0u);
+}
+
+TEST_F(GraphBindTest, DrawSlotsFallBackWithoutMdi) {
+  Caps loop = caps();
+  loop.multiDrawIndirect = false;
+  webgpu::set_caps(std::move(loop));
+  const wgpu::Buffer args = test_buffer(*m_device, wgpu::BufferUsage::Indirect, 8 * sizeof(indirect::DrawIndexedArgs));
+  const wgpu::Buffer indices = test_buffer(*m_device, wgpu::BufferUsage::Index, 64);
+  const BufferView view{.buffer = args, .size = args.GetSize()};
+  const indirect::EncodeStats before = indirect::encode_stats();
+  uint32_t draws = 0;
+  uint32_t indexed = 0;
+  const auto error = encode_draws(*m_device, [&](const wgpu::RenderPassEncoder& pass) {
+    draws = indirect::draw_slots(pass, view, 0, 8);
+    ASSERT_TRUE(indirect::bind_indices(pass, BufferView{.buffer = indices, .size = 64}));
+    indexed = indirect::draw_indexed_slots(pass, view, 0, 8);
+  });
+  EXPECT_EQ(error, std::nullopt);
+  EXPECT_EQ(draws, 8u);
+  EXPECT_EQ(indexed, 8u);
+  const indirect::EncodeStats after = indirect::encode_stats();
+  EXPECT_EQ(after.loopDraws - before.loopDraws, 16u);
+  EXPECT_EQ(after.multiDraws - before.multiDraws, 0u);
+  EXPECT_EQ(after.encoded - before.encoded, 16u);
+}
+
+template <typename Record>
+std::vector<uint32_t> record_words(const Record& record) {
+  std::vector<uint32_t> words(sizeof(Record) / sizeof(uint32_t));
+  std::memcpy(words.data(), &record, sizeof(Record));
+  return words;
+}
+
+TEST(IndirectRecords, CpuMakersFollowRules) {
+  static_assert(offsetof(indirect::DrawIndexedArgs, baseVertex) == 12 &&
+                offsetof(indirect::DrawIndexedArgs, firstInstance) == 16);
+  static_assert(offsetof(indirect::DrawArgs, firstInstance) == 12 && offsetof(indirect::DispatchArgs, z) == 8);
+  EXPECT_EQ(indirect::record_size(indirect::Record::Draw), 16u);
+  EXPECT_EQ(indirect::record_size(indirect::Record::DrawIndexed), 20u);
+  EXPECT_EQ(indirect::record_size(indirect::Record::Dispatch), 12u);
+  using Words = std::vector<uint32_t>;
+  const Words zeroDraw(4, 0);
+  const Words zeroIndexed(5, 0);
+  const Words zeroDispatch(3, 0);
+
+  EXPECT_EQ(record_words(indirect::make_draw(3, 2, 5, 8, 2)), (Words{3, 2, 5, 0}));
+  EXPECT_EQ(record_words(indirect::make_draw(8, 1, 0, 8, 1)), (Words{8, 1, 0, 0}));
+  EXPECT_EQ(record_words(indirect::make_draw(4, 1, 5, 8, 1)), zeroDraw);
+  EXPECT_EQ(record_words(indirect::make_draw(0, 1, 9, 8, 1)), zeroDraw);
+  EXPECT_EQ(record_words(indirect::make_draw(1, 3, 0, 8, 2)), zeroDraw);
+  EXPECT_EQ(record_words(indirect::make_draw(1, 1, UINT32_MAX, 512, 1)), zeroDraw);
+  EXPECT_EQ(record_words(indirect::make_draw(2, 1, UINT32_MAX - 1, indirect::Unbounded, 1)), zeroDraw);
+  EXPECT_EQ(record_words(indirect::make_draw(1, 1, UINT32_MAX - 1, indirect::Unbounded, 1)),
+            (Words{1, 1, UINT32_MAX - 1, 0}));
+  EXPECT_EQ(record_words(indirect::make_draw(1, UINT32_MAX, 0, 8, indirect::Unbounded)), (Words{1, UINT32_MAX, 0, 0}));
+
+  EXPECT_EQ(record_words(indirect::make_draw_indexed(6, 1, 2, -4, 8, 1)),
+            (Words{6, 1, 2, static_cast<uint32_t>(-4), 0}));
+  EXPECT_EQ(record_words(indirect::make_draw_indexed(0, 1, 9, 0, 8, 1)), zeroIndexed);
+  EXPECT_EQ(record_words(indirect::make_draw_indexed(7, 1, 2, 0, 8, 1)), zeroIndexed);
+  EXPECT_EQ(record_words(indirect::make_draw_indexed(6, 2, 2, 0, 8, 1)), zeroIndexed);
+  EXPECT_EQ(record_words(indirect::make_draw_indexed(UINT32_MAX, 1, 0, 0, indirect::Unbounded, 1)),
+            (Words{UINT32_MAX, 1, 0, 0, 0}));
+  EXPECT_EQ(record_words(indirect::make_draw_indexed(1, 1, UINT32_MAX, 0, indirect::Unbounded, 1)), zeroIndexed);
+
+  EXPECT_EQ(record_words(indirect::make_dispatch(65535, 1, 7)), (Words{65535, 1, 7}));
+  EXPECT_EQ(record_words(indirect::make_dispatch(65536, 1, 1)), zeroDispatch);
+  EXPECT_EQ(record_words(indirect::make_dispatch(1, 65536, 1)), zeroDispatch);
+  EXPECT_EQ(record_words(indirect::make_dispatch(1, 1, UINT32_MAX)), zeroDispatch);
+
+  const BufferView view{.size = 100};
+  EXPECT_EQ(indirect::capacity(view, indirect::Record::Draw), 6u);
+  EXPECT_EQ(indirect::capacity(view, indirect::Record::DrawIndexed), 5u);
+  EXPECT_EQ(indirect::capacity(view, indirect::Record::Dispatch), 8u);
+  const gpu_heap::BlockView block{.offset = 512, .size = 256, .generation = 3};
+  const BufferView fromBlock = indirect::buffer_view(block);
+  EXPECT_EQ(fromBlock.offset, 512u);
+  EXPECT_EQ(fromBlock.size, 256u);
+}
+
+class IndirectGpu : public ::testing::Test {
+protected:
+  void SetUp() override {
+    m_options.backend =
+        test::parse_test_backend(std::getenv("AURORA_TEST_BACKEND")).value_or(wgpu::BackendType::Undefined);
+    std::string error;
+    m_device = test::create_test_device(m_options, error);
+    if (!m_device) {
+      GTEST_SKIP() << "no adapter: " << error;
+    }
+    if (m_device->adapterInfo.backendType == wgpu::BackendType::Null) {
+      GTEST_SKIP() << "the null backend runs no shaders";
+    }
+    ::testing::Test::RecordProperty("adapter", std::string{std::string_view{m_device->adapterInfo.device}});
+    ::testing::Test::RecordProperty("backend", static_cast<int>(m_device->adapterInfo.backendType));
+    m_globals = std::make_unique<test::ScopedGlobalDevice>(*m_device, m_options);
+  }
+
+  void TearDown() override {
+    if (m_device) {
+      EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
+    }
+    m_globals.reset();
+    m_device.reset();
+  }
+
+  test::TestDeviceOptions m_options;
+  std::unique_ptr<test::TestDevice> m_device;
+  std::unique_ptr<test::ScopedGlobalDevice> m_globals;
+};
+
+TEST_F(IndirectGpu, MultiDrawMatchesLoop) {
+  const wgpu::Device& device = m_device->device;
+  const auto make_buffer = [&](wgpu::BufferUsage usage, const void* data, uint64_t size) {
+    const wgpu::BufferDescriptor descriptor{.usage = usage | wgpu::BufferUsage::CopyDst, .size = size};
+    const wgpu::Buffer buffer = device.CreateBuffer(&descriptor);
+    m_device->queue.WriteBuffer(buffer, 0, data, size);
+    return buffer;
+  };
+  std::array<indirect::DrawArgs, 8> draws{};
+  std::array<indirect::DrawIndexedArgs, 8> indexedDraws{};
+  for (const size_t slot : {1, 4, 6}) {
+    draws[slot] = indirect::make_draw(3, 1, 0, 3, 1);
+  }
+  for (const size_t slot : {0, 3, 7}) {
+    indexedDraws[slot] = indirect::make_draw_indexed(3, 1, 0, 0, 3, 1);
+  }
+  constexpr std::array<uint32_t, 4> Indices{0, 1, 2, 0};
+  const wgpu::Buffer drawArgs = make_buffer(wgpu::BufferUsage::Indirect, draws.data(), sizeof(draws));
+  const wgpu::Buffer indexedArgs = make_buffer(wgpu::BufferUsage::Indirect, indexedDraws.data(), sizeof(indexedDraws));
+  const wgpu::Buffer indices = make_buffer(wgpu::BufferUsage::Index, Indices.data(), sizeof(Indices));
+
+  const std::string code = std::string{WhiteFragmentWgsl} + std::string{FullscreenVertexWgsl};
+  const wgpu::ShaderSourceWGSL wgsl{wgpu::ShaderSourceWGSL::Init{.code = code.c_str()}};
+  const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl};
+  const wgpu::ShaderModule module = device.CreateShaderModule(&moduleDescriptor);
+  const wgpu::BlendComponent add{
+      .operation = wgpu::BlendOperation::Add,
+      .srcFactor = wgpu::BlendFactor::One,
+      .dstFactor = wgpu::BlendFactor::One,
+  };
+  const wgpu::BlendState blend{.color = add, .alpha = add};
+  const wgpu::ColorTargetState target{.format = TextureFormat::RGBA16Float, .blend = &blend};
+  const wgpu::FragmentState fragment{.module = module, .entryPoint = "fs", .targetCount = 1, .targets = &target};
+  const wgpu::RenderPipelineDescriptor pipelineDescriptor{
+      .vertex = {.module = module, .entryPoint = "vs"},
+      .fragment = &fragment,
+  };
+  const wgpu::RenderPipeline pipeline = device.CreateRenderPipeline(&pipelineDescriptor);
+
+  const auto render = [&](bool indexed, uint32_t& encoded) -> std::optional<std::vector<uint32_t>> {
+    const wgpu::TextureDescriptor textureDescriptor{
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc,
+        .size = {1, 1, 1},
+        .format = TextureFormat::RGBA16Float,
+    };
+    const wgpu::Texture texture = device.CreateTexture(&textureDescriptor);
+    const wgpu::BufferDescriptor readDescriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                                .size = 256};
+    const wgpu::Buffer texels = device.CreateBuffer(&readDescriptor);
+    const wgpu::CommandEncoder encoder = device.CreateCommandEncoder();
+    const wgpu::RenderPassColorAttachment color{
+        .view = texture.CreateView(),
+        .loadOp = wgpu::LoadOp::Clear,
+        .storeOp = wgpu::StoreOp::Store,
+        .clearValue = {0, 0, 0, 0},
+    };
+    const wgpu::RenderPassDescriptor passDescriptor{.colorAttachmentCount = 1, .colorAttachments = &color};
+    const wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&passDescriptor);
+    pass.SetPipeline(pipeline);
+    if (indexed) {
+      indirect::bind_indices(pass, BufferView{.buffer = indices, .size = sizeof(Indices)});
+      encoded =
+          indirect::draw_indexed_slots(pass, BufferView{.buffer = indexedArgs, .size = sizeof(indexedDraws)}, 0, 8);
+    } else {
+      encoded = indirect::draw_slots(pass, BufferView{.buffer = drawArgs, .size = sizeof(draws)}, 0, 8);
+    }
+    pass.End();
+    const wgpu::TexelCopyTextureInfo source{.texture = texture};
+    const wgpu::TexelCopyBufferInfo destination{.layout = {.bytesPerRow = 256, .rowsPerImage = 1}, .buffer = texels};
+    const wgpu::Extent3D extent{1, 1, 1};
+    encoder.CopyTextureToBuffer(&source, &destination, &extent);
+    const wgpu::CommandBuffer commands = encoder.Finish();
+    m_device->queue.Submit(1, &commands);
+    return test::read_buffer(*m_device, texels, 0, 8);
+  };
+
+  std::vector<bool> modes;
+  if (caps().multiDrawIndirect) {
+    modes.push_back(true);
+  }
+  modes.push_back(false);
+  ::testing::Test::RecordProperty("multiDrawIndirect", caps().multiDrawIndirect ? 1 : 0);
+  for (const bool multiDraw : modes) {
+    Caps mode = caps();
+    mode.multiDrawIndirect = multiDraw;
+    webgpu::set_caps(std::move(mode));
+    for (const bool indexed : {false, true}) {
+      SCOPED_TRACE(std::string{multiDraw ? "multi-draw" : "loop"} + (indexed ? ", indexed" : ""));
+      uint32_t encoded = 0;
+      const auto texel = render(indexed, encoded);
+      ASSERT_TRUE(texel);
+      EXPECT_EQ(encoded, multiDraw ? 1u : 8u);
+      EXPECT_EQ((*texel)[0], 0x42004200u);
+      EXPECT_EQ((*texel)[1], 0x42004200u);
+    }
   }
 }
 } // namespace

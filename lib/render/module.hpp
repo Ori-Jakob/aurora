@@ -10,4 +10,5 @@ void initialize();
 void quiesce() noexcept;
 void shutdown() noexcept;
 void on_worker_frame_begin(uint64_t frameId, const FrameState* frame);
+void on_frame_recording(uint64_t frameId) noexcept;
 } // namespace aurora::render::detail
