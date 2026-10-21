@@ -133,6 +133,7 @@ enum class ParkStep : uint8_t { BeforeFlag, AfterFlag };
 using ParkHook = void (*)(ParkStep step);
 void set_park_hook(ParkHook hook) noexcept;
 bool worker_parked() noexcept;
+uint32_t process_waiters() noexcept;
 uint32_t spin_before_sleep_ns() noexcept;
 } // namespace testing
 

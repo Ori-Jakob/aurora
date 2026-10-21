@@ -499,6 +499,8 @@ void set_park_hook(ParkHook hook) noexcept { sParkHook.store(hook, std::memory_o
 
 bool worker_parked() noexcept { return sPublish.workerParked.load(std::memory_order_seq_cst); }
 
+uint32_t process_waiters() noexcept { return sProcess.waiters.load(std::memory_order_seq_cst); }
+
 uint32_t spin_before_sleep_ns() noexcept {
   return static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(kSpinBeforeSleep).count());
 }

@@ -648,7 +648,6 @@ TEST_F(GXFifoTest, DrainSleepsOnBusyWorker) {
   sBlockingCallbackEntered.store(false, std::memory_order_relaxed);
   sBlockingCallbackMayReturn.store(false, std::memory_order_relaxed);
   sBlockingCallbackReturned.store(false, std::memory_order_relaxed);
-  std::atomic<bool> drainStarted{false};
   std::atomic<bool> drainReturned{false};
 
   fifo::init();
@@ -660,12 +659,12 @@ TEST_F(GXFifoTest, DrainSleepsOnBusyWorker) {
   }
   const auto before = fifo::stats();
   std::thread drainThread{[&] {
-    drainStarted.store(true, std::memory_order_release);
     fifo::drain();
     drainReturned.store(true, std::memory_order_release);
   }};
-  if (!wait_for(drainStarted, true)) {
-    fail_hard("the drain thread did not start");
+  // A drain that is not yet a waiter when the worker stores processed returns Ready with no notify
+  if (!wait_until([] { return fifo::testing::process_waiters() != 0; })) {
+    fail_hard("the drain did not register as a waiter");
   }
   std::this_thread::sleep_for(std::chrono::milliseconds{10});
   sBlockingCallbackMayReturn.store(true, std::memory_order_release);
