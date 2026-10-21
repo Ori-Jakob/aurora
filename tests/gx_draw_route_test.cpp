@@ -11,6 +11,7 @@ namespace aurora::gx {
 extern uint32_t g_testPipelineBuildCount;
 extern uint32_t g_testShaderInfoCount;
 extern uint32_t g_testUniformBuildCount;
+extern u32 g_testLastUniformInfoSize;
 extern GXCompare g_testPopulateDepthFunc;
 extern u32 g_testPopulateTevStageCount;
 } // namespace aurora::gx
@@ -20,6 +21,7 @@ extern gx::DrawData g_testLastDraw;
 extern bool g_testMergeDraws;
 extern bool g_testNormalAttachment;
 extern uint32_t g_testPipelineRefCount;
+extern PipelineRef g_testLastPipelineRef;
 extern uint32_t g_testMergedDrawCount;
 extern uint64_t g_testPushedVertexBytes;
 extern uint64_t g_testPushedIndexBytes;
@@ -33,6 +35,7 @@ namespace gfx = aurora::gfx;
 namespace hints = aurora::gx::hints;
 namespace route = aurora::gx::draw_route;
 using aurora::gx::g_gxState;
+using aurora::gx::g_testLastUniformInfoSize;
 using aurora::gx::g_testPipelineBuildCount;
 using aurora::gx::g_testPopulateDepthFunc;
 using aurora::gx::g_testPopulateTevStageCount;
@@ -107,9 +110,11 @@ protected:
     gfx::g_testPushedVertexBytes = 0;
     gfx::g_testPushedIndexBytes = 0;
     gfx::g_testPipelineRefCount = 0;
+    gfx::g_testLastPipelineRef = 0;
     g_testPipelineBuildCount = 0;
     g_testShaderInfoCount = 0;
     g_testUniformBuildCount = 0;
+    g_testLastUniformInfoSize = 0;
   }
 
   void TearDown() override {
@@ -135,6 +140,8 @@ protected:
     EXPECT_EQ(g_testPipelineBuildCount, 2u);
     EXPECT_EQ(gfx::g_testPipelineRefCount, 2u);
     EXPECT_EQ(g_testShaderInfoCount, 2u);
+    EXPECT_EQ(gfx::g_testLastDraw.pipeline, gfx::g_testLastPipelineRef);
+    EXPECT_EQ(g_testLastUniformInfoSize, 2u);
     EXPECT_EQ(g_gxState.dirty, 0u);
   }
 
@@ -477,6 +484,8 @@ TEST_F(GXDrawRouteTest, PipelineRebuildWithSameConfigSkipsLookup) {
   const CpuZoneDelta zones;
   triangle();
   decode();
+  const auto ref = gfx::g_testLastDraw.pipeline;
+  EXPECT_NE(ref, 0u);
   g_gxState.dirty |= aurora::gx::DirtyPipeline;
   triangle();
   decode();
@@ -484,6 +493,9 @@ TEST_F(GXDrawRouteTest, PipelineRebuildWithSameConfigSkipsLookup) {
   EXPECT_EQ(g_testPipelineBuildCount, 2u);
   EXPECT_EQ(gfx::g_testPipelineRefCount, 1u);
   EXPECT_EQ(g_testShaderInfoCount, 1u);
+  // The skip must keep what the first lookup returned, not just avoid calling it again
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, ref);
+  EXPECT_EQ(g_testLastUniformInfoSize, 1u);
   // A rebuild still forces the uniform, as a lookup does
   EXPECT_EQ(zones.calls(fifo::CpuZoneUniformBuild), 2u);
   EXPECT_EQ(g_testUniformBuildCount, 2u);

@@ -854,6 +854,45 @@ TEST_F(GxDynamicPaletteTest, StaleTlutSlotBindingBlocksReuse) {
   resolve_sampled_textures(sampling(0));
 
   EXPECT_NE(g_gxState.textures[0].ref, first);
+
+  // The block ends with its frame, so the next frame's bump keeps and reconverts the target
+  const auto blocked = g_gxState.textures[0].ref;
+  const uint64_t copies = testing::copy_allocations();
+  const uint64_t conversions = testing::palette_conversions();
+  texture::end_frame();
+  bump_tlut(0, palette);
+  resolve_sampled_textures(sampling(0));
+
+  EXPECT_EQ(g_gxState.textures[0].ref, blocked);
+  EXPECT_EQ(testing::copy_allocations(), copies);
+  EXPECT_EQ(testing::palette_conversions(), conversions + 1);
+}
+
+TEST_F(GxDynamicPaletteTest, ShutdownEndsReuseBlock) {
+  Palette other{};
+  g_gxState.loadedTluts[1] = make_tlut(other.data(), 2, 256);
+  resolve_sampled_textures(sampling(0));
+  const auto first = g_gxState.textures[0].ref;
+  texture::end_frame();
+  g_gxState.loadedTextures[0].tlut = GX_TLUT1;
+  resolve_sampled_textures(sampling(0));
+  ASSERT_EQ(g_gxState.textures[0].ref, first);
+  g_gxState.loadedTextures[0].tlut = GX_TLUT0;
+
+  // The block was set in frame 2, and the frame count reaches 2 again after the shutdown
+  texture::shutdown();
+  g_gxState.textures[0] = {};
+  copy_texture(&destination, 4, 4, GX_TF_I8);
+  resolve_sampled_textures(sampling(0));
+  const auto target = g_gxState.textures[0].ref;
+  const uint64_t copies = testing::copy_allocations();
+  texture::end_frame();
+  texture::end_frame();
+  bump_tlut(0, palette);
+  resolve_sampled_textures(sampling(0));
+
+  EXPECT_EQ(g_gxState.textures[0].ref, target);
+  EXPECT_EQ(testing::copy_allocations(), copies);
 }
 
 TEST_F(GxDynamicPaletteTest, MatchingTouchDoesNotBlockReuse) {
