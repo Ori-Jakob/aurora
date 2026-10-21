@@ -21,6 +21,7 @@ struct PipelineId {
   [[nodiscard]] explicit operator bool() const noexcept { return value != 0; }
   bool operator==(const PipelineId&) const = default;
 };
+inline constexpr PipelineId NeverReady{UINT32_MAX};
 
 struct Constant {
   std::string_view name;
@@ -94,6 +95,7 @@ PipelineId request_render(const RenderPipelineDesc& desc);
 PipelineStatus wait(PipelineId id, uint64_t timeoutNs = UINT64_MAX);
 bool wait_idle(uint64_t timeoutNs);
 [[nodiscard]] PipelineStats stats() noexcept;
+[[nodiscard]] uint64_t session() noexcept;
 std::vector<PipelineFailure> failures();
 bool validate_module(std::string_view id, std::span<const std::string_view> defines, std::string& error);
 

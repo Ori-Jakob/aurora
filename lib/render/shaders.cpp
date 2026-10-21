@@ -86,7 +86,7 @@ std::condition_variable g_cv;
 std::mutex g_deviceMutex;
 bool g_initialized = false;
 bool g_shuttingDown = false;
-uint64_t g_session = 0;
+std::atomic_uint64_t g_session = 0;
 std::atomic_uint64_t g_sourceGeneration = 0;
 std::vector<std::string_view> g_implicitDefines;
 std::map<std::string, std::shared_ptr<const std::string>, std::less<>> g_runtime;
@@ -812,6 +812,8 @@ PipelineStats stats() noexcept {
       .modules = g_moduleCount.load(std::memory_order_relaxed),
   };
 }
+
+uint64_t session() noexcept { return g_session.load(std::memory_order_acquire); }
 
 std::vector<PipelineFailure> failures() {
   std::lock_guard lock{g_mutex};

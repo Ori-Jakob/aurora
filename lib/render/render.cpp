@@ -11,6 +11,7 @@
 #include "shaders.hpp"
 #include "debug/debug.hpp"
 #include "debug/views.hpp"
+#include "geometry/compact.hpp"
 
 #include "../gx/command_processor.hpp"
 #include "../logging.hpp"
@@ -72,6 +73,7 @@ void initialize() {
   register_gx_resolver(GxResource::Depth, &resolve_gx_depth);
   jobs::initialize(webgpu::g_backendType == wgpu::BackendType::WebGPU ? 0 : jobs::default_worker_count());
   shaders::initialize();
+  compact::initialize();
   debug::initialize();
   debug::initialize_classification();
   install_hints();
@@ -92,6 +94,7 @@ void shutdown() noexcept {
   remove_hints();
   debug::shutdown_classification();
   debug::shutdown();
+  compact::shutdown();
   // Compile jobs use the device, so they finish before the job pool and the device go away
   shaders::shutdown();
   jobs::shutdown();
@@ -110,6 +113,7 @@ void on_worker_frame_begin([[maybe_unused]] uint64_t frameId, [[maybe_unused]] c
   retire_heap_blocks();
   transient_pool_tick(frame != nullptr ? frame->graph : nullptr, TransientPool::Clock::now());
   bind_cache_tick(frameId);
+  compact::worker_frame_begin(frameId);
 #endif
 }
 

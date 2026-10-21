@@ -2,6 +2,7 @@
 
 #include "gfx/resources.hpp"
 #include "webgpu/caps.hpp"
+#include "webgpu/feature_profile.hpp"
 #include "webgpu/gpu.hpp"
 
 #include <algorithm>
@@ -15,6 +16,7 @@
 namespace aurora::test {
 namespace {
 constexpr uint64_t WaitTimeoutNs = 5'000'000'000;
+constexpr uint32_t GxDrawImmediateSize = 64;
 
 constexpr std::array OptionalFeatures{
     wgpu::FeatureName::ShaderF16,
@@ -52,8 +54,9 @@ std::unique_ptr<TestDevice> create_test_device(const TestDeviceOptions& options,
   }
 
   // Matches gpu.cpp, so hardware runs land on the discrete GPU the game would use
+  const bool profileMode = options.profile.has_value();
   const wgpu::RequestAdapterOptions adapterOptions{
-      .featureLevel = options.core ? wgpu::FeatureLevel::Core : wgpu::FeatureLevel::Compatibility,
+      .featureLevel = options.core && !profileMode ? wgpu::FeatureLevel::Core : wgpu::FeatureLevel::Compatibility,
       .powerPreference = wgpu::PowerPreference::HighPerformance,
       .backendType = options.backend,
   };
@@ -77,31 +80,65 @@ std::unique_ptr<TestDevice> create_test_device(const TestDeviceOptions& options,
     return nullptr;
   }
 
+  wgpu::SupportedFeatures adapterSupported;
+  result->adapter.GetFeatures(&adapterSupported);
+  const std::span<const wgpu::FeatureName> adapterFeatures{adapterSupported.features, adapterSupported.featureCount};
+  wgpu::Limits adapterLimits{};
+  result->adapter.GetLimits(&adapterLimits);
   std::vector<wgpu::FeatureName> features;
-  if (options.core && result->adapter.HasFeature(wgpu::FeatureName::CoreFeaturesAndLimits)) {
-    features.push_back(wgpu::FeatureName::CoreFeaturesAndLimits);
-  }
-  if (options.optionalFeatures) {
-    for (const auto feature : OptionalFeatures) {
-      if (result->adapter.HasFeature(feature)) {
-        features.push_back(feature);
-      }
-    }
-  }
+  wgpu::CompatibilityModeLimits compatLimits{wgpu::CompatibilityModeLimits::Init{
+      .maxStorageBuffersInVertexStage = 2,
+      .maxStorageBuffersInFragmentStage = 2,
+  }};
+  wgpu::Limits requiredLimits{};
   // Errors reach the callback during the failing call, so a test sees them before its next check
   std::vector<const char*> deviceToggles{"enable_immediate_error_handling"};
-  if (options.productionToggles) {
-    // Mirrors a Release full-profile device
-    deviceToggles.insert(deviceToggles.end(), {"skip_validation", "disable_robustness"});
+  std::vector<const char*> disabledToggles;
+  if (profileMode) {
+    const AuroraFeatureProfile profile = *options.profile;
+    features = webgpu::select_device_features(adapterFeatures, profile);
+    requiredLimits = webgpu::build_required_limits(
+        adapterLimits, webgpu::requests_core_features(adapterFeatures, profile), profile, GxDrawImmediateSize);
+    requiredLimits.nextInChain = &compatLimits;
+    deviceToggles.insert(deviceToggles.end(), {"disable_symbol_renaming", "gl_allow_context_on_multi_threads"});
+#if _WIN32
+    deviceToggles.push_back("use_dxc");
+#endif
+    disabledToggles = {"timestamp_quantization", "use_spirv_reconvergence_mode"};
+    if (options.productionToggles) {
+      deviceToggles.push_back("disable_robustness");
+      if (!webgpu::feature_profile_forces_validation(profile)) {
+        deviceToggles.push_back("skip_validation");
+      }
+    }
+  } else {
+    if (options.core && result->adapter.HasFeature(wgpu::FeatureName::CoreFeaturesAndLimits)) {
+      features.push_back(wgpu::FeatureName::CoreFeaturesAndLimits);
+    }
+    if (options.optionalFeatures) {
+      for (const auto feature : OptionalFeatures) {
+        if (result->adapter.HasFeature(feature)) {
+          features.push_back(feature);
+        }
+      }
+    }
+    requiredLimits.maxImmediateSize = std::min(adapterLimits.maxImmediateSize, GxDrawImmediateSize);
+    if (options.productionToggles) {
+      // Mirrors a Release full-profile device
+      deviceToggles.insert(deviceToggles.end(), {"skip_validation", "disable_robustness"});
+    }
   }
   wgpu::DawnTogglesDescriptor deviceTogglesDescriptor{wgpu::DawnTogglesDescriptor::Init{
       .enabledToggleCount = deviceToggles.size(),
       .enabledToggles = deviceToggles.data(),
+      .disabledToggleCount = disabledToggles.size(),
+      .disabledToggles = disabledToggles.data(),
   }};
   wgpu::DeviceDescriptor deviceDescriptor({
       .nextInChain = &deviceTogglesDescriptor,
       .requiredFeatureCount = features.size(),
       .requiredFeatures = features.data(),
+      .requiredLimits = &requiredLimits,
   });
   deviceDescriptor.SetUncapturedErrorCallback(
       [](const wgpu::Device&, wgpu::ErrorType type, wgpu::StringView text, TestDevice* device) {
@@ -127,6 +164,7 @@ std::unique_ptr<TestDevice> create_test_device(const TestDeviceOptions& options,
   }
   result->queue = result->device.GetQueue();
   result->core = result->device.HasFeature(wgpu::FeatureName::CoreFeaturesAndLimits);
+  result->profile = options.profile.value_or(result->core ? FEATURE_PROFILE_FULL : FEATURE_PROFILE_COMPAT);
   return result;
 }
 
@@ -197,6 +235,15 @@ std::optional<std::vector<uint32_t>> read_buffer(TestDevice& device, const wgpu:
   std::memcpy(words.data(), readback.GetConstMappedRange(0, size), words.size() * sizeof(uint32_t));
   readback.Unmap();
   return words;
+}
+
+bool submit_and_wait(TestDevice& device, const wgpu::CommandBuffer& commands) {
+  device.queue.Submit(1, &commands);
+  bool done = false;
+  const wgpu::Future future = device.queue.OnSubmittedWorkDone(
+      wgpu::CallbackMode::WaitAnyOnly,
+      [&](wgpu::QueueWorkDoneStatus status, wgpu::StringView) { done = status == wgpu::QueueWorkDoneStatus::Success; });
+  return device.instance.WaitAny(future, WaitTimeoutNs) == wgpu::WaitStatus::Success && done;
 }
 
 struct ScopedGlobalDevice::Saved {
@@ -270,7 +317,7 @@ ScopedGlobalDevice::ScopedGlobalDevice(TestDevice& device, const TestDeviceOptio
   webgpu::set_caps(webgpu::build_caps({
       .backend = info.backendType,
       .adapterType = info.adapterType,
-      .profile = device.core ? FEATURE_PROFILE_FULL : FEATURE_PROFILE_COMPAT,
+      .profile = device.profile,
       .vendorId = info.vendorID,
       .deviceId = info.deviceID,
       .adapterName = info.device.IsUndefined() ? std::string_view{"Unknown"} : std::string_view{info.device},

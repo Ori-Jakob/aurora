@@ -2,6 +2,9 @@
 
 #include "render/debug/debug.hpp"
 #include "render/module.hpp"
+#if AURORA_ENABLE_RENDER
+#include "render/geometry/compact.hpp"
+#endif
 #include "render/settings.hpp"
 #include "render_test_caps.hpp"
 #include "webgpu/gpu.hpp"
@@ -542,6 +545,24 @@ TEST_F(RenderApiTest, InitializeHonoursEarlierRequest) {
   EXPECT_EQ(effective_settings().ao, Quality::High);
   detail::shutdown();
   EXPECT_EQ(effective_settings().ao, Quality::Off);
+}
+
+TEST_F(RenderApiTest, CompactInitializeWithoutDeviceIsInert) {
+  Caps deviceCaps = full_caps();
+  deviceCaps.limits.maxComputeWorkgroupSizeX = 256;
+  deviceCaps.limits.maxComputeWorkgroupsPerDimension = 65535;
+  ASSERT_TRUE(compact::supported(deviceCaps));
+  ASSERT_FALSE(webgpu::g_device);
+  detail::testing::set_caps(deviceCaps);
+  webgpu::g_graphicsConfig.msaaSamples = 1;
+  detail::initialize();
+  EXPECT_EQ(compact::pipeline(), shaders::NeverReady);
+  EXPECT_FALSE(compact::ready());
+  const compact::Stats before = compact::stats();
+  compact::worker_frame_begin(1);
+  EXPECT_EQ(compact::stats().bindGroupsLastFrame, before.bindGroupsLastFrame);
+  detail::shutdown();
+  EXPECT_EQ(compact::pipeline(), shaders::NeverReady);
 }
 #endif
 

@@ -5,6 +5,7 @@
 #include "gfx/resources.hpp"
 #include "logging.hpp"
 #include "render/frame_state.hpp"
+#include "render/geometry/compact.hpp"
 #include "render/geometry/indirect.hpp"
 #include "render/gpu_heap.hpp"
 #include "render/graph.hpp"
@@ -1744,6 +1745,7 @@ protected:
 
   void TearDown() override {
     if (m_device) {
+      compact::shutdown();
       shaders::shutdown();
       jobs::shutdown();
     }
@@ -1939,6 +1941,145 @@ TEST_F(GraphBindPipelineTest, LatchPassesCompileSetupToHook) {
   ASSERT_NE(node, InvalidNode);
   EXPECT_NE(state->graph->nodes[node].pipelineIds[0], 0u);
   testing::reset();
+}
+
+constexpr uint32_t CompactCapacity = 4096;
+
+const compact::GraphJob CompactJob{
+    .op = compact::Op::Compact,
+    .capacity = CompactCapacity,
+    .input = "t.flags",
+    .output = "t.list",
+    .scratch = "t.scratch",
+    .keepMask = 1,
+    .args = "t.args",
+    .argsSpec = {.kind = compact::ArgsKind::DrawIndexed, .field = 1, .record = {3, 0, 0, 0, 0}},
+};
+
+void declare_compact(InternalPassBuilder& builder, const PassSetup& setup, const void* state) {
+  compact::declare(builder, setup, *static_cast<const compact::GraphJob*>(state));
+}
+
+std::vector<TestPass> compact_passes() {
+  std::vector<TestPass> passes{
+      {.name = "t.flags",
+       .declare =
+           [](InternalPassBuilder& b) {
+             b.create_buffer("t.flags", {.size = CompactCapacity * sizeof(uint32_t)}, Access::StorageWrite);
+           },
+       .encodes = false},
+      {.name = "t.use",
+       .order = 2,
+       .declare =
+           [](InternalPassBuilder& b) {
+             b.use_buffer("t.args", Access::Indirect);
+             b.use_buffer("t.list", Access::StorageRead);
+             b.side_effect();
+           }},
+  };
+  passes[1].encode = [](PassContext& ctx) {
+    const wgpu::ComputePipeline pipeline = compute_pipeline(ctx.pipeline_layout(), frame_shader(R"(
+@compute @workgroup_size(1)
+fn main() {
+  _ = aurora_frame.frame_index;
+}
+)"));
+    const BufferView args = ctx.buffer(BufRef{0});
+    const wgpu::ComputePassEncoder pass = ctx.begin_compute();
+    pass.SetPipeline(pipeline);
+    pass.DispatchWorkgroupsIndirect(args.buffer, args.offset);
+    pass.End();
+  };
+  return passes;
+}
+
+std::shared_ptr<const CompiledGraph> compile_compact(const std::vector<TestPass>& passes, const compact::GraphJob& job,
+                                                     const Caps& deviceCaps) {
+  std::vector<PassDesc> descs{desc_of(passes[0]),
+                              compact::graph_pass("t.compact", Stage::OpaqueDone, declare_compact, &job),
+                              desc_of(passes[1])};
+  descs[1].order = 1;
+  GraphInputs inputs;
+  inputs.env = gather_graph_environment();
+  inputs.caps = &deviceCaps;
+  inputs.passes = descs;
+  const std::shared_ptr<CompiledGraph> graph = compile_graph(inputs);
+  prepare_graph_bindings(*graph);
+  return graph;
+}
+
+TEST_F(GraphBindPipelineTest, CompactPassEncodes) {
+  compact::initialize();
+  ASSERT_TRUE(compact::supported(caps()));
+  std::atomic_bool release = false;
+  std::atomic_bool started = false;
+  const jobs::JobHandle gate = jobs::submit([&](const jobs::JobContext& context) {
+    started = true;
+    while (!release && !context.cancelled()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+  });
+  while (!started) {
+    std::this_thread::yield();
+  }
+  std::vector<TestPass> passes = compact_passes();
+  const TestFrame frame{compile_compact(passes, CompactJob, caps())};
+  const CompiledNode& node = frame.graph->nodes[frame.node("t.compact")];
+  ASSERT_EQ(node.status, CullReason::None);
+  EXPECT_TRUE(node.manualBindings);
+  ASSERT_NE(node.pipelineIds[0], 0u);
+  EXPECT_EQ(node.pipelineIds[0], compact::pipeline().value);
+  EXPECT_EQ(shaders::status({node.pipelineIds[0]}), shaders::PipelineStatus::Pending);
+  const StageData pending = build_opaque(frame, 1);
+  EXPECT_FALSE(pending.is_enabled(frame.program_index("t.compact")));
+  EXPECT_FALSE(pending.is_enabled(frame.program_index("t.use")));
+  release = true;
+  gate.wait();
+  ASSERT_EQ(shaders::wait({node.pipelineIds[0]}, PipelineWaitNs), shaders::PipelineStatus::Ready);
+  const StageData readyStage = build_opaque(frame, 2);
+  EXPECT_TRUE(readyStage.is_enabled(frame.program_index("t.compact")));
+  EXPECT_TRUE(readyStage.is_enabled(frame.program_index("t.use")));
+
+  const auto usage = [&](std::string_view name) {
+    return frame.graph->resources[frame.graph->find_resource(name)].bufferUsage;
+  };
+  constexpr wgpu::BufferUsage StorageCopy = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+  EXPECT_EQ(static_cast<wgpu::BufferUsage>(usage("t.scratch") & StorageCopy), StorageCopy);
+  EXPECT_EQ(static_cast<wgpu::BufferUsage>(usage("t.args") & (StorageCopy | wgpu::BufferUsage::Indirect)),
+            StorageCopy | wgpu::BufferUsage::Indirect);
+  EXPECT_TRUE(usage("t.list") & wgpu::BufferUsage::Storage);
+
+  const compact::Stats before = compact::stats();
+  EXPECT_EQ(run_frame(frame, 3), std::nullopt);
+  EXPECT_EQ(compact::stats().jobs - before.jobs, 1u);
+  EXPECT_EQ(compact::stats().dispatches - before.dispatches, 4u);
+  EXPECT_EQ(passes[1].calls, 1);
+  const uint64_t created = compact::stats().bindGroupsCreated;
+  EXPECT_EQ(run_frame(frame, 4), std::nullopt);
+  EXPECT_EQ(compact::stats().jobs - before.jobs, 2u);
+  EXPECT_EQ(compact::stats().bindGroupsCreated, created);
+  EXPECT_EQ(compact::stats().rejected, before.rejected);
+}
+
+TEST_F(GraphBindPipelineTest, CompactPassSkipsInvalidPlan) {
+  compact::initialize();
+  Caps compatCaps = caps();
+  compatCaps.core = false;
+  compatCaps.profile = FEATURE_PROFILE_COMPAT;
+  compatCaps.limits.maxStorageBufferBindingSize = 128ull << 20;
+  ASSERT_EQ(compact::max_capacity(compatCaps), 33'554'432u);
+  compact::GraphJob job = CompactJob;
+  job.capacity = 33'554'433;
+  std::vector<TestPass> passes = compact_passes();
+  const TestFrame frame{compile_compact(passes, job, compatCaps)};
+  EXPECT_EQ(frame.graph->nodes[frame.node("t.compact")].status, CullReason::Skipped);
+  EXPECT_EQ(frame.graph->nodes[frame.node("t.use")].status, CullReason::MissingInput);
+  const compact::Stats before = compact::stats();
+  EXPECT_EQ(run_frame(frame, 1), std::nullopt);
+  EXPECT_EQ(compact::stats().jobs, before.jobs);
+  EXPECT_EQ(compact::stats().passes, before.passes);
+  EXPECT_EQ(compact::stats().dispatches, before.dispatches);
+  EXPECT_EQ(passes[1].calls, 0);
 }
 
 TEST_F(GraphBindTest, BindCacheStatsFromAnotherThread) {

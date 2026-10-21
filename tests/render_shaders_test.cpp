@@ -309,6 +309,7 @@ TEST(ShaderEmbed, LibraryIdsAreValid) {
   }
   EXPECT_TRUE(ids.contains("aurora/frame"));
   EXPECT_TRUE(ids.contains("aurora/indirect"));
+  EXPECT_TRUE(ids.contains("scan"));
 }
 
 struct LogLine {
@@ -406,6 +407,31 @@ TEST_F(RenderShaders, LibraryShadersCompile) {
     std::string error;
     EXPECT_TRUE(validate_module(shader.id, {}, error)) << shader.id << ": " << error;
   }
+}
+
+TEST_F(RenderShaders, NeverReadyIsNeverReady) {
+  EXPECT_TRUE(NeverReady);
+  EXPECT_EQ(status(NeverReady), PipelineStatus::Failed);
+  EXPECT_FALSE(ready(NeverReady));
+  EXPECT_EQ(wait(NeverReady, WaitNs), PipelineStatus::Failed);
+  EXPECT_FALSE(compute_pipeline(NeverReady));
+  EXPECT_FALSE(render_pipeline(NeverReady));
+  const std::array ids{NeverReady.value, 0u};
+  EXPECT_FALSE(pipelines_ready(ids));
+  const PipelineId real = request_compute({.shader = "test/fill_pattern"});
+  ASSERT_EQ(wait(real, WaitNs), PipelineStatus::Ready);
+  EXPECT_NE(real, NeverReady);
+}
+
+TEST_F(RenderShaders, SessionAdvancesAcrossShutdown) {
+  const uint64_t running = session();
+  EXPECT_NE(running, 0u);
+  shutdown();
+  const uint64_t stopped = session();
+  EXPECT_GT(stopped, running);
+  initialize();
+  EXPECT_GT(session(), stopped);
+  register_test_table();
 }
 
 TEST_F(RenderShaders, LibraryImportResolves) {
@@ -900,7 +926,6 @@ struct GpuReadback {
   [[nodiscard]] std::vector<uint32_t> run(const wgpu::ComputePipeline& pipeline,
                                           std::span<const wgpu::BindGroup> groups, uint32_t workgroups,
                                           const wgpu::Buffer& output, uint64_t size) const {
-    const wgpu::Buffer readback = buffer(size, wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst);
     const wgpu::CommandEncoder encoder = device->device.CreateCommandEncoder();
     const wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
     pass.SetPipeline(pipeline);
@@ -909,20 +934,9 @@ struct GpuReadback {
     }
     pass.DispatchWorkgroups(workgroups);
     pass.End();
-    encoder.CopyBufferToBuffer(output, 0, readback, 0, size);
     const wgpu::CommandBuffer commands = encoder.Finish();
     device->queue.Submit(1, &commands);
-    bool mapped = false;
-    const wgpu::Future future = readback.MapAsync(
-        wgpu::MapMode::Read, 0, size, wgpu::CallbackMode::WaitAnyOnly,
-        [&](wgpu::MapAsyncStatus status, wgpu::StringView) { mapped = status == wgpu::MapAsyncStatus::Success; });
-    if (device->instance.WaitAny(future, WaitNs) != wgpu::WaitStatus::Success || !mapped) {
-      return {};
-    }
-    std::vector<uint32_t> out(size / sizeof(uint32_t));
-    std::memcpy(out.data(), readback.GetConstMappedRange(0, size), size);
-    readback.Unmap();
-    return out;
+    return test::read_buffer(*device, output, 0, size).value_or(std::vector<uint32_t>{});
   }
 
   [[nodiscard]] wgpu::BindGroup group(const wgpu::ComputePipeline& pipeline, uint32_t index,
