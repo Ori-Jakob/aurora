@@ -464,6 +464,9 @@ const ContractResource* find_contract_resource(std::string_view name) noexcept {
   return it != ContractResources.end() ? &*it : nullptr;
 }
 
+// A white dummy, filtering or a stale read would report visible objects as occluded
+constexpr std::array FarDepthPyramids{FarDepthPyramid{"hzb.depth", Stage::OpaqueDone, "gx.overlay"}};
+
 bool format_supports(wgpu::TextureFormat format, Access access, const GraphFeatures& features) noexcept {
   const FormatRow* row = find_format(format);
   switch (access) {
@@ -1081,7 +1084,7 @@ private:
       m_rejection.reset();
       PassBuilderState state{.build = this, .node = i, .stage = node.stage, .kind = node.passKind};
       InternalPassBuilder builder{state};
-      const PassSetup setup{m_inputs.settings, m_inputs.caps, &m_inputs.env};
+      const PassSetup setup{m_inputs.settings, m_inputs.caps, &m_inputs.env, m_inputs.sceneDepthSource};
       desc.declare(builder, setup, desc.state);
       if (m_skipped) {
         if (node.status == CullReason::None) {
@@ -1352,6 +1355,10 @@ private:
       problem = fmt::format("names invalid resource '{}'", use.name);
     } else if (is_gx_name(use.name)) {
       problem = fmt::format("cannot read GX resource '{}'", use.name);
+    } else if (find_far_depth_pyramid(use.name)) {
+      problem = fmt::format(
+          "cannot read far depth pyramid '{}': gx@OpaqueDone draws precede it and later GX draws may change depth",
+          use.name);
     } else if (use.buffer ? texture_only(use.access) : buffer_only(use.access)) {
       problem =
           fmt::format("uses {} '{}' for {}", use.buffer ? "buffer" : "texture", use.name, access_name(use.access));
@@ -1395,7 +1402,7 @@ private:
   }
 
   void declare_gx_reads() {
-    const PassSetup setup{m_inputs.settings, m_inputs.caps, &m_inputs.env};
+    const PassSetup setup{m_inputs.settings, m_inputs.caps, &m_inputs.env, m_inputs.sceneDepthSource};
     for (const GxReadDesc& desc : m_inputs.gxReads) {
       const auto chain = find_chain_node(desc.node);
       if (!chain || ChainNodes[*chain].kind == ChainKind::Phase) {
@@ -1455,6 +1462,35 @@ private:
     }
   }
 
+  static std::optional<std::string> check_far_pyramid_use(const CompiledNode& node, const CompiledUse& use,
+                                                          const CompiledResource& resource) {
+    const FarDepthPyramid* far = find_far_depth_pyramid(resource.name);
+    if (far == nullptr || (use.role != UseRole::Use && use.role != UseRole::Prev)) {
+      return std::nullopt;
+    }
+    if (use.missing == Missing::BindDummyWhite) {
+      return fmt::format("reads '{}' with a white dummy, which would report every object as occluded", resource.name);
+    }
+    if (use.role == UseRole::Prev) {
+      return fmt::format("reads the previous frame of '{}', which is never kept", resource.name);
+    }
+    if (writes(use.access)) {
+      return fmt::format("writes '{}', which only its builder writes", resource.name);
+    }
+    const auto sampleType = use.options.sampleType;
+    const auto dimension = use.options.dimension;
+    if ((sampleType != wgpu::TextureSampleType::Undefined &&
+         sampleType != wgpu::TextureSampleType::UnfilterableFloat) ||
+        (dimension != wgpu::TextureViewDimension::Undefined && dimension != wgpu::TextureViewDimension::e2D)) {
+      return fmt::format("samples '{}' as other than unfilterable float 2d, the only way it binds", resource.name);
+    }
+    if (node.stage != far->stage) {
+      return fmt::format("reads '{}' outside {}, where GX may clear or overwrite depth", resource.name,
+                         stage_name(far->stage));
+    }
+    return std::nullopt;
+  }
+
   std::optional<std::string> check_pass_uses(NodeId nodeId) {
     const CompiledNode& node = m_graph.nodes[nodeId];
     uint32_t colors = 0;
@@ -1466,6 +1502,9 @@ private:
       if (resource.buffer != use.buffer) {
         return fmt::format("uses '{}' as a {}, but it is a {}", resource.name, use.buffer ? "buffer" : "texture",
                            use.buffer ? "texture" : "buffer");
+      }
+      if (auto problem = check_far_pyramid_use(node, use, resource)) {
+        return problem;
       }
       if (use.role == UseRole::Prev && resource.described && resource.kind != ResourceKind::History) {
         return fmt::format("reads the previous frame of '{}', which is not a history", resource.name);
@@ -1563,6 +1602,23 @@ private:
       conflict = conflict || *before == 0;
     } else {
       placement.lower = anchoredToPass ? 0 : last;
+    }
+    if (!conflict) {
+      for (const CompiledUse& use : uses_of(nodeId)) {
+        const FarDepthPyramid* far =
+            use.role == UseRole::Use ? find_far_depth_pyramid(m_graph.resources[use.resource].name) : nullptr;
+        if (far == nullptr) {
+          continue;
+        }
+        const auto fence = static_cast<uint16_t>(*find_chain_node(far->fence) - chain.first);
+        if (placement.upper == InvalidNode || placement.upper > fence) {
+          disable(nodeId, CullReason::InvalidDeclaration,
+                  fmt::format("render graph: '{}' reads '{}' but is not anchored before {}, whose GX draws may "
+                              "change depth; disabled",
+                              node.name, far->name, far->fence));
+          return;
+        }
+      }
     }
     if (conflict) {
       disable(
@@ -2842,6 +2898,11 @@ std::optional<GxResource> find_gx_resource(std::string_view name) noexcept {
   return std::nullopt;
 }
 
+const FarDepthPyramid* find_far_depth_pyramid(std::string_view name) noexcept {
+  const auto it = std::ranges::find(FarDepthPyramids, name, &FarDepthPyramid::name);
+  return it != FarDepthPyramids.end() ? &*it : nullptr;
+}
+
 wgpu::TextureFormat gx_fixed_format(GxResource resource) noexcept {
   const auto index = static_cast<size_t>(resource);
   return index < GxRows.size() ? GxRows[index].format : wgpu::TextureFormat::Undefined;
@@ -3157,7 +3218,7 @@ DummyKey dummy_key(const CompiledGraph& graph, const CompiledUse& use, const Gra
   }
   key.dimension = use.options.dimension != wgpu::TextureViewDimension::Undefined ? use.options.dimension : dimension;
   // Matches the plan's binding for scene depth, which both the depth texture and its R32Float snapshot satisfy
-  if (use.access == Access::Sampled && is_scene_depth(resource)) {
+  if (use.access == Access::Sampled && (is_scene_depth(resource) || find_far_depth_pyramid(resource.name))) {
     key.sampleType = wgpu::TextureSampleType::UnfilterableFloat;
   } else {
     key.sampleType = use.options.sampleType != wgpu::TextureSampleType::Undefined

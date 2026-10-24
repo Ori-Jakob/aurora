@@ -127,6 +127,9 @@ std::unique_ptr<TestDevice> create_test_device(const TestDeviceOptions& options,
       // Mirrors a Release full-profile device
       deviceToggles.insert(deviceToggles.end(), {"skip_validation", "disable_robustness"});
     }
+    if (options.preciseTimestamps) {
+      disabledToggles.push_back("timestamp_quantization");
+    }
   }
   wgpu::DawnTogglesDescriptor deviceTogglesDescriptor{wgpu::DawnTogglesDescriptor::Init{
       .enabledToggleCount = deviceToggles.size(),
@@ -244,6 +247,39 @@ bool submit_and_wait(TestDevice& device, const wgpu::CommandBuffer& commands) {
       wgpu::CallbackMode::WaitAnyOnly,
       [&](wgpu::QueueWorkDoneStatus status, wgpu::StringView) { done = status == wgpu::QueueWorkDoneStatus::Success; });
   return device.instance.WaitAny(future, WaitTimeoutNs) == wgpu::WaitStatus::Success && done;
+}
+
+std::vector<float> read_texture_mip(TestDevice& device, const wgpu::Texture& texture, uint32_t mip) {
+  const uint32_t width = std::max(1u, texture.GetWidth() >> mip);
+  const uint32_t height = std::max(1u, texture.GetHeight() >> mip);
+  const uint32_t rowBytes = (width * sizeof(float) + 255) & ~255u;
+  const uint64_t size = uint64_t{rowBytes} * height;
+  const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                          .size = size};
+  const wgpu::Buffer texels = device.device.CreateBuffer(&descriptor);
+  const bool depth = texture.GetFormat() == wgpu::TextureFormat::Depth32Float;
+  const wgpu::TexelCopyTextureInfo source{
+      .texture = texture,
+      .mipLevel = mip,
+      .aspect = depth ? wgpu::TextureAspect::DepthOnly : wgpu::TextureAspect::All,
+  };
+  const wgpu::TexelCopyBufferInfo destination{.layout = {.bytesPerRow = rowBytes, .rowsPerImage = height},
+                                              .buffer = texels};
+  const wgpu::Extent3D extent{width, height, 1};
+  const wgpu::CommandEncoder encoder = device.device.CreateCommandEncoder();
+  encoder.CopyTextureToBuffer(&source, &destination, &extent);
+  const wgpu::CommandBuffer commands = encoder.Finish();
+  device.queue.Submit(1, &commands);
+  const std::optional<std::vector<uint32_t>> words = read_buffer(device, texels, 0, size);
+  if (!words) {
+    return {};
+  }
+  std::vector<float> out(size_t{width} * height);
+  for (uint32_t y = 0; y < height; ++y) {
+    std::memcpy(out.data() + size_t{y} * width, words->data() + size_t{y} * (rowBytes / sizeof(uint32_t)),
+                width * sizeof(float));
+  }
+  return out;
 }
 
 struct ScopedGlobalDevice::Saved {

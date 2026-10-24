@@ -691,7 +691,7 @@ std::shared_ptr<const FrameState> latch_frame() {
         latched_settings(), caps(), g_graphEnvironment,
         {.externals = g_externals, .externalEncode = &external_encode, .sceneDepthSource = sceneDepthSource});
     if (compiled) {
-      prepare_graph_bindings(*compiled, {&latched_settings(), &caps(), &g_graphEnvironment});
+      prepare_graph_bindings(*compiled, {&latched_settings(), &caps(), &g_graphEnvironment, sceneDepthSource});
     }
     graph = compiled ? std::move(compiled) : empty_graph();
   }

@@ -202,10 +202,19 @@ struct PassSetup {
   const Settings* settings = nullptr;
   const Caps* caps = nullptr;
   const GraphEnvironment* env = nullptr;
+  DepthSource sceneDepth = DepthSource::Unavailable;
   bool gx_available(GxResource resource) const noexcept {
     return env != nullptr && env->gxFormats[static_cast<size_t>(resource)] != wgpu::TextureFormat::Undefined;
   }
 };
+
+// A min-depth pyramid that a white dummy, filtering, a stale stage or a GX read would make over-cull
+struct FarDepthPyramid {
+  std::string_view name;
+  Stage stage;
+  std::string_view fence;
+};
+const FarDepthPyramid* find_far_depth_pyramid(std::string_view name) noexcept;
 
 class InternalPassBuilder;
 using PassDeclareFn = void (*)(InternalPassBuilder& builder, const PassSetup& setup, const void* state);

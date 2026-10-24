@@ -103,12 +103,10 @@ bool build_stage_data(StageData& stage) {
     if (node.enabled != nullptr && !node.enabled(stage, node.state)) {
       continue;
     }
-#if AURORA_ENABLE_RENDER
-    // A pass still compiling drops out like a disabled one, so the cull treats it as missing for its consumers
-    if (!shaders::pipelines_ready(node.pipelineIds)) {
+    // A pass still compiling, or whose hook never got a pipeline, drops out like a disabled one for its consumers
+    if (!pass_pipelines_ready(node)) {
       continue;
     }
-#endif
     stage.enabled[i / 64] |= uint64_t{1} << (i % 64);
   }
 #if AURORA_ENABLE_RENDER
@@ -176,6 +174,17 @@ void after_frame(const FrameState* frame) noexcept {
   if (!has_native_passes(frame)) {
     return;
   }
+}
+
+bool pass_pipelines_ready(const CompiledNode& node) noexcept {
+  if (node.pipelines != nullptr && node.pipelineIds[0] == 0) {
+    return false;
+  }
+#if AURORA_ENABLE_RENDER
+  return shaders::pipelines_ready(node.pipelineIds);
+#else
+  return true;
+#endif
 }
 
 void reset_frame_cull() noexcept { g_frameCull = {}; }

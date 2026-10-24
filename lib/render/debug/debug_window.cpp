@@ -4,6 +4,7 @@
 #include "../gpu_heap.hpp"
 #include "../graph_pool.hpp"
 #include "../shaders.hpp"
+#include "../stage.hpp"
 #include "../../webgpu/gpu_prof.hpp"
 
 #include <imgui.h>
@@ -196,7 +197,7 @@ void record_stage_cull(const detail::CompiledGraph& graph, Stage stage, uint64_t
     std::optional<std::string>& entry = g_pendingCull.reasons[node.frameSlot];
     if (reasons[i] == detail::FrameCullReason::Ran) {
       entry.reset();
-    } else if (reasons[i] == detail::FrameCullReason::NotEnabled && !shaders::pipelines_ready(node.pipelineIds)) {
+    } else if (reasons[i] == detail::FrameCullReason::NotEnabled && !detail::pass_pipelines_ready(node)) {
       entry = std::string{PipelineNotReady};
     } else {
       entry = std::string{detail::frame_cull_reason_name(reasons[i])};

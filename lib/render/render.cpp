@@ -12,6 +12,7 @@
 #include "debug/debug.hpp"
 #include "debug/views.hpp"
 #include "geometry/compact.hpp"
+#include "geometry/hzb.hpp"
 
 #include "../gx/command_processor.hpp"
 #include "../logging.hpp"
@@ -74,6 +75,7 @@ void initialize() {
   jobs::initialize(webgpu::g_backendType == wgpu::BackendType::WebGPU ? 0 : jobs::default_worker_count());
   shaders::initialize();
   compact::initialize();
+  hzb::initialize();
   debug::initialize();
   debug::initialize_classification();
   install_hints();
@@ -98,6 +100,7 @@ void shutdown() noexcept {
   // Compile jobs use the device, so they finish before the job pool and the device go away
   shaders::shutdown();
   jobs::shutdown();
+  hzb::shutdown();
   // Unhooks the release listener before the pool clears, so its last releases have no cache left to evict from
   shutdown_bindings();
   transient_pool().clear();
@@ -114,6 +117,7 @@ void on_worker_frame_begin([[maybe_unused]] uint64_t frameId, [[maybe_unused]] c
   transient_pool_tick(frame != nullptr ? frame->graph : nullptr, TransientPool::Clock::now());
   bind_cache_tick(frameId);
   compact::worker_frame_begin(frameId);
+  hzb::worker_tick(frameId);
 #endif
 }
 

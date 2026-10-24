@@ -2,6 +2,7 @@
 
 #include "render_graph_planned.hpp"
 
+#include "render/geometry/hzb.hpp"
 #include "render/graph.hpp"
 #include "render/graph_layout.hpp"
 
@@ -557,6 +558,39 @@ TEST(GraphLayoutTest, OversizedParamsRejectedAtRegistration) {
   EXPECT_EQ(register_pass({.name = "p.big", .paramsSize = MaxPassParamsSize + 1, .encode = encode}), InvalidPassId);
   EXPECT_NE(register_pass({.name = "p.fits", .paramsSize = MaxPassParamsSize, .encode = encode}), InvalidPassId);
   testing::clear_passes();
+}
+
+TEST(GraphLayoutTest, FarPyramidBindsUnfilterable) {
+  const std::vector<TestPass> passes{
+      {.name = "t.build",
+       .body =
+           [](InternalPassBuilder& b) {
+             b.after(phase::Geometry);
+             b.create(hzb::Resource, hzb::pyramid_desc(), Access::StorageWrite);
+             b.create("t.r32", {.format = TextureFormat::R32Float, .sizeClass = SizeClass::Efb}, Access::StorageWrite);
+           }},
+      {.name = "t.read",
+       .order = 1,
+       .body =
+           [](InternalPassBuilder& b) {
+             b.after(phase::Geometry);
+             b.use(hzb::Resource, Access::Sampled, UseOptions{.missing = Missing::BindDummyBlack});
+             b.use("t.r32", Access::Sampled, UseOptions{.missing = Missing::BindDummyBlack});
+             b.side_effect();
+           }},
+  };
+  GraphInputs inputs = test_inputs();
+  inputs.env.limits.features.float32Filterable = true;
+  const auto graph = compile(passes, inputs);
+  ASSERT_EQ(node_of(*graph, "t.read").status, CullReason::None);
+  const BindingPlan& plan = plan_of(*graph, "t.read");
+  ASSERT_EQ(plan.slots.size(), 2u);
+  EXPECT_EQ(plan.slots[0].sampleType, TextureSampleType::UnfilterableFloat);
+  EXPECT_EQ(plan.slots[0].viewDimension, TextureViewDimension::e2D);
+  EXPECT_EQ(plan.slots[1].sampleType, TextureSampleType::Float);
+  const auto uses = graph->node_uses(graph->find_node("t.read"));
+  EXPECT_EQ(dummy_key(*graph, uses[0], inputs.env.limits.features).sampleType, TextureSampleType::UnfilterableFloat);
+  EXPECT_EQ(dummy_key(*graph, uses[1], inputs.env.limits.features).sampleType, TextureSampleType::Float);
 }
 } // namespace
 } // namespace aurora::render::detail

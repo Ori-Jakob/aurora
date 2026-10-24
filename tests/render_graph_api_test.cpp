@@ -1131,5 +1131,16 @@ TEST_F(RenderGraphApi, StageSamplerMaskTracksActivePasses) {
   const auto& bits = unavailable->sceneDepthSamplers[static_cast<size_t>(Stage::BeforeHud)];
   EXPECT_TRUE(std::ranges::all_of(bits, [](uint64_t word) { return word == 0; }));
 }
+
+TEST_F(RenderGraphApi, FarPyramidIsNotInTheContract) {
+  add("mod.cull", Stage::OpaqueDone, PassKind::Compute, [](PassBuilder& b) {
+    b.after(phase::Geometry);
+    b.use("hzb.depth", Access::Sampled, Missing::BindDummyBlack);
+    b.side_effect();
+  });
+  const auto graph = compile_externals();
+  EXPECT_EQ(status(*graph, "mod.cull"), CullReason::InvalidDeclaration);
+  EXPECT_EQ(diagnostic(*graph, "mod.cull"), "render graph: 'mod.cull' cannot use 'hzb.depth'; disabled");
+}
 } // namespace
 } // namespace aurora::render::detail

@@ -1,15 +1,18 @@
 #include <gtest/gtest.h>
 
 #include "logging.hpp"
+#include "render/geometry/hzb.hpp"
 #include "render/graph.hpp"
 #include "render_graph_planned.hpp"
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -2695,6 +2698,197 @@ TEST_F(RenderGraphCull, CullReasonsMatchMask) {
   EXPECT_EQ(reason_of(graph, backward, "ao.gtao"), FrameCullReason::Ran);
   EXPECT_EQ(frame_cull_reason_name(FrameCullReason::InputDisabled), "InputDisabled");
   EXPECT_EQ(frame_cull_reason_name(static_cast<FrameCullReason>(9)), "Unknown");
+}
+
+std::vector<DepthSource> g_seenSceneDepth;
+
+void declare_scene_depth_probe(InternalPassBuilder& builder, const PassSetup& setup, const void*) {
+  g_seenSceneDepth.push_back(setup.sceneDepth);
+  builder.create_buffer("t.probe", {.size = 256}, Access::StorageWrite);
+  builder.side_effect();
+}
+
+void declare_scene_depth_gx_probe(InternalPassBuilder&, const PassSetup& setup, const void*) {
+  g_seenSceneDepth.push_back(setup.sceneDepth);
+}
+
+TEST_F(RenderGraph, PassSetupCarriesSceneDepth) {
+  const std::vector<PassDesc> descs{
+      {.name = "t.probe", .kind = PassKind::Compute, .declare = declare_scene_depth_probe}};
+  const std::vector<GxReadDesc> reads{{.node = "gx@OpaqueDone", .declare = declare_scene_depth_gx_probe}};
+  for (const DepthSource source : {DepthSource::Direct, DepthSource::Copy, DepthSource::Unavailable}) {
+    g_seenSceneDepth.clear();
+    GraphInputs inputs = test_inputs();
+    inputs.sceneDepthSource = source;
+    inputs.passes = descs;
+    inputs.gxReads = reads;
+    compile_graph(inputs);
+    EXPECT_EQ(g_seenSceneDepth, (std::vector<DepthSource>{source, source}));
+  }
+}
+
+TestPass pyramid_creator() {
+  return {.name = "t.build",
+          .body =
+              [](InternalPassBuilder& b) {
+                b.after(phase::Geometry);
+                b.use(resource::GxDepth, Access::Sampled, UseOptions{.missing = Missing::BindDummyBlack});
+                b.create(hzb::Resource, hzb::pyramid_desc(), Access::StorageWrite);
+              },
+          .sink = false};
+}
+
+TestPass pyramid_reader(std::string name, std::function<void(InternalPassBuilder&)> body,
+                        Stage stage = Stage::OpaqueDone, PassKind kind = PassKind::Compute) {
+  return {.name = std::move(name), .stage = stage, .kind = kind, .order = 1, .body = std::move(body)};
+}
+
+std::function<void(InternalPassBuilder&)> reads_pyramid(std::optional<std::string_view> after,
+                                                        UseOptions options = {.missing = Missing::BindDummyBlack},
+                                                        Access access = Access::Sampled) {
+  return [after, options, access](InternalPassBuilder& b) {
+    if (after) {
+      b.after(*after);
+    }
+    b.use(hzb::Resource, access, options);
+  };
+}
+
+std::string rejection(const CompiledGraph& graph, std::string_view pass) {
+  const Diagnostic* diagnostic = diagnostic_for(graph, pass, CullReason::InvalidDeclaration);
+  return diagnostic != nullptr ? diagnostic->message : std::string{};
+}
+
+TEST_F(RenderGraph, FarPyramidRejectsWhiteDummy) {
+  const auto graph =
+      compile({pyramid_creator(),
+               pyramid_reader("t.white", reads_pyramid(phase::Geometry, {.missing = Missing::BindDummyWhite}))});
+  EXPECT_EQ(node(*graph, "t.white").status, CullReason::InvalidDeclaration);
+  EXPECT_EQ(rejection(*graph, "t.white"),
+            "render graph: 't.white' reads 'hzb.depth' with a white dummy, which would "
+            "report every object as occluded; disabled");
+}
+
+TEST_F(RenderGraph, FarPyramidReadRules) {
+  const auto graph = compile({
+      pyramid_creator(),
+      pyramid_reader("t.prev",
+                     [](InternalPassBuilder& b) {
+                       b.after(phase::Geometry);
+                       b.use_prev(hzb::Resource);
+                     }),
+      pyramid_reader("t.write", reads_pyramid(phase::Geometry, {}, Access::StorageWrite)),
+      pyramid_reader("t.float", reads_pyramid(phase::Geometry, {.sampleType = wgpu::TextureSampleType::Float})),
+      pyramid_reader("t.array", reads_pyramid(phase::Geometry, {.dimension = wgpu::TextureViewDimension::e2DArray})),
+      pyramid_reader("t.late", reads_pyramid(std::nullopt), Stage::PrePost),
+      pyramid_reader("t.copy", reads_pyramid(phase::Geometry, {}, Access::CopySrc), Stage::OpaqueDone, PassKind::Copy),
+      pyramid_reader("t.ok",
+                     reads_pyramid(phase::Geometry, {.dimension = wgpu::TextureViewDimension::e2D,
+                                                     .sampleType = wgpu::TextureSampleType::UnfilterableFloat})),
+  });
+  const std::array<std::pair<std::string_view, std::string_view>, 5> rejected{{
+      {"t.prev", "reads the previous frame of 'hzb.depth', which is never kept"},
+      {"t.write", "writes 'hzb.depth', which only its builder writes"},
+      {"t.float", "samples 'hzb.depth' as other than unfilterable float 2d, the only way it binds"},
+      {"t.array", "samples 'hzb.depth' as other than unfilterable float 2d, the only way it binds"},
+      {"t.late", "reads 'hzb.depth' outside OpaqueDone, where GX may clear or overwrite depth"},
+  }};
+  for (const auto& [pass, fragment] : rejected) {
+    EXPECT_EQ(node(*graph, pass).status, CullReason::InvalidDeclaration) << pass;
+    EXPECT_NE(rejection(*graph, pass).find(fragment), std::string::npos) << pass << ": " << rejection(*graph, pass);
+  }
+  EXPECT_TRUE(active(*graph, "t.copy"));
+  EXPECT_TRUE(active(*graph, "t.ok"));
+  EXPECT_TRUE(active(*graph, "t.build"));
+}
+
+TEST_F(RenderGraph, FarPyramidReaderMustPrecedeOverlay) {
+  const auto graph = compile({
+      pyramid_creator(),
+      pyramid_reader("t.free", reads_pyramid(std::nullopt)),
+      pyramid_reader("t.overlay", reads_pyramid(phase::Overlay)),
+      pyramid_reader("t.geometry", reads_pyramid(phase::Geometry)),
+      pyramid_reader("t.composite", reads_pyramid(phase::Composite)),
+      pyramid_reader("t.before",
+                     [](InternalPassBuilder& b) {
+                       b.before(phase::Overlay);
+                       b.use(hzb::Resource, Access::Sampled, UseOptions{.missing = Missing::BindDummyBlack});
+                     }),
+  });
+  for (const std::string pass : {"t.free", "t.overlay"}) {
+    EXPECT_EQ(node(*graph, pass).status, CullReason::InvalidDeclaration) << pass;
+    EXPECT_EQ(rejection(*graph, pass), "render graph: '" + pass +
+                                           "' reads 'hzb.depth' but is not anchored before gx.overlay, whose GX draws "
+                                           "may change depth; disabled");
+  }
+  for (const std::string_view pass : {"t.geometry", "t.composite", "t.before"}) {
+    EXPECT_TRUE(active(*graph, pass)) << pass;
+    EXPECT_TRUE(has_edge(*graph, "t.build", pass, EdgeKind::Raw)) << pass;
+  }
+}
+
+void declare_black_pyramid_gx_read(InternalPassBuilder& builder, const PassSetup&, const void*) {
+  builder.use(hzb::Resource, Access::Sampled, UseOptions{.missing = Missing::BindDummyBlack});
+}
+
+void declare_white_pyramid_gx_read(InternalPassBuilder& builder, const PassSetup&, const void*) {
+  builder.use(hzb::Resource, Access::Sampled, UseOptions{.missing = Missing::BindDummyWhite});
+}
+
+TEST_F(RenderGraph, FarPyramidGxReadRejected) {
+  for (const PassDeclareFn declare : {&declare_black_pyramid_gx_read, &declare_white_pyramid_gx_read}) {
+    for (const std::string_view chain : {"gx@OpaqueDone", "gx.overlay"}) {
+      GraphInputs inputs = test_inputs();
+      const std::vector<GxReadDesc> reads{{.node = chain, .declare = declare}};
+      inputs.gxReads = reads;
+      const auto graph = compile({pyramid_creator()}, inputs);
+      size_t invalid = 0;
+      for (const Diagnostic& diagnostic : graph->diagnostics) {
+        EXPECT_NE(diagnostic.reason, CullReason::Cycle) << diagnostic.message;
+        if (diagnostic.reason == CullReason::InvalidDeclaration) {
+          ++invalid;
+          EXPECT_NE(diagnostic.message.find("cannot read far depth pyramid 'hzb.depth'"), std::string::npos)
+              << diagnostic.message;
+        }
+      }
+      EXPECT_EQ(invalid, 1u) << chain;
+      for (const CompiledUse& use : graph->node_uses(graph->find_node(chain))) {
+        EXPECT_NE(graph->resources[use.resource].name, hzb::Resource) << chain;
+      }
+    }
+  }
+}
+
+TEST_F(RenderGraph, PlannedHzbReaderSurvivesRules) {
+  const auto planned = compile_planned();
+  const CompiledGraph& graph = *planned.graph;
+  ASSERT_EQ(node(graph, "vg.cull").status, CullReason::None);
+  const BindingPlan& plan = graph.bindingPlans[graph.find_node("vg.cull")];
+  const ResourceId pyramid = graph.find_resource(hzb::Resource);
+  const auto slot = std::ranges::find(plan.slots, pyramid, &BindingSlot::resource);
+  ASSERT_NE(slot, plan.slots.end());
+  EXPECT_EQ(slot->type, BindingType::SampledTexture);
+  EXPECT_EQ(slot->sampleType, wgpu::TextureSampleType::UnfilterableFloat);
+  EXPECT_EQ(slot->viewDimension, wgpu::TextureViewDimension::e2D);
+  EXPECT_TRUE(has_edge(graph, "hzb.opaque", "vg.cull", EdgeKind::Raw));
+}
+
+TEST_F(RenderGraph, HzbDescMatchesPlannedRow) {
+  const auto planned = compile_planned();
+  const CompiledGraph& graph = *planned.graph;
+  const CompiledResource& pyramid = resource(graph, hzb::Resource);
+  constexpr TexDesc desc = hzb::pyramid_desc();
+  EXPECT_EQ(pyramid.tex.format, desc.format);
+  EXPECT_EQ(pyramid.tex.sizeClass, desc.sizeClass);
+  EXPECT_EQ(pyramid.tex.divisor, desc.divisor);
+  EXPECT_EQ(pyramid.tex.mips, desc.mips);
+  EXPECT_NE(find_far_depth_pyramid(hzb::Resource), nullptr);
+  EXPECT_EQ(find_far_depth_pyramid("grass.hzb"), nullptr);
+  const uint32_t width = (graph.efbSize.width + 1) / 2;
+  const uint32_t height = (graph.efbSize.height + 1) / 2;
+  EXPECT_EQ(pyramid.extent.width, width);
+  EXPECT_EQ(pyramid.extent.height, height);
+  EXPECT_EQ(pyramid.mipLevels, static_cast<uint32_t>(std::bit_width(std::max(width, height))));
 }
 } // namespace
 } // namespace aurora::render::detail

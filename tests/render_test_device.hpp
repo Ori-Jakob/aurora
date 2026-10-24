@@ -22,6 +22,7 @@ struct TestDeviceOptions {
   uint64_t uniformBufferSize = 64 * 1024;
   bool productionToggles = false;
   std::optional<AuroraFeatureProfile> profile;
+  bool preciseTimestamps = false;
 };
 
 struct TestDevice {
@@ -43,6 +44,7 @@ std::optional<wgpu::BackendType> parse_test_backend(const char* value) noexcept;
 std::optional<std::vector<uint32_t>> read_buffer(TestDevice& device, const wgpu::Buffer& buffer, uint64_t offset,
                                                  uint64_t size);
 bool submit_and_wait(TestDevice& device, const wgpu::CommandBuffer& commands);
+std::vector<float> read_texture_mip(TestDevice& device, const wgpu::Texture& texture, uint32_t mip);
 
 class ScopedGlobalDevice {
 public:

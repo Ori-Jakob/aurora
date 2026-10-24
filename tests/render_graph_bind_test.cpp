@@ -4,6 +4,8 @@
 
 #include "gfx/resources.hpp"
 #include "logging.hpp"
+#include "render/debug/debug.hpp"
+#include "render/debug/graph_inspection.hpp"
 #include "render/frame_state.hpp"
 #include "render/geometry/compact.hpp"
 #include "render/geometry/indirect.hpp"
@@ -1881,6 +1883,31 @@ TEST_F(GraphBindPipelineTest, FailedPipelineKeepsPassDisabled) {
   }
   EXPECT_EQ(count_logs(LOG_WARNING, "test/graph_broken.wgsl:3:"), 1u);
   EXPECT_EQ(passes[0].calls, 0);
+}
+
+TEST_F(GraphBindPipelineTest, HookWithoutPipelineStaysDisabled) {
+  debug::testing::reset();
+  std::vector<TestPass> passes{fill_pass("test/graph_fill"), reader_pass()};
+  passes[0].pipelines = [](const PipelineSetup&, std::span<uint32_t, MaxPassPipelines> ids) { ids[0] = 0; };
+  TestFrame frame{compile(passes)};
+  frame.state.inspectorOpen = true;
+  const CompiledNode& node = frame.graph->nodes[frame.node("gp.fill")];
+  ASSERT_EQ(node.status, CullReason::None);
+  EXPECT_EQ(node.pipelineIds[0], 0u);
+  EXPECT_TRUE(shaders::pipelines_ready(node.pipelineIds));
+  EXPECT_FALSE(pass_pipelines_ready(node));
+  for (uint64_t frameId = 1; frameId <= 3; ++frameId) {
+    const StageData stage = build_opaque(frame, frameId);
+    EXPECT_FALSE(stage.is_enabled(frame.program_index("gp.fill")));
+    EXPECT_FALSE(stage.is_enabled(frame.program_index("gp.read")));
+  }
+  debug::publish_frame_cull(3, frame.graph->graphHash);
+  debug::FrameCullSnapshot cull;
+  ASSERT_TRUE(debug::latest_frame_cull(cull));
+  ASSERT_LT(node.frameSlot, cull.reasons.size());
+  EXPECT_EQ(cull.reasons[node.frameSlot], std::optional<std::string>{"PipelineNotReady"});
+  EXPECT_EQ(passes[0].calls, 0);
+  debug::testing::reset();
 }
 
 TEST_F(GraphBindPipelineTest, RejectedRequestsKeepPassesDisabled) {

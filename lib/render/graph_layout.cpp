@@ -41,6 +41,10 @@ wgpu::TextureSampleType sample_type(const CompiledUse& use, const CompiledResour
   if (resource.kind == ResourceKind::Gx && resource.gx == GxResource::Depth) {
     return wgpu::TextureSampleType::UnfilterableFloat;
   }
+  // Filtering would interpolate between texel minima
+  if (find_far_depth_pyramid(resource.name)) {
+    return wgpu::TextureSampleType::UnfilterableFloat;
+  }
   if (use.options.sampleType != wgpu::TextureSampleType::Undefined) {
     return use.options.sampleType;
   }

@@ -29,6 +29,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/debug/views.hpp
         lib/render/geometry/compact.cpp
         lib/render/geometry/compact.hpp
+        lib/render/geometry/hzb.cpp
+        lib/render/geometry/hzb.hpp
         lib/render/geometry/indirect.cpp
         lib/render/geometry/indirect.hpp
         lib/render/gpu_heap.cpp
