@@ -48,6 +48,7 @@ public:
     u8(GX_AURORA);
     u16(subCmd);
   }
+  void raw(std::span<const uint8_t> bytes) { m_bytes.insert(m_bytes.end(), bytes.begin(), bytes.end()); }
 
   [[nodiscard]] std::vector<uint8_t>& bytes() noexcept { return m_bytes; }
 

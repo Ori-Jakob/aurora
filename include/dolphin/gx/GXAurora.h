@@ -125,7 +125,7 @@ extern "C" {
 #define GX_AURORA_RENDER_GRASS_PATCHES 0x010E
 #define GX_AURORA_RENDER_SKY 0x010F
 #define GX_AURORA_RENDER_FOG_VOLUMES 0x0110
-// Draws depend on GPU-system commands, so they get producers only together with their decoder
+// GPU-system commands feed draws, so they decode in core whatever the hint switch says
 #define GX_AURORA_GPU_UPLOAD 0x0120
 #define GX_AURORA_GPU_RESERVE 0x0121
 #define GX_AURORA_GPU_DISPATCH 0x0122
@@ -154,6 +154,12 @@ extern "C" {
 #define AURORA_HINT_GRASS_PATCHES_VERSION 1
 #define AURORA_HINT_SKY_VERSION 1
 #define AURORA_HINT_FOG_VOLUMES_VERSION 1
+#define AURORA_HINT_GPU_UPLOAD_VERSION 1
+#define AURORA_HINT_GPU_RESERVE_VERSION 1
+#define AURORA_HINT_LOAD_ARRAY_GPU_VERSION 1
+#define AURORA_HINT_GPU_UPDATE_PERSISTENT_VERSION 1
+#define AURORA_HINT_GPU_CREATE_SYSTEM_VERSION 1
+#define AURORA_HINT_GPU_DESTROY_SYSTEM_VERSION 1
 
 #define AURORA_MAX_LIGHTS 256
 #define AURORA_MAX_SKELETON_JOINTS 256
@@ -161,6 +167,8 @@ extern "C" {
 #define AURORA_MAX_WIND_SOURCES 32
 #define AURORA_MAX_GRASS_LIGHT_SETS 255
 #define AURORA_MAX_FOG_VOLUMES 64
+#define AURORA_GPU_RESERVE_ZERO 1u
+#define AURORA_GPU_SYSTEM_GPU_ONLY_STATE 1u
 
 #define GX2_SET_POLYGON_OFFSET 0x1000
 
@@ -537,6 +545,7 @@ void GXAuroraSetWindSources(const AuroraWindSource* sources, u16 count);
 void GXAuroraSetGrassPatches(u32 gpuHandle, u32 count, f32 interpStep, const AuroraGrassLightSet* sets, u8 setCount);
 void GXAuroraSetSky(const AuroraSky* sky);
 void GXAuroraSetFogVolumes(const AuroraFogVolume* volumes, u16 count);
+void GXSetArrayGPU(GXAttr attr, u64 gpuHandle, u32 byteOffset, u8 stride);
 
 #if __cplusplus
 }

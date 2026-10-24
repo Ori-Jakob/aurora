@@ -212,7 +212,7 @@ int print_info(trace::TraceReader& reader, const std::filesystem::path& path) {
 int run_write_self_test(const Options& options) {
   std::string error;
   gx::fifo::init();
-  const bool ok = write_self_test_trace(options.writeSelfTest, true, error);
+  const bool ok = write_self_test_trace(options.writeSelfTest, SelfTestMode::Hints, error);
   gx::fifo::shutdown();
   if (!ok) {
     print_error(error);
@@ -264,10 +264,14 @@ int run_self_test(int argc, char* argv[], const Options& options) {
 
   const auto hintsPath = options.outDir / "self_test_hints.gxtrace";
   const auto plainPath = options.outDir / "self_test_plain.gxtrace";
+  const auto gpuPath = options.outDir / "self_test_gpu_arrays.gxtrace";
   trace::TraceReader hintsReader;
   trace::TraceReader plainReader;
-  if (!write_self_test_trace(hintsPath, true, error) || !write_self_test_trace(plainPath, false, error) ||
-      !hintsReader.open(hintsPath, error) || !plainReader.open(plainPath, error)) {
+  trace::TraceReader gpuReader;
+  if (!write_self_test_trace(hintsPath, SelfTestMode::Hints, error) ||
+      !write_self_test_trace(plainPath, SelfTestMode::Plain, error) ||
+      !write_self_test_trace(gpuPath, SelfTestMode::GpuArrays, error) || !hintsReader.open(hintsPath, error) ||
+      !plainReader.open(plainPath, error) || !gpuReader.open(gpuPath, error)) {
     print_error(error);
     aurora_shutdown();
     return ExitUsage;
@@ -280,9 +284,11 @@ int run_self_test(int argc, char* argv[], const Options& options) {
   plainOptions.classifyDraws = false;
   Replayer hints{hintsOptions, hintsReader, true, view};
   Replayer plain{plainOptions, plainReader, true};
+  Replayer gpu{plainOptions, gpuReader, true};
   ReplayResult first;
   ReplayResult second;
   ReplayResult plainResult;
+  ReplayResult gpuResult;
   if (!hints.replay(0, first, error) || !hints.replay(1, second, error)) {
     print_error(error);
     aurora_shutdown();
@@ -292,6 +298,11 @@ int run_self_test(int argc, char* argv[], const Options& options) {
     print_error(error);
     aurora_shutdown();
     return plain.exit_code();
+  }
+  if (!gpu.replay(0, gpuResult, error)) {
+    print_error(error);
+    aurora_shutdown();
+    return gpu.exit_code();
   }
 
   std::string failure;
@@ -303,14 +314,22 @@ int run_self_test(int argc, char* argv[], const Options& options) {
     failure = fmt::format("replayed {} frames instead of {}", first.frames.size(), SelfTestFrameCount);
   } else if (!view && !same_frames(first.frames, plainResult.frames, mismatch)) {
     failure = "the plain trace differs from the hint trace: " + mismatch;
-  } else if (const uint64_t misses = first.misses + second.misses + plainResult.misses; misses != 0) {
+  } else if (const uint64_t misses = first.misses + second.misses + plainResult.misses + gpuResult.misses;
+             misses != 0) {
     failure = fmt::format("{} guest reads were not resolved", misses);
+  } else if (!same_frames(plainResult.frames, gpuResult.frames, mismatch)) {
+    failure = "the GPU-array trace differs from the plain trace: " + mismatch;
+  } else if (const auto& gpuRun = gpuResult.gpuRuns.back().stats; gpuRun.uploads != 2 * SelfTestFrameCount ||
+                                                                  gpuRun.suppressedDraws != 0 ||
+                                                                  gpuRun.failedHandles != 0 || gpuRun.rejected != 0) {
+    failure = fmt::format("the GPU-array trace decoded {} uploads, suppressed {} draws, failed {} and rejected {}",
+                          gpuRun.uploads, gpuRun.suppressedDraws, gpuRun.failedHandles, gpuRun.rejected);
   } else if (view) {
 #if AURORA_ENABLE_RENDER
     check_view_frames(options, first, plainResult, auroraInfo.backend != BACKEND_NULL, failure);
 #endif
-  } else {
-    check_self_test_frames(first.images, plainResult.images, auroraInfo.backend != BACKEND_NULL, failure);
+  } else if (check_self_test_frames(first.images, plainResult.images, auroraInfo.backend != BACKEND_NULL, failure)) {
+    check_self_test_frames(gpuResult.images, plainResult.images, auroraInfo.backend != BACKEND_NULL, failure);
   }
 
   std::vector<FrameTiming> timings = first.timings;
@@ -369,6 +388,16 @@ int run_replay(int argc, char* argv[], const Options& options) {
     return ExitUsage;
   }
 
+  if (const auto& trailer = reader.trailer(); trailer) {
+    if ((trailer->endFlags & trace::EndGpuStateUncaptured) != 0) {
+      std::fprintf(stderr,
+                   "aurora_gxreplay: warning: GPU systems kept state the trace could not capture; replay may "
+                   "diverge from the live run\n");
+    }
+    if ((trailer->endFlags & trace::EndGpuStorageMissed) != 0) {
+      std::fprintf(stderr, "aurora_gxreplay: warning: the live run missed streaming storage for GPU-channel data\n");
+    }
+  }
   AuroraInfo auroraInfo{};
   const bool synthetic = (reader.header().flags & trace::FileSynthetic) != 0;
   if (const auto code = bring_up_aurora(argc, argv, options, reader.info(), synthetic, auroraInfo, error);
@@ -421,6 +450,17 @@ int run_replay(int argc, char* argv[], const Options& options) {
   aurora_shutdown();
 
   for (const auto& result : results) {
+    for (const auto& gpu : result.gpuRuns) {
+      std::printf(
+          "aurora_gxreplay: gpu: run %u, uploads %llu, reserves %llu, binds %llu, suppressed %llu, failed %llu, "
+          "misses %llu, rejected %llu, systems %u\n",
+          gpu.run, static_cast<unsigned long long>(gpu.stats.uploads),
+          static_cast<unsigned long long>(gpu.stats.reserves), static_cast<unsigned long long>(gpu.stats.binds),
+          static_cast<unsigned long long>(gpu.stats.suppressedDraws),
+          static_cast<unsigned long long>(gpu.stats.failedHandles),
+          static_cast<unsigned long long>(gpu.stats.storageMisses), static_cast<unsigned long long>(gpu.stats.rejected),
+          gpu.stats.liveSystems);
+    }
     for (const auto& resident : result.residentRuns) {
       std::printf(
           "aurora_gxreplay: resident arrays: run %u, stages %llu, hits %llu, resets %llu, epochs %llu, "

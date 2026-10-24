@@ -3,11 +3,14 @@
 #include "hints.hpp"
 #include "procedural.hpp"
 
+#include <aurora/gpu_systems.hpp>
 #include <dolphin/gx.h>
 #include <dolphin/mtx.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 namespace render_demo {
@@ -78,8 +81,13 @@ struct Lights {
   Vec spotDir;
 };
 
+constexpr u32 BoxNormalsOffset = sizeof(BoxPositions);
+constexpr u32 BoxColorsOffset = BoxNormalsOffset + sizeof(BoxNormals);
+constexpr u32 BoxArrayBytes = BoxColorsOffset + sizeof(BoxColors);
+
 alignas(32) u8 sBoxDisplayList[256];
 u32 sBoxDisplayListSize = 0;
+aurora::render::gpu::Handle sBoxArrays = aurora::render::gpu::InvalidHandle;
 std::vector<u8> sGroundTexture;
 GXTexObj sGroundTexObj;
 std::vector<std::vector<SkinnedVertex>> sTentacle;
@@ -102,9 +110,32 @@ void set_box_format() {
   GXSetVtxAttrFmt(GX_VTXFMT1, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
   GXSetVtxAttrFmt(GX_VTXFMT1, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
   GXSetVtxAttrFmt(GX_VTXFMT1, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+  if (sBoxArrays != aurora::render::gpu::InvalidHandle) {
+    GXSetArrayGPU(GX_VA_POS, sBoxArrays, 0, sizeof(BoxPositions[0]));
+    GXSetArrayGPU(GX_VA_NRM, sBoxArrays, BoxNormalsOffset, sizeof(BoxNormals[0]));
+    GXSetArrayGPU(GX_VA_CLR0, sBoxArrays, BoxColorsOffset, sizeof(BoxColors[0]));
+    return;
+  }
   GXSetArray(GX_VA_POS, BoxPositions, sizeof(BoxPositions), sizeof(BoxPositions[0]), true);
   GXSetArray(GX_VA_NRM, BoxNormals, sizeof(BoxNormals), sizeof(BoxNormals[0]), true);
   GXSetArray(GX_VA_CLR0, BoxColors, sizeof(BoxColors), sizeof(BoxColors[0]), true);
+}
+
+void upload_gpu_arrays(const SceneOptions& options) {
+  sBoxArrays = aurora::render::gpu::InvalidHandle;
+  if (options.gpuArrays) {
+    std::array<u8, BoxArrayBytes> bytes{};
+    std::memcpy(bytes.data(), BoxPositions, sizeof(BoxPositions));
+    std::memcpy(bytes.data() + BoxNormalsOffset, BoxNormals, sizeof(BoxNormals));
+    std::memcpy(bytes.data() + BoxColorsOffset, BoxColors, sizeof(BoxColors));
+    sBoxArrays = aurora::render::gpu::upload(bytes.data(), BoxArrayBytes);
+  }
+  static const std::vector<u8> zeroes(aurora::render::gpu::MaxUploadBytes);
+  for (u64 left = u64{options.gpuPadMiB} << 20; left != 0;) {
+    const auto piece = static_cast<u32>(std::min<u64>(left, aurora::render::gpu::MaxUploadBytes));
+    aurora::render::gpu::upload(zeroes.data(), piece);
+    left -= piece;
+  }
 }
 
 void set_lit_channel(GXColorSrc matSrc) {
@@ -491,6 +522,12 @@ bool init_scene() {
   return sBoxDisplayListSize != 0;
 }
 
+uint32_t gpu_uploads_per_frame(const SceneOptions& options) noexcept {
+  const u64 padBytes = u64{options.gpuPadMiB} << 20;
+  const u64 maxUpload = aurora::render::gpu::MaxUploadBytes;
+  return (options.gpuArrays ? 1u : 0u) + static_cast<uint32_t>((padBytes + maxUpload - 1) / maxUpload);
+}
+
 SceneCamera scene_camera(u32 frame) noexcept {
   const f32 t = static_cast<f32>(frame) / 60.f;
   SceneCamera camera;
@@ -505,6 +542,7 @@ SceneCamera scene_camera(u32 frame) noexcept {
 void draw_scene(u32 frame, const SceneOptions& options) {
   // Not gated on hints_enabled() so the off capture proves emitters add only hint bytes; real producers do gate on it
   set_hint_emission(options.hints);
+  upload_gpu_arrays(options);
   const f32 t = static_cast<f32>(frame) / 60.f;
   const SceneCamera camera = scene_camera(frame);
   GXSetCopyClear(ClearColor, GX_MAX_Z24);
@@ -561,6 +599,7 @@ void draw_scene(u32 frame, const SceneOptions& options) {
 }
 
 void shutdown_scene() {
+  sBoxArrays = aurora::render::gpu::InvalidHandle;
   GXDestroyTexObj(&sGroundTexObj);
   sGroundTexture = {};
   sTentacle = {};

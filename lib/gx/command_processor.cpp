@@ -7,6 +7,7 @@
 #include "dolphin/gd/GDGeometry.h"
 #include "dolphin/gx/GXAurora.h"
 #include "draw_route.hpp"
+#include "gpu_channel.hpp"
 #include "guest_memory.hpp"
 #include "gx.hpp"
 #include "hints.hpp"
@@ -23,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -739,6 +741,12 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
       continue;
     }
     auto& array = state.arrays[i];
+    if (array.gpu)
+      UNLIKELY {
+        // GPU arrays have no guest bytes, so they skip the upload cache and the resident arena
+        immediates.arrayStart[i - GX_VA_POS] = gpu_channel::lookup(array.gpuHandle).range.offset + array.gpuOffset;
+        continue;
+      }
     if (array.cachedRange.size == 0) {
       ZoneScopedN("upload array");
       const CpuZoneScope arrays{CpuZoneArrays};
@@ -876,6 +884,22 @@ static bool route_draw(const draw_route::Query& query) noexcept {
   return false;
 }
 
+static bool gpu_arrays_ready() noexcept {
+  for (u32 mask = g_gxState.gpuArrayMask; mask != 0; mask &= mask - 1) {
+    const u32 attr = GX_VA_POS + std::countr_zero(mask);
+    if (g_gxState.vtxDesc[attr] != GX_INDEX8 && g_gxState.vtxDesc[attr] != GX_INDEX16) {
+      continue;
+    }
+    const auto& array = g_gxState.arrays[attr];
+    const auto info = gpu_channel::lookup(array.gpuHandle);
+    if ((info.state != gpu_channel::HandleState::Uploaded && info.state != gpu_channel::HandleState::Written) ||
+        array.gpuOffset >= info.range.size) {
+      return false;
+    }
+  }
+  return true;
+}
+
 static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange) noexcept {
   ZoneScoped;
   u32 numIndices = 0;
@@ -903,6 +927,13 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
   u32 totalVtxBytes = vtxCount * vtxSize;
   if (totalVtxBytes > reader.remaining())
     UNLIKELY { handle_draw_overrun(totalVtxBytes, reader); }
+  if (g_gxState.gpuArrayMask != 0 && !gpu_arrays_ready())
+    UNLIKELY {
+      reader.skip(totalVtxBytes);
+      break_draw_merge();
+      gpu_channel::note_suppressed_draw();
+      return;
+    }
 
   if (route_draw({.prim = prim, .fmt = fmt, .vtxCount = vtxCount})) {
     reader.skip(totalVtxBytes);
@@ -977,6 +1008,13 @@ static void handle_draw_indexed(ByteReader& reader) noexcept {
     vtxSize = calc_vtx_size(fmt);
   }
   const u32 totalVtxBytes = vtxCount * vtxSize;
+  if (indexCount != 0 && g_gxState.gpuArrayMask != 0 && !gpu_arrays_ready())
+    UNLIKELY {
+      reader.skip(idxBytes + totalVtxBytes);
+      break_draw_merge();
+      gpu_channel::note_suppressed_draw();
+      return;
+    }
   if (indexCount != 0 && route_draw({.prim = prim, .fmt = fmt, .vtxCount = vtxCount, .indexed = true})) {
     reader.skip(idxBytes + totalVtxBytes);
     return;
@@ -1036,7 +1074,7 @@ void handle_aurora(ByteReader& reader) noexcept {
 
     auto& array = g_gxState.arrays[attrIdx];
     const auto newData = reinterpret_cast<void*>(arrayAddr);
-    if (array.data != newData || array.size != arraySize || array.le != le) {
+    if (array.gpu || array.data != newData || array.size != arraySize || array.le != le) {
       if (array.le != le) {
         // Endianness is baked into the shader
         g_gxState.dirty |= DirtyPipeline;
@@ -1045,6 +1083,12 @@ void handle_aurora(ByteReader& reader) noexcept {
       array.size = arraySize;
       array.le = le;
       array.cachedRange = {};
+      if (array.gpu) {
+        array.gpu = false;
+        array.gpuHandle = 0;
+        array.gpuOffset = 0;
+        g_gxState.gpuArrayMask &= ~(1u << (attrIdx - GX_VA_POS));
+      }
       g_gxState.dirty |= DirtyImmediates;
     }
   } else if (subCmd == GX_AURORA_LOAD_TEXOBJ) {
@@ -1307,6 +1351,38 @@ void init_immutable_arrays() noexcept {
   } else {
     g_immutableMode = ImmutableArrayMode::On;
   }
+}
+
+void load_array_gpu(uint8_t attr, uint64_t handle, uint32_t byteOffset) noexcept {
+  auto& array = g_gxState.arrays[attr];
+  if (!array.gpu || array.gpuHandle != handle || array.gpuOffset != byteOffset || array.data != nullptr ||
+      array.size != 0 || !array.le) {
+    if (!array.le) {
+      g_gxState.dirty |= DirtyPipeline;
+    }
+    array.data = nullptr;
+    array.size = 0;
+    array.le = true;
+    array.cachedRange = {};
+    array.gpu = true;
+    array.gpuHandle = handle;
+    array.gpuOffset = byteOffset;
+    g_gxState.gpuArrayMask |= static_cast<u16>(1u << (attr - GX_VA_POS));
+    g_gxState.dirty |= DirtyImmediates;
+  }
+  gpu_channel::note_bind(handle != 0);
+}
+
+void end_gpu_frame() noexcept {
+  if (g_gxState.gpuArrayMask != 0) {
+    for (u32 mask = g_gxState.gpuArrayMask; mask != 0; mask &= mask - 1) {
+      auto& array = g_gxState.arrays[GX_VA_POS + std::countr_zero(mask)];
+      array.gpuHandle = 0;
+      array.gpuOffset = 0;
+    }
+    g_gxState.dirty |= DirtyImmediates;
+  }
+  gpu_channel::end_frame();
 }
 
 ImmutableArrayStats immutable_array_stats() noexcept {

@@ -1,5 +1,7 @@
 #include "capture.hpp"
 
+#include <aurora/gpu_systems.hpp>
+#include <aurora/render_caps.hpp>
 #include <aurora/trace.hpp>
 
 #include "capture_session.hpp"
@@ -10,6 +12,7 @@
 #include "../gfx/pipeline_cache.hpp"
 #include "../gfx/texture_replacement.hpp"
 #include "../gx/fifo.hpp"
+#include "../gx/gpu_channel.hpp"
 #include "../gx/guest_memory.hpp"
 #include "../gx/gx.hpp"
 #include "../internal.hpp"
@@ -22,6 +25,7 @@
 #include <atomic>
 #include <mutex>
 #include <string_view>
+#include <utility>
 
 namespace aurora::trace {
 namespace {
@@ -38,6 +42,9 @@ bool g_stopRequested = false;
 std::string g_abortReason;
 uint32_t g_endFlags = 0;
 Vec2<uint32_t> g_frameViSize;
+uint64_t g_frameStorageMisses = 0;
+bool g_warnedGpuState = false;
+bool g_warnedStorageMiss = false;
 
 void observe_guest_read(void*, gx::guest_memory::Kind kind, uint64_t address, std::span<const uint8_t> bytes) noexcept {
   std::lock_guard lock{g_mutex};
@@ -69,13 +76,20 @@ uint32_t device_features() noexcept {
   if (webgpu::g_textureComponentSwizzleSupported) {
     features |= DeviceTextureSwizzle;
   }
+  if (render::caps().subgroups) {
+    features |= DeviceSubgroups;
+  }
+  if (render::caps().shaderF16) {
+    features |= DeviceShaderF16;
+  }
   return features;
 }
 
 TraceInfo make_info() {
   const auto& graphics = webgpu::g_graphicsConfig;
   TraceInfo info{
-      .captureFlags = CaptureReplacementsBypassed | CaptureBlockingPipelines | CaptureSynchronousPublish,
+      .captureFlags =
+          CaptureReplacementsBypassed | CaptureBlockingPipelines | CaptureSynchronousPublish | CaptureDeviceFeaturesV2,
       .backend = g_config.desiredBackend,
       .msaaSamples = graphics.msaaSamples,
       .maxAnisotropy = graphics.textureAnisotropy,
@@ -102,6 +116,7 @@ RenderConfig current_render_config() noexcept {
       .viEfbHeight = viSize.y,
       .viewportPolicy = static_cast<uint8_t>(gx::g_gxState.viewportPolicy),
       .normalBuffer = webgpu::g_graphicsConfig.normalBuffer,
+      .streamingStorageMiB = static_cast<uint32_t>(gfx::detail::streaming_sizes().storage / (1024 * 1024)),
   };
 }
 
@@ -204,6 +219,13 @@ void on_frame_begin() noexcept {
       return;
     }
     gfx::set_blocking_pipelines(true);
+    gx::gpu_channel::wait_systems();
+    if (gx::gpu_channel::uncaptured_gpu_state()) {
+      g_endFlags |= EndGpuStateUncaptured;
+      if (!std::exchange(g_warnedGpuState, true)) {
+        Log.warn("A live GPU system keeps state on the GPU only, so replays of this trace may diverge");
+      }
+    }
     gx::guest_memory::set_hooks(&RecordHooks);
     gx::fifo::set_process_observer(&RecordObserver);
     gx::fifo::set_synchronous_publish(true);
@@ -213,6 +235,7 @@ void on_frame_begin() noexcept {
 
   const auto config = current_render_config();
   g_frameViSize = {config.viFbWidth, config.viEfbHeight};
+  g_frameStorageMisses = render::gpu::stats().storageMisses;
   g_session.begin_frame(gfx::current_frame(), config);
 
   // The latch has just run, and stages flushed at finish run after on_frame_end commits the frame
@@ -246,6 +269,12 @@ void on_frame_end() noexcept {
     g_endFlags |= EndViChangedMidFrame;
     Log.warn("VI configuration changed from {}x{} to {}x{} during captured frame {}", g_frameViSize.x, g_frameViSize.y,
              viSize.x, viSize.y, g_status.framesCaptured - 1);
+  }
+  if (render::gpu::stats().storageMisses != g_frameStorageMisses) {
+    g_endFlags |= EndGpuStorageMissed;
+    if (!std::exchange(g_warnedStorageMiss, true)) {
+      Log.warn("GPU-channel data missed streaming storage during captured frame {}", g_status.framesCaptured - 1);
+    }
   }
 
   if (!g_abortReason.empty()) {

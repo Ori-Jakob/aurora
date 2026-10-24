@@ -101,6 +101,10 @@ std::optional<std::string> check_hints(const HintTally& tally, bool decoding, Co
     if (seen.malformed != 0) {
       return failure(id, "malformed", seen.malformed, emitted);
     }
+    // GPU-system commands are not hints and decode whatever the hint switch says
+    if (id >= GX_AURORA_GPU_UPLOAD && id <= GX_AURORA_GPU_DESTROY_SYSTEM) {
+      continue;
+    }
     if (seen.late != 0) {
       return failure(id, "late", seen.late, emitted);
     }

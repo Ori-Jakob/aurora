@@ -33,6 +33,7 @@
 #include <utility>
 #include <vector>
 
+#include <aurora/gpu_systems.hpp>
 #include <SDL3/SDL_stdinc.h>
 #include <tracy/Tracy.hpp>
 #include <magic_enum.hpp>
@@ -72,6 +73,10 @@ ResidentLayout g_residentLayout{};
 uint32_t g_testGrowthFrame = 0;
 bool g_loggedStagingCap = false;
 uint32_t g_frameIndex = UINT32_MAX;
+ChannelBudget g_channelBudget;
+uint64_t g_channelDemand = 0;
+bool g_warnedChannelBudget = false;
+bool g_warnedStorageGrowth = false;
 
 std::array<FramePacket, FrameSlotCount> g_framePackets;
 uint64_t g_nextFrameId = 1;
@@ -379,11 +384,48 @@ uint64_t resident_limit(uint64_t streamingStorage, uint64_t bound) noexcept {
 }
 
 StreamingLimits streaming_limits() noexcept {
-  const uint64_t bound = buffer_bound();
+  const uint64_t bound = round_streaming_limit(buffer_bound());
   return {.vertex = bound,
           .index = bound,
-          .storage = streaming_storage_limit(bound, g_residentCapacity),
+          .storage = round_streaming_limit(streaming_storage_limit(bound, g_residentCapacity)),
           .staging = g_resources.limits.maxBufferSize};
+}
+
+void create_compute_layouts() {
+  if (g_resources.computeStreamLayout) {
+    return;
+  }
+  const wgpu::BindGroupLayoutDescriptor emptyDesc{.label = "Compute empty bind group layout"};
+  g_resources.computeEmptyLayout = g_device.CreateBindGroupLayout(&emptyDesc);
+  const wgpu::BindGroupDescriptor emptyGroupDesc{
+      .label = "Compute empty bind group",
+      .layout = g_resources.computeEmptyLayout,
+  };
+  g_resources.computeEmptyGroup = g_device.CreateBindGroup(&emptyGroupDesc);
+  const std::array streamEntries{
+      wgpu::BindGroupLayoutEntry{
+          .binding = 0,
+          .visibility = wgpu::ShaderStage::Compute,
+          .buffer = {.type = wgpu::BufferBindingType::Storage, .minBindingSize = 0},
+      },
+      wgpu::BindGroupLayoutEntry{
+          .binding = 1,
+          .visibility = wgpu::ShaderStage::Compute,
+          .buffer = {.type = wgpu::BufferBindingType::Uniform, .hasDynamicOffset = true, .minBindingSize = 256},
+      },
+  };
+  const wgpu::BindGroupLayoutDescriptor streamDesc{
+      .label = "Compute stream bind group layout",
+      .entryCount = streamEntries.size(),
+      .entries = streamEntries.data(),
+  };
+  g_resources.computeStreamLayout = g_device.CreateBindGroupLayout(&streamDesc);
+}
+
+void release_compute_layouts() noexcept {
+  g_resources.computeEmptyGroup = {};
+  g_resources.computeEmptyLayout = {};
+  g_resources.computeStreamLayout = {};
 }
 
 uint32_t read_test_growth_frame() noexcept {
@@ -405,17 +447,51 @@ Resources& resources() noexcept { return g_resources; }
 const wgpu::Buffer& staging_buffer(size_t slot) { return g_stagingBuffers[slot]; }
 
 void request_streaming_sizes(const StreamingSizes& minimum) noexcept {
-  g_requestedSizes.vertex = std::max(g_requestedSizes.vertex, minimum.vertex);
-  g_requestedSizes.index = std::max(g_requestedSizes.index, minimum.index);
-  g_requestedSizes.storage = std::max(g_requestedSizes.storage, minimum.storage);
+  // Sizes stay 1 MiB multiples so every staging segment keeps the map and copy alignment
+  const auto merge = [](uint64_t& requested, uint64_t wanted) {
+    if (wanted > requested) {
+      requested = round_streaming_request(wanted);
+    }
+  };
+  merge(g_requestedSizes.vertex, minimum.vertex);
+  merge(g_requestedSizes.index, minimum.index);
+  merge(g_requestedSizes.storage, minimum.storage);
 }
 
 StreamingSizes streaming_sizes() noexcept { return g_targetSizes; }
+
+ChannelBudget channel_budget() noexcept { return g_channelBudget; }
+
+void request_channel_storage(uint64_t bytesPerFrame) noexcept {
+  g_channelDemand = std::max(g_channelDemand, bytesPerFrame);
+}
+
+void grow_streaming_storage_now(uint64_t storage) noexcept {
+  // begin_frame swaps in a staging buffer of the new size, so growing between frames is safe
+  g_targetSizes =
+      next_streaming_sizes(g_targetSizes, AuroraStats{},
+                           {.vertex = 0, .index = 0, .storage = round_streaming_request(storage)}, streaming_limits())
+          .sizes;
+  if (g_targetSizes.storage < storage && !std::exchange(g_warnedStorageGrowth, true)) {
+    Log.warn("Streaming storage stays at {} MiB, below the {} MiB requested", g_targetSizes.storage / MiB,
+             (storage + MiB - 1) / MiB);
+  }
+}
+
+wgpu::BindGroupLayout compute_empty_layout() noexcept { return g_resources.computeEmptyLayout; }
+
+wgpu::BindGroup compute_empty_group() noexcept { return g_resources.computeEmptyGroup; }
+
+wgpu::BindGroupLayout compute_stream_layout() noexcept { return g_resources.computeStreamLayout; }
 
 namespace testing {
 StreamingSizes requested_streaming_sizes() noexcept { return g_requestedSizes; }
 
 void reset_streaming_request() noexcept { g_requestedSizes = {}; }
+
+void create_compute_layouts() noexcept { gfx::create_compute_layouts(); }
+
+void release_compute_layouts() noexcept { gfx::release_compute_layouts(); }
 } // namespace testing
 
 StreamingGrowth next_streaming_sizes(const StreamingSizes& current, const AuroraStats& lastFrame,
@@ -630,6 +706,10 @@ void initialize() {
   // For uniform & storage buffer offset alignments
   g_device.GetLimits(&g_resources.limits);
   g_testGrowthFrame = read_test_growth_frame();
+  g_channelBudget = {
+      .bytes = channel_storage_budget(g_targetSizes.storage, 0, false, render::gpu::MaxFrameChannelBytes),
+      .alignment = g_resources.limits.minStorageBufferOffsetAlignment,
+  };
 
   create_buffer(g_resources.uniformBuffer, wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst, UniformBufferSize,
                 "Shared Uniform Buffer");
@@ -684,6 +764,7 @@ void initialize() {
     };
     g_resources.uniformBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
   }
+  create_compute_layouts();
 
   gx::initialize();
 #ifdef AURORA_ENABLE_RMLUI
@@ -742,6 +823,11 @@ void shutdown() {
   }
   render::detail::shutdown();
   shutdown_recording();
+  release_compute_layouts();
+  g_channelBudget = {};
+  g_channelDemand = 0;
+  g_warnedChannelBudget = false;
+  g_warnedStorageGrowth = false;
   g_resources.staticBindGroup = {};
   g_resources.staticBindGroupLayout = {};
   g_resources.uniformBindGroup = {};
@@ -877,8 +963,20 @@ void end_frame(EndFrameCallback callback) {
   if (g_testGrowthFrame != 0 && frame.frameIndex == g_testGrowthFrame) {
     g_requestedSizes.storage = 2 * g_targetSizes.storage;
   }
+  const uint64_t lastStorage = frame.stats.lastStorageSize;
+  const uint64_t legacy = lastStorage - std::min(lastStorage, last_channel_storage_bytes());
+  if (g_channelDemand != 0) {
+    request_streaming_sizes({.vertex = 0, .index = 0, .storage = channel_storage_request(g_channelDemand, legacy)});
+  }
   const auto growth = next_streaming_sizes(g_targetSizes, frame.stats, g_requestedSizes, streaming_limits());
   g_targetSizes = growth.sizes;
+  g_channelBudget.bytes =
+      channel_storage_budget(g_targetSizes.storage, legacy, true, render::gpu::MaxFrameChannelBytes);
+  if (g_channelDemand > g_channelBudget.bytes && !std::exchange(g_warnedChannelBudget, true)) {
+    Log.warn("GPU channel budget {} bytes stays below its demand of {} bytes; streaming storage is {} MiB of {} MiB",
+             g_channelBudget.bytes, g_channelDemand, g_targetSizes.storage / MiB, streaming_limits().storage / MiB);
+  }
+  g_channelDemand = 0;
   g_residentCapacity =
       next_resident_capacity(g_residentCapacity, take_resident_request(), g_targetSizes.storage, buffer_bound());
   if (growth.stagingCapped && !std::exchange(g_loggedStagingCap, true)) {

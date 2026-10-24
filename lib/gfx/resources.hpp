@@ -2,6 +2,9 @@
 
 #include "types.hpp"
 
+#include <algorithm>
+#include <bit>
+
 namespace aurora::gfx {
 inline constexpr bool UseTextureBuffer = true;
 inline constexpr uint64_t UniformBufferSize = 25165824; // 24 MiB
@@ -46,6 +49,34 @@ static_assert(staging_layout({}).textureUpload ==
 static_assert(staging_layout({}).total == UniformBufferSize + VertexBufferSize + IndexBufferSize + StorageBufferSize +
                                               (UseTextureBuffer ? TextureUploadSize : 0));
 
+inline constexpr uint64_t StreamingGranule = 1024 * 1024;
+
+constexpr uint64_t round_streaming_request(uint64_t bytes) noexcept {
+  return bytes == 0 ? 0 : std::bit_ceil(std::max(bytes, StreamingGranule));
+}
+
+constexpr uint64_t round_streaming_limit(uint64_t bytes) noexcept { return bytes & ~(StreamingGranule - 1); }
+
+// Twice last frame's legacy covers the 4/3 that the growth rule alone guarantees
+constexpr uint64_t legacy_storage_reserve(uint64_t storage, uint64_t legacy, bool history) noexcept {
+  if (!history) {
+    return storage / 2;
+  }
+  return std::min(storage, std::max(storage / 4, AURORA_ALIGN(2 * legacy, StreamingGranule)));
+}
+
+constexpr uint64_t channel_storage_budget(uint64_t storage, uint64_t legacy, bool history, uint64_t cap) noexcept {
+  return std::min(storage - legacy_storage_reserve(storage, legacy, history), cap);
+}
+
+constexpr uint64_t channel_storage_request(uint64_t demand, uint64_t legacy) noexcept {
+  return 2 * demand + AURORA_ALIGN(2 * legacy, StreamingGranule);
+}
+
+static_assert(round_streaming_request(StorageBufferSize) == StorageBufferSize);
+static_assert(round_streaming_request(32 * StreamingGranule) == 32 * StreamingGranule);
+static_assert(round_streaming_request(VertexBufferSize) % StreamingGranule == 0);
+
 struct StreamingLimits {
   uint64_t vertex = 0;
   uint64_t index = 0;
@@ -80,6 +111,9 @@ struct Resources {
   wgpu::BindGroup staticBindGroup;
   wgpu::BindGroupLayout uniformBindGroupLayout;
   wgpu::BindGroup uniformBindGroup;
+  wgpu::BindGroupLayout computeEmptyLayout;
+  wgpu::BindGroup computeEmptyGroup;
+  wgpu::BindGroupLayout computeStreamLayout;
   wgpu::Limits limits;
   AuroraStats stats{};
   StreamingSizes deviceSizes;

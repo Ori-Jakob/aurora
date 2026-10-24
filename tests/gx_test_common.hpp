@@ -7,6 +7,7 @@
 #include "gx/gx.hpp"
 #include "gx/fifo.hpp"
 #include "gx/command_processor.hpp"
+#include "gx/gpu_channel.hpp"
 #include "gx/hints.hpp"
 #include "gfx/depth_peek.hpp"
 
@@ -133,6 +134,8 @@ protected:
     aurora::gx::fifo::testing::set_immutable_array_mode(aurora::gx::fifo::ImmutableArrayMode::On);
     aurora::gx::fifo::testing::reset_immutable_array_stats();
     aurora::gfx::testing::reset_resident_stubs();
+    aurora::gx::gpu_channel::reset();
+    aurora::gx::gpu_channel::testing::reset_stats();
   }
 
   void TearDown() override { aurora::gx::fifo::shutdown(); }
@@ -277,6 +280,7 @@ inline void expect_state_eq(const aurora::gx::GXState& want, const aurora::gx::G
   for (size_t i = 0; i < want.arrays.size(); ++i) {
     EXPECT_EQ(want.arrays[i], got.arrays[i]) << "array " << i;
   }
+  EXPECT_EQ(want.gpuArrayMask, got.gpuArrayMask);
   EXPECT_EQ(want.depthCompare, got.depthCompare);
   EXPECT_EQ(want.depthUpdate, got.depthUpdate);
   EXPECT_EQ(want.colorUpdate, got.colorUpdate);

@@ -44,6 +44,7 @@ enum CaptureFlag : uint32_t {
   CaptureReplacementsBypassed = 1u << 0,
   CaptureBlockingPipelines = 1u << 1,
   CaptureSynchronousPublish = 1u << 2,
+  CaptureDeviceFeaturesV2 = 1u << 3,
 };
 enum DeviceFeature : uint32_t {
   DeviceCoreFeatures = 1u << 0,
@@ -51,8 +52,16 @@ enum DeviceFeature : uint32_t {
   DeviceBcTextures = 1u << 2,
   DeviceAstcTextures = 1u << 3,
   DeviceTextureSwizzle = 1u << 4,
+  DeviceSubgroups = 1u << 5,
+  DeviceShaderF16 = 1u << 6,
 };
-enum EndFlag : uint32_t { EndAborted = 1u << 0, EndViChangedMidFrame = 1u << 1 };
+enum EndFlag : uint32_t {
+  EndAborted = 1u << 0,
+  EndViChangedMidFrame = 1u << 1,
+  EndGpuStateUncaptured = 1u << 2,
+  EndGpuStorageMissed = 1u << 3,
+};
+uint32_t compared_device_features(uint32_t captureFlags) noexcept;
 
 struct Hash128 {
   uint64_t low = 0;
@@ -104,6 +113,7 @@ struct RenderConfig {
   uint32_t viEfbHeight = 480;
   uint8_t viewportPolicy = 0;
   bool normalBuffer = false;
+  uint32_t streamingStorageMiB = 0;
   bool operator==(const RenderConfig&) const = default;
 };
 struct MemoryMapRecord {

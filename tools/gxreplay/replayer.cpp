@@ -24,6 +24,7 @@
 #include "window.hpp"
 
 #include <aurora/gfx.h>
+#include <aurora/render_caps.hpp>
 #include <aurora/texture.hpp>
 #include <SDL3/SDL_error.h>
 #include <SDL3/SDL_events.h>
@@ -132,6 +133,12 @@ uint32_t device_features() noexcept {
   if (webgpu::g_textureComponentSwizzleSupported) {
     features |= trace::DeviceTextureSwizzle;
   }
+  if (render::caps().subgroups) {
+    features |= trace::DeviceSubgroups;
+  }
+  if (render::caps().shaderF16) {
+    features |= trace::DeviceShaderF16;
+  }
   return features;
 }
 
@@ -140,7 +147,33 @@ uint64_t malformed_hints() noexcept {
   for (uint16_t id = GX_AURORA_RENDER_CAMERA; id <= GX_AURORA_RENDER_WIND_SOURCES; ++id) {
     total += gx::hints::counters(id).malformed;
   }
+  for (uint16_t id = GX_AURORA_GPU_UPLOAD; id <= GX_AURORA_GPU_DESTROY_SYSTEM; ++id) {
+    total += gx::hints::counters(id).malformed;
+  }
   return total;
+}
+
+render::gpu::Stats gpu_delta(const render::gpu::Stats& before, const render::gpu::Stats& after) noexcept {
+  return {
+      .refused = after.refused - before.refused,
+      .refusedBytes = after.refusedBytes - before.refusedBytes,
+      .staleBinds = after.staleBinds - before.staleBinds,
+      .uploads = after.uploads - before.uploads,
+      .uploadBytes = after.uploadBytes - before.uploadBytes,
+      .reserves = after.reserves - before.reserves,
+      .reserveBytes = after.reserveBytes - before.reserveBytes,
+      .failedHandles = after.failedHandles - before.failedHandles,
+      .storageMisses = after.storageMisses - before.storageMisses,
+      .rejected = after.rejected - before.rejected,
+      .binds = after.binds - before.binds,
+      .invalidBinds = after.invalidBinds - before.invalidBinds,
+      .suppressedDraws = after.suppressedDraws - before.suppressedDraws,
+      .created = after.created - before.created,
+      .destroyed = after.destroyed - before.destroyed,
+      .updates = after.updates - before.updates,
+      .updateBytes = after.updateBytes - before.updateBytes,
+      .liveSystems = after.liveSystems,
+  };
 }
 
 class ScopedStoreHooks {
@@ -197,14 +230,15 @@ ExitCode bring_up_aurora(int argc, char* argv[], const Options& options, const t
   }
   if (!synthetic && !options.allowDeviceMismatch) {
     const auto& graphics = webgpu::g_graphicsConfig;
-    const uint32_t features = device_features();
+    const uint32_t compared = trace::compared_device_features(info.captureFlags);
+    const uint32_t features = device_features() & compared;
     if (graphics.msaaSamples != info.msaaSamples || graphics.textureAnisotropy != info.maxAnisotropy ||
-        features != info.deviceFeatures) {
+        features != (info.deviceFeatures & compared)) {
       error = fmt::format(
           "device differs from the capture: MSAA {} (trace {}), anisotropy {} (trace {}), features "
           "0x{:X} (trace 0x{:X}); pass --allow-device-mismatch to replay anyway",
           graphics.msaaSamples, info.msaaSamples, graphics.textureAnisotropy, info.maxAnisotropy, features,
-          info.deviceFeatures);
+          info.deviceFeatures & compared);
       aurora_shutdown();
       return ExitDeviceMismatch;
     }
@@ -267,6 +301,7 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
   gx::reset_texture_caches();
   m_store.reset();
   const auto residentStart = gx::fifo::immutable_array_stats();
+  const auto gpuStart = render::gpu::stats();
   if (!m_reader.rewind(error)) {
     return fail(ExitTrace, error, error);
   }
@@ -488,6 +523,7 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
       .violations = residentEnd.violations - residentStart.violations,
       .arenaFull = residentEnd.arenaFull - residentStart.arenaFull,
   });
+  out.gpuRuns.push_back({.run = run, .stats = gpu_delta(gpuStart, render::gpu::stats())});
   return true;
 }
 
@@ -505,6 +541,10 @@ void Replayer::collect_gpu_timing(uint32_t run, uint32_t frame, ReplayResult& ou
 }
 
 bool Replayer::apply_render_config(const trace::RenderConfig& config, std::string& error) {
+  if (config.streamingStorageMiB != 0) {
+    // Live accepted its GPU-channel commands against this size, so replay must be at least as large
+    gfx::detail::grow_streaming_storage_now(uint64_t{config.streamingStorageMiB} * 1024 * 1024);
+  }
   const auto viSize = vi::configured_fb_size();
   if (config.viFbWidth != viSize.x || config.viEfbHeight != viSize.y) {
     GXRenderModeObj renderMode{};

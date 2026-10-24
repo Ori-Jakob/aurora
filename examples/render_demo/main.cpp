@@ -10,6 +10,7 @@
 #include <aurora/aurora.h>
 #include <aurora/event.h>
 #include <aurora/gfx.hpp>
+#include <aurora/gpu_systems.hpp>
 #include <aurora/render.hpp>
 #include <aurora/render_caps.hpp>
 #include <aurora/trace.hpp>
@@ -141,7 +142,11 @@ render_demo::ObservedCounters snapshot_counters(u16 id, void* userData) {
 
 void print_hint_summary(const render_demo::HintTally& tally, const HintCounterSnapshot& snapshot) {
   render_demo::ObservedCounters total;
-  for (const auto& counters : snapshot.ids) {
+  for (uint32_t id = render_demo::FirstHintId; id <= render_demo::LastHintId; ++id) {
+    if (id >= GX_AURORA_GPU_UPLOAD && id <= GX_AURORA_GPU_DESTROY_SYSTEM) {
+      continue;
+    }
+    const auto& counters = snapshot.ids[id - render_demo::FirstHintId];
     total.decoded += counters.decoded;
     total.skipped += counters.skipped;
     total.malformed += counters.malformed;
@@ -158,6 +163,80 @@ void print_hint_summary(const render_demo::HintTally& tally, const HintCounterSn
 }
 
 constexpr uint64_t CustomDrawProbeUniformBytes = 256;
+
+constexpr std::string_view NoopSystemWgsl = R"(@compute @workgroup_size(aurora_wg_x, aurora_wg_y, aurora_wg_z)
+fn noop(@builtin(global_invocation_id) id: vec3<u32>) {
+  if (stream_active(id)) {
+    state_store(0u, state_load(0u));
+  }
+}
+)";
+constexpr std::array<aurora::render::gpu::KernelDesc, 1> NoopKernels{{{.entryPoint = "noop"}}};
+constexpr uint32_t NoopStateBytes = 256;
+
+struct GpuDemo {
+  aurora::render::gpu::SystemId system = aurora::render::gpu::InvalidSystem;
+  bool available = false;
+};
+
+GpuDemo create_gpu_demo(const render_demo::Options& options) {
+  if (!options.gpuArrays) {
+    return {};
+  }
+  GpuDemo demo{.available = aurora::render::gpu::systems_available()};
+  if (demo.available) {
+    demo.system = aurora::render::gpu::create_system({
+        .name = "demo_noop",
+        .wgsl = NoopSystemWgsl,
+        .kernels = NoopKernels,
+        .persistentBytes = NoopStateBytes,
+    });
+  }
+  return demo;
+}
+
+void update_gpu_demo(const GpuDemo& demo, uint32_t frame) {
+  if (demo.system != aurora::render::gpu::InvalidSystem &&
+      aurora::render::gpu::system_status(demo.system) == aurora::render::gpu::SystemStatus::Ready) {
+    aurora::render::gpu::update_persistent(demo.system, 0, &frame, sizeof(frame));
+  }
+}
+
+aurora::render::gpu::SystemStatus settled_status(const GpuDemo& demo) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+  auto status = aurora::render::gpu::system_status(demo.system);
+  while (status == aurora::render::gpu::SystemStatus::Pending && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    status = aurora::render::gpu::system_status(demo.system);
+  }
+  return status;
+}
+
+struct GpuReport {
+  aurora::render::gpu::Stats stats;
+  std::string systems;
+};
+
+GpuReport finish_gpu_demo(const GpuDemo& demo) {
+  GpuReport report{.stats = aurora::render::gpu::stats()};
+  if (!demo.available) {
+    report.systems = "unavailable";
+  } else {
+    const bool ready = demo.system != aurora::render::gpu::InvalidSystem &&
+                       settled_status(demo) == aurora::render::gpu::SystemStatus::Ready;
+    report.systems = std::string{"ready "} + (ready ? "1" : "0") + "/1";
+  }
+  if (demo.system != aurora::render::gpu::InvalidSystem) {
+    aurora::render::gpu::destroy_system(demo.system);
+  }
+  return report;
+}
+
+bool gpu_failed(const GpuReport& report, uint64_t expectedUploads) {
+  const auto& stats = report.stats;
+  return stats.suppressedDraws != 0 || stats.failedHandles != 0 || stats.rejected != 0 || stats.refused != 0 ||
+         stats.staleBinds != 0 || stats.uploads != expectedUploads;
+}
 
 struct CustomDrawProbe {
   aurora::gfx::DrawTypeId type = aurora::gfx::InvalidDrawType;
@@ -403,8 +482,11 @@ int main(int argc, char* argv[]) {
   }
   // The receiver is installed once at initialisation, so the answer is fixed for the whole run
   const bool decoding = aurora::render::hints_enabled();
-  const render_demo::SceneOptions sceneOptions{
-      .hints = options.hints, .captureOnlyBox = options.hints && decoding, .customDrawProbe = g_customDrawProbe.type};
+  const render_demo::SceneOptions sceneOptions{.hints = options.hints,
+                                               .captureOnlyBox = options.hints && decoding,
+                                               .customDrawProbe = g_customDrawProbe.type,
+                                               .gpuArrays = options.gpuArrays,
+                                               .gpuPadMiB = options.gpuPadMiB};
   bool decodingChanged = false;
 
   GXInit(nullptr, 0);
@@ -426,6 +508,7 @@ int main(int argc, char* argv[]) {
     aurora_shutdown();
     return ExitRenderGraphCheck;
   }
+  const GpuDemo gpuDemo = create_gpu_demo(options);
 
   const auto start = std::chrono::steady_clock::now();
   const auto timeout = std::chrono::seconds{options.timeoutSeconds};
@@ -473,6 +556,7 @@ int main(int argc, char* argv[]) {
       continue;
     }
     decodingChanged |= aurora::render::hints_enabled() != decoding;
+    update_gpu_demo(gpuDemo, frame);
     render_demo::draw_scene(frame, sceneOptions);
     aurora_end_frame();
     ++frame;
@@ -486,6 +570,8 @@ int main(int argc, char* argv[]) {
   render_demo::finish_graph_passes();
   const auto graphReport = render_demo::graph_pass_report();
   HintCounterSnapshot hintCounters = read_hint_counters();
+  const bool gpuChannel = options.gpuArrays || options.gpuPadMiB != 0;
+  const GpuReport gpuReport = gpuChannel ? finish_gpu_demo(gpuDemo) : GpuReport{};
   render_demo::unregister_graph_passes();
   if (g_customDrawProbe.type != aurora::gfx::InvalidDrawType) {
     aurora::gfx::unregister_draw_type(g_customDrawProbe.type);
@@ -529,6 +615,17 @@ int main(int argc, char* argv[]) {
   if (options.gpuCull != 0) {
     print_cull_report(graphReport.cull, frame, options.cullTimings);
   }
+  const uint64_t expectedUploads = uint64_t{frame} * render_demo::gpu_uploads_per_frame(sceneOptions);
+  if (gpuChannel) {
+    const auto& stats = gpuReport.stats;
+    std::printf(
+        "render_demo: gpu: uploads %llu, binds %llu, suppressed %llu, failed %llu, rejected %llu, refused %llu, "
+        "stale %llu, systems %s\n",
+        static_cast<unsigned long long>(stats.uploads), static_cast<unsigned long long>(stats.binds),
+        static_cast<unsigned long long>(stats.suppressedDraws), static_cast<unsigned long long>(stats.failedHandles),
+        static_cast<unsigned long long>(stats.rejected), static_cast<unsigned long long>(stats.refused),
+        static_cast<unsigned long long>(stats.staleBinds), gpuReport.systems.c_str());
+  }
   const bool cullFailure =
       options.gpuCull != 0 && cull_failed(graphReport.cull, options.frames, frame, info.backend == BACKEND_NULL);
   const render_demo::HintTally& tally = render_demo::hint_tally();
@@ -571,7 +668,7 @@ int main(int argc, char* argv[]) {
                  traceStatus.error.empty() ? "the capture window was never reached" : traceStatus.error.c_str());
     return ExitTraceFailed;
   }
-  if (options.failOnError && errors != 0) {
+  if (options.failOnError && (errors != 0 || (gpuChannel && gpu_failed(gpuReport, expectedUploads)))) {
     return ExitLoggedError;
   }
   return ExitSuccess;

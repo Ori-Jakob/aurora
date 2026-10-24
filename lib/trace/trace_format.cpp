@@ -13,6 +13,12 @@ Hash128 hash_bytes(std::span<const uint8_t> bytes) noexcept {
 
 uint32_t checksum_bytes(std::span<const uint8_t> bytes) noexcept { return XXH32(bytes.data(), bytes.size(), 0); }
 
+uint32_t compared_device_features(uint32_t captureFlags) noexcept {
+  constexpr uint32_t V1 =
+      DeviceCoreFeatures | DeviceDualSourceBlending | DeviceBcTextures | DeviceAstcTextures | DeviceTextureSwizzle;
+  return (captureFlags & CaptureDeviceFeaturesV2) != 0 ? UINT32_MAX : V1;
+}
+
 void LeWriter::u8(uint8_t v) { m_out.push_back(v); }
 
 void LeWriter::u16(uint16_t v) {
@@ -224,15 +230,16 @@ void encode_render_config(LeWriter& out, const RenderConfig& config) {
   out.u8(config.viewportPolicy);
   out.u8(config.normalBuffer ? 1 : 0);
   out.u16(0);
-  out.u32(0);
+  out.u32(config.streamingStorageMiB);
 }
 
 bool decode_render_config(std::span<const uint8_t> bytes, RenderConfig& config) {
   LeReader reader{bytes};
   uint8_t normalBuffer = 0;
+  uint16_t reserved = 0;
   if (bytes.size() < RenderConfigSize || !reader.u32(config.efbWidth) || !reader.u32(config.efbHeight) ||
       !reader.u32(config.viFbWidth) || !reader.u32(config.viEfbHeight) || !reader.u8(config.viewportPolicy) ||
-      !reader.u8(normalBuffer)) {
+      !reader.u8(normalBuffer) || !reader.u16(reserved) || !reader.u32(config.streamingStorageMiB)) {
     return false;
   }
   config.normalBuffer = normalBuffer != 0;

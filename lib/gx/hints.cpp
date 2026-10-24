@@ -1,6 +1,7 @@
 #include "hints.hpp"
 
 #include "command_processor.hpp"
+#include "gpu_channel.hpp"
 
 #include <dolphin/gx/GXCommandList.h>
 
@@ -95,21 +96,21 @@ IdInfo id_info(uint16_t id) noexcept {
     return {"SKY", AURORA_HINT_SKY_VERSION};
   case GX_AURORA_RENDER_FOG_VOLUMES:
     return {"FOG_VOLUMES", AURORA_HINT_FOG_VOLUMES_VERSION};
-  // Payloads arrive together with their decoder
   case GX_AURORA_GPU_UPLOAD:
-    return {"GPU_UPLOAD", 0};
+    return {"GPU_UPLOAD", AURORA_HINT_GPU_UPLOAD_VERSION};
   case GX_AURORA_GPU_RESERVE:
-    return {"GPU_RESERVE", 0};
+    return {"GPU_RESERVE", AURORA_HINT_GPU_RESERVE_VERSION};
+  // Payloads arrive together with their decoder
   case GX_AURORA_GPU_DISPATCH:
     return {"GPU_DISPATCH", 0};
   case GX_AURORA_LOAD_ARRAY_GPU:
-    return {"LOAD_ARRAY_GPU", 0};
+    return {"LOAD_ARRAY_GPU", AURORA_HINT_LOAD_ARRAY_GPU_VERSION};
   case GX_AURORA_GPU_UPDATE_PERSISTENT:
-    return {"GPU_UPDATE_PERSISTENT", 0};
+    return {"GPU_UPDATE_PERSISTENT", AURORA_HINT_GPU_UPDATE_PERSISTENT_VERSION};
   case GX_AURORA_GPU_CREATE_SYSTEM:
-    return {"GPU_CREATE_SYSTEM", 0};
+    return {"GPU_CREATE_SYSTEM", AURORA_HINT_GPU_CREATE_SYSTEM_VERSION};
   case GX_AURORA_GPU_DESTROY_SYSTEM:
-    return {"GPU_DESTROY_SYSTEM", 0};
+    return {"GPU_DESTROY_SYSTEM", AURORA_HINT_GPU_DESTROY_SYSTEM_VERSION};
   default:
     return {"reserved", 0};
   }
@@ -218,6 +219,10 @@ public:
 
   bool value(bool valid, std::string_view field, uint64_t value) noexcept {
     return valid || fail({Fault::Value, field, value});
+  }
+
+  bool need(size_t bytes) noexcept {
+    return m_in.remaining() >= bytes || fail({Fault::Size, {}, m_in.size(), m_in.offset() + bytes});
   }
 
 private:
@@ -521,6 +526,152 @@ bool decode_core(uint16_t id, Decoder& decoder) noexcept {
   fifo::release_array_immutable(address, generation);
   return true;
 }
+std::string_view take_text(ByteReader& in, size_t length) noexcept {
+  const auto bytes = in.take(length);
+  return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
+}
+
+bool decode_create(Decoder& decoder, std::span<const uint8_t> payload) noexcept {
+  using namespace render::gpu;
+  ByteReader& in = decoder.in();
+  if (!decoder.header(wire::GpuCreateHeader)) {
+    return false;
+  }
+  gpu_channel::SystemCreate desc{};
+  desc.id = in.read<uint64_t>();
+  desc.persistentBytes = in.read<uint32_t>();
+  desc.flags = in.read<uint32_t>();
+  desc.requirements = in.read<uint32_t>();
+  const uint8_t nameLength = in.read<uint8_t>();
+  const uint8_t kernelCount = in.read<uint8_t>();
+  const uint32_t sourceLength = in.read<uint32_t>();
+  const bool gpuOnly = (desc.flags & SystemGpuOnlyState) != 0;
+  const uint32_t stateLimit = gpuOnly ? MaxGpuOnlyStateBytes : MaxPersistentBytes;
+  if (!decoder.value((desc.flags & ~(SystemGpuOnlyState | wire::CreateLibrarySource)) == 0, "flags", desc.flags) ||
+      !decoder.value((desc.requirements & ~(RequiresCore | RequiresSubgroups | RequiresShaderF16)) == 0, "requirements",
+                     desc.requirements) ||
+      !decoder.value(desc.persistentBytes % 4 == 0 && desc.persistentBytes <= stateLimit &&
+                         (!gpuOnly || desc.persistentBytes != 0),
+                     "persistent bytes", desc.persistentBytes) ||
+      !decoder.value(nameLength >= 1 && nameLength <= MaxSystemNameBytes, "name length", nameLength) ||
+      !decoder.value(kernelCount >= 1 && kernelCount <= MaxKernels, "kernel count", kernelCount) ||
+      !decoder.value(sourceLength >= 1 && sourceLength <= MaxSystemSourceBytes, "source length", sourceLength) ||
+      !decoder.need(nameLength)) {
+    return false;
+  }
+  desc.name = take_text(in, nameLength);
+  if (!decoder.value(gpu_channel::valid_system_name(desc.name), "name", nameLength)) {
+    return false;
+  }
+  std::array<gpu_channel::KernelCreate, MaxKernels> kernels{};
+  for (uint8_t i = 0; i < kernelCount; ++i) {
+    if (!decoder.need(1)) {
+      return false;
+    }
+    const uint8_t entryLength = in.read<uint8_t>();
+    if (!decoder.need(size_t{entryLength} + wire::GpuCreateKernelHeader - 1)) {
+      return false;
+    }
+    auto& kernel = kernels[i];
+    kernel.entryPoint = take_text(in, entryLength);
+    for (uint32_t& dimension : kernel.workgroupSize) {
+      dimension = in.read<uint16_t>();
+    }
+    kernel.flags = in.read<uint8_t>();
+    const auto& size = kernel.workgroupSize;
+    if (!decoder.value(gpu_channel::valid_entry_point(kernel.entryPoint), "entry point", i) ||
+        !decoder.value(gpu_channel::valid_workgroup(size[0], size[1], size[2]), "workgroup size",
+                       uint64_t{size[0]} * size[1] * size[2]) ||
+        !decoder.value((kernel.flags & ~KernelStateAtomic) == 0 &&
+                           ((kernel.flags & KernelStateAtomic) == 0 || desc.persistentBytes != 0),
+                       "kernel flags", kernel.flags)) {
+      return false;
+    }
+  }
+  if (!decoder.size(in.offset() + sourceLength)) {
+    return false;
+  }
+  desc.source = take_text(in, sourceLength);
+  desc.library = (desc.flags & wire::CreateLibrarySource) != 0;
+  desc.flags &= ~wire::CreateLibrarySource;
+  desc.kernels = {kernels.data(), kernelCount};
+  gpu_channel::on_create(desc, payload);
+  return true;
+}
+
+bool decode_gpu(uint16_t id, Decoder& decoder, std::span<const uint8_t> payload) noexcept {
+  using namespace render::gpu;
+  ByteReader& in = decoder.in();
+  uint16_t version = 0;
+  if (!decoder.version(id_info(id).version, version)) {
+    return false;
+  }
+  switch (id) {
+  case GX_AURORA_GPU_UPLOAD: {
+    if (!decoder.header(wire::GpuUploadHeader)) {
+      return false;
+    }
+    const uint64_t handle = in.read<uint64_t>();
+    const size_t bytes = in.remaining();
+    if (!decoder.value(bytes >= 1 && bytes <= MaxUploadBytes, "upload size", bytes)) {
+      return false;
+    }
+    gpu_channel::on_upload(handle, in.take(bytes));
+    return true;
+  }
+  case GX_AURORA_GPU_RESERVE: {
+    if (!decoder.size(wire::GpuReserveV1)) {
+      return false;
+    }
+    const uint64_t handle = in.read<uint64_t>();
+    const uint32_t bytes = in.read<uint32_t>();
+    const uint32_t flags = in.read<uint32_t>();
+    if (!decoder.value(bytes >= 1 && bytes <= MaxUploadBytes, "reserve size", bytes) ||
+        !decoder.value((flags & ~ReserveZero) == 0, "reserve flags", flags)) {
+      return false;
+    }
+    gpu_channel::on_reserve(handle, bytes, flags);
+    return true;
+  }
+  case GX_AURORA_LOAD_ARRAY_GPU: {
+    if (!decoder.size(wire::LoadArrayGpuV1)) {
+      return false;
+    }
+    const uint8_t attr = in.read<uint8_t>();
+    const uint64_t handle = in.read<uint64_t>();
+    const uint32_t byteOffset = in.read<uint32_t>();
+    if (!decoder.value(attr >= GX_VA_POS && attr <= GX_VA_TEX7, "attribute", attr)) {
+      return false;
+    }
+    fifo::load_array_gpu(attr, handle, byteOffset);
+    return true;
+  }
+  case GX_AURORA_GPU_UPDATE_PERSISTENT: {
+    if (!decoder.header(wire::GpuUpdateHeader)) {
+      return false;
+    }
+    const uint64_t system = in.read<uint64_t>();
+    const uint32_t byteOffset = in.read<uint32_t>();
+    const size_t bytes = in.remaining();
+    if (!decoder.value(byteOffset % 4 == 0, "update offset", byteOffset) ||
+        !decoder.value(bytes >= 4 && bytes % 4 == 0 && bytes <= MaxPersistentBytes, "update size", bytes)) {
+      return false;
+    }
+    gpu_channel::on_update(system, byteOffset, in.take(bytes));
+    return true;
+  }
+  case GX_AURORA_GPU_CREATE_SYSTEM:
+    return decode_create(decoder, payload);
+  case GX_AURORA_GPU_DESTROY_SYSTEM:
+    if (!decoder.size(wire::GpuDestroyV1)) {
+      return false;
+    }
+    gpu_channel::on_destroy(in.read<uint64_t>());
+    return true;
+  default:
+    return false;
+  }
+}
 } // namespace
 
 void set_sink(const Sink* sink) noexcept { g_sink.store(sink, std::memory_order_release); }
@@ -529,6 +680,7 @@ const Sink* sink() noexcept { return g_sink.load(std::memory_order_acquire); }
 
 void reset_state() noexcept {
   fifo::reset_immutable_arrays();
+  gpu_channel::reset_decoder();
   if (const Sink* current = sink(); current != nullptr && current->reset != nullptr) {
     current->reset(current->userData);
   }
@@ -549,6 +701,17 @@ void handle(uint16_t id, ByteReader& reader) noexcept {
     if (!decode_core(id, decoder)) {
       add(id, Malformed);
       warn_rejected(id, decoder.fault());
+    }
+    return;
+  }
+  // Draws depend on these, so they decode without the render module or its hint switch
+  if (gpu_channel::is_command(id)) {
+    Decoder decoder{payload};
+    if (!decode_gpu(id, decoder, payload)) {
+      add(id, Malformed);
+      warn_rejected(id, decoder.fault());
+    } else {
+      add(id, Decoded);
     }
     return;
   }
@@ -581,8 +744,20 @@ Counters counters(uint16_t id) noexcept {
 
 uint64_t total_bytes() noexcept {
   uint64_t total = 0;
-  for (const auto& values : g_counters) {
-    total += values[Bytes].load(std::memory_order_relaxed);
+  for (size_t index = 0; index < IdCount; ++index) {
+    if (!gpu_channel::is_command(static_cast<uint16_t>(FirstId + index))) {
+      total += g_counters[index][Bytes].load(std::memory_order_relaxed);
+    }
+  }
+  return total;
+}
+
+uint64_t gpu_command_bytes() noexcept {
+  uint64_t total = 0;
+  for (size_t index = 0; index < IdCount; ++index) {
+    if (gpu_channel::is_command(static_cast<uint16_t>(FirstId + index))) {
+      total += g_counters[index][Bytes].load(std::memory_order_relaxed);
+    }
   }
   return total;
 }

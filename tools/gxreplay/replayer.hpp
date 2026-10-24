@@ -11,6 +11,7 @@
 
 #include <absl/container/flat_hash_set.h>
 #include <aurora/aurora.h>
+#include <aurora/gpu_systems.hpp>
 
 #include <cstdint>
 #include <span>
@@ -29,12 +30,18 @@ enum ExitCode : int {
   ExitUnresolvedReads = 6,
 };
 
+struct GpuRun {
+  uint32_t run = 0;
+  render::gpu::Stats stats;
+};
+
 struct ReplayResult {
   std::vector<FrameResult> frames;
   std::vector<FrameTiming> timings;
   std::vector<GpuFrameTiming> gpuTimings;
   std::vector<CpuFrameZones> cpuZones;
   std::vector<ResidentRun> residentRuns;
+  std::vector<GpuRun> gpuRuns;
   uint64_t misses = 0;
   std::vector<std::vector<uint8_t>> images;
   std::vector<ClassifyFrame> classify;

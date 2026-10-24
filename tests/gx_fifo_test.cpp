@@ -824,7 +824,7 @@ TEST_F(GXFifoTest, AuroraHint_CoreBlockSkippedByLength) {
 }
 
 TEST_F(GXFifoTest, AuroraHint_ModuleBlockSkippedByLength) {
-  for (const u16 id : {u16{0x0100}, u16{0x0123}, u16{0x01FF}}) {
+  for (const u16 id : {u16{0x0100}, u16{0x0127}, u16{0x01FF}}) {
     reset_gx_state();
     GX_WRITE_AURORA_HINT(id, kFakeBpWrite.data(), kFakeBpWrite.size());
     write_raw(kRealBpWrite);
@@ -870,7 +870,7 @@ TEST_F(GXFifoTest, AuroraHint_LargePayloadThroughThreadedFifo) {
 
   aurora::gx::fifo::init();
   aurora::gx::fifo::begin_frame();
-  GX_WRITE_AURORA_HINT(0x0120, payload.data(), static_cast<u32>(payload.size()));
+  GX_WRITE_AURORA_HINT(0x0127, payload.data(), static_cast<u32>(payload.size()));
   write_raw(kRealBpWrite);
   aurora::gx::fifo::publish();
   aurora::gx::fifo::drain();

@@ -5,7 +5,10 @@
 #include "trace/capture_session.hpp"
 #include "trace/snapshot_store.hpp"
 #include "trace/state_preamble.hpp"
+#include "trace/trace_format.hpp"
 #include "trace/trace_reader.hpp"
+
+#include <aurora/gpu_systems.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -72,6 +75,8 @@ bool parse_preamble(std::span<const u8> bytes, std::vector<PreambleCommand>& out
         payload = 13;
       } else if (subCmd == GX_AURORA_LOAD_COPY_DEST) {
         payload = 8;
+      } else if (subCmd >= GX_AURORA_HINT_FIRST && subCmd <= GX_AURORA_HINT_LAST) {
+        payload = 4 + be32(pos + 3);
       } else {
         return false;
       }
@@ -536,7 +541,7 @@ struct DecodedFrame {
   std::vector<u8> colors;
 };
 
-std::vector<DecodedFrame> decode_trace(const std::filesystem::path& path, uint64_t& misses) {
+std::vector<DecodedFrame> decode_trace(const std::filesystem::path& path, uint64_t& misses, bool endFrames = false) {
   std::vector<DecodedFrame> frames;
   aurora::trace::TraceReader reader;
   std::string error;
@@ -572,6 +577,9 @@ std::vector<DecodedFrame> decode_trace(const std::filesystem::path& path, uint64
       }
     }
     frames.push_back(std::move(decoded));
+    if (endFrames) {
+      aurora::gx::fifo::end_frame();
+    }
   }
   EXPECT_TRUE(error.empty()) << error;
   aurora::gx::guest_memory::set_hooks(nullptr);
@@ -581,12 +589,131 @@ std::vector<DecodedFrame> decode_trace(const std::filesystem::path& path, uint64
 }
 } // namespace
 
+TEST_F(GXFifoTest, SelfTestTrace_GpuArraysDrawLikePlain) {
+  const auto gpuPath = temp_trace("self_test_gpu_arrays");
+  const auto plainPath = temp_trace("self_test_gpu_plain");
+  std::string error;
+  ASSERT_TRUE(aurora::gxreplay::write_self_test_trace(gpuPath, aurora::gxreplay::SelfTestMode::GpuArrays, error))
+      << error;
+  ASSERT_TRUE(aurora::gxreplay::write_self_test_trace(plainPath, aurora::gxreplay::SelfTestMode::Plain, error))
+      << error;
+  aurora::gx::gpu_channel::testing::reset_stats();
+  uint64_t gpuMisses = 0;
+  uint64_t plainMisses = 0;
+  const auto gpu = decode_trace(gpuPath, gpuMisses, true);
+  const auto stats = aurora::render::gpu::stats();
+  const auto plain = decode_trace(plainPath, plainMisses, true);
+  EXPECT_EQ(gpuMisses, 0u);
+  EXPECT_EQ(plainMisses, 0u);
+  ASSERT_EQ(gpu.size(), aurora::gxreplay::SelfTestFrameCount);
+  ASSERT_EQ(plain.size(), aurora::gxreplay::SelfTestFrameCount);
+  for (size_t i = 0; i < gpu.size(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(gpu[i].draws, plain[i].draws);
+    EXPECT_GT(gpu[i].draws, 0u);
+    EXPECT_TRUE(gpu[i].colors.empty());
+    EXPECT_EQ(gpu[i].state.gpuArrayMask, 1u << 0 | 1u << (GX_VA_CLR0 - GX_VA_POS));
+  }
+  EXPECT_EQ(stats.uploads, 2u * aurora::gxreplay::SelfTestFrameCount);
+  EXPECT_EQ(stats.suppressedDraws, 0u);
+  EXPECT_EQ(stats.failedHandles, 0u);
+  EXPECT_EQ(stats.rejected, 0u);
+}
+
+namespace {
+aurora::render::gpu::SystemStatus ready_status(void*, uint64_t) noexcept {
+  return aurora::render::gpu::SystemStatus::Ready;
+}
+constexpr aurora::gx::gpu_channel::SystemBackend StatusOnlyBackend{.status = ready_status};
+} // namespace
+
+TEST_F(GXFifoTest, StatePreamble_RebuildsGpuChannel) {
+  namespace gpu = aurora::render::gpu;
+  namespace channel = aurora::gx::gpu_channel;
+  channel::set_system_backend(&StatusOnlyBackend);
+  const std::array<gpu::KernelDesc, 1> kernels{{{.entryPoint = "main"}}};
+  const auto stateful =
+      gpu::create_system({.name = "kept", .wgsl = "fn main() {}", .kernels = kernels, .persistentBytes = 8});
+  const auto quiet = gpu::create_system({.name = "quiet", .wgsl = "fn main() {}", .kernels = kernels});
+  const std::array<u32, 2> words{0x11111111, 0x22222222};
+  gpu::update_persistent(stateful, 0, words.data(), sizeof(words));
+  static constexpr std::array<f32, 9> Positions{};
+  GXSetArrayGPU(GX_VA_POS, gpu::upload(Positions.data(), sizeof(Positions)), 0, 12);
+  decode_all(capture_fifo());
+  aurora::gx::fifo::end_frame();
+  const GXState snapshot = g_gxState;
+  ASSERT_TRUE(snapshot.arrays[GX_VA_POS].gpu);
+  EXPECT_EQ(snapshot.arrays[GX_VA_POS].gpuHandle, 0u);
+  EXPECT_FALSE(channel::uncaptured_gpu_state());
+
+  const auto preamble = aurora::trace::build_state_preamble(snapshot);
+  std::vector<PreambleCommand> commands;
+  ASSERT_TRUE(parse_preamble(preamble, commands));
+  EXPECT_EQ(std::ranges::count_if(
+                commands,
+                [](const PreambleCommand& c) { return c.opcode == GX_AURORA && c.reg == GX_AURORA_GPU_CREATE_SYSTEM; }),
+            2);
+  EXPECT_TRUE(contains(commands, GX_AURORA, GX_AURORA_GPU_UPDATE_PERSISTENT));
+  EXPECT_TRUE(contains(commands, GX_AURORA, GX_AURORA_LOAD_ARRAY_GPU));
+
+  channel::reset_decoder();
+  ASSERT_TRUE(channel::shadow(stateful).empty());
+  reset_gx_state();
+  decode_all(preamble);
+  expect_state_eq(snapshot, g_gxState);
+  const auto shadow = channel::shadow(stateful);
+  ASSERT_EQ(shadow.size(), sizeof(words));
+  EXPECT_EQ(std::memcmp(shadow.data(), words.data(), sizeof(words)), 0);
+  EXPECT_EQ(gpu::stats().liveSystems, 2u);
+  EXPECT_EQ(gpu::system_status(quiet), gpu::SystemStatus::Ready);
+
+  ASSERT_NE(gpu::create_system({.name = "gpu_only",
+                                .wgsl = "fn main() {}",
+                                .kernels = kernels,
+                                .persistentBytes = 16,
+                                .flags = gpu::SystemGpuOnlyState}),
+            gpu::InvalidSystem);
+  decode_all(capture_fifo());
+  EXPECT_TRUE(channel::uncaptured_gpu_state());
+  channel::set_system_backend(nullptr);
+}
+
+TEST_F(GXFifoTest, StatePreamble_WithoutGpuStateHasNoGpuCommands) {
+  build_full_state();
+  decode_all(capture_fifo());
+  const auto preamble = aurora::trace::build_state_preamble(g_gxState);
+  std::vector<PreambleCommand> commands;
+  ASSERT_TRUE(parse_preamble(preamble, commands));
+  for (u16 id = GX_AURORA_GPU_UPLOAD; id <= GX_AURORA_GPU_DESTROY_SYSTEM; ++id) {
+    EXPECT_FALSE(contains(commands, GX_AURORA, id)) << id;
+  }
+}
+
+TEST(TraceFormatGpu, RenderConfigCarriesStreamingStorage) {
+  const aurora::trace::RenderConfig config{
+      .efbWidth = 640, .efbHeight = 480, .viewportPolicy = 2, .normalBuffer = true, .streamingStorageMiB = 48};
+  std::vector<uint8_t> bytes;
+  aurora::trace::LeWriter out{bytes};
+  aurora::trace::encode_render_config(out, config);
+  ASSERT_EQ(bytes.size(), aurora::trace::RenderConfigSize);
+  aurora::trace::RenderConfig decoded;
+  ASSERT_TRUE(aurora::trace::decode_render_config(bytes, decoded));
+  EXPECT_EQ(decoded, config);
+  std::fill(bytes.end() - 4, bytes.end(), uint8_t{0});
+  ASSERT_TRUE(aurora::trace::decode_render_config(bytes, decoded));
+  EXPECT_EQ(decoded.streamingStorageMiB, 0u);
+  EXPECT_EQ(aurora::trace::compared_device_features(0), 0x1Fu);
+  EXPECT_EQ(aurora::trace::compared_device_features(aurora::trace::CaptureDeviceFeaturesV2), UINT32_MAX);
+}
+
 TEST_F(GXFifoTest, SelfTestTrace_HintsDoNotChangeDecodedState) {
   const auto hintsPath = temp_trace("self_test_hints");
   const auto plainPath = temp_trace("self_test_plain");
   std::string error;
-  ASSERT_TRUE(aurora::gxreplay::write_self_test_trace(hintsPath, true, error)) << error;
-  ASSERT_TRUE(aurora::gxreplay::write_self_test_trace(plainPath, false, error)) << error;
+  ASSERT_TRUE(aurora::gxreplay::write_self_test_trace(hintsPath, aurora::gxreplay::SelfTestMode::Hints, error))
+      << error;
+  ASSERT_TRUE(aurora::gxreplay::write_self_test_trace(plainPath, aurora::gxreplay::SelfTestMode::Plain, error))
+      << error;
 
   uint64_t hintMisses = 0;
   uint64_t plainMisses = 0;
@@ -614,8 +741,10 @@ TEST_F(GXFifoTest, SelfTestTrace_DecodedHintsDoNotChangeDecodedState) {
   const auto hintsPath = temp_trace("self_test_decoded_hints");
   const auto plainPath = temp_trace("self_test_decoded_plain");
   std::string error;
-  ASSERT_TRUE(aurora::gxreplay::write_self_test_trace(hintsPath, true, error)) << error;
-  ASSERT_TRUE(aurora::gxreplay::write_self_test_trace(plainPath, false, error)) << error;
+  ASSERT_TRUE(aurora::gxreplay::write_self_test_trace(hintsPath, aurora::gxreplay::SelfTestMode::Hints, error))
+      << error;
+  ASSERT_TRUE(aurora::gxreplay::write_self_test_trace(plainPath, aurora::gxreplay::SelfTestMode::Plain, error))
+      << error;
 
   HintRecorder recorder;
   const auto sink = recorder.sink();
@@ -642,7 +771,7 @@ TEST_F(GXFifoTest, SelfTestTrace_DecodedHintsDoNotChangeDecodedState) {
 TEST_F(GXFifoTest, SelfTestTrace_ValidHintsDecode) {
   const auto path = temp_trace("self_test_valid_hints");
   std::string error;
-  ASSERT_TRUE(aurora::gxreplay::write_self_test_trace(path, true, error)) << error;
+  ASSERT_TRUE(aurora::gxreplay::write_self_test_trace(path, aurora::gxreplay::SelfTestMode::Hints, error)) << error;
 
   HintRecorder recorder;
   const auto sink = recorder.sink();
@@ -729,7 +858,7 @@ TEST_F(GXFifoTest, SelfTestTrace_ValidHintsDecode) {
 TEST_F(GXFifoTest, SelfTestTrace_ContainsEveryHintIdAndSize) {
   const auto path = temp_trace("self_test_scan");
   std::string error;
-  ASSERT_TRUE(aurora::gxreplay::write_self_test_trace(path, true, error)) << error;
+  ASSERT_TRUE(aurora::gxreplay::write_self_test_trace(path, aurora::gxreplay::SelfTestMode::Hints, error)) << error;
 
   aurora::trace::TraceReader reader;
   ASSERT_TRUE(reader.open(path, error)) << error;

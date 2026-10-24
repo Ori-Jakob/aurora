@@ -39,6 +39,8 @@ struct Options {
   uint32_t benchTexturePermille = 500;
   bool benchBlocksSet = false;
   bool benchRebindSet = false;
+  bool gpuArrays = false;
+  uint32_t gpuPadMiB = 0;
 };
 
 std::optional<AuroraBackend> parse_backend(std::string_view name) noexcept;

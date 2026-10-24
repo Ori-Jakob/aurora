@@ -28,6 +28,7 @@ constexpr std::array<std::pair<std::string_view, AuroraFeatureProfile>, 4> Profi
 }};
 
 constexpr uint32_t DepthCheckMinFrames = 40;
+constexpr uint32_t MaxGpuPadMiB = 1024;
 
 std::optional<uint32_t> parse_u32(std::string_view text) noexcept {
   uint32_t value = 0;
@@ -235,6 +236,20 @@ bool apply_bench_rebind(Options& options, std::string_view value) {
   return true;
 }
 
+bool apply_gpu_arrays(Options& options, std::string_view) {
+  options.gpuArrays = true;
+  return true;
+}
+
+bool apply_gpu_pad_mib(Options& options, std::string_view value) {
+  const auto mib = parse_u32(value);
+  if (!mib || *mib == 0 || *mib > MaxGpuPadMiB) {
+    return false;
+  }
+  options.gpuPadMiB = *mib;
+  return true;
+}
+
 struct Flag {
   std::string_view name;
   bool takesValue;
@@ -243,7 +258,7 @@ struct Flag {
   bool frameLoop = false;
 };
 
-constexpr std::array<Flag, 26> Flags{{
+constexpr std::array<Flag, 28> Flags{{
     {"--frames", true, apply_frames, true},
     {"--timeout", true, apply_timeout, true},
     {"--backend", true, apply_backend},
@@ -268,6 +283,8 @@ constexpr std::array<Flag, 26> Flags{{
     {"--bench-indirect", true, apply_bench_indirect},
     {"--bench-blocks", true, apply_bench_blocks},
     {"--bench-rebind", true, apply_bench_rebind},
+    {"--gpu-arrays", false, apply_gpu_arrays, true},
+    {"--gpu-pad-mib", true, apply_gpu_pad_mib, true},
     {"-h", false, apply_help},
     {"--help", false, apply_help},
 }};
@@ -417,6 +434,9 @@ std::string_view usage() noexcept {
          "                      (exit code 10 on failure; combines only with device, size and bench options)\n"
          "  --bench-blocks N    measured ABBA blocks per bench pair (default 150)\n"
          "  --bench-rebind U,T  uniform and texture rebind rates in permille (default 1000,500)\n"
+         "  --gpu-arrays        upload the box arrays through the GPU channel each frame and bind them with\n"
+         "                      GXSetArrayGPU, and run a no-op GPU system\n"
+         "  --gpu-pad-mib N     upload N MiB (1 to 1024) of zeros through the GPU channel each frame\n"
          "  -h, --help          show this message\n";
 }
 } // namespace render_demo

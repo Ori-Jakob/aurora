@@ -2,6 +2,9 @@
 
 #include "fifo_encoder.hpp"
 
+#include "../gx/gpu_channel.hpp"
+#include "../gx/hints.hpp"
+
 #include <dolphin/gx/GXAurora.h>
 
 #include <algorithm>
@@ -209,7 +212,16 @@ void emit_xf_memory(FifoEncoder& out, const gx::GXState& state) {
 void emit_aurora_state(FifoEncoder& out, const gx::GXState& state) {
   for (u32 i = 0; i < ArrayBaseCount && GX_VA_POS + i < gx::MaxVtxAttr; ++i) {
     const auto& array = state.arrays[GX_VA_POS + i];
-    if (array.data != nullptr || array.size != 0 || !array.le) {
+    if (array.gpu) {
+      std::array<u8, GX_AURORA_HINT_HEADER_SIZE + gx::hints::wire::LoadArrayGpuV1> bytes{};
+      gx::hints::wire::Writer hint{bytes};
+      hint.header(GX_AURORA_LOAD_ARRAY_GPU, gx::hints::wire::LoadArrayGpuV1);
+      hint.u16(AURORA_HINT_LOAD_ARRAY_GPU_VERSION);
+      hint.u8(static_cast<u8>(GX_VA_POS + i));
+      hint.u64(0);
+      hint.u32(0);
+      out.raw(bytes);
+    } else if (array.data != nullptr || array.size != 0 || !array.le) {
       out.aurora(static_cast<u16>(GX_AURORA_LOAD_ARRAYBASE + i));
       out.u64(reinterpret_cast<uintptr_t>(array.data));
       out.u32(array.size);
@@ -312,6 +324,7 @@ std::vector<uint8_t> build_state_preamble(const gx::GXState& state) {
   emit_registers(out, state);
   emit_xf_memory(out, state);
   emit_aurora_state(out, state);
+  gx::gpu_channel::write_preamble(out.bytes());
   return std::move(out.bytes());
 }
 } // namespace aurora::trace

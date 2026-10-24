@@ -2,9 +2,11 @@
 
 #include "__gx.h"
 #include "gx/fifo.hpp"
+#include "gx/gpu_channel.hpp"
 #include "gx/guest_memory.hpp"
 #include "trace/capture_session.hpp"
 
+#include <aurora/gpu_systems.hpp>
 #include <dolphin/gx.h>
 #include <fmt/format.h>
 
@@ -55,7 +57,14 @@ void append_be(std::vector<uint8_t>& out, float value) {
   }
 }
 
-std::vector<uint8_t> quad_positions() {
+void append_le(std::vector<uint8_t>& out, float value) {
+  const auto bits = std::bit_cast<uint32_t>(value);
+  for (int shift = 0; shift <= 24; shift += 8) {
+    out.push_back(static_cast<uint8_t>(bits >> shift));
+  }
+}
+
+std::vector<uint8_t> quad_positions(bool littleEndian = false) {
   std::vector<uint8_t> out;
   for (const auto& quad : Quads) {
     const std::array<std::array<float, 2>, 4> corners{{
@@ -65,9 +74,13 @@ std::vector<uint8_t> quad_positions() {
         {quad.left, quad.bottom},
     }};
     for (const auto& corner : corners) {
-      append_be(out, corner[0]);
-      append_be(out, corner[1]);
-      append_be(out, -0.5f);
+      for (const float value : {corner[0], corner[1], -0.5f}) {
+        if (littleEndian) {
+          append_le(out, value);
+        } else {
+          append_be(out, value);
+        }
+      }
     }
   }
   return out;
@@ -230,7 +243,8 @@ std::vector<uint8_t> cut_fifo() {
   return bytes;
 }
 
-void emit_state(uint32_t frame, bool withHints) {
+void emit_state(uint32_t frame, SelfTestMode mode) {
+  const bool withHints = mode == SelfTestMode::Hints;
   if (frame == 0) {
     GXInit(nullptr, 0);
   }
@@ -277,8 +291,17 @@ void emit_state(uint32_t frame, bool withHints) {
   GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
   GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
   GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
-  GXSetArray(GX_VA_POS, guest_pointer(SelfTestPositionAddress), 144, 12, false);
-  GXSetArray(GX_VA_CLR0, guest_pointer(SelfTestColorAddress), 48, 4, false);
+  if (mode == SelfTestMode::GpuArrays) {
+    const auto positions = quad_positions(true);
+    const auto colors = quad_colors(frame);
+    const auto positionHandle = render::gpu::upload(positions.data(), static_cast<uint32_t>(positions.size()));
+    const auto colorHandle = render::gpu::upload(colors.data(), static_cast<uint32_t>(colors.size()));
+    GXSetArrayGPU(GX_VA_POS, positionHandle, 0, 12);
+    GXSetArrayGPU(GX_VA_CLR0, colorHandle, 0, 4);
+  } else {
+    GXSetArray(GX_VA_POS, guest_pointer(SelfTestPositionAddress), 144, 12, false);
+    GXSetArray(GX_VA_CLR0, guest_pointer(SelfTestColorAddress), 48, 4, false);
+  }
 }
 
 void emit_draws(bool withHints) {
@@ -415,7 +438,9 @@ AuroraFogVolume self_test_fog_volume() noexcept {
   };
 }
 
-bool write_self_test_trace(const std::filesystem::path& path, bool withHints, std::string& error) {
+bool write_self_test_trace(const std::filesystem::path& path, SelfTestMode mode, std::string& error) {
+  const bool withHints = mode == SelfTestMode::Hints;
+  const bool gpuArrays = mode == SelfTestMode::GpuArrays;
   trace::CaptureSession session;
   if (!session.open(path, 0, trace::FileSynthetic, error) ||
       !session.write_header_chunks(self_test_info(), {}, error)) {
@@ -426,6 +451,9 @@ bool write_self_test_trace(const std::filesystem::path& path, bool withHints, st
   gx::fifo::clear_buffer();
   const auto positions = quad_positions();
   const auto checker = checker_texels();
+  if (gpuArrays) {
+    gx::gpu_channel::end_frame();
+  }
   for (uint32_t frame = 0; frame < SelfTestFrameCount; ++frame) {
     session.begin_frame(frame, {
                                    .efbWidth = SelfTestWidth,
@@ -434,14 +462,19 @@ bool write_self_test_trace(const std::filesystem::path& path, bool withHints, st
                                    .viEfbHeight = SelfTestHeight,
                                    .viewportPolicy = AURORA_VIEWPORT_NATIVE,
                                });
-    emit_state(frame, withHints);
+    emit_state(frame, mode);
     session.processed(cut_fifo());
-    session.observe(static_cast<uint8_t>(gx::guest_memory::Kind::VertexArray), SelfTestPositionAddress, positions);
-    session.observe(static_cast<uint8_t>(gx::guest_memory::Kind::VertexArray), SelfTestColorAddress,
-                    quad_colors(frame));
+    if (!gpuArrays) {
+      session.observe(static_cast<uint8_t>(gx::guest_memory::Kind::VertexArray), SelfTestPositionAddress, positions);
+      session.observe(static_cast<uint8_t>(gx::guest_memory::Kind::VertexArray), SelfTestColorAddress,
+                      quad_colors(frame));
+    }
     session.observe(static_cast<uint8_t>(gx::guest_memory::Kind::Texture), SelfTestTextureAddress, checker);
     emit_draws(withHints);
     session.processed(cut_fifo());
+    if (gpuArrays) {
+      gx::gpu_channel::end_frame();
+    }
     if (!session.end_frame(error)) {
       session.discard();
       return false;

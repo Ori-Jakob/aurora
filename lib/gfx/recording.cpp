@@ -80,6 +80,8 @@ struct FrameRecorder {
 FrameRecorder g_recorder;
 uint32_t g_lastRecordedUniformSize = 0;
 std::atomic_uint64_t g_residentRequest{0};
+uint64_t g_channelStorageBytes = 0;
+uint64_t g_lastChannelStorageBytes = 0;
 
 std::string pass_label(std::string_view kind) {
 #ifdef AURORA_GFX_DEBUG_GROUPS
@@ -794,6 +796,7 @@ void begin_recording(FramePacket& packet, size_t frameSlot) {
   g_recorder.nextStage = 0;
   g_recorder.pendingStageEnd = 0;
   g_recorder.stageMarkerSeen = {};
+  g_channelStorageBytes = 0;
 
   current_render_passes().emplace_back();
   auto& pass = current_render_passes()[0];
@@ -823,6 +826,7 @@ RecordedFrame end_recording() {
   frame.stats.lastIndexSize = frame.indices.size();
   frame.stats.lastStorageSize = frame.storage.size();
   frame.stats.lastTextureUploadSize = frame.textureUpload.size();
+  g_lastChannelStorageBytes = g_channelStorageBytes;
 
   for (auto& array : gx::g_gxState.arrays) {
     array.cachedRange = {};
@@ -860,6 +864,8 @@ void shutdown_recording() {
   g_recorder.packet = nullptr;
   g_recorder.frameSlot = 0;
   g_lastRecordedUniformSize = 0;
+  g_channelStorageBytes = 0;
+  g_lastChannelStorageBytes = 0;
   g_recorder.suppressRenderWorker = false;
   g_recorder.normalRequested = false;
   g_recorder.nextStage = 0;
@@ -1501,6 +1507,50 @@ Range push_storage(const uint8_t* data, size_t length) {
   }
   return push(current_frame_packet().storage, data, length, resources().limits.minStorageBufferOffsetAlignment);
 }
+
+Range push_channel_storage(std::span<const uint8_t> bytes) noexcept {
+  if (!g_recorder.active()) {
+    return {};
+  }
+  ByteBuffer& storage = current_frame_packet().storage;
+  const size_t alignment = resources().limits.minStorageBufferOffsetAlignment;
+  const size_t before = storage.size();
+  const size_t begin = alignment != 0 ? AURORA_ALIGN(before, alignment) : before;
+  const size_t padded = AURORA_ALIGN(bytes.size(), size_t{4});
+  if (!storage.owned() && begin + padded > storage.capacity()) {
+    return {};
+  }
+  const Range range = push(storage, bytes.data(), bytes.size(), alignment);
+  // The next op's copy restarts at a 4-byte boundary, so a range must end on one
+  if (padded > bytes.size()) {
+    constexpr std::array<uint8_t, 4> Zeroes{};
+    storage.append(Zeroes.data(), padded - bytes.size());
+  }
+  g_channelStorageBytes += storage.size() - before;
+  return range;
+}
+
+Range reserve_channel_storage(size_t length, bool zero) noexcept {
+  if (!g_recorder.active()) {
+    return {};
+  }
+  ByteBuffer& storage = current_frame_packet().storage;
+  const size_t alignment = resources().limits.minStorageBufferOffsetAlignment;
+  const size_t before = storage.size();
+  const size_t begin = alignment != 0 ? AURORA_ALIGN(before, alignment) : before;
+  const size_t padded = AURORA_ALIGN(length, size_t{4});
+  if (!storage.owned() && begin + padded > storage.capacity()) {
+    return {};
+  }
+  const Range range = map(storage, padded, alignment);
+  if (zero) {
+    std::memset(storage.data() + range.offset, 0, padded);
+  }
+  g_channelStorageBytes += storage.size() - before;
+  return range;
+}
+
+uint64_t last_channel_storage_bytes() noexcept { return g_lastChannelStorageBytes; }
 
 ResidentStorage resident_storage() noexcept {
   if (!g_recorder.active()) {

@@ -5,8 +5,10 @@
 #include <aurora/render.hpp>
 #include <aurora/render_graph.hpp>
 
+#include <array>
 #include <cstddef>
 #include <optional>
+#include <span>
 #include <string>
 
 namespace aurora::gfx::detail {
@@ -104,6 +106,23 @@ template <typename T>
 Range push_storage(const T& data) {
   return push_storage(reinterpret_cast<const uint8_t*>(&data), sizeof(T));
 }
+Range push_channel_storage(std::span<const uint8_t> bytes) noexcept;
+Range reserve_channel_storage(size_t length, bool zero) noexcept;
+uint64_t last_channel_storage_bytes() noexcept;
+inline constexpr uint32_t DispatchMaxInputs = 8;
+inline constexpr uint32_t DispatchUserSize = 128;
+inline constexpr uint32_t DispatchParamsSize = 256;
+// Mirrors AuroraDispatch in aurora/stream.wgsl byte for byte; the two change together
+struct DispatchParams {
+  std::array<uint32_t, 4> output;
+  std::array<uint32_t, 16> inputs;
+  std::array<uint32_t, 4> groups;
+  std::array<uint32_t, 4> elements;
+  std::array<uint32_t, 4> reserved;
+  std::array<uint8_t, DispatchUserSize> user;
+};
+static_assert(sizeof(DispatchParams) == DispatchParamsSize);
+static_assert(sizeof(DispatchParams::inputs) == DispatchMaxInputs * 2 * sizeof(uint32_t));
 struct ResidentStorage {
   uint64_t frameId = 0;
   uint32_t base = 0;

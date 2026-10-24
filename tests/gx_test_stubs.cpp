@@ -7,6 +7,7 @@
 #include "gfx/frame_packet.hpp"
 #include "gfx/resources.hpp"
 #include "gfx/depth_peek.hpp"
+#include "gfx/frame.hpp"
 #include "gfx/recording.hpp"
 #include "gfx/tex_copy_conv.hpp"
 #include "gfx/tex_palette_conv.hpp"
@@ -196,6 +197,8 @@ const uint8_t* g_testLastStorageSource = nullptr;
 ResidentStorage g_testResidentStorage{};
 std::vector<detail::ResidentCopy> g_testResidentCopies;
 uint64_t g_testResidentRequest = 0;
+bool g_testChannelStorageFull = false;
+uint32_t g_testChannelPushes = 0;
 
 namespace testing {
 void reset_resident_stubs() noexcept {
@@ -242,6 +245,27 @@ Range push_storage(const uint8_t* data, size_t length) {
   }
   return range;
 }
+Range push_channel_storage(std::span<const uint8_t> bytes) noexcept {
+  ++g_testChannelPushes;
+  if (g_testChannelStorageFull) {
+    return {};
+  }
+  const auto range = push_range(s_storageCursor, bytes.size(), 256);
+  s_storageCursor = range.offset + AURORA_ALIGN(bytes.size(), size_t{4});
+  g_testStorage.resize(s_storageCursor);
+  std::memcpy(g_testStorage.data() + range.offset, bytes.data(), bytes.size());
+  return range;
+}
+Range reserve_channel_storage(size_t length, bool zero) noexcept {
+  ++g_testChannelPushes;
+  if (g_testChannelStorageFull) {
+    return {};
+  }
+  const auto range = push_range(s_storageCursor, AURORA_ALIGN(length, size_t{4}), 256);
+  g_testStorage.resize(s_storageCursor);
+  std::memset(g_testStorage.data() + range.offset, zero ? 0 : 0xCD, range.size);
+  return range;
+}
 ResidentStorage resident_storage() noexcept { return g_testResidentStorage; }
 void copy_to_resident(Range staged, uint32_t offset, uint32_t blockSize) noexcept {
   g_testResidentCopies.push_back({staged.offset, offset, AURORA_ALIGN(staged.size, 4u), blockSize});
@@ -282,6 +306,15 @@ RenderTargetLayout get_render_target_layout() noexcept {
   return layout;
 }
 } // namespace aurora::gfx
+
+namespace aurora::gfx::detail {
+ChannelBudget g_testChannelBudget{.bytes = UINT64_MAX / 4, .alignment = 256};
+uint64_t g_testChannelDemand = 0;
+ChannelBudget channel_budget() noexcept { return g_testChannelBudget; }
+void request_channel_storage(uint64_t bytesPerFrame) noexcept {
+  g_testChannelDemand = std::max(g_testChannelDemand, bytesPerFrame);
+}
+} // namespace aurora::gfx::detail
 
 // --- Pipeline/draw command stubs ---
 namespace aurora::gfx {

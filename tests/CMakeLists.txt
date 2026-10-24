@@ -92,6 +92,7 @@ if (AURORA_ENABLE_GX)
   # Compile GX sources directly to avoid pulling in the full renderer/WebGPU runtime
   add_executable(gx_fifo_tests
     gx_fifo_test.cpp
+    gx_gpu_channel_test.cpp
     gx_hints_test.cpp
     gx_draw_route_test.cpp
     gx_test_stubs.cpp
@@ -118,6 +119,7 @@ if (AURORA_ENABLE_GX)
     # FIFO/command processor (encoder + decoder)
     ../lib/gx/fifo.cpp
     ../lib/gx/command_processor.cpp
+    ../lib/gx/gpu_channel.cpp
     ../lib/gx/hints.cpp
     ../lib/gx/regs.cpp
     ../lib/thread.cpp
@@ -382,7 +384,7 @@ if (AURORA_ENABLE_GX)
 
     add_executable(render_gpu_tests render_test_device.cpp render_gpu_heap_test.cpp render_graph_pool_test.cpp
       render_graph_bind_test.cpp render_graph_planned.cpp render_graph_api_gpu_test.cpp render_compact_test.cpp
-      render_hzb_test.cpp render_hzb_reference.cpp)
+      render_hzb_test.cpp render_hzb_reference.cpp render_gpu_systems_test.cpp)
     target_include_directories(render_gpu_tests PRIVATE ../include ../lib)
     target_compile_definitions(render_gpu_tests PRIVATE AURORA TARGET_PC=1 AURORA_ENABLE_RENDER=1)
     target_link_libraries(render_gpu_tests PRIVATE aurora::gx aurora::vi gtest gtest_main)
@@ -585,6 +587,36 @@ if (TARGET render_demo)
     COMMAND $<TARGET_FILE:render_demo> --backend null --frames 120 --timeout 60 --fail-on-error --no-hints
             --check-hints --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_hints/none)
   set_tests_properties(render_demo_no_hints PROPERTIES LABELS smoke TIMEOUT 180)
+
+  # GPU-system commands decode in core, so these run with the render module off too
+  if (AURORA_ENABLE_RENDER)
+    set(_gpu_systems "systems ready 1/1")
+  else ()
+    set(_gpu_systems "systems unavailable")
+  endif ()
+  string(CONCAT _gpu_pass "gpu: uploads 120, binds [1-9][0-9]*, suppressed 0, failed 0, rejected 0, refused 0, "
+                          "stale 0, ${_gpu_systems}")
+  set(_gpu_fail "\\[(ERROR|FATAL): |hint check FAILED")
+  set(_gpu_args --backend null --frames 120 --timeout 60 --fail-on-error --gpu-arrays)
+  foreach (_profile IN ITEMS full compat metal metal32)
+    add_test(NAME render_demo_gpu_arrays_${_profile}
+      COMMAND $<TARGET_FILE:render_demo> ${_gpu_args} --profile ${_profile}
+              --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_gpu_arrays/${_profile})
+  endforeach ()
+  add_test(NAME render_demo_gpu_arrays_msaa
+    COMMAND $<TARGET_FILE:render_demo> ${_gpu_args} --profile metal --msaa 4
+            --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_gpu_arrays/msaa)
+  add_test(NAME render_demo_gpu_arrays_hints_disabled
+    COMMAND $<TARGET_FILE:render_demo> ${_gpu_args} --check-hints
+            --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_gpu_arrays/hints_disabled)
+  set_tests_properties(render_demo_gpu_arrays_hints_disabled PROPERTIES ENVIRONMENT "AURORA_RENDER_HINTS=0")
+  add_test(NAME render_demo_gpu_arrays_no_hints
+    COMMAND $<TARGET_FILE:render_demo> ${_gpu_args} --no-hints --check-hints
+            --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_gpu_arrays/no_hints)
+  set_tests_properties(render_demo_gpu_arrays_full render_demo_gpu_arrays_compat render_demo_gpu_arrays_metal
+    render_demo_gpu_arrays_metal32 render_demo_gpu_arrays_msaa render_demo_gpu_arrays_hints_disabled
+    render_demo_gpu_arrays_no_hints PROPERTIES LABELS smoke TIMEOUT 180 PASS_REGULAR_EXPRESSION "${_gpu_pass}"
+    FAIL_REGULAR_EXPRESSION "${_gpu_fail}")
   if (AURORA_ENABLE_RENDER)
     add_test(NAME render_demo_hints_vignette
       COMMAND $<TARGET_FILE:render_demo> --backend null --frames 120 --timeout 60 --fail-on-error --check-hints
@@ -659,6 +691,54 @@ if (TARGET aurora_gxreplay)
       ENVIRONMENT "AURORA_RENDER_HINTS=1;AURORA_IMMUTABLE_ARRAYS=validate;AURORA_TEST_STREAMING_GROWTH=2"
       FIXTURES_REQUIRED gxreplay_demo_trace PASS_REGULAR_EXPRESSION "${_resident_growth}"
       FAIL_REGULAR_EXPRESSION "${_resident_fail}")
+
+    set(_gpu_capture --backend null --frames 16 --timeout 60 --trace-start 10 --trace-frames 4)
+    add_test(NAME gxreplay_render_demo_gpu_capture
+      COMMAND $<TARGET_FILE:render_demo> ${_gpu_capture} --gpu-arrays --fail-on-error
+              --data-dir ${_gxreplay_dir}/demo_gpu_data --trace ${_gxreplay_dir}/render_demo_gpu.gxtrace)
+    set_tests_properties(gxreplay_render_demo_gpu_capture PROPERTIES FIXTURES_SETUP gxreplay_demo_gpu_trace)
+    add_test(NAME gxreplay_render_demo_gpu_default_capture
+      COMMAND $<TARGET_FILE:render_demo> ${_gpu_capture} --fail-on-error
+              --data-dir ${_gxreplay_dir}/demo_gpu_default_data
+              --trace ${_gxreplay_dir}/render_demo_gpu_default.gxtrace)
+    set_tests_properties(gxreplay_render_demo_gpu_default_capture PROPERTIES FIXTURES_SETUP gxreplay_demo_gpu_default)
+    set_tests_properties(gxreplay_render_demo_gpu_capture gxreplay_render_demo_gpu_default_capture PROPERTIES
+      LABELS smoke TIMEOUT 180 FAIL_REGULAR_EXPRESSION "\\[(ERROR|FATAL): ")
+    string(CONCAT _gpu_replay_fail "\\[(ERROR|FATAL): |suppressed [1-9]|failed [1-9]|misses [1-9]|rejected [1-9]|"
+                                   "is not bit-identical|guest reads were not resolved")
+    add_test(NAME gxreplay_render_demo_gpu_replay
+      COMMAND $<TARGET_FILE:aurora_gxreplay> ${_gxreplay_dir}/render_demo_gpu.gxtrace --backend null --repeat 2
+              --no-png --out ${_gxreplay_dir}/render_demo_gpu_replay)
+    set_tests_properties(gxreplay_render_demo_gpu_replay PROPERTIES LABELS smoke TIMEOUT 180
+      FIXTURES_REQUIRED gxreplay_demo_gpu_trace FIXTURES_SETUP gxreplay_demo_gpu_replay
+      PASS_REGULAR_EXPRESSION "gpu: run 1, uploads 4, reserves 0, binds [1-9]"
+      FAIL_REGULAR_EXPRESSION "${_gpu_replay_fail}")
+    add_test(NAME gxreplay_render_demo_gpu_default_replay
+      COMMAND $<TARGET_FILE:aurora_gxreplay> ${_gxreplay_dir}/render_demo_gpu_default.gxtrace --backend null --no-png
+              --out ${_gxreplay_dir}/render_demo_gpu_default_replay)
+    set_tests_properties(gxreplay_render_demo_gpu_default_replay PROPERTIES LABELS smoke TIMEOUT 180
+      FIXTURES_REQUIRED gxreplay_demo_gpu_default FIXTURES_SETUP gxreplay_demo_gpu_default_replay)
+    add_test(NAME gxreplay_render_demo_gpu_draws_ab
+      COMMAND ${CMAKE_COMMAND} -DA=${_gxreplay_dir}/render_demo_gpu_replay/frames.json
+              -DB=${_gxreplay_dir}/render_demo_gpu_default_replay/frames.json -DKEY=draws
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/compare_replay_frames.cmake)
+    set_tests_properties(gxreplay_render_demo_gpu_draws_ab PROPERTIES LABELS smoke TIMEOUT 60
+      FIXTURES_REQUIRED "gxreplay_demo_gpu_replay;gxreplay_demo_gpu_default_replay")
+    # Replay must grow to the storage size live recorded before frame 0; the null device caps memory, so pad little
+    add_test(NAME gxreplay_render_demo_gpu_sized_capture
+      COMMAND $<TARGET_FILE:render_demo> --backend null --frames 16 --timeout 60 --gpu-pad-mib 6 --trace-start 10
+              --trace-frames 3 --data-dir ${_gxreplay_dir}/demo_gpu_sized_data
+              --trace ${_gxreplay_dir}/render_demo_gpu_sized.gxtrace)
+    set_tests_properties(gxreplay_render_demo_gpu_sized_capture PROPERTIES LABELS smoke TIMEOUT 180
+      FIXTURES_SETUP gxreplay_demo_gpu_sized FAIL_REGULAR_EXPRESSION "\\[(ERROR|FATAL): ")
+    add_test(NAME gxreplay_render_demo_gpu_sized_replay
+      COMMAND $<TARGET_FILE:aurora_gxreplay> ${_gxreplay_dir}/render_demo_gpu_sized.gxtrace --backend null --no-png
+              --out ${_gxreplay_dir}/render_demo_gpu_sized_replay)
+    string(CONCAT _gpu_sized_pass "Streaming buffers resized: [^\n]*storage 16 MiB(.|\n)*"
+                                  "gpu: run 0, uploads 3, reserves 0, binds 0, suppressed 0, failed 0, misses 0")
+    set_tests_properties(gxreplay_render_demo_gpu_sized_replay PROPERTIES LABELS smoke TIMEOUT 180
+      FIXTURES_REQUIRED gxreplay_demo_gpu_sized PASS_REGULAR_EXPRESSION "${_gpu_sized_pass}"
+      FAIL_REGULAR_EXPRESSION "${_gpu_replay_fail}")
   endif ()
   if (AURORA_ENABLE_RENDER)
     set(_classify_trace ${_gxreplay_dir}/classify/self_test_hints.gxtrace)

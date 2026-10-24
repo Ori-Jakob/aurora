@@ -154,5 +154,56 @@ TEST(ResidentLayoutTest, StreamingStorageLeavesRoomForTheArena) {
   EXPECT_EQ(streaming_storage_limit(128 * MiB, 8 * MiB), 120 * MiB);
   EXPECT_EQ(streaming_storage_limit(128 * MiB, 0), 128 * MiB);
 }
+
+TEST(ChannelStorageTest, RequestsRoundToPowersOfTwoMiB) {
+  EXPECT_EQ(round_streaming_request(0), 0u);
+  EXPECT_EQ(round_streaming_request(1), MiB);
+  EXPECT_EQ(round_streaming_request(5000003), 8 * MiB);
+  EXPECT_EQ(round_streaming_request(32 * MiB), 32 * MiB);
+  EXPECT_EQ(round_streaming_limit(128 * MiB + 12), 128 * MiB);
+}
+
+void expect_segments_aligned(const StreamingSizes& sizes) {
+  const StagingLayout layout = staging_layout(sizes);
+  for (const uint64_t offset : {layout.uniform, layout.index, layout.storage, layout.textureUpload}) {
+    EXPECT_EQ(offset % 8, 0u) << offset;
+  }
+  EXPECT_EQ(layout.total % 4, 0u);
+  EXPECT_EQ(sizes.storage % MiB, 0u);
+}
+
+TEST(ChannelStorageTest, OddRequestsKeepSegmentAlignment) {
+  const uint64_t bound = round_streaming_limit(128 * MiB + 12);
+  const StreamingLimits limits{.vertex = bound, .index = bound, .storage = bound, .staging = 4 * GiB};
+  const auto odd = next_streaming_sizes({}, high_water(0, 0, 0),
+                                        {.vertex = 0, .index = 0, .storage = round_streaming_request(5000003)}, limits);
+  EXPECT_EQ(odd.sizes.storage, 8 * MiB);
+  expect_segments_aligned(odd.sizes);
+  const auto capped = next_streaming_sizes(
+      {}, high_water(0, 0, 0), {.vertex = 0, .index = 0, .storage = round_streaming_request(200 * MiB + 3)}, limits);
+  EXPECT_EQ(capped.sizes.storage, 128 * MiB);
+  expect_segments_aligned(capped.sizes);
+  const auto grown = next_streaming_sizes(capped.sizes, high_water(0, 0, 127 * MiB), {}, limits);
+  expect_segments_aligned(grown.sizes);
+}
+
+TEST(ChannelStorageTest, BudgetExamples) {
+  EXPECT_EQ(channel_storage_budget(8 * MiB, 3 * MiB, true, UINT64_MAX), 2 * MiB);
+  EXPECT_EQ(channel_storage_budget(8 * MiB, 1 * MiB, true, UINT64_MAX), 6 * MiB);
+  EXPECT_EQ(channel_storage_budget(8 * MiB, 0, false, UINT64_MAX), 4 * MiB);
+  EXPECT_EQ(channel_storage_budget(8 * MiB, 8 * MiB * 6 / 10, true, UINT64_MAX), 0u);
+  EXPECT_EQ(channel_storage_budget(1024 * MiB, 0, true, 256 * MiB), 256 * MiB);
+  EXPECT_EQ(legacy_storage_reserve(32 * MiB, 0, true), 8 * MiB);
+}
+
+TEST(ChannelStorageTest, RequestCoversDemandAboveLegacy) {
+  for (const uint64_t legacy : {uint64_t{0}, uint64_t{1}, 3 * MiB, 5 * MiB + 7, 40 * MiB}) {
+    for (const uint64_t demand : {uint64_t{1}, uint64_t{4096}, MiB + 1, 9 * MiB, 100 * MiB + 3}) {
+      const uint64_t storage = round_streaming_request(channel_storage_request(demand, legacy));
+      EXPECT_GE(channel_storage_budget(storage, legacy, true, UINT64_MAX), demand) << legacy << " " << demand;
+      EXPECT_LE(legacy + demand, storage / 2) << legacy << " " << demand;
+    }
+  }
+}
 } // namespace
 } // namespace aurora::gfx::detail

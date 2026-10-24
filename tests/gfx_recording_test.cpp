@@ -104,6 +104,70 @@ protected:
   bool recordingActive = true;
 };
 
+class GfxChannelStorageTest : public GfxRecordingTest {
+protected:
+  void SetUp() override {
+    GfxRecordingTest::SetUp();
+    savedAlignment = detail::resources().limits.minStorageBufferOffsetAlignment;
+    detail::resources().limits.minStorageBufferOffsetAlignment = 256;
+  }
+
+  void TearDown() override {
+    frame.storage = {};
+    detail::resources().limits.minStorageBufferOffsetAlignment = savedAlignment;
+    GfxRecordingTest::TearDown();
+  }
+
+  uint32_t savedAlignment = 0;
+};
+
+TEST_F(GfxChannelStorageTest, PushesStartAlignedAndEndOnWords) {
+  constexpr std::array<uint8_t, 3> Three{1, 2, 3};
+  EXPECT_EQ(push_storage(Three.data(), Three.size()).offset, 0u);
+  const Range upload = push_channel_storage(Three);
+  EXPECT_EQ(upload.offset, 256u);
+  EXPECT_EQ(upload.size, 3u);
+  ASSERT_EQ(frame.storage.size(), 260u);
+  EXPECT_EQ(std::vector<uint8_t>(frame.storage.data() + 256, frame.storage.data() + 260),
+            (std::vector<uint8_t>{1, 2, 3, 0}));
+  std::memset(frame.storage.data() + 260, 0xCD, frame.storage.capacity() - 260);
+  const Range reserved = reserve_channel_storage(10, true);
+  EXPECT_EQ(reserved.offset, 512u);
+  EXPECT_EQ(reserved.size, 12u);
+  ASSERT_EQ(frame.storage.size(), 524u);
+  EXPECT_EQ(std::vector<uint8_t>(frame.storage.data() + 512, frame.storage.data() + 524), std::vector<uint8_t>(12, 0));
+  const Range plain = reserve_channel_storage(5, false);
+  EXPECT_EQ(plain.offset, 768u);
+  EXPECT_EQ(plain.size, 8u);
+  next_frame();
+  EXPECT_EQ(last_channel_storage_bytes(), (260u - 3u) + (524u - 260u) + (776u - 524u));
+  push_storage(Three.data(), Three.size());
+  next_frame();
+  EXPECT_EQ(last_channel_storage_bytes(), 0u);
+}
+
+TEST_F(GfxChannelStorageTest, PushesNeverOverrunMappedStaging) {
+  std::vector<uint8_t> staging(1024);
+  frame.storage = ByteBuffer{staging.data(), staging.size()};
+  const std::vector<uint8_t> bytes(600, 9);
+  EXPECT_EQ(push_channel_storage(bytes).size, 600u);
+  EXPECT_EQ(push_channel_storage(bytes), Range{});
+  EXPECT_EQ(reserve_channel_storage(300, true), Range{});
+  const Range fits = reserve_channel_storage(200, true);
+  EXPECT_EQ(fits.offset, 768u);
+  EXPECT_EQ(frame.storage.size(), 968u);
+  frame.storage = {};
+}
+
+TEST_F(GfxChannelStorageTest, PushesOutsideRecordingReturnEmpty) {
+  finish();
+  detail::end_recording();
+  recordingActive = false;
+  constexpr std::array<uint8_t, 4> Word{1, 2, 3, 4};
+  EXPECT_EQ(push_channel_storage(Word), Range{});
+  EXPECT_EQ(reserve_channel_storage(4, true), Range{});
+}
+
 TEST_F(GfxRecordingTest, CreateRestoreReturnsToEfb) {
   seed(320, 180);
   begin_offscreen(320, 180);

@@ -459,6 +459,19 @@ TEST(RenderDemoHints, CheckAcceptsSkipping) {
   EXPECT_EQ(check(HintTally{}, false, none, 0), std::nullopt);
 }
 
+TEST(RenderDemoHints, GpuCommandsAreExempt) {
+  const HintTally tally = demo_tally(4, true);
+  FakeCounters counters = observe(tally, true);
+  counters[GX_AURORA_GPU_UPLOAD] = {.decoded = 4, .bytes = 4 * 209};
+  counters[GX_AURORA_LOAD_ARRAY_GPU] = {.decoded = 12, .bytes = 12 * 22};
+  EXPECT_EQ(check(tally, true, counters, 4), std::nullopt);
+  FakeCounters skipping = observe(demo_tally(4, false), false);
+  skipping[GX_AURORA_GPU_UPLOAD] = {.decoded = 4};
+  EXPECT_EQ(check(demo_tally(4, false), false, skipping, 0), std::nullopt);
+  counters[GX_AURORA_GPU_UPLOAD].malformed = 1;
+  EXPECT_EQ(check(tally, true, counters, 4), "GPU_UPLOAD (0x0120): malformed 1, emitted 0");
+}
+
 TEST(RenderDemoHints, CheckRejectsMissingDecode) {
   const HintTally tally = demo_tally(4, true);
   FakeCounters counters = observe(tally, true);
@@ -1186,6 +1199,21 @@ TEST(RenderDemoOptions, RejectsBenchRangesAndDependencies) {
   EXPECT_EQ(parse_error({"--bench-rebind", "1000,500"}), "--bench-rebind needs --bench-indirect");
 }
 
+TEST(RenderDemoOptions, ParsesGpuChannelFlags) {
+  const auto defaults = parse({});
+  ASSERT_TRUE(defaults);
+  EXPECT_FALSE(defaults->gpuArrays);
+  EXPECT_EQ(defaults->gpuPadMiB, 0u);
+  const auto options = parse({"--gpu-arrays", "--gpu-pad-mib", "40", "--trace", "t.gxtrace", "--no-hints"});
+  ASSERT_TRUE(options);
+  EXPECT_TRUE(options->gpuArrays);
+  EXPECT_EQ(options->gpuPadMiB, 40u);
+  EXPECT_FALSE(options->hints);
+  EXPECT_FALSE(parse({"--gpu-pad-mib", "0"}));
+  EXPECT_FALSE(parse({"--gpu-pad-mib", "1025"}));
+  EXPECT_FALSE(parse({"--gpu-pad-mib"}));
+}
+
 TEST(RenderDemoOptions, BenchExcludesFrameLoopFlags) {
   const std::vector<std::vector<const char*>> frameLoop{{"--frames", "10"},
                                                         {"--timeout", "5"},
@@ -1201,7 +1229,9 @@ TEST(RenderDemoOptions, BenchExcludesFrameLoopFlags) {
                                                         {"--custom-draw-probe"},
                                                         {"--gpu-cull", "4096"},
                                                         {"--cull-check"},
-                                                        {"--cull-timings"}};
+                                                        {"--cull-timings"},
+                                                        {"--gpu-arrays"},
+                                                        {"--gpu-pad-mib", "8"}};
   for (const auto& flag : frameLoop) {
     std::vector<const char*> args{"--bench-indirect", "b.json"};
     args.insert(args.end(), flag.begin(), flag.end());

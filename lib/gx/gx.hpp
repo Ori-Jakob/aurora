@@ -299,9 +299,13 @@ struct AttrArray {
   u8 stride;
   bool le = true;
   gfx::Range cachedRange;
+  bool gpu = false;
+  u64 gpuHandle = 0;
+  u32 gpuOffset = 0;
 };
 inline bool operator==(const AttrArray& lhs, const AttrArray& rhs) {
-  return lhs.data == rhs.data && lhs.size == rhs.size && lhs.stride == rhs.stride && lhs.le == rhs.le;
+  return lhs.data == rhs.data && lhs.size == rhs.size && lhs.stride == rhs.stride && lhs.le == rhs.le &&
+         lhs.gpu == rhs.gpu && lhs.gpuHandle == rhs.gpuHandle && lhs.gpuOffset == rhs.gpuOffset;
 }
 inline bool operator!=(const AttrArray& lhs, const AttrArray& rhs) { return !(lhs == rhs); }
 
@@ -414,6 +418,8 @@ struct GXState {
   u16 lastVtxSize = 0;
   GXVtxFmt lastVtxFmt = GX_MAX_VTXFMT;
   u8 dirty = DirtyAll;
+  // FIFO thread only; bit i mirrors arrays[GX_VA_POS + i].gpu
+  u16 gpuArrayMask = 0;
 
   // Shadow registers
   std::array<u32, 0x100> bpRegCache = [] {

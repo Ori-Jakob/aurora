@@ -2,6 +2,7 @@
 
 #include "render_test_device.hpp"
 
+#include "gfx/frame.hpp"
 #include "gfx/pipeline_cache.hpp"
 #include "logging.hpp"
 #include "render/geometry/compact.hpp"
@@ -11,6 +12,7 @@
 #include "render/jobs.hpp"
 #include "render/shader_resolve.hpp"
 #include "render/shaders.hpp"
+#include "render/systems/systems.hpp"
 #include "webgpu/gpu.hpp"
 
 #include <algorithm>
@@ -1124,11 +1126,17 @@ TEST(RenderShadersGpu, IndirectArgsMatchCpu) {
 
 // render_demo --bench-indirect drives the device from the main thread before the first latch
 TEST_F(RenderShaders, ModuleInitRequestsNoPipelines) {
+  gfx::detail::testing::create_compute_layouts();
   compact::initialize();
   detail::hzb::initialize();
+  systems::initialize();
+  const bool systemsInstalled = systems::kernel_layout() != nullptr;
   const PipelineStats after = stats();
+  systems::shutdown();
   detail::hzb::shutdown();
   compact::shutdown();
+  gfx::detail::testing::release_compute_layouts();
+  EXPECT_TRUE(systemsInstalled);
   EXPECT_EQ(after.pending, 0u);
   EXPECT_EQ(after.ready, 0u);
   EXPECT_EQ(after.failed, 0u);

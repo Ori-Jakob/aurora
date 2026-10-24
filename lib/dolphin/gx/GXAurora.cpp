@@ -6,10 +6,12 @@
 #include <vector>
 
 #include "__gx.h"
+#include "dolphin/gd/GDGeometry.h"
 #include "gx.hpp"
 #include "../../window.hpp"
 
 #include "../../gx/fifo.hpp"
+#include "../../gx/gpu_channel.hpp"
 #include "../../gx/hints.hpp"
 
 namespace {
@@ -314,6 +316,22 @@ void GXAuroraSetGrassPatches(u32 gpuHandle, u32 count, f32 interpStep, const Aur
                        wire::write(out, sets[i]);
                      }
                    });
+}
+
+void GXSetArrayGPU(GXAttr attr, u64 gpuHandle, u32 byteOffset, u8 stride) {
+  const GXAttr cpAttr = attr == GX_VA_NBT ? GX_VA_NRM : attr;
+  if (cpAttr < GX_VA_POS || cpAttr > GX_VA_TEX7) {
+    aurora::gx::gpu_channel::warn_bad_attribute(static_cast<u32>(attr));
+    return;
+  }
+  const u64 handle = aurora::gx::gpu_channel::bind_handle(gpuHandle);
+  write_fixed_hint<wire::LoadArrayGpuV1>(GX_AURORA_LOAD_ARRAY_GPU, AURORA_HINT_LOAD_ARRAY_GPU_VERSION,
+                                         [&](wire::Writer& out) {
+                                           out.u8(static_cast<u8>(cpAttr));
+                                           out.u64(handle);
+                                           out.u32(byteOffset);
+                                         });
+  GX_WRITE_CP_REG(CP_REG_ARRAYSTRIDE_ID | (cpAttr - GX_VA_POS), stride);
 }
 
 void GXAuroraSetSky(const AuroraSky* sky) {

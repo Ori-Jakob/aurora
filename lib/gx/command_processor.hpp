@@ -82,6 +82,9 @@ void release_array_immutable(uint64_t address, uint32_t generation) noexcept;
 void reset_immutable_arrays() noexcept;
 void init_immutable_arrays() noexcept;
 ImmutableArrayStats immutable_array_stats() noexcept;
+void load_array_gpu(uint8_t attr, uint64_t handle, uint32_t byteOffset) noexcept;
+// Only while the FIFO is drained
+void end_gpu_frame() noexcept;
 
 namespace testing {
 void reset_draw_route_stats() noexcept;

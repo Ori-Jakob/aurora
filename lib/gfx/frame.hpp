@@ -14,10 +14,22 @@ const wgpu::Buffer& staging_buffer(size_t slot);
 
 void request_streaming_sizes(const StreamingSizes& minimum) noexcept;
 StreamingSizes streaming_sizes() noexcept;
+struct ChannelBudget {
+  uint64_t bytes = 0;
+  uint32_t alignment = 0;
+};
+ChannelBudget channel_budget() noexcept;
+void request_channel_storage(uint64_t bytesPerFrame) noexcept;
+void grow_streaming_storage_now(uint64_t storage) noexcept;
+wgpu::BindGroupLayout compute_empty_layout() noexcept;
+wgpu::BindGroup compute_empty_group() noexcept;
+wgpu::BindGroupLayout compute_stream_layout() noexcept;
 
 namespace testing {
 StreamingSizes requested_streaming_sizes() noexcept;
 void reset_streaming_request() noexcept;
+void create_compute_layouts() noexcept;
+void release_compute_layouts() noexcept;
 } // namespace testing
 
 struct RegisteredDrawType {

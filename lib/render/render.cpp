@@ -13,6 +13,7 @@
 #include "debug/views.hpp"
 #include "geometry/compact.hpp"
 #include "geometry/hzb.hpp"
+#include "systems/systems.hpp"
 
 #include "../gx/command_processor.hpp"
 #include "../logging.hpp"
@@ -76,6 +77,7 @@ void initialize() {
   shaders::initialize();
   compact::initialize();
   hzb::initialize();
+  systems::initialize();
   debug::initialize();
   debug::initialize_classification();
   install_hints();
@@ -94,6 +96,7 @@ void shutdown() noexcept {
   shutdown_external_passes();
   clear_after_frame_callbacks();
   remove_hints();
+  systems::shutdown();
   debug::shutdown_classification();
   debug::shutdown();
   compact::shutdown();

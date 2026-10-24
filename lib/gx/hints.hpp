@@ -89,6 +89,7 @@ void handle(uint16_t id, ByteReader& reader) noexcept;
 
 Counters counters(uint16_t id) noexcept;
 uint64_t total_bytes() noexcept;
+uint64_t gpu_command_bytes() noexcept;
 void count_late(uint16_t id) noexcept;
 // Emitters run on the game thread, so their warn-once flags are kept apart from the decoder's
 bool emitter_warned(uint16_t id) noexcept;
@@ -123,6 +124,14 @@ inline constexpr uint32_t GrassPatchesHeader = 15;
 inline constexpr uint32_t GrassLightSet = 48;
 inline constexpr uint32_t SkyV1 = 166;
 inline constexpr uint32_t FogVolume = 64;
+inline constexpr uint32_t GpuUploadHeader = 10;
+inline constexpr uint32_t GpuReserveV1 = 18;
+inline constexpr uint32_t LoadArrayGpuV1 = 15;
+inline constexpr uint32_t GpuUpdateHeader = 14;
+inline constexpr uint32_t GpuCreateHeader = 28;
+inline constexpr uint32_t GpuCreateKernelHeader = 8;
+inline constexpr uint32_t GpuDestroyV1 = 10;
+inline constexpr uint32_t CreateLibrarySource = 1u << 1;
 
 // Big-endian like fifo::write_*, so payloads decode with ByteReader::read
 class Writer {

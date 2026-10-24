@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "hint_bytes.hpp"
+#include "gx/gpu_channel.hpp"
 #include "render/module.hpp"
 #include "render/settings.hpp"
 #include "render_test_caps.hpp"
@@ -77,9 +78,48 @@ std::vector<std::pair<uint16_t, std::vector<uint8_t>>> one_of_each() {
   });
   add(GX_AURORA_RENDER_SKY, 1, wire::SkyV1, [](Writer& w) { wire::write(w, AuroraSky{.layerCount = 0}); });
   add(GX_AURORA_RENDER_FOG_VOLUMES, 1, wire::CountedHeader, [](Writer& w) { w.u16(0); });
-  for (uint16_t id = GX_AURORA_GPU_UPLOAD; id <= GX_AURORA_GPU_DESTROY_SYSTEM; ++id) {
-    add(id, 1, wire::EmptyV1, [](Writer&) {});
-  }
+  constexpr uint64_t Handle = 1ull << 32 | 1;
+  constexpr uint64_t System = 1ull << 32 | 1;
+  add(GX_AURORA_GPU_UPLOAD, 1, wire::GpuUploadHeader + 4, [](Writer& w) {
+    w.u64(Handle);
+    w.u32(0x01020304);
+  });
+  add(GX_AURORA_GPU_RESERVE, 1, wire::GpuReserveV1, [](Writer& w) {
+    w.u64(Handle + 1);
+    w.u32(16);
+    w.u32(1);
+  });
+  add(GX_AURORA_GPU_DISPATCH, 1, wire::EmptyV1, [](Writer&) {});
+  add(GX_AURORA_LOAD_ARRAY_GPU, 1, wire::LoadArrayGpuV1, [](Writer& w) {
+    w.u8(GX_VA_TEX7);
+    w.u64(0);
+    w.u32(0);
+  });
+  add(GX_AURORA_GPU_UPDATE_PERSISTENT, 1, wire::GpuUpdateHeader + 4, [](Writer& w) {
+    w.u64(System);
+    w.u32(0);
+    w.u32(7);
+  });
+  add(GX_AURORA_GPU_CREATE_SYSTEM, 1, wire::GpuCreateHeader + 1 + wire::GpuCreateKernelHeader + 4 + 1, [](Writer& w) {
+    w.u64(System);
+    w.u32(4);
+    w.u32(0);
+    w.u32(0);
+    w.u8(1);
+    w.u8(1);
+    w.u32(1);
+    w.u8('s');
+    w.u8(4);
+    for (const char c : {'m', 'a', 'i', 'n'}) {
+      w.u8(static_cast<uint8_t>(c));
+    }
+    w.u16(64);
+    w.u16(1);
+    w.u16(1);
+    w.u8(0);
+    w.u8(';');
+  });
+  add(GX_AURORA_GPU_DESTROY_SYSTEM, 1, wire::GpuDestroyV1, [](Writer& w) { w.u64(System); });
   return out;
 }
 
@@ -90,6 +130,7 @@ protected:
 
   static void reset() {
     gx::hints::testing::reset_counters();
+    gx::gpu_channel::reset();
 #if AURORA_ENABLE_RENDER
     detail::testing::reset_hints();
 #endif
@@ -239,7 +280,8 @@ TEST_F(RenderHintsTest, EveryIdCountedOnce) {
     const HintCounters counters = hint_counters(id);
     const bool decodes =
         id == GX_AURORA_SET_ARRAY_IMMUTABLE || id == GX_AURORA_RELEASE_ARRAY_IMMUTABLE ||
-        (AURORA_ENABLE_RENDER != 0 && id >= GX_AURORA_RENDER_CAMERA && id <= GX_AURORA_RENDER_WIND_SOURCES);
+        (AURORA_ENABLE_RENDER != 0 && id >= GX_AURORA_RENDER_CAMERA && id <= GX_AURORA_RENDER_WIND_SOURCES) ||
+        gx::gpu_channel::is_command(id);
     EXPECT_EQ(counters.decoded, decodes ? 1u : 0u) << std::hex << id;
     EXPECT_EQ(counters.skipped, decodes ? 0u : 1u) << std::hex << id;
     EXPECT_EQ(counters.malformed, 0u) << std::hex << id;

@@ -22,6 +22,8 @@ inline constexpr uint64_t SelfTestCopyAddress = 0x80300000;
 inline constexpr uint32_t SelfTestWidth = 640;
 inline constexpr uint32_t SelfTestHeight = 480;
 
+enum class SelfTestMode : uint8_t { Plain, Hints, GpuArrays };
+
 struct SelfTestObject {
   uint64_t id;
   uint32_t categories;
@@ -59,7 +61,7 @@ AuroraFogVolume self_test_fog_volume() noexcept;
 
 trace::TraceInfo self_test_info();
 uint8_t self_test_hint_byte(size_t index) noexcept;
-bool write_self_test_trace(const std::filesystem::path& path, bool withHints, std::string& error);
+bool write_self_test_trace(const std::filesystem::path& path, SelfTestMode mode, std::string& error);
 bool check_self_test_frames(std::span<const std::vector<uint8_t>> withHints,
                             std::span<const std::vector<uint8_t>> plain, bool pixelProbes, std::string& error);
 // A debug view gives each quad a colour only its classification knows, so the caller supplies one per frame and quad

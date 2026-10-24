@@ -2,6 +2,7 @@
 
 #include "../thread.hpp"
 #include "command_processor.hpp"
+#include "gpu_channel.hpp"
 
 #include <algorithm>
 #include <array>
@@ -311,6 +312,7 @@ void init() {
 
   reset_immutable_arrays();
   init_immutable_arrays();
+  gpu_channel::reset();
   start_worker();
 }
 
@@ -324,6 +326,7 @@ void begin_frame() noexcept { sPublish.frameActive = true; }
 void end_frame() noexcept {
   sPublish.frameActive = false;
   clear_draw_cache(); // command_processor
+  end_gpu_frame();
   bump(sGame.frames);
   add_to_histogram(sFrameDrainUs, sGame.frameDrainNs);
   sGame.frameDrainNs = 0;
