@@ -30,6 +30,15 @@ struct Options {
   bool hints = true;
   bool checkHints = false;
   bool customDrawProbe = false;
+  uint32_t gpuCull = 0;
+  bool cullCheck = false;
+  bool cullTimings = false;
+  std::string benchPath;
+  uint32_t benchBlocks = 150;
+  uint32_t benchUniformPermille = 1000;
+  uint32_t benchTexturePermille = 500;
+  bool benchBlocksSet = false;
+  bool benchRebindSet = false;
 };
 
 std::optional<AuroraBackend> parse_backend(std::string_view name) noexcept;

@@ -1,7 +1,9 @@
+#include "bench_report.hpp"
 #include "graph_checks.hpp"
 #include "graph_passes.hpp"
 #include "hint_checks.hpp"
 #include "hints.hpp"
+#include "indirect_bench.hpp"
 #include "options.hpp"
 #include "scene.hpp"
 
@@ -9,6 +11,7 @@
 #include <aurora/event.h>
 #include <aurora/gfx.hpp>
 #include <aurora/render.hpp>
+#include <aurora/render_caps.hpp>
 #include <aurora/trace.hpp>
 #include <dolphin/gx.h>
 #include <SDL3/SDL_stdinc.h>
@@ -19,10 +22,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 
 // Last because it redefines main
 #include <aurora/main.h>
@@ -38,6 +43,8 @@ enum ExitCode : int {
   ExitTraceFailed = 6,
   ExitRenderGraphCheck = 7,
   ExitHintCheck = 8,
+  ExitCullCheck = 9,
+  ExitBench = 10,
 };
 
 std::atomic_uint32_t g_errorCount = 0;
@@ -191,6 +198,150 @@ void draw_custom_draw_probe(const aurora::gfx::DrawContext& ctx, const wgpu::Ren
   pass.SetIndexBuffer(ctx.indexBuffer, wgpu::IndexFormat::Uint32, 0, 4);
   pass.SetBindGroup(1, probe.group);
 }
+
+std::string_view profile_name(AuroraFeatureProfile profile) noexcept {
+  switch (profile) {
+  case FEATURE_PROFILE_COMPAT:
+    return "compat";
+  case FEATURE_PROFILE_METAL:
+    return "metal";
+  case FEATURE_PROFILE_METAL32:
+    return "metal32";
+  default:
+    return "full";
+  }
+}
+
+bool pump_events(void*) {
+  const AuroraEvent* event = aurora_update();
+  while (event != nullptr && event->type != AURORA_NONE) {
+    if (event->type == AURORA_EXIT) {
+      return false;
+    }
+    ++event;
+  }
+  return true;
+}
+
+bool write_text(const std::string& path, const std::string& text) {
+  std::error_code ec;
+  const std::filesystem::path target{path};
+  if (target.has_parent_path()) {
+    std::filesystem::create_directories(target.parent_path(), ec);
+  }
+  std::ofstream out{target, std::ios::binary | std::ios::trunc};
+  out << text;
+  return static_cast<bool>(out);
+}
+
+// Measurement-only exception to principle 13: own command buffers on the main thread, before the first frame
+int run_bench(const render_demo::Options& options, const AuroraInfo& info) {
+  aurora::gfx::synchronize();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+  while (render_demo::pipelines_compiling() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  std::string error;
+  if (render_demo::pipelines_compiling()) {
+    error = "pipelines were still compiling after 10 s";
+  } else if (aurora::gfx::current_frame() != 0) {
+    error = "a frame has already begun";
+  }
+  render_demo::BenchRun run;
+  bool ok = error.empty();
+  if (ok) {
+    const aurora::render::Caps& caps = aurora::render::caps();
+    const wgpu::Device device = aurora::gfx::device();
+    const render_demo::BenchDevice bench{
+        .instance = device.GetAdapter().GetInstance(),
+        .device = device,
+        .queue = aurora::gfx::queue(),
+        .colorFormat = aurora::gfx::color_format(),
+        .sampleCount = aurora::gfx::sample_count(),
+        .minUniformBufferOffsetAlignment = caps.limits.minUniformBufferOffsetAlignment,
+        .multiDrawIndirect = caps.multiDrawIndirect,
+        .timestampQuery = caps.timestampQuery,
+        .nullBackend = caps.backend == BACKEND_NULL,
+    };
+    run.device = "aurora";
+    run.backend = render_demo::backend_name(info.backend);
+    run.profile = profile_name(caps.profile);
+    run.adapter = caps.adapterName;
+    run.adapterKind = aurora::render::adapter_kind_name(caps.adapterKind);
+    run.vendorId = caps.vendorId;
+    run.deviceId = caps.deviceId;
+    run.maxImmediateSize = caps.limits.maxImmediateSize;
+    run.vertexStorageBuffers =
+        aurora::render::stage_binding_limits(caps, aurora::render::ShaderStage::Vertex).storageBuffers;
+    run.indirectFirstInstance = caps.indirectFirstInstance;
+    const render_demo::BenchOptions benchOptions{
+        .blocks = options.benchBlocks,
+        .width = options.width,
+        .height = options.height,
+        .uniformPermille = options.benchUniformPermille,
+        .texturePermille = options.benchTexturePermille,
+    };
+    ok = render_demo::run_indirect_bench(bench, benchOptions, pump_events, nullptr, run, error);
+    if (ok && !write_text(options.benchPath, render_demo::bench_json(run))) {
+      ok = false;
+      error = "failed to write " + options.benchPath;
+    }
+  }
+  aurora_shutdown();
+  if (!ok) {
+    std::fprintf(stderr, "render_demo: bench: %s\n", error.c_str());
+    return ExitBench;
+  }
+  std::printf("%s\n", render_demo::bench_summary(run, options.benchPath).c_str());
+  if (options.failOnError && g_errorCount.load(std::memory_order_relaxed) != 0) {
+    return ExitLoggedError;
+  }
+  return ExitSuccess;
+}
+
+std::string cull_status(const render_demo::CullReport& report) {
+  switch (report.check) {
+  case render_demo::CullCheck::Passed:
+    return "passed";
+  case render_demo::CullCheck::SkippedNull:
+    return "skipped (null backend)";
+  case render_demo::CullCheck::NotRequested:
+    return "skipped (not requested)";
+  default:
+    return "FAILED: " + report.failure;
+  }
+}
+
+void print_cull_report(const render_demo::CullReport& report, uint32_t frames, bool timings) {
+  if (report.clamp.starts_with("unavailable")) {
+    std::printf("render_demo: cull: %s\n", report.clamp.c_str());
+    return;
+  }
+  char timing[128] = "gpu timings off";
+  if (timings && report.cullMs && report.drawMs) {
+    std::snprintf(timing, sizeof(timing), "gpu cull %.3f ms, draw %.3f ms (median of %u frames, profiler on)",
+                  *report.cullMs, *report.drawMs, report.timingSamples);
+  } else if (timings) {
+    std::snprintf(timing, sizeof(timing), "gpu cull n/a, draw n/a (median of 0 frames, profiler on)");
+  }
+  std::printf(
+      "render_demo: cull: %u instances (requested %u), visible %u at frame %u, encodes %u/%u of %u, check %s, "
+      "ambiguous %u; %s\n",
+      report.instances, report.requested, report.visible, report.checkFrame, report.cullEncodes, report.drawEncodes,
+      frames, cull_status(report).c_str(), report.ambiguous, timing);
+  if (timings && report.cullP90Ms && report.drawP90Ms) {
+    std::printf("render_demo: cull: p90 gpu cull %.3f ms, draw %.3f ms (profiler on)\n", *report.cullP90Ms,
+                *report.drawP90Ms);
+  }
+}
+
+bool cull_failed(const render_demo::CullReport& report, uint32_t requestedFrames, uint32_t frames, bool nullBackend) {
+  if (report.registered && requestedFrames != 0 && (report.cullEncodes != frames || report.drawEncodes != frames)) {
+    return true;
+  }
+  return report.check == render_demo::CullCheck::Failed ||
+         (report.check == render_demo::CullCheck::NotReady && !nullBackend);
+}
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -238,6 +389,9 @@ int main(int argc, char* argv[]) {
     aurora_shutdown();
     return ExitBackendMismatch;
   }
+  if (!options.benchPath.empty()) {
+    return run_bench(options, info);
+  }
   if (options.customDrawProbe) {
     g_customDrawProbe.type = aurora::gfx::register_draw_type(
         {.label = "render_demo custom draw probe", .draw = draw_custom_draw_probe, .userdata = &g_customDrawProbe});
@@ -260,9 +414,13 @@ int main(int argc, char* argv[]) {
     aurora_shutdown();
     return ExitSceneInit;
   }
-  if (std::string graphError; !render_demo::register_graph_passes(
-          {.vignette = options.vignette, .vignetteAnchor = options.vignetteAnchor, .depthCheck = options.depthCheck},
-          graphError)) {
+  if (std::string graphError; !render_demo::register_graph_passes({.vignette = options.vignette,
+                                                                   .vignetteAnchor = options.vignetteAnchor,
+                                                                   .depthCheck = options.depthCheck,
+                                                                   .gpuCull = options.gpuCull,
+                                                                   .cullCheck = options.cullCheck,
+                                                                   .cullTimings = options.cullTimings},
+                                                                  graphError)) {
     std::fprintf(stderr, "render_demo: render graph setup failed: %s\n", graphError.c_str());
     render_demo::shutdown_scene();
     aurora_shutdown();
@@ -368,6 +526,11 @@ int main(int argc, char* argv[]) {
                 static_cast<int>(source.size()), source.data(), graphReport.probe[0], graphReport.probe[1],
                 graphReport.probe[2]);
   }
+  if (options.gpuCull != 0) {
+    print_cull_report(graphReport.cull, frame, options.cullTimings);
+  }
+  const bool cullFailure =
+      options.gpuCull != 0 && cull_failed(graphReport.cull, options.frames, frame, info.backend == BACKEND_NULL);
   const render_demo::HintTally& tally = render_demo::hint_tally();
   print_hint_summary(tally, hintCounters);
   std::optional<std::string> hintFailure;
@@ -396,6 +559,9 @@ int main(int argc, char* argv[]) {
   }
   if (depthFailure) {
     return ExitRenderGraphCheck;
+  }
+  if (cullFailure) {
+    return ExitCullCheck;
   }
   if (hintFailure) {
     return ExitHintCheck;

@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include "bench_report.hpp"
+#include "cull_reference.hpp"
 #include "graph_checks.hpp"
 #include "hint_checks.hpp"
 #include "options.hpp"
@@ -10,7 +12,12 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
+#include <iterator>
+#include <numeric>
 #include <optional>
+#include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -567,5 +574,637 @@ TEST(RenderDemoHints, DistanceRadius) {
     const DistanceFalloff falloff = distance_falloff(c.distance, c.brightness, c.fn);
     EXPECT_EQ(falloff.radius, 0.f) << c.distance << " " << c.brightness << " " << c.fn;
     EXPECT_GT(falloff.exponent, 0.f) << c.distance << " " << c.brightness << " " << c.fn;
+  }
+}
+
+namespace {
+struct TestCamera {
+  f32 proj[4][4]{};
+  f32 view[3][4]{};
+};
+
+// C_MTXPerspective(55, 4 / 3, 0.5, 400) with the eye at (ex, ey, ez) looking down -z
+TestCamera test_camera(f32 ex, f32 ey, f32 ez) {
+  constexpr f32 Near = 0.5f;
+  constexpr f32 Far = 400.f;
+  const f32 cot = 1.f / std::tan(55.f * 0.5f * 3.14159265358979f / 180.f);
+  TestCamera camera;
+  camera.proj[0][0] = cot / (4.f / 3.f);
+  camera.proj[1][1] = cot;
+  camera.proj[2][2] = -Near / (Far - Near);
+  camera.proj[2][3] = -(Far * Near) / (Far - Near);
+  camera.proj[3][2] = -1.f;
+  camera.view[0][0] = camera.view[1][1] = camera.view[2][2] = 1.f;
+  camera.view[0][3] = -ex;
+  camera.view[1][3] = -ey;
+  camera.view[2][3] = -ez;
+  return camera;
+}
+
+std::array<Plane, 6> test_planes(bool reversedZ = true) {
+  const TestCamera camera = test_camera(0.f, 5.f, -480.f);
+  return frustum_planes(view_projection(camera.proj, camera.view, reversedZ));
+}
+
+f32 plane_distance(const Plane& p, f32 x, f32 y, f32 z) { return p[0] * x + p[1] * y + p[2] * z + p[3]; }
+
+bool kept_by_kernel(const CullInstance& s, std::span<const Plane, 6> planes) {
+  for (const Plane& p : planes) {
+    const f32 distance = p[0] * s.x + p[1] * s.y + p[2] * s.z;
+    if (!(distance + p[3] >= -s.radius)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::vector<CullInstance> instances(u32 count) {
+  std::vector<CullInstance> out(count);
+  fill_cull_instances(out);
+  return out;
+}
+
+std::vector<u32> ids_of(std::span<const u32> words, const CullLayout& layout) {
+  const auto first = words.begin() + layout.idsWord;
+  return {first, first + words[HeaderTotal]};
+}
+
+std::vector<u32> with_ids(std::vector<u32> words, const CullLayout& layout, const std::vector<u32>& ids) {
+  words[1] = static_cast<u32>(ids.size());
+  words[HeaderTotal] = static_cast<u32>(ids.size());
+  std::fill(words.begin() + layout.idsWord, words.end(), 0u);
+  std::copy(ids.begin(), ids.end(), words.begin() + layout.idsWord);
+  return words;
+}
+
+struct CheckFixture {
+  std::vector<CullInstance> instances;
+  std::array<Plane, 6> planes;
+  CullLayout layout;
+  std::vector<u32> words;
+};
+
+CheckFixture check_fixture(u32 count = 4096) {
+  CheckFixture f{.instances = instances(count), .planes = test_planes(), .layout = cull_layout(count)};
+  f.words = simulate_cull(f.instances, f.planes, CullCheckFrame);
+  return f;
+}
+
+std::string check_failure(const CheckFixture& f, const std::vector<u32>& words) {
+  return check_cull_readback(words, f.layout, f.instances, f.planes, CullCheckFrame).failure.value_or("");
+}
+} // namespace
+
+TEST(RenderDemoCull, LayoutAlignsRegions) {
+  for (const u32 n : {1u, 127u, 128u, 129u, 1u << 20, 1u << 22}) {
+    SCOPED_TRACE(n);
+    const CullLayout layout = cull_layout(n);
+    EXPECT_EQ(layout.instances, n);
+    EXPECT_EQ(layout.groups, (n + 127) / 128);
+    EXPECT_EQ(layout.countsWord, HeaderWords);
+    EXPECT_EQ(layout.maskWord % 64, 0u);
+    EXPECT_EQ(layout.idsWord % 64, 0u);
+    EXPECT_GE(layout.maskWord, layout.countsWord + layout.groups);
+    EXPECT_GE(layout.idsWord, layout.maskWord + 4 * layout.groups);
+    EXPECT_EQ(layout.totalWords, layout.idsWord + n);
+    EXPECT_EQ(layout.bytes(), static_cast<u64>(layout.totalWords) * 4);
+    EXPECT_EQ(layout.ids_offset() % 256, 0u);
+  }
+  EXPECT_LT(cull_layout(1u << 20).bytes(), 4500000u);
+}
+
+TEST(RenderDemoCull, InstancesAreExactAndUnique) {
+  const auto all = instances(1u << 20);
+  u64 digest = 0xcbf29ce484222325ull;
+  for (u32 id = 0; id < all.size(); ++id) {
+    const CullInstance& s = all[id];
+    ASSERT_EQ(s.x, std::floor(s.x));
+    ASSERT_EQ(s.z, std::floor(s.z));
+    ASSERT_EQ(static_cast<s32>(s.x) + 512 + (static_cast<s32>(s.z) + 512) * 1024, static_cast<s32>(id));
+    ASSERT_EQ(s.y * 4.f, std::floor(s.y * 4.f));
+    ASSERT_LE(s.y, 1.75f);
+    ASSERT_EQ(s.radius * 16.f, std::floor(s.radius * 16.f));
+    ASSERT_GE(s.radius, 0.125f);
+    ASSERT_LE(s.radius, 0.3125f);
+    std::array<unsigned char, sizeof(CullInstance)> bytes;
+    std::memcpy(bytes.data(), &s, sizeof(s));
+    for (const unsigned char byte : bytes) {
+      digest = (digest ^ byte) * 0x100000001b3ull;
+    }
+  }
+  EXPECT_EQ(digest, 0x972b59bcb1940c5cull);
+}
+
+TEST(RenderDemoCull, ViewProjectionMatchesAuroraConversion) {
+  const TestCamera camera = test_camera(0.f, 0.f, 0.f);
+  const auto reversed = view_projection(camera.proj, camera.view, true);
+  const auto forward = view_projection(camera.proj, camera.view, false);
+  for (u32 c = 0; c < 4; ++c) {
+    EXPECT_FLOAT_EQ(reversed[c * 4 + 2], -camera.proj[2][c]);
+    EXPECT_FLOAT_EQ(forward[c * 4 + 2], camera.proj[2][c] + camera.proj[3][c]);
+    for (const u32 r : {0u, 1u, 3u}) {
+      EXPECT_FLOAT_EQ(reversed[c * 4 + r], camera.proj[r][c]);
+      EXPECT_FLOAT_EQ(forward[c * 4 + r], camera.proj[r][c]);
+    }
+  }
+  const auto depth = [](const std::array<f32, 16>& m, f32 z) { return (m[8 + 2] * z + m[12 + 2]) / (m[8 + 3] * z); };
+  EXPECT_NEAR(depth(reversed, -0.5f), 1.f, 1e-5f);
+  EXPECT_NEAR(depth(reversed, -400.f), 0.f, 1e-5f);
+  EXPECT_NEAR(depth(forward, -0.5f), 0.f, 1e-5f);
+  EXPECT_NEAR(depth(forward, -400.f), 1.f, 1e-5f);
+  const TestCamera moved = test_camera(3.f, -2.f, 7.f);
+  const auto translated = view_projection(moved.proj, moved.view, true);
+  EXPECT_FLOAT_EQ(translated[12 + 3], 7.f);
+}
+
+TEST(RenderDemoCull, PlanesContainTargetAndRejectOutside) {
+  for (const bool reversedZ : {true, false}) {
+    SCOPED_TRACE(reversedZ);
+    const TestCamera camera = test_camera(0.f, 0.f, 0.f);
+    const auto planes = frustum_planes(view_projection(camera.proj, camera.view, reversedZ));
+    for (const Plane& p : planes) {
+      EXPECT_NEAR(std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]), 1.f, 1e-5f);
+      EXPECT_GT(plane_distance(p, 0.f, 0.f, -10.f), 0.f);
+    }
+    const auto rejected = [&](f32 x, f32 y, f32 z) {
+      return std::ranges::any_of(planes, [&](const Plane& p) { return plane_distance(p, x, y, z) < 0.f; });
+    };
+    EXPECT_TRUE(rejected(0.f, 0.f, 10.f));
+    EXPECT_TRUE(rejected(0.f, 0.f, -500.f));
+    EXPECT_TRUE(rejected(0.f, 0.f, -0.25f));
+    EXPECT_TRUE(rejected(-1000.f, 0.f, -10.f));
+    EXPECT_TRUE(rejected(0.f, 1000.f, -10.f));
+  }
+}
+
+TEST(RenderDemoCull, SimulationMatchesCopyIf) {
+  constexpr u32 Count = 300000;
+  const auto all = instances(Count);
+  const auto planes = test_planes();
+  const CullLayout layout = cull_layout(Count);
+  const std::vector<u32> words = simulate_cull(all, planes, 77);
+  std::vector<u32> ids(Count);
+  std::iota(ids.begin(), ids.end(), 0u);
+  std::vector<u32> expected;
+  std::ranges::copy_if(ids, std::back_inserter(expected), [&](u32 id) { return kept_by_kernel(all[id], planes); });
+  ASSERT_EQ(words.size(), layout.totalWords);
+  EXPECT_GT(expected.size(), 500u);
+  EXPECT_LT(expected.size(), Count / 2);
+  EXPECT_EQ(words[0], CullIndexCount);
+  EXPECT_EQ(words[1], expected.size());
+  EXPECT_EQ(words[2] | words[3] | words[4], 0u);
+  EXPECT_EQ(words[HeaderFrameTag], 77u);
+  EXPECT_EQ(words[HeaderTotal], expected.size());
+  EXPECT_EQ(words[HeaderGroups], layout.groups);
+  EXPECT_EQ(ids_of(words, layout), expected);
+  for (u32 word = HeaderGroups + 1; word < HeaderWords; ++word) {
+    EXPECT_EQ(words[word], 0u);
+  }
+}
+
+TEST(RenderDemoCull, CheckAcceptsSimulation) {
+  const CheckFixture f = check_fixture(1u << 16);
+  const CullCheckResult result = check_cull_readback(f.words, f.layout, f.instances, f.planes, CullCheckFrame);
+  EXPECT_EQ(result.failure, std::nullopt);
+  EXPECT_GT(result.visible, 100u);
+  EXPECT_LE(result.ambiguous, (1u << 16) / 100);
+}
+
+TEST(RenderDemoCull, CheckToleratesAmbiguous) {
+  constexpr u32 Count = 300000;
+  const auto all = instances(Count);
+  // x = -100 with radius 0.125 touches the first plane exactly
+  const std::array<Plane, 6> planes{{{1.f, 0.f, 0.f, 99.875f},
+                                     {-1.f, 0.f, 0.f, 1000.f},
+                                     {0.f, 1.f, 0.f, 1000.f},
+                                     {0.f, -1.f, 0.f, 1000.f},
+                                     {0.f, 0.f, 1.f, 1000.f},
+                                     {0.f, 0.f, -1.f, 1000.f}}};
+  const CullLayout layout = cull_layout(Count);
+  const std::vector<u32> words = simulate_cull(all, planes, CullCheckFrame);
+  std::vector<u32> unambiguous;
+  for (const u32 id : ids_of(words, layout)) {
+    if (classify(all[id], planes) != CullClass::Ambiguous) {
+      unambiguous.push_back(id);
+    }
+  }
+  ASSERT_LT(unambiguous.size(), words[HeaderTotal]);
+  for (const auto& candidate : {words, with_ids(words, layout, unambiguous)}) {
+    const CullCheckResult result = check_cull_readback(candidate, layout, all, planes, CullCheckFrame);
+    EXPECT_EQ(result.failure, std::nullopt);
+    EXPECT_GT(result.ambiguous, 0u);
+  }
+}
+
+TEST(RenderDemoCull, CheckRejectsUnsorted) {
+  const CheckFixture f = check_fixture();
+  std::vector<u32> ids = ids_of(f.words, f.layout);
+  ASSERT_GE(ids.size(), 3u);
+  std::swap(ids[1], ids[2]);
+  EXPECT_TRUE(check_failure(f, with_ids(f.words, f.layout, ids)).starts_with("ids are not strictly increasing"));
+}
+
+TEST(RenderDemoCull, CheckRejectsMissingVisible) {
+  const CheckFixture f = check_fixture();
+  std::vector<u32> ids = ids_of(f.words, f.layout);
+  const auto visible =
+      std::ranges::find_if(ids, [&](u32 id) { return classify(f.instances[id], f.planes) == CullClass::Visible; });
+  ASSERT_NE(visible, ids.end());
+  const u32 missing = *visible;
+  ids.erase(visible);
+  EXPECT_EQ(check_failure(f, with_ids(f.words, f.layout, ids)),
+            "visible instance " + std::to_string(missing) + " is missing");
+}
+
+TEST(RenderDemoCull, CheckRejectsExtraCulled) {
+  const CheckFixture f = check_fixture();
+  std::vector<u32> ids = ids_of(f.words, f.layout);
+  u32 culled = 0;
+  while (classify(f.instances[culled], f.planes) != CullClass::Culled) {
+    ++culled;
+  }
+  ids.insert(std::ranges::lower_bound(ids, culled), culled);
+  EXPECT_EQ(check_failure(f, with_ids(f.words, f.layout, ids)),
+            "culled instance " + std::to_string(culled) + " was kept");
+}
+
+TEST(RenderDemoCull, CheckRejectsCountMismatch) {
+  const CheckFixture f = check_fixture();
+  std::vector<u32> words = f.words;
+  words[1] -= 1;
+  EXPECT_TRUE(check_failure(f, words).starts_with("instance count "));
+}
+
+TEST(RenderDemoCull, CheckRejectsTotalMismatch) {
+  const CheckFixture f = check_fixture();
+  std::vector<u32> words = f.words;
+  words[1] = words[HeaderTotal] = f.layout.instances + 1;
+  EXPECT_EQ(check_failure(f, words), "total 4097 exceeds 4096 instances");
+}
+
+TEST(RenderDemoCull, CheckRejectsWrongFrameTag) {
+  const CheckFixture f = check_fixture();
+  std::vector<u32> words = f.words;
+  words[HeaderFrameTag] = 7;
+  EXPECT_EQ(check_failure(f, words), "frame tag 7, expected 30");
+}
+
+TEST(RenderDemoCull, CheckRejectsFirstInstanceNonZero) {
+  const CheckFixture f = check_fixture();
+  std::vector<u32> words = f.words;
+  words[4] = 1;
+  EXPECT_EQ(check_failure(f, words), "first instance 1, expected 0");
+}
+
+TEST(RenderDemoCull, CheckRejectsIndexCountWrong) {
+  const CheckFixture f = check_fixture();
+  std::vector<u32> words = f.words;
+  words[0] = 36;
+  EXPECT_EQ(check_failure(f, words), "index count 36, expected 24");
+}
+
+TEST(RenderDemoCull, CheckRejectsIdOutOfRange) {
+  const CheckFixture f = check_fixture();
+  std::vector<u32> ids = ids_of(f.words, f.layout);
+  ASSERT_FALSE(ids.empty());
+  ids.back() = f.layout.instances + 5;
+  EXPECT_TRUE(check_failure(f, with_ids(f.words, f.layout, ids)).starts_with("id 4101 at slot "));
+}
+
+TEST(RenderDemoCull, CheckRejectsIllConditioned) {
+  constexpr u32 Count = 4096;
+  const auto all = instances(Count);
+  // y = 0.25 with radius 0.125 touches the plane exactly, about one instance in 32
+  const std::array<Plane, 6> planes{{{0.f, 1.f, 0.f, -0.375f},
+                                     {1.f, 0.f, 0.f, 1000.f},
+                                     {-1.f, 0.f, 0.f, 1000.f},
+                                     {0.f, -1.f, 0.f, 1000.f},
+                                     {0.f, 0.f, 1.f, 1000.f},
+                                     {0.f, 0.f, -1.f, 1000.f}}};
+  const std::vector<u32> words = simulate_cull(all, planes, CullCheckFrame);
+  const auto failure = check_cull_readback(words, cull_layout(Count), all, planes, CullCheckFrame).failure;
+  ASSERT_TRUE(failure.has_value());
+  EXPECT_TRUE(failure->starts_with("ill-conditioned reference"));
+}
+
+TEST(RenderDemoCull, CheckRejectsStaleFrame) {
+  CheckFixture f = check_fixture();
+  f.words = simulate_cull(f.instances, f.planes, CullCheckFrame - 1);
+  EXPECT_EQ(check_failure(f, f.words), "frame tag 29, expected 30");
+}
+
+TEST(RenderDemoCull, ShadersBakeTheLayout) {
+  const CullLayout layout = cull_layout(1000);
+  const std::string compute = cull_compute_wgsl(layout);
+  EXPECT_NE(compute.find("const N: u32 = 1000u;"), std::string::npos);
+  EXPECT_NE(compute.find("const IDS: u32 = " + std::to_string(layout.idsWord) + "u;"), std::string::npos);
+  for (const char* entry : {"fn cs_count", "fn cs_scan", "fn cs_scatter"}) {
+    EXPECT_NE(compute.find(entry), std::string::npos) << entry;
+  }
+  EXPECT_EQ(compute.find("atomic"), std::string::npos);
+  const std::string draw = cull_draw_wgsl(1000);
+  EXPECT_NE(draw.find("const N: u32 = 1000u;"), std::string::npos);
+  EXPECT_EQ(draw.find("instance_index"), std::string::npos);
+  EXPECT_EQ(draw.find("vertex_index"), std::string::npos);
+}
+
+namespace {
+SampleStats stats_of(f64 p50, f64 p90, f64 mean, f64 min, f64 max, u32 count) {
+  return {.p50 = p50, .p90 = p90, .mean = mean, .min = min, .max = max, .count = count};
+}
+
+BenchRun linear_run(f64 alpha, f64 gpuAlpha) {
+  BenchRun run;
+  for (const BenchPair& pair : bench_pairs()) {
+    PairResult result{.pair = pair};
+    const f64 n = pair.draws;
+    const f64 k = pair.passes;
+    result.deltaCpuUs.p50 = alpha + 0.02 * n + 1.5 * k;
+    result.deltaGpuUs = SampleStats{.p50 = gpuAlpha + 0.004 * n + 0.75 * k};
+    run.pairs.push_back(result);
+  }
+  return run;
+}
+
+ArmSamples ramp(f64 offset, f64 slope, u32 blocks, bool treatment) {
+  ArmSamples samples;
+  for (u32 k = 0; k < blocks; ++k) {
+    // Block k runs A, B, B, A at times 4k to 4k + 3
+    const f64 first = treatment ? 4.0 * k + 1 : 4.0 * k;
+    const f64 second = treatment ? 4.0 * k + 2 : 4.0 * k + 3;
+    for (const f64 t : {first, second}) {
+      samples.totalUs.push_back(offset + slope * t);
+      samples.encodeUs.push_back(1.0);
+      samples.finishUs.push_back(1.0);
+      samples.submitUs.push_back(1.0);
+    }
+  }
+  return samples;
+}
+} // namespace
+
+TEST(RenderDemoBench, PairMatrixIsStable) {
+  const auto pairs = bench_pairs();
+  ASSERT_EQ(pairs.size(), 37u);
+  std::set<std::string> names;
+  for (const BenchPair& pair : pairs) {
+    EXPECT_TRUE(names.insert(pair_name(pair)).second) << pair_name(pair);
+    EXPECT_LE(pair.draws, BenchMaxDraws);
+    EXPECT_LE(pair.passes, BenchMaxPasses);
+  }
+  EXPECT_EQ(pair_name(pairs[0]), "direct.vi.gx.gpu.u16~indirect.vi.gx.gpu.u16.n50.k1");
+  EXPECT_EQ(pair_name(pairs[1]), "direct.vi.gx.gpu.u16~indirect.vi.gx.gpu.u16.n500.k1");
+  EXPECT_EQ(pair_name(pairs[30]), "indirect.vi.gx.gpu.u16~indirect.vi.gx.cpu.u16.n500.k1");
+  EXPECT_EQ(pair_name(pairs[36]), "direct.vi.gx.gpu.u16~indirect.vi.subst.gpu.u32.n2000.k1");
+  // The 500 and 2000 draw partners of every slope sit next to each other
+  for (size_t i = 18; i + 1 < pairs.size(); ++i) {
+    if (pairs[i].draws == 500 && pairs[i].passes == 1 && i != 30) {
+      EXPECT_EQ(pairs[i + 1].draws, 2000u) << i;
+      EXPECT_EQ(pairs[i + 1].passes, 1u) << i;
+      EXPECT_TRUE(pairs[i + 1].a == pairs[i].a && pairs[i + 1].b == pairs[i].b) << i;
+    }
+  }
+}
+
+TEST(RenderDemoBench, AbbaPairingCancelsDrift) {
+  const ArmSamples a = ramp(100.0, 0.5, 40, false);
+  const ArmSamples b = ramp(107.0, 0.5, 40, true);
+  const PairResult result = reduce_pair(bench_pairs()[0], a, b);
+  EXPECT_NEAR(result.deltaCpuUs.p50, 7.0, 1e-9);
+  EXPECT_NEAR(result.deltaCpuUs.min, 7.0, 1e-9);
+  EXPECT_NEAR(result.deltaCpuUs.max, 7.0, 1e-9);
+  EXPECT_EQ(result.deltaCpuUs.count, 40u);
+  EXPECT_FALSE(result.deltaGpuUs.has_value());
+}
+
+TEST(RenderDemoBench, DriftAndInstability) {
+  const PairResult flat = reduce_pair(bench_pairs()[0], ramp(100.0, 0.0, 40, false), ramp(105.0, 0.0, 40, true));
+  EXPECT_FALSE(flat.unstable);
+  EXPECT_EQ(flat.drift, 0.0);
+  const PairResult drifting = reduce_pair(bench_pairs()[0], ramp(100.0, 0.5, 40, false), ramp(100.0, 0.5, 40, true));
+  EXPECT_GT(drifting.drift, 0.1);
+  EXPECT_TRUE(drifting.unstable);
+  ArmSamples noisy = ramp(100.0, 0.0, 40, false);
+  for (size_t i = 0; i < noisy.totalUs.size(); i += 4) {
+    noisy.totalUs[i] = 200.0;
+  }
+  EXPECT_TRUE(reduce_pair(bench_pairs()[0], noisy, ramp(100.0, 0.0, 40, true)).unstable);
+}
+
+TEST(RenderDemoBench, StatsMatchSpikeKit) {
+  const SampleStats s = sample_stats({10.0, 2.0, 4.0, 1.0, 3.0});
+  EXPECT_DOUBLE_EQ(s.p50, 3.0);
+  EXPECT_DOUBLE_EQ(s.p90, 7.6);
+  EXPECT_DOUBLE_EQ(s.mean, 4.0);
+  EXPECT_DOUBLE_EQ(s.min, 1.0);
+  EXPECT_DOUBLE_EQ(s.max, 10.0);
+  EXPECT_EQ(s.count, 5u);
+  EXPECT_EQ(sample_stats({}).count, 0u);
+  EXPECT_TRUE(unstable(stats_of(10.0, 12.6, 0, 0, 0, 3)));
+  EXPECT_FALSE(unstable(stats_of(10.0, 12.5, 0, 0, 0, 3)));
+}
+
+TEST(RenderDemoBench, RebindSpread) {
+  const auto count = [](u32 draws, u32 passes, u32 permille) {
+    u32 binds = 0;
+    for (u32 pass = 0; pass < passes; ++pass) {
+      const u32 first = pass * draws / passes;
+      const u32 last = (pass + 1) * draws / passes;
+      for (u32 draw = first; draw < last; ++draw) {
+        binds += rebinds(draw - first, draw, permille) ? 1 : 0;
+      }
+    }
+    return binds;
+  };
+  EXPECT_EQ(count(2000, 1, 500), 1001u);
+  EXPECT_EQ(count(2000, 1, 1000), 2000u);
+  EXPECT_EQ(count(500, 8, 1000), 500u);
+  EXPECT_EQ(count(2000, 8, 0), 8u);
+  EXPECT_EQ(count(1000, 1, 361), 362u);
+}
+
+TEST(RenderDemoBench, DerivedFit) {
+  const BenchRun run = linear_run(3.0, 1.0);
+  for (const BenchPipeline pipeline : {BenchPipeline::VertexIndex, BenchPipeline::Plain}) {
+    const BenchDerived derived = bench_derived(run, pipeline);
+    ASSERT_TRUE(derived.cpuFit && derived.gpuFit);
+    EXPECT_NEAR(derived.cpuFit->alpha, 3.0, 1e-9);
+    EXPECT_NEAR(derived.cpuFit->beta, 0.02, 1e-12);
+    EXPECT_NEAR(derived.cpuFit->gamma, 1.5, 1e-9);
+    EXPECT_NEAR(derived.cpuFit->rmsResidual, 0.0, 1e-9);
+    EXPECT_NEAR(derived.gpuFit->beta, 0.004, 1e-12);
+    EXPECT_NEAR(derived.gpuFit->gamma, 0.75, 1e-9);
+    EXPECT_NEAR(*derived.gate500CpuMs, 0.0145, 1e-12);
+  }
+  const BenchDerived vi = bench_derived(run, BenchPipeline::VertexIndex);
+  for (const auto& beta : {vi.substBetaCpuUs, vi.u32BetaCpuUs, vi.bundleBetaCpuUs, vi.zeroBetaCpuUs}) {
+    ASSERT_TRUE(beta.has_value());
+    EXPECT_NEAR(*beta, 0.02, 1e-12);
+  }
+  EXPECT_NEAR(*vi.zeroBetaGpuUs, 0.004, 1e-12);
+  EXPECT_NEAR(*vi.argsBarrierCpuUs, -14.5, 1e-9);
+  EXPECT_FALSE(bench_derived(run, BenchPipeline::Plain).substBetaCpuUs.has_value());
+  BenchRun clamped = run;
+  clamped.pairs[4].clamp = "error: x";
+  EXPECT_FALSE(bench_derived(clamped, BenchPipeline::VertexIndex).cpuFit.has_value());
+  EXPECT_TRUE(bench_derived(clamped, BenchPipeline::Plain).cpuFit.has_value());
+}
+
+TEST(RenderDemoBench, JsonGolden) {
+  const auto pairs = bench_pairs();
+  BenchRun run{.device = "aurora",
+               .backend = "null",
+               .profile = "full",
+               .adapter = "Null \"A\"",
+               .adapterKind = "cpu",
+               .build = "release",
+               .validation = "skipped",
+               .vendorId = 1,
+               .deviceId = 2,
+               .msaa = 4,
+               .width = 64,
+               .height = 32,
+               .warmupBlocks = 1,
+               .blocks = 2,
+               .uniformPermille = 959,
+               .texturePermille = 361,
+               .erroredPairs = 1,
+               .maxImmediateSize = 64,
+               .vertexStorageBuffers = 8,
+               .mdi = true,
+               .timestamps = true};
+  PairResult measured{.pair = pairs[0], .drift = 0.0125, .unstable = true};
+  measured.a.totalUs = stats_of(1.5, 2.25, 1.75, 1.0, 3.0, 4);
+  measured.a.gpuTotalUs = SampleStats{};
+  measured.a.gpuInvalid = 2;
+  measured.deltaCpuUs = stats_of(0.5, 0.75, 0.5, 0.25, 0.75, 2);
+  run.pairs.push_back(measured);
+  run.pairs.push_back({.pair = pairs[1], .clamp = "error: x"});
+  const std::string zero = R"({"p50":0.000,"p90":0.000,"mean":0.000,"min":0.000,"max":0.000,"count":0})";
+  const std::string arm = R"({"mode":"direct","pipeline":"vi","state":"gx","args":"gpu","index":"u16"})";
+  const std::string treated = R"({"mode":"indirect","pipeline":"vi","state":"gx","args":"gpu","index":"u16"})";
+  const std::string nullDerived = R"({"cpuFit":null,"gpuFit":null,"gate500":{"cpuMs":null,"gpuMs":null}})";
+  const std::string nullBetas = R"({"cpuBetaUs":null,"gpuBetaUs":null})";
+  const std::string expected =
+      std::string{R"({"schema":"aurora.render_demo.indirect_bench/1","device":"aurora","backend":"null",)"} +
+      R"("profile":"full","adapter":"Null \"A\"","adapterKind":"cpu","vendorId":1,"deviceId":2,"build":"release",)" +
+      R"("validation":"skipped","msaa":4,"target":{"width":64,"height":32},"caps":{"multiDrawIndirect":true,)" +
+      R"("indirectFirstInstance":false,"timestampQuery":true,"maxImmediateSize":64,"vertexStorageBuffers":8},)" +
+      R"("rebind":{"uniformPermille":959,"texturePermille":361},"wait":"spin","warmupBlocks":1,"blocks":2,)" +
+      R"("erroredPairs":1,"pairs":[{"name":"direct.vi.gx.gpu.u16~indirect.vi.gx.gpu.u16.n50.k1","draws":50,)" +
+      R"("passes":1,"a":)" + arm + R"(,"b":)" + treated + R"(,"clamp":"","unstable":true,"drift":0.0125,)" +
+      R"("arms":{"a":{"cpuUs":{"encode":)" + zero + R"(,"finish":)" + zero + R"(,"submit":)" + zero +
+      R"(,"total":{"p50":1.500,"p90":2.250,"mean":1.750,"min":1.000,"max":3.000,"count":4}},)" +
+      R"("gpuUs":{"total":)" + zero + R"(,"inPass":null,"args":null},"gpuInvalid":2},"b":{"cpuUs":{"encode":)" + zero +
+      R"(,"finish":)" + zero + R"(,"submit":)" + zero + R"(,"total":)" + zero +
+      R"(},"gpuUs":null,"gpuInvalid":0}},"deltaUs":{"cpu":)" +
+      R"({"p50":0.500,"p90":0.750,"mean":0.500,"min":0.250,"max":0.750,"count":2},"gpu":null}},)" +
+      R"({"name":"direct.vi.gx.gpu.u16~indirect.vi.gx.gpu.u16.n500.k1","draws":500,"passes":1,"a":)" + arm +
+      R"(,"b":)" + treated + R"(,"clamp":"error: x","unstable":false,"drift":0.0000,"arms":null,"deltaUs":null}],)" +
+      R"("derived":{"vi":)" + nullDerived + R"(,"plain":)" + nullDerived + R"(,"subst":)" + nullBetas + R"(,"u32":)" +
+      nullBetas + R"(,"bundle":)" + nullBetas + R"(,"zero":)" + nullBetas +
+      R"(,"argsBarrier":{"cpuUs":null,"gpuUs":null}}})" + "\n";
+  EXPECT_EQ(bench_json(run), expected);
+}
+
+TEST(RenderDemoBench, SummaryFormat) {
+  BenchRun run{.device = "aurora",
+               .backend = "null",
+               .profile = "full",
+               .build = "release",
+               .validation = "skipped",
+               .width = 64,
+               .height = 32,
+               .erroredPairs = 1};
+  EXPECT_EQ(bench_summary(run, "out.json"),
+            "render_demo: bench: 0 pairs on null/full (device aurora, validation skipped, build release, msaa 1, "
+            "64x32), mdi no, timestamps no, errored 1; 500 vi gx draws: indirect-direct cpu n/a, gpu n/a (paired "
+            "p50); wrote out.json");
+  BenchRun measured = linear_run(3.5, 1.25);
+  measured.device = "aurora";
+  measured.backend = "d3d12";
+  measured.profile = "compat";
+  measured.build = "release";
+  measured.validation = "on";
+  measured.msaa = 4;
+  measured.width = 2560;
+  measured.height = 1440;
+  measured.mdi = true;
+  measured.timestamps = true;
+  EXPECT_EQ(bench_summary(measured, "b.json"),
+            "render_demo: bench: 37 pairs on d3d12/compat (device aurora, validation on, build release, msaa 4, "
+            "2560x1440), mdi yes, timestamps yes, errored 0; 500 vi gx draws: indirect-direct cpu +0.015 ms, gpu "
+            "+0.004 ms (paired p50); wrote b.json");
+}
+
+TEST(RenderDemoOptions, ParsesCullFlags) {
+  const auto options = parse({"--gpu-cull", "1048576", "--cull-check", "--cull-timings", "--frames", "600"});
+  ASSERT_TRUE(options);
+  EXPECT_EQ(options->gpuCull, 1048576u);
+  EXPECT_TRUE(options->cullCheck);
+  EXPECT_TRUE(options->cullTimings);
+  EXPECT_TRUE(options->benchPath.empty());
+  EXPECT_TRUE(parse({"--gpu-cull", "4194304", "--cull-check"}));
+  EXPECT_TRUE(parse({"--gpu-cull", "1", "--cull-check", "--frames", "40"}));
+}
+
+TEST(RenderDemoOptions, ParsesBenchFlags) {
+  const auto options = parse({"--bench-indirect", "out/bench.json", "--bench-blocks", "3", "--bench-rebind", "959,361",
+                              "--backend", "null", "--profile", "compat", "--size", "2560x1440", "--data-dir", "d",
+                              "--msaa", "4", "--fail-on-error"});
+  ASSERT_TRUE(options);
+  EXPECT_EQ(options->benchPath, "out/bench.json");
+  EXPECT_EQ(options->benchBlocks, 3u);
+  EXPECT_EQ(options->benchUniformPermille, 959u);
+  EXPECT_EQ(options->benchTexturePermille, 361u);
+  EXPECT_EQ(options->width, 2560u);
+  EXPECT_EQ(options->msaa, 4u);
+  const auto defaults = parse({"--bench-indirect", "b.json"});
+  ASSERT_TRUE(defaults);
+  EXPECT_EQ(defaults->benchBlocks, 150u);
+  EXPECT_EQ(defaults->benchUniformPermille, 1000u);
+  EXPECT_EQ(defaults->benchTexturePermille, 500u);
+}
+
+TEST(RenderDemoOptions, RejectsCullRangesAndDependencies) {
+  EXPECT_FALSE(parse({"--gpu-cull", "0"}));
+  EXPECT_FALSE(parse({"--gpu-cull", "4194305"}));
+  EXPECT_FALSE(parse({"--gpu-cull", "many"}));
+  EXPECT_EQ(parse_error({"--cull-check"}), "--cull-check needs --gpu-cull");
+  EXPECT_EQ(parse_error({"--cull-timings"}), "--cull-timings needs --gpu-cull");
+  EXPECT_EQ(parse_error({"--gpu-cull", "128", "--cull-check", "--frames", "39"}),
+            "--cull-check needs at least 40 frames");
+  EXPECT_EQ(parse_error({"--gpu-cull", "128", "--trace", "t.gxtrace"}), "render graph passes cannot be traced");
+}
+
+TEST(RenderDemoOptions, RejectsBenchRangesAndDependencies) {
+  EXPECT_FALSE(parse({"--bench-indirect", "b.json", "--bench-blocks", "0"}));
+  EXPECT_FALSE(parse({"--bench-indirect", "b.json", "--bench-rebind", "1001,0"}));
+  EXPECT_FALSE(parse({"--bench-indirect", "b.json", "--bench-rebind", "500"}));
+  EXPECT_FALSE(parse({"--bench-indirect", ""}));
+  EXPECT_EQ(parse_error({"--bench-blocks", "3"}), "--bench-blocks needs --bench-indirect");
+  EXPECT_EQ(parse_error({"--bench-rebind", "1000,500"}), "--bench-rebind needs --bench-indirect");
+}
+
+TEST(RenderDemoOptions, BenchExcludesFrameLoopFlags) {
+  const std::vector<std::vector<const char*>> frameLoop{{"--frames", "10"},
+                                                        {"--timeout", "5"},
+                                                        {"--trace", "t.gxtrace"},
+                                                        {"--trace-start", "3"},
+                                                        {"--trace-frames", "2"},
+                                                        {"--vignette"},
+                                                        {"--vignette-anchor", "phase.sky"},
+                                                        {"--expect-anchor-warnings", "0"},
+                                                        {"--depth-check"},
+                                                        {"--no-hints"},
+                                                        {"--check-hints"},
+                                                        {"--custom-draw-probe"},
+                                                        {"--gpu-cull", "4096"},
+                                                        {"--cull-check"},
+                                                        {"--cull-timings"}};
+  for (const auto& flag : frameLoop) {
+    std::vector<const char*> args{"--bench-indirect", "b.json"};
+    args.insert(args.end(), flag.begin(), flag.end());
+    EXPECT_EQ(parse_error(args), "--bench-indirect cannot be combined with " + std::string{flag[0]});
   }
 }

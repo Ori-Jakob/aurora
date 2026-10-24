@@ -491,23 +491,31 @@ bool init_scene() {
   return sBoxDisplayListSize != 0;
 }
 
+SceneCamera scene_camera(u32 frame) noexcept {
+  const f32 t = static_cast<f32>(frame) / 60.f;
+  SceneCamera camera;
+  C_MTXPerspective(camera.projection, 55.f, 4.f / 3.f, 0.5f, 400.f);
+  camera.eye = {28.f * std::cos(0.25f * t), 11.f, 28.f * std::sin(0.25f * t)};
+  const Vec up{0.f, 1.f, 0.f};
+  camera.target = {0.f, 1.5f, 0.f};
+  C_MTXLookAt(camera.view, &camera.eye, &up, &camera.target);
+  return camera;
+}
+
 void draw_scene(u32 frame, const SceneOptions& options) {
   // Not gated on hints_enabled() so the off capture proves emitters add only hint bytes; real producers do gate on it
   set_hint_emission(options.hints);
   const f32 t = static_cast<f32>(frame) / 60.f;
+  const SceneCamera camera = scene_camera(frame);
   GXSetCopyClear(ClearColor, GX_MAX_Z24);
   GXSetViewport(0.f, 0.f, 640.f, 480.f, 0.f, 1.f);
   GXSetScissor(0, 0, 640, 480);
 
-  Mtx44 projection;
-  C_MTXPerspective(projection, 55.f, 4.f / 3.f, 0.5f, 400.f);
-  GXSetProjection(projection, GX_PERSPECTIVE);
-
-  const Point3d eye{28.f * std::cos(0.25f * t), 11.f, 28.f * std::sin(0.25f * t)};
-  const Vec up{0.f, 1.f, 0.f};
-  const Point3d target{0.f, 1.5f, 0.f};
-  Mtx view;
-  C_MTXLookAt(view, &eye, &up, &target);
+  GXSetProjection(camera.projection, GX_PERSPECTIVE);
+  const auto& projection = camera.projection;
+  const auto& view = camera.view;
+  const Point3d& eye = camera.eye;
+  const Point3d& target = camera.target;
 
   GXSetFog(Fog.type, Fog.start, Fog.end, Fog.nearZ, Fog.farZ, Fog.color);
   const Lights lights = setup_lights(view, t);

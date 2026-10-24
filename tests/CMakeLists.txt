@@ -457,6 +457,8 @@ endif () # AURORA_ENABLE_GX
 if (TARGET render_demo)
   add_executable(render_demo_tests
     render_demo_test.cpp
+    ../examples/render_demo/bench_report.cpp
+    ../examples/render_demo/cull_reference.cpp
     ../examples/render_demo/graph_checks.cpp
     ../examples/render_demo/hint_checks.cpp
     ../examples/render_demo/options.cpp
@@ -517,7 +519,55 @@ if (TARGET render_demo)
       COMMAND $<TARGET_FILE:render_demo> --backend null --profile metal --msaa 4 --frames 60 --timeout 60
               --fail-on-error --depth-check --vignette --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_depth/msaa)
     set_tests_properties(render_demo_depth_probe_msaa PROPERTIES LABELS smoke TIMEOUT 180)
+
+    add_executable(render_demo_gpu_tests render_demo_gpu_test.cpp render_test_device.cpp
+      ../examples/render_demo/cull_reference.cpp)
+    target_include_directories(render_demo_gpu_tests PRIVATE ../include ../lib ../examples/render_demo)
+    target_compile_definitions(render_demo_gpu_tests PRIVATE AURORA TARGET_PC=1 AURORA_ENABLE_RENDER=1)
+    target_link_libraries(render_demo_gpu_tests PRIVATE aurora::gx aurora::vi gtest gtest_main)
+    aurora_copy_runtime_dlls(render_demo_gpu_tests)
+    gtest_discover_tests(render_demo_gpu_tests PROPERTIES TIMEOUT 120)
+
+    # No PASS_REGULAR_EXPRESSION, so the exit code still counts
+    set(_cull_args --gpu-cull 1048576 --cull-check --frames 60 --timeout 60 --fail-on-error)
+    foreach (_profile IN ITEMS full compat metal metal32)
+      add_test(NAME render_demo_gpu_cull_${_profile}
+        COMMAND $<TARGET_FILE:render_demo> --backend null --profile ${_profile} ${_cull_args}
+                --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_cull/${_profile})
+      set_tests_properties(render_demo_gpu_cull_${_profile} PROPERTIES LABELS smoke TIMEOUT 180
+        FAIL_REGULAR_EXPRESSION "\\[(ERROR|FATAL): ")
+    endforeach ()
+    add_test(NAME render_demo_gpu_cull_msaa
+      COMMAND $<TARGET_FILE:render_demo> --backend null --profile metal --msaa 4 ${_cull_args}
+              --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_cull/msaa)
+    add_test(NAME render_demo_gpu_cull_no_hints
+      COMMAND $<TARGET_FILE:render_demo> --backend null --no-hints ${_cull_args}
+              --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_cull/no_hints)
+    add_test(NAME render_demo_gpu_cull_with_probe
+      COMMAND $<TARGET_FILE:render_demo> --backend null --gpu-cull 4096 --vignette --depth-check --frames 60
+              --timeout 60 --fail-on-error --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_cull/with_probe)
+    add_test(NAME render_demo_gpu_cull_timings
+      COMMAND $<TARGET_FILE:render_demo> --backend null --profile full --gpu-cull 1048576 --cull-check --cull-timings
+              --frames 90 --timeout 60 --fail-on-error --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_cull/timings)
+    set_tests_properties(render_demo_gpu_cull_msaa render_demo_gpu_cull_no_hints render_demo_gpu_cull_with_probe
+      render_demo_gpu_cull_timings PROPERTIES LABELS smoke TIMEOUT 180 FAIL_REGULAR_EXPRESSION "\\[(ERROR|FATAL): ")
+    add_test(NAME render_demo_rejects_gpu_cull_with_trace
+      COMMAND $<TARGET_FILE:render_demo> --gpu-cull 4096 --trace ${CMAKE_CURRENT_BINARY_DIR}/never.gxtrace)
+    set_tests_properties(render_demo_rejects_gpu_cull_with_trace PROPERTIES WILL_FAIL TRUE)
   endif ()
+
+  # The bench uses core WebGPU only, so it runs with the render module off too
+  foreach (_profile IN ITEMS full compat metal metal32)
+    add_test(NAME render_demo_bench_${_profile}
+      COMMAND $<TARGET_FILE:render_demo> --backend null --profile ${_profile}
+              --bench-indirect ${CMAKE_CURRENT_BINARY_DIR}/render_demo_bench/${_profile}.json --bench-blocks 1
+              --fail-on-error --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_bench/data_${_profile})
+    set_tests_properties(render_demo_bench_${_profile} PROPERTIES LABELS smoke TIMEOUT 180
+      FAIL_REGULAR_EXPRESSION "\\[(ERROR|FATAL): |errored [1-9]")
+  endforeach ()
+  add_test(NAME render_demo_rejects_bench_with_frames
+    COMMAND $<TARGET_FILE:render_demo> --bench-indirect ${CMAKE_CURRENT_BINARY_DIR}/never.json --frames 10)
+  set_tests_properties(render_demo_rejects_bench_with_frames PROPERTIES WILL_FAIL TRUE)
 
   foreach (_profile IN ITEMS full compat metal metal32)
     add_test(NAME render_demo_hints_${_profile}

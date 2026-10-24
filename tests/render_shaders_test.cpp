@@ -4,6 +4,8 @@
 
 #include "gfx/pipeline_cache.hpp"
 #include "logging.hpp"
+#include "render/geometry/compact.hpp"
+#include "render/geometry/hzb.hpp"
 #include "render/geometry/indirect.hpp"
 #include "render/graph_layout.hpp"
 #include "render/jobs.hpp"
@@ -1118,6 +1120,18 @@ TEST(RenderShadersGpu, IndirectArgsMatchCpu) {
       EXPECT_EQ(gpu.run(pipeline, groups, Count / 64, output, size), kernel.expected);
     }
   }
+}
+
+// render_demo --bench-indirect drives the device from the main thread before the first latch
+TEST_F(RenderShaders, ModuleInitRequestsNoPipelines) {
+  compact::initialize();
+  detail::hzb::initialize();
+  const PipelineStats after = stats();
+  detail::hzb::shutdown();
+  compact::shutdown();
+  EXPECT_EQ(after.pending, 0u);
+  EXPECT_EQ(after.ready, 0u);
+  EXPECT_EQ(after.failed, 0u);
 }
 } // namespace
 } // namespace aurora::render::shaders

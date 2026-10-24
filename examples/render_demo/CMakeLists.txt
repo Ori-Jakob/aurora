@@ -1,6 +1,12 @@
 include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/AuroraCopyRuntimeDLLs.cmake)
 
 add_executable(render_demo
+  bench_report.cpp
+  bench_report.hpp
+  cull_pass.cpp
+  cull_pass.hpp
+  cull_reference.cpp
+  cull_reference.hpp
   graph_checks.cpp
   graph_checks.hpp
   graph_passes.cpp
@@ -9,6 +15,8 @@ add_executable(render_demo
   hint_checks.hpp
   hints.cpp
   hints.hpp
+  indirect_bench.cpp
+  indirect_bench.hpp
   main.cpp
   options.cpp
   options.hpp

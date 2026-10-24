@@ -127,16 +127,6 @@ void encode_vignette(PassContext& ctx, void* userdata) {
 constexpr uint64_t ProbeBytes = 4 * sizeof(f32);
 constexpr auto PipelineWait = std::chrono::seconds{10};
 
-// Aurora's pipeline threads update the counter through atomic_ref, so it is read the same way
-bool pipelines_compiling() noexcept {
-  auto& queued = const_cast<uint32_t&>(aurora_get_stats()->queuedPipelines);
-#if defined(__cpp_lib_atomic_ref)
-  return std::atomic_ref{queued}.load(std::memory_order_relaxed) != 0;
-#else
-  return __atomic_load_n(&queued, __ATOMIC_RELAXED) != 0;
-#endif
-}
-
 constexpr std::string_view DepthProbeWgsl = R"(
 @group(1) @binding(0) var gx_depth: texture_2d<f32>;
 @group(2) @binding(0) var<storage, read_write> probes: array<f32, 4>;
@@ -310,6 +300,16 @@ bool register_depth_probe(std::string& error) {
 }
 } // namespace
 
+// Aurora's pipeline threads update the counter through atomic_ref, so it is read the same way
+bool pipelines_compiling() noexcept {
+  auto& queued = const_cast<uint32_t&>(aurora_get_stats()->queuedPipelines);
+#if defined(__cpp_lib_atomic_ref)
+  return std::atomic_ref{queued}.load(std::memory_order_relaxed) != 0;
+#else
+  return __atomic_load_n(&queued, __ATOMIC_RELAXED) != 0;
+#endif
+}
+
 bool register_graph_passes(const GraphPassOptions& options, std::string& error) {
   if (options.vignette) {
     sVignette.anchor = options.vignetteAnchor;
@@ -327,10 +327,16 @@ bool register_graph_passes(const GraphPassOptions& options, std::string& error) 
       return false;
     }
   }
-  return !options.depthCheck || register_depth_probe(error);
+  if (options.depthCheck && !register_depth_probe(error)) {
+    return false;
+  }
+  return options.gpuCull == 0 ||
+         register_cull_passes(
+             {.instances = options.gpuCull, .check = options.cullCheck, .timings = options.cullTimings}, error);
 }
 
 void update_graph_passes(u32 frame) {
+  update_cull_passes(frame);
   if (sProbe.id != aurora::render::InvalidPass && frame >= DepthCheckFrame &&
       sProbe.armedFrame.load(std::memory_order_relaxed) == UINT32_MAX) {
     // Draws whose pipeline is still compiling are skipped, so depth read before they finish misses part of the scene
@@ -352,6 +358,7 @@ void update_graph_passes(u32 frame) {
 }
 
 void finish_graph_passes() {
+  finish_cull_passes();
   // An unarmed or disabled probe copied nothing, so there is no readback to wait for
   if (sProbe.id == aurora::render::InvalidPass || sProbe.encodes.load(std::memory_order_relaxed) == 0 ||
       sProbe.armedFrame.load(std::memory_order_relaxed) == UINT32_MAX) {
@@ -372,6 +379,7 @@ GraphPassReport graph_pass_report() {
       .probeEncodes = sProbe.encodes.load(std::memory_order_relaxed),
       .probeReady = sProbe.result.load(std::memory_order_acquire) == ProbeResult::Ready,
       .source = aurora::render::scene_depth_source(),
+      .cull = cull_report(),
   };
   if (report.probeReady) {
     std::lock_guard lock{sProbe.mutex};
@@ -381,7 +389,8 @@ GraphPassReport graph_pass_report() {
 }
 
 void unregister_graph_passes() {
-  if (sVignette.id == aurora::render::InvalidPass && sProbe.id == aurora::render::InvalidPass) {
+  const bool cull = unregister_cull_passes();
+  if (!cull && sVignette.id == aurora::render::InvalidPass && sProbe.id == aurora::render::InvalidPass) {
     return;
   }
   for (PassId* id : {&sVignette.id, &sProbe.id}) {
@@ -392,6 +401,7 @@ void unregister_graph_passes() {
   }
   // The worker may still be inside encode, so the pipelines and buffers outlive it until the queue drains
   aurora::gfx::synchronize();
+  release_cull_passes();
   sVignette.pipeline = {};
   sVignette.layout = {};
   sProbe.pipeline = {};

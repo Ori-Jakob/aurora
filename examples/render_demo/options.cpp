@@ -1,5 +1,7 @@
 #include "options.hpp"
 
+#include "cull_reference.hpp"
+
 #include <array>
 #include <charconv>
 #include <utility>
@@ -180,31 +182,92 @@ bool apply_custom_draw_probe(Options& options, std::string_view) {
   return true;
 }
 
+bool apply_gpu_cull(Options& options, std::string_view value) {
+  const auto instances = parse_u32(value);
+  if (!instances || *instances == 0 || *instances > MaxCullInstances) {
+    return false;
+  }
+  options.gpuCull = *instances;
+  return true;
+}
+
+bool apply_cull_check(Options& options, std::string_view) {
+  options.cullCheck = true;
+  return true;
+}
+
+bool apply_cull_timings(Options& options, std::string_view) {
+  options.cullTimings = true;
+  return true;
+}
+
+bool apply_bench_indirect(Options& options, std::string_view value) {
+  if (value.empty()) {
+    return false;
+  }
+  options.benchPath = value;
+  return true;
+}
+
+bool apply_bench_blocks(Options& options, std::string_view value) {
+  const auto blocks = parse_u32(value);
+  if (!blocks || *blocks == 0) {
+    return false;
+  }
+  options.benchBlocks = *blocks;
+  options.benchBlocksSet = true;
+  return true;
+}
+
+bool apply_bench_rebind(Options& options, std::string_view value) {
+  const auto split = value.find(',');
+  if (split == std::string_view::npos) {
+    return false;
+  }
+  const auto uniform = parse_u32(value.substr(0, split));
+  const auto texture = parse_u32(value.substr(split + 1));
+  if (!uniform || !texture || *uniform > 1000 || *texture > 1000) {
+    return false;
+  }
+  options.benchUniformPermille = *uniform;
+  options.benchTexturePermille = *texture;
+  options.benchRebindSet = true;
+  return true;
+}
+
 struct Flag {
   std::string_view name;
   bool takesValue;
   bool (*apply)(Options& options, std::string_view value);
+  // The bench runs before GXInit and never enters the frame loop, so these flags would have nothing to act on
+  bool frameLoop = false;
 };
 
-constexpr std::array<Flag, 20> Flags{{
-    {"--frames", true, apply_frames},
-    {"--timeout", true, apply_timeout},
+constexpr std::array<Flag, 26> Flags{{
+    {"--frames", true, apply_frames, true},
+    {"--timeout", true, apply_timeout, true},
     {"--backend", true, apply_backend},
     {"--profile", true, apply_profile},
     {"--size", true, apply_size},
     {"--data-dir", true, apply_data_dir},
-    {"--trace", true, apply_trace},
-    {"--trace-start", true, apply_trace_start},
-    {"--trace-frames", true, apply_trace_frames},
+    {"--trace", true, apply_trace, true},
+    {"--trace-start", true, apply_trace_start, true},
+    {"--trace-frames", true, apply_trace_frames, true},
     {"--fail-on-error", false, apply_fail_on_error},
-    {"--vignette", false, apply_vignette},
-    {"--vignette-anchor", true, apply_vignette_anchor},
-    {"--expect-anchor-warnings", true, apply_expect_anchor_warnings},
+    {"--vignette", false, apply_vignette, true},
+    {"--vignette-anchor", true, apply_vignette_anchor, true},
+    {"--expect-anchor-warnings", true, apply_expect_anchor_warnings, true},
     {"--msaa", true, apply_msaa},
-    {"--depth-check", false, apply_depth_check},
-    {"--no-hints", false, apply_no_hints},
-    {"--check-hints", false, apply_check_hints},
-    {"--custom-draw-probe", false, apply_custom_draw_probe},
+    {"--depth-check", false, apply_depth_check, true},
+    {"--no-hints", false, apply_no_hints, true},
+    {"--check-hints", false, apply_check_hints, true},
+    {"--custom-draw-probe", false, apply_custom_draw_probe, true},
+    {"--gpu-cull", true, apply_gpu_cull, true},
+    {"--cull-check", false, apply_cull_check, true},
+    {"--cull-timings", false, apply_cull_timings, true},
+    {"--bench-indirect", true, apply_bench_indirect},
+    {"--bench-blocks", true, apply_bench_blocks},
+    {"--bench-rebind", true, apply_bench_rebind},
     {"-h", false, apply_help},
     {"--help", false, apply_help},
 }};
@@ -240,6 +303,7 @@ std::string_view backend_name(AuroraBackend backend) noexcept {
 std::optional<Options> parse_options(int argc, const char* const* argv, const char* envBackend, std::string& error) {
   Options options;
   bool backendFlag = false;
+  std::string_view frameLoopFlag;
   for (int i = 1; i < argc; ++i) {
     const std::string_view arg = argv[i];
     const Flag* flag = nullptr;
@@ -266,6 +330,9 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
       return std::nullopt;
     }
     backendFlag |= flag->name == "--backend";
+    if (flag->frameLoop && frameLoopFlag.empty()) {
+      frameLoopFlag = flag->name;
+    }
   }
   if (!backendFlag && !options.help && envBackend != nullptr && *envBackend != '\0') {
     const auto backend = parse_backend(envBackend);
@@ -274,6 +341,10 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
       return std::nullopt;
     }
     options.backend = *backend;
+  }
+  if (!options.benchPath.empty() && !frameLoopFlag.empty()) {
+    error = "--bench-indirect cannot be combined with " + std::string{frameLoopFlag};
+    return std::nullopt;
   }
   if (!options.tracePath.empty() && options.frames != 0 &&
       options.frames < static_cast<uint64_t>(options.traceStart) + options.traceFrames) {
@@ -285,7 +356,7 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
     return std::nullopt;
   }
   // Graph passes and custom draws record GPU work outside the GX FIFO, so the capture would be discarded
-  if ((options.vignette || options.depthCheck) && !options.tracePath.empty()) {
+  if ((options.vignette || options.depthCheck || options.gpuCull != 0) && !options.tracePath.empty()) {
     error = "render graph passes cannot be traced";
     return std::nullopt;
   }
@@ -296,6 +367,18 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
   // The probe reads frame 30 at the earliest, and the rest leave room for its readback to land
   if (options.depthCheck && options.frames != 0 && options.frames < DepthCheckMinFrames) {
     error = "--depth-check needs at least 40 frames";
+    return std::nullopt;
+  }
+  if ((options.cullCheck || options.cullTimings) && options.gpuCull == 0) {
+    error = options.cullCheck ? "--cull-check needs --gpu-cull" : "--cull-timings needs --gpu-cull";
+    return std::nullopt;
+  }
+  if (options.cullCheck && options.frames != 0 && options.frames < CullCheckMinFrames) {
+    error = "--cull-check needs at least 40 frames";
+    return std::nullopt;
+  }
+  if ((options.benchBlocksSet || options.benchRebindSet) && options.benchPath.empty()) {
+    error = options.benchBlocksSet ? "--bench-blocks needs --bench-indirect" : "--bench-rebind needs --bench-indirect";
     return std::nullopt;
   }
   return options;
@@ -325,6 +408,15 @@ std::string_view usage() noexcept {
          "  --no-hints          emit no render hints and no capture-only draw\n"
          "  --check-hints       exit with code 8 unless aurora decoded or skipped every emitted hint as expected\n"
          "  --custom-draw-probe record a custom draw that leaves foreign bindings behind between GX draws\n"
+         "  --gpu-cull N        frustum-cull N instances (1 to 4194304) in demo.cull and draw them indirectly\n"
+         "  --cull-check        exit with code 9 unless the frame-30 cull output matches the CPU reference\n"
+         "                      (needs --gpu-cull and at least 40 frames)\n"
+         "  --cull-timings      report GPU times of the cull passes from frame 60 (turns the profiler on)\n"
+         "  --bench-indirect PATH\n"
+         "                      measure indirect draw overhead before the frame loop, write JSON to PATH and exit\n"
+         "                      (exit code 10 on failure; combines only with device, size and bench options)\n"
+         "  --bench-blocks N    measured ABBA blocks per bench pair (default 150)\n"
+         "  --bench-rebind U,T  uniform and texture rebind rates in permille (default 1000,500)\n"
          "  -h, --help          show this message\n";
 }
 } // namespace render_demo
