@@ -66,8 +66,8 @@ uint64_t total_bytes() noexcept;
 uint32_t growth_submits() noexcept;
 void shutdown();
 
-enum class Region : uint8_t { DrawArgs, DispatchArgs, Index32 };
-inline constexpr uint32_t RegionCount = 3;
+enum class Region : uint8_t { DrawArgs, DispatchArgs, Index32, SystemState };
+inline constexpr uint32_t RegionCount = 4;
 inline constexpr uint32_t RegionGranularity = 256;
 inline constexpr uint32_t MaxBlocks = 1024;
 inline constexpr uint64_t AllRequests = UINT64_MAX;

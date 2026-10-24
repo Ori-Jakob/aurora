@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pipeline_cache.hpp"
+#include "recording.hpp"
 #include "resources.hpp"
 #include "types.hpp"
 #include "tex_palette_conv.hpp"
@@ -202,11 +203,28 @@ struct EncoderTask {
   uint32_t payloadSize = 0;
 };
 
+struct ComputeEntry {
+  enum class Kind : uint8_t { Dispatch, Copy };
+  Kind kind = Kind::Dispatch;
+  Range range;
+  uint32_t params = 0;
+  uint32_t dstOffset = 0;
+  std::array<uint32_t, 3> groups{};
+  ComputeBinder bind = nullptr;
+  CopyTarget target = nullptr;
+  alignas(std::max_align_t) std::array<std::byte, ComputePayloadSize> payload{};
+};
+
+struct ComputeBatch {
+  std::vector<ComputeEntry> entries;
+};
+
 enum class FrameOpType : uint8_t {
   RenderPass,
   TextureCopy,
   EncoderTask,
   RenderStage,
+  Compute,
 };
 
 struct FrameOp {
@@ -216,9 +234,26 @@ struct FrameOp {
   TextureCopy* textureCopy = nullptr;
   EncoderTask* encoderTask = nullptr;
   const render::detail::StageData* stageData = nullptr;
+  const ComputeBatch* computeBatch = nullptr;
   StagingHighWater highWater;
   std::vector<const TextureUpload*> textureUploads;
 };
+
+inline bool op_has_payload(const FrameOp& op) noexcept {
+  switch (op.type) {
+  case FrameOpType::RenderPass:
+    return op.renderPass != nullptr;
+  case FrameOpType::TextureCopy:
+    return op.textureCopy != nullptr;
+  case FrameOpType::EncoderTask:
+    return op.encoderTask != nullptr;
+  case FrameOpType::RenderStage:
+    return op.stageData != nullptr;
+  case FrameOpType::Compute:
+    return op.computeBatch != nullptr;
+  }
+  return false;
+}
 
 using RenderPassList = std::deque<RenderPass>;
 
@@ -234,6 +269,7 @@ struct FramePacket {
   std::deque<TextureCopy> textureCopies;
   std::deque<EncoderTask> encoderTasks;
   std::deque<render::detail::StageData> stages;
+  std::deque<ComputeBatch> computeBatches;
   std::deque<FrameOp> ops;
   std::deque<TextureUpload> textureUploads;
 #ifdef AURORA_GFX_DEBUG_GROUPS
@@ -255,6 +291,9 @@ struct FramePacket {
   uint32_t residentCapacity = 0;
   uint32_t residentLimit = 0;
   uint32_t residentEpoch = 0;
+  uint32_t pendingCompute = UINT32_MAX;
+  uint32_t computeParamsBytes = 0;
+  bool segmentReadsGpuState = false;
   StagingHighWater copied;
   AuroraStats stats{};
 };

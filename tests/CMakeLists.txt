@@ -590,9 +590,11 @@ if (TARGET render_demo)
 
   # GPU-system commands decode in core, so these run with the render module off too
   if (AURORA_ENABLE_RENDER)
-    set(_gpu_systems "systems ready 1/1")
+    set(_gpu_systems "dispatches [1-9][0-9]*, systems ready 2/2")
+    set(_gpu_reserves 4)
   else ()
-    set(_gpu_systems "systems unavailable")
+    set(_gpu_systems "dispatches 0, systems unavailable")
+    set(_gpu_reserves 0)
   endif ()
   string(CONCAT _gpu_pass "gpu: uploads 120, binds [1-9][0-9]*, suppressed 0, failed 0, rejected 0, refused 0, "
                           "stale 0, ${_gpu_systems}")
@@ -648,6 +650,13 @@ if (TARGET aurora_gxreplay)
     COMMAND $<TARGET_FILE:aurora_gxreplay> --self-test --backend null --cpu-draw-zones
             --out ${_gxreplay_dir}/self_test_cpu_draw_zones)
   set_tests_properties(gxreplay_self_test_cpu_draw_zones_null PROPERTIES LABELS smoke TIMEOUT 180)
+  set(AURORA_TEST_HARDWARE_BACKENDS "" CACHE STRING "Backends that run the hardware self-test, such as d3d12;vulkan")
+  foreach (_backend IN LISTS AURORA_TEST_HARDWARE_BACKENDS)
+    add_test(NAME gxreplay_self_test_gpu_${_backend}
+      COMMAND $<TARGET_FILE:aurora_gxreplay> --self-test --backend ${_backend}
+              --out ${_gxreplay_dir}/self_test_gpu_${_backend})
+    set_tests_properties(gxreplay_self_test_gpu_${_backend} PROPERTIES LABELS hardware TIMEOUT 180)
+  endforeach ()
   if (TARGET render_demo)
     add_test(NAME gxreplay_render_demo_capture
       COMMAND $<TARGET_FILE:render_demo> --backend null --frames 8 --timeout 60
@@ -711,7 +720,7 @@ if (TARGET aurora_gxreplay)
               --no-png --out ${_gxreplay_dir}/render_demo_gpu_replay)
     set_tests_properties(gxreplay_render_demo_gpu_replay PROPERTIES LABELS smoke TIMEOUT 180
       FIXTURES_REQUIRED gxreplay_demo_gpu_trace FIXTURES_SETUP gxreplay_demo_gpu_replay
-      PASS_REGULAR_EXPRESSION "gpu: run 1, uploads 4, reserves 0, binds [1-9]"
+      PASS_REGULAR_EXPRESSION "gpu: run 1, uploads 4, reserves ${_gpu_reserves}, binds [1-9]"
       FAIL_REGULAR_EXPRESSION "${_gpu_replay_fail}")
     add_test(NAME gxreplay_render_demo_gpu_default_replay
       COMMAND $<TARGET_FILE:aurora_gxreplay> ${_gxreplay_dir}/render_demo_gpu_default.gxtrace --backend null --no-png

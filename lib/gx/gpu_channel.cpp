@@ -39,9 +39,15 @@ enum class Refusal : uint8_t {
   Unknown,
   GpuOnly,
   Bounds,
+  Kernel,
+  CreationFrame,
+  DispatchHandle,
+  DispatchInputs,
+  DispatchParams,
+  Dispatches,
   Count,
 };
-enum class Rejection : uint8_t { Handle, Gap, Storage, Create, Update, Destroy, Count };
+enum class Rejection : uint8_t { Handle, Gap, Storage, Create, Update, Destroy, Dispatch, Count };
 
 struct GameSlot {
   uint32_t generation = 0;
@@ -49,6 +55,8 @@ struct GameSlot {
   uint32_t persistentBytes = 0;
   uint32_t flags = 0;
   uint32_t createSerial = 0;
+  uint32_t kernelCount = 0;
+  bool flushOwed = false;
 };
 
 struct GameState {
@@ -62,6 +70,7 @@ struct GameState {
   uint64_t requested = 0;
   uint64_t shadowBytes = 0;
   uint32_t liveSystems = 0;
+  uint32_t dispatches = 0;
   std::array<GameSlot, MaxSystems> slots{};
   std::array<bool, static_cast<size_t>(Refusal::Count)> warned{};
   uint64_t capChannel = MaxFrameChannelBytes;
@@ -74,9 +83,13 @@ struct FifoSlot {
   uint32_t generation = 0;
   bool live = false;
   bool shadowWritten = false;
+  bool pendingFlush = false;
+  bool dispatched = false;
+  bool stateDiverged = false;
   uint32_t flags = 0;
   uint32_t persistentBytes = 0;
   uint32_t createdSerial = 0;
+  uint32_t kernelCount = 0;
   std::vector<uint8_t> payload;
   std::vector<uint8_t> shadow;
 };
@@ -100,6 +113,7 @@ std::atomic<const SystemBackend*> g_backend{nullptr};
 std::atomic_uint64_t g_refused{0};
 std::atomic_uint64_t g_refusedBytes{0};
 std::atomic_uint64_t g_staleBinds{0};
+std::atomic_uint64_t g_dispatchesRefused{0};
 // FIFO thread writes these
 std::atomic_uint64_t g_uploads{0};
 std::atomic_uint64_t g_uploadBytes{0};
@@ -115,6 +129,9 @@ std::atomic_uint64_t g_created{0};
 std::atomic_uint64_t g_destroyed{0};
 std::atomic_uint64_t g_updates{0};
 std::atomic_uint64_t g_updateBytes{0};
+std::atomic_uint64_t g_dispatches{0};
+std::atomic_uint64_t g_dispatchesRejected{0};
+std::atomic_uint64_t g_persistentCopies{0};
 std::atomic_uint32_t g_liveSystems{0};
 
 inline void bump(std::atomic_uint64_t& counter, uint64_t n = 1) noexcept {
@@ -169,9 +186,9 @@ void write_command(uint16_t id, uint32_t payloadSize, Fill&& fill) noexcept {
   fifo::write_data(buffer.data(), static_cast<uint32_t>(buffer.size()));
 }
 
-bool budget_allows(uint64_t bytes, std::string_view what) noexcept {
+bool budget_allows(uint64_t bytes, std::string_view what, uint64_t flushBytes = 0) noexcept {
   latch_budget();
-  const uint64_t cost = cost_of(bytes);
+  const uint64_t cost = (bytes != 0 ? cost_of(bytes) : 0) + (flushBytes != 0 ? cost_of(flushBytes) : 0);
   if (g_game.cost + cost > g_game.budget) {
     g_game.demand += cost;
     refuse(Refusal::Budget, bytes, [&] {
@@ -188,6 +205,17 @@ void charge(uint64_t bytes, uint64_t commandBytes) noexcept {
   g_game.cost += cost;
   g_game.demand += cost;
   g_game.commandBytes += commandBytes;
+}
+
+uint64_t owed_flush(const GameSlot& slot) noexcept {
+  return slot.flushOwed && current_serial() != slot.createSerial ? slot.persistentBytes : 0;
+}
+
+void settle_flush(GameSlot& slot, uint64_t flushBytes) noexcept {
+  if (flushBytes != 0) {
+    charge(flushBytes, 0);
+    slot.flushOwed = false;
+  }
 }
 
 bool commands_allow(uint64_t bytes, std::string_view what) noexcept {
@@ -431,6 +459,8 @@ SystemId game_create(const SystemDesc& desc) noexcept {
   slot.persistentBytes = desc.persistentBytes;
   slot.flags = desc.flags;
   slot.createSerial = current_serial();
+  slot.kernelCount = static_cast<uint32_t>(desc.kernels.size());
+  slot.flushOwed = false;
   ++g_game.liveSystems;
   g_game.shadowBytes += shadowed;
   g_game.commandBytes += size;
@@ -469,7 +499,7 @@ void game_update(SystemId id, uint32_t byteOffset, const void* data, uint32_t by
   if (!outside_display_list(bytes, "update_persistent")) {
     return;
   }
-  const GameSlot* slot = live_slot(id);
+  GameSlot* slot = live_slot(id);
   if (slot == nullptr) {
     refuse(Refusal::Unknown, bytes, [&] { return fmt::format("system 0x{:016X} is not live", id); });
     return;
@@ -486,10 +516,15 @@ void game_update(SystemId id, uint32_t byteOffset, const void* data, uint32_t by
     });
     return;
   }
-  if (!budget_allows(bytes, "update_persistent") || !commands_allow(bytes, "update_persistent")) {
+  const uint64_t flush = owed_flush(*slot);
+  if (!budget_allows(bytes, "update_persistent", flush) || !commands_allow(bytes, "update_persistent")) {
     return;
   }
+  settle_flush(*slot, flush);
   charge(bytes, bytes);
+  if (current_serial() == slot->createSerial) {
+    slot->flushOwed = true;
+  }
   write_command<hints::wire::GpuUpdateHeader>(GX_AURORA_GPU_UPDATE_PERSISTENT, hints::wire::GpuUpdateHeader + bytes,
                                               [&](hints::wire::Writer& out) {
                                                 out.u16(AURORA_HINT_GPU_UPDATE_PERSISTENT_VERSION);
@@ -532,6 +567,92 @@ SystemStatus game_status(SystemId id) noexcept {
     return SystemStatus::Pending;
   }
   return status;
+}
+
+template <typename Message>
+bool refuse_dispatch(Refusal kind, Message&& message) noexcept {
+  bump(g_dispatchesRefused);
+  refuse(kind, 0, std::forward<Message>(message));
+  return false;
+}
+
+bool game_dispatch(SystemId system, uint32_t kernel, std::span<const Handle> inputs, Handle output,
+                   std::array<uint32_t, 3> elements, std::span<const uint8_t> params) noexcept {
+  if (g_backend.load(std::memory_order_acquire) == nullptr) {
+    return refuse_dispatch(Refusal::Systems, [] {
+      return std::string{"dispatch needs the render module, which is off or uninitialised"};
+    });
+  }
+  if (fifo::in_display_list()) {
+    return refuse_dispatch(Refusal::DisplayList, [] { return std::string{"dispatch inside a display list"}; });
+  }
+  GameSlot* slot = live_slot(system);
+  if (slot == nullptr || kernel >= slot->kernelCount) {
+    return refuse_dispatch(Refusal::Kernel, [&] {
+      return fmt::format("dispatch of kernel {} names system 0x{:016X}, which is not live or lacks it", kernel, system);
+    });
+  }
+  if (slot->persistentBytes != 0 && current_serial() == slot->createSerial) {
+    return refuse_dispatch(Refusal::CreationFrame, [&] {
+      return fmt::format("system 0x{:016X} keeps state, which exists only from the frame after its creation", system);
+    });
+  }
+  const bool outputOk = output == InvalidHandle ? slot->persistentBytes != 0 : handle_is_current(output);
+  if (!outputOk || !std::ranges::all_of(inputs, [](Handle input) { return handle_is_current(input); })) {
+    return refuse_dispatch(Refusal::DispatchHandle, [&] {
+      return fmt::format(
+          "dispatch of system 0x{:016X} names a handle that is not from this frame, or no output "
+          "for a system without state",
+          system);
+    });
+  }
+  if (inputs.size() > MaxDispatchInputs) {
+    return refuse_dispatch(Refusal::DispatchInputs, [&] {
+      return fmt::format("dispatch with {} inputs is past the limit of {}", inputs.size(), MaxDispatchInputs);
+    });
+  }
+  if (params.size() > MaxDispatchParamsSize) {
+    return refuse_dispatch(Refusal::DispatchParams, [&] {
+      return fmt::format("dispatch with {} parameter bytes is past the limit of {}", params.size(),
+                         MaxDispatchParamsSize);
+    });
+  }
+  if (g_game.dispatches >= MaxFrameDispatches) {
+    return refuse_dispatch(Refusal::Dispatches,
+                           [] { return fmt::format("more than {} dispatches this frame", MaxFrameDispatches); });
+  }
+  const auto paramWords = static_cast<uint32_t>((params.size() + 3) / 4);
+  const auto size =
+      static_cast<uint32_t>(hints::wire::GpuDispatchHeaderV1 + inputs.size() * sizeof(uint64_t) + paramWords * 4);
+  const uint64_t flush = owed_flush(*slot);
+  if (!commands_allow(size, "dispatch") || (flush != 0 && !budget_allows(0, "the owed state flush", flush))) {
+    bump(g_dispatchesRefused);
+    return false;
+  }
+  settle_flush(*slot, flush);
+  g_game.commandBytes += size;
+  ++g_game.dispatches;
+
+  constexpr size_t MaxSize =
+      HeaderSize + hints::wire::GpuDispatchHeaderV1 + MaxDispatchInputs * sizeof(uint64_t) + MaxDispatchParamsSize;
+  std::array<uint8_t, MaxSize> buffer{};
+  hints::wire::Writer out{std::span{buffer.data(), HeaderSize + size}};
+  out.header(GX_AURORA_GPU_DISPATCH, size);
+  out.u16(AURORA_HINT_GPU_DISPATCH_VERSION);
+  out.u64(system);
+  out.u32(kernel);
+  out.u64(output);
+  for (const uint32_t count : elements) {
+    out.u32(count);
+  }
+  out.u8(static_cast<uint8_t>(inputs.size()));
+  out.u8(static_cast<uint8_t>(paramWords));
+  for (const Handle input : inputs) {
+    out.u64(input);
+  }
+  out.bytes(params);
+  fifo::write_data(buffer.data(), HeaderSize + size);
+  return true;
 }
 } // namespace
 
@@ -645,9 +766,13 @@ bool on_create(const SystemCreate& desc, std::span<const uint8_t> payload) noexc
   slot.generation = generation;
   slot.live = true;
   slot.shadowWritten = false;
+  slot.pendingFlush = false;
+  slot.dispatched = false;
+  slot.stateDiverged = false;
   slot.flags = desc.flags;
   slot.persistentBytes = desc.persistentBytes;
   slot.createdSerial = current_serial();
+  slot.kernelCount = static_cast<uint32_t>(desc.kernels.size());
   slot.payload.assign(payload.begin(), payload.end());
   slot.shadow.assign(shadowed, 0);
   ++g_fifo.liveSystems;
@@ -675,6 +800,26 @@ bool on_update(uint64_t id, uint32_t byteOffset, std::span<const uint8_t> bytes)
   slot->shadowWritten = true;
   bump(g_updates);
   bump(g_updateBytes, bytes.size());
+  const SystemBackend* backend = g_backend.load(std::memory_order_acquire);
+  if (backend == nullptr || backend->update == nullptr || slot->persistentBytes == 0) {
+    return true;
+  }
+  if (current_serial() == slot->createdSerial) {
+    slot->pendingFlush = true;
+    return true;
+  }
+  bool applied = true;
+  if (std::exchange(slot->pendingFlush, false)) {
+    applied = backend->update(backend->userData, id, 0, slot->shadow);
+    bump(applied ? g_persistentCopies : g_storageMisses);
+  }
+  if (applied) {
+    applied = backend->update(backend->userData, id, byteOffset, bytes);
+    bump(applied ? g_persistentCopies : g_storageMisses);
+  }
+  if (!applied) {
+    slot->stateDiverged = true;
+  }
   return true;
 }
 
@@ -687,6 +832,9 @@ bool on_destroy(uint64_t id) noexcept {
   g_fifo.shadowBytes -= slot->shadow.size();
   slot->live = false;
   slot->shadowWritten = false;
+  slot->pendingFlush = false;
+  slot->dispatched = false;
+  slot->stateDiverged = false;
   slot->payload.clear();
   slot->shadow.clear();
   --g_fifo.liveSystems;
@@ -696,6 +844,73 @@ bool on_destroy(uint64_t id) noexcept {
       backend != nullptr && backend->destroy != nullptr) {
     backend->destroy(backend->userData, id);
   }
+  return true;
+}
+
+bool on_dispatch(uint64_t system, uint32_t kernel, uint64_t output, std::span<const uint64_t> inputs,
+                 std::array<uint32_t, 3> elements, std::span<const uint8_t> params) noexcept {
+  const auto fail = [&](auto&& message) {
+    bump(g_dispatchesRejected);
+    if (output != InvalidHandle) {
+      mark_failed(output);
+    }
+    if (!std::exchange(g_fifo.warned[static_cast<size_t>(Rejection::Dispatch)], true)) {
+      Log.warn("GPU channel: {}; the dispatch is rejected and its output fails", message());
+    }
+    return false;
+  };
+  FifoSlot* slot = live_fifo_slot(system);
+  if (slot == nullptr || kernel >= slot->kernelCount) {
+    return fail([&] { return fmt::format("system 0x{:016X} is not live or has no kernel {}", system, kernel); });
+  }
+  if (slot->persistentBytes != 0 && current_serial() == slot->createdSerial) {
+    return fail([&] { return fmt::format("system 0x{:016X} keeps state and was created this frame", system); });
+  }
+  const HandleInfo target = output != InvalidHandle ? lookup(output) : HandleInfo{};
+  if (output != InvalidHandle && target.state != HandleState::Reserved) {
+    return fail([&] { return fmt::format("output 0x{:016X} is not a reserve awaiting its writer", output); });
+  }
+  std::array<gfx::Range, MaxDispatchInputs> ranges{};
+  if (inputs.size() > ranges.size()) {
+    return fail([&] { return fmt::format("{} inputs are past the limit", inputs.size()); });
+  }
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    const HandleInfo info = lookup(inputs[i]);
+    if (info.state != HandleState::Uploaded && info.state != HandleState::Written) {
+      return fail([&] { return fmt::format("input 0x{:016X} has no data", inputs[i]); });
+    }
+    ranges[i] = {info.range.offset, AURORA_ALIGN(info.range.size, 4u)};
+  }
+  const SystemBackend* backend = g_backend.load(std::memory_order_acquire);
+  if (backend == nullptr || backend->dispatch == nullptr) {
+    return fail([] { return std::string{"no dispatch backend is installed"}; });
+  }
+  if (std::exchange(slot->pendingFlush, false)) {
+    if (backend->update == nullptr || !backend->update(backend->userData, system, 0, slot->shadow)) {
+      bump(g_storageMisses);
+      slot->stateDiverged = true;
+      return fail([&] { return fmt::format("the state of system 0x{:016X} could not be staged", system); });
+    }
+    bump(g_persistentCopies);
+  }
+  const DispatchDecode desc{
+      .system = system,
+      .kernel = kernel,
+      .output = target.range,
+      .inputs = std::span{ranges.data(), inputs.size()},
+      .elements = elements,
+      .params = params,
+  };
+  if (!backend->dispatch(backend->userData, desc)) {
+    return fail([&] { return fmt::format("system 0x{:016X} could not record kernel {}", system, kernel); });
+  }
+  if (output != InvalidHandle) {
+    mark_written(output);
+  }
+  if (slot->persistentBytes != 0) {
+    slot->dispatched = true;
+  }
+  bump(g_dispatches);
   return true;
 }
 
@@ -747,6 +962,7 @@ void end_frame() noexcept {
   g_game.cost = 0;
   g_game.commandBytes = 0;
   g_game.demand = 0;
+  g_game.dispatches = 0;
   uint32_t serial = g_serial.load(std::memory_order_relaxed) + 1;
   if (serial == 0) {
     serial = 1;
@@ -803,8 +1019,9 @@ void write_preamble(std::vector<uint8_t>& out) {
 }
 
 bool uncaptured_gpu_state() noexcept {
-  return std::ranges::any_of(g_fifo.slots,
-                             [](const FifoSlot& slot) { return slot.live && (slot.flags & SystemGpuOnlyState) != 0; });
+  return std::ranges::any_of(g_fifo.slots, [](const FifoSlot& slot) {
+    return slot.live && ((slot.flags & SystemGpuOnlyState) != 0 || slot.dispatched || slot.stateDiverged);
+  });
 }
 
 Stats stats() noexcept {
@@ -828,14 +1045,21 @@ Stats stats() noexcept {
       .updates = load(g_updates),
       .updateBytes = load(g_updateBytes),
       .liveSystems = g_liveSystems.load(std::memory_order_relaxed),
+      .dispatches = load(g_dispatches),
+      .dispatchesRefused = load(g_dispatchesRefused),
+      .dispatchesRejected = load(g_dispatchesRejected),
+      .persistentCopies = load(g_persistentCopies),
   };
 }
 
 namespace testing {
 void reset_stats() noexcept {
-  for (auto* counter : {&g_refused, &g_refusedBytes, &g_staleBinds, &g_uploads, &g_uploadBytes, &g_reserves,
-                        &g_reserveBytes, &g_failedHandles, &g_storageMisses, &g_rejected, &g_binds, &g_invalidBinds,
-                        &g_suppressedDraws, &g_created, &g_destroyed, &g_updates, &g_updateBytes}) {
+  for (auto* counter :
+       {&g_refused,         &g_refusedBytes, &g_staleBinds,      &g_uploads,           &g_uploadBytes,
+        &g_reserves,        &g_reserveBytes, &g_failedHandles,   &g_storageMisses,     &g_rejected,
+        &g_binds,           &g_invalidBinds, &g_suppressedDraws, &g_created,           &g_destroyed,
+        &g_updates,         &g_updateBytes,  &g_dispatches,      &g_dispatchesRefused, &g_dispatchesRejected,
+        &g_persistentCopies}) {
     counter->store(0, std::memory_order_relaxed);
   }
   g_game.warned = {};
@@ -873,6 +1097,11 @@ void update_persistent(SystemId id, uint32_t byteOffset, const void* data, uint3
 void destroy_system(SystemId id) noexcept { gx::gpu_channel::game_destroy(id); }
 
 SystemStatus system_status(SystemId id) noexcept { return gx::gpu_channel::game_status(id); }
+
+bool dispatch(SystemId system, uint32_t kernel, std::span<const Handle> inputs, Handle output,
+              std::array<uint32_t, 3> elements, std::span<const uint8_t> params) noexcept {
+  return gx::gpu_channel::game_dispatch(system, kernel, inputs, output, elements, params);
+}
 
 Stats stats() noexcept { return gx::gpu_channel::stats(); }
 } // namespace aurora::render::gpu

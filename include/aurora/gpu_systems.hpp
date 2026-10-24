@@ -28,6 +28,9 @@ inline constexpr uint32_t MaxWorkgroupInvocations = 128;
 inline constexpr uint32_t MaxSystemSourceBytes = 256u << 10;
 inline constexpr uint32_t MaxSystemNameBytes = 31;
 inline constexpr uint32_t MaxKernelNameBytes = 63;
+inline constexpr uint32_t MaxDispatchInputs = 8;
+inline constexpr uint32_t MaxDispatchParamsSize = 128;
+inline constexpr uint32_t MaxFrameDispatches = 4096;
 
 struct KernelDesc {
   std::string_view entryPoint;
@@ -52,6 +55,7 @@ struct Stats {
   uint64_t binds = 0, invalidBinds = 0, suppressedDraws = 0;
   uint64_t created = 0, destroyed = 0, updates = 0, updateBytes = 0;
   uint32_t liveSystems = 0;
+  uint64_t dispatches = 0, dispatchesRefused = 0, dispatchesRejected = 0, persistentCopies = 0;
 };
 
 bool systems_available() noexcept;
@@ -62,5 +66,7 @@ SystemId create_system(const SystemDesc& desc) noexcept;
 void update_persistent(SystemId id, uint32_t byteOffset, const void* data, uint32_t bytes) noexcept;
 void destroy_system(SystemId id) noexcept;
 SystemStatus system_status(SystemId id) noexcept;
+bool dispatch(SystemId system, uint32_t kernel, std::span<const Handle> inputs, Handle output,
+              std::array<uint32_t, 3> elements, std::span<const uint8_t> params = {}) noexcept;
 Stats stats() noexcept;
 } // namespace aurora::render::gpu

@@ -2,6 +2,7 @@
 
 #include "render_test_device.hpp"
 
+#include "gfx/encoding.hpp"
 #include "gfx/frame.hpp"
 #include "gfx/pipeline_cache.hpp"
 #include "logging.hpp"
@@ -12,6 +13,7 @@
 #include "render/jobs.hpp"
 #include "render/shader_resolve.hpp"
 #include "render/shaders.hpp"
+#include "render/systems/dispatch.hpp"
 #include "render/systems/systems.hpp"
 #include "webgpu/gpu.hpp"
 
@@ -1122,6 +1124,208 @@ TEST(RenderShadersGpu, IndirectArgsMatchCpu) {
       EXPECT_EQ(gpu.run(pipeline, groups, Count / 64, output, size), kernel.expected);
     }
   }
+}
+
+constexpr std::string_view StreamStepWgsl = R"(//#import aurora/stream
+@compute @workgroup_size(aurora_wg_x, aurora_wg_y, aurora_wg_z)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  if (!stream_active(id)) {
+    return;
+  }
+  let i = stream_index(id);
+  stream_store(i, stream_load(0u, i) + aurora_dispatch.user[0].x);
+}
+)";
+
+wgpu::Buffer g_testStateTarget;
+
+gfx::detail::CopyDestination test_state_target(const void*) { return {.buffer = g_testStateTarget, .size = 64}; }
+
+bool bind_test_kernel(const void* payload, const wgpu::ComputePassEncoder& pass) {
+  return systems::bind_kernel(gfx::detail::compute_payload<systems::KernelRef>(payload), pass);
+}
+
+struct ComputeRig {
+  static constexpr uint64_t StorageSize = 4096;
+  GpuReadback gpu;
+  wgpu::Buffer savedStorage;
+  wgpu::Buffer staging;
+  gfx::detail::FramePacket frame;
+  bool started = false;
+  bool null = false;
+
+  bool start() {
+    if (!gpu.start()) {
+      return false;
+    }
+    started = true;
+    null = gpu.device->adapterInfo.backendType == wgpu::BackendType::Null;
+    gfx::detail::testing::create_compute_layouts();
+    systems::initialize();
+    auto& res = gfx::detail::resources();
+    savedStorage = std::exchange(
+        res.storageBuffer,
+        gpu.buffer(StorageSize, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::CopySrc));
+    const std::vector<uint32_t> fill(StorageSize / 4, 0xFFFFFFFF);
+    gpu.device->queue.WriteBuffer(res.storageBuffer, 0, fill.data(), StorageSize);
+    frame.sizes = {.vertex = 0, .index = 0, .storage = StorageSize};
+    staging = gpu.buffer(gfx::detail::staging_layout(frame.sizes).storage + StorageSize,
+                         wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst);
+    gfx::detail::testing::set_staging_buffer(0, staging);
+    frame.stagingBuffer = 0;
+    return true;
+  }
+
+  ~ComputeRig() {
+    if (!started) {
+      return;
+    }
+    gfx::detail::release_compute_encoding();
+    gfx::detail::testing::set_staging_buffer(0, {});
+    gfx::detail::resources().storageBuffer = std::move(savedStorage);
+    g_testStateTarget = {};
+    systems::shutdown();
+    gfx::detail::testing::release_compute_layouts();
+  }
+
+  [[nodiscard]] PipelineId kernel(std::string_view shader, uint32_t width) const {
+    const std::array constants{
+        Constant{.name = "aurora_wg_x", .value = static_cast<double>(width)},
+        Constant{.name = "aurora_wg_y", .value = 1.0},
+        Constant{.name = "aurora_wg_z", .value = 1.0},
+    };
+    return request_compute({
+        .shader = shader,
+        .constants = constants,
+        .layout = systems::kernel_layout(),
+        .layoutKey = systems::KernelLayoutKey,
+    });
+  }
+
+  void params(uint32_t index, gfx::Range output, std::span<const gfx::Range> inputs, uint32_t elements,
+              uint32_t add) const {
+    gfx::DispatchParams block{};
+    block.output = {output.offset / 4, output.size / 4, 0, 0};
+    for (size_t i = 0; i < inputs.size(); ++i) {
+      block.inputs[2 * i] = inputs[i].offset / 4;
+      block.inputs[2 * i + 1] = inputs[i].size / 4;
+    }
+    block.groups = {1, 1, 1, static_cast<uint32_t>(inputs.size())};
+    block.elements = {elements, 1, 1, 0};
+    std::memcpy(block.user.data(), &add, sizeof(add));
+    gpu.device->queue.WriteBuffer(gfx::detail::resources().uniformBuffer, uint64_t{index} * 256, &block, sizeof(block));
+  }
+
+  static gfx::detail::ComputeEntry dispatch(uint32_t index, gfx::Range output, PipelineId pipeline,
+                                            std::array<uint32_t, 3> groups = {1, 1, 1}) {
+    gfx::detail::ComputeEntry entry{
+        .kind = gfx::detail::ComputeEntry::Kind::Dispatch,
+        .range = output,
+        .params = index * 256,
+        .groups = groups,
+        .bind = bind_test_kernel,
+    };
+    const systems::KernelRef ref{.pipeline = pipeline};
+    std::memcpy(entry.payload.data(), &ref, sizeof(ref));
+    return entry;
+  }
+
+  std::vector<uint32_t> encode(const gfx::detail::ComputeBatch& batch) {
+    const gfx::detail::FrameOp op{.type = gfx::detail::FrameOpType::Compute, .computeBatch = &batch};
+    wgpu::CommandEncoder encoder = gpu.device->device.CreateCommandEncoder();
+    gfx::detail::encode_op(encoder, frame, op);
+    const wgpu::CommandBuffer commands = encoder.Finish();
+    gpu.device->queue.Submit(1, &commands);
+    return test::read_buffer(*gpu.device, gfx::detail::resources().storageBuffer, 0, StorageSize)
+        .value_or(std::vector<uint32_t>{});
+  }
+};
+
+TEST(RenderShadersGpu, ComputeBatchEncodesInOrder) {
+  ComputeRig rig;
+  if (!rig.start()) {
+    GTEST_SKIP() << "no adapter";
+  }
+  ASSERT_TRUE(register_source("test_stream_step", StreamStepWgsl));
+  const PipelineId step = rig.kernel("test_stream_step", 64);
+  ASSERT_EQ(wait(step, WaitNs), PipelineStatus::Ready);
+  g_testStateTarget =
+      rig.gpu.buffer(64, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::CopySrc);
+  const std::array<uint32_t, 4> stagedWords{0x11, 0x22, 0x33, 0x44};
+  rig.gpu.device->queue.WriteBuffer(rig.staging, gfx::detail::staging_layout(rig.frame.sizes).storage + 1024,
+                                    stagedWords.data(), sizeof(stagedWords));
+
+  const gfx::Range r0{0, 16};
+  const gfx::Range r1{64, 16};
+  const gfx::Range r3{192, 16};
+  const gfx::Range r4{256, 16};
+  const gfx::Range r5{320, 16};
+  rig.params(0, r0, {}, 4, 1);
+  rig.params(1, r1, std::array{r0}, 4, 1);
+  rig.params(2, r3, std::array{r1}, 4, 1);
+  rig.params(3, r4, std::array{r1}, 4, 1);
+  rig.params(4, r5, {}, 4, 1);
+  gfx::detail::ComputeBatch batch;
+  batch.entries.push_back(ComputeRig::dispatch(0, r0, step));
+  batch.entries.push_back(ComputeRig::dispatch(1, r1, step));
+  batch.entries.push_back(ComputeRig::dispatch(2, r3, NeverReady));
+  batch.entries.push_back({
+      .kind = gfx::detail::ComputeEntry::Kind::Copy,
+      .range = {1024, 16},
+      .dstOffset = 4,
+      .target = test_state_target,
+  });
+  batch.entries.push_back(ComputeRig::dispatch(3, r4, step));
+  batch.entries.push_back(ComputeRig::dispatch(4, r5, step, {0, 1, 1}));
+  const uint32_t segments = gfx::detail::testing::compute_segments_encoded();
+  const std::vector<uint32_t> words = rig.encode(batch);
+  EXPECT_EQ(gfx::detail::testing::compute_segments_encoded(), segments + 2);
+  if (rig.null) {
+    GTEST_SKIP() << "the null backend runs no shaders";
+  }
+  ASSERT_EQ(words.size(), ComputeRig::StorageSize / 4);
+  const auto expect_words = [&](gfx::Range range, uint32_t value) {
+    for (uint32_t i = 0; i < range.size / 4; ++i) {
+      EXPECT_EQ(words[range.offset / 4 + i], value) << "byte " << range.offset + i * 4;
+    }
+  };
+  expect_words(r0, 1);
+  expect_words(r1, 2);
+  expect_words(r3, 0);
+  expect_words(r4, 3);
+  expect_words(r5, 0);
+  expect_words({16, 48}, 0xFFFFFFFF);
+  expect_words({336, 4096 - 336}, 0xFFFFFFFF);
+  const auto state = test::read_buffer(*rig.gpu.device, g_testStateTarget, 0, 64).value_or(std::vector<uint32_t>{});
+  ASSERT_EQ(state.size(), 16u);
+  EXPECT_EQ(state[0], 0u);
+  EXPECT_EQ(std::vector<uint32_t>(state.begin() + 1, state.begin() + 5),
+            std::vector<uint32_t>(stagedWords.begin(), stagedWords.end()));
+  EXPECT_EQ(state[5], 0u);
+}
+
+TEST(RenderShadersGpu, CopyKernelShortInput) {
+  ComputeRig rig;
+  if (!rig.start()) {
+    GTEST_SKIP() << "no adapter";
+  }
+  const PipelineId copy = rig.kernel("systems/copy", 64);
+  ASSERT_EQ(wait(copy, WaitNs), PipelineStatus::Ready);
+  const std::array<uint32_t, 4> input{5, 6, 7, 8};
+  rig.gpu.device->queue.WriteBuffer(gfx::detail::resources().storageBuffer, 0, input.data(), sizeof(input));
+  const gfx::Range in{0, 16};
+  const gfx::Range out{64, 32};
+  rig.params(0, out, std::array{in}, 8, 0);
+  gfx::detail::ComputeBatch batch;
+  batch.entries.push_back(ComputeRig::dispatch(0, out, copy));
+  const std::vector<uint32_t> words = rig.encode(batch);
+  if (rig.null) {
+    GTEST_SKIP() << "the null backend runs no shaders";
+  }
+  ASSERT_EQ(words.size(), ComputeRig::StorageSize / 4);
+  EXPECT_EQ(std::vector<uint32_t>(words.begin() + 16, words.begin() + 24),
+            (std::vector<uint32_t>{5, 6, 7, 8, 0, 0, 0, 0}));
+  EXPECT_EQ(words[24], 0xFFFFFFFFu);
 }
 
 // render_demo --bench-indirect drives the device from the main thread before the first latch

@@ -102,7 +102,7 @@ IdInfo id_info(uint16_t id) noexcept {
     return {"GPU_RESERVE", AURORA_HINT_GPU_RESERVE_VERSION};
   // Payloads arrive together with their decoder
   case GX_AURORA_GPU_DISPATCH:
-    return {"GPU_DISPATCH", 0};
+    return {"GPU_DISPATCH", AURORA_HINT_GPU_DISPATCH_VERSION};
   case GX_AURORA_LOAD_ARRAY_GPU:
     return {"LOAD_ARRAY_GPU", AURORA_HINT_LOAD_ARRAY_GPU_VERSION};
   case GX_AURORA_GPU_UPDATE_PERSISTENT:
@@ -631,6 +631,32 @@ bool decode_gpu(uint16_t id, Decoder& decoder, std::span<const uint8_t> payload)
       return false;
     }
     gpu_channel::on_reserve(handle, bytes, flags);
+    return true;
+  }
+  case GX_AURORA_GPU_DISPATCH: {
+    if (!decoder.header(wire::GpuDispatchHeaderV1)) {
+      return false;
+    }
+    const uint64_t system = in.read<uint64_t>();
+    const uint32_t kernel = in.read<uint32_t>();
+    const uint64_t output = in.read<uint64_t>();
+    std::array<uint32_t, 3> elements{};
+    for (uint32_t& count : elements) {
+      count = in.read<uint32_t>();
+    }
+    const uint8_t inputCount = in.read<uint8_t>();
+    const uint8_t paramWords = in.read<uint8_t>();
+    if (!decoder.value(inputCount <= MaxDispatchInputs, "input count", inputCount) ||
+        !decoder.value(paramWords * 4u <= MaxDispatchParamsSize, "parameter words", paramWords) ||
+        !decoder.size(wire::GpuDispatchHeaderV1 + size_t{inputCount} * sizeof(uint64_t) + size_t{paramWords} * 4)) {
+      return false;
+    }
+    std::array<uint64_t, MaxDispatchInputs> inputs{};
+    for (uint8_t i = 0; i < inputCount; ++i) {
+      inputs[i] = in.read<uint64_t>();
+    }
+    gpu_channel::on_dispatch(system, kernel, output, std::span{inputs.data(), inputCount}, elements,
+                             in.take(size_t{paramWords} * 4));
     return true;
   }
   case GX_AURORA_LOAD_ARRAY_GPU: {

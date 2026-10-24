@@ -319,11 +319,14 @@ int run_self_test(int argc, char* argv[], const Options& options) {
     failure = fmt::format("{} guest reads were not resolved", misses);
   } else if (!same_frames(plainResult.frames, gpuResult.frames, mismatch)) {
     failure = "the GPU-array trace differs from the plain trace: " + mismatch;
-  } else if (const auto& gpuRun = gpuResult.gpuRuns.back().stats; gpuRun.uploads != 2 * SelfTestFrameCount ||
-                                                                  gpuRun.suppressedDraws != 0 ||
-                                                                  gpuRun.failedHandles != 0 || gpuRun.rejected != 0) {
-    failure = fmt::format("the GPU-array trace decoded {} uploads, suppressed {} draws, failed {} and rejected {}",
-                          gpuRun.uploads, gpuRun.suppressedDraws, gpuRun.failedHandles, gpuRun.rejected);
+  } else if (const auto& gpuRun = gpuResult.gpuRuns.back().stats;
+             gpuRun.uploads != 2 * SelfTestFrameCount || gpuRun.suppressedDraws != 0 || gpuRun.failedHandles != 0 ||
+             gpuRun.rejected != 0 || gpuRun.dispatchesRejected != 0 ||
+             gpuRun.dispatches != (render::gpu::systems_available() ? SelfTestFrameCount : 0)) {
+    failure = fmt::format(
+        "the GPU-array trace decoded {} uploads and {} dispatches, suppressed {} draws, failed {} and rejected {}",
+        gpuRun.uploads, gpuRun.dispatches, gpuRun.suppressedDraws, gpuRun.failedHandles,
+        gpuRun.rejected + gpuRun.dispatchesRejected);
   } else if (view) {
 #if AURORA_ENABLE_RENDER
     check_view_frames(options, first, plainResult, auroraInfo.backend != BACKEND_NULL, failure);
@@ -453,13 +456,14 @@ int run_replay(int argc, char* argv[], const Options& options) {
     for (const auto& gpu : result.gpuRuns) {
       std::printf(
           "aurora_gxreplay: gpu: run %u, uploads %llu, reserves %llu, binds %llu, suppressed %llu, failed %llu, "
-          "misses %llu, rejected %llu, systems %u\n",
+          "misses %llu, rejected %llu, systems %u, dispatches %llu\n",
           gpu.run, static_cast<unsigned long long>(gpu.stats.uploads),
           static_cast<unsigned long long>(gpu.stats.reserves), static_cast<unsigned long long>(gpu.stats.binds),
           static_cast<unsigned long long>(gpu.stats.suppressedDraws),
           static_cast<unsigned long long>(gpu.stats.failedHandles),
-          static_cast<unsigned long long>(gpu.stats.storageMisses), static_cast<unsigned long long>(gpu.stats.rejected),
-          gpu.stats.liveSystems);
+          static_cast<unsigned long long>(gpu.stats.storageMisses),
+          static_cast<unsigned long long>(gpu.stats.rejected + gpu.stats.dispatchesRejected), gpu.stats.liveSystems,
+          static_cast<unsigned long long>(gpu.stats.dispatches));
     }
     for (const auto& resident : result.residentRuns) {
       std::printf(

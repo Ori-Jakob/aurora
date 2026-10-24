@@ -1,5 +1,7 @@
 #include "systems.hpp"
 
+#include "dispatch.hpp"
+
 #include "../../gfx/frame.hpp"
 #include "../../gx/gpu_channel.hpp"
 #include "../../internal.hpp"
@@ -31,6 +33,9 @@ struct Slot {
   SystemStatus fixed = SystemStatus::Pending;
   uint32_t kernelCount = 0;
   std::array<shaders::PipelineId, gpu::MaxKernels> pipelines{};
+  std::array<std::array<uint32_t, 3>, gpu::MaxKernels> workgroups{};
+  gpu_heap::BlockHandle state = gpu_heap::BlockHandle::Invalid;
+  uint32_t stateBytes = 0;
 };
 
 struct PipelineKey {
@@ -66,8 +71,8 @@ SystemStatus check(const SystemCreate& desc) noexcept {
   }
   const auto& limits = deviceCaps.limits;
   const uint64_t stateLimit = std::min<uint64_t>(gpu::MaxGpuOnlyStateBytes, limits.maxStorageBufferBindingSize);
-  if ((desc.flags & gpu::SystemGpuOnlyState) != 0 || desc.persistentBytes > stateLimit) {
-    Log.warn("GPU system '{}' failed: GPU-only state of {} bytes needs dispatch support", desc.name,
+  if (desc.persistentBytes > stateLimit) {
+    Log.warn("GPU system '{}' failed: {} bytes of state are past the device's binding limit", desc.name,
              desc.persistentBytes);
     return SystemStatus::Failed;
   }
@@ -167,8 +172,26 @@ void backend_create(void*, const SystemCreate& desc) noexcept {
       slot.fixed = SystemStatus::Failed;
     }
   }
+  for (uint32_t i = 0; i < slot.kernelCount; ++i) {
+    slot.workgroups[i] = desc.kernels[i].workgroupSize;
+  }
+  if (slot.fixed == SystemStatus::Pending && desc.persistentBytes != 0) {
+    slot.state = gpu_heap::create_block(gpu_heap::Region::SystemState,
+                                        AURORA_ALIGN(uint64_t{desc.persistentBytes}, gpu_heap::RegionGranularity));
+    slot.stateBytes = desc.persistentBytes;
+    if (slot.state == gpu_heap::BlockHandle::Invalid) {
+      slot.fixed = SystemStatus::Failed;
+    }
+  }
   std::lock_guard lock{g_slotMutex};
   g_slots[index] = slot;
+}
+
+void release_slot(Slot& slot) noexcept {
+  if (slot.state != gpu_heap::BlockHandle::Invalid) {
+    gpu_heap::destroy_block(slot.state);
+  }
+  slot = {};
 }
 
 void backend_destroy(void*, uint64_t id) noexcept {
@@ -178,14 +201,18 @@ void backend_destroy(void*, uint64_t id) noexcept {
   }
   std::lock_guard lock{g_slotMutex};
   if (g_slots[index].id == id) {
-    g_slots[index] = {};
+    release_slot(g_slots[index]);
   }
 }
 
-void backend_reset(void*) noexcept {
+void release_slots() noexcept {
   std::lock_guard lock{g_slotMutex};
-  g_slots = {};
+  for (Slot& slot : g_slots) {
+    release_slot(slot);
+  }
 }
+
+void backend_reset(void*) noexcept { release_slots(); }
 
 SystemStatus backend_status(void*, uint64_t id) noexcept {
   const uint32_t index = slot_index(id);
@@ -242,6 +269,8 @@ constexpr gx::gpu_channel::SystemBackend Backend{
     .reset = backend_reset,
     .status = backend_status,
     .wait_all = backend_wait_all,
+    .dispatch = decode_dispatch,
+    .update = apply_update,
 };
 } // namespace
 
@@ -273,14 +302,16 @@ void initialize() {
       .bindGroupLayouts = layouts.data(),
   };
   g_kernelLayout = device.CreatePipelineLayout(&layoutDescriptor);
+  initialize_dispatch();
   gx::gpu_channel::set_system_backend(&Backend);
 }
 
 void shutdown() {
   gx::gpu_channel::set_system_backend(nullptr);
+  shutdown_dispatch();
+  release_slots();
   {
     std::lock_guard lock{g_slotMutex};
-    g_slots = {};
     g_pipelines.clear();
     g_pipelineSession = 0;
   }
@@ -300,6 +331,25 @@ shaders::PipelineId kernel_pipeline(uint64_t id, uint32_t kernel) noexcept {
   std::lock_guard lock{g_slotMutex};
   const Slot& slot = g_slots[index];
   return slot.id == id && kernel < slot.kernelCount ? slot.pipelines[kernel] : shaders::PipelineId{};
+}
+
+bool kernel_slot(uint64_t id, uint32_t kernel, KernelSlot& out) noexcept {
+  const uint32_t index = slot_index(id);
+  if (index >= gpu::MaxSystems) {
+    return false;
+  }
+  std::lock_guard lock{g_slotMutex};
+  const Slot& slot = g_slots[index];
+  if (slot.id != id || kernel >= slot.kernelCount) {
+    return false;
+  }
+  out = {
+      .pipeline = slot.pipelines[kernel],
+      .workgroupSize = slot.workgroups[kernel],
+      .state = slot.state,
+      .stateBytes = slot.stateBytes,
+  };
+  return true;
 }
 
 bool wait_ready(uint64_t id) noexcept {

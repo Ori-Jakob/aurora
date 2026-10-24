@@ -60,6 +60,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/shaders.cpp
         lib/render/shaders.hpp
         lib/render/shaders_embed.hpp
+        lib/render/systems/dispatch.cpp
+        lib/render/systems/dispatch.hpp
         lib/render/systems/systems.cpp
         lib/render/systems/systems.hpp
         lib/render/tlsf.cpp

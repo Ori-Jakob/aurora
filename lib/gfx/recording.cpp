@@ -262,6 +262,8 @@ StagingHighWater current_high_water(const FramePacket& frame) noexcept {
 }
 
 FrameOp capture_frame_op(FramePacket& frame, FrameOpType type, uint32_t index) {
+  AURORA_ASSERT(frame.pendingCompute == UINT32_MAX, "Frame op {} captured with a compute batch still pending",
+                magic_enum::enum_name(type));
   FrameOp op{
       .type = type,
       .index = index,
@@ -273,6 +275,8 @@ FrameOp capture_frame_op(FramePacket& frame, FrameOpType type, uint32_t index) {
       .encoderTask =
           type == FrameOpType::EncoderTask && index < frame.encoderTasks.size() ? &frame.encoderTasks[index] : nullptr,
       .stageData = type == FrameOpType::RenderStage && index < frame.stages.size() ? &frame.stages[index] : nullptr,
+      .computeBatch =
+          type == FrameOpType::Compute && index < frame.computeBatches.size() ? &frame.computeBatches[index] : nullptr,
       .highWater = current_high_water(frame),
   };
   op.textureUploads.reserve(op.highWater.textureUploadCount);
@@ -582,18 +586,35 @@ void enqueue_op(FramePacket& frame, uint32_t opIndex) {
   }
   auto op = frame.ops[opIndex];
   render_worker::enqueue_encode_pass(frame.frameId, opIndex, [packet = &frame, op = std::move(op)] {
-    if (op.renderPass == nullptr && op.textureCopy == nullptr && op.encoderTask == nullptr && op.stageData == nullptr) {
+    if (!op_has_payload(op)) {
       return;
     }
     encode_op(packet->encoder, *packet, op);
   });
 }
 
+void flush_compute(FramePacket& frame) {
+  if (frame.pendingCompute == UINT32_MAX) {
+    return;
+  }
+  const uint32_t batch = std::exchange(frame.pendingCompute, UINT32_MAX);
+  const auto opIndex = static_cast<uint32_t>(frame.ops.size());
+  frame.ops.emplace_back(capture_frame_op(frame, FrameOpType::Compute, batch));
+  enqueue_op(frame, opIndex);
+}
+
+// Ops enqueue eagerly, so a batch emitted before the next op lands ahead of every pass not yet enqueued
+void emit_op(FramePacket& frame, FrameOpType type, uint32_t index) {
+  flush_compute(frame);
+  frame.segmentReadsGpuState = false;
+  const auto opIndex = static_cast<uint32_t>(frame.ops.size());
+  frame.ops.emplace_back(capture_frame_op(frame, type, index));
+  enqueue_op(frame, opIndex);
+}
+
 void enqueue_pass(FramePacket& frame, uint32_t passIndex) {
   seal_pass(frame, passIndex);
-  const auto opIndex = static_cast<uint32_t>(frame.ops.size());
-  frame.ops.emplace_back(capture_frame_op(frame, FrameOpType::RenderPass, passIndex));
-  enqueue_op(frame, opIndex);
+  emit_op(frame, FrameOpType::RenderPass, passIndex);
 }
 
 // Keyed by the batch's first sampling stage, so batches never share one; queue order keeps reads before the rewrite
@@ -733,9 +754,7 @@ void emit_stage_batch(StageBatch& batch, const render::detail::SceneDepth& depth
     data.sceneDepth = shared;
     const auto stageIndex = static_cast<uint32_t>(frame.stages.size());
     frame.stages.emplace_back(std::move(data));
-    const auto opIndex = static_cast<uint32_t>(frame.ops.size());
-    frame.ops.emplace_back(capture_frame_op(frame, FrameOpType::RenderStage, stageIndex));
-    enqueue_op(frame, opIndex);
+    emit_op(frame, FrameOpType::RenderStage, stageIndex);
   }
 }
 
@@ -817,6 +836,7 @@ RecordedFrame end_recording() {
   AURORA_ASSERT(g_recorder.currentRenderPass == UINT32_MAX,
                 "end_frame called before finish finalized the current render pass");
   CHECK(g_recorder.pendingStageEnd == 0, "end_frame called with render stages still pending");
+  CHECK(g_recorder.frame().pendingCompute == UINT32_MAX, "end_frame called with a compute batch still pending");
   auto& frame = g_recorder.frame();
   frame.stats.drawCallCount = g_recorder.drawCallCount;
   frame.stats.mergedDrawCallCount = g_recorder.mergedDrawCallCount;
@@ -849,6 +869,7 @@ RecordedFrame end_recording() {
 }
 
 void shutdown_recording() {
+  release_compute_encoding();
   for (auto& pool : g_passSnapshotPools) {
     pool = {};
   }
@@ -983,9 +1004,7 @@ void queue_texture_copy(wgpu::TexelCopyTextureInfo src, wgpu::TexelCopyTextureIn
       .dst = std::move(dst),
       .size = size,
   });
-  const auto opIndex = static_cast<uint32_t>(frame.ops.size());
-  frame.ops.emplace_back(capture_frame_op(frame, FrameOpType::TextureCopy, copyIndex));
-  enqueue_op(frame, opIndex);
+  emit_op(frame, FrameOpType::TextureCopy, copyIndex);
 }
 
 void begin_color_pass(const ColorPassDescriptor& desc) {
@@ -1387,9 +1406,7 @@ bool push_encoder_task(EncoderTaskId type, const void* payload, size_t payloadSi
   if (payloadSize > 0) {
     std::memcpy(task.payload.data(), payload, payloadSize);
   }
-  const auto opIndex = static_cast<uint32_t>(frame.ops.size());
-  frame.ops.emplace_back(capture_frame_op(frame, FrameOpType::EncoderTask, taskIndex));
-  enqueue_op(frame, opIndex);
+  emit_op(frame, FrameOpType::EncoderTask, taskIndex);
 
   resume_efb_pass_loading(prevPass);
   return true;
@@ -1613,6 +1630,140 @@ uint64_t uniform_space_left() noexcept {
   const size_t begin = alignment != 0 ? AURORA_ALIGN(uniforms.size(), alignment) : uniforms.size();
   return begin < uniforms.capacity() ? uniforms.capacity() - begin : 0;
 }
+
+namespace {
+RecordResult refuse_record(std::string_view what, RecordResult result) noexcept {
+  static std::array<bool, magic_enum::enum_count<RecordResult>()> warned{};
+  if (!std::exchange(warned[static_cast<size_t>(result)], true)) {
+    Log.warn("{}: {}; nothing queued", what, magic_enum::enum_name(result));
+  }
+  return result;
+}
+
+RecordResult check_segment(std::string_view what) noexcept {
+  if (!g_recorder.active()) {
+    return refuse_record(what, RecordResult::NoRecording);
+  }
+  if (g_recorder.currentRenderPass == UINT32_MAX) {
+    return refuse_record(what, RecordResult::NoOpenPass);
+  }
+  if (current_frame_packet().segmentReadsGpuState) {
+    return refuse_record(what, RecordResult::SegmentReadsState);
+  }
+  return RecordResult::Recorded;
+}
+
+bool bad_storage_range(const FramePacket& frame, Range range) noexcept {
+  return range.offset % 4 != 0 || range.size % 4 != 0 || uint64_t{range.offset} + range.size > frame.storage.size();
+}
+
+ComputeBatch& pending_batch(FramePacket& frame) {
+  if (frame.pendingCompute == UINT32_MAX) {
+    frame.pendingCompute = static_cast<uint32_t>(frame.computeBatches.size());
+    frame.computeBatches.emplace_back();
+  }
+  return frame.computeBatches[frame.pendingCompute];
+}
+} // namespace
+
+namespace detail {
+RecordResult record_dispatch(ComputeBinder bind, std::span<const std::byte> payload,
+                             const DispatchArgs& args) noexcept {
+  AURORA_ASSERT(!render_worker::is_worker_thread(), "record_dispatch called on the render worker");
+  constexpr std::string_view What = "record_dispatch";
+  if (const RecordResult result = check_segment(What); result != RecordResult::Recorded) {
+    return result;
+  }
+  FramePacket& frame = current_frame_packet();
+  if (bad_storage_range(frame, args.output) ||
+      std::ranges::any_of(args.inputs, [&](const Range& input) { return bad_storage_range(frame, input); })) {
+    return refuse_record(What, RecordResult::BadRange);
+  }
+  if (args.inputs.size() > DispatchMaxInputs) {
+    return refuse_record(What, RecordResult::TooManyInputs);
+  }
+  if (args.user.size() > DispatchUserSize) {
+    return refuse_record(What, RecordResult::UserTooLarge);
+  }
+  const auto& limits = resources().limits;
+  if (std::ranges::any_of(args.groups,
+                          [&](uint32_t groups) { return groups > limits.maxComputeWorkgroupsPerDimension; })) {
+    return refuse_record(What, RecordResult::GroupLimit);
+  }
+  AURORA_ASSERT(payload.size() <= ComputePayloadSize, "record_dispatch payload of {} bytes", payload.size());
+  ComputeEntry entry{.kind = ComputeEntry::Kind::Dispatch, .range = args.output, .groups = args.groups, .bind = bind};
+  std::memcpy(entry.payload.data(), payload.data(), payload.size());
+  if (std::ranges::find(args.groups, 0u) != args.groups.end()) {
+    if (args.output.size != 0) {
+      pending_batch(frame).entries.push_back(entry);
+    }
+    return RecordResult::Recorded;
+  }
+  if (frame.computeParamsBytes + DispatchParamsSize > DispatchParamsBudget) {
+    return refuse_record(What, RecordResult::ParamsBudget);
+  }
+  if (uniform_space_left() < DispatchParamsSize + gx::MaxUniformSize) {
+    return refuse_record(What, RecordResult::UniformSpace);
+  }
+  DispatchParams params{};
+  params.output = {args.output.offset / 4, args.output.size / 4, 0, 0};
+  for (size_t i = 0; i < args.inputs.size(); ++i) {
+    params.inputs[2 * i] = args.inputs[i].offset / 4;
+    params.inputs[2 * i + 1] = args.inputs[i].size / 4;
+  }
+  params.groups = {args.groups[0], args.groups[1], args.groups[2], static_cast<uint32_t>(args.inputs.size())};
+  params.elements = {args.elements[0], args.elements[1], args.elements[2], 0};
+  if (!args.user.empty()) {
+    std::memcpy(params.user.data(), args.user.data(), args.user.size());
+  }
+  const uint32_t alignment = limits.minUniformBufferOffsetAlignment;
+  const Range block = push(frame.uniforms, reinterpret_cast<const uint8_t*>(&params), sizeof(params), alignment);
+  frame.computeParamsBytes += alignment != 0 ? AURORA_ALIGN(DispatchParamsSize, alignment) : DispatchParamsSize;
+  entry.params = block.offset;
+  pending_batch(frame).entries.push_back(entry);
+  return RecordResult::Recorded;
+}
+
+RecordResult record_copy(CopyTarget target, std::span<const std::byte> payload, Range staged,
+                         uint32_t dstOffset) noexcept {
+  AURORA_ASSERT(!render_worker::is_worker_thread(), "record_copy called on the render worker");
+  constexpr std::string_view What = "record_copy";
+  if (const RecordResult result = check_segment(What); result != RecordResult::Recorded) {
+    return result;
+  }
+  FramePacket& frame = current_frame_packet();
+  if (staged.size == 0 || bad_storage_range(frame, staged) || dstOffset % 4 != 0) {
+    return refuse_record(What, RecordResult::BadRange);
+  }
+  AURORA_ASSERT(payload.size() <= ComputePayloadSize, "record_copy payload of {} bytes", payload.size());
+  ComputeEntry entry{
+      .kind = ComputeEntry::Kind::Copy,
+      .range = staged,
+      .dstOffset = dstOffset,
+      .target = target,
+  };
+  std::memcpy(entry.payload.data(), payload.data(), payload.size());
+  pending_batch(frame).entries.push_back(entry);
+  return RecordResult::Recorded;
+}
+
+void note_segment_reads_gpu_state() noexcept {
+  if (g_recorder.active()) {
+    current_frame_packet().segmentReadsGpuState = true;
+  }
+}
+
+namespace testing {
+size_t pending_compute_entries() noexcept {
+  if (!g_recorder.active()) {
+    return 0;
+  }
+  const FramePacket& frame = current_frame_packet();
+  return frame.pendingCompute < frame.computeBatches.size() ? frame.computeBatches[frame.pendingCompute].entries.size()
+                                                            : 0;
+}
+} // namespace testing
+} // namespace detail
 
 uint32_t last_recorded_uniform_size() noexcept { return g_lastRecordedUniformSize; }
 

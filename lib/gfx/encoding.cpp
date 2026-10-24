@@ -408,6 +408,94 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
     frame.copied.textureUploadCount = op.textureUploads.size();
   }
 }
+
+struct StreamGroup {
+  wgpu::Buffer storage;
+  uint64_t storageSize = 0;
+  wgpu::Buffer uniform;
+  wgpu::BindGroup group;
+};
+StreamGroup g_streamGroup;
+uint32_t g_computeSegments = 0;
+
+const wgpu::BindGroup& stream_group(const FramePacket& frame) {
+  const auto& res = resources();
+  auto& cached = g_streamGroup;
+  if (cached.group && cached.storage.Get() == res.storageBuffer.Get() && cached.storageSize == frame.sizes.storage &&
+      cached.uniform.Get() == res.uniformBuffer.Get()) {
+    return cached.group;
+  }
+  const std::array entries{
+      wgpu::BindGroupEntry{.binding = 0, .buffer = res.storageBuffer, .offset = 0, .size = frame.sizes.storage},
+      wgpu::BindGroupEntry{.binding = 1, .buffer = res.uniformBuffer, .offset = 0, .size = DispatchParamsSize},
+  };
+  const wgpu::BindGroupDescriptor descriptor{
+      .label = "GPU systems stream bind group",
+      .layout = compute_stream_layout(),
+      .entryCount = entries.size(),
+      .entries = entries.data(),
+  };
+  cached = {
+      .storage = res.storageBuffer,
+      .storageSize = frame.sizes.storage,
+      .uniform = res.uniformBuffer,
+      .group = g_device.CreateBindGroup(&descriptor),
+  };
+  return cached.group;
+}
+
+bool zero_groups(const ComputeEntry& entry) noexcept {
+  return std::ranges::find(entry.groups, 0u) != entry.groups.end();
+}
+
+void encode_compute(wgpu::CommandEncoder& cmd, FramePacket& frame, const ComputeBatch& batch) {
+  ZoneScoped;
+  const auto& res = resources();
+  for (const auto& entry : batch.entries) {
+    if (entry.kind == ComputeEntry::Kind::Dispatch && entry.range.size > 0) {
+      cmd.ClearBuffer(res.storageBuffer, entry.range.offset, entry.range.size);
+    }
+  }
+  wgpu::ComputePassEncoder pass;
+  const auto end_pass = [&] {
+    if (pass) {
+      pass.End();
+      pass = nullptr;
+    }
+  };
+  for (const auto& entry : batch.entries) {
+    if (entry.kind == ComputeEntry::Kind::Copy) {
+      end_pass();
+      const CopyDestination dst = entry.target(entry.payload.data());
+      if (dst.buffer && uint64_t{entry.dstOffset} + entry.range.size <= dst.size &&
+          dst.base + dst.size <= dst.buffer.GetSize()) {
+        cmd.CopyBufferToBuffer(staging_buffer(frame.stagingBuffer),
+                               staging_layout(frame.sizes).storage + entry.range.offset, dst.buffer,
+                               dst.base + entry.dstOffset, entry.range.size);
+      }
+      continue;
+    }
+    if (zero_groups(entry)) {
+      continue;
+    }
+    if (!pass) {
+      constexpr std::string_view Label = "GPU systems";
+      const wgpu::ComputePassDescriptor descriptor{
+          .label = Label,
+          .timestampWrites = webgpu::gpu_prof::pass_writes(Label),
+      };
+      pass = cmd.BeginComputePass(&descriptor);
+      pass.SetBindGroup(0, compute_empty_group());
+      ++g_computeSegments;
+    }
+    const uint32_t offset = entry.params;
+    pass.SetBindGroup(1, stream_group(frame), 1, &offset);
+    if (entry.bind(entry.payload.data(), pass)) {
+      pass.DispatchWorkgroups(entry.groups[0], entry.groups[1], entry.groups[2]);
+    }
+  }
+  end_pass();
+}
 } // namespace
 
 namespace detail {
@@ -435,8 +523,19 @@ void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op)
       ::aurora::render::detail::run_stage(cmd, *op.stageData);
     }
     break;
+  case FrameOpType::Compute:
+    if (op.computeBatch != nullptr) {
+      encode_compute(cmd, frame, *op.computeBatch);
+    }
+    break;
   }
 }
+
+void release_compute_encoding() noexcept { g_streamGroup = {}; }
+
+namespace testing {
+uint32_t compute_segments_encoded() noexcept { return g_computeSegments; }
+} // namespace testing
 } // namespace detail
 
 void bind_pipeline(const wgpu::RenderPipeline& pipeline, const wgpu::RenderPassEncoder& pass) {

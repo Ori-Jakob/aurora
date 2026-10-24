@@ -88,6 +88,7 @@ constexpr u32 BoxArrayBytes = BoxColorsOffset + sizeof(BoxColors);
 alignas(32) u8 sBoxDisplayList[256];
 u32 sBoxDisplayListSize = 0;
 aurora::render::gpu::Handle sBoxArrays = aurora::render::gpu::InvalidHandle;
+aurora::render::gpu::Handle sBoxPositions = aurora::render::gpu::InvalidHandle;
 std::vector<u8> sGroundTexture;
 GXTexObj sGroundTexObj;
 std::vector<std::vector<SkinnedVertex>> sTentacle;
@@ -111,7 +112,7 @@ void set_box_format() {
   GXSetVtxAttrFmt(GX_VTXFMT1, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
   GXSetVtxAttrFmt(GX_VTXFMT1, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
   if (sBoxArrays != aurora::render::gpu::InvalidHandle) {
-    GXSetArrayGPU(GX_VA_POS, sBoxArrays, 0, sizeof(BoxPositions[0]));
+    GXSetArrayGPU(GX_VA_POS, sBoxPositions, 0, sizeof(BoxPositions[0]));
     GXSetArrayGPU(GX_VA_NRM, sBoxArrays, BoxNormalsOffset, sizeof(BoxNormals[0]));
     GXSetArrayGPU(GX_VA_CLR0, sBoxArrays, BoxColorsOffset, sizeof(BoxColors[0]));
     return;
@@ -121,14 +122,30 @@ void set_box_format() {
   GXSetArray(GX_VA_CLR0, BoxColors, sizeof(BoxColors), sizeof(BoxColors[0]), true);
 }
 
+void copy_box_positions(aurora::render::gpu::SystemId copy) {
+  namespace gpu = aurora::render::gpu;
+  if (copy == gpu::InvalidSystem || sBoxArrays == gpu::InvalidHandle ||
+      gpu::system_status(copy) != gpu::SystemStatus::Ready) {
+    return;
+  }
+  const gpu::Handle copied = gpu::reserve(sizeof(BoxPositions));
+  const std::array<gpu::Handle, 1> inputs{sBoxArrays};
+  if (copied != gpu::InvalidHandle && gpu::dispatch(copy, 0, inputs, copied, {sizeof(BoxPositions) / 4, 1, 1})) {
+    sBoxPositions = copied;
+  }
+}
+
 void upload_gpu_arrays(const SceneOptions& options) {
   sBoxArrays = aurora::render::gpu::InvalidHandle;
+  sBoxPositions = aurora::render::gpu::InvalidHandle;
   if (options.gpuArrays) {
     std::array<u8, BoxArrayBytes> bytes{};
     std::memcpy(bytes.data(), BoxPositions, sizeof(BoxPositions));
     std::memcpy(bytes.data() + BoxNormalsOffset, BoxNormals, sizeof(BoxNormals));
     std::memcpy(bytes.data() + BoxColorsOffset, BoxColors, sizeof(BoxColors));
     sBoxArrays = aurora::render::gpu::upload(bytes.data(), BoxArrayBytes);
+    sBoxPositions = sBoxArrays;
+    copy_box_positions(options.gpuCopySystem);
   }
   static const std::vector<u8> zeroes(aurora::render::gpu::MaxUploadBytes);
   for (u64 left = u64{options.gpuPadMiB} << 20; left != 0;) {
@@ -600,6 +617,7 @@ void draw_scene(u32 frame, const SceneOptions& options) {
 
 void shutdown_scene() {
   sBoxArrays = aurora::render::gpu::InvalidHandle;
+  sBoxPositions = aurora::render::gpu::InvalidHandle;
   GXDestroyTexObj(&sGroundTexObj);
   sGroundTexture = {};
   sTentacle = {};

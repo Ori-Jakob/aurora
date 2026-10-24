@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "gfx/clear.hpp"
 #include "gfx/frame.hpp"
 #include "gfx/frame_packet.hpp"
 #include "gfx/lru_cache.hpp"
@@ -432,6 +433,292 @@ TEST_F(GfxRecordingTest, ResidentRequestKeepsTheLargest) {
   request_resident_capacity(2048);
   EXPECT_EQ(detail::take_resident_request(), 8192u);
   EXPECT_EQ(detail::take_resident_request(), 0u);
+}
+
+struct TestKernel {
+  uint32_t id = 0;
+};
+
+bool bind_test_kernel(const TestKernel&, const wgpu::ComputePassEncoder&) { return true; }
+
+detail::CopyDestination test_copy_target(const TestKernel&) { return {}; }
+
+uint32_t entry_id(const detail::ComputeEntry& entry) {
+  TestKernel kernel;
+  std::memcpy(&kernel, entry.payload.data(), sizeof(kernel));
+  return kernel.id;
+}
+
+class GfxDispatchTest : public GfxRecordingTest {
+protected:
+  void SetUp() override {
+    savedLimits = detail::resources().limits;
+    auto& limits = detail::resources().limits;
+    limits.minUniformBufferOffsetAlignment = 256;
+    limits.minStorageBufferOffsetAlignment = 16;
+    limits.maxComputeWorkgroupsPerDimension = 65535;
+    GfxRecordingTest::SetUp();
+  }
+
+  void TearDown() override {
+    frame.uniforms = {};
+    GfxRecordingTest::TearDown();
+    detail::resources().limits = savedLimits;
+  }
+
+  static RecordResult dispatch(uint32_t id, Range output, std::span<const Range> inputs = {},
+                               std::array<uint32_t, 3> groups = {1, 1, 1}, std::span<const uint8_t> user = {}) {
+    return record_dispatch<&bind_test_kernel>(
+        TestKernel{id}, {.output = output, .inputs = inputs, .groups = groups, .elements = {3, 1, 1}, .user = user});
+  }
+
+  static RecordResult copy(uint32_t id, Range staged, uint32_t dstOffset = 0) {
+    return record_copy<&test_copy_target>(TestKernel{id}, staged, dstOffset);
+  }
+
+  static void draw() { push_draw_command(clear::DrawData{}); }
+
+  static size_t draws(const detail::RenderPass& pass) {
+    return static_cast<size_t>(std::ranges::count(pass.commands, detail::CommandType::Draw, &detail::Command::type));
+  }
+
+  std::vector<detail::FrameOpType> types() const {
+    std::vector<detail::FrameOpType> out;
+    for (const auto& op : frame.ops) {
+      out.push_back(op.type);
+    }
+    return out;
+  }
+
+  std::vector<uint32_t> ids(const detail::ComputeBatch& batch) const {
+    std::vector<uint32_t> out;
+    for (const auto& entry : batch.entries) {
+      out.push_back(entry_id(entry));
+    }
+    return out;
+  }
+
+  wgpu::Limits savedLimits;
+};
+
+constexpr auto ComputeOp = detail::FrameOpType::Compute;
+constexpr auto RenderPassOp = detail::FrameOpType::RenderPass;
+
+TEST_F(GfxDispatchTest, DispatchPrecedesConsumingDraw) {
+  draw();
+  ASSERT_EQ(dispatch(1, reserve_channel_storage(64, false)), RecordResult::Recorded);
+  draw();
+  EXPECT_TRUE(frame.ops.empty());
+  EXPECT_EQ(detail::testing::pending_compute_entries(), 1u);
+  finish();
+  EXPECT_EQ(types(), (std::vector{ComputeOp, RenderPassOp}));
+  ASSERT_NE(frame.ops[0].computeBatch, nullptr);
+  EXPECT_EQ(ids(*frame.ops[0].computeBatch), (std::vector<uint32_t>{1}));
+  EXPECT_EQ(frame.ops[1].renderPass, &frame.renderPasses[0]);
+  EXPECT_EQ(draws(frame.renderPasses[0]), 2u);
+  EXPECT_EQ(count_efb_passes(), 1u);
+  EXPECT_EQ(frame.pendingCompute, UINT32_MAX);
+}
+
+TEST_F(GfxDispatchTest, CoalescesAcrossDraws) {
+  const Range output = reserve_channel_storage(16, false);
+  ASSERT_EQ(dispatch(1, output), RecordResult::Recorded);
+  draw();
+  ASSERT_EQ(dispatch(2, output), RecordResult::Recorded);
+  set_viewport({0.f, 0.f, 32.f, 32.f, 0.f, 1.f});
+  constexpr std::array<uint32_t, 4> Words{1, 2, 3, 4};
+  push_storage(Words);
+  ASSERT_EQ(dispatch(3, output), RecordResult::Recorded);
+  draw();
+  finish();
+  EXPECT_EQ(types(), (std::vector{ComputeOp, RenderPassOp}));
+  EXPECT_EQ(ids(*frame.ops[0].computeBatch), (std::vector<uint32_t>{1, 2, 3}));
+  EXPECT_EQ(frame.computeBatches.size(), 1u);
+}
+
+TEST_F(GfxDispatchTest, EveryOpKindFlushesFirst) {
+  ASSERT_EQ(dispatch(1, reserve_channel_storage(16, false)), RecordResult::Recorded);
+  copy_current_offscreen();
+  EXPECT_EQ(types(), (std::vector{ComputeOp, RenderPassOp}));
+  ASSERT_EQ(dispatch(2, reserve_channel_storage(16, false)), RecordResult::Recorded);
+  queue_texture_copy({}, {}, {1, 1, 1});
+  EXPECT_EQ(types(), (std::vector{ComputeOp, RenderPassOp, ComputeOp, RenderPassOp, detail::FrameOpType::TextureCopy}));
+  EXPECT_EQ(dispatch(3, reserve_channel_storage(16, false)), RecordResult::NoOpenPass);
+
+  next_frame();
+  ASSERT_EQ(dispatch(4, reserve_channel_storage(16, false)), RecordResult::Recorded);
+  finish();
+  EXPECT_EQ(types(), (std::vector{ComputeOp, RenderPassOp}));
+  EXPECT_EQ(ids(*frame.ops[0].computeBatch), (std::vector<uint32_t>{4}));
+}
+
+TEST_F(GfxDispatchTest, SuspendedEfbKeepsBatchPending) {
+  seed(64, 64);
+  draw();
+  const Range output = reserve_channel_storage(16, false);
+  ASSERT_EQ(dispatch(1, output), RecordResult::Recorded);
+  begin_offscreen(64, 64);
+  EXPECT_TRUE(frame.ops.empty());
+  draw();
+  ASSERT_EQ(dispatch(2, output), RecordResult::Recorded);
+  end_offscreen();
+  ASSERT_EQ(types(), (std::vector{ComputeOp, RenderPassOp}));
+  EXPECT_EQ(ids(*frame.ops[0].computeBatch), (std::vector<uint32_t>{1, 2}));
+  EXPECT_TRUE(frame.ops[1].renderPass->label.starts_with("Offscreen"));
+  finish();
+  EXPECT_EQ(types(), (std::vector{ComputeOp, RenderPassOp, RenderPassOp}));
+  EXPECT_TRUE(frame.ops[2].renderPass->label.starts_with("EFB"));
+  EXPECT_EQ(draws(*frame.ops[2].renderPass), 1u);
+}
+
+TEST_F(GfxDispatchTest, OpHighWaterCoversRanges) {
+  const Range output = reserve_channel_storage(64, false);
+  ASSERT_EQ(dispatch(1, output), RecordResult::Recorded);
+  const uint32_t params = frame.computeBatches[0].entries[0].params;
+  finish();
+  ASSERT_EQ(frame.ops.size(), 2u);
+  const auto& compute = frame.ops[0].highWater;
+  const auto& pass = frame.ops[1].highWater;
+  EXPECT_GE(compute.storage, output.offset + output.size);
+  EXPECT_GE(compute.uniforms, params + DispatchParamsSize);
+  EXPECT_EQ(compute.storage, pass.storage);
+  EXPECT_EQ(compute.uniforms, pass.uniforms);
+  EXPECT_EQ(compute.verts, pass.verts);
+  EXPECT_EQ(compute.indices, pass.indices);
+}
+
+TEST_F(GfxDispatchTest, ParamsBlockLayout) {
+  constexpr std::array<uint32_t, 4> Words{1, 2, 3, 4};
+  push_storage(Words);
+  const std::array<uint8_t, 16> bytes{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+  const Range input = push_channel_storage(bytes);
+  const Range output = reserve_channel_storage(32, false);
+  const std::array inputs{input, input};
+  const std::array<uint8_t, 5> user{9, 8, 7, 6, 5};
+  ASSERT_EQ(dispatch(1, output, inputs, {4, 2, 1}, user), RecordResult::Recorded);
+  const auto& entry = frame.computeBatches[0].entries[0];
+  EXPECT_EQ(entry.params % 256, 0u);
+  EXPECT_EQ(frame.computeParamsBytes, 256u);
+  DispatchParams params;
+  std::memcpy(&params, frame.uniforms.data() + entry.params, sizeof(params));
+  EXPECT_EQ(params.output, (std::array<uint32_t, 4>{output.offset / 4, 8, 0, 0}));
+  EXPECT_EQ(params.inputs[0], input.offset / 4);
+  EXPECT_EQ(params.inputs[1], 4u);
+  EXPECT_EQ(params.inputs[2], input.offset / 4);
+  EXPECT_EQ(params.inputs[3], 4u);
+  for (size_t i = 4; i < params.inputs.size(); ++i) {
+    EXPECT_EQ(params.inputs[i], 0u) << i;
+  }
+  EXPECT_EQ(params.groups, (std::array<uint32_t, 4>{4, 2, 1, 2}));
+  EXPECT_EQ(params.elements, (std::array<uint32_t, 4>{3, 1, 1, 0}));
+  EXPECT_EQ(params.reserved, (std::array<uint32_t, 4>{}));
+  EXPECT_EQ(std::vector<uint8_t>(params.user.begin(), params.user.begin() + 5), (std::vector<uint8_t>{9, 8, 7, 6, 5}));
+  EXPECT_TRUE(std::all_of(params.user.begin() + 5, params.user.end(), [](uint8_t b) { return b == 0; }));
+}
+
+TEST_F(GfxDispatchTest, RejectsInvalid) {
+  const Range output = reserve_channel_storage(16, false);
+  const Range past{output.offset, output.size + 16};
+  const std::array<Range, 9> nine{output, output, output, output, output, output, output, output, output};
+  const std::vector<uint8_t> big(DispatchUserSize + 1);
+  EXPECT_EQ(dispatch(1, {output.offset + 2, 4}), RecordResult::BadRange);
+  EXPECT_EQ(dispatch(1, {output.offset, 6}), RecordResult::BadRange);
+  EXPECT_EQ(dispatch(1, output, std::array{past}), RecordResult::BadRange);
+  EXPECT_EQ(dispatch(1, output, nine), RecordResult::TooManyInputs);
+  EXPECT_EQ(dispatch(1, output, {}, {1, 1, 1}, big), RecordResult::UserTooLarge);
+  EXPECT_EQ(dispatch(1, output, {}, {65536, 1, 1}), RecordResult::GroupLimit);
+  frame.computeParamsBytes = DispatchParamsBudget - 128;
+  EXPECT_EQ(dispatch(1, output), RecordResult::ParamsBudget);
+  frame.computeParamsBytes = 0;
+  std::vector<uint8_t> small(1024);
+  ByteBuffer owned = std::exchange(frame.uniforms, ByteBuffer{small.data(), small.size()});
+  EXPECT_EQ(dispatch(1, output), RecordResult::UniformSpace);
+  frame.uniforms = std::move(owned);
+  detail::note_segment_reads_gpu_state();
+  EXPECT_EQ(dispatch(1, output), RecordResult::SegmentReadsState);
+  EXPECT_EQ(copy(1, output), RecordResult::SegmentReadsState);
+  EXPECT_EQ(detail::testing::pending_compute_entries(), 0u);
+  EXPECT_EQ(frame.computeParamsBytes, 0u);
+
+  next_frame();
+  const Range staged = push_channel_storage(std::array<uint8_t, 8>{});
+  EXPECT_EQ(copy(1, {staged.offset + 2, 4}), RecordResult::BadRange);
+  EXPECT_EQ(copy(1, {staged.offset, 0}), RecordResult::BadRange);
+  EXPECT_EQ(copy(1, {staged.offset, 4096}), RecordResult::BadRange);
+  EXPECT_EQ(copy(1, staged, 2), RecordResult::BadRange);
+  EXPECT_EQ(detail::testing::pending_compute_entries(), 0u);
+  finish();
+  detail::end_recording();
+  recordingActive = false;
+  EXPECT_EQ(dispatch(1, output), RecordResult::NoRecording);
+  EXPECT_EQ(copy(1, staged), RecordResult::NoRecording);
+}
+
+TEST_F(GfxDispatchTest, ZeroGroupsArePreClearOnly) {
+  const Range output = reserve_channel_storage(16, false);
+  const size_t uniforms = frame.uniforms.size();
+  EXPECT_EQ(dispatch(1, output, {}, {0, 1, 1}), RecordResult::Recorded);
+  EXPECT_EQ(dispatch(2, {}, {}, {1, 0, 1}), RecordResult::Recorded);
+  EXPECT_EQ(detail::testing::pending_compute_entries(), 1u);
+  EXPECT_EQ(frame.uniforms.size(), uniforms);
+  EXPECT_EQ(frame.computeParamsBytes, 0u);
+  const auto& entry = frame.computeBatches[0].entries[0];
+  EXPECT_EQ(entry_id(entry), 1u);
+  EXPECT_EQ(entry.groups, (std::array<uint32_t, 3>{0, 1, 1}));
+  EXPECT_EQ(entry.range.size, 16u);
+  EXPECT_EQ(dispatch(3, {}, {}, {1, 1, 1}), RecordResult::Recorded);
+  EXPECT_EQ(detail::testing::pending_compute_entries(), 2u);
+  EXPECT_EQ(frame.computeParamsBytes, 256u);
+}
+
+TEST_F(GfxDispatchTest, SegmentFlagResetsAtOps) {
+  const Range output = reserve_channel_storage(16, false);
+  detail::note_segment_reads_gpu_state();
+  EXPECT_EQ(dispatch(1, output), RecordResult::SegmentReadsState);
+  draw();
+  EXPECT_EQ(dispatch(1, output), RecordResult::SegmentReadsState);
+  copy_current_offscreen();
+  EXPECT_EQ(dispatch(2, output), RecordResult::Recorded);
+  finish();
+  EXPECT_EQ(types(), (std::vector{RenderPassOp, ComputeOp, RenderPassOp}));
+}
+
+TEST_F(GfxDispatchTest, CopyEntriesKeepOrder) {
+  const Range output = reserve_channel_storage(16, false);
+  const Range staged = push_channel_storage(std::array<uint8_t, 8>{1, 2, 3, 4, 5, 6, 7, 8});
+  ASSERT_EQ(dispatch(1, output), RecordResult::Recorded);
+  ASSERT_EQ(copy(2, staged, 4), RecordResult::Recorded);
+  ASSERT_EQ(dispatch(3, output), RecordResult::Recorded);
+  finish();
+  ASSERT_EQ(types(), (std::vector{ComputeOp, RenderPassOp}));
+  const auto& entries = frame.ops[0].computeBatch->entries;
+  ASSERT_EQ(entries.size(), 3u);
+  EXPECT_EQ(entries[0].kind, detail::ComputeEntry::Kind::Dispatch);
+  EXPECT_EQ(entries[1].kind, detail::ComputeEntry::Kind::Copy);
+  EXPECT_EQ(entries[1].range.offset, staged.offset);
+  EXPECT_EQ(entries[1].range.size, 8u);
+  EXPECT_EQ(entries[1].dstOffset, 4u);
+  EXPECT_NE(entries[1].target, nullptr);
+  EXPECT_EQ(entries[2].kind, detail::ComputeEntry::Kind::Dispatch);
+  EXPECT_EQ(ids(*frame.ops[0].computeBatch), (std::vector<uint32_t>{1, 2, 3}));
+}
+
+TEST_F(GfxDispatchTest, OpPayloadCoversEveryType) {
+  detail::RenderPass pass;
+  detail::TextureCopy textureCopy;
+  detail::EncoderTask task;
+  render::detail::StageData stage;
+  detail::ComputeBatch batch;
+  using enum detail::FrameOpType;
+  for (const auto type : {RenderPass, TextureCopy, EncoderTask, RenderStage, Compute}) {
+    EXPECT_FALSE(detail::op_has_payload({.type = type})) << static_cast<int>(type);
+  }
+  EXPECT_TRUE(detail::op_has_payload({.type = RenderPass, .renderPass = &pass}));
+  EXPECT_TRUE(detail::op_has_payload({.type = TextureCopy, .textureCopy = &textureCopy}));
+  EXPECT_TRUE(detail::op_has_payload({.type = EncoderTask, .encoderTask = &task}));
+  EXPECT_TRUE(detail::op_has_payload({.type = RenderStage, .stageData = &stage}));
+  EXPECT_TRUE(detail::op_has_payload({.type = Compute, .computeBatch = &batch}));
+  EXPECT_FALSE(detail::op_has_payload({.type = Compute, .renderPass = &pass}));
 }
 
 #if AURORA_ENABLE_RENDER
@@ -2232,6 +2519,52 @@ TEST_F(GxDrawUniform, OutsideRecordingIsNotCached) {
   const size_t before = pushed_bytes();
   EXPECT_EQ(gx::build_draw_uniform(info), first);
   EXPECT_EQ(pushed_bytes(), before);
+}
+
+class GfxDispatchStageTest : public GfxRenderStageTest {
+protected:
+  void SetUp() override {
+    savedLimits = detail::resources().limits;
+    detail::resources().limits.minUniformBufferOffsetAlignment = 256;
+    detail::resources().limits.minStorageBufferOffsetAlignment = 16;
+    detail::resources().limits.maxComputeWorkgroupsPerDimension = 65535;
+    GfxRenderStageTest::SetUp();
+  }
+
+  void TearDown() override {
+    GfxRenderStageTest::TearDown();
+    detail::resources().limits = savedLimits;
+  }
+
+  static RecordResult dispatch(uint32_t id) {
+    return record_dispatch<&bind_test_kernel>(
+        TestKernel{id}, {.output = reserve_channel_storage(16, false), .groups = {1, 1, 1}, .elements = {1, 1, 1}});
+  }
+
+  wgpu::Limits savedLimits;
+};
+
+TEST_F(GfxDispatchStageTest, StageOpFlushesPendingDispatch) {
+  add_pass("opaque", Stage::OpaqueDone);
+  ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+  ASSERT_EQ(dispatch(1), RecordResult::Recorded);
+  record_stage(Stage::OpaqueDone);
+  EXPECT_EQ(op_types(), (std::vector{ComputeOp, PassOp, StageOp}));
+  ASSERT_EQ(dispatch(2), RecordResult::Recorded);
+  finish();
+  EXPECT_EQ(op_types(), (std::vector{ComputeOp, PassOp, StageOp, ComputeOp, PassOp}));
+}
+
+TEST_F(GfxDispatchStageTest, MergesAreUnaffected) {
+  push_draw_command(gx::DrawData{});
+  gx::DrawData* last = get_last_draw_command<gx::DrawData>();
+  ASSERT_NE(last, nullptr);
+  const size_t commands = frame.renderPasses[0].commands.size();
+  ASSERT_EQ(dispatch(1), RecordResult::Recorded);
+  EXPECT_EQ(get_last_draw_command<gx::DrawData>(), last);
+  EXPECT_EQ(frame.renderPasses[0].commands.size(), commands);
+  push_draw_command(gx::DrawData{});
+  EXPECT_EQ(frame.renderPasses[0].commands.size(), commands + 1);
 }
 #endif
 

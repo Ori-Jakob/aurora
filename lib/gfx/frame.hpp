@@ -30,6 +30,7 @@ StreamingSizes requested_streaming_sizes() noexcept;
 void reset_streaming_request() noexcept;
 void create_compute_layouts() noexcept;
 void release_compute_layouts() noexcept;
+void set_staging_buffer(size_t slot, wgpu::Buffer buffer) noexcept;
 } // namespace testing
 
 struct RegisteredDrawType {

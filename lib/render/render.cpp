@@ -13,6 +13,7 @@
 #include "debug/views.hpp"
 #include "geometry/compact.hpp"
 #include "geometry/hzb.hpp"
+#include "systems/dispatch.hpp"
 #include "systems/systems.hpp"
 
 #include "../gx/command_processor.hpp"
@@ -121,6 +122,7 @@ void on_worker_frame_begin([[maybe_unused]] uint64_t frameId, [[maybe_unused]] c
   bind_cache_tick(frameId);
   compact::worker_frame_begin(frameId);
   hzb::worker_tick(frameId);
+  systems::tick_worker(frameId);
 #endif
 }
 

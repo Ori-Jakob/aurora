@@ -177,8 +177,37 @@ struct FakeBackend {
   gpu::SystemStatus status = gpu::SystemStatus::Ready;
   u32 waits = 0;
   u32 resets = 0;
+  bool hooks = false;
+  bool dispatchResult = true;
+  bool updateResult = true;
+  std::vector<aurora::gfx::Range> inputs;
+  std::vector<u8> params;
+  std::array<u32, 3> elements{};
 
   channel::SystemBackend backend() {
+    channel::SystemBackend out = base_backend();
+    if (!hooks) {
+      return out;
+    }
+    out.dispatch = [](void* self, const channel::DispatchDecode& desc) noexcept {
+      auto& fake = get(self);
+      fake.events.push_back({"dispatch " + std::to_string(desc.kernel), desc.system, aurora::gfx::g_testDrawCount});
+      fake.inputs.assign(desc.inputs.begin(), desc.inputs.end());
+      fake.params.assign(desc.params.begin(), desc.params.end());
+      fake.elements = desc.elements;
+      return fake.dispatchResult;
+    };
+    out.update = [](void* self, u64 id, u32 offset, std::span<const u8> bytes) noexcept {
+      auto& fake = get(self);
+      fake.events.push_back(
+          {"update " + std::to_string(offset) + " " + std::to_string(bytes.size()), id, aurora::gfx::g_testDrawCount});
+      return fake.updateResult;
+    };
+    return out;
+  }
+
+private:
+  channel::SystemBackend base_backend() {
     return {
         .userData = this,
         .create =
@@ -921,4 +950,244 @@ TEST_F(GXGpuChannelTest, LargeUploadThroughThreadedFifo) {
   aurora::gx::fifo::end_frame();
   aurora::gx::fifo::shutdown();
   EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41123456u);
+}
+
+namespace {
+std::vector<u8> dispatch_command(u64 system, u32 kernel, u64 output, std::array<u32, 3> elements,
+                                 const std::vector<u64>& inputs, u8 paramWords, u16 version = 1, int sizeDelta = 0) {
+  const size_t size = wire::GpuDispatchHeaderV1 + inputs.size() * 8 + size_t{paramWords} * 4;
+  auto bytes = payload(size, [&](wire::Writer& out) {
+    out.u16(version);
+    out.u64(system);
+    out.u32(kernel);
+    out.u64(output);
+    for (const u32 count : elements) {
+      out.u32(count);
+    }
+    out.u8(static_cast<u8>(inputs.size()));
+    out.u8(paramWords);
+    for (const u64 input : inputs) {
+      out.u64(input);
+    }
+  });
+  bytes.resize(static_cast<size_t>(static_cast<int>(bytes.size()) + sizeDelta));
+  return raw_hint(GX_AURORA_GPU_DISPATCH, bytes);
+}
+
+constexpr std::array<gpu::KernelDesc, 2> kTwoKernels{{{.entryPoint = "a"}, {.entryPoint = "b"}}};
+} // namespace
+
+TEST_F(GXGpuChannelTest, DispatchWireBytes) {
+  FakeBackend fake;
+  fake.hooks = true;
+  const auto backend = fake.backend();
+  channel::set_system_backend(&backend);
+  const auto system = gpu::create_system({.name = "sys", .wgsl = kSource, .kernels = kTwoKernels});
+  const auto src = gpu::upload(kTriangle.data(), 35);
+  const auto dst = gpu::reserve(36);
+  const auto wide = gpu::reserve(8);
+  decode();
+
+  const std::array<u8, 3> three{1, 2, 3};
+  const std::array<gpu::Handle, 1> inputs{src};
+  ASSERT_TRUE(gpu::dispatch(system, 1, inputs, dst, {9, 1, 1}, three));
+  const auto expected = payload(wire::GpuDispatchHeaderV1 + 8 + 4, [&](wire::Writer& out) {
+    out.u16(AURORA_HINT_GPU_DISPATCH_VERSION);
+    out.u64(system);
+    out.u32(1);
+    out.u64(dst);
+    out.u32(9);
+    out.u32(1);
+    out.u32(1);
+    out.u8(1);
+    out.u8(1);
+    out.u64(src);
+    out.bytes(three);
+  });
+  const auto first = capture_fifo();
+  EXPECT_EQ(first, raw_hint(GX_AURORA_GPU_DISPATCH, expected));
+  decode_fifo(first);
+  ASSERT_EQ(fake.events.size(), 2u);
+  EXPECT_EQ(fake.events[1].what, "dispatch 1");
+  EXPECT_EQ(fake.events[1].id, system);
+  ASSERT_EQ(fake.inputs.size(), 1u);
+  EXPECT_EQ(fake.inputs[0].offset, channel::lookup(src).range.offset);
+  EXPECT_EQ(fake.inputs[0].size, 36u);
+  EXPECT_EQ(fake.params, (std::vector<u8>{1, 2, 3, 0}));
+  EXPECT_EQ(fake.elements, (std::array<u32, 3>{9, 1, 1}));
+  EXPECT_EQ(channel::lookup(dst).state, channel::HandleState::Written);
+
+  const std::vector<u8> full(gpu::MaxDispatchParamsSize, 0xAB);
+  ASSERT_TRUE(gpu::dispatch(system, 0, {}, wide, {1, 1, 1}, full));
+  const auto second = capture_fifo();
+  EXPECT_EQ(second.size(), GX_AURORA_HINT_HEADER_SIZE + wire::GpuDispatchHeaderV1 + gpu::MaxDispatchParamsSize);
+  decode_fifo(second);
+  EXPECT_EQ(fake.params, full);
+  EXPECT_EQ(gpu::stats().dispatches, 2u);
+  EXPECT_EQ(hints::counters(GX_AURORA_GPU_DISPATCH).decoded, 2u);
+  EXPECT_EQ(hints::total_bytes(), 0u);
+}
+
+TEST_F(GXGpuChannelTest, DispatchRefusals) {
+  FakeBackend fake;
+  fake.hooks = true;
+  const auto backend = fake.backend();
+  channel::set_system_backend(&backend);
+  const auto system = gpu::create_system({.name = "sys", .wgsl = kSource, .kernels = kTwoKernels});
+  const auto stateful =
+      gpu::create_system({.name = "state", .wgsl = kSource, .kernels = kTwoKernels, .persistentBytes = 16});
+  const auto src = gpu::upload(kTriangle.data(), sizeof(kTriangle));
+  const auto dst = gpu::reserve(16);
+  decode();
+
+  const std::array<gpu::Handle, 1> one{src};
+  const std::array<gpu::Handle, 9> nine{src, src, src, src, src, src, src, src, src};
+  const std::vector<u8> tooBig(gpu::MaxDispatchParamsSize + 1);
+  const u32 size = aurora::gx::fifo::get_buffer_size();
+  EXPECT_FALSE(gpu::dispatch(system, 0, one, dst, {1, 1, 1}, tooBig));
+  EXPECT_FALSE(gpu::dispatch(system, 0, nine, dst, {1, 1, 1}));
+  EXPECT_FALSE(gpu::dispatch(system, 0, one, handle_for(9), {1, 1, 1}));
+  EXPECT_FALSE(gpu::dispatch(system, 2, one, dst, {1, 1, 1}));
+  EXPECT_FALSE(gpu::dispatch(system, 0, {}, gpu::InvalidHandle, {1, 1, 1}));
+  EXPECT_FALSE(gpu::dispatch(stateful, 0, {}, gpu::InvalidHandle, {1, 1, 1}));
+  EXPECT_EQ(aurora::gx::fifo::get_buffer_size(), size);
+  EXPECT_EQ(gpu::stats().dispatchesRefused, 6u);
+
+  for (u32 i = 0; i < gpu::MaxFrameDispatches; ++i) {
+    ASSERT_TRUE(gpu::dispatch(system, 0, one, dst, {1, 1, 1}));
+  }
+  const u32 full = aurora::gx::fifo::get_buffer_size();
+  EXPECT_FALSE(gpu::dispatch(system, 0, one, dst, {1, 1, 1}));
+  EXPECT_EQ(aurora::gx::fifo::get_buffer_size(), full);
+  EXPECT_EQ(gpu::stats().dispatchesRefused, 7u);
+
+  next_frame();
+  EXPECT_FALSE(gpu::dispatch(system, 0, one, dst, {1, 1, 1}));
+  EXPECT_TRUE(gpu::dispatch(stateful, 0, {}, gpu::InvalidHandle, {1, 1, 1}));
+  channel::set_system_backend(nullptr);
+  EXPECT_FALSE(gpu::dispatch(stateful, 0, {}, gpu::InvalidHandle, {1, 1, 1}));
+  EXPECT_EQ(gpu::stats().dispatchesRefused, 9u);
+  EXPECT_EQ(gpu::stats().refused, 9u);
+}
+
+TEST_F(GXGpuChannelTest, OwedFlushChargedOnce) {
+  FakeBackend fake;
+  fake.hooks = true;
+  const auto backend = fake.backend();
+  channel::set_system_backend(&backend);
+  const auto stateful =
+      gpu::create_system({.name = "state", .wgsl = kSource, .kernels = kTwoKernels, .persistentBytes = 1024});
+  const std::array<u32, 2> words{1, 2};
+  gpu::update_persistent(stateful, 0, words.data(), sizeof(words));
+  next_frame();
+  EXPECT_EQ(aurora::gfx::detail::g_testChannelDemand, 512u);
+
+  aurora::gfx::detail::g_testChannelDemand = 0;
+  aurora::gfx::detail::g_testChannelBudget = {.bytes = 1000, .alignment = 256};
+  EXPECT_FALSE(gpu::dispatch(stateful, 0, {}, gpu::InvalidHandle, {1, 1, 1}));
+  EXPECT_EQ(gpu::stats().dispatchesRefused, 1u);
+  next_frame();
+
+  aurora::gfx::detail::g_testChannelDemand = 0;
+  aurora::gfx::detail::g_testChannelBudget = {.bytes = UINT64_MAX / 4, .alignment = 256};
+  EXPECT_TRUE(gpu::dispatch(stateful, 0, {}, gpu::InvalidHandle, {1, 1, 1}));
+  EXPECT_TRUE(gpu::dispatch(stateful, 1, {}, gpu::InvalidHandle, {1, 1, 1}));
+  next_frame();
+  EXPECT_EQ(aurora::gfx::detail::g_testChannelDemand, 1280u);
+
+  aurora::gfx::detail::g_testChannelDemand = 0;
+  gpu::update_persistent(stateful, 0, words.data(), sizeof(words));
+  next_frame();
+  EXPECT_EQ(aurora::gfx::detail::g_testChannelDemand, 512u);
+}
+
+TEST_F(GXGpuChannelTest, DispatchDecodeOrderAndFlush) {
+  FakeBackend fake;
+  fake.hooks = true;
+  const auto backend = fake.backend();
+  channel::set_system_backend(&backend);
+  const auto stateful =
+      gpu::create_system({.name = "state", .wgsl = kSource, .kernels = kTwoKernels, .persistentBytes = 16});
+  const auto system = gpu::create_system({.name = "sys", .wgsl = kSource, .kernels = kTwoKernels});
+  const std::array<u32, 2> words{0xAABBCCDD, 0x11223344};
+  gpu::update_persistent(stateful, 4, words.data(), sizeof(words));
+  decode();
+  ASSERT_EQ(fake.events.size(), 2u);
+  EXPECT_EQ(gpu::stats().persistentCopies, 0u);
+  EXPECT_FALSE(channel::uncaptured_gpu_state());
+
+  next_frame();
+  ASSERT_TRUE(gpu::dispatch(stateful, 1, {}, gpu::InvalidHandle, {1, 1, 1}));
+  gpu::update_persistent(stateful, 0, words.data(), 4);
+  decode();
+  ASSERT_EQ(fake.events.size(), 5u);
+  EXPECT_EQ(fake.events[2].what, "update 0 16");
+  EXPECT_EQ(fake.events[3].what, "dispatch 1");
+  EXPECT_EQ(fake.events[4].what, "update 0 4");
+  EXPECT_EQ(gpu::stats().persistentCopies, 2u);
+  EXPECT_EQ(gpu::stats().dispatches, 1u);
+  EXPECT_TRUE(channel::uncaptured_gpu_state());
+
+  const auto src = gpu::upload(kTriangle.data(), sizeof(kTriangle));
+  const auto unwritten = gpu::reserve(16);
+  const auto dst = gpu::reserve(16);
+  const auto rejected = gpu::reserve(16);
+  const std::array<gpu::Handle, 1> pending{unwritten};
+  const std::array<gpu::Handle, 1> ready{src};
+  ASSERT_TRUE(gpu::dispatch(system, 0, pending, dst, {1, 1, 1}));
+  decode();
+  EXPECT_EQ(channel::lookup(dst).state, channel::HandleState::Failed);
+  fake.dispatchResult = false;
+  ASSERT_TRUE(gpu::dispatch(system, 0, ready, rejected, {1, 1, 1}));
+  decode();
+  EXPECT_EQ(channel::lookup(rejected).state, channel::HandleState::Failed);
+  EXPECT_EQ(gpu::stats().dispatchesRejected, 2u);
+  EXPECT_EQ(fake.events.size(), 6u);
+
+  write_bytes(dispatch_command(system, 0, src, {1, 1, 1}, {}, 0));
+  write_bytes(dispatch_command(system, 7, 0, {1, 1, 1}, {}, 0));
+  write_bytes(dispatch_command(0x99ull << 32 | 9, 0, 0, {1, 1, 1}, {}, 0));
+  decode();
+  EXPECT_EQ(gpu::stats().dispatchesRejected, 5u);
+  EXPECT_EQ(channel::lookup(src).state, channel::HandleState::Failed);
+}
+
+TEST_F(GXGpuChannelTest, DispatchMalformed) {
+  FakeBackend fake;
+  fake.hooks = true;
+  const auto backend = fake.backend();
+  channel::set_system_backend(&backend);
+  const auto system = gpu::create_system({.name = "sys", .wgsl = kSource, .kernels = kTwoKernels});
+  decode();
+  write_bytes(dispatch_command(system, 0, 0, {1, 1, 1}, {}, 0, 2));
+  write_bytes(dispatch_command(system, 0, 0, {1, 1, 1}, {}, 1, 1, -4));
+  write_bytes(dispatch_command(system, 0, 0, {1, 1, 1}, {1, 2, 3, 4, 5, 6, 7, 8, 9}, 0));
+  write_bytes(dispatch_command(system, 0, 0, {1, 1, 1}, {}, 33));
+  write_bytes(dispatch_command(system, 0, 0, {1, 1, 1}, {}, 0, 1, 4));
+  write_bytes({kRealBpWrite.begin(), kRealBpWrite.end()});
+  decode();
+  EXPECT_EQ(hints::counters(GX_AURORA_GPU_DISPATCH).malformed, 5u);
+  EXPECT_EQ(hints::counters(GX_AURORA_GPU_DISPATCH).decoded, 0u);
+  EXPECT_EQ(fake.events.size(), 1u);
+  EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41123456u);
+}
+
+TEST_F(GXGpuChannelTest, FailedUpdateMarksStateUncaptured) {
+  FakeBackend fake;
+  fake.hooks = true;
+  fake.updateResult = false;
+  const auto backend = fake.backend();
+  channel::set_system_backend(&backend);
+  const auto stateful =
+      gpu::create_system({.name = "state", .wgsl = kSource, .kernels = kTwoKernels, .persistentBytes = 16});
+  decode();
+  next_frame();
+  const std::array<u32, 1> word{5};
+  gpu::update_persistent(stateful, 0, word.data(), sizeof(word));
+  decode();
+  EXPECT_EQ(gpu::stats().storageMisses, 1u);
+  EXPECT_TRUE(channel::uncaptured_gpu_state());
+  gpu::destroy_system(stateful);
+  decode();
+  EXPECT_FALSE(channel::uncaptured_gpu_state());
 }

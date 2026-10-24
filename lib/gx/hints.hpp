@@ -126,6 +126,7 @@ inline constexpr uint32_t SkyV1 = 166;
 inline constexpr uint32_t FogVolume = 64;
 inline constexpr uint32_t GpuUploadHeader = 10;
 inline constexpr uint32_t GpuReserveV1 = 18;
+inline constexpr uint32_t GpuDispatchHeaderV1 = 36;
 inline constexpr uint32_t LoadArrayGpuV1 = 15;
 inline constexpr uint32_t GpuUpdateHeader = 14;
 inline constexpr uint32_t GpuCreateHeader = 28;

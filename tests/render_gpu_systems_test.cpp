@@ -8,15 +8,21 @@
 #include "gx/fifo.hpp"
 #include "gx/gpu_channel.hpp"
 #include "gx/hints.hpp"
+#include "gfx/frame_packet.hpp"
+#include "gfx/recording.hpp"
+#include "render/gpu_heap.hpp"
 #include "render/jobs.hpp"
 #include "render/shaders.hpp"
+#include "render/systems/dispatch.hpp"
 #include "render/systems/systems.hpp"
 
 #include <aurora/gpu_systems.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -117,6 +123,7 @@ protected:
       GTEST_SKIP() << "no null device: " << error;
     }
     m_globals = std::make_unique<test::ScopedGlobalDevice>(*m_device, options);
+    gpu_heap::shutdown();
     jobs::initialize(2);
     shaders::initialize();
     gfx::detail::testing::create_compute_layouts();
@@ -133,6 +140,7 @@ protected:
     gfx::set_blocking_pipelines(false);
     gx::fifo::clear_buffer();
     systems::shutdown();
+    gpu_heap::shutdown();
     gfx::detail::testing::release_compute_layouts();
     shaders::shutdown();
     jobs::shutdown();
@@ -180,13 +188,32 @@ TEST_F(RenderGpuSystems, BrokenKernelsFail) {
             SystemStatus::Failed);
   EXPECT_EQ(create_and_decode({.name = "missing", .library = "systems/missing", .kernels = MainKernel}, id),
             SystemStatus::Failed);
+}
+
+TEST_F(RenderGpuSystems, GpuOnlyStateGetsABlock) {
+  gpu::SystemId id = gpu::InvalidSystem;
   EXPECT_EQ(create_and_decode({.name = "gpu_only",
                                .wgsl = NoopSource,
                                .kernels = MainKernel,
-                               .persistentBytes = 64,
+                               .persistentBytes = 300,
                                .flags = gpu::SystemGpuOnlyState},
                               id),
-            SystemStatus::Failed);
+            SystemStatus::Pending);
+  channel::end_frame();
+  EXPECT_EQ(gpu::system_status(id), SystemStatus::Ready);
+  systems::KernelSlot slot;
+  ASSERT_TRUE(systems::kernel_slot(id, 0, slot));
+  EXPECT_NE(slot.state, gpu_heap::BlockHandle::Invalid);
+  EXPECT_EQ(slot.stateBytes, 300u);
+  EXPECT_EQ(slot.workgroupSize, (std::array<uint32_t, 3>{64, 1, 1}));
+  EXPECT_EQ(gpu_heap::block_state(slot.state), gpu_heap::BlockState::Pending);
+  gpu_heap::begin_frame_worker();
+  ASSERT_EQ(gpu_heap::block_state(slot.state), gpu_heap::BlockState::Ready);
+  EXPECT_EQ(gpu_heap::block_view(slot.state).size, 512u);
+  gpu::destroy_system(id);
+  decode_pending();
+  gpu_heap::begin_frame_worker();
+  EXPECT_EQ(gpu_heap::block_state(slot.state), gpu_heap::BlockState::Invalid);
 }
 
 TEST_F(RenderGpuSystems, UnmetRequirementIsUnavailable) {
@@ -275,6 +302,233 @@ TEST_F(RenderGpuSystems, StatefulSystemReadyFromNextFrame) {
             SystemStatus::Pending);
   channel::end_frame();
   EXPECT_EQ(gpu::system_status(id), SystemStatus::Ready);
+}
+
+std::vector<uint8_t> upload_bytes(uint64_t handle, std::span<const uint8_t> data) {
+  std::vector<uint8_t> payload(wire::GpuUploadHeader + data.size());
+  wire::Writer out{payload};
+  out.u16(1);
+  out.u64(handle);
+  out.bytes(data);
+  return hint(GX_AURORA_GPU_UPLOAD, payload);
+}
+
+std::vector<uint8_t> reserve_bytes(uint64_t handle, uint32_t bytes, uint32_t flags = 0) {
+  std::vector<uint8_t> payload(wire::GpuReserveV1);
+  wire::Writer out{payload};
+  out.u16(1);
+  out.u64(handle);
+  out.u32(bytes);
+  out.u32(flags);
+  return hint(GX_AURORA_GPU_RESERVE, payload);
+}
+
+std::vector<uint8_t> update_bytes(uint64_t system, uint32_t offset, std::span<const uint8_t> data) {
+  std::vector<uint8_t> payload(wire::GpuUpdateHeader + data.size());
+  wire::Writer out{payload};
+  out.u16(1);
+  out.u64(system);
+  out.u32(offset);
+  out.bytes(data);
+  return hint(GX_AURORA_GPU_UPDATE_PERSISTENT, payload);
+}
+
+std::vector<uint8_t> dispatch_bytes(uint64_t system, uint32_t kernel, uint64_t output, std::array<uint32_t, 3> elements,
+                                    std::span<const uint64_t> inputs, std::span<const uint8_t> params = {}) {
+  std::vector<uint8_t> payload(wire::GpuDispatchHeaderV1 + inputs.size() * 8 + params.size());
+  wire::Writer out{payload};
+  out.u16(1);
+  out.u64(system);
+  out.u32(kernel);
+  out.u64(output);
+  for (const uint32_t count : elements) {
+    out.u32(count);
+  }
+  out.u8(static_cast<uint8_t>(inputs.size()));
+  out.u8(static_cast<uint8_t>(params.size() / 4));
+  for (const uint64_t input : inputs) {
+    out.u64(input);
+  }
+  out.bytes(params);
+  return hint(GX_AURORA_GPU_DISPATCH, payload);
+}
+
+void process(const std::vector<uint8_t>& bytes) {
+  gx::fifo::process(bytes.data(), static_cast<uint32_t>(bytes.size()));
+}
+
+uint64_t handle_at(uint32_t index) { return uint64_t{channel::current_serial()} << 32 | index; }
+
+constexpr std::array<gpu::KernelDesc, 1> CopyKernel{{{.entryPoint = "main", .workgroupSize = {64, 1, 1}}}};
+
+class RenderSystemsDispatch : public RenderGpuSystems {
+protected:
+  void SetUp() override {
+    RenderGpuSystems::SetUp();
+    if (!m_device) {
+      return;
+    }
+    gfx::detail::testing::suppress_render_worker(true);
+    gfx::detail::begin_recording(m_packet, 0);
+    m_recording = true;
+  }
+
+  void TearDown() override {
+    if (m_recording) {
+      gfx::finish();
+      gfx::detail::end_recording();
+      gfx::detail::shutdown_recording();
+      gfx::detail::testing::suppress_render_worker(false);
+    }
+    RenderGpuSystems::TearDown();
+  }
+
+  void next_frame() {
+    gfx::finish();
+    gfx::detail::end_recording();
+    m_packet = {};
+    channel::end_frame();
+    gfx::detail::begin_recording(m_packet, 0);
+  }
+
+  const std::vector<gfx::detail::ComputeEntry>& pending_entries() const {
+    static const std::vector<gfx::detail::ComputeEntry> None;
+    return m_packet.pendingCompute < m_packet.computeBatches.size()
+               ? m_packet.computeBatches[m_packet.pendingCompute].entries
+               : None;
+  }
+
+  gpu::SystemId copy_system() {
+    const auto id = gpu::create_system({.name = "copy", .library = "systems/copy", .kernels = CopyKernel});
+    decode_pending();
+    EXPECT_EQ(gpu::system_status(id), SystemStatus::Ready);
+    return id;
+  }
+
+  gfx::detail::FramePacket m_packet;
+  bool m_recording = false;
+};
+
+TEST_F(RenderSystemsDispatch, RecordsGroupsAndParams) {
+  const auto id = copy_system();
+  std::vector<uint8_t> data(260);
+  for (size_t i = 0; i < data.size(); ++i) {
+    data[i] = static_cast<uint8_t>(i);
+  }
+  process(upload_bytes(handle_at(1), data));
+  process(reserve_bytes(handle_at(2), 260));
+  const std::array<uint64_t, 1> inputs{handle_at(1)};
+  const std::array<uint8_t, 4> user{7, 0, 0, 0};
+  process(dispatch_bytes(id, 0, handle_at(2), {65, 1, 1}, inputs, user));
+
+  const auto src = channel::lookup(handle_at(1));
+  const auto dst = channel::lookup(handle_at(2));
+  EXPECT_EQ(dst.state, channel::HandleState::Written);
+  EXPECT_EQ(gpu::stats().dispatches, 1u);
+  EXPECT_EQ(gfx::detail::testing::pending_compute_entries(), 1u);
+  const auto& entries = pending_entries();
+  ASSERT_EQ(entries.size(), 1u);
+  const auto& entry = entries[0];
+  EXPECT_EQ(entry.kind, gfx::detail::ComputeEntry::Kind::Dispatch);
+  EXPECT_EQ(entry.groups, (std::array<uint32_t, 3>{2, 1, 1}));
+  EXPECT_EQ(entry.range.offset, dst.range.offset);
+  EXPECT_EQ(entry.range.size, 260u);
+  EXPECT_EQ(entry.params % 256, 0u);
+  EXPECT_EQ(m_packet.computeParamsBytes, gfx::DispatchParamsSize);
+  ASSERT_LE(entry.params + sizeof(gfx::DispatchParams), m_packet.uniforms.size());
+  gfx::DispatchParams params;
+  std::memcpy(&params, m_packet.uniforms.data() + entry.params, sizeof(params));
+  EXPECT_EQ(params.output, (std::array<uint32_t, 4>{dst.range.offset / 4, 65, 0, 0}));
+  EXPECT_EQ(params.inputs[0], src.range.offset / 4);
+  EXPECT_EQ(params.inputs[1], 65u);
+  for (size_t i = 2; i < params.inputs.size(); ++i) {
+    EXPECT_EQ(params.inputs[i], 0u) << i;
+  }
+  EXPECT_EQ(params.groups, (std::array<uint32_t, 4>{2, 1, 1, 1}));
+  EXPECT_EQ(params.elements, (std::array<uint32_t, 4>{65, 1, 1, 0}));
+  EXPECT_EQ(params.reserved, (std::array<uint32_t, 4>{}));
+  EXPECT_EQ(params.user[0], 7u);
+  EXPECT_TRUE(std::all_of(params.user.begin() + 1, params.user.end(), [](uint8_t b) { return b == 0; }));
+
+  gfx::finish();
+  ASSERT_EQ(m_packet.ops.size(), 2u);
+  EXPECT_EQ(m_packet.ops[0].type, gfx::detail::FrameOpType::Compute);
+  EXPECT_EQ(m_packet.ops[0].computeBatch, &m_packet.computeBatches[0]);
+  EXPECT_EQ(m_packet.ops[1].type, gfx::detail::FrameOpType::RenderPass);
+}
+
+TEST_F(RenderSystemsDispatch, ZeroElementsPreClearOnly) {
+  const auto id = copy_system();
+  process(reserve_bytes(handle_at(1), 64));
+  const size_t uniforms = m_packet.uniforms.size();
+  process(dispatch_bytes(id, 0, handle_at(1), {0, 1, 1}, {}));
+  EXPECT_EQ(channel::lookup(handle_at(1)).state, channel::HandleState::Written);
+  ASSERT_EQ(pending_entries().size(), 1u);
+  EXPECT_EQ(pending_entries()[0].groups[0], 0u);
+  EXPECT_EQ(pending_entries()[0].range.size, 64u);
+  EXPECT_EQ(m_packet.uniforms.size(), uniforms);
+  EXPECT_EQ(m_packet.computeParamsBytes, 0u);
+}
+
+TEST_F(RenderSystemsDispatch, RejectionsFailTheOutput) {
+  const auto id = copy_system();
+  const auto state =
+      gpu::create_system({.name = "state", .wgsl = NoopSource, .kernels = MainKernel, .persistentBytes = 16});
+  decode_pending();
+  const std::array<uint8_t, 16> data{};
+  process(upload_bytes(handle_at(1), data));
+  for (uint32_t index = 2; index <= 6; ++index) {
+    process(reserve_bytes(handle_at(index), 16));
+  }
+  process(reserve_bytes(handle_at(7), 16, gpu::ReserveZero));
+  const std::array<uint64_t, 1> uploaded{handle_at(1)};
+  const std::array<uint64_t, 1> unwritten{handle_at(4)};
+  process(dispatch_bytes(0x77ull << 32 | 5, 0, handle_at(2), {1, 1, 1}, uploaded));
+  process(dispatch_bytes(id, 1, handle_at(3), {1, 1, 1}, uploaded));
+  process(dispatch_bytes(id, 0, handle_at(7), {1, 1, 1}, uploaded));
+  process(dispatch_bytes(id, 0, handle_at(5), {1, 1, 1}, unwritten));
+  process(dispatch_bytes(state, 0, handle_at(6), {1, 1, 1}, {}));
+  for (const uint32_t index : {2u, 3u, 5u, 6u, 7u}) {
+    EXPECT_EQ(channel::lookup(handle_at(index)).state, channel::HandleState::Failed) << index;
+  }
+  EXPECT_EQ(channel::lookup(handle_at(4)).state, channel::HandleState::Reserved);
+  EXPECT_EQ(gpu::stats().dispatchesRejected, 5u);
+  EXPECT_EQ(gpu::stats().dispatches, 0u);
+  EXPECT_TRUE(pending_entries().empty());
+}
+
+TEST_F(RenderSystemsDispatch, CreationFrameUpdateFlushesBeforeFirstDispatch) {
+  const auto state =
+      gpu::create_system({.name = "state", .wgsl = NoopSource, .kernels = MainKernel, .persistentBytes = 16});
+  decode_pending();
+  const std::array<uint8_t, 8> words{1, 2, 3, 4, 5, 6, 7, 8};
+  process(update_bytes(state, 4, words));
+  EXPECT_TRUE(pending_entries().empty());
+  EXPECT_FALSE(channel::uncaptured_gpu_state());
+
+  next_frame();
+  EXPECT_EQ(gpu::system_status(state), SystemStatus::Ready);
+  process(dispatch_bytes(state, 0, 0, {1, 1, 1}, {}));
+  const auto& entries = pending_entries();
+  ASSERT_EQ(entries.size(), 2u);
+  EXPECT_EQ(entries[0].kind, gfx::detail::ComputeEntry::Kind::Copy);
+  EXPECT_EQ(entries[0].dstOffset, 0u);
+  ASSERT_EQ(entries[0].range.size, 16u);
+  const std::vector<uint8_t> staged(m_packet.storage.data() + entries[0].range.offset,
+                                    m_packet.storage.data() + entries[0].range.offset + 16);
+  EXPECT_EQ(staged, (std::vector<uint8_t>{0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0}));
+  EXPECT_EQ(entries[1].kind, gfx::detail::ComputeEntry::Kind::Dispatch);
+  EXPECT_EQ(entries[1].range.size, 0u);
+  EXPECT_EQ(gpu::stats().persistentCopies, 1u);
+  EXPECT_EQ(gpu::stats().dispatches, 1u);
+  EXPECT_TRUE(channel::uncaptured_gpu_state());
+
+  process(update_bytes(state, 8, std::span{words}.first(4)));
+  ASSERT_EQ(entries.size(), 3u);
+  EXPECT_EQ(entries[2].kind, gfx::detail::ComputeEntry::Kind::Copy);
+  EXPECT_EQ(entries[2].dstOffset, 8u);
+  EXPECT_EQ(entries[2].range.size, 4u);
+  EXPECT_EQ(gpu::stats().persistentCopies, 2u);
 }
 } // namespace
 } // namespace aurora::render

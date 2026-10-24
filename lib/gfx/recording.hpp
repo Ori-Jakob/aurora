@@ -7,13 +7,25 @@
 
 #include <array>
 #include <cstddef>
+#include <cstring>
+#include <new>
 #include <optional>
 #include <span>
 #include <string>
+#include <type_traits>
 
 namespace aurora::gfx::detail {
 
 struct FramePacket;
+
+using ComputeBinder = bool (*)(const void* payload, const wgpu::ComputePassEncoder& pass);
+struct CopyDestination {
+  wgpu::Buffer buffer;
+  uint64_t base = 0;
+  uint64_t size = 0;
+};
+using CopyTarget = CopyDestination (*)(const void* payload);
+inline constexpr size_t ComputePayloadSize = 64;
 
 struct RecordedFrame {
   FramePacket* packet;
@@ -123,6 +135,61 @@ struct DispatchParams {
 };
 static_assert(sizeof(DispatchParams) == DispatchParamsSize);
 static_assert(sizeof(DispatchParams::inputs) == DispatchMaxInputs * 2 * sizeof(uint32_t));
+inline constexpr uint32_t DispatchParamsBudget = 1024 * 1024;
+struct DispatchArgs {
+  Range output;
+  std::span<const Range> inputs;
+  std::array<uint32_t, 3> groups{};
+  std::array<uint32_t, 3> elements{};
+  std::span<const uint8_t> user;
+};
+enum class RecordResult : uint8_t {
+  Recorded,
+  NoRecording,
+  NoOpenPass,
+  BadRange,
+  TooManyInputs,
+  UserTooLarge,
+  GroupLimit,
+  UniformSpace,
+  ParamsBudget,
+  SegmentReadsState,
+};
+namespace detail {
+RecordResult record_dispatch(ComputeBinder bind, std::span<const std::byte> payload, const DispatchArgs& args) noexcept;
+RecordResult record_copy(CopyTarget target, std::span<const std::byte> payload, Range staged,
+                         uint32_t dstOffset) noexcept;
+void note_segment_reads_gpu_state() noexcept;
+namespace testing {
+size_t pending_compute_entries() noexcept;
+}
+
+template <typename T>
+const T& compute_payload(const void* data) noexcept {
+  void* bytes = const_cast<void*>(data);
+  return *std::launder(static_cast<const T*>(std::memmove(bytes, bytes, sizeof(T))));
+}
+
+template <typename T>
+inline constexpr bool ComputePayload =
+    std::is_trivially_copyable_v<T> && sizeof(T) <= ComputePayloadSize && alignof(T) <= alignof(std::max_align_t);
+} // namespace detail
+
+template <auto Bind, typename T>
+RecordResult record_dispatch(const T& payload, const DispatchArgs& args) noexcept {
+  static_assert(detail::ComputePayload<T>);
+  constexpr detail::ComputeBinder binder = [](const void* data, const wgpu::ComputePassEncoder& pass) {
+    return Bind(detail::compute_payload<T>(data), pass);
+  };
+  return detail::record_dispatch(binder, std::as_bytes(std::span{&payload, 1}), args);
+}
+
+template <auto Target, typename T>
+RecordResult record_copy(const T& payload, Range staged, uint32_t dstOffset) noexcept {
+  static_assert(detail::ComputePayload<T>);
+  constexpr detail::CopyTarget target = [](const void* data) { return Target(detail::compute_payload<T>(data)); };
+  return detail::record_copy(target, std::as_bytes(std::span{&payload, 1}), staged, dstOffset);
+}
 struct ResidentStorage {
   uint64_t frameId = 0;
   uint32_t base = 0;

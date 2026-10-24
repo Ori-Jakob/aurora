@@ -79,6 +79,7 @@ constexpr std::array<RegionInfo, RegionCount> Regions{{
     {"heap.draw_args", wgpu::BufferUsage::Indirect | wgpu::BufferUsage::Storage, 64 * 1024},
     {"heap.dispatch_args", wgpu::BufferUsage::Indirect | wgpu::BufferUsage::Storage, 16 * 1024},
     {"heap.idx32", wgpu::BufferUsage::Index | wgpu::BufferUsage::Vertex | wgpu::BufferUsage::Storage, 1024 * 1024},
+    {"heap.system_state", wgpu::BufferUsage::Storage, 1024 * 1024},
 }};
 
 constexpr uint32_t BlockIndexBits = 12;

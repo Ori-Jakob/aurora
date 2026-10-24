@@ -89,7 +89,16 @@ std::vector<std::pair<uint16_t, std::vector<uint8_t>>> one_of_each() {
     w.u32(16);
     w.u32(1);
   });
-  add(GX_AURORA_GPU_DISPATCH, 1, wire::EmptyV1, [](Writer&) {});
+  add(GX_AURORA_GPU_DISPATCH, 1, wire::GpuDispatchHeaderV1, [](Writer& w) {
+    w.u64(System);
+    w.u32(0);
+    w.u64(0);
+    w.u32(1);
+    w.u32(1);
+    w.u32(1);
+    w.u8(0);
+    w.u8(0);
+  });
   add(GX_AURORA_LOAD_ARRAY_GPU, 1, wire::LoadArrayGpuV1, [](Writer& w) {
     w.u8(GX_VA_TEX7);
     w.u64(0);

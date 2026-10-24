@@ -713,10 +713,10 @@ TEST_F(GXHintTest, FogVolumes_RoundTrip) {
   EXPECT_EQ(hints::counters(GX_AURORA_RENDER_FOG_VOLUMES).skipped, 1u);
 }
 
-TEST_F(GXHintTest, SkippedReservedAndDispatch) {
+TEST_F(GXHintTest, SkippedReserved) {
   install();
   std::vector<u8> bytes;
-  const std::vector<u16> ids{0x0052, 0x00FF, 0x0111, GX_AURORA_GPU_DISPATCH, 0x0127};
+  const std::vector<u16> ids{0x0052, 0x00FF, 0x0111, 0x0127};
   for (const u16 id : ids) {
     bytes = bytes + raw_hint(id, hex("00 01 AA BB CC"));
   }
@@ -736,10 +736,8 @@ TEST_F(GXHintTest, GpuCommandsRejectMalformedSizes) {
   std::vector<u8> bytes;
   std::vector<u16> ids;
   for (u16 id = GX_AURORA_GPU_UPLOAD; id <= GX_AURORA_GPU_DESTROY_SYSTEM; ++id) {
-    if (id != GX_AURORA_GPU_DISPATCH) {
-      ids.push_back(id);
-      bytes = bytes + raw_hint(id, hex("00 01 AA BB CC"));
-    }
+    ids.push_back(id);
+    bytes = bytes + raw_hint(id, hex("00 01 AA BB CC"));
   }
   const uint64_t hintBytes = hints::total_bytes();
   decode_then_bp(bytes);
@@ -757,9 +755,10 @@ TEST_F(GXHintTest, GpuCommandsRejectMalformedSizes) {
 TEST_F(GXHintTest, EveryDeclaredIdHasNameAndVersion) {
   for (const u16 id : kDeclaredIds) {
     EXPECT_NE(hints::name(id), "reserved") << id;
-    EXPECT_EQ(hints::latest_version(id) == 0, id == GX_AURORA_GPU_DISPATCH) << id;
+    EXPECT_NE(hints::latest_version(id), 0u) << id;
   }
   EXPECT_EQ(hints::latest_version(GX_AURORA_GPU_UPLOAD), 1u);
+  EXPECT_EQ(hints::latest_version(GX_AURORA_GPU_DISPATCH), 1u);
   EXPECT_EQ(hints::latest_version(GX_AURORA_GPU_DESTROY_SYSTEM), 1u);
   EXPECT_EQ(hints::name(GX_AURORA_RENDER_TEV_POLICY), "TEV_POLICY");
   EXPECT_EQ(hints::latest_version(GX_AURORA_RENDER_LIGHTS), 2u);

@@ -173,9 +173,12 @@ fn noop(@builtin(global_invocation_id) id: vec3<u32>) {
 )";
 constexpr std::array<aurora::render::gpu::KernelDesc, 1> NoopKernels{{{.entryPoint = "noop"}}};
 constexpr uint32_t NoopStateBytes = 256;
+constexpr std::array<aurora::render::gpu::KernelDesc, 1> CopyKernels{
+    {{.entryPoint = "main", .workgroupSize = {64, 1, 1}}}};
 
 struct GpuDemo {
   aurora::render::gpu::SystemId system = aurora::render::gpu::InvalidSystem;
+  aurora::render::gpu::SystemId copy = aurora::render::gpu::InvalidSystem;
   bool available = false;
 };
 
@@ -191,6 +194,11 @@ GpuDemo create_gpu_demo(const render_demo::Options& options) {
         .kernels = NoopKernels,
         .persistentBytes = NoopStateBytes,
     });
+    demo.copy = aurora::render::gpu::create_system({
+        .name = "demo_copy",
+        .library = "systems/copy",
+        .kernels = CopyKernels,
+    });
   }
   return demo;
 }
@@ -202,12 +210,12 @@ void update_gpu_demo(const GpuDemo& demo, uint32_t frame) {
   }
 }
 
-aurora::render::gpu::SystemStatus settled_status(const GpuDemo& demo) {
+aurora::render::gpu::SystemStatus settled_status(aurora::render::gpu::SystemId system) {
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
-  auto status = aurora::render::gpu::system_status(demo.system);
+  auto status = aurora::render::gpu::system_status(system);
   while (status == aurora::render::gpu::SystemStatus::Pending && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds{5});
-    status = aurora::render::gpu::system_status(demo.system);
+    status = aurora::render::gpu::system_status(system);
   }
   return status;
 }
@@ -222,12 +230,19 @@ GpuReport finish_gpu_demo(const GpuDemo& demo) {
   if (!demo.available) {
     report.systems = "unavailable";
   } else {
-    const bool ready = demo.system != aurora::render::gpu::InvalidSystem &&
-                       settled_status(demo) == aurora::render::gpu::SystemStatus::Ready;
-    report.systems = std::string{"ready "} + (ready ? "1" : "0") + "/1";
+    uint32_t ready = 0;
+    for (const auto system : {demo.system, demo.copy}) {
+      if (system != aurora::render::gpu::InvalidSystem &&
+          settled_status(system) == aurora::render::gpu::SystemStatus::Ready) {
+        ++ready;
+      }
+    }
+    report.systems = "ready " + std::to_string(ready) + "/2";
   }
-  if (demo.system != aurora::render::gpu::InvalidSystem) {
-    aurora::render::gpu::destroy_system(demo.system);
+  for (const auto system : {demo.system, demo.copy}) {
+    if (system != aurora::render::gpu::InvalidSystem) {
+      aurora::render::gpu::destroy_system(system);
+    }
   }
   return report;
 }
@@ -235,7 +250,8 @@ GpuReport finish_gpu_demo(const GpuDemo& demo) {
 bool gpu_failed(const GpuReport& report, uint64_t expectedUploads) {
   const auto& stats = report.stats;
   return stats.suppressedDraws != 0 || stats.failedHandles != 0 || stats.rejected != 0 || stats.refused != 0 ||
-         stats.staleBinds != 0 || stats.uploads != expectedUploads;
+         stats.staleBinds != 0 || stats.uploads != expectedUploads || stats.dispatchesRejected != 0 ||
+         stats.dispatchesRefused != 0;
 }
 
 struct CustomDrawProbe {
@@ -482,11 +498,11 @@ int main(int argc, char* argv[]) {
   }
   // The receiver is installed once at initialisation, so the answer is fixed for the whole run
   const bool decoding = aurora::render::hints_enabled();
-  const render_demo::SceneOptions sceneOptions{.hints = options.hints,
-                                               .captureOnlyBox = options.hints && decoding,
-                                               .customDrawProbe = g_customDrawProbe.type,
-                                               .gpuArrays = options.gpuArrays,
-                                               .gpuPadMiB = options.gpuPadMiB};
+  render_demo::SceneOptions sceneOptions{.hints = options.hints,
+                                         .captureOnlyBox = options.hints && decoding,
+                                         .customDrawProbe = g_customDrawProbe.type,
+                                         .gpuArrays = options.gpuArrays,
+                                         .gpuPadMiB = options.gpuPadMiB};
   bool decodingChanged = false;
 
   GXInit(nullptr, 0);
@@ -509,6 +525,7 @@ int main(int argc, char* argv[]) {
     return ExitRenderGraphCheck;
   }
   const GpuDemo gpuDemo = create_gpu_demo(options);
+  sceneOptions.gpuCopySystem = gpuDemo.copy;
 
   const auto start = std::chrono::steady_clock::now();
   const auto timeout = std::chrono::seconds{options.timeoutSeconds};
@@ -620,11 +637,12 @@ int main(int argc, char* argv[]) {
     const auto& stats = gpuReport.stats;
     std::printf(
         "render_demo: gpu: uploads %llu, binds %llu, suppressed %llu, failed %llu, rejected %llu, refused %llu, "
-        "stale %llu, systems %s\n",
+        "stale %llu, dispatches %llu, systems %s\n",
         static_cast<unsigned long long>(stats.uploads), static_cast<unsigned long long>(stats.binds),
         static_cast<unsigned long long>(stats.suppressedDraws), static_cast<unsigned long long>(stats.failedHandles),
         static_cast<unsigned long long>(stats.rejected), static_cast<unsigned long long>(stats.refused),
-        static_cast<unsigned long long>(stats.staleBinds), gpuReport.systems.c_str());
+        static_cast<unsigned long long>(stats.staleBinds), static_cast<unsigned long long>(stats.dispatches),
+        gpuReport.systems.c_str());
   }
   const bool cullFailure =
       options.gpuCull != 0 && cull_failed(graphReport.cull, options.frames, frame, info.backend == BACKEND_NULL);

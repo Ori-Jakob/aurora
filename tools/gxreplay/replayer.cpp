@@ -173,6 +173,10 @@ render::gpu::Stats gpu_delta(const render::gpu::Stats& before, const render::gpu
       .updates = after.updates - before.updates,
       .updateBytes = after.updateBytes - before.updateBytes,
       .liveSystems = after.liveSystems,
+      .dispatches = after.dispatches - before.dispatches,
+      .dispatchesRefused = after.dispatchesRefused - before.dispatchesRefused,
+      .dispatchesRejected = after.dispatchesRejected - before.dispatchesRejected,
+      .persistentCopies = after.persistentCopies - before.persistentCopies,
   };
 }
 

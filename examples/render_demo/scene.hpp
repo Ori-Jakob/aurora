@@ -11,6 +11,7 @@ struct SceneOptions {
   aurora::gfx::DrawTypeId customDrawProbe = aurora::gfx::InvalidDrawType;
   bool gpuArrays = false;
   uint32_t gpuPadMiB = 0;
+  uint64_t gpuCopySystem = 0;
 };
 
 struct SceneCamera {

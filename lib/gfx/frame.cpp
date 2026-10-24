@@ -492,6 +492,8 @@ void reset_streaming_request() noexcept { g_requestedSizes = {}; }
 void create_compute_layouts() noexcept { gfx::create_compute_layouts(); }
 
 void release_compute_layouts() noexcept { gfx::release_compute_layouts(); }
+
+void set_staging_buffer(size_t slot, wgpu::Buffer buffer) noexcept { g_stagingBuffers[slot] = std::move(buffer); }
 } // namespace testing
 
 StreamingGrowth next_streaming_sizes(const StreamingSizes& current, const AuroraStats& lastFrame,

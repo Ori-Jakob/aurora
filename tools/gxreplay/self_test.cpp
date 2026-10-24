@@ -10,9 +10,11 @@
 #include <dolphin/gx.h>
 #include <fmt/format.h>
 
+#include <array>
 #include <bit>
 #include <cmath>
 #include <numbers>
+#include <utility>
 
 namespace aurora::gxreplay {
 namespace {
@@ -33,6 +35,8 @@ constexpr std::array<Quad, 3> Quads{{
     {64.f, 304.f, 320.f, 464.f, 192, 384},
 }};
 static_assert(Quads.size() == SelfTestObjects.size());
+constexpr std::array<render::gpu::KernelDesc, 1> CopyKernel{{{.entryPoint = "main", .workgroupSize = {64, 1, 1}}}};
+render::gpu::SystemId g_copySystem = render::gpu::InvalidSystem;
 
 struct Rgb {
   uint8_t r;
@@ -294,8 +298,16 @@ void emit_state(uint32_t frame, SelfTestMode mode) {
   if (mode == SelfTestMode::GpuArrays) {
     const auto positions = quad_positions(true);
     const auto colors = quad_colors(frame);
-    const auto positionHandle = render::gpu::upload(positions.data(), static_cast<uint32_t>(positions.size()));
+    const auto size = static_cast<uint32_t>(positions.size());
+    auto positionHandle = render::gpu::upload(positions.data(), size);
     const auto colorHandle = render::gpu::upload(colors.data(), static_cast<uint32_t>(colors.size()));
+    if (g_copySystem != render::gpu::InvalidSystem) {
+      const auto copied = render::gpu::reserve(size);
+      const std::array<render::gpu::Handle, 1> inputs{positionHandle};
+      if (render::gpu::dispatch(g_copySystem, 0, inputs, copied, {size / 4, 1, 1})) {
+        positionHandle = copied;
+      }
+    }
     GXSetArrayGPU(GX_VA_POS, positionHandle, 0, 12);
     GXSetArrayGPU(GX_VA_CLR0, colorHandle, 0, 4);
   } else {
@@ -453,6 +465,10 @@ bool write_self_test_trace(const std::filesystem::path& path, SelfTestMode mode,
   const auto checker = checker_texels();
   if (gpuArrays) {
     gx::gpu_channel::end_frame();
+    if (render::gpu::systems_available()) {
+      g_copySystem =
+          render::gpu::create_system({.name = "self_test_copy", .library = "systems/copy", .kernels = CopyKernel});
+    }
   }
   for (uint32_t frame = 0; frame < SelfTestFrameCount; ++frame) {
     session.begin_frame(frame, {
@@ -479,6 +495,10 @@ bool write_self_test_trace(const std::filesystem::path& path, SelfTestMode mode,
       session.discard();
       return false;
     }
+  }
+  if (g_copySystem != render::gpu::InvalidSystem) {
+    render::gpu::destroy_system(std::exchange(g_copySystem, render::gpu::InvalidSystem));
+    cut_fifo();
   }
   if (!session.finalize(0, {}, error)) {
     session.discard();

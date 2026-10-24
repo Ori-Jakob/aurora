@@ -28,6 +28,14 @@ struct SystemCreate {
   std::span<const KernelCreate> kernels;
   uint32_t persistentBytes, flags, requirements;
 };
+struct DispatchDecode {
+  uint64_t system;
+  uint32_t kernel;
+  gfx::Range output;
+  std::span<const gfx::Range> inputs;
+  std::array<uint32_t, 3> elements;
+  std::span<const uint8_t> params;
+};
 // Swapped only while the FIFO is drained, like hints::set_sink
 struct SystemBackend {
   void* userData = nullptr;
@@ -36,11 +44,12 @@ struct SystemBackend {
   void (*reset)(void*) noexcept = nullptr;
   render::gpu::SystemStatus (*status)(void*, uint64_t id) noexcept = nullptr;
   void (*wait_all)(void*) noexcept = nullptr;
+  bool (*dispatch)(void*, const DispatchDecode&) noexcept = nullptr;
+  bool (*update)(void*, uint64_t id, uint32_t byteOffset, std::span<const uint8_t> bytes) noexcept = nullptr;
 };
 void set_system_backend(const SystemBackend* backend) noexcept;
 constexpr bool is_command(uint16_t id) noexcept {
-  return id == GX_AURORA_GPU_UPLOAD || id == GX_AURORA_GPU_RESERVE ||
-         (id >= GX_AURORA_LOAD_ARRAY_GPU && id <= GX_AURORA_GPU_DESTROY_SYSTEM);
+  return id >= GX_AURORA_GPU_UPLOAD && id <= GX_AURORA_GPU_DESTROY_SYSTEM;
 }
 bool valid_system_name(std::string_view name) noexcept;
 bool valid_entry_point(std::string_view entry) noexcept;
@@ -54,6 +63,8 @@ bool on_reserve(uint64_t handle, uint32_t bytes, uint32_t flags) noexcept;
 bool on_create(const SystemCreate& desc, std::span<const uint8_t> payload) noexcept;
 bool on_update(uint64_t id, uint32_t byteOffset, std::span<const uint8_t> bytes) noexcept;
 bool on_destroy(uint64_t id) noexcept;
+bool on_dispatch(uint64_t system, uint32_t kernel, uint64_t output, std::span<const uint64_t> inputs,
+                 std::array<uint32_t, 3> elements, std::span<const uint8_t> params) noexcept;
 HandleInfo lookup(uint64_t handle) noexcept;
 bool mark_written(uint64_t handle) noexcept;
 bool mark_failed(uint64_t handle) noexcept;
