@@ -51,6 +51,12 @@ if (AURORA_ENABLE_RENDER)
         lib/render/jobs.cpp
         lib/render/jobs.hpp
         lib/render/json.hpp
+        lib/render/material/key_text.hpp
+        lib/render/material/manifest.cpp
+        lib/render/material/manifest.hpp
+        lib/render/material/registry.cpp
+        lib/render/material/registry.hpp
+        lib/render/material/schema_text.cpp
         lib/render/scene/classifier.cpp
         lib/render/scene/classifier.hpp
         lib/render/scene/classify.cpp
@@ -77,6 +83,6 @@ if (AURORA_ENABLE_RENDER)
     target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_RENDER=1)
     target_link_libraries(aurora_gx PRIVATE yyjson::yyjson)
 else ()
-    target_sources(aurora_gx PRIVATE lib/render/graph_api_off.cpp)
+    target_sources(aurora_gx PRIVATE lib/render/graph_api_off.cpp lib/render/material/registry_off.cpp)
     target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_RENDER=0)
 endif ()

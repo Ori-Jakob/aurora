@@ -227,6 +227,10 @@ if (AURORA_ENABLE_GX)
     gtest
     gtest_main
   )
+  if (AURORA_ENABLE_RENDER)
+    target_sources(material_contract_tests PRIVATE material_registry_test.cpp)
+    target_link_libraries(material_contract_tests PRIVATE yyjson::yyjson)
+  endif ()
   aurora_copy_runtime_dlls(material_contract_tests)
   gtest_discover_tests(material_contract_tests)
 

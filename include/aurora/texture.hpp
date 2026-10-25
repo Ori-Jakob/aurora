@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <variant>
 #include <vector>
@@ -50,6 +51,14 @@ struct ReplacementOptions {
 struct ReplacementRegistration {
   uint64_t id = 0;
   ReplacementKey key;
+};
+
+enum class MaterialLayer : uint8_t { Game = 1, Pack = 2, Mod = 3, User = 4 };
+enum class MaterialManifestStatus : uint8_t { Accepted, Rejected, Missing, Unreadable, Unavailable, Superseded };
+
+struct MaterialManifestRegistration {
+  uint64_t id = 0;
+  MaterialManifestStatus status = MaterialManifestStatus::Unreadable;
 };
 
 struct ReplacementGroup {
@@ -103,6 +112,74 @@ void reload_replacement_directory(const std::filesystem::path& root, Replacement
                                   ReplacementOptions options = {});
 
 bool has_replacement(const GXTexObj* obj, const GXTlutObj* tlut = nullptr);
+
+struct MaterialManifestOptions {
+  MaterialLayer layer = MaterialLayer::Pack;
+  int32_t priority = 0;
+  std::string_view label = {};
+  std::string_view base = {};
+  bool writable = false;
+};
+
+struct MaterialDiagnostic {
+  std::string label;
+  std::string rule;
+  std::string pointer;
+  std::string detail;
+};
+
+struct MaterialManifestInfo {
+  uint64_t id = 0;
+  std::string label;
+  std::filesystem::path path;
+  std::string base;
+  MaterialLayer layer = MaterialLayer::Pack;
+  int32_t priority = 0;
+  uint64_t sequence = 0;
+  MaterialManifestStatus status = MaterialManifestStatus::Unreadable;
+  bool writable = false;
+  bool overridden = false;
+  bool layerEnabled = false;
+  uint32_t materialCount = 0;
+  uint32_t grassTypeCount = 0;
+  std::optional<MaterialDiagnostic> violation;
+};
+
+struct MaterialReport {
+  std::vector<MaterialManifestInfo> manifests;
+  std::vector<MaterialDiagnostic> diagnostics;
+  uint32_t materialCount = 0;
+  uint32_t grassTypeCount = 0;
+  uint64_t generation = 0;
+};
+
+/// Texture material manifests merge in ascending (layer, priority, sequence) order, where sequence is registration
+/// order; the last manifest to set a field wins. Every function is thread safe and may be called before aurora
+/// initializes and after it shuts down.
+/// `base` names the directory a manifest's map paths are relative to; a file defaults to its own directory.
+/// Registration ids are never reused.
+/// A missing or unreadable file keeps its registration; id 0 means the render module is disabled, the layer is
+/// invalid, or the text is over 16 MiB.
+MaterialManifestRegistration load_material_manifest(const std::filesystem::path& path,
+                                                    MaterialManifestOptions options = {});
+MaterialManifestRegistration register_material_manifest(std::string_view text, MaterialManifestOptions options = {});
+std::optional<MaterialManifestInfo> material_manifest_info(const MaterialManifestRegistration& registration);
+/// Reload re-reads a file (or re-checks registered text) and drops any override; update overrides the content for
+/// this session without touching the file. When reloads or updates of one registration overlap, the one started last
+/// wins and the others return Superseded and apply nothing.
+MaterialManifestStatus reload_material_manifest(const MaterialManifestRegistration& registration);
+MaterialManifestStatus update_material_manifest(const MaterialManifestRegistration& registration,
+                                                std::string_view text);
+void unregister_material_manifest(const MaterialManifestRegistration& registration);
+void unregister_material_manifests(std::span<const MaterialManifestRegistration> registrations);
+void clear_material_manifests();
+void set_material_layer_enabled(MaterialLayer layer, bool enabled);
+std::optional<MaterialDiagnostic> check_material_manifest(std::string_view text, MaterialLayer layer);
+MaterialReport material_report();
+std::string material_manifest_json(bool pretty = true);
+std::string find_material_json(const TextureSourceKey& key, bool pretty = false);
+std::string format_material_key(const TextureSourceKey& key);
+std::optional<TextureSourceKey> parse_material_key(std::string_view text);
 
 } // namespace aurora::texture
 

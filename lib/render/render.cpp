@@ -24,6 +24,9 @@
 #include <imgui.h>
 #endif
 
+#include <dolphin/gx/GXStruct.h>
+#include <aurora/texture.hpp>
+
 #include <array>
 
 namespace aurora::render {
@@ -95,6 +98,7 @@ void shutdown() noexcept {
 #if AURORA_ENABLE_RENDER
   // Game registrations are dropped first so no callback can reach anything torn down below
   shutdown_external_passes();
+  texture::clear_material_manifests();
   clear_after_frame_callbacks();
   remove_hints();
   systems::shutdown();
