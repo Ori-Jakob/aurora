@@ -2,7 +2,10 @@
 
 #include "texture.hpp"
 #include <aurora/texture.hpp>
+#include <filesystem>
 #include <optional>
+#include <string>
+#include <string_view>
 
 namespace aurora::gfx::texture_replacement {
 struct ReplacementResult {
@@ -30,6 +33,27 @@ bool has_replacement(const GXTexObj_& obj) noexcept;
 bool has_replacement(const GXTexObj_& obj, const GXTlutObj_& tlut) noexcept;
 std::string build_texture_replacement_name(const GXTexObj_& obj) noexcept;
 std::string build_texture_replacement_name(const texture::TextureSourceKey& sourceKey) noexcept;
+
+enum class CompanionRole : uint8_t { Albedo, Delight, Nrm, Orm, Emit, GrassMask, Mat };
+inline constexpr uint32_t CompanionRoleCount = 7;
+
+struct CompanionName {
+  texture::TextureSourceKey key;
+  CompanionRole role = CompanionRole::Albedo;
+  uint32_t mip = 0;
+};
+
+struct CompanionFile {
+  uint64_t id = 0;
+  std::filesystem::path path;
+};
+
+std::string_view companion_role_name(CompanionRole role) noexcept;
+std::optional<CompanionName> parse_companion_filename(std::string_view filename) noexcept;
+std::string companion_mip_filename(std::string_view path, uint32_t mip);
+std::optional<CompanionFile> find_companion(const texture::TextureSourceKey& key, CompanionRole role);
+uint32_t companion_roles(const texture::TextureSourceKey& key) noexcept;
+uint64_t companion_generation() noexcept;
 
 namespace testing {
 void set_workers_paused(bool paused) noexcept;

@@ -63,6 +63,9 @@ struct MaterialManifestRegistration {
 
 struct ReplacementGroup {
   std::vector<ReplacementRegistration> registrations;
+  // Companion maps and pack manifests found by load_replacement_directory; removed with the group
+  std::vector<ReplacementRegistration> companions;
+  std::vector<MaterialManifestRegistration> manifests;
 };
 
 /// Parses a replacement filename of the form "tex1_{w}x{h}[_m]_{texhash}[_{tluthash}]_{fmt}[_arb].dds|.png"

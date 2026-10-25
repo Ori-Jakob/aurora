@@ -5,6 +5,9 @@
 #include "../gx/gx.hpp"
 #include "../gx/texture.hpp"
 #include "../internal.hpp"
+#if AURORA_ENABLE_RENDER
+#include "../render/material/registry.hpp"
+#endif
 #include "../thread.hpp"
 #include "../webgpu/gpu.hpp"
 #include "dds_io.hpp"
@@ -145,6 +148,30 @@ uint64_t s_replacementCacheBytes = 0;
 uint64_t s_nextRegistrationId = 1;
 uint64_t s_nextSequence = 1;
 uint32_t s_sourceEntryCount = 0;
+
+using gfx::texture_replacement::CompanionName;
+using gfx::texture_replacement::CompanionRole;
+using gfx::texture_replacement::CompanionRoleCount;
+
+struct CompanionEntry {
+  uint64_t id = 0;
+  int32_t priority = 0;
+  uint64_t sequence = 0;
+  std::filesystem::path path;
+};
+
+using CompanionSet = std::array<std::vector<CompanionEntry>, CompanionRoleCount>;
+
+constexpr std::array<std::string_view, CompanionRoleCount> CompanionRoleNames{"albedo", "delight",   "nrm", "orm",
+                                                                              "emit",   "grassmask", "mat"};
+#if AURORA_ENABLE_RENDER
+static_assert(CompanionRoleNames == render::material::MapRoleNames);
+static_assert(render::material::map_role_bit(static_cast<uint32_t>(CompanionRole::Albedo)) == 1u << 16 &&
+              render::material::map_role_bit(static_cast<uint32_t>(CompanionRole::Mat)) == 1u << 22);
+#endif
+
+absl::flat_hash_map<TextureSourceKey, CompanionSet, SourceKeyHash> s_companionsByKey;
+std::atomic<uint64_t> s_companionGeneration{0};
 
 std::mutex s_jobMutex;
 std::condition_variable s_jobCv;
@@ -1271,6 +1298,10 @@ void clear_replacement_runtime_state_locked(std::vector<std::shared_ptr<VirtualR
   s_replacementLru.clear();
   s_replacementCacheBytes = 0;
   s_sourceEntryCount = 0;
+  if (!s_companionsByKey.empty()) {
+    s_companionsByKey.clear();
+    s_companionGeneration.fetch_add(1, std::memory_order_relaxed);
+  }
 }
 
 bool is_source_key(const ReplacementKey& key) noexcept { return std::holds_alternative<TextureSourceKey>(key); }
@@ -1299,6 +1330,63 @@ ReplacementRegistration register_file_replacement(TextureSourceKey key, std::fil
   erase_cache_locked(replacementKey);
   gx::clear_static_texture_cache();
   return registration;
+}
+
+void register_companions(std::span<const CompanionName> names, std::span<const std::filesystem::path> paths,
+                         ReplacementOptions options, std::vector<ReplacementRegistration>& out) {
+  if (names.empty()) {
+    return;
+  }
+  std::lock_guard lk(s_registryMutex);
+  for (size_t i = 0; i < names.size(); ++i) {
+    const uint64_t id = s_nextRegistrationId++;
+    s_companionsByKey[names[i].key][static_cast<size_t>(names[i].role)].push_back({
+        .id = id,
+        .priority = options.priority,
+        .sequence = s_nextSequence++,
+        .path = paths[i],
+    });
+    out.push_back({.id = id, .key = names[i].key});
+  }
+  s_companionGeneration.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool erase_companion_locked(const TextureSourceKey& key, uint64_t id) noexcept {
+  const auto it = s_companionsByKey.find(key);
+  if (it == s_companionsByKey.end()) {
+    return false;
+  }
+  bool erased = false;
+  bool empty = true;
+  for (auto& entries : it->second) {
+    const auto entry = std::find_if(entries.begin(), entries.end(),
+                                    [id](const CompanionEntry& candidate) { return candidate.id == id; });
+    if (entry != entries.end()) {
+      entries.erase(entry);
+      erased = true;
+    }
+    empty &= entries.empty();
+  }
+  if (empty) {
+    s_companionsByKey.erase(it);
+  }
+  return erased;
+}
+
+const CompanionSet* find_companion_set_locked(TextureSourceKey key) noexcept {
+  if (!key.hasTlut) {
+    key.tlutHash = 0;
+  }
+  if (const auto it = s_companionsByKey.find(key); it != s_companionsByKey.end()) {
+    return &it->second;
+  }
+  if (key.hasTlut && key.tlutHash != kReplacementWildcardTlutHash) {
+    key.tlutHash = kReplacementWildcardTlutHash;
+    if (const auto it = s_companionsByKey.find(key); it != s_companionsByKey.end()) {
+      return &it->second;
+    }
+  }
+  return nullptr;
 }
 } // namespace
 
@@ -1466,7 +1554,25 @@ void unregister_replacements(std::span<const ReplacementRegistration> registrati
   wait_for_virtual_reads(waitStates);
 }
 
-void unregister_replacements(const ReplacementGroup& group) { unregister_replacements(group.registrations); }
+void unregister_replacements(const ReplacementGroup& group) {
+  unregister_replacements(group.registrations);
+  if (!group.companions.empty()) {
+    std::lock_guard lk(s_registryMutex);
+    bool removed = false;
+    for (const auto& registration : group.companions) {
+      const auto* key = std::get_if<TextureSourceKey>(&registration.key);
+      if (key != nullptr && registration.id != 0) {
+        removed |= erase_companion_locked(*key, registration.id);
+      }
+    }
+    if (removed) {
+      s_companionGeneration.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  if (!group.manifests.empty()) {
+    unregister_material_manifests(group.manifests);
+  }
+}
 
 void unregister_replacements(const ReplacementKey& key) {
   std::vector<std::shared_ptr<VirtualReadState>> waitStates;
@@ -1555,6 +1661,7 @@ ReplacementGroup load_replacement_directory(const std::filesystem::path& root, R
   }
 
   std::vector<ReplacementCandidate> candidates;
+  std::vector<ReplacementCandidate> manifestCandidates;
   std::error_code ec;
   for (std::filesystem::recursive_directory_iterator it(
            root,
@@ -1572,6 +1679,14 @@ ReplacementGroup load_replacement_directory(const std::filesystem::path& root, R
 
     const auto& path = it->path();
     if (is_relative_to(path, dumpRoot)) {
+      continue;
+    }
+
+    if (iequals_ascii(io::fs_path_to_string(path.filename()), "materials.json")) {
+      auto components = path_components(root, path);
+      if (components.size() <= 2) {
+        manifestCandidates.push_back({.path = path, .components = std::move(components)});
+      }
       continue;
     }
 
@@ -1593,17 +1708,60 @@ ReplacementGroup load_replacement_directory(const std::filesystem::path& root, R
   std::sort(candidates.begin(), candidates.end(), compare_replacement_candidates);
 
   absl::flat_hash_set<TextureSourceKey, SourceKeyHash> registeredKeys;
+  std::vector<const ReplacementCandidate*> unparsed;
   for (const auto& candidate : candidates) {
     const auto parsed = parse_replacement_filename(io::fs_path_to_string(candidate.path.filename()));
-    if (!parsed.has_value() || registeredKeys.contains(*parsed)) {
+    if (!parsed.has_value()) {
+      unparsed.push_back(&candidate);
+      continue;
+    }
+    if (registeredKeys.contains(*parsed)) {
       continue;
     }
     registeredKeys.insert(*parsed);
     group.registrations.push_back(register_file_replacement(*parsed, candidate.path, options));
   }
 
+  std::vector<CompanionName> companionNames;
+  std::vector<std::filesystem::path> companionPaths;
+  absl::flat_hash_map<TextureSourceKey, uint32_t, SourceKeyHash> indexedRoles;
+  size_t unrecognized = 0;
+  for (const auto* candidate : unparsed) {
+    const auto name =
+        gfx::texture_replacement::parse_companion_filename(io::fs_path_to_string(candidate->path.filename()));
+    if (!name.has_value()) {
+      ++unrecognized;
+      continue;
+    }
+    if (name->mip > 0) {
+      continue;
+    }
+    const uint32_t roleBit = 1u << static_cast<uint32_t>(name->role);
+    uint32_t& roles = indexedRoles[name->key];
+    if ((roles & roleBit) != 0) {
+      continue;
+    }
+    roles |= roleBit;
+    companionNames.push_back(*name);
+    companionPaths.push_back(candidate->path);
+  }
+  register_companions(companionNames, companionPaths, options, group.companions);
+
+  std::sort(manifestCandidates.begin(), manifestCandidates.end(), compare_replacement_candidates);
+  for (auto it = manifestCandidates.rbegin(); it != manifestCandidates.rend(); ++it) {
+    const auto registration =
+        load_material_manifest(it->path, {.layer = MaterialLayer::Pack, .priority = options.priority});
+    if (registration.id != 0) {
+      group.manifests.push_back(registration);
+    }
+  }
+
   Log.info("Loaded {} texture replacement registrations from {}", group.registrations.size(),
            io::fs_path_to_string(root));
+  if (!group.companions.empty() || !group.manifests.empty() || unrecognized != 0) {
+    Log.info("Indexed {} companion material map(s) and {} manifest(s) from {} ({} unrecognized name(s))",
+             group.companions.size(), group.manifests.size(), io::fs_path_to_string(root), unrecognized);
+  }
   return group;
 }
 
@@ -1784,6 +1942,129 @@ bool should_build_source_key() noexcept {
   std::lock_guard lk(s_registryMutex);
   return s_sourceEntryCount != 0 || g_config.allowTextureDumps;
 }
+
+std::string_view companion_role_name(CompanionRole role) noexcept {
+  const auto index = static_cast<size_t>(role);
+  return index < CompanionRoleNames.size() ? CompanionRoleNames[index] : std::string_view{};
+}
+
+std::optional<CompanionName> parse_companion_filename(std::string_view filename) noexcept {
+  constexpr std::string_view extension = ".dds";
+  if (filename.size() < extension.size() ||
+      !iequals_ascii(filename.substr(filename.size() - extension.size()), extension)) {
+    return std::nullopt;
+  }
+  std::string_view body = filename.substr(0, filename.size() - extension.size());
+  const size_t dot = body.rfind('.');
+  if (dot == std::string_view::npos) {
+    return std::nullopt;
+  }
+  const auto role = std::find(CompanionRoleNames.begin(), CompanionRoleNames.end(), body.substr(dot + 1));
+  if (role == CompanionRoleNames.end()) {
+    return std::nullopt;
+  }
+  body = body.substr(0, dot);
+
+  uint32_t mip = 0;
+  size_t digits = body.size();
+  while (digits > 0 && body[digits - 1] >= '0' && body[digits - 1] <= '9') {
+    --digits;
+  }
+  if (digits < body.size() && body.substr(0, digits).ends_with("_mip")) {
+    const std::string_view number = body.substr(digits);
+    if (number.front() == '0' || number.size() > 2) {
+      return std::nullopt;
+    }
+    for (const char ch : number) {
+      mip = mip * 10 + static_cast<uint32_t>(ch - '0');
+    }
+    if (mip > 15) {
+      return std::nullopt;
+    }
+    body = body.substr(0, digits - 4);
+  }
+
+  const auto key = parse_replacement_filename(fmt::format("{}.dds", body));
+  if (!key.has_value()) {
+    return std::nullopt;
+  }
+  size_t start = 0;
+  while (true) {
+    const size_t end = body.find('_', start);
+    if ((end == std::string_view::npos ? body.size() : end) - start > 16) {
+      return std::nullopt;
+    }
+    if (end == std::string_view::npos) {
+      break;
+    }
+    start = end + 1;
+  }
+  if (key->textureHash == kReplacementWildcardTextureHash) {
+    return std::nullopt;
+  }
+  return CompanionName{
+      .key = *key,
+      .role = static_cast<CompanionRole>(role - CompanionRoleNames.begin()),
+      .mip = mip,
+  };
+}
+
+std::string companion_mip_filename(std::string_view path, uint32_t mip) {
+  const size_t slash = path.find_last_of("/\\");
+  const size_t nameStart = slash == std::string_view::npos ? 0 : slash + 1;
+  size_t extension = path.rfind('.');
+  if (extension == std::string_view::npos || extension < nameStart) {
+    extension = path.size();
+  }
+  size_t roleDot = extension > nameStart ? path.rfind('.', extension - 1) : std::string_view::npos;
+  if (roleDot == std::string_view::npos || roleDot < nameStart) {
+    roleDot = extension;
+  }
+  return fmt::format("{}_mip{}{}", path.substr(0, roleDot), mip, path.substr(roleDot));
+}
+
+std::optional<CompanionFile> find_companion(const TextureSourceKey& key, CompanionRole role) {
+  const auto index = static_cast<size_t>(role);
+  if (s_bypass.load(std::memory_order_relaxed) || index >= CompanionRoleCount) {
+    return std::nullopt;
+  }
+  std::lock_guard lk(s_registryMutex);
+  const auto* set = find_companion_set_locked(key);
+  if (set == nullptr) {
+    return std::nullopt;
+  }
+  const CompanionEntry* selected = nullptr;
+  for (const auto& entry : (*set)[index]) {
+    if (selected == nullptr || entry.priority > selected->priority ||
+        (entry.priority == selected->priority && entry.sequence > selected->sequence)) {
+      selected = &entry;
+    }
+  }
+  if (selected == nullptr) {
+    return std::nullopt;
+  }
+  return CompanionFile{.id = selected->id, .path = selected->path};
+}
+
+uint32_t companion_roles(const TextureSourceKey& key) noexcept {
+  if (s_bypass.load(std::memory_order_relaxed)) {
+    return 0;
+  }
+  std::lock_guard lk(s_registryMutex);
+  const auto* set = find_companion_set_locked(key);
+  if (set == nullptr) {
+    return 0;
+  }
+  uint32_t roles = 0;
+  for (uint32_t i = 0; i < CompanionRoleCount; ++i) {
+    if (!(*set)[i].empty()) {
+      roles |= 1u << i;
+    }
+  }
+  return roles;
+}
+
+uint64_t companion_generation() noexcept { return s_companionGeneration.load(std::memory_order_relaxed); }
 
 void set_bypass(bool bypass) noexcept { s_bypass.store(bypass, std::memory_order_relaxed); }
 

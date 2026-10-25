@@ -1,11 +1,14 @@
 #include "material_contract_check.hpp"
 
 #include "gfx/dds_io.hpp"
+#include "gfx/texture_replacement.hpp"
+#include "internal.hpp"
 
 #include <fmt/format.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <ostream>
@@ -492,6 +495,95 @@ TEST_F(MaterialContractTest, ClampedChainMirrorsPackLayout) {
   // GZ2 packs stop downscaling at the 16x16 native size, so their tails repeat it.
   check_chain({}, {64, 32, 16, 16, 16});
   check_chain("mat", {32, 16, 16, 16});
+}
+
+TEST_F(MaterialContractTest, CompanionParserMatchesC1Names) {
+  std::vector<std::string> names;
+  for (const Json& entry : index_array("names")) {
+    names.push_back(text_of(entry, "name"));
+  }
+  EXPECT_EQ(names.size(), 30u);
+  for (const Json& entry : index_array("dds")) {
+    names.push_back(text_of(entry, "file"));
+  }
+  EXPECT_EQ(names.size(), 77u);
+  size_t companions = 0;
+  for (const std::string& name : names) {
+    SCOPED_TRACE(name);
+    const NameInfo info = classify_name(name);
+    const auto parsed = gfx::texture_replacement::parse_companion_filename(name);
+    ASSERT_EQ(parsed.has_value(), info.kind == NameKind::Companion || info.kind == NameKind::CompanionMip);
+    if (!parsed) {
+      continue;
+    }
+    ++companions;
+    EXPECT_EQ(canonical_key(parsed->key), info.key);
+    EXPECT_EQ(gfx::texture_replacement::companion_role_name(parsed->role), info.role);
+    EXPECT_EQ(parsed->mip, info.mip);
+  }
+  EXPECT_GT(companions, 0u);
+}
+
+class MaterialDiscoveryTest : public MaterialContractTest {
+protected:
+  void SetUp() override {
+    gfx::texture_replacement::shutdown();
+    gfx::texture_replacement::testing::set_worker_count(1);
+    gfx::texture_replacement::testing::set_workers_paused(true);
+    m_cachePath = (std::filesystem::temp_directory_path() /
+                   ("aurora-discovery-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())))
+                      .string();
+    m_savedCachePath = g_config.cachePath;
+    g_config.cachePath = m_cachePath.c_str();
+  }
+
+  void TearDown() override {
+    g_config.cachePath = m_savedCachePath;
+    gfx::texture_replacement::shutdown();
+    std::error_code ec;
+    std::filesystem::remove_all(m_cachePath, ec);
+  }
+
+  std::string m_cachePath;
+  const char* m_savedCachePath = nullptr;
+};
+
+TEST_F(MaterialDiscoveryTest, DiscoveryOverDdsFixtures) {
+  using gfx::texture_replacement::CompanionRole;
+  const auto group = texture::load_replacement_directory(s_root / "dds");
+  std::set<std::string> registrations;
+  for (const auto& registration : group.registrations) {
+    registrations.insert(canonical_key(std::get<texture::TextureSourceKey>(registration.key)));
+  }
+  EXPECT_EQ(registrations, (std::set<std::string>{"tex1_16x16_000000000000a001_14", "tex1_16x16_000000000000c001_14"}));
+  EXPECT_EQ(group.companions.size(), 24u);
+  EXPECT_TRUE(group.manifests.empty());
+
+  const auto roles = companion_roles();
+  size_t levelZero = 0;
+  for (const auto& entry : std::filesystem::directory_iterator{s_root / "dds"}) {
+    const std::string name = entry.path().filename().string();
+    const NameInfo info = classify_name(name);
+    if (info.kind != NameKind::Companion) {
+      continue;
+    }
+    SCOPED_TRACE(name);
+    ++levelZero;
+    const auto key = texture::parse_replacement_filename(info.key + ".dds");
+    ASSERT_TRUE(key.has_value());
+    const auto role = static_cast<CompanionRole>(std::find(roles.begin(), roles.end(), info.role) - roles.begin());
+    const auto file = gfx::texture_replacement::find_companion(*key, role);
+    ASSERT_TRUE(file.has_value());
+    EXPECT_EQ(file->path.filename().string(), name);
+  }
+  EXPECT_EQ(levelZero, 24u);
+
+  const texture::TextureSourceKey d0f1{
+      .textureHash = 0xd001, .tlutHash = 0xd0f1, .width = 16, .height = 16, .format = 9, .hasTlut = true};
+  EXPECT_EQ(gfx::texture_replacement::companion_roles(d0f1), 1u << static_cast<uint32_t>(CompanionRole::Orm));
+
+  texture::unregister_replacements(group);
+  EXPECT_EQ(gfx::texture_replacement::companion_roles(d0f1), 0u);
 }
 
 struct SplitMix64 {
