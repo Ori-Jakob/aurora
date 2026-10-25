@@ -8,6 +8,7 @@
 #include "stage.hpp"
 #include "../gfx/frame.hpp"
 #include "../gfx/recording.hpp"
+#include "../gfx/texture_replacement.hpp"
 #include "../logging.hpp"
 #include "../webgpu/caps.hpp"
 
@@ -671,6 +672,8 @@ std::shared_ptr<const FrameState> latch_frame() {
   if (settingsChanged && module_features_effective(latched_settings())) {
     gfx::detail::request_streaming_sizes({.storage = ModuleStorageBufferSize});
   }
+  // Unconditional so the value latched at init also reaches the loader
+  gfx::texture_replacement::set_mip_repair(latched_settings().textureMaterials);
   std::shared_ptr<const CompiledGraph> graph = g_frameState ? g_frameState->graph : nullptr;
   bool inspectorOpen = false;
 #if AURORA_ENABLE_RENDER

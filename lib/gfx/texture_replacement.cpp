@@ -6,6 +6,7 @@
 #include "../gx/texture.hpp"
 #include "../internal.hpp"
 #if AURORA_ENABLE_RENDER
+#include "../render/material/mip_repair.hpp"
 #include "../render/material/registry.hpp"
 #endif
 #include "../thread.hpp"
@@ -46,6 +47,10 @@
 namespace aurora::texture {
 namespace {
 constexpr Module Log{"aurora::texture"};
+
+using gfx::texture_replacement::ChainReport;
+using gfx::texture_replacement::ChainVerdict;
+using gfx::texture_replacement::MipFit;
 
 constexpr uint64_t kReplacementCacheBudgetBytes = 4294967296; // 4GB
 constexpr uint64_t kReplacementWildcardTextureHash = kWildcardTextureHash;
@@ -94,6 +99,7 @@ struct SelectedCache {
   uint64_t bytes = 0;
   std::list<ReplacementKey>::iterator lruIt;
   Tier tier = Tier::Full;
+  ChainReport chain{};
 };
 
 struct EntryLoadSnapshot {
@@ -117,6 +123,8 @@ struct LoadCompletion {
   EntryLoadSnapshot entry;
   std::optional<gfx::ConvertedTexture> texture;
   bool thumbnailStored = false;
+  ChainReport chain{};
+  bool repairEnabled = false;
 };
 
 struct SourceKeyHash {
@@ -139,6 +147,7 @@ struct ReplacementKeyHash {
 std::mutex s_registryMutex;
 std::atomic_bool s_bypass{false};
 std::atomic_bool s_synchronousLoads{false};
+std::atomic_bool s_mipRepair{false};
 absl::flat_hash_map<ReplacementKey, std::vector<ReplacementEntry>, ReplacementKeyHash> s_entriesByKey;
 absl::flat_hash_map<ReplacementKey, SelectedCache, ReplacementKeyHash> s_cacheByKey;
 absl::flat_hash_set<uint64_t> s_failedIds;
@@ -579,8 +588,105 @@ struct VirtualTextureSource {
   std::optional<gfx::ConvertedTexture> load_mip() { return decode(); }
 };
 
+uint8_t level_count_u8(uint64_t count) noexcept { return static_cast<uint8_t>(std::min<uint64_t>(count, UINT8_MAX)); }
+
+bool is_arbitrary_mip_name(std::string_view name) noexcept {
+  const size_t slash = name.find_last_of("/\\");
+  const size_t start = slash == std::string_view::npos ? 0 : slash + 1;
+  size_t dot = name.rfind('.');
+  if (dot == std::string_view::npos || dot < start) {
+    dot = name.size();
+  }
+  return name.substr(start, dot - start).ends_with("_arb");
+}
+
+bool chain_repairable(wgpu::TextureFormat format, const gfx::ConvertedTexture& last, std::string_view name) noexcept {
+  const uint64_t texels = uint64_t{last.width} * last.height;
+  if (texels <= 1 || is_arbitrary_mip_name(name)) {
+    return false;
+  }
+#if AURORA_ENABLE_RENDER
+  return render::material::can_repair(format) && texels <= render::material::MaxRepairSourceTexels;
+#else
+  static_cast<void>(format);
+  return false;
+#endif
+}
+
+std::optional<gfx::ConvertedTexture> rebuild_mip_chain(const gfx::ConvertedTexture& base,
+                                                       std::span<const gfx::ConvertedTexture> kept,
+                                                       ChainReport& report) noexcept {
+#if AURORA_ENABLE_RENDER
+  const gfx::ConvertedTexture& last = kept.empty() ? base : kept.back();
+  const auto start = std::chrono::steady_clock::now();
+  auto tail = render::material::generate_mip_tail({
+      .format = base.format,
+      .width = last.width,
+      .height = last.height,
+      .level = {last.data.data(), last.data.size()},
+  });
+  const auto micros =
+      std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+  if (!tail) {
+    return std::nullopt;
+  }
+
+  const uint32_t mips = gfx::texture_replacement::full_mip_count(base.width, base.height);
+  const uint64_t n = gfx::calc_texture_size(base.format, base.width, base.height, mips);
+  if (n == 0) {
+    return std::nullopt;
+  }
+  ByteBuffer blob{n};
+  uint64_t o = 0;
+  const auto append = [&](const ByteBuffer& d) noexcept -> bool {
+    if (o + d.size() > n) {
+      return false;
+    }
+    std::memcpy(blob.data() + o, d.data(), d.size());
+    o += d.size();
+    return true;
+  };
+  if (!append(base.data)) {
+    return std::nullopt;
+  }
+  for (const auto& mip : kept) {
+    if (!append(mip.data)) {
+      return std::nullopt;
+    }
+  }
+  if (!append(*tail) || o != n) {
+    return std::nullopt;
+  }
+
+  report.generatedLevels = level_count_u8(mips - 1 - kept.size());
+  report.repaired = true;
+  report.repairMicros = static_cast<uint32_t>(std::min<int64_t>(micros, UINT32_MAX));
+  return gfx::ConvertedTexture{
+      .format = base.format,
+      .width = base.width,
+      .height = base.height,
+      .mips = mips,
+      .data = std::move(blob),
+  };
+#else
+  static_cast<void>(base);
+  static_cast<void>(kept);
+  static_cast<void>(report);
+  return std::nullopt;
+#endif
+}
+
+struct InvalidMip {
+  uint32_t expectedWidth = 0;
+  uint32_t expectedHeight = 0;
+  std::string name;
+  uint32_t width = 0;
+  uint32_t height = 0;
+};
+
 template <typename Source>
-std::optional<gfx::ConvertedTexture> load_encoded_replacement(Source&& src) noexcept {
+std::optional<gfx::ConvertedTexture> load_encoded_replacement(Source&& src, bool repair, ChainReport& report) noexcept {
+  report = {};
   auto base = src.load_base();
   if (!base.has_value()) {
     Log.warn("texture_replacement: failed to load texture {}", src.name());
@@ -600,39 +706,91 @@ std::optional<gfx::ConvertedTexture> load_encoded_replacement(Source&& src) noex
     return std::nullopt;
   }
 
+  const uint32_t fullLevels = gfx::texture_replacement::full_mip_count(base->width, base->height);
+  report.format = base->format;
+  report.fullLevels = level_count_u8(fullLevels);
   if (base->mips > 1) {
+    report.verdict = ChainVerdict::Internal;
+    report.keptLevels = level_count_u8(base->mips);
     return base;
   }
 
   std::vector<gfx::ConvertedTexture> more;
+  ChainVerdict verdict = ChainVerdict::Unprobed;
+  uint32_t stopLevel = 0;
+  uint32_t prevWidth = base->width;
+  uint32_t prevHeight = base->height;
+  std::optional<InvalidMip> invalid;
   for (uint32_t mipLevel = 1;; ++mipLevel) {
     if (!src.open_mip(mipLevel)) {
       break;
     }
 
     auto lvl = src.load_mip();
-    const uint32_t ew = std::max(base->width >> mipLevel, 1u);
-    const uint32_t eh = std::max(base->height >> mipLevel, 1u);
-    const bool ok = lvl.has_value() && lvl->format == base->format && lvl->width == ew && lvl->height == eh;
-    if (!ok) {
-      if (!lvl.has_value()) {
-        Log.warn("texture_replacement: could not load mip {}", src.mip_name());
-      } else if (lvl->format != base->format) {
-        Log.warn("texture_replacement: mip {} has format {}, base has {}", src.mip_name(),
-                 static_cast<uint32_t>(lvl->format), static_cast<uint32_t>(base->format));
+    if (!lvl.has_value()) {
+      Log.warn("texture_replacement: could not load mip {}", src.mip_name());
+      verdict = ChainVerdict::Broken;
+      break;
+    }
+    if (lvl->format != base->format) {
+      Log.warn("texture_replacement: mip {} has format {}, base has {}", src.mip_name(),
+               static_cast<uint32_t>(lvl->format), static_cast<uint32_t>(base->format));
+      verdict = ChainVerdict::Broken;
+      break;
+    }
+    const auto fit = gfx::texture_replacement::classify_mip_level(base->width, base->height, mipLevel, prevWidth,
+                                                                  prevHeight, lvl->width, lvl->height);
+    if (fit != MipFit::Standard) {
+      stopLevel = mipLevel;
+      if (fit == MipFit::Clamped) {
+        verdict = ChainVerdict::Clamped;
       } else {
-        Log.warn("texture_replacement: expected {}x{} for mip {}, got {}x{}", ew, eh, src.mip_name(), lvl->width,
-                 lvl->height);
+        verdict = ChainVerdict::Invalid;
+        invalid = InvalidMip{
+            .expectedWidth = mipLevel >= 32 ? 1u : std::max(base->width >> mipLevel, 1u),
+            .expectedHeight = mipLevel >= 32 ? 1u : std::max(base->height >> mipLevel, 1u),
+            .name = src.mip_name(),
+            .width = lvl->width,
+            .height = lvl->height,
+        };
       }
-
       break;
     }
     // If a sidecar mip file contains mipmaps, keep only the top level mip.
     if (!remove_mipmaps(*lvl)) {
       Log.warn("texture_replacement: could not slice first mip {}", src.mip_name());
+      verdict = ChainVerdict::Broken;
       break;
     }
+    prevWidth = lvl->width;
+    prevHeight = lvl->height;
     more.push_back(std::move(*lvl));
+  }
+
+  const uint64_t keptLevels = 1 + more.size();
+  if (verdict == ChainVerdict::Unprobed) {
+    verdict = more.empty()               ? ChainVerdict::Mipless
+              : keptLevels >= fullLevels ? ChainVerdict::Complete
+                                         : ChainVerdict::Short;
+  }
+  report.verdict = verdict;
+  report.keptLevels = level_count_u8(keptLevels);
+  report.repairable = (verdict == ChainVerdict::Clamped || verdict == ChainVerdict::Invalid) &&
+                      chain_repairable(base->format, more.empty() ? *base : more.back(), src.name());
+  if (repair && report.repairable) {
+    if (auto rebuilt = rebuild_mip_chain(*base, more, report); rebuilt.has_value()) {
+      Log.debug("texture_replacement: rebuilt {} mips for {} in {} us", report.generatedLevels, src.name(),
+                report.repairMicros);
+      return rebuilt;
+    }
+    Log.warn("texture_replacement: could not rebuild mips for {}", src.name());
+  }
+  if (verdict == ChainVerdict::Clamped) {
+    Log.debug("texture_replacement: mip chain for {} clamps at {}x{} from mip {}", src.name(), prevWidth, prevHeight,
+              stopLevel);
+  } else if (invalid.has_value()) {
+    Log.warn("texture_replacement: expected {}x{} for mip {}, got {}x{}", invalid->expectedWidth,
+             invalid->expectedHeight, invalid->name, invalid->width, invalid->height);
   }
 
   if (more.empty()) {
@@ -677,16 +835,20 @@ std::optional<gfx::ConvertedTexture> load_encoded_replacement(Source&& src) noex
   };
 }
 
-std::optional<gfx::ConvertedTexture> load_file_replacement(const EntryLoadSnapshot& entry) noexcept {
-  return load_encoded_replacement(FileTextureSource{.path = entry.path});
+std::optional<gfx::ConvertedTexture> load_file_replacement(const EntryLoadSnapshot& entry, bool repair,
+                                                           ChainReport& report) noexcept {
+  return load_encoded_replacement(FileTextureSource{.path = entry.path}, repair, report);
 }
 
-std::optional<gfx::ConvertedTexture> load_virtual_replacement(const EntryLoadSnapshot& entry) noexcept {
-  return load_encoded_replacement(VirtualTextureSource{
-      .path = entry.virtualPath,
-      .source = entry.source,
-      .readState = entry.virtualReadState,
-  });
+std::optional<gfx::ConvertedTexture> load_virtual_replacement(const EntryLoadSnapshot& entry, bool repair,
+                                                              ChainReport& report) noexcept {
+  return load_encoded_replacement(
+      VirtualTextureSource{
+          .path = entry.virtualPath,
+          .source = entry.source,
+          .readState = entry.virtualReadState,
+      },
+      repair, report);
 }
 
 EntryLoadSnapshot snapshot_entry(const ReplacementKey& key, const ReplacementEntry& entry) {
@@ -752,15 +914,17 @@ void worker_main(std::stop_token token) {
     std::optional<gfx::ConvertedTexture> texture;
     bool thumbnailIncludesBase = false;
     bool thumbnailStored = false;
+    ChainReport chain;
+    bool repairEnabled = false;
     if (job.tier == Tier::Thumbnail) {
       if (auto thumbnail = load_thumbnail(job.entry); thumbnail.has_value()) {
         texture = std::move(thumbnail->texture);
         thumbnailIncludesBase = thumbnail->includesBase;
       }
-    } else if (job.entry.kind == EntryKind::File) {
-      texture = load_file_replacement(job.entry);
-    } else if (job.entry.kind == EntryKind::Virtual) {
-      texture = load_virtual_replacement(job.entry);
+    } else if (job.entry.kind == EntryKind::File || job.entry.kind == EntryKind::Virtual) {
+      repairEnabled = s_mipRepair.load(std::memory_order_acquire);
+      texture = job.entry.kind == EntryKind::File ? load_file_replacement(job.entry, repairEnabled, chain)
+                                                  : load_virtual_replacement(job.entry, repairEnabled, chain);
     }
 
     if (job.tier == Tier::Thumbnail && texture.has_value() && usable_as_legacy_base(texture->format) &&
@@ -784,6 +948,8 @@ void worker_main(std::stop_token token) {
             .entry = std::move(job.entry),
             .texture = job.tier == Tier::Full ? std::move(texture) : std::nullopt,
             .thumbnailStored = thumbnailStored,
+            .chain = chain,
+            .repairEnabled = repairEnabled,
         });
       }
     }
@@ -989,7 +1155,8 @@ void evict_replacement_cache_if_needed() noexcept {
   }
 }
 
-void cache_replacement_locked(const ReplacementKey& key, uint64_t id, gfx::TextureHandle handle, Tier tier) noexcept {
+void cache_replacement_locked(const ReplacementKey& key, uint64_t id, gfx::TextureHandle handle, Tier tier,
+                              const ChainReport& chain = {}) noexcept {
   erase_cache_locked(key);
   if (!handle) {
     return;
@@ -1003,6 +1170,7 @@ void cache_replacement_locked(const ReplacementKey& key, uint64_t id, gfx::Textu
                                 .bytes = replacementBytes,
                                 .lruIt = s_replacementLru.begin(),
                                 .tier = tier,
+                                .chain = chain,
                             });
   s_replacementCacheBytes += replacementBytes;
   evict_replacement_cache_if_needed();
@@ -1062,7 +1230,8 @@ std::optional<ReplacementKey> find_source_replacement_key_locked(const TextureSo
   return std::nullopt;
 }
 
-gfx::TextureHandle load_entry_handle(const ReplacementKey& key, const ReplacementEntry& entry) noexcept {
+gfx::TextureHandle load_entry_handle(const ReplacementKey& key, const ReplacementEntry& entry,
+                                     ChainReport& chain) noexcept {
   if (s_failedIds.contains(entry.id)) {
     return {};
   }
@@ -1070,8 +1239,9 @@ gfx::TextureHandle load_entry_handle(const ReplacementKey& key, const Replacemen
   gfx::TextureHandle handle;
   if (entry.kind == EntryKind::File || entry.kind == EntryKind::Virtual) {
     const auto snapshot = snapshot_entry(key, entry);
-    const auto replacement =
-        entry.kind == EntryKind::File ? load_file_replacement(snapshot) : load_virtual_replacement(snapshot);
+    const bool repair = s_mipRepair.load(std::memory_order_acquire);
+    const auto replacement = entry.kind == EntryKind::File ? load_file_replacement(snapshot, repair, chain)
+                                                           : load_virtual_replacement(snapshot, repair, chain);
     if (!replacement.has_value()) {
       s_failedIds.insert(entry.id);
       return {};
@@ -1123,11 +1293,12 @@ find_replacement_for_key_locked(const ReplacementKey& key) noexcept {
     }
   }
 
-  auto handle = load_entry_handle(key, *entry);
+  ChainReport chain;
+  auto handle = load_entry_handle(key, *entry, chain);
   if (!handle) {
     return gfx::texture_replacement::ReplacementResult{.id = entry->id};
   }
-  cache_replacement_locked(key, entry->id, handle, Tier::Full);
+  cache_replacement_locked(key, entry->id, handle, Tier::Full, chain);
   return gfx::texture_replacement::ReplacementResult{.handle = std::move(handle), .id = entry->id};
 }
 
@@ -1865,13 +2036,23 @@ StreamingStats process_streaming() noexcept {
   std::vector<LoadCompletion> deferred;
   for (auto& completion : s_readyPublishes) {
     bool selected = false;
+    bool stale = false;
     {
       std::lock_guard lock{s_registryMutex};
       const auto* entry = find_selected_entry_locked(completion.entry.key);
       selected = entry != nullptr && entry->id == completion.entry.id;
-      if (selected && !completion.texture.has_value()) {
+      stale = selected && completion.chain.repairable &&
+              completion.repairEnabled != s_mipRepair.load(std::memory_order_acquire);
+      if (selected && !stale && !completion.texture.has_value()) {
         s_failedIds.insert(completion.entry.id);
       }
+    }
+    if (stale) {
+      finish_full_load(completion.entry.id);
+      if (!s_synchronousLoads.load(std::memory_order_relaxed)) {
+        queue_full_load(completion.entry);
+      }
+      continue;
     }
     if (!selected || !completion.texture.has_value()) {
       finish_full_load(completion.entry.id);
@@ -1890,7 +2071,7 @@ StreamingStats process_streaming() noexcept {
       std::lock_guard lock{s_registryMutex};
       const auto* entry = find_selected_entry_locked(completion.entry.key);
       if (entry != nullptr && entry->id == completion.entry.id) {
-        cache_replacement_locked(completion.entry.key, completion.entry.id, handle, Tier::Full);
+        cache_replacement_locked(completion.entry.key, completion.entry.id, handle, Tier::Full, completion.chain);
         s_failedIds.erase(completion.entry.id);
         published = true;
       }
@@ -2091,6 +2272,39 @@ void set_synchronous_loads(bool synchronous) noexcept {
   s_synchronousLoads.store(synchronous, std::memory_order_relaxed);
 }
 
+void set_mip_repair(bool enabled) noexcept {
+  if (s_mipRepair.load(std::memory_order_relaxed) == enabled ||
+      s_mipRepair.exchange(enabled, std::memory_order_acq_rel) == enabled) {
+    return;
+  }
+  const bool async = gx::texture::AsyncTextureReplacements && !s_synchronousLoads.load(std::memory_order_relaxed);
+  std::lock_guard lk(s_registryMutex);
+  std::vector<ReplacementKey> erased;
+  for (const auto& [key, cache] : s_cacheByKey) {
+    if (cache.tier != Tier::Full || !cache.chain.repairable) {
+      continue;
+    }
+    const auto* entry = find_selected_entry_locked(key);
+    if (entry == nullptr || entry->id != cache.id) {
+      continue;
+    }
+    if (async) {
+      queue_full_load(snapshot_entry(key, *entry));
+    } else {
+      erased.push_back(key);
+    }
+  }
+  for (const auto& key : erased) {
+    erase_cache_locked(key);
+  }
+  if (!erased.empty()) {
+    gx::clear_static_texture_cache();
+    gx::texture::invalidate_bindings();
+  }
+}
+
+bool mip_repair_built() noexcept { return AURORA_ENABLE_RENDER != 0; }
+
 bool has_replacement(const GXTexObj_& obj) noexcept {
   std::lock_guard lk(s_registryMutex);
   if (s_entriesByKey.empty()) {
@@ -2165,6 +2379,11 @@ bool wait_for_completions(uint64_t id, uint32_t count, uint32_t timeoutMs) noexc
 
 std::optional<ConvertedTexture>
 load_replacement_texture(const texture::ReplacementRegistration& registration) noexcept {
+  return load_replacement_texture(registration, false, nullptr);
+}
+
+std::optional<ConvertedTexture> load_replacement_texture(const texture::ReplacementRegistration& registration,
+                                                         bool repair, ChainReport* report) noexcept {
   std::optional<EntryLoadSnapshot> snapshot;
   {
     std::lock_guard lock{s_registryMutex};
@@ -2176,7 +2395,60 @@ load_replacement_texture(const texture::ReplacementRegistration& registration) n
   if (!snapshot) {
     return std::nullopt;
   }
-  return snapshot->kind == EntryKind::File ? load_file_replacement(*snapshot) : load_virtual_replacement(*snapshot);
+  ChainReport chain;
+  auto texture = snapshot->kind == EntryKind::File ? load_file_replacement(*snapshot, repair, chain)
+                                                   : load_virtual_replacement(*snapshot, repair, chain);
+  if (report != nullptr) {
+    *report = chain;
+  }
+  return texture;
+}
+
+std::optional<ConvertedTexture> load_replacement_file(const std::filesystem::path& path, bool repair,
+                                                      ChainReport* report) noexcept {
+  ChainReport chain;
+  auto texture = load_encoded_replacement(FileTextureSource{.path = path}, repair, chain);
+  if (report != nullptr) {
+    *report = chain;
+  }
+  return texture;
+}
+
+std::optional<ByteBuffer> decode_replacement_level(wgpu::TextureFormat format, uint32_t width, uint32_t height,
+                                                   ArrayRef<uint8_t> level) noexcept {
+#if AURORA_ENABLE_RENDER
+  return render::material::decode_level(format, width, height, level);
+#else
+  static_cast<void>(format);
+  static_cast<void>(width);
+  static_cast<void>(height);
+  static_cast<void>(level);
+  return std::nullopt;
+#endif
+}
+
+bool seed_resident_full(const texture::ReplacementRegistration& registration, wgpu::TextureFormat format,
+                        uint32_t width, uint32_t height, uint32_t mips, const ChainReport& chain) noexcept {
+  // Deviceless handle: cache bookkeeping reads only format, size and mipCount
+  auto handle =
+      std::make_shared<gfx::TextureRef>(wgpu::Texture{}, wgpu::TextureView{}, wgpu::TextureView{},
+                                        wgpu::Extent3D{width, height, 1}, format, mips, gfx::InvalidTextureFormat);
+  handle->isReplacement = true;
+  std::lock_guard lock{s_registryMutex};
+  if (find_entry_locked(registration.key, registration.id) == nullptr) {
+    return false;
+  }
+  cache_replacement_locked(registration.key, registration.id, std::move(handle), Tier::Full, chain);
+  return true;
+}
+
+std::optional<ChainReport> resident_chain(const texture::ReplacementKey& key) noexcept {
+  std::lock_guard lock{s_registryMutex};
+  const auto it = s_cacheByKey.find(key);
+  if (it == s_cacheByKey.end()) {
+    return std::nullopt;
+  }
+  return it->second.chain;
 }
 
 bool has_thumbnail(uint64_t id) noexcept {

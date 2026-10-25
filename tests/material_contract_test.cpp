@@ -11,11 +11,14 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
+#include <optional>
 #include <ostream>
 #include <set>
 #include <span>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -503,6 +506,167 @@ TEST_F(MaterialContractTest, ClampedChainMirrorsPackLayout) {
   // GZ2 packs stop downscaling at the 16x16 native size, so their tails repeat it.
   check_chain({}, {64, 32, 16, 16, 16});
   check_chain("mat", {32, 16, 16, 16});
+}
+
+std::vector<std::vector<uint8_t>> reference_box_levels(const std::vector<uint8_t>& level, uint32_t width,
+                                                       uint32_t height) {
+  std::vector<uint32_t> current(level.begin(), level.end());
+  for (auto& value : current) {
+    value <<= 8;
+  }
+  std::vector<std::vector<uint8_t>> levels;
+  while (width > 1 || height > 1) {
+    const uint32_t outWidth = std::max(width / 2, 1u);
+    const uint32_t outHeight = std::max(height / 2, 1u);
+    const uint32_t stepX = width / outWidth;
+    const uint32_t stepY = height / outHeight;
+    std::vector<uint32_t> next(size_t{outWidth} * outHeight * 4);
+    for (uint32_t y = 0; y < outHeight; ++y) {
+      for (uint32_t x = 0; x < outWidth; ++x) {
+        for (uint32_t c = 0; c < 4; ++c) {
+          uint32_t sum = 0;
+          for (uint32_t sy = 0; sy < stepY; ++sy) {
+            for (uint32_t sx = 0; sx < stepX; ++sx) {
+              sum += current[((size_t{y} * stepY + sy) * width + x * stepX + sx) * 4 + c];
+            }
+          }
+          next[(size_t{y} * outWidth + x) * 4 + c] = (sum + stepX * stepY / 2) / (stepX * stepY);
+        }
+      }
+    }
+    std::vector<uint8_t> out(next.size());
+    for (size_t i = 0; i < next.size(); ++i) {
+      out[i] = static_cast<uint8_t>(std::min((next[i] + 128) >> 8, 255u));
+    }
+    levels.push_back(std::move(out));
+    current = std::move(next);
+    width = outWidth;
+    height = outHeight;
+  }
+  return levels;
+}
+
+std::vector<uint8_t> box_downsample(const std::vector<uint8_t>& rgba, uint32_t width, uint32_t factor) {
+  const uint32_t outWidth = width / factor;
+  std::vector<uint8_t> out(size_t{outWidth} * outWidth * 4);
+  for (uint32_t y = 0; y < outWidth; ++y) {
+    for (uint32_t x = 0; x < outWidth; ++x) {
+      for (uint32_t c = 0; c < 4; ++c) {
+        uint32_t sum = 0;
+        for (uint32_t sy = 0; sy < factor; ++sy) {
+          for (uint32_t sx = 0; sx < factor; ++sx) {
+            sum += rgba[((size_t{y} * factor + sy) * width + x * factor + sx) * 4 + c];
+          }
+        }
+        out[(size_t{y} * outWidth + x) * 4 + c] = static_cast<uint8_t>((sum + factor * factor / 2) / (factor * factor));
+      }
+    }
+  }
+  return out;
+}
+
+struct LevelDelta {
+  double mean = 0;
+  int max = 0;
+};
+
+LevelDelta level_delta(const std::vector<uint8_t>& expected, const std::vector<uint8_t>& actual) {
+  LevelDelta delta;
+  if (expected.size() != actual.size() || expected.empty()) {
+    delta.max = 256;
+    return delta;
+  }
+  for (size_t i = 0; i < expected.size(); ++i) {
+    const int diff = std::abs(static_cast<int>(expected[i]) - static_cast<int>(actual[i]));
+    delta.mean += diff;
+    delta.max = std::max(delta.max, diff);
+  }
+  delta.mean /= static_cast<double>(expected.size());
+  return delta;
+}
+
+TEST_F(MaterialContractTest, ClampedChainLoadsRepaired) {
+  namespace tr = gfx::texture_replacement;
+  struct BcCaps {
+    bool saved = webgpu::g_bcTexturesSupported;
+    BcCaps() { webgpu::g_bcTexturesSupported = true; }
+    ~BcCaps() { webgpu::g_bcTexturesSupported = saved; }
+  } caps;
+  const auto dir = s_root / "dds";
+  const std::string stem = "tex1_16x16_000000000000c001_14";
+  const auto path = dir / (stem + ".dds");
+  const auto file_level = [&](uint32_t level) {
+    return gfx::dds::load_dds_file(level == 0 ? path : dir / fmt::format("{}_mip{}.dds", stem, level));
+  };
+
+  std::vector<uint8_t> authored;
+  for (uint32_t level = 0; level < 3; ++level) {
+    const auto file = file_level(level);
+    ASSERT_TRUE(file.has_value());
+    authored.insert(authored.end(), file->data.data(), file->data.data() + file->data.size());
+  }
+
+  tr::ChainReport offReport;
+  const auto off = tr::testing::load_replacement_file(path, false, &offReport);
+  ASSERT_TRUE(off.has_value());
+  EXPECT_EQ(off->format, wgpu::TextureFormat::BC7RGBAUnorm);
+  EXPECT_EQ(off->mips, 3u);
+  EXPECT_EQ(offReport.verdict, tr::ChainVerdict::Clamped);
+  ASSERT_EQ(off->data.size(), authored.size());
+  EXPECT_TRUE(std::equal(authored.begin(), authored.end(), off->data.data()));
+  if (!tr::mip_repair_built()) {
+    GTEST_SKIP() << "render module disabled";
+  }
+
+  tr::ChainReport onReport;
+  const auto on = tr::testing::load_replacement_file(path, true, &onReport);
+  ASSERT_TRUE(on.has_value());
+  EXPECT_EQ(on->mips, 7u);
+  EXPECT_EQ(onReport.verdict, tr::ChainVerdict::Clamped);
+  EXPECT_TRUE(onReport.repaired);
+  EXPECT_EQ(onReport.keptLevels, 3u);
+  EXPECT_EQ(onReport.generatedLevels, 4u);
+  ASSERT_EQ(on->data.size(), gfx::calc_texture_size(on->format, 64, 64, 7));
+  EXPECT_TRUE(std::equal(authored.begin(), authored.end(), on->data.data()));
+
+  const auto chain_level = [&](uint32_t level) {
+    const uint32_t width = std::max(64u >> level, 1u);
+    const uint64_t offset = gfx::calc_texture_size(on->format, 64, 64, level);
+    const uint64_t size = gfx::calc_texture_size(on->format, width, width, 1);
+    const auto rgba = tr::testing::decode_replacement_level(on->format, width, width, {on->data.data() + offset, size});
+    return rgba ? std::vector<uint8_t>(rgba->data(), rgba->data() + rgba->size()) : std::vector<uint8_t>{};
+  };
+  constexpr LevelDelta Bc7Tolerance{.mean = 16.0, .max = 64};
+  const auto reference = reference_box_levels(chain_level(2), 16, 16);
+  ASSERT_EQ(reference.size(), 4u);
+  for (uint32_t level = 3; level < 7; ++level) {
+    SCOPED_TRACE(level);
+    const auto delta = level_delta(reference[level - 3], chain_level(level));
+    EXPECT_LE(delta.mean, Bc7Tolerance.mean);
+    EXPECT_LE(delta.max, Bc7Tolerance.max);
+  }
+  for (const auto& [level, factor] : {std::pair{3u, 2u}, std::pair{4u, 4u}}) {
+    SCOPED_TRACE(level);
+    const auto file = file_level(level);
+    ASSERT_TRUE(file.has_value());
+    const auto rgba = tr::testing::decode_replacement_level(file->format, 16, 16, file->data);
+    ASSERT_TRUE(rgba.has_value());
+    const auto delta =
+        level_delta(box_downsample({rgba->data(), rgba->data() + rgba->size()}, 16, factor), chain_level(level));
+    EXPECT_LE(delta.mean, Bc7Tolerance.mean);
+    EXPECT_LE(delta.max, Bc7Tolerance.max);
+  }
+
+  std::array<std::optional<gfx::ConvertedTexture>, 2> results;
+  std::thread first([&] { results[0] = tr::testing::load_replacement_file(path, true); });
+  std::thread second([&] { results[1] = tr::testing::load_replacement_file(path, true); });
+  first.join();
+  second.join();
+  for (const auto& result : results) {
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->data.size(), on->data.size());
+    EXPECT_TRUE(std::equal(on->data.data(), on->data.data() + on->data.size(), result->data.data()));
+  }
 }
 
 TEST_F(MaterialContractTest, CompanionParserMatchesC1Names) {

@@ -58,6 +58,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/material/key_text.hpp
         lib/render/material/manifest.cpp
         lib/render/material/manifest.hpp
+        lib/render/material/mip_repair.cpp
+        lib/render/material/mip_repair.hpp
         lib/render/material/registry.cpp
         lib/render/material/registry.hpp
         lib/render/material/schema_text.cpp
@@ -85,7 +87,7 @@ if (AURORA_ENABLE_RENDER)
         OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/aurora_render_wgsl.cpp"
         SOURCES ${_aurora_render_wgsl})
     target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_RENDER=1)
-    target_link_libraries(aurora_gx PRIVATE yyjson::yyjson)
+    target_link_libraries(aurora_gx PRIVATE yyjson::yyjson aurora_bccodec)
 else ()
     target_sources(aurora_gx PRIVATE lib/render/graph_api_off.cpp lib/render/material/registry_off.cpp)
     target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_RENDER=0)

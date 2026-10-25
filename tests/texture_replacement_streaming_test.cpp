@@ -10,8 +10,12 @@
 #include <atomic>
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -327,15 +331,46 @@ std::string virtual_mip_name(uint32_t hash, uint32_t mip) {
 
 struct MapSource {
   std::map<std::string, std::vector<uint8_t>, std::less<>> files;
+  std::string gatePath;
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool gateEntered = false;
+  bool gateReleased = false;
+  std::vector<std::string> reads;
 
   static bool read(void* userData, const char* path, std::vector<uint8_t>& outBytes) {
-    const auto& source = *static_cast<const MapSource*>(userData);
+    auto& source = *static_cast<MapSource*>(userData);
+    std::unique_lock lock{source.mutex};
+    source.reads.emplace_back(path);
+    if (!source.gateEntered && !source.gatePath.empty() && source.gatePath == path) {
+      source.gateEntered = true;
+      source.cv.notify_all();
+      source.cv.wait(lock, [&] { return source.gateReleased; });
+    }
     const auto it = source.files.find(std::string_view{path});
     if (it == source.files.end()) {
       return false;
     }
     outBytes = it->second;
     return true;
+  }
+
+  bool wait_for_gate() {
+    std::unique_lock lock{mutex};
+    return cv.wait_for(lock, 2s, [&] { return gateEntered; });
+  }
+
+  void release_gate() {
+    {
+      std::lock_guard lock{mutex};
+      gateReleased = true;
+    }
+    cv.notify_all();
+  }
+
+  bool was_read(std::string_view path) {
+    std::lock_guard lock{mutex};
+    return std::find(reads.begin(), reads.end(), path) != reads.end();
   }
 
   texture::VirtualFileSource callbacks() { return {.read = &MapSource::read, .userData = this}; }
@@ -877,6 +912,742 @@ TEST_F(CompanionScanTest, PackManifestsFollowGroup) {
   const auto removed = texture::material_report();
   EXPECT_TRUE(removed.manifests.empty());
   EXPECT_EQ(removed.generation, report.generation + 1);
+}
+
+struct CapturedLogs {
+  std::mutex mutex;
+  std::vector<std::pair<AuroraLogLevel, std::string>> lines;
+};
+
+CapturedLogs g_capturedLogs;
+
+void capture_log(AuroraLogLevel level, const char*, const char* message, unsigned int len) {
+  std::lock_guard lock{g_capturedLogs.mutex};
+  g_capturedLogs.lines.emplace_back(level, std::string{message, len});
+}
+
+// Restores the previous log callback even when an assertion leaves the test early
+class ScopedWarningCapture {
+public:
+  ScopedWarningCapture() noexcept : m_previous(g_config.logCallback) {
+    {
+      std::lock_guard lock{g_capturedLogs.mutex};
+      g_capturedLogs.lines.clear();
+    }
+    g_config.logCallback = &capture_log;
+  }
+  ~ScopedWarningCapture() { g_config.logCallback = m_previous; }
+  ScopedWarningCapture(const ScopedWarningCapture&) = delete;
+  ScopedWarningCapture& operator=(const ScopedWarningCapture&) = delete;
+
+  [[nodiscard]] std::vector<std::string> lines(AuroraLogLevel level, std::string_view text = {}) const {
+    std::lock_guard lock{g_capturedLogs.mutex};
+    std::vector<std::string> out;
+    for (const auto& [lineLevel, line] : g_capturedLogs.lines) {
+      if (lineLevel == level && line.find(text) != std::string::npos) {
+        out.push_back(line);
+      }
+    }
+    return out;
+  }
+  [[nodiscard]] size_t warnings(std::string_view text = {}) const { return lines(LOG_WARNING, text).size(); }
+  [[nodiscard]] size_t debugs(std::string_view text) const { return lines(LOG_DEBUG, text).size(); }
+
+private:
+  AuroraLogCallback m_previous;
+};
+
+// load_replacement_directory builds the dump root from cachePath even with dumps off
+class ScopedCachePath {
+public:
+  explicit ScopedCachePath(const std::filesystem::path& path) : m_path(path.string()), m_previous(g_config.cachePath) {
+    EXPECT_FALSE(g_config.allowTextureDumps);
+    g_config.cachePath = m_path.c_str();
+  }
+  ~ScopedCachePath() { g_config.cachePath = m_previous; }
+  ScopedCachePath(const ScopedCachePath&) = delete;
+  ScopedCachePath& operator=(const ScopedCachePath&) = delete;
+
+private:
+  std::string m_path;
+  const char* m_previous;
+};
+
+std::vector<uint8_t> test_pixels(uint32_t width, uint32_t height, uint32_t seed) {
+  std::vector<uint8_t> pixels(size_t{width} * height * 4);
+  uint32_t state = seed * 2654435761u + 1u;
+  for (auto& value : pixels) {
+    state = state * 1664525u + 1013904223u;
+    value = static_cast<uint8_t>(state >> 24);
+  }
+  return pixels;
+}
+
+std::vector<uint8_t> rgba8_dds(uint32_t width, uint32_t height, const std::vector<uint8_t>& pixels) {
+  const auto encoded = dds::encode_rgba8_dds(width, height, pixels);
+  return {encoded.data(), encoded.data() + encoded.size()};
+}
+
+std::vector<uint32_t> box_taps(uint32_t size, uint32_t outSize, uint32_t index) {
+  if (size == 1) {
+    return {0};
+  }
+  std::vector<uint32_t> taps{2 * index, 2 * index + 1};
+  if (size % 2 == 1 && index == outSize - 1) {
+    taps.push_back(2 * index + 2);
+  }
+  return taps;
+}
+
+std::vector<uint8_t> reference_box_tail(const std::vector<uint8_t>& level, uint32_t width, uint32_t height) {
+  std::vector<uint32_t> current(level.begin(), level.end());
+  for (auto& value : current) {
+    value <<= 8;
+  }
+  std::vector<uint8_t> out;
+  while (width > 1 || height > 1) {
+    const uint32_t outWidth = std::max(width / 2, 1u);
+    const uint32_t outHeight = std::max(height / 2, 1u);
+    std::vector<uint32_t> next(size_t{outWidth} * outHeight * 4);
+    for (uint32_t y = 0; y < outHeight; ++y) {
+      const auto ys = box_taps(height, outHeight, y);
+      for (uint32_t x = 0; x < outWidth; ++x) {
+        const auto xs = box_taps(width, outWidth, x);
+        const uint32_t count = static_cast<uint32_t>(xs.size() * ys.size());
+        for (uint32_t c = 0; c < 4; ++c) {
+          uint32_t sum = 0;
+          for (const uint32_t sy : ys) {
+            for (const uint32_t sx : xs) {
+              sum += current[(size_t{sy} * width + sx) * 4 + c];
+            }
+          }
+          next[(size_t{y} * outWidth + x) * 4 + c] = (sum + count / 2) / count;
+        }
+      }
+    }
+    for (const uint32_t value : next) {
+      out.push_back(static_cast<uint8_t>(std::min((value + 128) >> 8, 255u)));
+    }
+    current = std::move(next);
+    width = outWidth;
+    height = outHeight;
+  }
+  return out;
+}
+
+std::vector<uint8_t> joined(std::initializer_list<const std::vector<uint8_t>*> parts) {
+  std::vector<uint8_t> out;
+  for (const auto* part : parts) {
+    out.insert(out.end(), part->begin(), part->end());
+  }
+  return out;
+}
+
+bool holds_bytes(const ConvertedTexture& texture, const std::vector<uint8_t>& expected) {
+  return texture.data.size() == expected.size() && std::equal(expected.begin(), expected.end(), texture.data.data());
+}
+
+TEST(MipChainTest, ClassifiesLikeContract) {
+  static_assert(full_mip_count(1, 1) == 1);
+  static_assert(full_mip_count(64, 64) == 7);
+  static_assert(full_mip_count(64, 16) == 7);
+  static_assert(full_mip_count(5, 3) == 3);
+  static_assert(full_mip_count(2688, 2688) == 12);
+  // The c001 fixture chains: 64, 32, 16, 16, 16 and the .mat chain 32, 16, 16, 16
+  static_assert(classify_mip_level(64, 64, 1, 64, 64, 32, 32) == MipFit::Standard);
+  static_assert(classify_mip_level(64, 64, 2, 32, 32, 16, 16) == MipFit::Standard);
+  static_assert(classify_mip_level(64, 64, 3, 16, 16, 16, 16) == MipFit::Clamped);
+  static_assert(classify_mip_level(64, 64, 4, 16, 16, 16, 16) == MipFit::Clamped);
+  static_assert(classify_mip_level(32, 32, 2, 16, 16, 16, 16) == MipFit::Clamped);
+  EXPECT_EQ(classify_mip_level(64, 64, 1, 64, 64, 64, 64), MipFit::Clamped);
+  EXPECT_EQ(classify_mip_level(128, 64, 2, 64, 32, 64, 32), MipFit::Clamped);
+  EXPECT_EQ(classify_mip_level(64, 64, 2, 32, 32, 24, 24), MipFit::Invalid);
+  EXPECT_EQ(classify_mip_level(64, 64, 3, 16, 16, 4, 4), MipFit::Invalid);
+  EXPECT_EQ(classify_mip_level(64, 64, 3, 16, 16, 12, 12), MipFit::Invalid);
+  EXPECT_EQ(classify_mip_level(64, 32, 3, 8, 4, 8, 8), MipFit::Invalid);
+  EXPECT_EQ(classify_mip_level(64, 64, 2, 32, 32, 32, 16), MipFit::Invalid);
+  EXPECT_EQ(classify_mip_level(4, 4, 3, 1, 1, 1, 1), MipFit::Standard);
+  EXPECT_EQ(classify_mip_level(64, 64, 40, 1, 1, 1, 1), MipFit::Standard);
+  EXPECT_EQ(classify_mip_level(64, 64, 40, 2, 2, 2, 2), MipFit::Clamped);
+  EXPECT_EQ(classify_mip_level(64, 64, 40, 2, 2, 2, 1), MipFit::Invalid);
+}
+
+class MipRepairTest : public ReplacementStreamingTest {
+protected:
+  void SetUp() override {
+    ReplacementStreamingTest::SetUp();
+    m_savedBc = webgpu::g_bcTexturesSupported;
+    m_dir = std::filesystem::temp_directory_path() /
+            ("aurora-mip-repair-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(m_dir);
+  }
+
+  void TearDown() override {
+    ReplacementStreamingTest::TearDown();
+    set_mip_repair(false);
+    set_synchronous_loads(false);
+    webgpu::g_bcTexturesSupported = m_savedBc;
+    std::error_code ec;
+    std::filesystem::remove_all(m_dir, ec);
+  }
+
+  struct Chain {
+    std::filesystem::path path;
+    std::vector<std::vector<uint8_t>> levels;
+  };
+
+  Chain write_chain(std::string_view stem, std::initializer_list<std::pair<uint32_t, uint32_t>> sizes,
+                    uint32_t seed = 1) const {
+    Chain chain;
+    uint32_t level = 0;
+    for (const auto& [width, height] : sizes) {
+      auto pixels = test_pixels(width, height, seed + level);
+      const auto name = level == 0 ? fmt::format("{}.dds", stem) : fmt::format("{}_mip{}.dds", stem, level);
+      const auto path = m_dir / name;
+      const auto bytes = rgba8_dds(width, height, pixels);
+      std::ofstream file(path, std::ios::binary);
+      file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+      if (level == 0) {
+        chain.path = path;
+      }
+      chain.levels.push_back(std::move(pixels));
+      ++level;
+    }
+    return chain;
+  }
+
+  std::filesystem::path m_dir;
+  bool m_savedBc = false;
+};
+
+TEST_F(MipRepairTest, RepairOffKeepsLegacyPrefix) {
+  const auto chain = write_chain("tex1_16x16_000000000000e001_6", {{16, 16}, {8, 8}, {8, 8}, {8, 8}});
+  ScopedWarningCapture capture;
+  ChainReport report;
+  const auto loaded = testing::load_replacement_file(chain.path, false, &report);
+  ASSERT_TRUE(loaded.has_value());
+  EXPECT_EQ(loaded->format, wgpu::TextureFormat::RGBA8Unorm);
+  EXPECT_EQ(loaded->mips, 2u);
+  EXPECT_TRUE(holds_bytes(*loaded, joined({&chain.levels[0], &chain.levels[1]})));
+  EXPECT_EQ(report.verdict, ChainVerdict::Clamped);
+  EXPECT_EQ(report.format, wgpu::TextureFormat::RGBA8Unorm);
+  EXPECT_EQ(report.keptLevels, 2u);
+  EXPECT_EQ(report.fullLevels, 5u);
+  EXPECT_EQ(report.repairable, mip_repair_built());
+  EXPECT_FALSE(report.repaired);
+  EXPECT_EQ(report.generatedLevels, 0u);
+  EXPECT_EQ(capture.warnings(), 0u);
+  EXPECT_EQ(capture.debugs("clamps at 8x8 from mip 2"), 1u);
+}
+
+TEST_F(MipRepairTest, Rgba8TailIsExactBoxFilter) {
+  if (!mip_repair_built()) {
+    GTEST_SKIP() << "render module disabled";
+  }
+  const auto even = write_chain("tex1_24x12_000000000000e002_6", {{24, 12}, {12, 6}, {12, 6}});
+  const auto odd = write_chain("tex1_10x6_000000000000e003_6", {{10, 6}, {5, 3}, {5, 3}}, 7);
+  ScopedWarningCapture capture;
+  for (const auto* chain : {&even, &odd}) {
+    SCOPED_TRACE(chain->path.filename().string());
+    ChainReport report;
+    const auto loaded = testing::load_replacement_file(chain->path, true, &report);
+    ASSERT_TRUE(loaded.has_value());
+    const auto [width, height] = std::pair{loaded->width, loaded->height};
+    EXPECT_EQ(loaded->mips, full_mip_count(width, height));
+    const auto tail = reference_box_tail(chain->levels[1], std::max(width / 2, 1u), std::max(height / 2, 1u));
+    EXPECT_TRUE(holds_bytes(*loaded, joined({&chain->levels[0], &chain->levels[1], &tail})));
+    EXPECT_EQ(report.verdict, ChainVerdict::Clamped);
+    EXPECT_TRUE(report.repairable);
+    EXPECT_TRUE(report.repaired);
+    EXPECT_EQ(report.keptLevels, 2u);
+    EXPECT_EQ(report.generatedLevels, full_mip_count(width, height) - 2);
+  }
+  EXPECT_EQ(capture.warnings(), 0u);
+  EXPECT_EQ(capture.debugs("rebuilt 3 mips for"), 1u);
+  EXPECT_EQ(capture.debugs("rebuilt 2 mips for"), 1u);
+}
+
+TEST_F(MipRepairTest, InvalidChainRegeneratesFromLastStandardLevel) {
+  testing::set_workers_paused(true);
+  MapSource source;
+  const auto base = test_pixels(16, 16, 1);
+  const auto mip1 = test_pixels(8, 8, 2);
+  source.files[virtual_name(0xe004)] = rgba8_dds(16, 16, base);
+  source.files[virtual_mip_name(0xe004, 1)] = rgba8_dds(8, 8, mip1);
+  source.files[virtual_mip_name(0xe004, 2)] = rgba8_dds(6, 6, test_pixels(6, 6, 3));
+  source.files[virtual_mip_name(0xe004, 3)] = rgba8_dds(2, 2, test_pixels(2, 2, 4));
+  const auto registration = texture::register_virtual_replacement(virtual_name(0xe004), source.callbacks());
+  ASSERT_NE(registration.id, 0u);
+
+  ScopedWarningCapture capture;
+  ChainReport off;
+  const auto legacy = testing::load_replacement_texture(registration, false, &off);
+  ASSERT_TRUE(legacy.has_value());
+  EXPECT_EQ(legacy->mips, 2u);
+  EXPECT_TRUE(holds_bytes(*legacy, joined({&base, &mip1})));
+  EXPECT_EQ(off.verdict, ChainVerdict::Invalid);
+  EXPECT_EQ(capture.warnings(fmt::format("expected 4x4 for mip {}, got 6x6", virtual_mip_name(0xe004, 2))), 1u);
+
+  if (mip_repair_built()) {
+    ChainReport on;
+    const auto repaired = testing::load_replacement_texture(registration, true, &on);
+    ASSERT_TRUE(repaired.has_value());
+    EXPECT_EQ(repaired->mips, 5u);
+    const auto tail = reference_box_tail(mip1, 8, 8);
+    EXPECT_TRUE(holds_bytes(*repaired, joined({&base, &mip1, &tail})));
+    EXPECT_EQ(on.verdict, ChainVerdict::Invalid);
+    EXPECT_TRUE(on.repaired);
+    EXPECT_EQ(on.generatedLevels, 3u);
+    EXPECT_EQ(capture.warnings(), 1u);
+  }
+  EXPECT_FALSE(source.was_read(virtual_mip_name(0xe004, 3)));
+  texture::unregister_replacement(registration);
+}
+
+TEST_F(MipRepairTest, ArbChainKeepsPrefix) {
+  const auto chain = write_chain("tex1_16x16_000000000000e005_6_arb", {{16, 16}, {8, 8}, {8, 8}});
+  ScopedWarningCapture capture;
+  for (const bool repair : {false, true}) {
+    SCOPED_TRACE(repair);
+    ChainReport report;
+    const auto loaded = testing::load_replacement_file(chain.path, repair, &report);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(loaded->mips, 2u);
+    EXPECT_TRUE(holds_bytes(*loaded, joined({&chain.levels[0], &chain.levels[1]})));
+    EXPECT_EQ(report.verdict, ChainVerdict::Clamped);
+    EXPECT_FALSE(report.repairable);
+    EXPECT_FALSE(report.repaired);
+  }
+  EXPECT_EQ(capture.warnings(), 0u);
+}
+
+TEST_F(MipRepairTest, UntouchedChainsAreByteIdentical) {
+  webgpu::g_bcTexturesSupported = true;
+  const auto complete = write_chain("tex1_8x8_000000000000e006_6", {{8, 8}, {4, 4}, {2, 2}, {1, 1}});
+  const auto shortChain = write_chain("tex1_16x16_000000000000e007_6", {{16, 16}, {8, 8}});
+  const auto mipless = write_chain("tex1_16x16_000000000000e008_6", {{16, 16}});
+  const auto internalPath = m_dir / "tex1_16x16_000000000000e009_6.dds";
+  {
+    const auto bytes = make_dds(28, Format::RGBA8Unorm, 16, 16, 5);
+    std::ofstream file(internalPath, std::ios::binary);
+    file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  }
+  const auto bc7Path = m_dir / "tex1_16x16_000000000000e00a_14.dds";
+  const auto bc7Mip = m_dir / "tex1_16x16_000000000000e00a_14_mip1.dds";
+  for (const auto& [path, width] : {std::pair{bc7Path, 16u}, std::pair{bc7Mip, 8u}}) {
+    const auto bytes = make_dds(98, Format::BC7RGBAUnorm, width, width, 1, static_cast<uint8_t>(width));
+    std::ofstream file(path, std::ios::binary);
+    file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  }
+
+  struct Case {
+    std::filesystem::path path;
+    ChainVerdict verdict;
+    uint32_t mips;
+  };
+  const std::array cases{
+      Case{complete.path, ChainVerdict::Complete, 4}, Case{shortChain.path, ChainVerdict::Short, 2},
+      Case{mipless.path, ChainVerdict::Mipless, 1},   Case{internalPath, ChainVerdict::Internal, 5},
+      Case{bc7Path, ChainVerdict::Short, 2},
+  };
+  ScopedWarningCapture capture;
+  for (const auto& entry : cases) {
+    SCOPED_TRACE(entry.path.filename().string());
+    ChainReport offReport;
+    ChainReport onReport;
+    const auto off = testing::load_replacement_file(entry.path, false, &offReport);
+    const auto on = testing::load_replacement_file(entry.path, true, &onReport);
+    ASSERT_TRUE(off.has_value());
+    ASSERT_TRUE(on.has_value());
+    EXPECT_EQ(off->format, on->format);
+    EXPECT_EQ(off->mips, entry.mips);
+    EXPECT_EQ(on->mips, entry.mips);
+    EXPECT_TRUE(holds_bytes(*on, std::vector<uint8_t>(off->data.data(), off->data.data() + off->data.size())));
+    EXPECT_EQ(offReport.verdict, entry.verdict);
+    EXPECT_EQ(onReport.verdict, entry.verdict);
+    EXPECT_EQ(onReport.keptLevels, entry.mips);
+    EXPECT_FALSE(onReport.repairable);
+    EXPECT_FALSE(onReport.repaired);
+  }
+  EXPECT_TRUE(
+      holds_bytes(*testing::load_replacement_file(complete.path, true),
+                  joined({&complete.levels[0], &complete.levels[1], &complete.levels[2], &complete.levels[3]})));
+  EXPECT_EQ(capture.warnings(), 0u);
+}
+
+TEST_F(MipRepairTest, BrokenSidecarStillWarns) {
+  testing::set_workers_paused(true);
+  MapSource source;
+  source.files[virtual_name(0xe00b)] = make_dds(28, Format::RGBA8Unorm, 16, 16);
+  source.files[virtual_mip_name(0xe00b, 1)] = make_dds(87, Format::BGRA8Unorm, 8, 8);
+  source.files[virtual_name(0xe00c)] = make_dds(28, Format::RGBA8Unorm, 16, 16);
+  source.files[virtual_mip_name(0xe00c, 1)] = {1, 2, 3, 4};
+  source.files[virtual_name(0xe00d)] = make_dds(28, Format::RGBA8Unorm, 16, 16);
+  source.files[virtual_mip_name(0xe00d, 1)] = make_dds(28, Format::RGBA8Unorm, 8, 8);
+  source.files[virtual_mip_name(0xe00d, 2)] = {1, 2, 3, 4};
+  source.files[virtual_mip_name(0xe00d, 3)] = make_dds(28, Format::RGBA8Unorm, 4, 4);
+  struct Case {
+    uint32_t hash;
+    std::string warning;
+    uint32_t mips;
+  };
+  const std::array cases{
+      Case{0xe00b, fmt::format("mip {} has format", virtual_mip_name(0xe00b, 1)), 1},
+      Case{0xe00c, fmt::format("could not load mip {}", virtual_mip_name(0xe00c, 1)), 1},
+      Case{0xe00d, fmt::format("could not load mip {}", virtual_mip_name(0xe00d, 2)), 2},
+  };
+  for (const auto& entry : cases) {
+    SCOPED_TRACE(entry.hash);
+    const auto registration = texture::register_virtual_replacement(virtual_name(entry.hash), source.callbacks());
+    ASSERT_NE(registration.id, 0u);
+    for (const bool repair : {false, true}) {
+      ScopedWarningCapture capture;
+      ChainReport report;
+      const auto loaded = testing::load_replacement_texture(registration, repair, &report);
+      ASSERT_TRUE(loaded.has_value());
+      EXPECT_EQ(loaded->mips, entry.mips);
+      EXPECT_EQ(report.verdict, ChainVerdict::Broken);
+      EXPECT_FALSE(report.repairable);
+      EXPECT_FALSE(report.repaired);
+      EXPECT_EQ(capture.warnings(), 1u);
+      EXPECT_EQ(capture.warnings(entry.warning), 1u);
+    }
+    texture::unregister_replacement(registration);
+  }
+  EXPECT_FALSE(source.was_read(virtual_mip_name(0xe00d, 3)));
+}
+
+TEST_F(MipRepairTest, StaleCompletionIsRequeued) {
+  if (!mip_repair_built()) {
+    GTEST_SKIP() << "render module disabled";
+  }
+  testing::set_workers_paused(true);
+  MapSource source;
+  source.files[virtual_name(0xe00e)] = rgba8_dds(128, 128, test_pixels(128, 128, 1));
+  source.files[virtual_mip_name(0xe00e, 1)] = rgba8_dds(64, 64, test_pixels(64, 64, 2));
+  source.files[virtual_mip_name(0xe00e, 2)] = rgba8_dds(64, 64, test_pixels(64, 64, 3));
+  source.gatePath = virtual_name(0xe00e);
+  const auto registration = texture::register_virtual_replacement(virtual_name(0xe00e), source.callbacks());
+  ASSERT_NE(registration.id, 0u);
+  GXTexObj_ obj{};
+  const auto key = std::get<texture::TextureSourceKey>(registration.key);
+  ASSERT_TRUE(find_source_replacement(obj, key).has_value());
+
+  testing::set_workers_paused(false);
+  ASSERT_TRUE(source.wait_for_gate());
+  set_mip_repair(true);
+  source.release_gate();
+  // The full load and the thumbnail probe of the mipless base
+  ASSERT_TRUE(testing::wait_for_completions(registration.id, 2, 2000));
+  const auto stats = process_streaming();
+  EXPECT_EQ(stats.publishes, 0u);
+  EXPECT_EQ(stats.pendingLoads, 1u);
+  EXPECT_FALSE(testing::resident_chain(registration.key).has_value());
+  EXPECT_TRUE(testing::wait_for_completions(registration.id, 1, 2000));
+}
+
+TEST_F(MipRepairTest, ToggleRequeuesOnlyRepairableResidentChains) {
+  RecordingSource source;
+  testing::set_workers_paused(true);
+  const auto png_name = [](uint32_t hash) { return fmt::format("tex1_16x16_{:016x}_6.png", hash); };
+  const auto repairable =
+      texture::register_virtual_replacement(png_name(0xe010), {.read = &RecordingSource::read, .userData = &source});
+  const auto complete =
+      texture::register_virtual_replacement(png_name(0xe011), {.read = &RecordingSource::read, .userData = &source});
+  const auto shadowed =
+      texture::register_virtual_replacement(png_name(0xe012), {.read = &RecordingSource::read, .userData = &source});
+  const auto selected =
+      texture::register_virtual_replacement(png_name(0xe012), {.read = &RecordingSource::read, .userData = &source});
+  ASSERT_NE(repairable.id, 0u);
+  ASSERT_NE(complete.id, 0u);
+  ASSERT_NE(shadowed.id, 0u);
+  ASSERT_NE(selected.id, 0u);
+  const ChainReport clamped{.verdict = ChainVerdict::Clamped, .repairable = true};
+  const ChainReport whole{.verdict = ChainVerdict::Complete};
+  ASSERT_TRUE(testing::seed_resident_full(repairable, Format::RGBA8Unorm, 16, 16, 2, clamped));
+  ASSERT_TRUE(testing::seed_resident_full(complete, Format::RGBA8Unorm, 16, 16, 5, whole));
+  ASSERT_TRUE(testing::seed_resident_full(shadowed, Format::RGBA8Unorm, 16, 16, 2, clamped));
+
+  set_mip_repair(true);
+  set_mip_repair(true);
+  testing::set_workers_paused(false);
+  EXPECT_TRUE(testing::wait_for_completions(repairable.id, 1, 2000));
+  EXPECT_FALSE(testing::wait_for_completions(complete.id, 1, 200));
+  EXPECT_FALSE(testing::wait_for_completions(shadowed.id, 1, 0));
+  EXPECT_FALSE(testing::wait_for_completions(selected.id, 1, 0));
+  EXPECT_FALSE(testing::wait_for_completions(repairable.id, 2, 0));
+  {
+    std::lock_guard lock{source.mutex};
+    EXPECT_EQ(source.paths, std::vector<std::string>{png_name(0xe010)});
+  }
+  const auto resident = testing::resident_chain(repairable.key);
+  ASSERT_TRUE(resident.has_value());
+  EXPECT_TRUE(resident->repairable);
+  EXPECT_TRUE(testing::resident_chain(complete.key).has_value());
+  EXPECT_TRUE(testing::resident_chain(shadowed.key).has_value());
+}
+
+TEST_F(MipRepairTest, SynchronousToggleErasesRepairableResidentChains) {
+  RecordingSource source;
+  set_synchronous_loads(true);
+  const auto png_name = [](uint32_t hash) { return fmt::format("tex1_16x16_{:016x}_6.png", hash); };
+  const auto repairable =
+      texture::register_virtual_replacement(png_name(0xe013), {.read = &RecordingSource::read, .userData = &source});
+  const auto complete =
+      texture::register_virtual_replacement(png_name(0xe014), {.read = &RecordingSource::read, .userData = &source});
+  ASSERT_TRUE(testing::seed_resident_full(repairable, Format::RGBA8Unorm, 16, 16, 2,
+                                          {.verdict = ChainVerdict::Invalid, .repairable = true}));
+  ASSERT_TRUE(
+      testing::seed_resident_full(complete, Format::RGBA8Unorm, 16, 16, 5, {.verdict = ChainVerdict::Complete}));
+
+  set_mip_repair(true);
+  EXPECT_FALSE(testing::resident_chain(repairable.key).has_value());
+  const auto kept = testing::resident_chain(complete.key);
+  ASSERT_TRUE(kept.has_value());
+  EXPECT_EQ(kept->verdict, ChainVerdict::Complete);
+  EXPECT_FALSE(testing::wait_for_completions(repairable.id, 1, 200));
+  std::lock_guard lock{source.mutex};
+  EXPECT_TRUE(source.paths.empty());
+}
+
+class ReplacementPackSweep : public MipRepairTest {};
+
+double srgb_to_linear(double value) {
+  return value <= 0.04045 ? value / 12.92 : std::pow((value + 0.055) / 1.055, 2.4);
+}
+
+double linear_to_srgb(double value) {
+  return value <= 0.0031308 ? value * 12.92 : 1.055 * std::pow(value, 1.0 / 2.4) - 0.055;
+}
+
+std::vector<uint8_t> linear_box_level(const std::vector<uint8_t>& level, uint32_t width, uint32_t height) {
+  const uint32_t outWidth = std::max(width / 2, 1u);
+  const uint32_t outHeight = std::max(height / 2, 1u);
+  std::vector<uint8_t> out(size_t{outWidth} * outHeight * 4);
+  for (uint32_t y = 0; y < outHeight; ++y) {
+    const auto ys = box_taps(height, outHeight, y);
+    for (uint32_t x = 0; x < outWidth; ++x) {
+      const auto xs = box_taps(width, outWidth, x);
+      for (uint32_t c = 0; c < 4; ++c) {
+        double sum = 0;
+        for (const uint32_t sy : ys) {
+          for (const uint32_t sx : xs) {
+            const double value = level[(size_t{sy} * width + sx) * 4 + c] / 255.0;
+            sum += c == 3 ? value : srgb_to_linear(value);
+          }
+        }
+        const double mean = sum / static_cast<double>(xs.size() * ys.size());
+        out[(size_t{y} * outWidth + x) * 4 + c] =
+            static_cast<uint8_t>(std::lround(std::clamp(c == 3 ? mean : linear_to_srgb(mean), 0.0, 1.0) * 255.0));
+      }
+    }
+  }
+  return out;
+}
+
+double mean_abs_difference(const uint8_t* lhs, const uint8_t* rhs, size_t count, bool colorOnly) {
+  double sum = 0;
+  size_t samples = 0;
+  for (size_t i = 0; i < count; ++i) {
+    if (colorOnly && i % 4 == 3) {
+      continue;
+    }
+    sum += std::abs(static_cast<int>(lhs[i]) - static_cast<int>(rhs[i]));
+    ++samples;
+  }
+  return samples == 0 ? 0.0 : sum / static_cast<double>(samples);
+}
+
+std::vector<uint8_t> decoded(const ConvertedTexture& chain, uint32_t level) {
+  const uint32_t width = std::max(chain.width >> level, 1u);
+  const uint32_t height = std::max(chain.height >> level, 1u);
+  const uint64_t offset = calc_texture_size(chain.format, chain.width, chain.height, level);
+  const uint64_t size = calc_texture_size(chain.format, width, height, 1);
+  if (offset + size > chain.data.size()) {
+    return {};
+  }
+  const auto rgba = testing::decode_replacement_level(chain.format, width, height, {chain.data.data() + offset, size});
+  return rgba ? std::vector<uint8_t>(rgba->data(), rgba->data() + rgba->size()) : std::vector<uint8_t>{};
+}
+
+std::string summarize(std::vector<double> values, double scale, std::string_view unit) {
+  if (values.empty()) {
+    return "n 0";
+  }
+  std::sort(values.begin(), values.end());
+  double sum = 0;
+  for (const double value : values) {
+    sum += value;
+  }
+  const auto at = [&](size_t percent) { return values[std::min(values.size() - 1, values.size() * percent / 100)]; };
+  return fmt::format("n {}, mean {:.3f}{}, p50 {:.3f}{}, p95 {:.3f}{}, max {:.3f}{}", values.size(),
+                     sum / static_cast<double>(values.size()) * scale, unit, at(50) * scale, unit, at(95) * scale, unit,
+                     values.back() * scale, unit);
+}
+
+std::map<std::string, std::filesystem::path> base_paths_by_name(const std::filesystem::path& root) {
+  std::vector<std::pair<std::vector<std::string>, std::filesystem::path>> candidates;
+  std::error_code ec;
+  for (std::filesystem::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+    if (!it->is_regular_file()) {
+      continue;
+    }
+    std::vector<std::string> components;
+    for (const auto& component : it->path().lexically_relative(root)) {
+      components.push_back(component.string());
+    }
+    candidates.emplace_back(std::move(components), it->path());
+  }
+  const auto lower = [](std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return text;
+  };
+  std::sort(candidates.begin(), candidates.end(), [&](const auto& lhs, const auto& rhs) {
+    const size_t count = std::min(lhs.first.size(), rhs.first.size());
+    for (size_t i = 0; i < count; ++i) {
+      const auto a = lower(lhs.first[i]);
+      const auto b = lower(rhs.first[i]);
+      if (a != b) {
+        return a < b;
+      }
+      if (lhs.first[i] != rhs.first[i]) {
+        return lhs.first[i] < rhs.first[i];
+      }
+    }
+    return lhs.first.size() < rhs.first.size();
+  });
+  std::map<std::string, std::filesystem::path> out;
+  for (const auto& [components, path] : candidates) {
+    if (const auto key = texture::parse_replacement_filename(path.filename().string()); key.has_value()) {
+      out.try_emplace(build_texture_replacement_name(*key), path);
+    }
+  }
+  return out;
+}
+
+TEST_F(ReplacementPackSweep, HasNoMipWarnings) {
+  const char* pack = std::getenv("AURORA_TEST_REPLACEMENT_PACK");
+  if (pack == nullptr || *pack == '\0') {
+    GTEST_SKIP() << "AURORA_TEST_REPLACEMENT_PACK is not set";
+  }
+  if (!mip_repair_built()) {
+    GTEST_SKIP() << "render module disabled";
+  }
+  const std::filesystem::path root{pack};
+  ScopedCachePath cachePath{m_dir / "cache"};
+  BcCapsGuard caps{true};
+  testing::set_workers_paused(true);
+  ScopedWarningCapture capture;
+  const auto group = texture::load_replacement_directory(root);
+  ASSERT_FALSE(group.registrations.empty());
+  const auto paths = base_paths_by_name(root);
+
+  std::map<ChainVerdict, size_t> verdicts;
+  std::vector<double> repairMicros;
+  std::vector<std::pair<uint32_t, std::string>> slowest;
+  std::vector<double> resampleDelta;
+  std::vector<double> linearDelta;
+  std::vector<double> encodeDelta;
+  size_t failures = 0;
+  for (const auto& registration : group.registrations) {
+    ChainReport report;
+    const auto loaded = testing::load_replacement_texture(registration, true, &report);
+    ++verdicts[report.verdict];
+    if (!loaded.has_value()) {
+      ++failures;
+      continue;
+    }
+    if (report.verdict != ChainVerdict::Clamped && report.verdict != ChainVerdict::Invalid) {
+      continue;
+    }
+    const auto& key = std::get<texture::TextureSourceKey>(registration.key);
+    const auto name = build_texture_replacement_name(key);
+    EXPECT_TRUE(report.repaired) << name;
+    EXPECT_EQ(loaded->mips, full_mip_count(loaded->width, loaded->height)) << name;
+    EXPECT_EQ(report.keptLevels + report.generatedLevels, report.fullLevels) << name;
+    repairMicros.push_back(report.repairMicros);
+
+    const uint32_t level = report.keptLevels;
+    const uint32_t lastWidth = std::max(loaded->width >> (level - 1), 1u);
+    const uint32_t lastHeight = std::max(loaded->height >> (level - 1), 1u);
+    slowest.emplace_back(report.repairMicros, fmt::format("{} from {}x{}", name, lastWidth, lastHeight));
+    const auto last = decoded(*loaded, level - 1);
+    const auto generated = decoded(*loaded, level);
+    if (last.empty() || generated.empty()) {
+      continue;
+    }
+    const auto stored = reference_box_tail(last, lastWidth, lastHeight);
+    const auto linear = linear_box_level(last, lastWidth, lastHeight);
+    linearDelta.push_back(mean_abs_difference(stored.data(), linear.data(), linear.size(), true));
+    encodeDelta.push_back(mean_abs_difference(stored.data(), generated.data(), generated.size(), false));
+
+    const auto path = paths.find(name);
+    if (report.verdict != ChainVerdict::Clamped || path == paths.end()) {
+      continue;
+    }
+    const auto& base = path->second;
+    const auto clampedPath =
+        base.parent_path() / fmt::format("{}_mip{}{}", base.stem().string(), level, base.extension().string());
+    const auto authored = dds::load_dds_file(clampedPath);
+    if (!authored || authored->format != loaded->format || authored->width != lastWidth ||
+        authored->height != lastHeight) {
+      continue;
+    }
+    const auto authoredRgba = testing::decode_replacement_level(
+        authored->format, lastWidth, lastHeight,
+        {authored->data.data(), calc_texture_size(authored->format, lastWidth, lastHeight, 1)});
+    if (!authoredRgba) {
+      continue;
+    }
+    const uint32_t width = std::max(lastWidth / 2, 1u);
+    const uint32_t height = std::max(lastHeight / 2, 1u);
+    const uint32_t factorX = lastWidth / width;
+    const uint32_t factorY = lastHeight / height;
+    std::vector<uint8_t> resampled(size_t{width} * height * 4);
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x) {
+        for (uint32_t c = 0; c < 4; ++c) {
+          uint32_t sum = 0;
+          for (uint32_t sy = 0; sy < factorY; ++sy) {
+            for (uint32_t sx = 0; sx < factorX; ++sx) {
+              sum += authoredRgba->data()[((size_t{y} * factorY + sy) * lastWidth + x * factorX + sx) * 4 + c];
+            }
+          }
+          resampled[(size_t{y} * width + x) * 4 + c] =
+              static_cast<uint8_t>((sum + factorX * factorY / 2) / (factorX * factorY));
+        }
+      }
+    }
+    resampleDelta.push_back(mean_abs_difference(resampled.data(), generated.data(), resampled.size(), false));
+  }
+
+  const auto warnings = capture.lines(LOG_WARNING, "texture_replacement:");
+  for (size_t i = 0; i < std::min<size_t>(warnings.size(), 20); ++i) {
+    ADD_FAILURE() << warnings[i];
+  }
+  EXPECT_EQ(warnings.size(), 0u);
+  EXPECT_EQ(failures, 0u);
+  constexpr std::array<std::string_view, 8> VerdictNames{"Unprobed", "Mipless", "Internal", "Complete",
+                                                         "Short",    "Clamped", "Invalid",  "Broken"};
+  std::string histogram;
+  for (const auto& [verdict, count] : verdicts) {
+    histogram += fmt::format(" {} {}", VerdictNames[static_cast<size_t>(verdict)], count);
+  }
+  std::printf("registrations %zu, failures %zu, verdicts:%s\n", group.registrations.size(), failures,
+              histogram.c_str());
+  std::printf("repair time: %s\n", summarize(repairMicros, 0.001, " ms").c_str());
+  std::sort(slowest.begin(), slowest.end(), std::greater<>{});
+  for (size_t i = 0; i < std::min<size_t>(slowest.size(), 3); ++i) {
+    std::printf("  %.3f ms %s\n", slowest[i].first * 0.001, slowest[i].second.c_str());
+  }
+  std::printf("resample vs regenerate, first generated level, mean |d| per chain (RGBA): %s\n",
+              summarize(resampleDelta, 1.0, "").c_str());
+  std::printf("stored vs linear box, first generated level, mean |d| per chain (RGB): %s\n",
+              summarize(linearDelta, 1.0, "").c_str());
+  std::printf("encoded vs box reference, first generated level, mean |d| per chain (RGBA): %s\n",
+              summarize(encodeDelta, 1.0, "").c_str());
+  texture::unregister_replacements(group);
 }
 } // namespace
 } // namespace aurora::gfx::texture_replacement

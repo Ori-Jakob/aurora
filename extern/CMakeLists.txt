@@ -272,6 +272,32 @@ if (AURORA_ENABLE_GX)
     add_library(yyjson::yyjson ALIAS aurora_yyjson)
   endif ()
 
+  if (AURORA_ENABLE_RENDER AND NOT TARGET aurora_bccodec)
+    message(STATUS "aurora: Fetching bcdec and bc7enc")
+    # Both used under their public-domain (Unlicense) alternative; bc7e.ispc and the tools are not built
+    set(_bcdec_url https://raw.githubusercontent.com/iOrange/bcdec/80859ed3b7afb1c527a2a99d70c61457bea72d0c)
+    set(_bc7enc_url https://raw.githubusercontent.com/richgel999/bc7enc_rdo/b9438627eef73a1157e84201b6fa6eb2ffd6d9f0)
+    set(_bccodec_dir ${FETCHCONTENT_BASE_DIR}/aurora_bccodec)
+    foreach (_bccodec_file IN ITEMS
+        "${_bcdec_url}/bcdec.h|134520764d96f70a27db814173616c89ad85db95fbd3328417c7a8c77e7ca189"
+        "${_bc7enc_url}/bc7enc.h|f40f4a956ed6a8845b7909e83831de09512424408b32ca29551bf49aee2fecf6"
+        "${_bc7enc_url}/bc7enc.cpp|b90444a091530a13c61fa6375583fcc9bc9ca47e474fd71f818876de68c1b581")
+      string(REPLACE "|" ";" _bccodec_file "${_bccodec_file}")
+      list(GET _bccodec_file 0 _bccodec_source)
+      list(GET _bccodec_file 1 _bccodec_hash)
+      get_filename_component(_bccodec_name "${_bccodec_source}" NAME)
+      file(DOWNLOAD "${_bccodec_source}" "${_bccodec_dir}/${_bccodec_name}"
+        EXPECTED_HASH SHA256=${_bccodec_hash} STATUS _bccodec_status)
+      list(GET _bccodec_status 0 _bccodec_code)
+      if (NOT _bccodec_code EQUAL 0)
+        message(FATAL_ERROR "aurora: failed to download ${_bccodec_source}: ${_bccodec_status}")
+      endif ()
+    endforeach ()
+    add_library(aurora_bccodec STATIC ${_bccodec_dir}/bc7enc.cpp)
+    target_include_directories(aurora_bccodec SYSTEM PUBLIC ${_bccodec_dir})
+    set_target_properties(aurora_bccodec PROPERTIES FOLDER "extern")
+  endif ()
+
   if (AURORA_CACHE_USE_ZSTD)
     aurora_find_package_global(zstd CONFIG QUIET)
     if (NOT TARGET zstd::libzstd)

@@ -3,6 +3,7 @@
 #include "texture.hpp"
 #include "texture_convert.hpp"
 #include <aurora/texture.hpp>
+#include <algorithm>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -49,6 +50,47 @@ constexpr bool legacy_base_accepts(wgpu::TextureFormat format) noexcept {
     return true;
   }
 }
+
+enum class MipFit { Standard, Clamped, Invalid };
+
+// C1 D8 (spec-w8.md:61): exact size, or a repeat of the previous level that is not smaller than expected
+constexpr MipFit classify_mip_level(uint32_t baseWidth, uint32_t baseHeight, uint32_t level, uint32_t prevWidth,
+                                    uint32_t prevHeight, uint32_t width, uint32_t height) noexcept {
+  const uint32_t expectedWidth = level >= 32 ? 1u : std::max(baseWidth >> level, 1u);
+  const uint32_t expectedHeight = level >= 32 ? 1u : std::max(baseHeight >> level, 1u);
+  if (width == expectedWidth && height == expectedHeight) {
+    return MipFit::Standard;
+  }
+  if (width == prevWidth && height == prevHeight && width >= expectedWidth && height >= expectedHeight) {
+    return MipFit::Clamped;
+  }
+  return MipFit::Invalid;
+}
+
+constexpr uint32_t full_mip_count(uint32_t width, uint32_t height) noexcept {
+  uint32_t count = 1;
+  while (width > 1 || height > 1) {
+    width = std::max(width >> 1, 1u);
+    height = std::max(height >> 1, 1u);
+    ++count;
+  }
+  return count;
+}
+
+// Unprobed: the handle came from a raw entry or the thumbnail tier, not a full encoded load
+enum class ChainVerdict : uint8_t { Unprobed, Mipless, Internal, Complete, Short, Clamped, Invalid, Broken };
+
+struct ChainReport {
+  ChainVerdict verdict = ChainVerdict::Unprobed;
+  wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
+  uint8_t keptLevels = 0, generatedLevels = 0, fullLevels = 0;
+  bool repairable = false, repaired = false;
+  uint32_t repairMicros = 0;
+};
+
+// Latched from Settings::textureMaterials; a flip reloads only chains whose bytes depend on it.
+void set_mip_repair(bool enabled) noexcept;
+bool mip_repair_built() noexcept;
 
 struct ReplacementTextureDescriptors {
   wgpu::TextureDescriptor texture;
@@ -99,6 +141,15 @@ void set_workers_paused(bool paused) noexcept;
 void set_worker_count(uint32_t count) noexcept;
 bool wait_for_completions(uint64_t id, uint32_t count, uint32_t timeoutMs) noexcept;
 std::optional<ConvertedTexture> load_replacement_texture(const texture::ReplacementRegistration& registration) noexcept;
+std::optional<ConvertedTexture> load_replacement_texture(const texture::ReplacementRegistration& registration,
+                                                         bool repair, ChainReport* report) noexcept;
+std::optional<ConvertedTexture> load_replacement_file(const std::filesystem::path& path, bool repair,
+                                                      ChainReport* report = nullptr) noexcept;
+std::optional<ByteBuffer> decode_replacement_level(wgpu::TextureFormat format, uint32_t width, uint32_t height,
+                                                   ArrayRef<uint8_t> level) noexcept;
+bool seed_resident_full(const texture::ReplacementRegistration& registration, wgpu::TextureFormat format,
+                        uint32_t width, uint32_t height, uint32_t mips, const ChainReport& chain) noexcept;
+std::optional<ChainReport> resident_chain(const texture::ReplacementKey& key) noexcept;
 bool has_thumbnail(uint64_t id) noexcept;
 } // namespace testing
 } // namespace aurora::gfx::texture_replacement
