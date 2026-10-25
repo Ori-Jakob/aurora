@@ -5,8 +5,10 @@
 
 #include "gfx/clear.hpp"
 #include "gfx/frame_packet.hpp"
+#include "gfx/hash.hpp"
 #include "gfx/pipeline_cache.hpp"
 #include "gfx/resources.hpp"
+#include "gfx/scene_targets.hpp"
 #include "gx/hex_wgsl.hpp"
 #include "gx/pipeline.hpp"
 #include "gx/render_ext.hpp"
@@ -20,6 +22,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -341,6 +344,92 @@ TEST_F(GxShaderExtDevice, HexPipelinesCompileOnBackend) {
   }
   const auto error = test::pop_validation_error(*m_device);
   EXPECT_FALSE(error.has_value()) << error.value_or("");
+}
+
+TEST_F(GxShaderExtDevice, GBufferLayoutPipelinesValidate) {
+  const gfx::SceneLayoutBase base{
+      .color = wgpu::TextureFormat::BGRA8Unorm,
+      .depth = wgpu::TextureFormat::Depth32Float,
+      .size = {64, 64, 1},
+      .samples = 1,
+  };
+  const auto created = [&](const auto& create) {
+    m_device->device.PushErrorScope(wgpu::ErrorFilter::Validation);
+    const bool built = create();
+    const auto error = test::pop_validation_error(*m_device);
+    EXPECT_FALSE(error.has_value()) << error.value_or("");
+    return built && !error;
+  };
+  const auto build_clears = [&](const gfx::RenderTargetLayout& layout) {
+    for (uint32_t bits = 0; bits < 8; ++bits) {
+      const gfx::clear::PipelineConfig clear{
+          .clearColor = (bits & 1) != 0, .clearAlpha = (bits & 2) != 0, .clearDepth = (bits & 4) != 0};
+      EXPECT_TRUE(created([&] { return static_cast<bool>(gfx::clear::create_pipeline(clear, layout)); })) << bits;
+    }
+  };
+
+  ASSERT_TRUE(start({.backend = wgpu::BackendType::Null, .core = true}, true));
+  ASSERT_TRUE(m_device->core);
+  const gfx::RenderTargetLayout gbuffer = gfx::compose_scene_layout({.gbuffer = true}, base);
+  const gfx::RenderTargetLayout ids = gfx::compose_scene_layout({.gbuffer = true, .debugId = true}, base);
+  EXPECT_EQ(gfx::compose_scene_layout({.normal = true, .gbuffer = true}, base).key, gbuffer.key);
+
+  std::vector<ShaderConfig> configs;
+  std::unordered_set<uint64_t> seen;
+  size_t invalidLegacy = 0;
+  for (const corpus::Entry& entry : corpus::generate_synthetic()) {
+    ShaderConfig config = corpus::decode(entry.record);
+    config.ext = {};
+    if (!seen.insert(xxh3_hash(config)).second) {
+      continue;
+    }
+    if (module_error(*m_device, build_shader_source(config, DstAlphaMode::None))) {
+      ++invalidLegacy;
+      continue;
+    }
+    configs.push_back(config);
+  }
+  ASSERT_FALSE(configs.empty());
+  size_t litNormal = 0;
+  for (const ShaderConfig& config : configs) {
+    const PipelineConfig plain = pipeline_for(config);
+    PipelineConfig prepass = plain;
+    prepass.dstAlpha = 0x80;
+    prepass.blendMode = GX_BM_BLEND;
+    prepass.blendFacSrc = GX_BL_SRCALPHA;
+    prepass.blendFacDst = GX_BL_INVSRCALPHA;
+    PipelineConfig colorOff = plain;
+    colorOff.colorUpdate = false;
+    EXPECT_TRUE(created([&] { return static_cast<bool>(create_pipeline(plain, gbuffer).main); }));
+    EXPECT_TRUE(created([&] { return static_cast<bool>(create_pipeline(plain, ids).main); }));
+    EXPECT_TRUE(created([&] {
+      const gfx::CompiledPipeline pipeline = create_pipeline(prepass, gbuffer);
+      return pipeline.main && pipeline.prepass;
+    }));
+    EXPECT_TRUE(created([&] { return static_cast<bool>(create_pipeline(colorOff, gbuffer).main); }));
+    litNormal += config.attrs[GX_VA_NRM].attrType != GX_NONE && build_shader_info(config).lightingEnabled ? 1 : 0;
+  }
+  EXPECT_GE(litNormal, 1u);
+  build_clears(gbuffer);
+  build_clears(ids);
+  std::printf("gbuffer layouts: %zu configs built, %zu lit with normals, %zu with invalid legacy text\n",
+              configs.size(), litNormal, invalidLegacy);
+  RecordProperty("configs", static_cast<int>(configs.size()));
+  m_globals.reset();
+  EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
+  m_device.reset();
+
+  ASSERT_TRUE(start({.backend = wgpu::BackendType::Null, .core = true, .profile = FEATURE_PROFILE_METAL32}, true));
+  wgpu::Limits limits{};
+  m_device->device.GetLimits(&limits);
+  if (!m_device->core || limits.maxColorAttachmentBytesPerSample != 32) {
+    GTEST_SKIP() << "no 32-byte core device";
+  }
+  const PipelineConfig plain = pipeline_for(configs.front());
+  for (const gfx::RenderTargetLayout& layout : {gbuffer, ids}) {
+    EXPECT_TRUE(created([&] { return static_cast<bool>(create_pipeline(plain, layout).main); }));
+    build_clears(layout);
+  }
 }
 
 TEST_F(GxShaderExtDevice, HexTapsPreserveTexelLength) {

@@ -5,6 +5,7 @@
 #include "recording.hpp"
 #include "render_worker.hpp"
 #include "resource_cache.hpp"
+#include "scene_targets.hpp"
 #include "tex_copy_conv.hpp"
 #include "tex_palette_conv.hpp"
 #include "texture_replacement.hpp"
@@ -584,36 +585,7 @@ wgpu::TextureFormat depth_format() noexcept { return webgpu::g_graphicsConfig.de
 uint32_t sample_count() noexcept { return webgpu::g_graphicsConfig.msaaSamples; }
 
 RenderTargetLayout scene_render_target_layout() noexcept {
-  RenderTargetLayout layout{
-      .colorAttachmentCount = 1,
-      .colorAttachments = {{{
-          .semantic = ColorAttachmentSemantic::SceneColor,
-          .format = webgpu::g_frameBuffer.format,
-          .width = webgpu::g_frameBuffer.size.width,
-          .height = webgpu::g_frameBuffer.size.height,
-      }}},
-      .depthStencilFormat = webgpu::g_graphicsConfig.depthFormat,
-      .sampleCount = webgpu::g_graphicsConfig.msaaSamples,
-  };
-  if (webgpu::g_graphicsConfig.normalBuffer) {
-    layout.colorAttachments[layout.colorAttachmentCount++] = {
-        .semantic = ColorAttachmentSemantic::Normal,
-        .format = webgpu::g_normalBuffer.format,
-        .width = webgpu::g_normalBuffer.size.width,
-        .height = webgpu::g_normalBuffer.size.height,
-    };
-  }
-  // Last, so later targets go before it and the base layout stays a prefix
-  if (webgpu::g_graphicsConfig.debugIdBuffer) {
-    layout.colorAttachments[layout.colorAttachmentCount++] = {
-        .semantic = ColorAttachmentSemantic::DebugId,
-        .format = webgpu::g_debugIdBuffer.format,
-        .width = webgpu::g_debugIdBuffer.size.width,
-        .height = webgpu::g_debugIdBuffer.size.height,
-    };
-  }
-  finalize_render_target_layout(layout);
-  return layout;
+  return compose_scene_layout(live_scene_targets(), live_layout_base());
 }
 
 bool uses_reversed_z() noexcept { return gx::UseReversedZ; }

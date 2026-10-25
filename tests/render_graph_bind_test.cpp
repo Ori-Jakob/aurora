@@ -1150,6 +1150,81 @@ fn fs(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
   EXPECT_EQ(count_logs(LOG_WARNING, "needs 'gx.normal'"), 0u);
 }
 
+TEST_F(GraphBindDeviceTest, GxGBufferTargetsBindAsSampled) {
+  if (!webgpu::g_hasCoreFeatures) {
+    GTEST_SKIP() << "the G-buffer needs a core device";
+  }
+  push_validation_scope();
+  ASSERT_TRUE(webgpu::set_gbuffer(true));
+  ASSERT_EQ(pop_validation_scope(), std::nullopt);
+  struct Target {
+    GxResource resource;
+    const webgpu::TextureWithSampler* texture;
+  };
+  const std::array targets{
+      Target{GxResource::Motion, &webgpu::g_motionBuffer},
+      Target{GxResource::Reactive, &webgpu::g_reactiveBuffer},
+      Target{GxResource::Fog, &webgpu::g_fogRecordBuffer},
+  };
+  GraphInputs inputs = test_inputs();
+  for (const Target& target : targets) {
+    const auto index = static_cast<size_t>(target.resource);
+    ASSERT_TRUE(target.texture->texture) << gx_resource_name(target.resource);
+    const wgpu::TextureUsage usage = target.texture->texture.GetUsage();
+    EXPECT_EQ(target.texture->texture.GetFormat(), gx_fixed_format(target.resource));
+    EXPECT_EQ(target.texture->texture.GetSampleCount(), 1u);
+    EXPECT_EQ(inputs.env.gxFormats[index], target.texture->texture.GetFormat());
+    EXPECT_EQ(inputs.env.gxUsage[index], usage);
+    EXPECT_TRUE(usage & wgpu::TextureUsage::CopySrc);
+  }
+  const auto normal = static_cast<size_t>(GxResource::Normal);
+  ASSERT_TRUE(webgpu::g_normalBuffer.texture);
+  EXPECT_EQ(inputs.env.gxFormats[normal], webgpu::NormalBufferFormat);
+
+  std::vector<TestPass> passes{
+      {.name = "gb.read",
+       .order = 0,
+       .declare =
+           [&targets](InternalPassBuilder& b) {
+             for (const Target& target : targets) {
+               b.use(gx_resource_name(target.resource), Access::Sampled, Missing::BindDummyBlack);
+             }
+             b.use("gx.normal", Access::Sampled, Missing::BindDummyBlack);
+             b.side_effect();
+           }},
+  };
+  const TestFrame frame{compile(passes, inputs)};
+  ASSERT_EQ(frame.graph->nodes[frame.node("gb.read")].status, CullReason::None);
+  ASSERT_EQ(run_frame(frame, 1), std::nullopt);
+  EXPECT_EQ(passes[0].calls, 1);
+  const auto identities = testing::last_identities(frame.node("gb.read"));
+  ASSERT_EQ(identities.size(), targets.size() + 1);
+  for (size_t i = 0; i < targets.size(); ++i) {
+    EXPECT_EQ(identities[i].kind, IdentityKind::Gx) << i;
+    EXPECT_EQ(identities[i].value, reinterpret_cast<uintptr_t>(targets[i].texture->view.Get())) << i;
+  }
+  EXPECT_EQ(identities[targets.size()].kind, IdentityKind::Gx);
+  EXPECT_EQ(identities[targets.size()].value, reinterpret_cast<uintptr_t>(webgpu::g_normalBuffer.view.Get()));
+
+  ASSERT_TRUE(webgpu::set_gbuffer(false));
+  for (const Target& target : targets) {
+    EXPECT_FALSE(target.texture->texture) << gx_resource_name(target.resource);
+  }
+  EXPECT_FALSE(webgpu::g_normalBuffer.texture);
+  inputs = test_inputs();
+  EXPECT_EQ(inputs.env.gxFormats[static_cast<size_t>(GxResource::Motion)], TextureFormat::Undefined);
+  EXPECT_EQ(inputs.env.gxFormats[normal], TextureFormat::Undefined);
+
+  ASSERT_TRUE(webgpu::set_gbuffer(true));
+  const WGPUTexture shared = webgpu::g_normalBuffer.texture.Get();
+  ASSERT_TRUE(webgpu::enable_normal_buffer());
+  EXPECT_EQ(webgpu::g_normalBuffer.texture.Get(), shared);
+  ASSERT_TRUE(webgpu::set_gbuffer(false));
+  EXPECT_EQ(webgpu::g_normalBuffer.texture.Get(), shared);
+  EXPECT_FALSE(webgpu::g_motionBuffer.texture);
+  EXPECT_EQ(test_inputs().env.gxFormats[normal], webgpu::NormalBufferFormat);
+}
+
 TEST_F(GraphBindTest, LoadOpsFollowCreator) {
   using testing::AttachmentOps;
   std::vector<std::vector<AttachmentOps>> recorded;

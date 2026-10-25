@@ -393,24 +393,39 @@ bool resolve_gx_color(const StageData&, Access, GxBinding& out) {
   return true;
 }
 
-bool resolve_gx_normal(const StageData&, Access access, GxBinding& out) {
-  const webgpu::TextureWithSampler& normal = webgpu::g_normalBuffer;
-  if (!webgpu::g_graphicsConfig.normalBuffer || !normal.texture) {
+bool bind_gx_target(const webgpu::TextureWithSampler& target, bool present, Access access, GxBinding& out) {
+  if (!present || !target.texture) {
     return false;
   }
-  if (access == Access::Sampled && !(normal.texture.GetUsage() & wgpu::TextureUsage::TextureBinding)) {
+  if (access == Access::Sampled && !(target.texture.GetUsage() & wgpu::TextureUsage::TextureBinding)) {
     return false;
   }
   out = {
-      .texture = normal.texture,
-      .sampleView = normal.view,
-      .attachmentView = normal.view,
-      .copyTexture = normal.texture,
-      .size = normal.size,
-      .format = normal.texture.GetFormat(),
-      .samples = normal.texture.GetSampleCount(),
+      .texture = target.texture,
+      .sampleView = target.view,
+      .attachmentView = target.view,
+      .copyTexture = target.texture,
+      .size = target.size,
+      .format = target.texture.GetFormat(),
+      .samples = target.texture.GetSampleCount(),
   };
   return true;
+}
+
+bool resolve_gx_normal(const StageData&, Access access, GxBinding& out) {
+  return bind_gx_target(webgpu::g_normalBuffer, webgpu::normal_present(), access, out);
+}
+
+bool resolve_gx_motion(const StageData&, Access access, GxBinding& out) {
+  return bind_gx_target(webgpu::g_motionBuffer, webgpu::g_graphicsConfig.gbuffer, access, out);
+}
+
+bool resolve_gx_reactive(const StageData&, Access access, GxBinding& out) {
+  return bind_gx_target(webgpu::g_reactiveBuffer, webgpu::g_graphicsConfig.gbuffer, access, out);
+}
+
+bool resolve_gx_fog(const StageData&, Access access, GxBinding& out) {
+  return bind_gx_target(webgpu::g_fogRecordBuffer, webgpu::g_graphicsConfig.gbuffer, access, out);
 }
 
 GxResolveFn gx_resolver(GxResource resource) noexcept {
@@ -426,6 +441,12 @@ GxResolveFn gx_resolver(GxResource resource) noexcept {
     return &resolve_gx_color;
   case GxResource::Normal:
     return &resolve_gx_normal;
+  case GxResource::Motion:
+    return &resolve_gx_motion;
+  case GxResource::Reactive:
+    return &resolve_gx_reactive;
+  case GxResource::Fog:
+    return &resolve_gx_fog;
   default:
     return nullptr;
   }

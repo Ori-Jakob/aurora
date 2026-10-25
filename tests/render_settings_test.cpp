@@ -244,5 +244,28 @@ TEST_F(RenderLatchTest, GraphHandedThroughFrameState) {
 #else
 TEST_F(RenderLatchTest, ModuleOffHasNoGraph) { EXPECT_EQ(latch_frame()->graph, nullptr); }
 #endif
+
+TEST_F(RenderLatchTest, GBufferWantNeedsBaseTier) {
+  using detail::ForceMode;
+  using detail::gbuffer_wanted;
+  Settings request;
+  request.taa = true;
+  const Settings none;
+  const Caps full = full_caps();
+  Caps budget24 = full;
+  budget24.limits.maxColorAttachmentBytesPerSample = 24;
+  Caps metal32 = full;
+  metal32.limits.maxColorAttachmentBytesPerSample = 32;
+
+  EXPECT_FALSE(gbuffer_wanted(request, compat_caps(), 1, true, ForceMode::On));
+  EXPECT_FALSE(gbuffer_wanted(request, full, 4, true, ForceMode::On));
+  EXPECT_FALSE(gbuffer_wanted(request, budget24, 1, true, ForceMode::On));
+  EXPECT_TRUE(gbuffer_wanted(none, metal32, 1, true, ForceMode::On));
+  EXPECT_TRUE(gbuffer_wanted(request, metal32, 1, true, ForceMode::Unset));
+  EXPECT_TRUE(gbuffer_wanted(request, full, 1, true, ForceMode::Unset));
+  EXPECT_FALSE(gbuffer_wanted(none, full, 1, true, ForceMode::Unset));
+  EXPECT_FALSE(gbuffer_wanted(request, full, 1, false, ForceMode::On));
+  EXPECT_FALSE(gbuffer_wanted(request, full, 1, true, ForceMode::Off));
+}
 } // namespace
 } // namespace aurora::render::test

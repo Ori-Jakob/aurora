@@ -577,6 +577,8 @@ struct ShaderTargets {
   uint32_t normal = UINT32_MAX;
   uint32_t debugId = UINT32_MAX;
 };
+// Under a G-buffer layout ext = 0 text writes no normal; the receiver normal belongs to output draws (M7-W5)
+ShaderTargets shader_targets(const gfx::RenderTargetLayout& layout) noexcept;
 std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlphaMode,
                                 const ShaderTargets& targets) noexcept;
 wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout,

@@ -8,6 +8,7 @@
 #include "stage.hpp"
 #include "../gfx/frame.hpp"
 #include "../gfx/recording.hpp"
+#include "../gfx/scene_targets.hpp"
 #include "../gfx/texture_replacement.hpp"
 #include "../gx/texture.hpp"
 #include "../logging.hpp"
@@ -307,6 +308,41 @@ bool generate_mips_env() noexcept {
   return enabled;
 }
 
+ForceMode gbuffer_env() noexcept {
+  static const ForceMode forced = [] {
+    const char* value = SDL_getenv("AURORA_RENDER_GBUFFER");
+    if (value == nullptr) {
+      return ForceMode::Unset;
+    }
+    const std::string_view text{value};
+    if (text == "on") {
+      Log.warn("AURORA_RENDER_GBUFFER=on: forcing the base G-buffer tier regardless of settings");
+      return ForceMode::On;
+    }
+    if (text == "off") {
+      Log.warn("AURORA_RENDER_GBUFFER=off: keeping the base G-buffer tier off regardless of settings");
+      return ForceMode::Off;
+    }
+    Log.warn("AURORA_RENDER_GBUFFER={} is neither on nor off; ignored", text);
+    return ForceMode::Unset;
+  }();
+  return forced;
+}
+
+bool latch_gbuffer_want(uint32_t msaaSamples) {
+  static bool warnedUnsupported = false;
+  const ForceMode forced = gbuffer_env();
+  const Caps& deviceCaps = caps();
+  if (forced == ForceMode::On && deviceCaps.valid && device_tier(deviceCaps, msaaSamples) == Tier::None &&
+      !std::exchange(warnedUnsupported, true)) {
+    const Reason reason = !deviceCaps.core  ? Reason::NeedsCore
+                          : msaaSamples > 1 ? Reason::MsaaActive
+                                            : Reason::ColorBudget;
+    Log.warn("AURORA_RENDER_GBUFFER=on: the base G-buffer tier is unavailable ({})", reason_name(reason));
+  }
+  return gbuffer_wanted(latched_settings(), deviceCaps, msaaSamples, module_enabled(), forced);
+}
+
 void log_latched_settings(uint64_t generation, FeatureMask previous, const Settings& latched) {
   const FeatureMask enabled = enabled_features(latched);
   std::string names;
@@ -414,6 +450,12 @@ Tier device_tier(const Caps& caps, uint32_t msaaSamples) noexcept {
     return Tier::None;
   }
   return budget >= PbrTierColorBytes ? Tier::Pbr : Tier::Base;
+}
+
+bool gbuffer_wanted(const Settings& settings, const Caps& caps, uint32_t msaaSamples, bool moduleEnabled,
+                    ForceMode forced) noexcept {
+  return moduleEnabled && device_tier(caps, msaaSamples) != Tier::None && forced != ForceMode::Off &&
+         (requested_option(settings, Feature::GBuffer) != 0 || forced == ForceMode::On);
 }
 
 FeatureSupport evaluate_support(Feature feature, uint8_t option, const Settings& context,
@@ -691,6 +733,8 @@ std::shared_ptr<const FrameState> latch_frame() {
   }
   // Unconditional so the value latched at init also reaches the loader
   gfx::texture_replacement::set_mip_repair(latched_settings().textureMaterials);
+  // Before the inspector and the graph environment read the scene layout
+  gfx::detail::latch_scene_layout(latch_gbuffer_want(msaaSamples));
   const bool generateMips = latched_settings().generateMissingMips || generate_mips_env();
   gx::texture::set_generate_missing_mips(generateMips);
   gfx::texture_replacement::set_mip_generation(generateMips);

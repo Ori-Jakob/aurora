@@ -18,6 +18,10 @@ enum class ColorAttachmentSemantic : uint8_t {
   Auxiliary,
   // Inspector pick ids; always the last scene attachment
   DebugId,
+  // Base G-buffer targets; the scene composer, not these values, sets attachment order
+  Motion,
+  Reactive,
+  Fog,
 };
 
 struct ColorAttachmentLayout {
@@ -172,12 +176,14 @@ struct ResolvedTargets {
 /// discarding its output). Depth is left null when unsupported by the device.
 /// Returns false (with a warning) outside an active render pass. Scene pipelines
 /// must rebuild based on layout.key, which can change at runtime.
-/// 
+///
 /// **Normals:**
 /// The first resolve with normals will enable the normal attachment at the start
 /// of the next frame and stay enabled until shutdown. Before the normal buffer
 /// gets enabled, the resolved normal buffer will be null. Resolved normals will
-/// also be null in offscreen passes and when unsupported by the device.
+/// also be null in offscreen passes and when unsupported by the device. The
+/// normal attachment is also present while the base G-buffer tier is live, and
+/// a request made then does not enable it.
 bool resolve_pass(const ResolveDesc& desc, ResolvedTargets& out);
 
 /// Opens an offscreen render pass (GXCreateFrameBuffer semantics): cleared

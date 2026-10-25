@@ -49,10 +49,19 @@ GraphEnvironment gather_graph_environment() {
                                              wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst;
   env.gxFormats[gx_index(GxResource::Depth)] = config.depthFormat;
   env.gxUsage[gx_index(GxResource::Depth)] = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding;
-  if (config.normalBuffer) {
+  constexpr wgpu::TextureUsage SceneTargetUsage =
+      wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc;
+  if (webgpu::normal_present()) {
     env.gxFormats[gx_index(GxResource::Normal)] = webgpu::NormalBufferFormat;
-    env.gxUsage[gx_index(GxResource::Normal)] =
-        wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc;
+    env.gxUsage[gx_index(GxResource::Normal)] = SceneTargetUsage;
+  }
+  if (config.gbuffer) {
+    env.gxFormats[gx_index(GxResource::Motion)] = webgpu::MotionBufferFormat;
+    env.gxUsage[gx_index(GxResource::Motion)] = SceneTargetUsage;
+    env.gxFormats[gx_index(GxResource::Reactive)] = webgpu::ReactiveBufferFormat;
+    env.gxUsage[gx_index(GxResource::Reactive)] = SceneTargetUsage;
+    env.gxFormats[gx_index(GxResource::Fog)] = webgpu::FogRecordFormat;
+    env.gxUsage[gx_index(GxResource::Fog)] = SceneTargetUsage;
   }
   if (config.debugIdBuffer) {
     env.gxFormats[gx_index(GxResource::DebugId)] = webgpu::DebugIdBufferFormat;

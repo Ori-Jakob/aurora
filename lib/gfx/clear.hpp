@@ -5,6 +5,7 @@
 #include "types.hpp"
 
 #include <array>
+#include <string>
 
 #include <webgpu/webgpu_cpp.h>
 
@@ -28,4 +29,8 @@ static_assert(std::has_unique_object_representations_v<PipelineConfig>);
 
 wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const RenderTargetLayout& layout);
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass, const wgpu::Extent3D& targetSize);
+
+namespace detail {
+std::string shader_source(const PipelineConfig& config, const RenderTargetLayout& layout);
+} // namespace detail
 } // namespace aurora::gfx::clear

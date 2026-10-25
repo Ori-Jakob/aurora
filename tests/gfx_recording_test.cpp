@@ -39,6 +39,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace aurora::gfx {
@@ -50,6 +51,8 @@ constexpr auto DepthFormat = wgpu::TextureFormat::Depth24Plus;
 class GfxRecordingTest : public ::testing::Test {
 protected:
   void SetUp() override {
+    // Without a device the limit stays undefined, and padding a copy's uniforms to it reserves gigabytes
+    savedUniformAlignment = std::exchange(detail::resources().limits.minUniformBufferOffsetAlignment, 256);
     webgpu::g_graphicsConfig.surfaceConfiguration.format = ColorFormat;
     webgpu::g_graphicsConfig.depthFormat = DepthFormat;
     webgpu::g_graphicsConfig.msaaSamples = 1;
@@ -70,6 +73,7 @@ protected:
       detail::end_recording();
     }
     detail::shutdown_recording();
+    detail::resources().limits.minUniformBufferOffsetAlignment = savedUniformAlignment;
   }
 
   void seed(uint32_t width, uint32_t height) {
@@ -103,6 +107,7 @@ protected:
 
   detail::FramePacket frame;
   bool recordingActive = true;
+  uint32_t savedUniformAlignment = 0;
 };
 
 class GfxChannelStorageTest : public GfxRecordingTest {
@@ -235,6 +240,68 @@ TEST_F(GfxRecordingTest, EfbPassCarriesDebugIdLast) {
 
   webgpu::g_graphicsConfig.debugIdBuffer = false;
   webgpu::g_debugIdBuffer = {};
+}
+
+TEST_F(GfxRecordingTest, EfbPassCarriesGBufferTargets) {
+  struct TierReset {
+    ~TierReset() { webgpu::g_graphicsConfig.gbuffer = false; }
+  } tierReset;
+  webgpu::g_graphicsConfig.gbuffer = true;
+  constexpr std::array Semantics{ColorAttachmentSemantic::SceneColor, ColorAttachmentSemantic::Normal,
+                                 ColorAttachmentSemantic::Motion, ColorAttachmentSemantic::Reactive,
+                                 ColorAttachmentSemantic::Fog};
+  const auto clears = [&] {
+    std::vector<bool> out;
+    const auto& pass = frame.renderPasses.back();
+    for (uint32_t i = 0; i < pass.colorAttachmentCount; ++i) {
+      out.push_back(pass.colorAttachments[i].clear);
+    }
+    return out;
+  };
+  const auto resolve = [](bool clearColor, bool clearAlpha, bool clearDepth) {
+    auto target = std::make_shared<TextureRef>(wgpu::Texture{}, wgpu::TextureView{}, wgpu::TextureView{},
+                                               wgpu::Extent3D{640, 480, 1}, ColorFormat, 1, GX_TF_RGBA8);
+    resolve_pass_into(std::move(target), {0, 0, 0, 0}, clearColor, clearAlpha, clearDepth, {}, 1.f, GX_TF_RGBA8,
+                      GX_PF_RGBA6_Z24);
+  };
+
+  // A zero-size EFB makes every rect full and leaves nothing to draw, so no clear draw needs a pipeline
+  webgpu::g_frameBuffer.size = {0, 0, 1};
+  next_frame();
+  const auto& first = frame.renderPasses.front();
+  ASSERT_EQ(first.colorAttachmentCount, Semantics.size());
+  for (uint32_t i = 0; i < Semantics.size(); ++i) {
+    EXPECT_EQ(first.colorAttachments[i].semantic, Semantics[i]) << i;
+  }
+  EXPECT_EQ(first.colorAttachments[2].format, wgpu::TextureFormat::RG16Float);
+  EXPECT_EQ(first.colorAttachments[3].format, wgpu::TextureFormat::R8Unorm);
+  EXPECT_EQ(first.colorAttachments[4].format, wgpu::TextureFormat::RGBA8Uint);
+  EXPECT_EQ(clears(), (std::vector<bool>{true, true, true, true, true}));
+
+  resolve(false, false, true);
+  EXPECT_EQ(clears(), (std::vector<bool>{false, true, true, false, false}));
+  resolve(true, true, false);
+  EXPECT_EQ(clears(), (std::vector<bool>{true, false, false, true, true}));
+  resolve(true, false, false);
+  EXPECT_EQ(clears(), (std::vector<bool>{false, false, false, true, true}));
+  resolve(false, false, false);
+  EXPECT_EQ(clears(), (std::vector<bool>(5, false)));
+  resolve(true, true, true);
+  ResolvedTargets ignored;
+  ASSERT_TRUE(resolve_pass({.color = false}, ignored));
+  EXPECT_EQ(clears(), (std::vector<bool>(5, false)));
+
+  webgpu::g_frameBuffer.size = {640, 480, 1};
+  next_frame();
+}
+
+TEST(GfxRecordingArmTest, ShouldArmModNormal) {
+  EXPECT_TRUE(detail::should_arm_mod_normal(true, false, false, true, 1));
+  EXPECT_FALSE(detail::should_arm_mod_normal(true, false, true, true, 1));
+  EXPECT_FALSE(detail::should_arm_mod_normal(false, false, false, true, 1));
+  EXPECT_FALSE(detail::should_arm_mod_normal(true, true, false, true, 1));
+  EXPECT_FALSE(detail::should_arm_mod_normal(true, false, false, false, 1));
+  EXPECT_FALSE(detail::should_arm_mod_normal(true, false, false, true, 4));
 }
 
 TEST_F(GfxRecordingTest, CopiedOffscreenPassIsRetainedOnRestore) {

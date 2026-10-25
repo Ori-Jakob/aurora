@@ -296,6 +296,9 @@ struct ScopedGlobalDevice::Saved {
   webgpu::TextureWithSampler frameBufferResolved;
   webgpu::TextureWithSampler depthBuffer;
   webgpu::TextureWithSampler normalBuffer;
+  webgpu::TextureWithSampler motionBuffer;
+  webgpu::TextureWithSampler reactiveBuffer;
+  webgpu::TextureWithSampler fogRecordBuffer;
 };
 
 ScopedGlobalDevice::ScopedGlobalDevice(TestDevice& device, const TestDeviceOptions& options)
@@ -332,6 +335,9 @@ ScopedGlobalDevice::ScopedGlobalDevice(TestDevice& device, const TestDeviceOptio
   saved.frameBufferResolved = std::exchange(webgpu::g_frameBufferResolved, {});
   saved.depthBuffer = std::exchange(webgpu::g_depthBuffer, {});
   saved.normalBuffer = std::exchange(webgpu::g_normalBuffer, {});
+  saved.motionBuffer = std::exchange(webgpu::g_motionBuffer, {});
+  saved.reactiveBuffer = std::exchange(webgpu::g_reactiveBuffer, {});
+  saved.fogRecordBuffer = std::exchange(webgpu::g_fogRecordBuffer, {});
   if (options.createEfb) {
     const auto& size = options.efbSize;
     webgpu::g_frameBuffer = webgpu::create_render_texture(size.width, size.height, true);
@@ -368,6 +374,9 @@ ScopedGlobalDevice::ScopedGlobalDevice(TestDevice& device, const TestDeviceOptio
 ScopedGlobalDevice::~ScopedGlobalDevice() {
   Saved& saved = *m_saved;
   webgpu::reset_caps();
+  webgpu::g_fogRecordBuffer = std::move(saved.fogRecordBuffer);
+  webgpu::g_reactiveBuffer = std::move(saved.reactiveBuffer);
+  webgpu::g_motionBuffer = std::move(saved.motionBuffer);
   webgpu::g_normalBuffer = std::move(saved.normalBuffer);
   webgpu::g_depthBuffer = std::move(saved.depthBuffer);
   webgpu::g_frameBufferResolved = std::move(saved.frameBufferResolved);

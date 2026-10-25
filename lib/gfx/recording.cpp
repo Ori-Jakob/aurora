@@ -4,6 +4,7 @@
 #include "frame.hpp"
 #include "lru_cache.hpp"
 #include "resource_cache.hpp"
+#include "scene_targets.hpp"
 
 #include "clear.hpp"
 #include "pipeline_cache.hpp"
@@ -105,15 +106,27 @@ void set_efb_targets(RenderPass& pass) {
     auto& color = pass.colorAttachments[i];
     color.semantic = layout.colorAttachments[i].semantic;
     color.format = layout.colorAttachments[i].format;
-    if (color.semantic == ColorAttachmentSemantic::Normal) {
-      color.size = webgpu::g_normalBuffer.size;
-      color.view = webgpu::g_normalBuffer.view;
-    } else if (color.semantic == ColorAttachmentSemantic::DebugId) {
-      color.size = webgpu::g_debugIdBuffer.size;
-      color.view = webgpu::g_debugIdBuffer.view;
-    } else {
-      AURORA_ASSERT(false, "Scene render-target attachment {} has no backing texture", i);
+    const webgpu::TextureWithSampler* target = nullptr;
+    switch (color.semantic) {
+      DEFAULT_FATAL("Scene render-target attachment {} has no backing texture", i);
+    case ColorAttachmentSemantic::Normal:
+      target = &webgpu::g_normalBuffer;
+      break;
+    case ColorAttachmentSemantic::Motion:
+      target = &webgpu::g_motionBuffer;
+      break;
+    case ColorAttachmentSemantic::Reactive:
+      target = &webgpu::g_reactiveBuffer;
+      break;
+    case ColorAttachmentSemantic::Fog:
+      target = &webgpu::g_fogRecordBuffer;
+      break;
+    case ColorAttachmentSemantic::DebugId:
+      target = &webgpu::g_debugIdBuffer;
+      break;
     }
+    color.size = target->size;
+    color.view = target->view;
   }
   pass.depthStencilView = webgpu::g_depthBuffer.view;
   pass.depthStencilFormat = layout.depthStencilFormat;
@@ -122,7 +135,7 @@ void set_efb_targets(RenderPass& pass) {
   pass.copySourceView =
       webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved.view : webgpu::g_frameBuffer.view;
   pass.copySourceDepthView = webgpu::g_depthBuffer.view;
-  if (webgpu::g_graphicsConfig.normalBuffer) {
+  if (webgpu::normal_present()) {
     pass.copySourceNormalTexture = webgpu::g_normalBuffer.texture;
   }
   pass.msaaSamples = layout.sampleCount;
@@ -804,6 +817,10 @@ void warn_stage_once(uint8_t index, StageWarning kind) {
 
 namespace detail {
 
+bool should_arm_mod_normal(bool requested, bool offscreen, bool normalPresent, bool core, uint32_t msaa) noexcept {
+  return requested && !offscreen && !normalPresent && core && msaa == 1;
+}
+
 void begin_recording(FramePacket& packet, size_t frameSlot) {
   CHECK(!g_recorder.active(), "A recording session is already active");
   if (g_recorder.normalRequested && webgpu::enable_normal_buffer()) {
@@ -1158,8 +1175,10 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
   for (uint32_t i = 0; i < newPass.colorAttachmentCount; ++i) {
     auto& color = newPass.colorAttachments[i];
     color.loadOp = wgpu::LoadOp::Undefined;
-    if (color.semantic == ColorAttachmentSemantic::Normal && clearDepth && fullTarget) {
-      color.clear = true;
+    if (clears_with_depth(color.semantic) || clears_with_color(color.semantic)) {
+      // Geometry targets reset with depth, colour records with colour
+      color.clear = (clears_with_depth(color.semantic) && clearDepth && fullTarget) ||
+                    (clears_with_color(color.semantic) && clearColor && fullTarget);
     } else if (color.semantic == ColorAttachmentSemantic::DebugId) {
       color.clear = clearColor && fullTarget;
     } else {
@@ -1325,8 +1344,9 @@ bool resolve_pass(const ResolveDesc& desc, ResolvedTargets& out) {
   const uint32_t width = prevPass.colorAttachments[SceneColorAttachmentIndex].size.width;
   const uint32_t height = prevPass.colorAttachments[SceneColorAttachmentIndex].size.height;
   const bool wantNormal = desc.normal && prevPass.copySourceNormalTexture;
-  if (desc.normal && !g_recorder.inOffscreen && !webgpu::g_graphicsConfig.normalBuffer && webgpu::g_hasCoreFeatures &&
-      webgpu::g_graphicsConfig.msaaSamples == 1) {
+  // A request under the G-buffer reads its normal, so it must not leave a sticky legacy buffer behind
+  if (detail::should_arm_mod_normal(desc.normal, g_recorder.inOffscreen, webgpu::normal_present(),
+                                    webgpu::g_hasCoreFeatures, webgpu::g_graphicsConfig.msaaSamples)) {
     g_recorder.normalRequested = true;
   }
   // Requesting no snapshots is a plain pass break (or offscreen close, discarding its output).

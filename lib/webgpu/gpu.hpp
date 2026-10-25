@@ -13,6 +13,9 @@ struct SDL_Window;
 namespace aurora::webgpu {
 inline constexpr wgpu::TextureFormat NormalBufferFormat = wgpu::TextureFormat::RGB10A2Unorm;
 inline constexpr wgpu::TextureFormat DebugIdBufferFormat = wgpu::TextureFormat::R32Uint;
+inline constexpr wgpu::TextureFormat MotionBufferFormat = wgpu::TextureFormat::RG16Float;
+inline constexpr wgpu::TextureFormat ReactiveBufferFormat = wgpu::TextureFormat::R8Unorm;
+inline constexpr wgpu::TextureFormat FogRecordFormat = wgpu::TextureFormat::RGBA8Uint;
 
 struct GraphicsConfig {
   wgpu::SurfaceConfiguration surfaceConfiguration;
@@ -21,6 +24,8 @@ struct GraphicsConfig {
   uint16_t textureAnisotropy;
   bool normalBuffer = false;
   bool debugIdBuffer = false;
+  // Base G-buffer tier; normalBuffer stays the mod's sticky request that traces record
+  bool gbuffer = false;
 };
 struct TextureWithSampler {
   wgpu::Texture texture;
@@ -54,6 +59,9 @@ extern TextureWithSampler g_frameBufferResolved;
 extern TextureWithSampler g_depthBuffer;
 extern TextureWithSampler g_normalBuffer;
 extern TextureWithSampler g_debugIdBuffer;
+extern TextureWithSampler g_motionBuffer;
+extern TextureWithSampler g_reactiveBuffer;
+extern TextureWithSampler g_fogRecordBuffer;
 extern wgpu::RenderPipeline g_CopyPipeline;
 extern wgpu::RenderPipeline g_CopyPremultipliedAlphaPipeline;
 extern wgpu::BindGroup g_CopyBindGroup;
@@ -72,8 +80,11 @@ void release_surface() noexcept;
 bool refresh_surface(bool recreate = true);
 void resize_swapchain(uint32_t width, uint32_t height, uint32_t nativeWidth, uint32_t nativeHeight, bool force = false);
 TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool multisampled);
+bool scene_targets_supported() noexcept;
 bool enable_normal_buffer();
 bool set_debug_id_buffer(bool enabled);
+bool set_gbuffer(bool enabled);
+inline bool normal_present() noexcept { return g_graphicsConfig.normalBuffer || g_graphicsConfig.gbuffer; }
 const TextureWithSampler& present_source() noexcept;
 wgpu::BindGroup create_copy_bind_group(const TextureWithSampler& source);
 void set_resampler(AuroraSampler sampler) noexcept;

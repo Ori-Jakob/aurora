@@ -3,6 +3,7 @@
 #include "gx_shader_corpus.hpp"
 
 #include "gfx/resources.hpp"
+#include "gfx/scene_targets.hpp"
 #include "gx/shader_info.hpp"
 
 #include <fmt/format.h>
@@ -833,6 +834,42 @@ TEST(GxShaderGoldenTest, DebugIdOutputNeedsTarget) {
   const std::string dual = build_shader_source(config, DstAlphaMode::DualSource, ShaderTargets{.debugId = 1});
   EXPECT_EQ(dual.find("debug_id"), std::string::npos);
   EXPECT_EQ(dual, build_shader_source(config, DstAlphaMode::DualSource));
+}
+
+TEST(GxShaderGoldenTest, GBufferLayoutDropsLegacyNormal) {
+  const gfx::SceneLayoutBase base{
+      .color = wgpu::TextureFormat::BGRA8Unorm,
+      .depth = wgpu::TextureFormat::Depth32Float,
+      .size = {64, 64, 1},
+      .samples = 1,
+  };
+  const gfx::RenderTargetLayout gbuffer = gfx::compose_scene_layout({.gbuffer = true}, base);
+  EXPECT_EQ(shader_targets(gbuffer).normal, UINT32_MAX);
+  EXPECT_EQ(shader_targets(gbuffer).debugId, UINT32_MAX);
+  EXPECT_EQ(shader_targets(gfx::compose_scene_layout({.normal = true, .gbuffer = true}, base)).normal, UINT32_MAX);
+  EXPECT_EQ(shader_targets(gfx::compose_scene_layout({.normal = true}, base)).normal, 1u);
+  const ShaderTargets ids = shader_targets(gfx::compose_scene_layout({.gbuffer = true, .debugId = true}, base));
+  EXPECT_EQ(ids.normal, UINT32_MAX);
+  EXPECT_EQ(ids.debugId, 5u);
+  const ShaderTargets legacyIds = shader_targets(gfx::compose_scene_layout({.normal = true, .debugId = true}, base));
+  EXPECT_EQ(legacyIds.normal, 1u);
+  EXPECT_EQ(legacyIds.debugId, 2u);
+
+  const ShaderTargets targets = shader_targets(gbuffer);
+  size_t compared = 0;
+  for (const Entry& entry : synthetic()) {
+    const ShaderConfig config = decode(entry.record);
+    if (config.ext != RenderExtConfig{}) {
+      continue;
+    }
+    const DstAlphaMode mode = decode_variant(entry.record).dstAlphaMode;
+    const std::string text = build_shader_source(config, mode, targets);
+    EXPECT_EQ(text, build_shader_source(config, mode, ShaderTargets{})) << entry.label;
+    EXPECT_EQ(text.find("in.mv_nrm"), std::string::npos) << entry.label;
+    ++compared;
+  }
+  EXPECT_GT(compared, 0u);
+  RecordProperty("compared", static_cast<int>(compared));
 }
 
 TEST(GxShaderGoldenTest, FixtureIsWellFormed) {

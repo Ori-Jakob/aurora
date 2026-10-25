@@ -46,6 +46,9 @@ TextureWithSampler g_frameBufferResolved;
 TextureWithSampler g_depthBuffer;
 TextureWithSampler g_normalBuffer;
 TextureWithSampler g_debugIdBuffer;
+TextureWithSampler g_motionBuffer;
+TextureWithSampler g_reactiveBuffer;
+TextureWithSampler g_fogRecordBuffer;
 
 // EFB -> XFB copy pipeline
 static wgpu::BindGroupLayout g_CopyBindGroupLayout;
@@ -572,42 +575,51 @@ static TextureWithSampler create_depth_texture(uint32_t width, uint32_t height) 
   };
 }
 
-static TextureWithSampler create_normal_texture(uint32_t width, uint32_t height) {
+static TextureWithSampler create_scene_target(const char* label, wgpu::TextureFormat format, uint32_t width,
+                                              uint32_t height) {
   const wgpu::Extent3D size{width, height, 1};
   const wgpu::TextureDescriptor desc{
-      .label = "Scene normals",
+      .label = label,
       .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc,
       .size = size,
-      .format = NormalBufferFormat,
-  };
-  auto texture = g_device.CreateTexture(&desc);
-  auto view = texture.CreateView();
-  return {.texture = std::move(texture), .view = std::move(view), .size = size, .format = NormalBufferFormat};
-}
-
-static TextureWithSampler create_debug_id_texture(uint32_t width, uint32_t height) {
-  const wgpu::Extent3D size{width, height, 1};
-  const wgpu::TextureDescriptor desc{
-      .label = "Scene debug ids",
-      .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::TextureBinding,
-      .size = size,
-      .format = DebugIdBufferFormat,
+      .format = format,
       .sampleCount = 1,
   };
   auto texture = g_device.CreateTexture(&desc);
   auto view = texture.CreateView();
-  return {.texture = std::move(texture), .view = std::move(view), .size = size, .format = DebugIdBufferFormat};
+  return {.texture = std::move(texture), .view = std::move(view), .size = size, .format = format};
+}
+
+static TextureWithSampler create_normal_texture(uint32_t width, uint32_t height) {
+  return create_scene_target("Scene normals", NormalBufferFormat, width, height);
+}
+
+static TextureWithSampler create_debug_id_texture(uint32_t width, uint32_t height) {
+  return create_scene_target("Scene debug ids", DebugIdBufferFormat, width, height);
+}
+
+static void create_gbuffer_targets(uint32_t width, uint32_t height) {
+  g_motionBuffer = create_scene_target("Scene motion", MotionBufferFormat, width, height);
+  g_reactiveBuffer = create_scene_target("Scene reactive", ReactiveBufferFormat, width, height);
+  g_fogRecordBuffer = create_scene_target("Scene fog records", FogRecordFormat, width, height);
+}
+
+bool scene_targets_supported() noexcept {
+  return g_hasCoreFeatures && g_graphicsConfig.msaaSamples == 1 && g_device && g_frameBuffer.size.width != 0 &&
+         g_frameBuffer.size.height != 0;
 }
 
 bool enable_normal_buffer() {
   if (g_graphicsConfig.normalBuffer) {
     return true;
   }
-  if (!g_hasCoreFeatures || g_graphicsConfig.msaaSamples != 1 || !g_device || g_frameBuffer.size.width == 0 ||
-      g_frameBuffer.size.height == 0) {
+  if (!scene_targets_supported()) {
     return false;
   }
-  g_normalBuffer = create_normal_texture(g_frameBuffer.size.width, g_frameBuffer.size.height);
+  // Under the G-buffer the texture already exists and the render worker may be reading it
+  if (!g_normalBuffer.texture) {
+    g_normalBuffer = create_normal_texture(g_frameBuffer.size.width, g_frameBuffer.size.height);
+  }
   g_graphicsConfig.normalBuffer = true;
   return true;
 }
@@ -616,8 +628,7 @@ bool set_debug_id_buffer(bool enabled) {
   if (g_graphicsConfig.debugIdBuffer == enabled) {
     return true;
   }
-  if (enabled && (!g_hasCoreFeatures || g_graphicsConfig.msaaSamples != 1 || !g_device ||
-                  g_frameBuffer.size.width == 0 || g_frameBuffer.size.height == 0)) {
+  if (enabled && !scene_targets_supported()) {
     return false;
   }
   // The render worker resolves gbuf.debug_id from this global, so it must be idle before the swap
@@ -625,6 +636,32 @@ bool set_debug_id_buffer(bool enabled) {
   g_debugIdBuffer =
       enabled ? create_debug_id_texture(g_frameBuffer.size.width, g_frameBuffer.size.height) : TextureWithSampler{};
   g_graphicsConfig.debugIdBuffer = enabled;
+  return true;
+}
+
+bool set_gbuffer(bool enabled) {
+  if (g_graphicsConfig.gbuffer == enabled) {
+    return true;
+  }
+  if (enabled && !scene_targets_supported()) {
+    return false;
+  }
+  // The render worker resolves these globals, so it must be idle before the swap
+  gfx::gpu_synchronize();
+  if (enabled) {
+    create_gbuffer_targets(g_frameBuffer.size.width, g_frameBuffer.size.height);
+    if (!g_normalBuffer.texture) {
+      g_normalBuffer = create_normal_texture(g_frameBuffer.size.width, g_frameBuffer.size.height);
+    }
+  } else {
+    g_motionBuffer = {};
+    g_reactiveBuffer = {};
+    g_fogRecordBuffer = {};
+    if (!g_graphicsConfig.normalBuffer) {
+      g_normalBuffer = {};
+    }
+  }
+  g_graphicsConfig.gbuffer = enabled;
   return true;
 }
 
@@ -1278,6 +1315,10 @@ void shutdown() {
   g_graphicsConfig.normalBuffer = false;
   g_debugIdBuffer = {};
   g_graphicsConfig.debugIdBuffer = false;
+  g_motionBuffer = {};
+  g_reactiveBuffer = {};
+  g_fogRecordBuffer = {};
+  g_graphicsConfig.gbuffer = false;
   g_queue = {};
   g_surface = {};
   g_device = {};
@@ -1317,8 +1358,11 @@ static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t 
   g_frameBuffer = create_render_texture(width, height, true);
   g_frameBufferResolved = create_render_texture(width, height, false);
   g_depthBuffer = create_depth_texture(width, height);
-  if (g_graphicsConfig.normalBuffer) {
+  if (normal_present()) {
     g_normalBuffer = create_normal_texture(width, height);
+  }
+  if (g_graphicsConfig.gbuffer) {
+    create_gbuffer_targets(width, height);
   }
   if (g_graphicsConfig.debugIdBuffer) {
     g_debugIdBuffer = create_debug_id_texture(width, height);

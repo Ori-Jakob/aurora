@@ -7,6 +7,8 @@ add_library(aurora_gx STATIC
         lib/gfx/recording.cpp
         lib/gfx/render_worker.cpp
         lib/gfx/resource_cache.cpp
+        lib/gfx/scene_targets.cpp
+        lib/gfx/scene_targets.hpp
         lib/gfx/dds_io.cpp
         lib/gfx/tex_copy_conv.cpp
         lib/gfx/tex_palette_conv.cpp

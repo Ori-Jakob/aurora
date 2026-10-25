@@ -12,6 +12,7 @@ inline constexpr uint32_t PbrTierColorBytes = 44;
 inline constexpr uint64_t HighVramBytes = 6ull << 30;
 
 enum class Tier : uint8_t { None, Base, Pbr };
+enum class ForceMode : uint8_t { Unset, On, Off };
 
 struct FeatureInfo {
   std::string_view name;
@@ -33,6 +34,8 @@ const BuiltOptions& default_built_options() noexcept;
 uint8_t requested_option(const Settings& settings, Feature feature) noexcept;
 bool sun_shadows(const Settings& settings) noexcept;
 Tier device_tier(const Caps& caps, uint32_t msaaSamples) noexcept;
+bool gbuffer_wanted(const Settings& settings, const Caps& caps, uint32_t msaaSamples, bool moduleEnabled,
+                    ForceMode forced) noexcept;
 FeatureSupport evaluate_support(Feature feature, uint8_t option, const Settings& context,
                                 const SupportEnv& env) noexcept;
 Settings sanitize_settings(const Settings& requested) noexcept;

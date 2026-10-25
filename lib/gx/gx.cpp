@@ -344,17 +344,16 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
   };
   const auto blendState = to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp,
                                          config.dstAlpha, options.dstAlphaMode == DstAlphaMode::DualSource);
+  const ShaderTargets targets = shader_targets(layout);
   std::array<wgpu::ColorTargetState, gfx::MaxColorAttachments> colorTargets{};
   for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
-    const gfx::ColorAttachmentSemantic semantic = layout.colorAttachments[i].semantic;
-    const bool writes = semantic == gfx::ColorAttachmentSemantic::DebugId
-                            ? options.colorUpdate
-                            : semantic == gfx::ColorAttachmentSemantic::Normal && writesDepth;
+    const bool writes = i == targets.debugId ? options.colorUpdate : i == targets.normal && writesDepth;
     colorTargets[i] = {
         .format = layout.colorAttachments[i].format,
         .writeMask = writes ? wgpu::ColorWriteMask::All : wgpu::ColorWriteMask::None,
     };
   }
+  // Integer targets such as the fog record can never blend
   colorTargets[gfx::SceneColorAttachmentIndex].blend = &blendState;
   colorTargets[gfx::SceneColorAttachmentIndex].writeMask = to_write_mask(options.colorUpdate, options.alphaUpdate);
   const wgpu::FragmentState fragmentState{

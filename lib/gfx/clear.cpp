@@ -1,6 +1,7 @@
 #include "clear.hpp"
 
 #include "encoding.hpp"
+#include "scene_targets.hpp"
 #include "../webgpu/gpu.hpp"
 #include "tracy/Tracy.hpp"
 
@@ -19,6 +20,12 @@ wgpu::ColorWriteMask clear_write_mask(bool clearColor, bool clearAlpha) {
   return writeMask;
 }
 
+bool clears_target(const PipelineConfig& config, ColorAttachmentSemantic semantic) {
+  return (config.clearDepth && clears_with_depth(semantic)) || (config.clearColor && clears_with_color(semantic));
+}
+} // namespace
+
+namespace detail {
 std::string shader_source(const PipelineConfig& config, const RenderTargetLayout& layout) {
   std::string source{R"""(
 struct VertexOutput {
@@ -46,9 +53,19 @@ fn vs_main(@builtin(vertex_index) vtxIdx: u32) -> VertexOutput {
     values += "    out.color = vec4f(1.0);\n";
   }
   for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
-    if (config.clearDepth && layout.colorAttachments[i].semantic == ColorAttachmentSemantic::Normal) {
+    const ColorAttachmentSemantic semantic = layout.colorAttachments[i].semantic;
+    if (!clears_target(config, semantic)) {
+      continue;
+    }
+    if (semantic == ColorAttachmentSemantic::Normal) {
       outputs += fmt::format("    @location({0}) normal{0}: vec4f,\n", i);
       values += fmt::format("    out.normal{} = vec4f(0.0);\n", i);
+    } else if (semantic == ColorAttachmentSemantic::Fog) {
+      outputs += fmt::format("    @location({0}) t{0}: vec4u,\n", i);
+      values += fmt::format("    out.t{} = vec4u(0u);\n", i);
+    } else {
+      outputs += fmt::format("    @location({0}) t{0}: vec4f,\n", i);
+      values += fmt::format("    out.t{} = vec4f(0.0);\n", i);
     }
   }
   if (!outputs.empty()) {
@@ -71,11 +88,11 @@ fn fs_main() {
   }
   return source;
 }
-} // namespace
+} // namespace detail
 
 wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const RenderTargetLayout& layout) {
   ZoneScoped;
-  const auto source = shader_source(config, layout);
+  const auto source = detail::shader_source(config, layout);
   wgpu::ShaderSourceWGSL sourceDescriptor{};
   sourceDescriptor.code = source.c_str();
   const wgpu::ShaderModuleDescriptor moduleDescriptor{
@@ -106,9 +123,8 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const RenderT
   for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
     colorTargets[i] = {
         .format = layout.colorAttachments[i].format,
-        .writeMask = config.clearDepth && layout.colorAttachments[i].semantic == ColorAttachmentSemantic::Normal
-                         ? wgpu::ColorWriteMask::All
-                         : wgpu::ColorWriteMask::None,
+        .writeMask = clears_target(config, layout.colorAttachments[i].semantic) ? wgpu::ColorWriteMask::All
+                                                                                : wgpu::ColorWriteMask::None,
     };
   }
   colorTargets[SceneColorAttachmentIndex].blend = &blendState;

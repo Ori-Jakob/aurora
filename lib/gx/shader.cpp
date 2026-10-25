@@ -1,4 +1,5 @@
 #include "../gfx/hash.hpp"
+#include "../gfx/scene_targets.hpp"
 #include "../gfx/types.hpp"
 
 #include "../internal.hpp"
@@ -2042,9 +2043,7 @@ fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
   return shaderSource;
 }
 
-wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout,
-                                DstAlphaMode dstAlphaMode) noexcept {
-  ZoneScoped;
+ShaderTargets shader_targets(const gfx::RenderTargetLayout& layout) noexcept {
   ShaderTargets targets;
   for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
     if (layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::Normal) {
@@ -2053,6 +2052,16 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTar
       targets.debugId = i;
     }
   }
+  if (gfx::layout_has_gbuffer(layout)) {
+    targets.normal = UINT32_MAX;
+  }
+  return targets;
+}
+
+wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout,
+                                DstAlphaMode dstAlphaMode) noexcept {
+  ZoneScoped;
+  const ShaderTargets targets = shader_targets(layout);
   const auto shaderSource = build_shader_source(config, dstAlphaMode, targets);
   auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(targets.normal, xxh3_hash(config)));
   if (targets.debugId != UINT32_MAX) {
