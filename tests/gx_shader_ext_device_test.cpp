@@ -919,5 +919,92 @@ TEST_F(GxShaderExtDevice, GbufferMarkerPipelinesCompileOnBackend) {
   EXPECT_EQ(gbuffer_pipeline_failures(), failures);
   RecordProperty("compiled", static_cast<int>(compiled));
 }
+
+constexpr size_t MinFogConfigs = 22;
+constexpr std::array<u8, 11> FogTypes{
+    GX_FOG_NONE,         GX_FOG_PERSP_LIN,     GX_FOG_PERSP_EXP,     GX_FOG_PERSP_EXP2,
+    GX_FOG_PERSP_REVEXP, GX_FOG_PERSP_REVEXP2, GX_FOG_ORTHO_LIN,     GX_FOG_ORTHO_EXP,
+    GX_FOG_ORTHO_EXP2,   GX_FOG_ORTHO_REVEXP,  GX_FOG_ORTHO_REVEXP2,
+};
+
+// The corpus drops fog-family records that an earlier family already holds, so the family is rebuilt on its base
+std::vector<ShaderConfig> fog_family_configs() {
+  const std::vector<corpus::Entry> entries = corpus::generate_synthetic();
+  const auto first =
+      std::ranges::find_if(entries, [](const corpus::Entry& entry) { return entry.label.starts_with("fog/"); });
+  if (first == entries.end()) {
+    return {};
+  }
+  std::vector<ShaderConfig> configs;
+  for (const u8 type : FogTypes) {
+    for (const bool range : {false, true}) {
+      ShaderConfig config = corpus::decode(first->record);
+      config.ext = {};
+      config.fogType = type;
+      config.fogRangeEnabled = range;
+      configs.push_back(config);
+    }
+  }
+  return configs;
+}
+
+TEST_F(GxShaderExtDevice, FogRecordValidatesWhereLegacyValidates) {
+  const std::vector<ShaderConfig> configs = fog_family_configs();
+  ASSERT_GE(configs.size(), MinFogConfigs);
+  const ShaderTargets gbuffer = shader_targets(gbuffer_layout());
+  ASSERT_NE(gbuffer.fog, UINT32_MAX);
+  for (const bool core : {true, false}) {
+    ASSERT_TRUE(start({.backend = wgpu::BackendType::Null, .core = core}, false)) << "core " << core;
+    size_t validated = 0;
+    for (const ShaderConfig& config : configs) {
+      const auto legacyError = module_error(*m_device, build_shader_source(config, DstAlphaMode::None));
+      EXPECT_FALSE(legacyError.has_value()) << "core " << core << ": " << legacyError.value_or("");
+      for (const ShaderTargets& targets : {ShaderTargets{.fog = 1}, gbuffer}) {
+        const std::string text = build_shader_source(with_output(config, 1), DstAlphaMode::None, targets);
+        ASSERT_NE(text.find("out.fog ="), std::string::npos);
+        const auto error = module_error(*m_device, text);
+        EXPECT_FALSE(error.has_value()) << "core " << core << " fog " << int{config.fogType} << ": "
+                                        << error.value_or("") << "\n"
+                                        << text;
+      }
+      ++validated;
+    }
+    EXPECT_GE(validated, MinFogConfigs) << "core " << core;
+    EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
+    m_device.reset();
+  }
+  RecordProperty("configs", static_cast<int>(configs.size()));
+}
+
+TEST_F(GxShaderExtDevice, FogTargetPipelinesCreate) {
+  ASSERT_TRUE(start({.backend = wgpu::BackendType::Null, .core = true}, true));
+  gfx::set_blocking_pipelines(true);
+  const gfx::RenderTargetLayout layout = gbuffer_layout();
+  ASSERT_NE(shader_targets(layout).fog, UINT32_MAX);
+  const std::vector<ShaderConfig> configs = legacy_valid_configs(*m_device);
+  const auto found = std::ranges::find_if(
+      configs, [](const ShaderConfig& config) { return !build_shader_info(config).lightingEnabled; });
+  ASSERT_NE(found, configs.end());
+  ShaderConfig unlit = *found;
+  unlit.fogType = GX_FOG_PERSP_EXP;
+  const uint64_t failures = gbuffer_pipeline_failures();
+  for (const u8 output : {u8{0}, u8{1}}) {
+    const PipelineConfig opaque = pipeline_for(with_output(unlit, output));
+    PipelineConfig logic = opaque;
+    logic.blendMode = GX_BM_LOGIC;
+    logic.blendOp = GX_LO_COPY;
+    PipelineConfig prepass = blended(opaque);
+    prepass.dstAlpha = 0x80;
+    for (const PipelineConfig& variant : {opaque, blended(opaque), logic}) {
+      EXPECT_TRUE(static_cast<bool>(create_pipeline(variant, layout).main)) << "output " << int{output};
+      EXPECT_EQ(writes_fog_record(variant, {.colorUpdate = variant.colorUpdate}),
+                output != 0 && effectively_opaque(variant));
+    }
+    const gfx::CompiledPipeline split = create_pipeline(prepass, layout);
+    EXPECT_TRUE(split.main && split.prepass) << "output " << int{output};
+  }
+  EXPECT_EQ(gbuffer_pipeline_failures(), failures);
+  EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
+}
 } // namespace
 } // namespace aurora::gx

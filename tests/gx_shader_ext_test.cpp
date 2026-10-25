@@ -722,5 +722,122 @@ TEST_F(GxShaderExtTest, GbufferLitDrawCarriesNormalVarying) {
   EXPECT_EQ(varying_count(marker, legacy), varying_count(lit, legacy));
   EXPECT_EQ(location_count(build_shader_source(marker, DstAlphaMode::None, legacy)), varying_count(marker, legacy));
 }
+
+constexpr std::array<u8, 11> FogTypes{
+    GX_FOG_NONE,         GX_FOG_PERSP_LIN,     GX_FOG_PERSP_EXP,     GX_FOG_PERSP_EXP2,
+    GX_FOG_PERSP_REVEXP, GX_FOG_PERSP_REVEXP2, GX_FOG_ORTHO_LIN,     GX_FOG_ORTHO_EXP,
+    GX_FOG_ORTHO_EXP2,   GX_FOG_ORTHO_REVEXP,  GX_FOG_ORTHO_REVEXP2,
+};
+
+ShaderConfig fogged(u8 type) {
+  ShaderConfig config = single_site();
+  config.fogType = type;
+  return config;
+}
+
+TEST_F(GxShaderExtTest, FogRecordNeedsTargetAndOutput) {
+  for (const u8 output : {u8{0}, u8{1}}) {
+    const ShaderConfig config = with_output(fogged(GX_FOG_PERSP_LIN), output);
+    for (const auto mode : {DstAlphaMode::None, DstAlphaMode::Replace}) {
+      EXPECT_EQ(build_shader_source(config, mode).find("fog: vec4u"), std::string::npos);
+      EXPECT_EQ(build_shader_source(config, mode, 1u).find("fog: vec4u"), std::string::npos);
+      EXPECT_EQ(build_shader_source(config, mode).find("out.fog"), std::string::npos);
+    }
+  }
+  const ShaderConfig plain = fogged(GX_FOG_PERSP_LIN);
+  EXPECT_EQ(build_shader_source(plain, DstAlphaMode::None, ShaderTargets{.normal = 1, .fog = 4}),
+            build_shader_source(plain, DstAlphaMode::None, ShaderTargets{.normal = 1}));
+  EXPECT_EQ(build_shader_source(plain, DstAlphaMode::None, GbufferTargets),
+            build_shader_source(plain, DstAlphaMode::None,
+                                ShaderTargets{.motion = 2, .reactive = 3, .gbufferNormal = 1, .fog = 4}));
+
+  const ShaderConfig marker = with_output(plain, 1);
+  const std::string text = build_shader_source(marker, DstAlphaMode::None, ShaderTargets{.normal = 1, .fog = 4});
+  EXPECT_EQ(count(fragment_output(text), "@location(4) fog: vec4u,"), 1u);
+  EXPECT_EQ(count(text, "out.fog ="), 1u);
+  EXPECT_EQ(location_count(text), location_count(build_shader_source(marker, DstAlphaMode::None, 1u)));
+
+  const std::string only = build_shader_source(marker, DstAlphaMode::None, ShaderTargets{.fog = 1});
+  EXPECT_EQ(fragment_output(only),
+            "struct FragmentOutput {\n    @location(0) color: vec4f,\n    @location(1) fog: vec4u,\n");
+
+  const std::string ids =
+      build_shader_source(marker, DstAlphaMode::None, ShaderTargets{.normal = 1, .debugId = 5, .fog = 4});
+  EXPECT_LT(fragment_output(ids).find("normal: vec4f"), fragment_output(ids).find("fog: vec4u"));
+  EXPECT_LT(fragment_output(ids).find("fog: vec4u"), fragment_output(ids).find("debug_id: u32"));
+  EXPECT_LT(ids.find("out.fog ="), ids.rfind("return out;"));
+}
+
+TEST_F(GxShaderExtTest, FogRecordLockFollowsType) {
+  constexpr std::string_view Mix = "prev = vec4f(mix(prev.rgb, ubuf.fog.color.rgb, clamp(fogZ, 0.0, 1.0)), prev.a);";
+  constexpr std::string_view Record =
+      "out.fog = vec4u(vec3u(round(ubuf.fog.color.rgb * 255.0)), "
+      "(min(u32(round(clamp(fogZ, 0.0, 1.0) * 127.0)), 127u) << 1u) | ";
+  for (const u8 type : FogTypes) {
+    const std::string text =
+        build_shader_source(with_output(fogged(type), 1), DstAlphaMode::None, ShaderTargets{.fog = 1});
+    EXPECT_EQ(count(text, "out.fog ="), 1u) << int{type};
+    if (type == GX_FOG_NONE) {
+      EXPECT_NE(text.find("out.fog = vec4u(0u);"), std::string::npos);
+      EXPECT_EQ(text.find(Record), std::string::npos);
+      continue;
+    }
+    const std::string lock = type == GX_FOG_PERSP_LIN ? "0u);" : "1u);";
+    EXPECT_NE(text.find(std::string{Record} + lock), std::string::npos) << int{type};
+    ASSERT_NE(text.find(Mix), std::string::npos) << int{type};
+    EXPECT_LT(text.find(Mix), text.find("out.fog =")) << int{type};
+  }
+}
+
+TEST_F(GxShaderExtTest, FogRecordPredicate) {
+  struct Blend {
+    GXBlendMode mode;
+    GXBlendFactor src;
+    GXBlendFactor dst;
+    GXLogicOp op;
+    bool opaque;
+  };
+  constexpr std::array<Blend, 7> Blends{{
+      {GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR, true},
+      {GX_BM_BLEND, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR, true},
+      {GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR, false},
+      {GX_BM_LOGIC, GX_BL_ONE, GX_BL_ZERO, GX_LO_COPY, true},
+      {GX_BM_LOGIC, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR, false},
+      {GX_BM_LOGIC, GX_BL_ONE, GX_BL_ZERO, GX_LO_NOOP, false},
+      {GX_BM_SUBTRACT, GX_BL_ONE, GX_BL_ONE, GX_LO_CLEAR, false},
+  }};
+  for (const u8 output : {u8{0}, u8{1}, u8{2}}) {
+    for (const bool colorUpdate : {false, true}) {
+      for (const Blend& blend : Blends) {
+        PipelineConfig config{};
+        config.shaderConfig.ext.output = output;
+        config.blendMode = blend.mode;
+        config.blendFacSrc = blend.src;
+        config.blendFacDst = blend.dst;
+        config.blendOp = blend.op;
+        config.colorUpdate = colorUpdate;
+        const PipelineOptions options{.colorUpdate = colorUpdate};
+        EXPECT_EQ(writes_fog_record(config, options), output != 0 && colorUpdate && blend.opaque)
+            << int{output} << " " << colorUpdate << " " << int{blend.mode} << " " << int{blend.op};
+      }
+    }
+  }
+
+  const auto populated = [](GXPixelFmt format, GXBlendFactor src, GXBlendFactor dst) {
+    g_gxState = {};
+    g_gxState.pixelFmt = format;
+    g_gxState.blendMode = GX_BM_BLEND;
+    g_gxState.blendFacSrc = src;
+    g_gxState.blendFacDst = dst;
+    g_gxState.colorUpdate = true;
+    PipelineConfig config{};
+    populate_pipeline_config(config, GX_TRIANGLES, GX_VTXFMT0);
+    config.shaderConfig.ext.output = 1;
+    return writes_fog_record(config, PipelineOptions{.colorUpdate = config.colorUpdate});
+  };
+  EXPECT_TRUE(populated(GX_PF_RGB8_Z24, GX_BL_DSTALPHA, GX_BL_INVDSTALPHA));
+  EXPECT_FALSE(populated(GX_PF_RGBA6_Z24, GX_BL_DSTALPHA, GX_BL_INVDSTALPHA));
+  EXPECT_FALSE(populated(GX_PF_RGB8_Z24, GX_BL_INVDSTALPHA, GX_BL_DSTALPHA));
+}
 } // namespace
 } // namespace aurora::gx

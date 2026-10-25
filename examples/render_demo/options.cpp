@@ -29,6 +29,7 @@ constexpr std::array<std::pair<std::string_view, AuroraFeatureProfile>, 4> Profi
 
 constexpr uint32_t DepthCheckMinFrames = 40;
 constexpr uint32_t MotionCheckMinFrames = 40;
+constexpr uint32_t FogCheckMinFrames = 40;
 constexpr uint32_t MaxGpuPadMiB = 1024;
 
 std::optional<uint32_t> parse_u32(std::string_view text) noexcept {
@@ -179,6 +180,11 @@ bool apply_motion_view(Options& options, std::string_view) {
   return true;
 }
 
+bool apply_fog_check(Options& options, std::string_view) {
+  options.fogCheck = true;
+  return true;
+}
+
 bool apply_no_hints(Options& options, std::string_view) {
   options.hints = false;
   return true;
@@ -269,7 +275,7 @@ struct Flag {
   bool frameLoop = false;
 };
 
-constexpr std::array<Flag, 30> Flags{{
+constexpr std::array<Flag, 31> Flags{{
     {"--frames", true, apply_frames, true},
     {"--timeout", true, apply_timeout, true},
     {"--backend", true, apply_backend},
@@ -287,6 +293,7 @@ constexpr std::array<Flag, 30> Flags{{
     {"--depth-check", false, apply_depth_check, true},
     {"--motion-check", false, apply_motion_check, true},
     {"--motion-view", false, apply_motion_view, true},
+    {"--fog-check", false, apply_fog_check, true},
     {"--no-hints", false, apply_no_hints, true},
     {"--check-hints", false, apply_check_hints, true},
     {"--custom-draw-probe", false, apply_custom_draw_probe, true},
@@ -386,7 +393,8 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
     return std::nullopt;
   }
   // Graph passes and custom draws record GPU work outside the GX FIFO, so the capture would be discarded
-  if ((options.vignette || options.depthCheck || options.motionCheck || options.motionView || options.gpuCull != 0) &&
+  if ((options.vignette || options.depthCheck || options.motionCheck || options.motionView || options.fogCheck ||
+       options.gpuCull != 0) &&
       !options.tracePath.empty()) {
     error = "render graph passes cannot be traced";
     return std::nullopt;
@@ -402,6 +410,15 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
   }
   if (options.motionCheck && options.frames != 0 && options.frames < MotionCheckMinFrames) {
     error = "--motion-check needs at least 40 frames";
+    return std::nullopt;
+  }
+  // The bands are judged per GX draw against OPAQUE_DONE's records, which only hinted single-sample frames produce
+  if (options.fogCheck && (!options.hints || options.customDrawProbe || options.msaa > 1)) {
+    error = "--fog-check cannot be combined with --no-hints, --custom-draw-probe or --msaa above 1";
+    return std::nullopt;
+  }
+  if (options.fogCheck && options.frames != 0 && options.frames < FogCheckMinFrames) {
+    error = "--fog-check needs at least 40 frames";
     return std::nullopt;
   }
   if ((options.cullCheck || options.cullTimings) && options.gpuCull == 0) {
@@ -443,6 +460,8 @@ std::string_view usage() noexcept {
          "  --motion-check      register demo.motion_probe and exit with code 11 unless gbuf.motion and\n"
          "                      gbuf.reactive match the scene's own motion (needs at least 40 frames)\n"
          "  --motion-view       show gbuf.motion in the scene colour before the HUD\n"
+         "  --fog-check         draw two GX fog bands, register demo.fog_check and exit with code 12 unless\n"
+         "                      gbuf.fog holds their exact records at OPAQUE_DONE (needs at least 40 frames)\n"
          "  --no-hints          emit no render hints and no capture-only draw\n"
          "  --check-hints       exit with code 8 unless aurora decoded or skipped every emitted hint as expected\n"
          "  --custom-draw-probe record a custom draw that leaves foreign bindings behind between GX draws\n"

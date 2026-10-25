@@ -21,6 +21,12 @@ constexpr GXColor AmbientColor{40, 44, 56, 255};
 constexpr GXColor White{255, 255, 255, 255};
 constexpr GXColor HudColor{20, 24, 32, 160};
 constexpr FogParams Fog{GX_FOG_PERSP_LIN, 40.f, 160.f, 0.5f, 400.f, ClearColor};
+constexpr GXColor BandColor{200, 120, 60, 255};
+// The default fog stops near f = 0.23 here; these bands cover f up to the clamp and put lock 1 on real pipelines
+constexpr std::array<FogParams, 2> FogBands{{
+    {GX_FOG_PERSP_LIN, 10.f, 60.f, 0.5f, 400.f, ClearColor},
+    {GX_FOG_PERSP_EXP, 10.f, 60.f, 0.5f, 400.f, BandColor},
+}};
 constexpr f32 PointRefDistance = 10.f;
 constexpr f32 PointRefBrightness = 0.5f;
 constexpr f32 SpotCutoff = 25.f;
@@ -105,6 +111,8 @@ void load_matrices(const Mtx modelView, u32 id) {
   GXLoadPosMtxImm(modelView, id);
   GXLoadNrmMtxImm(normal, id);
 }
+
+void set_fog(const FogParams& fog) { GXSetFog(fog.type, fog.start, fog.end, fog.nearZ, fog.farZ, fog.color); }
 
 void set_box_format() {
   GXClearVtxDesc();
@@ -661,6 +669,8 @@ std::optional<std::array<f32, 2>> motion_probe_expected(MotionProbe probe, u32 f
   }
 }
 
+const std::array<FogParams, 2>& fog_bands() noexcept { return FogBands; }
+
 void draw_scene(u32 frame, const SceneOptions& options) {
   // Not gated on hints_enabled() so the off capture proves emitters add only hint bytes; real producers do gate on it
   set_hint_emission(options.hints);
@@ -677,16 +687,22 @@ void draw_scene(u32 frame, const SceneOptions& options) {
   const Point3d& eye = camera.eye;
   const Point3d& target = camera.target;
 
-  GXSetFog(Fog.type, Fog.start, Fog.end, Fog.nearZ, Fog.farZ, Fog.color);
+  set_fog(Fog);
   const Lights lights = setup_lights(view, t);
   // Every frame-level hint goes out before SCENE_BEGIN, where aurora freezes the frame's values
   emit_frame_hints(frame, view, projection, lights);
   hint_stage(AURORA_STAGE_SCENE_BEGIN);
 
+  if (options.fogBands) {
+    set_fog(FogBands[0]);
+  }
   begin_object(GroundObject, AURORA_CAT_STATIC | AURORA_CAT_TERRAIN, AURORA_OBJ_IMMOBILE);
   hint_material(GroundMaterial);
   draw_ground(view);
   end_object();
+  if (options.fogBands) {
+    set_fog(FogBands[1]);
+  }
   if (options.customDrawProbe != aurora::gfx::InvalidDrawType) {
     aurora::gfx::push_custom_draw(options.customDrawProbe, nullptr, 0);
   }

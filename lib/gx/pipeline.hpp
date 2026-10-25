@@ -66,6 +66,10 @@ struct PipelineOptions {
   bool alphaUpdate = false;
   bool depthUpdate = false;
 };
+// The record belongs to the last draw that replaced RGB, so blended writes keep the record below them
+constexpr bool writes_fog_record(const PipelineConfig& c, const PipelineOptions& o) noexcept {
+  return c.shaderConfig.ext.output != 0 && o.colorUpdate && effectively_opaque(c);
+}
 
 gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout);
 uint64_t gbuffer_pipeline_failures() noexcept;

@@ -4,6 +4,7 @@
 #include "gx/draw_route.hpp"
 #include "gx/gx.hpp"
 #include "gx/hints.hpp"
+#include "gx/pipeline.hpp"
 #include "gx/render_ext.hpp"
 #include "gx/texture.hpp"
 #include "render/frame_state.hpp"
@@ -638,6 +639,43 @@ TEST_F(RenderGxExt, OutputMarksInWindowWritersOnly) {
   EXPECT_EQ(output_for(colorOnly, true), 1u);
   EXPECT_EQ(output_for(noTest, true), 0u);
   EXPECT_EQ(output_for(both, false), 0u);
+}
+
+TEST_F(RenderGxExt, FogLayoutMarksInWindowOpaqueWriters) {
+  const ScopedTargets targets;
+  const ScopedHints hints;
+  webgpu::g_graphicsConfig.gbuffer = true;
+  apply_frame_state(frame(false, false));
+  const gfx::RenderTargetLayout gbuffer = scene_layout(true);
+  const gfx::RenderTargetLayout legacy = scene_layout(false);
+  ASSERT_NE(gx::shader_targets(gbuffer).fog, UINT32_MAX);
+  ASSERT_EQ(gx::shader_targets(legacy).fog, UINT32_MAX);
+  gx::PipelineConfig colorOnly = writer(false, true);
+  colorOnly.blendMode = GX_BM_NONE;
+  const gx::PipelineOptions options{.colorUpdate = true};
+  const auto marked = [&](const gfx::RenderTargetLayout& layout) {
+    gx::PipelineConfig config = colorOnly;
+    config.shaderConfig.ext.output = derived_output(colorOnly, layout);
+    return config;
+  };
+
+  records::on_route(draw_class());
+  ASSERT_EQ(gx::render_ext::g_drawInputs, records::InWindow);
+  const gx::PipelineConfig inWindow = marked(gbuffer);
+  EXPECT_GE(inWindow.shaderConfig.ext.output, 1u);
+  EXPECT_TRUE(gx::writes_fog_record(inWindow, options));
+  EXPECT_EQ(marked(legacy).shaderConfig.ext.output, 0u);
+  EXPECT_FALSE(gx::writes_fog_record(marked(legacy), options));
+
+  scene::DrawClass offscreen = draw_class();
+  offscreen.offscreen = true;
+  for (const scene::DrawClass& cls : {draw_class(scene::Window::PreScene), draw_class(scene::Window::Translucent),
+                                      draw_class(scene::Window::Post), offscreen}) {
+    records::on_route(cls);
+    const gx::PipelineConfig config = marked(gbuffer);
+    EXPECT_EQ(config.shaderConfig.ext.output, 0u) << static_cast<int>(cls.key.window);
+    EXPECT_FALSE(gx::writes_fog_record(config, options)) << static_cast<int>(cls.key.window);
+  }
 }
 
 TEST_F(RenderGxExt, HooksInstalledForGbufferWithoutStochastic) {

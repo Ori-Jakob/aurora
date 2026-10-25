@@ -846,7 +846,8 @@ absl::flat_hash_set<gfx::ShaderRef> s_seenShaders;
 
 HashType shader_hash(const ShaderConfig& config, DstAlphaMode dstAlphaMode, const ShaderTargets& targets) noexcept {
   auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(targets.normal, xxh3_hash(config)));
-  for (const uint32_t target : {targets.debugId, targets.motion, targets.reactive, targets.gbufferNormal}) {
+  for (const uint32_t target :
+       {targets.debugId, targets.motion, targets.reactive, targets.gbufferNormal, targets.fog}) {
     if (target != UINT32_MAX) {
       hash = xxh3_hash(target, hash);
     }
@@ -1731,6 +1732,15 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     members.push_back({targets.reactive, fmt::format("    @location({}) reactive: vec4f,\n", targets.reactive),
                        "\n    out.reactive = vec4f(saturate(prev.a));"s});
   }
+  if (targets.fog != UINT32_MAX && config.ext.output != 0) {
+    const u32 lock = config.fogType != GX_FOG_PERSP_LIN ? 1 : 0;
+    members.push_back({targets.fog, fmt::format("    @location({}) fog: vec4u,\n", targets.fog),
+                       info.usesFog
+                           ? fmt::format("\n    out.fog = vec4u(vec3u(round(ubuf.fog.color.rgb * 255.0)), "
+                                         "(min(u32(round(clamp(fogZ, 0.0, 1.0) * 127.0)), 127u) << 1u) | {}u);",
+                                         lock)
+                           : "\n    out.fog = vec4u(0u);"s});
+  }
   if (!members.empty()) {
     std::ranges::stable_sort(members, {}, &OutputMember::location);
     fragmentOutput = "\nstruct FragmentOutput {\n    @location(0) color: vec4f,\n";
@@ -2146,6 +2156,8 @@ ShaderTargets shader_targets(const gfx::RenderTargetLayout& layout) noexcept {
       targets.motion = i;
     } else if (layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::Reactive) {
       targets.reactive = i;
+    } else if (layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::Fog) {
+      targets.fog = i;
     }
   }
   if (gfx::layout_has_gbuffer(layout)) {

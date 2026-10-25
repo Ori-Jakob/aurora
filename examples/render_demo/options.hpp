@@ -29,6 +29,7 @@ struct Options {
   bool depthCheck = false;
   bool motionCheck = false;
   bool motionView = false;
+  bool fogCheck = false;
   bool hints = true;
   bool checkHints = false;
   bool customDrawProbe = false;

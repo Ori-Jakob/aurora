@@ -19,6 +19,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -48,6 +49,7 @@ enum ExitCode : int {
   ExitCullCheck = 9,
   ExitBench = 10,
   ExitMotionCheck = 11,
+  ExitFogCheck = 12,
 };
 
 std::atomic_uint32_t g_errorCount = 0;
@@ -162,6 +164,46 @@ std::optional<std::string> motion_check_failure(const render_demo::GraphPassRepo
   if (groundReactive != 0.f || !(waterReactive > 0.f)) {
     std::snprintf(text, sizeof(text), "reactive reads %.6g on the ground and %.6g on the water", groundReactive,
                   waterReactive);
+    return std::string{text};
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> fog_check_failure(const render_demo::GraphPassReport& report, bool nullBackend) {
+  using namespace render_demo;
+  // The null backend runs no shaders, so its values say nothing
+  if (nullBackend) {
+    return std::nullopt;
+  }
+  if (report.fogEncodes == 0) {
+    return std::string{"gbuf.fog or gx.depth unavailable"};
+  }
+  if (!report.fogReady) {
+    return std::string{"check readback did not complete"};
+  }
+  const auto& w = report.fog;
+  if (w[FogWritten] != 1) {
+    return std::string{"check shader did not run"};
+  }
+  const double pixels = static_cast<double>(w[FogWidth]) * w[FogHeight];
+  const double geometry = w[FogGeometry];
+  char text[160];
+  if (w[FogRgbMismatch] != 0 || w[FogQMismatch] != 0 || w[FogSkyNonZero] != 0) {
+    std::snprintf(text, sizeof(text), "%u colour and %u q mismatches, %u records on sky pixels", w[FogRgbMismatch],
+                  w[FogQMismatch], w[FogSkyNonZero]);
+    return std::string{text};
+  }
+  if (geometry == 0.0 || (geometry - w[FogZeroOnGeometry]) / geometry < 0.99) {
+    std::snprintf(text, sizeof(text), "%u of %u geometry pixels have no record", w[FogZeroOnGeometry], w[FogGeometry]);
+    return std::string{text};
+  }
+  if (w[FogBand0] < 0.05 * pixels || w[FogBand1] < 0.002 * pixels) {
+    std::snprintf(text, sizeof(text), "band coverage %u and %u of %.0f pixels", w[FogBand0], w[FogBand1], pixels);
+    return std::string{text};
+  }
+  const u32 minQ = 127 - w[FogBand0QMinInv];
+  if (minQ > 15 || w[FogBand0QMax] != 127) {
+    std::snprintf(text, sizeof(text), "band 0 q spans %u-%u, not 15 or less to 127", minQ, w[FogBand0QMax]);
     return std::string{text};
   }
   return std::nullopt;
@@ -564,7 +606,8 @@ int main(int argc, char* argv[]) {
                                          .captureOnlyBox = options.hints && decoding,
                                          .customDrawProbe = g_customDrawProbe.type,
                                          .gpuArrays = options.gpuArrays,
-                                         .gpuPadMiB = options.gpuPadMiB};
+                                         .gpuPadMiB = options.gpuPadMiB,
+                                         .fogBands = options.fogCheck};
   bool decodingChanged = false;
 
   GXInit(nullptr, 0);
@@ -581,7 +624,8 @@ int main(int argc, char* argv[]) {
                                                                    .cullCheck = options.cullCheck,
                                                                    .cullTimings = options.cullTimings,
                                                                    .motionCheck = options.motionCheck,
-                                                                   .motionView = options.motionView},
+                                                                   .motionView = options.motionView,
+                                                                   .fogCheck = options.fogCheck},
                                                                   graphError)) {
     std::fprintf(stderr, "render_demo: render graph setup failed: %s\n", graphError.c_str());
     render_demo::shutdown_scene();
@@ -708,6 +752,21 @@ int main(int argc, char* argv[]) {
         "%.6g), reactive ground %.3g water %.3g\n",
         status.c_str(), m[32], m[0], m[1], m[8], m[9], m[16], m[17], m[2], m[26]);
   }
+  const std::optional<std::string> fogFailure =
+      options.fogCheck ? fog_check_failure(graphReport, info.backend == BACKEND_NULL) : std::nullopt;
+  if (options.fogCheck) {
+    const std::string status = fogFailure                     ? "FAILED: " + *fogFailure
+                               : info.backend == BACKEND_NULL ? std::string{"skipped (null backend)"}
+                                                              : std::string{"passed"};
+    const auto& f = graphReport.fog;
+    std::printf(
+        "render_demo: fog check %s: geometry %u, no record %u, sky records %u, band 0 %u (q %u-%u), band 1 "
+        "%u, colour mismatches %u, q mismatches %u, max error %.4g/127\n",
+        status.c_str(), f[render_demo::FogGeometry], f[render_demo::FogZeroOnGeometry], f[render_demo::FogSkyNonZero],
+        f[render_demo::FogBand0], 127 - f[render_demo::FogBand0QMinInv], f[render_demo::FogBand0QMax],
+        f[render_demo::FogBand1], f[render_demo::FogRgbMismatch], f[render_demo::FogQMismatch],
+        std::bit_cast<float>(f[render_demo::FogMaxErrorBits]) * 127.f);
+  }
   if (options.gpuCull != 0) {
     print_cull_report(graphReport.cull, frame, options.cullTimings);
   }
@@ -756,6 +815,9 @@ int main(int argc, char* argv[]) {
   }
   if (motionFailure) {
     return ExitMotionCheck;
+  }
+  if (fogFailure) {
+    return ExitFogCheck;
   }
   if (cullFailure) {
     return ExitCullCheck;

@@ -586,6 +586,7 @@ struct ShaderTargets {
   uint32_t motion = UINT32_MAX;
   uint32_t reactive = UINT32_MAX;
   uint32_t gbufferNormal = UINT32_MAX;
+  uint32_t fog = UINT32_MAX;
 };
 inline uint32_t normal_target(const ShaderConfig& config, const ShaderTargets& targets) noexcept {
   if (targets.normal != UINT32_MAX) {

@@ -347,6 +347,7 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
   const ShaderTargets targets = shader_targets(layout);
   const uint32_t normalTarget = normal_target(config.shaderConfig, targets);
   const bool opaque = effectively_opaque(config);
+  const bool writesFog = writes_fog_record(config, options);
   // Coverage only grows, so overlapping translucents keep the strongest
   static const wgpu::BlendState ReactiveBlend{
       .color = {.operation = wgpu::BlendOperation::Max,
@@ -365,6 +366,8 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
       writes = writesDepth || (options.colorUpdate && opaque);
     } else if (i == targets.reactive) {
       writes = options.colorUpdate && !opaque;
+    } else if (i == targets.fog) {
+      writes = writesFog;
     }
     colorTargets[i] = {
         .format = layout.colorAttachments[i].format,

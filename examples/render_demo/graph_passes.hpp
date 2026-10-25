@@ -10,6 +10,26 @@
 #include <string>
 
 namespace render_demo {
+inline constexpr u32 FogCheckFrame = 30;
+
+enum FogCheckWord : u32 {
+  FogGeometry,
+  FogSkyNonZero,
+  FogZeroOnGeometry,
+  FogRgbMismatch,
+  FogQMismatch,
+  FogBand0,
+  FogBand1,
+  // 127 minus the smallest band-0 q, so a zeroed buffer means no sample
+  FogBand0QMinInv,
+  FogBand0QMax,
+  FogMaxErrorBits,
+  FogWidth,
+  FogHeight,
+  FogWritten,
+  FogCheckWords = 16,
+};
+
 struct GraphPassOptions {
   bool vignette = false;
   std::string vignetteAnchor;
@@ -19,6 +39,7 @@ struct GraphPassOptions {
   bool cullTimings = false;
   bool motionCheck = false;
   bool motionView = false;
+  bool fogCheck = false;
 };
 
 struct GraphPassReport {
@@ -31,6 +52,9 @@ struct GraphPassReport {
   u32 motionEncodes = 0;
   bool motionReady = false;
   std::array<f32, MotionProbeFloats> motion{};
+  u32 fogEncodes = 0;
+  bool fogReady = false;
+  std::array<u32, FogCheckWords> fog{};
 };
 
 bool pipelines_compiling() noexcept;
