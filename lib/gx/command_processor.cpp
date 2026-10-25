@@ -766,6 +766,15 @@ static bool binds_generated_mips(const ShaderInfo& info) noexcept {
   return false;
 }
 
+static RenderExtConfig drop_unsafe_binds(RenderExtConfig ext) noexcept {
+  for (u32 i = 0; i < MaxTextures; ++i) {
+    if ((ext.stochasticMask >> i & 1u) != 0 && !render_ext::stochastic_bind_ok(g_gxState.textures[i])) {
+      ext.stochasticMask &= static_cast<u8>(~(1u << i));
+    }
+  }
+  return ext;
+}
+
 static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
                          u32 numIndices) noexcept {
   ZoneScoped;
@@ -865,12 +874,7 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     if (const auto* hooks = render_ext::hooks(); hooks != nullptr && hooks->derive != nullptr) {
       ext = hooks->derive(hooks->userData, cache.config, cache.shaderInfo, targetLayout, lanes);
     }
-    for (u32 i = 0; i < MaxTextures; ++i) {
-      if ((ext.stochasticMask >> i & 1u) != 0 && !render_ext::stochastic_bind_ok(state.textures[i])) {
-        ext.stochasticMask &= static_cast<u8>(~(1u << i));
-      }
-    }
-    ext = render_ext::normalize(ext, cache.shaderInfo);
+    ext = render_ext::normalize(drop_unsafe_binds(ext), cache.shaderInfo);
     const bool lanesChanged = render_ext::store_lanes(lanes, ext.stochasticMask);
     if (ext != cache.config.shaderConfig.ext) {
       const ShaderInfo previous = cache.shaderInfo;
@@ -912,6 +916,20 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
         break;
       }
     }
+  }
+
+  // Offscreen passes share the legacy key and blocking frames switch at once, so neither is warmed
+  if (const auto* warm = lookupPipeline || bindsRebuilt || extInputsChanged ? gfx::layout_warm() : nullptr;
+      warm != nullptr && targetLayoutKey == warm->liveKey && !gfx::is_offscreen() && !gfx::blocking_pipelines()) {
+    ZoneScopedN("warm pending layout");
+    PipelineConfig pending = cache.config;
+    render_ext::StochasticLanes scratchLanes{};
+    RenderExtConfig ext{};
+    if (const auto* hooks = render_ext::hooks(); hooks != nullptr && hooks->derive != nullptr) {
+      ext = hooks->derive(hooks->userData, pending, cache.shaderInfo, warm->pending, scratchLanes);
+    }
+    pending.shaderConfig.ext = render_ext::normalize(drop_unsafe_binds(ext), cache.shaderInfo);
+    gfx::warm_scene_variant(pending);
   }
 
   const bool uniformValid = (state.dirty & DirtyUniform) == 0 && cache.uniformRange.size != 0;

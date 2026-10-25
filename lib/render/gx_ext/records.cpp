@@ -141,7 +141,7 @@ void shutdown() noexcept {
 }
 
 bool on_route(const scene::DrawClass& cls) noexcept {
-  gx::render_ext::g_drawInputs = g_gbuffer ? draw_inputs(cls) : 0;
+  gx::render_ext::g_drawInputs = g_gbuffer || gfx::gbuffer_live_or_pending() ? draw_inputs(cls) : 0;
   return g_active;
 }
 

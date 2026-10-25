@@ -45,6 +45,7 @@ inline bool store_lanes(const StochasticLanes& lanes, u8 mask) noexcept {
   return changed;
 }
 
+// The FIFO also derives for a pending layout, so derive only writes lanes and keeps output bits to G-buffer layouts
 struct Hooks {
   RenderExtConfig (*derive)(void* userData, const PipelineConfig& config, const ShaderInfo& info,
                             const gfx::RenderTargetLayout& layout, StochasticLanes& lanes) noexcept = nullptr;

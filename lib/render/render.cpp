@@ -19,6 +19,7 @@
 #include "systems/dispatch.hpp"
 #include "systems/systems.hpp"
 
+#include "../gfx/scene_targets.hpp"
 #include "../gx/command_processor.hpp"
 #include "../logging.hpp"
 #include "../webgpu/gpu.hpp"
@@ -164,7 +165,11 @@ FeatureSupport feature_support(Feature feature, uint8_t option, const Settings& 
   return detail::current_support(feature, option, &context);
 }
 
-bool feature_ready(Feature) noexcept { return true; }
+bool feature_ready(Feature feature) noexcept {
+  // feature_active calls this, and inactive features stay ready
+  return detail::feature_info(feature).tier == detail::Tier::None || !feature_enabled(effective_settings(), feature) ||
+         !gfx::scene_layout_transitioning();
+}
 
 std::string_view feature_name(Feature feature) noexcept { return detail::feature_info(feature).name; }
 

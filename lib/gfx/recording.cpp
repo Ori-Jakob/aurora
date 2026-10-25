@@ -847,6 +847,8 @@ void begin_recording(FramePacket& packet, size_t frameSlot) {
   if (g_recorder.normalRequested && webgpu::enable_normal_buffer()) {
     g_recorder.normalRequested = false;
   }
+  // The lazy mod normal can change the layout after the latch, so the live key is taken again here
+  detail::refresh_layout_warm();
   g_recorder.packet = &packet;
   g_recorder.frameSlot = frameSlot;
   g_passSnapshotPools[frameSlot].used = 0;

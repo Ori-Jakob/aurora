@@ -2,6 +2,9 @@
 
 #include "types.hpp"
 
+#include <optional>
+#include <span>
+
 namespace aurora::gfx::clear {
 struct PipelineConfig;
 } // namespace aurora::gfx::clear
@@ -58,10 +61,31 @@ PipelineRef ready_pipeline(const gx::PipelineConfig& config, const RenderTargetL
 // The inspector's pick target comes and goes, so warm-up tracks the layout without it
 RenderTargetLayout pipeline_base_layout(RenderTargetLayout layout) noexcept;
 
+PipelineRef warm_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout);
+PipelineRef warm_pipeline(const clear::PipelineConfig& config, const RenderTargetLayout& layout);
+
 struct WarmProgress {
   uint32_t ready = 0;
   uint32_t total = 0;
+  uint32_t failed = 0;
 };
 WarmProgress warm_known_pipelines(const RenderTargetLayout& layout, ShaderType type);
+WarmProgress count_resolved(std::span<const PipelineRef> refs) noexcept;
+bool background_pipelines_drained() noexcept;
+
+void note_skipped_draw() noexcept;
+uint64_t skipped_draws() noexcept;
+
+namespace detail {
+enum class PipelinePriority : uint8_t {
+  Background, // cache warmup
+  Warm,       // pending scene layout
+  Normal,     // async skip draw
+  Blocking,   // block until compiled
+};
+
+std::optional<PipelinePriority> next_queue(bool normal, bool warm, bool background) noexcept;
+PipelinePriority promoted(PipelinePriority current, PipelinePriority requested) noexcept;
+} // namespace detail
 
 } // namespace aurora::gfx

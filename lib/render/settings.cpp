@@ -324,7 +324,11 @@ ForceMode gbuffer_env() noexcept {
       Log.warn("AURORA_RENDER_GBUFFER=off: keeping the base G-buffer tier off regardless of settings");
       return ForceMode::Off;
     }
-    Log.warn("AURORA_RENDER_GBUFFER={} is neither on nor off; ignored", text);
+    if (text == "cycle") {
+      Log.warn("AURORA_RENDER_GBUFFER=cycle: switching the base G-buffer tier every {} frames", GBufferCycleLatches);
+      return ForceMode::Cycle;
+    }
+    Log.warn("AURORA_RENDER_GBUFFER={} is not on, off or cycle; ignored", text);
     return ForceMode::Unset;
   }();
   return forced;
@@ -332,7 +336,8 @@ ForceMode gbuffer_env() noexcept {
 
 bool latch_gbuffer_want(uint32_t msaaSamples) {
   static bool warnedUnsupported = false;
-  const ForceMode forced = gbuffer_env();
+  static uint64_t latchIndex = 0;
+  const ForceMode forced = forced_gbuffer(gbuffer_env(), latchIndex++);
   const Caps& deviceCaps = caps();
   if (forced == ForceMode::On && deviceCaps.valid && device_tier(deviceCaps, msaaSamples) == Tier::None &&
       !std::exchange(warnedUnsupported, true)) {
@@ -457,6 +462,14 @@ bool gbuffer_wanted(const Settings& settings, const Caps& caps, uint32_t msaaSam
                     ForceMode forced) noexcept {
   return moduleEnabled && device_tier(caps, msaaSamples) != Tier::None && forced != ForceMode::Off &&
          (requested_option(settings, Feature::GBuffer) != 0 || forced == ForceMode::On);
+}
+
+// Counted in latches rather than time, so a replay switches on the same frames every run
+ForceMode forced_gbuffer(ForceMode mode, uint64_t latchIndex) noexcept {
+  if (mode != ForceMode::Cycle) {
+    return mode;
+  }
+  return (latchIndex / GBufferCycleLatches) % 2 == 0 ? ForceMode::Off : ForceMode::On;
 }
 
 FeatureSupport evaluate_support(Feature feature, uint8_t option, const Settings& context,
@@ -694,6 +707,7 @@ void reset_settings_state(uint32_t msaaSamples) noexcept {
 void shutdown_settings_state() noexcept {
   g_frameState.reset();
   g_latched.reset();
+  gfx::detail::reset_scene_layout();
 #if AURORA_ENABLE_RENDER
   g_graphEnvironment = {};
   g_externals.reset();
@@ -806,6 +820,7 @@ void reset() noexcept {
   g_generation = 0;
   g_frameState.reset();
   reset_frame_cull();
+  gfx::detail::reset_scene_layout();
 #if AURORA_ENABLE_RENDER
   g_graphEnvironment = {};
   g_externals.reset();

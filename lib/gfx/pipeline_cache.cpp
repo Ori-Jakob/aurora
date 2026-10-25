@@ -92,11 +92,13 @@ static absl::flat_hash_map<PipelineRef, CompiledPipeline> g_pipelines;
 static absl::flat_hash_map<HashType, KnownPipeline> g_knownPipelines;
 static std::optional<uint64_t> g_pipelineLayoutKey;
 static std::deque<PendingPipeline> g_pipelineQueue;
+static std::deque<PendingPipeline> g_warmPipelineQueue;
 static std::deque<PendingPipeline> g_backgroundPipelineQueue;
 static absl::flat_hash_set<PipelineRef> g_pendingPipelines;
 static std::atomic_bool g_gpuCachePrunePending = false;
 static std::atomic_bool g_blockingPipelines = false;
 static std::atomic_uint64_t g_pipelineEpoch = 0;
+static std::atomic_uint64_t g_skippedDraws = 0;
 
 static sqlite3* g_pipelineCacheDb = nullptr;
 static sqlite3_stmt* g_pipelineCacheLoadStmt = nullptr;
@@ -407,46 +409,78 @@ static auto find_pending_pipeline(Queue& queue, PipelineRef hash) {
   return std::find_if(queue.begin(), queue.end(), [=](const PendingPipeline& pending) { return pending.hash == hash; });
 }
 
-enum class PipelinePriority {
-  Background, // cache warmup
-  Normal,     // async skip draw
-  Blocking,   // block until compiled
-};
+using detail::PipelinePriority;
+
+namespace detail {
+std::optional<PipelinePriority> next_queue(bool normal, bool warm, bool background) noexcept {
+  if (normal) {
+    return PipelinePriority::Normal;
+  }
+  if (warm) {
+    return PipelinePriority::Warm;
+  }
+  if (background) {
+    return PipelinePriority::Background;
+  }
+  return std::nullopt;
+}
+
+PipelinePriority promoted(PipelinePriority current, PipelinePriority requested) noexcept {
+  // Normal-queue entries keep their place, as before the warm queue existed
+  return current < PipelinePriority::Normal && requested > current ? requested : current;
+}
+} // namespace detail
+
+static std::deque<PendingPipeline>& pipeline_queue(PipelinePriority priority) {
+  switch (priority) {
+  case PipelinePriority::Background:
+    return g_backgroundPipelineQueue;
+  case PipelinePriority::Warm:
+    return g_warmPipelineQueue;
+  default:
+    return g_pipelineQueue;
+  }
+}
+
+static std::optional<PipelinePriority> next_pending_queue() {
+  return detail::next_queue(!g_pipelineQueue.empty(), !g_warmPipelineQueue.empty(), !g_backgroundPipelineQueue.empty());
+}
 
 static void promote_pending_pipeline(PipelineRef hash, PipelinePriority priority) {
   if (priority == PipelinePriority::Background) {
     return;
   }
 
-  auto backgroundIt = find_pending_pipeline(g_backgroundPipelineQueue, hash);
-  if (backgroundIt == g_backgroundPipelineQueue.end()) {
+  for (const PipelinePriority current : {PipelinePriority::Warm, PipelinePriority::Background}) {
+    auto& queue = pipeline_queue(current);
+    auto it = find_pending_pipeline(queue, hash);
+    if (it == queue.end()) {
+      continue;
+    }
+    const PipelinePriority target = detail::promoted(current, priority);
+    if (target == current) {
+      return;
+    }
+    if (target == PipelinePriority::Blocking) {
+      g_pipelineQueue.emplace_front(std::move(*it));
+    } else {
+      pipeline_queue(target).emplace_back(std::move(*it));
+    }
+    queue.erase(it);
     return;
   }
-  if (priority == PipelinePriority::Blocking) {
-    g_pipelineQueue.emplace_front(std::move(*backgroundIt));
-  } else {
-    g_pipelineQueue.emplace_back(std::move(*backgroundIt));
-  }
-  g_backgroundPipelineQueue.erase(backgroundIt);
 }
 
 static std::optional<PendingPipeline> take_pending_pipeline(PipelineRef hash) {
-  auto priorityIt = find_pending_pipeline(g_pipelineQueue, hash);
-  if (priorityIt != g_pipelineQueue.end()) {
-    PendingPipeline pending = std::move(*priorityIt);
-    g_pipelineQueue.erase(priorityIt);
-    g_pendingPipelines.erase(hash);
-    return pending;
+  for (auto* queue : {&g_pipelineQueue, &g_warmPipelineQueue, &g_backgroundPipelineQueue}) {
+    auto it = find_pending_pipeline(*queue, hash);
+    if (it != queue->end()) {
+      PendingPipeline pending = std::move(*it);
+      queue->erase(it);
+      g_pendingPipelines.erase(hash);
+      return pending;
+    }
   }
-
-  auto backgroundIt = find_pending_pipeline(g_backgroundPipelineQueue, hash);
-  if (backgroundIt != g_backgroundPipelineQueue.end()) {
-    PendingPipeline pending = std::move(*backgroundIt);
-    g_backgroundPipelineQueue.erase(backgroundIt);
-    g_pendingPipelines.erase(hash);
-    return pending;
-  }
-
   return std::nullopt;
 }
 
@@ -480,6 +514,8 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
   ZoneScoped;
 
   const bool blocking = priority == PipelinePriority::Blocking;
+  // Warm-up must never take a live draw's compile slot
+  const bool inlineBuild = !g_hasPipelineThread && priority != PipelinePriority::Warm;
   bool notifyWorker = false;
   bool pipelineReady = false;
   bool createdPipeline = false;
@@ -506,7 +542,7 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
         promote_pending_pipeline(runtimeKey, priority);
         notifyWorker = priority != PipelinePriority::Background;
       }
-    } else if (!g_hasPipelineThread && (blocking || g_pipelinesPerFrame < BuildPipelinesPerFrame)) {
+    } else if (inlineBuild && (blocking || g_pipelinesPerFrame < BuildPipelinesPerFrame)) {
       auto result = cb();
       pipelineCount = result.pipeline_count();
       g_pipelines.try_emplace(runtimeKey, std::move(result));
@@ -521,6 +557,9 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
       switch (priority) {
       case PipelinePriority::Background:
         g_backgroundPipelineQueue.emplace_back(std::move(pending));
+        break;
+      case PipelinePriority::Warm:
+        g_warmPipelineQueue.emplace_back(std::move(pending));
         break;
       case PipelinePriority::Normal:
         g_pipelineQueue.emplace_back(std::move(pending));
@@ -1057,17 +1096,20 @@ static void pipeline_worker() {
       std::unique_lock lock{g_pipelineMutex};
       if (g_hasPipelineThread) {
         if (!hasMore) {
-          g_pipelineQueueCv.wait(lock, [] {
-            return !g_pipelineQueue.empty() || !g_backgroundPipelineQueue.empty() || g_pipelineThreadEnd;
-          });
+          g_pipelineQueueCv.wait(lock, [] { return next_pending_queue().has_value() || g_pipelineThreadEnd; });
         }
-      } else if (g_pipelineQueue.empty() && g_backgroundPipelineQueue.empty()) {
+      } else if (!next_pending_queue()) {
         return;
       }
       if (g_pipelineThreadEnd) {
         break;
       }
-      auto& source = !g_pipelineQueue.empty() ? g_pipelineQueue : g_backgroundPipelineQueue;
+      const std::optional<PipelinePriority> next = next_pending_queue();
+      if (!next) {
+        hasMore = false;
+        continue;
+      }
+      auto& source = pipeline_queue(*next);
       pending = std::move(source.front());
       source.pop_front();
     }
@@ -1077,7 +1119,7 @@ static void pipeline_worker() {
       std::lock_guard lock{g_pipelineMutex};
       g_pipelines.try_emplace(pending.hash, std::move(result));
       g_pendingPipelines.erase(pending.hash);
-      hasMore = !g_pipelineQueue.empty() || !g_backgroundPipelineQueue.empty();
+      hasMore = next_pending_queue().has_value();
     }
     if (!g_hasPipelineThread) {
       g_pipelinesPerFrame += std::max(1u, pipelineCount);
@@ -1246,21 +1288,48 @@ WarmProgress warm_known_pipelines(const RenderTargetLayout& layout, ShaderType t
       }
     }
   }
-  WarmProgress progress;
+  std::vector<PipelineRef> refs;
+  refs.reserve(known.size());
   for (const auto& pipeline : known) {
     std::visit(
         [&](const auto& config) {
-          if (!admitted(config, layout)) {
-            return;
+          if (admitted(config, layout)) {
+            refs.push_back(resolve_pipeline(pipeline.type, config, layout, PipelinePriority::Background));
           }
-          const PipelineRef ref = resolve_pipeline(pipeline.type, config, layout, PipelinePriority::Background);
-          ++progress.total;
-          progress.ready += pipeline_state(ref) != PipelineState::Pending ? 1 : 0;
         },
         pipeline.config);
   }
+  return count_resolved(refs);
+}
+
+WarmProgress count_resolved(std::span<const PipelineRef> refs) noexcept {
+  WarmProgress progress{.total = static_cast<uint32_t>(refs.size())};
+  std::lock_guard guard{g_pipelineMutex};
+  for (const PipelineRef ref : refs) {
+    const auto it = g_pipelines.find(ref);
+    if (it != g_pipelines.end()) {
+      ++(it->second.main ? progress.ready : progress.failed);
+    }
+  }
   return progress;
 }
+
+bool background_pipelines_drained() noexcept {
+  std::lock_guard guard{g_pipelineMutex};
+  return g_backgroundPipelineQueue.empty();
+}
+
+PipelineRef warm_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) {
+  return resolve_pipeline(ShaderType::GX, config, layout, PipelinePriority::Warm);
+}
+
+PipelineRef warm_pipeline(const clear::PipelineConfig& config, const RenderTargetLayout& layout) {
+  return resolve_pipeline(ShaderType::Clear, config, layout, PipelinePriority::Warm);
+}
+
+void note_skipped_draw() noexcept { g_skippedDraws.fetch_add(1, std::memory_order_relaxed); }
+
+uint64_t skipped_draws() noexcept { return g_skippedDraws.load(std::memory_order_relaxed); }
 
 void rebuild_pipeline_cache() {
   ZoneScoped;
@@ -1341,6 +1410,7 @@ void shutdown_pipeline_cache() {
   g_knownPipelines.clear();
   g_pipelineLayoutKey.reset();
   g_pipelineQueue.clear();
+  g_warmPipelineQueue.clear();
   g_backgroundPipelineQueue.clear();
   g_pendingPipelines.clear();
 

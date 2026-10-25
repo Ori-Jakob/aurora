@@ -161,6 +161,10 @@ uint64_t gbuffer_pipeline_failures() noexcept { return g_gbufferFailures.load(st
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   gfx::CompiledPipeline pipeline;
   if (!gfx::get_pipeline(data.pipeline, pipeline)) {
+    // Empty draws (M6-W13) never count
+    if (data.instanceCount != 0) {
+      gfx::note_skipped_draw();
+    }
     return;
   }
   const auto& resources = gfx::detail::resources();

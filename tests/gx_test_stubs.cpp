@@ -6,6 +6,7 @@
 #include "gfx/clear.hpp"
 #include "gfx/frame_packet.hpp"
 #include "gfx/resources.hpp"
+#include "gfx/scene_targets.hpp"
 #include "gfx/depth_peek.hpp"
 #include "gfx/frame.hpp"
 #include "gfx/recording.hpp"
@@ -379,6 +380,10 @@ PipelineRef ready_pipeline(const gx::PipelineConfig& config, const RenderTargetL
 bool g_testBlockingPipelines = false;
 void set_blocking_pipelines(bool blocking) noexcept { g_testBlockingPipelines = blocking; }
 bool blocking_pipelines() noexcept { return g_testBlockingPipelines; }
+const LayoutWarm* g_testLayoutWarm = nullptr;
+std::vector<gx::PipelineConfig> g_testWarmedConfigs;
+const LayoutWarm* layout_warm() noexcept { return g_testLayoutWarm; }
+void warm_scene_variant(const gx::PipelineConfig& config) { g_testWarmedConfigs.push_back(config); }
 gx::DrawData g_testLastDraw{};
 uint32_t g_testDrawCount = 0;
 std::atomic<uint32_t> g_testProcessedDrawCount{0};
@@ -447,7 +452,8 @@ void end_offscreen() {
   s_lastCommandIsGxDraw = false;
   testing::endOffscreenCount.fetch_add(1, std::memory_order_release);
 }
-bool is_offscreen() noexcept { return false; }
+bool g_testOffscreen = false;
+bool is_offscreen() noexcept { return g_testOffscreen; }
 } // namespace aurora::gfx
 
 namespace aurora::gfx::depth_peek {

@@ -129,7 +129,7 @@ void apply_frame_state(const detail::FrameState& state) noexcept {
   if (want != g_active || force != g_force || (want && generationChanged)) {
     set_active(want, force);
   }
-  gx::render_ext::set_hooks(g_active || records::gbuffer() ? &kHooks : nullptr);
+  gx::render_ext::set_hooks(g_active || records::gbuffer() || gfx::gbuffer_live_or_pending() ? &kHooks : nullptr);
 }
 
 void shutdown() noexcept {

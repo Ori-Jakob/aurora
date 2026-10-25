@@ -421,7 +421,7 @@ bool warm_step(const gfx::RenderTargetLayout& live) {
     ready += gfx::pipeline_state(ref) != gfx::PipelineState::Pending ? 1 : 0;
   }
   const gfx::WarmProgress clear = gfx::warm_known_pipelines(armed, gfx::ShaderType::Clear);
-  g_warm.ready = ready + clear.ready;
+  g_warm.ready = ready + clear.ready + clear.failed;
   g_warm.total = static_cast<uint32_t>(g_warm.pending.size()) + clear.total;
   const double seconds = std::chrono::duration<double>(Clock::now() - g_warm.start).count();
   return pick::warm_complete(

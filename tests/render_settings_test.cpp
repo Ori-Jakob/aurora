@@ -267,5 +267,21 @@ TEST_F(RenderLatchTest, GBufferWantNeedsBaseTier) {
   EXPECT_FALSE(gbuffer_wanted(request, full, 1, false, ForceMode::On));
   EXPECT_FALSE(gbuffer_wanted(request, full, 1, true, ForceMode::Off));
 }
+
+TEST_F(RenderLatchTest, CycleForceTogglesEvery600Latches) {
+  using detail::forced_gbuffer;
+  using detail::ForceMode;
+  constexpr uint64_t Period = detail::GBufferCycleLatches;
+  ASSERT_EQ(Period, 600u);
+  EXPECT_EQ(forced_gbuffer(ForceMode::Cycle, 0), ForceMode::Off);
+  EXPECT_EQ(forced_gbuffer(ForceMode::Cycle, Period - 1), ForceMode::Off);
+  EXPECT_EQ(forced_gbuffer(ForceMode::Cycle, Period), ForceMode::On);
+  EXPECT_EQ(forced_gbuffer(ForceMode::Cycle, 2 * Period - 1), ForceMode::On);
+  EXPECT_EQ(forced_gbuffer(ForceMode::Cycle, 2 * Period), ForceMode::Off);
+  EXPECT_EQ(forced_gbuffer(ForceMode::Cycle, 5 * Period + 7), ForceMode::On);
+  for (const ForceMode mode : {ForceMode::Unset, ForceMode::On, ForceMode::Off}) {
+    EXPECT_EQ(forced_gbuffer(mode, Period), mode);
+  }
+}
 } // namespace
 } // namespace aurora::render::test

@@ -1,12 +1,15 @@
 // Draw routing: suppressed draws, merge breaks and push-time substitution against emulated merging
 
 #include "gx_test_common.hpp"
+#include "gfx/frame_packet.hpp"
+#include "gfx/recording.hpp"
 #include "gx/draw_route.hpp"
 #include "gx/pipeline.hpp"
 #include "gx/render_ext.hpp"
 
 #include <array>
 #include <bitset>
+#include <cstring>
 #include <memory>
 #include <vector>
 
@@ -41,6 +44,9 @@ extern uint32_t g_testPipelineStateQueries;
 extern PipelineRef g_testReadyLegacyRef;
 extern uint32_t g_testReadyProbes;
 extern gx::RenderExtConfig g_testLastReadyExt;
+extern const LayoutWarm* g_testLayoutWarm;
+extern std::vector<gx::PipelineConfig> g_testWarmedConfigs;
+extern bool g_testOffscreen;
 namespace testing {
 void reset_stub_ranges() noexcept;
 } // namespace testing
@@ -156,6 +162,41 @@ RenderExtConfig input_hook(void* userData, const aurora::gx::PipelineConfig& con
 
 constexpr render_ext::Hooks InputHook{.derive = &input_hook};
 
+// Marks in-window draws only under a G-buffer layout, as the provider does, and gives that layout its own lanes
+RenderExtConfig layout_hook(void* userData, const aurora::gx::PipelineConfig& config,
+                            const aurora::gx::ShaderInfo& info, const gfx::RenderTargetLayout& layout,
+                            render_ext::StochasticLanes& lanes) noexcept {
+  ++g_deriveCalls;
+  RenderExtConfig ext = flag_hook(userData, config, info, layout, lanes);
+  if (gfx::layout_has_gbuffer(layout)) {
+    lanes.fill(aurora::Vec4<float>{2.f, 0.f, 0.f, 1.f});
+    ext.output = render_ext::g_drawInputs != 0 ? 1 : 0;
+  }
+  return ext;
+}
+
+constexpr render_ext::Hooks LayoutHook{.derive = &layout_hook};
+
+gfx::RenderTargetLayout pending_gbuffer_layout() {
+  gfx::RenderTargetLayout layout = gfx::get_render_target_layout();
+  layout.colorAttachments[layout.colorAttachmentCount++] = {gfx::ColorAttachmentSemantic::Motion,
+                                                            wgpu::TextureFormat::RG16Float};
+  gfx::detail::finalize_render_target_layout(layout);
+  return layout;
+}
+
+void expect_same_draw(const aurora::gx::DrawData& a, const aurora::gx::DrawData& b) {
+  EXPECT_EQ(a.pipeline, b.pipeline);
+  EXPECT_EQ(std::memcmp(&a.vertRange, &b.vertRange, sizeof(a.vertRange)), 0);
+  EXPECT_EQ(std::memcmp(&a.idxRange, &b.idxRange, sizeof(a.idxRange)), 0);
+  EXPECT_EQ(std::memcmp(&a.uniformRange, &b.uniformRange, sizeof(a.uniformRange)), 0);
+  EXPECT_EQ(std::memcmp(&a.immediateData, &b.immediateData, sizeof(a.immediateData)), 0);
+  EXPECT_EQ(a.vtxCount, b.vtxCount);
+  EXPECT_EQ(a.indexCount, b.indexCount);
+  EXPECT_EQ(a.instanceCount, b.instanceCount);
+  EXPECT_EQ(a.dstAlpha, b.dstAlpha);
+}
+
 struct ExtStats {
   uint64_t fallbackDraws = render_ext::g_stats.fallbackDraws.load();
   uint64_t pendingDraws = render_ext::g_stats.pendingDraws.load();
@@ -229,6 +270,9 @@ protected:
     gfx::g_testMergeDraws = false;
     gfx::g_testNormalAttachment = false;
     gfx::set_blocking_pipelines(false);
+    gfx::g_testLayoutWarm = nullptr;
+    gfx::g_testWarmedConfigs.clear();
+    gfx::g_testOffscreen = false;
     g_testPopulateDepthFunc = GX_NEVER;
     g_testPopulateTevStageCount = 0;
     GXFifoTest::TearDown();
@@ -1382,4 +1426,98 @@ TEST_F(GXDrawRouteTest, RecordedCommandsEndTheMergeChain) {
   // A viewport that did not change appends nothing, so only the third draw merges
   EXPECT_EQ(gfx::g_testDrawCount, 4u);
   EXPECT_EQ(gfx::g_testMergedDrawCount, 1u);
+}
+
+TEST_F(GXDrawRouteTest, PendingLayoutWarmsLookedUpConfigs) {
+  gfx::g_testMergeDraws = false;
+  render_ext::set_hooks(&LayoutHook);
+  render_ext::g_drawInputs = 1;
+  g_testStochasticEligible = 1;
+  g_gxState.textures[0] = repeat_bind(1);
+  const gfx::LayoutWarm warm{.pending = pending_gbuffer_layout(), .liveKey = gfx::get_render_target_layout().key};
+  struct Run {
+    aurora::gx::DrawData draw;
+    render_ext::StochasticLanes lanes;
+    uint32_t lookups = 0;
+    uint32_t uniformBuilds = 0;
+    std::vector<aurora::gx::PipelineConfig> warmed;
+  };
+  const auto run = [&](const gfx::LayoutWarm* layoutWarm) {
+    fifo::invalidate_draw_cache();
+    gfx::testing::reset_stub_ranges();
+    render_ext::g_stochasticUniforms = {};
+    gfx::g_testLayoutWarm = layoutWarm;
+    gfx::g_testWarmedConfigs.clear();
+    gfx::g_testPipelineRefCount = 0;
+    g_testUniformBuildCount = 0;
+    triangle();
+    decode();
+    triangle();
+    decode();
+    g_testPopulateDepthFunc = GX_LEQUAL;
+    g_gxState.dirty |= aurora::gx::DirtyPipeline;
+    triangle();
+    decode();
+    g_testPopulateDepthFunc = GX_NEVER;
+    gfx::g_testLayoutWarm = nullptr;
+    return Run{gfx::g_testLastDraw, render_ext::g_stochasticUniforms, gfx::g_testPipelineRefCount,
+               g_testUniformBuildCount, gfx::g_testWarmedConfigs};
+  };
+
+  const Run plain = run(nullptr);
+  const Run warmed = run(&warm);
+  EXPECT_TRUE(plain.warmed.empty());
+  EXPECT_EQ(warmed.lookups, 2u);
+  ASSERT_EQ(warmed.warmed.size(), warmed.lookups);
+  for (const auto& config : warmed.warmed) {
+    EXPECT_EQ(config.shaderConfig.ext.output, 1u);
+    EXPECT_EQ(config.shaderConfig.ext.stochasticMask, 1u);
+  }
+  EXPECT_NE(warmed.warmed[0].depthFunc, warmed.warmed[1].depthFunc);
+  // The live lookup keeps the live layout's bits; only the shadow derive sees the pending targets
+  EXPECT_EQ(gfx::g_testLastLookupExt.output, 0u);
+  EXPECT_EQ(warmed.lookups, plain.lookups);
+  EXPECT_EQ(warmed.uniformBuilds, plain.uniformBuilds);
+  EXPECT_TRUE(warmed.lanes == plain.lanes);
+  expect_same_draw(warmed.draw, plain.draw);
+
+  gfx::g_testOffscreen = true;
+  EXPECT_TRUE(run(&warm).warmed.empty());
+  gfx::g_testOffscreen = false;
+  gfx::set_blocking_pipelines(true);
+  EXPECT_TRUE(run(&warm).warmed.empty());
+  gfx::set_blocking_pipelines(false);
+  gfx::LayoutWarm stale = warm;
+  stale.liveKey ^= 1;
+  EXPECT_TRUE(run(&stale).warmed.empty());
+}
+
+TEST_F(GXDrawRouteTest, InputChangeWarmsWithoutRebind) {
+  gfx::g_testMergeDraws = false;
+  render_ext::set_hooks(&LayoutHook);
+  const gfx::LayoutWarm warm{.pending = pending_gbuffer_layout(), .liveKey = gfx::get_render_target_layout().key};
+  gfx::g_testLayoutWarm = &warm;
+  triangle();
+  decode();
+  ASSERT_EQ(gfx::g_testWarmedConfigs.size(), 1u);
+  EXPECT_EQ(gfx::g_testWarmedConfigs.back().shaderConfig.ext.output, 0u);
+  const uint32_t lookups = gfx::g_testPipelineRefCount;
+
+  const CpuZoneDelta zones;
+  render_ext::g_drawInputs = 1;
+  triangle();
+  decode();
+  ASSERT_EQ(gfx::g_testWarmedConfigs.size(), 2u);
+  EXPECT_EQ(gfx::g_testWarmedConfigs.back().shaderConfig.ext.output, 1u);
+  triangle();
+  decode();
+  EXPECT_EQ(gfx::g_testWarmedConfigs.size(), 2u);
+  render_ext::g_drawInputs = 0;
+  triangle();
+  decode();
+  ASSERT_EQ(gfx::g_testWarmedConfigs.size(), 3u);
+  EXPECT_EQ(gfx::g_testWarmedConfigs.back().shaderConfig.ext.output, 0u);
+  // The live layout has no G-buffer, so its bits never change and nothing is looked up or rebound
+  EXPECT_EQ(gfx::g_testPipelineRefCount, lookups);
+  EXPECT_EQ(zones.calls(fifo::CpuZoneBindGroupBuild), 0u);
 }

@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 
+#include "gfx/pipeline_cache.hpp"
+#include "gfx/scene_targets.hpp"
 #include "render/debug/debug.hpp"
+#include "render/frame_state.hpp"
 #include "render/module.hpp"
 #if AURORA_ENABLE_RENDER
 #include "render/geometry/compact.hpp"
@@ -594,6 +597,33 @@ TEST_F(RenderApiTest, CompactInitializeWithoutDeviceIsInert) {
   EXPECT_EQ(compact::stats().bindGroupsLastFrame, before.bindGroupsLastFrame);
   detail::shutdown();
   EXPECT_EQ(compact::pipeline(), shaders::NeverReady);
+}
+#endif
+
+#if AURORA_ENABLE_RENDER
+TEST_F(RenderApiTest, FeatureReadyFollowsSceneLayout) {
+  detail::testing::set_caps(full_caps());
+  enable_all_built();
+  apply_settings({.taa = true});
+  detail::latch_frame();
+  ASSERT_TRUE(feature_enabled(effective_settings(), Feature::Taa));
+  ASSERT_NE(feature_info(Feature::Taa).tier, detail::Tier::None);
+  EXPECT_TRUE(feature_ready(Feature::Taa));
+
+  // Leaving the tier warms the legacy layout, which needs no device
+  webgpu::g_graphicsConfig.gbuffer = true;
+  gfx::detail::latch_scene_layout(false);
+  ASSERT_TRUE(gfx::scene_layout_transitioning());
+  EXPECT_FALSE(feature_ready(Feature::Taa));
+  EXPECT_FALSE(feature_active(Feature::Taa));
+  EXPECT_TRUE(feature_ready(Feature::TextureMaterials));
+  EXPECT_TRUE(feature_ready(Feature::Ao));
+
+  gfx::detail::latch_scene_layout(true);
+  EXPECT_FALSE(gfx::scene_layout_transitioning());
+  EXPECT_TRUE(feature_ready(Feature::Taa));
+  webgpu::g_graphicsConfig.gbuffer = false;
+  gfx::shutdown_pipeline_cache();
 }
 #endif
 

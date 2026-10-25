@@ -633,6 +633,47 @@ TEST_F(GxShaderExtDevice, WarmSkipsOutputRowsWithoutTargets) {
   }
 }
 
+// Warm requests never build inline, so without a pipeline thread they compile at frame end, as on WebGPU
+void drain_layout_warm() {
+  for (uint32_t frame = 0; frame < 64; ++frame) {
+    const gfx::testing::WarmTally tally = gfx::testing::warm_tally();
+    if (tally.progress.ready + tally.progress.failed == tally.progress.total) {
+      return;
+    }
+    gfx::begin_pipeline_frame();
+    gfx::end_pipeline_frame();
+  }
+}
+
+TEST_F(GxShaderExtDevice, LayoutWarmCountsFailedAsResolved) {
+  ASSERT_TRUE(start({.backend = wgpu::BackendType::Null, .core = true}, true));
+  gfx::set_blocking_pipelines(true);
+  const std::vector<HexCase>& cases = hex_cases();
+  ASSERT_FALSE(cases.empty());
+  const PipelineConfig hex = pipeline_for(cases.front().config);
+  PipelineConfig legacy = render_ext::legacy_config(hex);
+  legacy.polygonOffsetBits = 2;
+  PipelineConfig corrupt = hex;
+  corrupt.polygonOffsetBits = 1;
+  gfx::testing::begin_warm(gbuffer_layout(), 1);
+  gfx::warm_scene_variant(legacy);
+  gfx::warm_scene_variant(hex);
+  drain_layout_warm();
+  testing::set_hex_corrupt(true);
+  gfx::warm_scene_variant(corrupt);
+  drain_layout_warm();
+  testing::set_hex_corrupt(false);
+
+  const gfx::testing::WarmTally tally = gfx::testing::warm_tally();
+  EXPECT_EQ(tally.pairs, 3u);
+  EXPECT_EQ(tally.progress.total, 5u);
+  EXPECT_EQ(tally.progress.ready + tally.progress.failed, tally.progress.total);
+  EXPECT_GE(tally.progress.failed, 1u);
+  EXPECT_EQ(tally.hardFailed, 0u);
+  gfx::detail::reset_scene_layout();
+  EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
+}
+
 TEST_F(GxShaderExtDevice, MotionPipelinesCompileOnBackend) {
   const auto backend = hardware_backend();
   if (!backend) {

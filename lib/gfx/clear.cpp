@@ -1,6 +1,7 @@
 #include "clear.hpp"
 
 #include "encoding.hpp"
+#include "pipeline_cache.hpp"
 #include "scene_targets.hpp"
 #include "../webgpu/gpu.hpp"
 #include "tracy/Tracy.hpp"
@@ -156,6 +157,7 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const RenderT
 
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass, const wgpu::Extent3D& targetSize) {
   if (!bind_pipeline(data.pipeline, pass)) {
+    note_skipped_draw();
     return;
   }
 
