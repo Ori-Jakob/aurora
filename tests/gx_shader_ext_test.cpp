@@ -450,7 +450,12 @@ size_t check_varyings(std::span<const corpus::Entry> entries) {
     const DstAlphaMode mode = corpus::decode_variant(entry.record).dstAlphaMode;
     const u32 planned = build_shader_info(config).varyings;
     EXPECT_LE(planned, MaxGxVaryings) << entry.label;
-    for (const ShaderTargets targets : {ShaderTargets{}, ShaderTargets{.normal = 1}}) {
+    for (const ShaderTargets targets :
+         {ShaderTargets{}, ShaderTargets{.normal = 1}, ShaderTargets{.normal = 1, .motion = 2}}) {
+      // MRT layouts never select dual-source blending, so motion text never meets it
+      if (targets.motion != UINT32_MAX && mode == DstAlphaMode::DualSource) {
+        continue;
+      }
       const size_t locations = location_count(build_shader_source(config, mode, targets));
       EXPECT_EQ(locations, varying_count(config, targets)) << entry.label << " normal " << targets.normal;
       EXPECT_LE(locations, planned) << entry.label << " normal " << targets.normal;
@@ -472,12 +477,15 @@ TEST_F(GxShaderExtTest, VaryingWorstCaseFitsBudget) {
   ASSERT_FALSE(info.lightingEnabled);
   EXPECT_EQ(info.sampledColorChannels.count(), 2u);
   EXPECT_EQ(info.sampledTexCoords.count(), MaxTexCoord);
-  EXPECT_EQ(static_cast<u32>(info.varyings), 11u);
+  EXPECT_EQ(static_cast<u32>(info.varyings), 13u);
   EXPECT_LE(static_cast<u32>(info.varyings), MaxGxVaryings);
   const std::string text = build_shader_source(config, DstAlphaMode::None, ShaderTargets{.normal = 1});
   EXPECT_EQ(location_count(text), 11u);
   EXPECT_EQ(count(vertex_output(text), "_uvw: vec3f,"), MaxTexCoord);
   EXPECT_EQ(varying_count(config, ShaderTargets{.normal = 1}), 11u);
+  const ShaderTargets motion{.normal = 1, .motion = 2};
+  EXPECT_EQ(location_count(build_shader_source(config, DstAlphaMode::None, motion)), 13u);
+  EXPECT_EQ(varying_count(config, motion), 13u);
 }
 
 TEST_F(GxShaderExtTest, LitDrawWithNormalTargetCountsNormal) {
@@ -485,7 +493,7 @@ TEST_F(GxShaderExtTest, LitDrawWithNormalTargetCountsNormal) {
   config.colorChannels[GX_COLOR0] = {.matSrc = GX_SRC_REG, .ambSrc = GX_SRC_REG, .lightingEnabled = true};
   const ShaderInfo info = build_shader_info(config);
   ASSERT_TRUE(info.lightingEnabled);
-  EXPECT_EQ(static_cast<u32>(info.varyings), 11u);
+  EXPECT_EQ(static_cast<u32>(info.varyings), 13u);
   EXPECT_EQ(location_count(build_shader_source(config, DstAlphaMode::None, ShaderTargets{.normal = 1})), 11u);
   EXPECT_EQ(varying_count(config, ShaderTargets{.normal = 1}), 11u);
   EXPECT_EQ(location_count(build_shader_source(config, DstAlphaMode::None, ShaderTargets{})), 10u);
@@ -504,6 +512,86 @@ TEST_F(GxShaderExtTest, LocalCorpusVaryingsFit) {
   const size_t maxLocations = check_varyings(*entries);
   RecordProperty("records", static_cast<int>(entries->size()));
   RecordProperty("maxVaryings", static_cast<int>(maxLocations));
+}
+
+std::string fragment_output(const std::string& text) {
+  const size_t begin = text.find("struct FragmentOutput {");
+  const size_t end = text.find("};", begin);
+  return begin == std::string::npos || end == std::string::npos ? std::string{} : text.substr(begin, end - begin);
+}
+
+ShaderConfig with_palette(ShaderConfig config) {
+  config.attrs[GX_VA_PNMTXIDX] = {.attrType = GX_DIRECT, .cnt = 1, .compType = GX_U8};
+  return config;
+}
+
+TEST_F(GxShaderExtTest, MotionNeedsMotionTarget) {
+  const ShaderConfig config = single_site();
+  for (const std::string& text :
+       {wgsl(config), build_shader_source(config, DstAlphaMode::None, 1u),
+        build_shader_source(config, DstAlphaMode::None, ShaderTargets{.normal = 1, .debugId = 2})}) {
+    EXPECT_EQ(text.find("mo_cur"), std::string::npos);
+    EXPECT_EQ(text.find("gx_record_word"), std::string::npos);
+    EXPECT_EQ(text.find("motion: vec2f"), std::string::npos);
+  }
+  const ShaderTargets targets{.motion = 2};
+  const std::string text = build_shader_source(config, DstAlphaMode::None, targets);
+  EXPECT_EQ(count(vertex_output(text), "mo_cur: vec3f,"), 1u);
+  EXPECT_EQ(count(vertex_output(text), "mo_prev: vec3f,"), 1u);
+  EXPECT_EQ(location_count(text), location_count(wgsl(config)) + MotionVaryings);
+  EXPECT_EQ(varying_count(config, targets), varying_count(config, ShaderTargets{}) + MotionVaryings);
+  EXPECT_NE(fragment_output(text).find("@location(2) motion: vec2f,"), std::string::npos);
+  EXPECT_NE(text.find("fn gx_record_word(k: u32) -> u32"), std::string::npos);
+  EXPECT_NE(text.find("let mo_flags = gx_record_word(1u);"), std::string::npos);
+  EXPECT_NE(text.find("gx_abuf_mtx(mo_frame + 16u)"), std::string::npos);
+  EXPECT_NE(text.find("gx_abuf_mtx(gx_record_word(4u) + 0u)"), std::string::npos);
+  EXPECT_NE(text.find("(mo_flags & 4096u)"), std::string::npos);
+  EXPECT_NE(text.find("(mo_flags & 4u)"), std::string::npos);
+  EXPECT_NE(text.find("out.motion = select(vec2f(4.0), mo_d, mo_w > 1e-5 && all(abs(mo_d) < vec2f(4.0)));"),
+            std::string::npos);
+  EXPECT_LT(text.find("let mo_cur = out.pos;"), text.find("out.pos = vec4f(out.pos.xy + mo_jit"));
+  EXPECT_LT(text.find("out.pos = vec4f(mv_pos, 1.0) * ubuf.proj;"), text.find("let mo_cur = out.pos;"));
+  EXPECT_EQ(text.find("offset_ndc * mo_prev.w"), std::string::npos);
+  EXPECT_EQ(text.find("reactive"), std::string::npos);
+  const std::string ids = build_shader_source(config, DstAlphaMode::None, ShaderTargets{.debugId = 5, .motion = 2});
+  EXPECT_LT(fragment_output(ids).find("motion: vec2f"), fragment_output(ids).find("debug_id: u32"));
+}
+
+TEST_F(GxShaderExtTest, PaletteMotionIndexesPrevBlock) {
+  const ShaderConfig config = with_palette(single_site());
+  const std::string text = build_shader_source(config, DstAlphaMode::None, ShaderTargets{.motion = 2});
+  EXPECT_NE(text.find("gx_abuf_mtx(gx_record_word(4u) + min(in_pnmtxidx, 9u) * 12u)"), std::string::npos);
+  EXPECT_EQ(text.find("gx_record_word(4u) + 0u"), std::string::npos);
+  EXPECT_NE(text.find("mo_mv = vec4f(in_pos, 1.0) *"), std::string::npos);
+  EXPECT_NE(text.find("mo_mv = vec4f(mv_pos, 1.0) *"), std::string::npos);
+}
+
+TEST_F(GxShaderExtTest, PointAndLineMotionAddsOffset) {
+  constexpr std::string_view Offset = "mo_prev = vec4f(mo_prev.xy + offset_ndc * mo_prev.w, mo_prev.zw);";
+  for (const u8 lineMode : {u8{1}, u8{2}, u8{3}}) {
+    ShaderConfig config = single_site();
+    config.lineMode = lineMode;
+    const std::string text = build_shader_source(config, DstAlphaMode::None, ShaderTargets{.motion = 2});
+    EXPECT_EQ(count(text, Offset), 1u) << static_cast<int>(lineMode);
+    EXPECT_LT(text.find("if (mo_source != 0u)"), text.find(Offset)) << static_cast<int>(lineMode);
+    EXPECT_EQ(location_count(text), varying_count(config, ShaderTargets{.motion = 2})) << static_cast<int>(lineMode);
+  }
+  const std::string triangles = build_shader_source(single_site(), DstAlphaMode::None, ShaderTargets{.motion = 2});
+  EXPECT_EQ(count(triangles, Offset), 0u);
+}
+
+TEST_F(GxShaderExtTest, ReactiveNeedsReactiveTarget) {
+  const ShaderConfig config = single_site();
+  EXPECT_EQ(build_shader_source(config, DstAlphaMode::None, ShaderTargets{.motion = 2}).find("reactive"),
+            std::string::npos);
+  const std::string text = build_shader_source(config, DstAlphaMode::Replace, ShaderTargets{.reactive = 3});
+  EXPECT_NE(fragment_output(text).find("@location(3) reactive: vec4f,"), std::string::npos);
+  EXPECT_NE(text.find("out.reactive = vec4f(saturate(prev.a));"), std::string::npos);
+  EXPECT_EQ(text.find("mo_cur"), std::string::npos);
+  EXPECT_EQ(location_count(text), location_count(wgsl(config)));
+  const std::string both = build_shader_source(config, DstAlphaMode::None, ShaderTargets{.motion = 2, .reactive = 3});
+  EXPECT_LT(fragment_output(both).find("motion: vec2f"), fragment_output(both).find("reactive: vec4f"));
+  EXPECT_LT(both.find("out.motion ="), both.find("out.reactive ="));
 }
 } // namespace
 } // namespace aurora::gx

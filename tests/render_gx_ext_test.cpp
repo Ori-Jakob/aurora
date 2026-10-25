@@ -111,7 +111,7 @@ scene::DrawClass draw_class(scene::Window window = scene::Window::Opaque, uint64
 uint32_t stamp(const scene::DrawClass& cls, uint32_t instances = 1) {
   gx::DrawData draw{};
   draw.instanceCount = instances;
-  records::stamp(draw, cls);
+  records::stamp(draw, gx::PipelineConfig{}, cls);
   return draw.immediateData._pad;
 }
 

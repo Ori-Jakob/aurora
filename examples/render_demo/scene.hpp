@@ -4,6 +4,9 @@
 #include <dolphin/mtx.h>
 #include <dolphin/types.h>
 
+#include <array>
+#include <optional>
+
 namespace render_demo {
 struct SceneOptions {
   bool hints = true;
@@ -21,7 +24,11 @@ struct SceneCamera {
   Point3d target;
 };
 
+enum class MotionProbe : u32 { Ground, Box, Tentacle, Water };
+
 SceneCamera scene_camera(u32 frame) noexcept;
+std::array<std::array<f32, 2>, 4> motion_probe_points(u32 frame) noexcept;
+std::optional<std::array<f32, 2>> motion_probe_expected(MotionProbe probe, u32 frame, std::array<f32, 2> ndc) noexcept;
 uint32_t gpu_uploads_per_frame(const SceneOptions& options) noexcept;
 bool init_scene();
 void draw_scene(u32 frame, const SceneOptions& options);

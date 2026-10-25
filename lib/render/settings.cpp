@@ -19,6 +19,7 @@
 #include "gx_ext/ext_provider.hpp"
 #include "hints.hpp"
 #include "scene/classify.hpp"
+#include "scene/motion.hpp"
 #endif
 
 #include <SDL3/SDL_stdinc.h>
@@ -769,6 +770,7 @@ std::shared_ptr<const FrameState> latch_frame() {
     }
     graph = compiled ? std::move(compiled) : empty_graph();
   }
+  scene::motion::latch(latched_settings(), gfx::layout_has_gbuffer(gfx::scene_render_target_layout()));
   latch_pass_params();
   inspectorOpen = g_graphEnvironment.inspectorOpen;
 #endif

@@ -41,6 +41,19 @@ struct PipelineConfig {
   bool depthCompare, depthUpdate, alphaUpdate, colorUpdate;
 };
 static_assert(std::has_unique_object_representations_v<PipelineConfig>);
+// Replaces the colour it covers; reads the remapped config factors, unlike scene::blended's raw state
+constexpr bool effectively_opaque(const PipelineConfig& c) noexcept {
+  switch (c.blendMode) {
+  case GX_BM_NONE:
+    return true;
+  case GX_BM_BLEND:
+    return c.blendFacSrc == GX_BL_ONE && c.blendFacDst == GX_BL_ZERO;
+  case GX_BM_LOGIC:
+    return c.blendOp == GX_LO_COPY;
+  default:
+    return false;
+  }
+}
 
 constexpr uint32_t persisted_version(const PipelineConfig& config) noexcept {
   return config.shaderConfig.ext == RenderExtConfig{} ? config.version : GXExtRowVersion;
@@ -55,6 +68,7 @@ struct PipelineOptions {
 };
 
 gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout);
+uint64_t gbuffer_pipeline_failures() noexcept;
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass);
 struct BindCounts {
   uint64_t draws, texturedDraws, uniformBinds, textureBinds, indexBinds, encodeNs;

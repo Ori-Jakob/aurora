@@ -126,6 +126,8 @@ struct DrawClass {
   bool suppressed = false;
   bool keyChanged = false;
   uint32_t index = 0;
+  // Pre-merge GX draw index within the open object; offscreen and suppressed draws are not counted
+  uint16_t ordinal = 0;
 };
 
 struct ClassifiedDraw {
@@ -300,6 +302,7 @@ private:
   std::array<Entry, MaxScopeDepth> m_scopes{};
   Entry m_object;
   bool m_objectOpen = false;
+  uint32_t m_objectDraws = 0;
   uint32_t m_scopeDepth = 0;
   uint32_t m_scopeSwallow = 0;
   uint32_t m_objectSwallow = 0;

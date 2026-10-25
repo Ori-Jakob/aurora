@@ -15,6 +15,8 @@ enum SceneHintBits : uint32_t {
   SceneHasEpoch = 1u << 5,
 };
 
+enum class MotionReason : uint8_t { Valid, NoCamera, NoPrevious, Unusable, Cut, SceneEpoch, StorageFull, Inactive };
+
 // Frame-level hint values as of the frame's accepted SCENE_BEGIN; immutable once published
 struct SceneHints {
   uint64_t hintFrame = 0;
@@ -26,6 +28,10 @@ struct SceneHints {
   std::vector<AuroraWindSource> windSources;
   uint32_t sceneEpoch = 0;
   bool sceneEpochChanged = false;
+  // Decided at the last pre-freeze MAIN camera; TAA resets history when false
+  bool motionValid = false;
+  MotionReason motionReason = MotionReason::NoCamera;
+  float jitterPx[2] = {0.f, 0.f};
 
   [[nodiscard]] bool has(uint32_t bits) const noexcept { return (present & bits) == bits; }
 };

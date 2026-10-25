@@ -9,6 +9,7 @@
 
 namespace aurora::gx {
 struct DrawData;
+struct PipelineConfig;
 } // namespace aurora::gx
 
 namespace aurora::render::detail {
@@ -18,6 +19,10 @@ struct FrameState;
 namespace aurora::render::scene {
 struct DrawClass;
 } // namespace aurora::render::scene
+
+namespace aurora::render::scene::motion {
+struct MotionFrame;
+} // namespace aurora::render::scene::motion
 
 namespace aurora::render::gx_ext::records {
 struct DrawRecord {
@@ -57,6 +62,11 @@ struct FrameRecord {
   uint32_t pad1 = 0;
 };
 static_assert(sizeof(FrameRecord) == 16);
+static_assert(sizeof(FrameRecord) == gx::render_ext::FrameMotionWord * sizeof(uint32_t));
+
+namespace frame_flag {
+inline constexpr uint32_t HasCamera = 1u << 0;
+} // namespace frame_flag
 
 struct Stats {
   uint64_t frames = 0;
@@ -75,7 +85,8 @@ void shutdown() noexcept;
 
 // FIFO thread
 bool on_route(const scene::DrawClass& cls) noexcept;
-void stamp(gx::DrawData& draw, const scene::DrawClass& cls) noexcept;
+void stamp(gx::DrawData& draw, const gx::PipelineConfig& config, const scene::DrawClass& cls) noexcept;
+bool set_camera_frame(const scene::motion::MotionFrame& frame) noexcept;
 
 namespace testing {
 void set_active(bool active, bool gbuffer, bool debugId) noexcept;

@@ -7,14 +7,18 @@
 #include "gx.hpp"
 #include "gx_fmt.hpp"
 #include "hex_wgsl.hpp"
+#include "render_ext.hpp"
 #include "shader_info.hpp"
 
 #include <dolphin/gx/GXEnum.h>
 
 #include <absl/container/flat_hash_set.h>
+#include <algorithm>
 #include <mutex>
+#include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "tracy/Tracy.hpp"
 
@@ -839,6 +843,22 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
 }
 
 absl::flat_hash_set<gfx::ShaderRef> s_seenShaders;
+
+HashType shader_hash(const ShaderConfig& config, DstAlphaMode dstAlphaMode, const ShaderTargets& targets) noexcept {
+  auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(targets.normal, xxh3_hash(config)));
+  for (const uint32_t target : {targets.debugId, targets.motion, targets.reactive}) {
+    if (target != UINT32_MAX) {
+      hash = xxh3_hash(target, hash);
+    }
+  }
+  return hash;
+}
+
+struct OutputMember {
+  uint32_t location;
+  std::string declaration;
+  std::string assignment;
+};
 } // namespace
 
 std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlphaMode,
@@ -850,10 +870,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
                                 const ShaderTargets& targets) noexcept {
   ZoneScoped;
   const uint32_t normalAttachment = targets.normal;
-  auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(normalAttachment, xxh3_hash(config)));
-  if (targets.debugId != UINT32_MAX) {
-    hash = xxh3_hash(targets.debugId, hash);
-  }
+  const auto hash = shader_hash(config, dstAlphaMode, targets);
   const auto info = build_shader_info(config);
   if (EnableDebugPrints && !s_seenShaders.contains(hash)) {
     s_seenShaders.insert(hash);
@@ -1624,32 +1641,98 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     fragmentFn += "\n    prev.a = 1.0;";
   }
 
+  if (targets.motion != UINT32_MAX) {
+    CHECK(dstAlphaMode != DstAlphaMode::DualSource, "GX motion output with dual-source blending");
+    uniformPre +=
+        "\nfn gx_record_word(k: u32) -> u32 { return select(0u, load_word(&abuf, imm._pad + k), imm._pad != 0u); }"
+        "\nfn gx_abuf_vec4(word: u32) -> vec4f { return bitcast<vec4f>(vec4u(load_word(&abuf, word), "
+        "load_word(&abuf, word + 1u), load_word(&abuf, word + 2u), load_word(&abuf, word + 3u))); }"
+        "\nfn gx_abuf_mtx(word: u32) -> mat3x4f { return mat3x4f(gx_abuf_vec4(word), gx_abuf_vec4(word + 4u), "
+        "gx_abuf_vec4(word + 8u)); }";
+    vtxOutAttrs += fmt::format("\n    @location({}) mo_cur: vec3f,", vtxOutIdx++);
+    vtxOutAttrs += fmt::format("\n    @location({}) mo_prev: vec3f,", vtxOutIdx++);
+    const std::string paletteIndex =
+        config.attrs[GX_VA_PNMTXIDX].attrType != GX_NONE
+            ? fmt::format("min(in_pnmtxidx, {}u) * 12u", render_ext::MotionPaletteSlots - 1)
+            : "0u"s;
+    const std::string_view lineOffset =
+        config.lineMode != 0 ? "\n        mo_prev = vec4f(mo_prev.xy + offset_ndc * mo_prev.w, mo_prev.zw);"sv : ""sv;
+    const u32 frameWord = render_ext::FrameMotionWord;
+    const u32 prevProjWord = render_ext::FrameMotionPrevProjWord;
+    vtxXfrAttrs += fmt::format(
+        "\n    let mo_cur = out.pos;"
+        "\n    let mo_flags = gx_record_word({0}u);"
+        "\n    let mo_source = mo_flags & {1}u;"
+        "\n    var mo_prev = mo_cur;"
+        "\n    if (mo_source != 0u) {{"
+        "\n        let mo_frame = gx_record_word(0u) + {2}u;"
+        "\n        var mo_mv: vec3f;"
+        "\n        if (mo_source == {3}u) {{"
+        "\n            mo_mv = vec4f(mv_pos, 1.0) * gx_abuf_mtx(mo_frame + {4}u);"
+        "\n        }} else {{"
+        "\n            mo_mv = vec4f(in_pos, 1.0) * gx_abuf_mtx(gx_record_word({5}u) + {6});"
+        "\n        }}"
+        "\n        let mo_v = vec4f(mo_mv, 1.0);"
+        "\n        if ((mo_flags & {7}u) != 0u) {{"
+        "\n            mo_prev = vec4f(dot(mo_v, gx_abuf_vec4(mo_frame + {8}u)), "
+        "dot(mo_v, gx_abuf_vec4(mo_frame + {9}u)), 0.0, dot(mo_v, gx_abuf_vec4(mo_frame + {10}u)));"
+        "\n        }} else {{"
+        "\n            mo_prev = mo_v * ubuf.proj;"
+        "\n        }}{11}"
+        "\n    }}"
+        "\n    if ((mo_flags & {12}u) != 0u) {{"
+        "\n        let mo_jit = gx_abuf_vec4(gx_record_word(0u) + {13}u).xy;"
+        "\n        out.pos = vec4f(out.pos.xy + mo_jit * vec2f(2.0, -2.0) / ubuf.render_viewport_size * out.pos.w, "
+        "out.pos.zw);"
+        "\n    }}"
+        "\n    out.mo_cur = mo_cur.xyw;"
+        "\n    out.mo_prev = mo_prev.xyw;",
+        render_ext::DrawRecordFlagsWord, render_ext::MotionSourceMask, frameWord, render_ext::MotionSourceCamera,
+        render_ext::FrameMotionReprojectWord, render_ext::DrawRecordPrevMtxWord, paletteIndex,
+        render_ext::RecordFlagPrevProjFrame, prevProjWord, prevProjWord + 4, prevProjWord + 8, lineOffset,
+        render_ext::RecordFlagJitter, frameWord + render_ext::FrameMotionJitterWord);
+  }
+
   CHECK(vtxOutIdx <= info.varyings, "GX shader emits {} inter-stage locations, planned {}", vtxOutIdx, info.varyings);
   std::string fragmentOutput;
   std::string_view fragmentOutputType = "@location(0) vec4f"sv;
   std::string fragmentReturn = "\n    return prev;"s;
-  if (normalAttachment != UINT32_MAX || targets.debugId != UINT32_MAX) {
+  std::vector<OutputMember> members;
+  if (normalAttachment != UINT32_MAX) {
+    std::string assignment =
+        useNormalTarget ? "\n    let nrm_len_sq = dot(in.mv_nrm, in.mv_nrm);"
+                          "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm), nrm_len_sq > 1e-10);"
+                          "\n    out.normal = vec4f(unit_nrm * 0.5 + 0.5, select(0.0, 1.0, nrm_len_sq > 1e-10));"s
+                        : "\n    out.normal = vec4f(0.5, 0.5, 0.5, 0.0);"s;
+    members.push_back(
+        {normalAttachment, fmt::format("    @location({}) normal: vec4f,\n", normalAttachment), std::move(assignment)});
+  }
+  if (targets.debugId != UINT32_MAX) {
+    members.push_back({targets.debugId, fmt::format("    @location({}) debug_id: u32,\n", targets.debugId),
+                       "\n    out.debug_id = imm._pad;"s});
+  }
+  if (targets.motion != UINT32_MAX) {
+    members.push_back(
+        {targets.motion, fmt::format("    @location({}) motion: vec2f,\n", targets.motion),
+         fmt::format("\n    let mo_w = in.mo_prev.z;"
+                     "\n    let mo_d = in.mo_cur.xy / in.mo_cur.z - in.mo_prev.xy / mo_w;"
+                     "\n    out.motion = select(vec2f({0:.1f}), mo_d, mo_w > 1e-5 && all(abs(mo_d) < vec2f({0:.1f})));",
+                     render_ext::MotionInvalidNdc)});
+  }
+  if (targets.reactive != UINT32_MAX) {
+    members.push_back({targets.reactive, fmt::format("    @location({}) reactive: vec4f,\n", targets.reactive),
+                       "\n    out.reactive = vec4f(saturate(prev.a));"s});
+  }
+  if (!members.empty()) {
+    std::ranges::stable_sort(members, {}, &OutputMember::location);
     fragmentOutput = "\nstruct FragmentOutput {\n    @location(0) color: vec4f,\n";
-    if (normalAttachment != UINT32_MAX) {
-      fragmentOutput += fmt::format("    @location({}) normal: vec4f,\n", normalAttachment);
-    }
-    if (targets.debugId != UINT32_MAX) {
-      fragmentOutput += fmt::format("    @location({}) debug_id: u32,\n", targets.debugId);
+    fragmentReturn = "\n    var out: FragmentOutput;\n    out.color = prev;";
+    for (const OutputMember& member : members) {
+      fragmentOutput += member.declaration;
+      fragmentReturn += member.assignment;
     }
     fragmentOutput += "};\n";
     fragmentOutputType = "FragmentOutput"sv;
-    fragmentReturn = "\n    var out: FragmentOutput;\n    out.color = prev;";
-    if (useNormalTarget) {
-      fragmentReturn +=
-          "\n    let nrm_len_sq = dot(in.mv_nrm, in.mv_nrm);"
-          "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm), nrm_len_sq > 1e-10);"
-          "\n    out.normal = vec4f(unit_nrm * 0.5 + 0.5, select(0.0, 1.0, nrm_len_sq > 1e-10));";
-    } else if (normalAttachment != UINT32_MAX) {
-      fragmentReturn += "\n    out.normal = vec4f(0.5, 0.5, 0.5, 0.0);";
-    }
-    if (targets.debugId != UINT32_MAX) {
-      fragmentReturn += "\n    out.debug_id = imm._pad;";
-    }
     fragmentReturn += "\n    return out;";
   }
 
@@ -2051,6 +2134,10 @@ ShaderTargets shader_targets(const gfx::RenderTargetLayout& layout) noexcept {
       targets.normal = i;
     } else if (layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::DebugId) {
       targets.debugId = i;
+    } else if (layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::Motion) {
+      targets.motion = i;
+    } else if (layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::Reactive) {
+      targets.reactive = i;
     }
   }
   if (gfx::layout_has_gbuffer(layout)) {
@@ -2064,10 +2151,7 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTar
   ZoneScoped;
   const ShaderTargets targets = shader_targets(layout);
   const auto shaderSource = build_shader_source(config, dstAlphaMode, targets);
-  auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(targets.normal, xxh3_hash(config)));
-  if (targets.debugId != UINT32_MAX) {
-    hash = xxh3_hash(targets.debugId, hash);
-  }
+  const auto hash = shader_hash(config, dstAlphaMode, targets);
   wgpu::ShaderSourceWGSL wgslDescriptor{};
   wgslDescriptor.code = shaderSource.c_str();
   const auto label = fmt::format("GX Shader {:x}", hash);

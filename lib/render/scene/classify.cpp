@@ -153,7 +153,7 @@ bool push(void*, gx::DrawData& draw, const gx::PipelineConfig& config, const gx:
   const bool changed = gate != fakeshadow::Edit::Skipped && g_hooks != nullptr && g_hooks->push != nullptr &&
                        g_hooks->push(draw, config, info, cls);
   // Before the inspector's observer, which reads the record locator
-  gx_ext::records::stamp(draw, cls);
+  gx_ext::records::stamp(draw, config, cls);
   // Last, so the inspector records the draw that is actually pushed
   if (g_observer != nullptr && g_observer->observe != nullptr) {
     g_observer->observe(draw, config, info, cls);

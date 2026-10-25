@@ -62,6 +62,22 @@ inline u32 g_drawInputs = 0;
 inline constexpr u32 DrawRecordWords = 8;
 inline constexpr u32 DrawRecordFlagsWord = 1;
 inline constexpr u32 DrawRecordReceiverShift = 6;
+inline constexpr u32 DrawRecordPrevMtxWord = 4;
+inline constexpr u32 MotionSourceMask = 3u;
+inline constexpr u32 MotionSourceNone = 0;
+inline constexpr u32 MotionSourceCamera = 1;
+inline constexpr u32 MotionSourceObject = 2;
+inline constexpr u32 MotionSourcePalette = 3;
+inline constexpr u32 RecordFlagJitter = 1u << 2;
+inline constexpr u32 RecordFlagPrevProjFrame = 1u << 12;
+inline constexpr u32 FrameMotionWord = 4;
+inline constexpr u32 FrameMotionJitterWord = 0;
+inline constexpr u32 FrameMotionValidWord = 2;
+inline constexpr u32 FrameMotionPrevProjWord = 4;
+inline constexpr u32 FrameMotionReprojectWord = 16;
+inline constexpr u32 FrameMotionWords = 28;
+inline constexpr float MotionInvalidNdc = 4.f;
+inline constexpr u32 MotionPaletteSlots = 10;
 
 inline bool stochastic_bind_ok(const gfx::TextureBind& bind) noexcept {
   return bind.ref != nullptr && !bind.ref->attachmentTextureView && bind.texObj.wrap_s() == GX_REPEAT &&

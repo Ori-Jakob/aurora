@@ -69,6 +69,8 @@ constexpr u32 MaxIndexAttr = 12; // VA_POS -> VA_TEX7
 constexpr u32 MaxUniformSize = 3840;
 // Inter-stage locations a GX shader may use; compat guarantees 15 and core 16, so built-ins keep headroom
 constexpr u32 MaxGxVaryings = 14;
+// Current and previous clip xyw
+constexpr u32 MotionVaryings = 2;
 constexpr u32 XfRegCount = 0x58; // 0x1000-0x1057
 
 enum DirtyFlag : u8 {
@@ -580,6 +582,9 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
 struct ShaderTargets {
   uint32_t normal = UINT32_MAX;
   uint32_t debugId = UINT32_MAX;
+  // Motion target; a layout property like normal, so the 3-argument form never has it
+  uint32_t motion = UINT32_MAX;
+  uint32_t reactive = UINT32_MAX;
 };
 // Under a G-buffer layout ext = 0 text writes no normal; the receiver normal belongs to output draws (M7-W5)
 ShaderTargets shader_targets(const gfx::RenderTargetLayout& layout) noexcept;

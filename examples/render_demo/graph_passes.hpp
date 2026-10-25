@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cull_pass.hpp"
+#include "graph_checks.hpp"
 
 #include <aurora/render_graph.hpp>
 #include <dolphin/types.h>
@@ -16,6 +17,8 @@ struct GraphPassOptions {
   u32 gpuCull = 0;
   bool cullCheck = false;
   bool cullTimings = false;
+  bool motionCheck = false;
+  bool motionView = false;
 };
 
 struct GraphPassReport {
@@ -25,6 +28,9 @@ struct GraphPassReport {
   std::array<f32, 4> probe{};
   aurora::render::DepthSource source = aurora::render::DepthSource::Unavailable;
   CullReport cull;
+  u32 motionEncodes = 0;
+  bool motionReady = false;
+  std::array<f32, MotionProbeFloats> motion{};
 };
 
 bool pipelines_compiling() noexcept;

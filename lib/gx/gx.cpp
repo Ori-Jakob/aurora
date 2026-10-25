@@ -345,11 +345,29 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
   const auto blendState = to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp,
                                          config.dstAlpha, options.dstAlphaMode == DstAlphaMode::DualSource);
   const ShaderTargets targets = shader_targets(layout);
+  const bool opaque = effectively_opaque(config);
+  // Coverage only grows, so overlapping translucents keep the strongest
+  static const wgpu::BlendState ReactiveBlend{
+      .color = {.operation = wgpu::BlendOperation::Max,
+                .srcFactor = wgpu::BlendFactor::One,
+                .dstFactor = wgpu::BlendFactor::One},
+      .alpha = {.operation = wgpu::BlendOperation::Max,
+                .srcFactor = wgpu::BlendFactor::One,
+                .dstFactor = wgpu::BlendFactor::One},
+  };
   std::array<wgpu::ColorTargetState, gfx::MaxColorAttachments> colorTargets{};
   for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
-    const bool writes = i == targets.debugId ? options.colorUpdate : i == targets.normal && writesDepth;
+    bool writes = i == targets.normal && writesDepth;
+    if (i == targets.debugId) {
+      writes = options.colorUpdate;
+    } else if (i == targets.motion) {
+      writes = writesDepth || (options.colorUpdate && opaque);
+    } else if (i == targets.reactive) {
+      writes = options.colorUpdate && !opaque;
+    }
     colorTargets[i] = {
         .format = layout.colorAttachments[i].format,
+        .blend = i == targets.reactive ? &ReactiveBlend : nullptr,
         .writeMask = writes ? wgpu::ColorWriteMask::All : wgpu::ColorWriteMask::None,
     };
   }

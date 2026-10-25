@@ -1,6 +1,7 @@
 #include "hints.hpp"
 
 #include "scene/classify.hpp"
+#include "scene/motion.hpp"
 #include "../gfx/recording.hpp"
 #include "../logging.hpp"
 
@@ -45,6 +46,10 @@ void clear_frame() noexcept {
   g_live.windSources.clear();
   g_live.sceneEpoch = 0;
   g_live.sceneEpochChanged = false;
+  g_live.motionValid = false;
+  g_live.motionReason = MotionReason::NoCamera;
+  g_live.jitterPx[0] = 0.f;
+  g_live.jitterPx[1] = 0.f;
   g_frozen = false;
   g_lastMarker = NoMarker;
 }
@@ -55,6 +60,7 @@ void on_reset(void*) noexcept {
   g_epochSeen = false;
   g_epochBaseline = 0;
   scene::reset();
+  scene::motion::reset();
 }
 
 void on_camera(void*, const gx::hints::Camera& camera) noexcept {
@@ -67,12 +73,18 @@ void on_camera(void*, const gx::hints::Camera& camera) noexcept {
     return;
   }
   g_live.mainCamera = camera;
+  const bool usable = gx::hints::main_camera_usable(camera.gxProj);
   // The last MAIN camera before the freeze decides, so an unusable one clears an earlier usable one
-  if (gx::hints::main_camera_usable(camera.gxProj)) {
+  if (usable) {
     g_live.present |= SceneHasMainCamera;
   } else {
     g_live.present &= ~SceneHasMainCamera;
   }
+  const auto v = scene::motion::on_main_camera(camera, usable);
+  g_live.motionValid = v.valid;
+  g_live.motionReason = v.reason;
+  g_live.jitterPx[0] = v.jitterPx[0];
+  g_live.jitterPx[1] = v.jitterPx[1];
 }
 
 void on_object_begin(void*, const gx::hints::ObjectBegin& object) noexcept { scene::on_object_begin(object); }

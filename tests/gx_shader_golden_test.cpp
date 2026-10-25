@@ -856,16 +856,19 @@ TEST(GxShaderGoldenTest, GBufferLayoutDropsLegacyNormal) {
   EXPECT_EQ(legacyIds.debugId, 2u);
 
   const ShaderTargets targets = shader_targets(gbuffer);
+  EXPECT_EQ(targets.motion, 2u);
+  EXPECT_EQ(targets.reactive, 3u);
   size_t compared = 0;
   for (const Entry& entry : synthetic()) {
     const ShaderConfig config = decode(entry.record);
-    if (config.ext != RenderExtConfig{}) {
+    const DstAlphaMode mode = decode_variant(entry.record).dstAlphaMode;
+    if (config.ext != RenderExtConfig{} || mode == DstAlphaMode::DualSource) {
       continue;
     }
-    const DstAlphaMode mode = decode_variant(entry.record).dstAlphaMode;
     const std::string text = build_shader_source(config, mode, targets);
-    EXPECT_EQ(text, build_shader_source(config, mode, ShaderTargets{})) << entry.label;
+    EXPECT_EQ(text, build_shader_source(config, mode, ShaderTargets{.motion = 2, .reactive = 3})) << entry.label;
     EXPECT_EQ(text.find("in.mv_nrm"), std::string::npos) << entry.label;
+    EXPECT_EQ(text.find("normal: vec4f"), std::string::npos) << entry.label;
     ++compared;
   }
   EXPECT_GT(compared, 0u);

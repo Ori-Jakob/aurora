@@ -27,6 +27,8 @@ struct Options {
   bool expectAnchorWarningsSet = false;
   uint32_t msaa = 1;
   bool depthCheck = false;
+  bool motionCheck = false;
+  bool motionView = false;
   bool hints = true;
   bool checkHints = false;
   bool customDrawProbe = false;

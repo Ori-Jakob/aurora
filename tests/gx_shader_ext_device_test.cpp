@@ -432,6 +432,144 @@ TEST_F(GxShaderExtDevice, GBufferLayoutPipelinesValidate) {
   }
 }
 
+// Unique ext-0 synthetic configs; those whose legacy text already fails fail for older reasons
+std::vector<ShaderConfig> legacy_valid_configs(test::TestDevice& device, size_t limit = SIZE_MAX) {
+  std::vector<ShaderConfig> configs;
+  std::unordered_set<uint64_t> seen;
+  for (const corpus::Entry& entry : corpus::generate_synthetic()) {
+    ShaderConfig config = corpus::decode(entry.record);
+    config.ext = {};
+    if (!seen.insert(xxh3_hash(config)).second ||
+        module_error(device, build_shader_source(config, DstAlphaMode::None))) {
+      continue;
+    }
+    configs.push_back(config);
+    if (configs.size() == limit) {
+      break;
+    }
+  }
+  return configs;
+}
+
+gfx::RenderTargetLayout gbuffer_layout() {
+  return gfx::compose_scene_layout({.gbuffer = true}, {.color = wgpu::TextureFormat::BGRA8Unorm,
+                                                       .depth = wgpu::TextureFormat::Depth32Float,
+                                                       .size = {64, 64, 1},
+                                                       .samples = 1});
+}
+
+PipelineConfig blended(PipelineConfig config) {
+  config.blendMode = GX_BM_BLEND;
+  config.blendFacSrc = GX_BL_SRCALPHA;
+  config.blendFacDst = GX_BL_INVSRCALPHA;
+  config.depthUpdate = false;
+  return config;
+}
+
+TEST_F(GxShaderExtDevice, MotionPipelinesValidate) {
+  ASSERT_TRUE(start({.backend = wgpu::BackendType::Null, .core = true}, true));
+  gfx::set_blocking_pipelines(true);
+  const gfx::RenderTargetLayout layout = gbuffer_layout();
+  const ShaderTargets targets = shader_targets(layout);
+  ASSERT_NE(targets.motion, UINT32_MAX);
+  ASSERT_NE(targets.reactive, UINT32_MAX);
+  const std::vector<ShaderConfig> configs = legacy_valid_configs(*m_device);
+  ASSERT_FALSE(configs.empty());
+  const uint64_t failures = gbuffer_pipeline_failures();
+  size_t built = 0;
+  for (const ShaderConfig& config : configs) {
+    const PipelineConfig opaque = pipeline_for(config);
+    PipelineConfig noDepth = opaque;
+    noDepth.depthUpdate = false;
+    PipelineConfig prepass = blended(opaque);
+    prepass.dstAlpha = 0x80;
+    for (const PipelineConfig& variant : {opaque, noDepth, blended(opaque)}) {
+      EXPECT_TRUE(static_cast<bool>(create_pipeline(variant, layout).main));
+      ++built;
+    }
+    const gfx::CompiledPipeline split = create_pipeline(prepass, layout);
+    EXPECT_TRUE(split.main && split.prepass);
+    ++built;
+  }
+  EXPECT_EQ(gbuffer_pipeline_failures(), failures);
+  EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
+  std::printf("motion pipelines: %zu configs, %zu pipelines\n", configs.size(), built);
+  RecordProperty("configs", static_cast<int>(configs.size()));
+
+  const char* path = std::getenv("AURORA_GX_SHADER_CORPUS");
+  if (path == nullptr || *path == '\0') {
+    return;
+  }
+  std::string error;
+  const auto entries = corpus::read_corpus(path, &error);
+  ASSERT_TRUE(entries.has_value()) << error;
+  size_t validated = 0;
+  size_t skipped = 0;
+  for (const corpus::Entry& entry : *entries) {
+    const ShaderConfig config = corpus::decode(entry.record);
+    const DstAlphaMode mode = corpus::decode_variant(entry.record).dstAlphaMode;
+    if (mode == DstAlphaMode::DualSource || module_error(*m_device, build_shader_source(config, mode))) {
+      ++skipped;
+      continue;
+    }
+    const auto failure = module_error(*m_device, build_shader_source(config, mode, targets));
+    EXPECT_FALSE(failure.has_value()) << entry.label << ": " << failure.value_or("");
+    ++validated;
+  }
+  EXPECT_GT(validated, 0u);
+  std::printf("TP corpus: %zu tier-B texts validated, %zu skipped\n", validated, skipped);
+  RecordProperty("corpusValidated", static_cast<int>(validated));
+}
+
+TEST_F(GxShaderExtDevice, GbufferPipelineFailureIsCaptured) {
+  ASSERT_TRUE(start({.backend = wgpu::BackendType::Null, .core = true}, true));
+  gfx::set_blocking_pipelines(true);
+  const gfx::RenderTargetLayout control = gbuffer_layout();
+  gfx::RenderTargetLayout broken = control;
+  const uint32_t motion = shader_targets(control).motion;
+  ASSERT_NE(motion, UINT32_MAX);
+  broken.colorAttachments[motion].format = wgpu::TextureFormat::R32Uint;
+  gfx::detail::finalize_render_target_layout(broken);
+  ASSERT_NE(broken.key, control.key);
+  const std::vector<ShaderConfig> configs = legacy_valid_configs(*m_device, 1);
+  ASSERT_FALSE(configs.empty());
+  const PipelineConfig config = pipeline_for(configs.front());
+
+  const uint64_t failures = gbuffer_pipeline_failures();
+  EXPECT_EQ(gfx::pipeline_state(gfx::find_debug_pipeline(config, control)), gfx::PipelineState::Ready);
+  EXPECT_EQ(gbuffer_pipeline_failures(), failures);
+  const gfx::PipelineRef ref = gfx::find_debug_pipeline(config, broken);
+  EXPECT_EQ(gfx::pipeline_state(ref), gfx::PipelineState::Failed);
+  gfx::CompiledPipeline compiled;
+  EXPECT_FALSE(gfx::get_pipeline(ref, compiled));
+  EXPECT_EQ(gbuffer_pipeline_failures(), failures + 1);
+  EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
+}
+
+TEST_F(GxShaderExtDevice, MotionPipelinesCompileOnBackend) {
+  const auto backend = hardware_backend();
+  if (!backend) {
+    GTEST_SKIP() << "AURORA_TEST_BACKEND names no hardware backend";
+  }
+  if (!start({.backend = *backend, .core = true, .allowCpu = false}, true)) {
+    GTEST_SKIP() << "no adapter";
+  }
+  const gfx::RenderTargetLayout layout = gbuffer_layout();
+  const std::vector<ShaderConfig> configs = legacy_valid_configs(*m_device, 64);
+  ASSERT_EQ(configs.size(), 64u);
+  const uint64_t failures = gbuffer_pipeline_failures();
+  size_t compiled = 0;
+  for (const ShaderConfig& config : configs) {
+    for (const PipelineConfig& variant : {pipeline_for(config), blended(pipeline_for(config))}) {
+      const bool built = static_cast<bool>(create_pipeline(variant, layout).main);
+      EXPECT_TRUE(built);
+      compiled += built ? 1 : 0;
+    }
+  }
+  EXPECT_EQ(gbuffer_pipeline_failures(), failures);
+  RecordProperty("compiled", static_cast<int>(compiled));
+}
+
 TEST_F(GxShaderExtDevice, HexTapsPreserveTexelLength) {
   const auto backend = hardware_backend();
   if (!backend) {

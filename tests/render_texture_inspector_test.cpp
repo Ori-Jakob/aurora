@@ -129,7 +129,7 @@ protected:
   // Records first, as scene::push stamps them before the observer runs
   void stamp_and_observe(const gx::ShaderInfo& info, const scene::DrawClass& cls, uint32_t instances = 1) {
     gx::DrawData draw = draw_data(instances);
-    gx_ext::records::stamp(draw, cls);
+    gx_ext::records::stamp(draw, m_config, cls);
     observe(draw, m_config, info, cls);
     m_lastPad = draw.immediateData._pad;
   }
@@ -648,7 +648,7 @@ TEST_F(TextureInspector, NeutralColumnFollowsGateDecision) {
     cls.key.categories = categories;
     gx::DrawData draw = draw_data();
     fakeshadow::push(draw, m_config, info, cls);
-    gx_ext::records::stamp(draw, cls);
+    gx_ext::records::stamp(draw, m_config, cls);
     observe(draw, m_config, info, cls);
     return draw;
   };

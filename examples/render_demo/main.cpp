@@ -20,6 +20,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -46,6 +47,7 @@ enum ExitCode : int {
   ExitHintCheck = 8,
   ExitCullCheck = 9,
   ExitBench = 10,
+  ExitMotionCheck = 11,
 };
 
 std::atomic_uint32_t g_errorCount = 0;
@@ -112,6 +114,57 @@ std::optional<std::string> depth_check_failure(const render_demo::GraphPassRepor
     return std::string{"probe readback did not complete"};
   }
   return render_demo::check_depth_probe(report.probe, reversedZ);
+}
+
+constexpr std::array<f32, 3> MotionTolerancePx{0.05f, 0.05f, 0.25f};
+
+std::optional<std::string> motion_check_failure(const render_demo::GraphPassReport& report, bool nullBackend) {
+  // The null backend runs no shaders, so its values say nothing
+  if (nullBackend) {
+    return std::nullopt;
+  }
+  if (report.motionEncodes == 0) {
+    return std::string{"gbuf.motion unavailable"};
+  }
+  if (!report.motionReady) {
+    return std::string{"probe readback did not complete"};
+  }
+  const auto& values = report.motion;
+  constexpr u32 Header = render_demo::MotionProbeCount * render_demo::MotionProbeStride;
+  if (values[Header + 3] < 1.f) {
+    return std::string{"probe shader did not run"};
+  }
+  const auto frame = static_cast<u32>(values[Header]);
+  const f32 width = values[Header + 1];
+  const f32 height = values[Header + 2];
+  char text[192];
+  for (u32 i = 0; i < MotionTolerancePx.size(); ++i) {
+    const f32* probe = values.data() + i * render_demo::MotionProbeStride;
+    const std::array<f32, 2> ndc{(probe[4] + 0.5f) / width * 2.f - 1.f, 1.f - (probe[5] + 0.5f) / height * 2.f};
+    const auto expected = render_demo::motion_probe_expected(static_cast<render_demo::MotionProbe>(i), frame, ndc);
+    if (!expected) {
+      std::snprintf(text, sizeof(text), "probe %u has no expected motion at frame %u", i, frame);
+      return std::string{text};
+    }
+    const f32 dx = (probe[0] - (*expected)[0]) * 0.5f * width;
+    const f32 dy = (probe[1] - (*expected)[1]) * 0.5f * height;
+    const f32 error = std::sqrt(dx * dx + dy * dy);
+    if (!(error <= MotionTolerancePx[i])) {
+      std::snprintf(text, sizeof(text),
+                    "probe %u at (%g, %g) frame %u read motion (%.6g, %.6g), expected (%.6g, %.6g): %.4g px off", i,
+                    probe[4], probe[5], frame, probe[0], probe[1], (*expected)[0], (*expected)[1], error);
+      return std::string{text};
+    }
+  }
+  const f32 groundReactive = values[2];
+  const f32 waterReactive =
+      values[static_cast<u32>(render_demo::MotionProbe::Water) * render_demo::MotionProbeStride + 2];
+  if (groundReactive != 0.f || !(waterReactive > 0.f)) {
+    std::snprintf(text, sizeof(text), "reactive reads %.6g on the ground and %.6g on the water", groundReactive,
+                  waterReactive);
+    return std::string{text};
+  }
+  return std::nullopt;
 }
 
 struct HintCounterSnapshot {
@@ -526,7 +579,9 @@ int main(int argc, char* argv[]) {
                                                                    .depthCheck = options.depthCheck,
                                                                    .gpuCull = options.gpuCull,
                                                                    .cullCheck = options.cullCheck,
-                                                                   .cullTimings = options.cullTimings},
+                                                                   .cullTimings = options.cullTimings,
+                                                                   .motionCheck = options.motionCheck,
+                                                                   .motionView = options.motionView},
                                                                   graphError)) {
     std::fprintf(stderr, "render_demo: render graph setup failed: %s\n", graphError.c_str());
     render_demo::shutdown_scene();
@@ -641,6 +696,18 @@ int main(int argc, char* argv[]) {
                 static_cast<int>(source.size()), source.data(), graphReport.probe[0], graphReport.probe[1],
                 graphReport.probe[2]);
   }
+  const std::optional<std::string> motionFailure =
+      options.motionCheck ? motion_check_failure(graphReport, info.backend == BACKEND_NULL) : std::nullopt;
+  if (options.motionCheck) {
+    const std::string status = motionFailure                  ? "FAILED: " + *motionFailure
+                               : info.backend == BACKEND_NULL ? std::string{"skipped (null backend)"}
+                                                              : std::string{"passed"};
+    const auto& m = graphReport.motion;
+    std::printf(
+        "render_demo: motion check %s: frame %g, ground (%.6g, %.6g), box (%.6g, %.6g), tentacle (%.6g, "
+        "%.6g), reactive ground %.3g water %.3g\n",
+        status.c_str(), m[32], m[0], m[1], m[8], m[9], m[16], m[17], m[2], m[26]);
+  }
   if (options.gpuCull != 0) {
     print_cull_report(graphReport.cull, frame, options.cullTimings);
   }
@@ -686,6 +753,9 @@ int main(int argc, char* argv[]) {
   }
   if (depthFailure) {
     return ExitRenderGraphCheck;
+  }
+  if (motionFailure) {
+    return ExitMotionCheck;
   }
   if (cullFailure) {
     return ExitCullCheck;

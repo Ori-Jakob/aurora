@@ -4,6 +4,7 @@
 #include "../gfx/resources.hpp"
 #include "../gfx/pipeline_cache.hpp"
 #include "../gfx/resource_cache.hpp"
+#include "../gfx/scene_targets.hpp"
 #include "../webgpu/error_scope.hpp"
 
 #include "gx_fmt.hpp"
@@ -38,6 +39,8 @@ struct Counters {
 // MRT turns dual-source into an alpha prepass; these counts measure that cost
 std::atomic_uint64_t g_dualSourcePipelines{0};
 std::atomic_uint64_t g_prepassPipelines{0};
+std::atomic_uint64_t g_gbufferFailures{0};
+std::atomic_bool g_gbufferFailureLogged{false};
 
 inline void count(std::atomic_uint64_t& c, uint64_t n = 1) noexcept {
   c.store(c.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
@@ -125,7 +128,8 @@ std::optional<PipelineConfig> migrate_v13_config(std::span<const uint8_t> bytes)
 
 gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout) {
   ZoneScoped;
-  if (config.shaderConfig.ext == RenderExtConfig{}) {
+  // Scene-target text is not golden, so a backend failure must drop the draw instead of ending the process
+  if (config.shaderConfig.ext == RenderExtConfig{} && !gfx::layout_has_gbuffer(layout)) {
     return create_unchecked(config, layout);
   }
   // A failed ext variant leaves an entry with no main pipeline, which render() skips and the FIFO replaces with legacy
@@ -136,11 +140,23 @@ gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::R
   const std::optional<std::string> error = webgpu::pop_error_scopes();
   if (moduleError || error) {
     const auto hash = xxh3_hash(layout.key, xxh3_hash(config, static_cast<HashType>(gfx::ShaderType::GX)));
-    Log.warn("GX ext pipeline {:x} failed: {}", hash, moduleError ? *moduleError : *error);
+    const std::string& message = moduleError ? *moduleError : *error;
+    if (gfx::layout_has_gbuffer(layout)) {
+      g_gbufferFailures.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (config.shaderConfig.ext != RenderExtConfig{}) {
+      Log.warn("GX ext pipeline {:x} failed: {}", hash, message);
+    } else if (!g_gbufferFailureLogged.exchange(true, std::memory_order_relaxed)) {
+      Log.warn("GX scene-target pipeline {:x} failed: {}", hash, message);
+    } else {
+      Log.debug("GX scene-target pipeline {:x} failed: {}", hash, message);
+    }
     return {};
   }
   return pipeline;
 }
+
+uint64_t gbuffer_pipeline_failures() noexcept { return g_gbufferFailures.load(std::memory_order_relaxed); }
 
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   gfx::CompiledPipeline pipeline;

@@ -30,6 +30,9 @@ constexpr Vec WindDirection{1.f, 0.f, 0.f};
 constexpr f32 WindPower = 0.3f;
 constexpr u32 TentacleBones = 4;
 constexpr f32 MarkerScale = 0.35f;
+constexpr size_t MotionProbeBox = 2;
+constexpr std::array<f32, 2> MotionProbeGroundNdc{0.3f, -0.7f};
+constexpr Vec WaterProbe{-18.f, 0.05f, 14.f};
 
 constexpr u64 GroundObject = 1;
 constexpr u64 FirstBoxObject = 0x100;
@@ -277,23 +280,27 @@ void draw_ground(const Mtx view) {
   GXEnd();
 }
 
+void box_model(size_t i, f32 t, Mtx model) {
+  const auto& box = BoxPlacements[i];
+  Mtx translate;
+  Mtx rotate;
+  Mtx scale;
+  C_MTXTrans(translate, box.x, box.scale / 2.f, box.z);
+  C_MTXRotRad(rotate, 'y', t * (0.3f + 0.15f * static_cast<f32>(i)));
+  C_MTXScale(scale, box.scale, box.scale, box.scale);
+  C_MTXConcat(translate, rotate, model);
+  C_MTXConcat(model, scale, model);
+}
+
 void draw_boxes(const Mtx view, f32 t) {
   set_lit_channel(GX_SRC_VTX);
   set_pass_color_tev();
   GXSetCurrentMtx(GX_PNMTX0);
   GXSetCullMode(GX_CULL_BACK);
   for (size_t i = 0; i < BoxPlacements.size(); ++i) {
-    const auto& box = BoxPlacements[i];
-    Mtx translate;
-    Mtx rotate;
-    Mtx scale;
     Mtx model;
     Mtx modelView;
-    C_MTXTrans(translate, box.x, box.scale / 2.f, box.z);
-    C_MTXRotRad(rotate, 'y', t * (0.3f + 0.15f * static_cast<f32>(i)));
-    C_MTXScale(scale, box.scale, box.scale, box.scale);
-    C_MTXConcat(translate, rotate, model);
-    C_MTXConcat(model, scale, model);
+    box_model(i, t, model);
     C_MTXConcat(view, model, modelView);
     begin_object(FirstBoxObject + i, AURORA_CAT_DYNAMIC, 0);
     load_matrices(modelView, GX_PNMTX0);
@@ -522,6 +529,46 @@ void emit_frame_hints(u32 frame, const Mtx view, const Mtx44 projection, const L
   const AuroraFogVolume waterMist = fog_volume(Vec{-18.f, 1.f, 14.f}, Vec{6.f, 1.5f, 6.f}, 0.05f);
   hint_fog_volumes({&waterMist, 1});
 }
+std::array<f32, 2> project(const SceneCamera& camera, const Vec& world) noexcept {
+  Vec view;
+  C_MTXMultVec(camera.view, &world, &view);
+  const auto& p = camera.projection;
+  const f32 x = p[0][0] * view.x + p[0][1] * view.y + p[0][2] * view.z + p[0][3];
+  const f32 y = p[1][0] * view.x + p[1][1] * view.y + p[1][2] * view.z + p[1][3];
+  const f32 w = p[3][0] * view.x + p[3][1] * view.y + p[3][2] * view.z + p[3][3];
+  return {x / w, y / w};
+}
+
+Vec on_plane(const SceneCamera& camera, std::array<f32, 2> ndc, f32 height) noexcept {
+  const auto& p = camera.projection;
+  const Vec viewDir{(ndc[0] + p[0][2]) / p[0][0], (ndc[1] + p[1][2]) / p[1][1], -1.f};
+  Mtx inverse;
+  C_MTXInverse(camera.view, inverse);
+  Vec dir;
+  C_MTXMultVecSR(inverse, &viewDir, &dir);
+  const f32 s = (height - static_cast<f32>(camera.eye.y)) / dir.y;
+  return {static_cast<f32>(camera.eye.x) + s * dir.x, height, static_cast<f32>(camera.eye.z) + s * dir.z};
+}
+
+std::array<f32, 2> difference(std::array<f32, 2> a, std::array<f32, 2> b) noexcept {
+  return {a[0] - b[0], a[1] - b[1]};
+}
+
+Vec tentacle_probe_local(const SceneCamera& camera, const Mtx bone) noexcept {
+  constexpr f32 Height = 1.f;
+  constexpr f32 Sides = 10.f;
+  const f32 radius = 0.28f - (Height - 0.75f) / 0.75f * 0.06f;
+  Mtx inverse;
+  C_MTXInverse(bone, inverse);
+  const Vec eye{static_cast<f32>(camera.eye.x), static_cast<f32>(camera.eye.y), static_cast<f32>(camera.eye.z)};
+  Vec local;
+  C_MTXMultVec(inverse, &eye, &local);
+  const f32 phi = std::atan2(local.z, local.x);
+  const f32 step = 2.f * Pi / Sides;
+  const f32 mid = (std::floor(phi / step) + 0.5f) * step;
+  const f32 r = radius * std::cos(step / 2.f) / std::cos(phi - mid);
+  return {r * std::cos(phi), Height, r * std::sin(phi)};
+}
 } // namespace
 
 bool init_scene() {
@@ -554,6 +601,64 @@ SceneCamera scene_camera(u32 frame) noexcept {
   camera.target = {0.f, 1.5f, 0.f};
   C_MTXLookAt(camera.view, &camera.eye, &up, &camera.target);
   return camera;
+}
+
+std::array<std::array<f32, 2>, 4> motion_probe_points(u32 frame) noexcept {
+  const f32 t = static_cast<f32>(frame) / 60.f;
+  const SceneCamera camera = scene_camera(frame);
+  Mtx model;
+  box_model(MotionProbeBox, t, model);
+  const Vec boxLocal{0.f, 0.5f, 0.f};
+  Vec boxTop;
+  C_MTXMultVec(model, &boxLocal, &boxTop);
+  Mtx bones[TentacleBones];
+  tentacle_bones(t, bones);
+  const Vec tentacleLocal = tentacle_probe_local(camera, bones[TentacleBones - 1]);
+  Vec tentacle;
+  C_MTXMultVec(bones[TentacleBones - 1], &tentacleLocal, &tentacle);
+  return {MotionProbeGroundNdc, project(camera, boxTop), project(camera, tentacle), project(camera, WaterProbe)};
+}
+
+std::optional<std::array<f32, 2>> motion_probe_expected(MotionProbe probe, u32 frame, std::array<f32, 2> ndc) noexcept {
+  if (frame == 0) {
+    return std::nullopt;
+  }
+  const f32 t = static_cast<f32>(frame) / 60.f;
+  const f32 previousT = static_cast<f32>(frame - 1) / 60.f;
+  const SceneCamera camera = scene_camera(frame);
+  const SceneCamera previous = scene_camera(frame - 1);
+  switch (probe) {
+  case MotionProbe::Ground:
+    return difference(ndc, project(previous, on_plane(camera, ndc, 0.f)));
+  case MotionProbe::Box: {
+    Mtx model;
+    Mtx previousModel;
+    Mtx inverse;
+    Mtx motion;
+    box_model(MotionProbeBox, t, model);
+    box_model(MotionProbeBox, previousT, previousModel);
+    C_MTXInverse(model, inverse);
+    C_MTXConcat(previousModel, inverse, motion);
+    const Vec top = on_plane(camera, ndc, BoxPlacements[MotionProbeBox].scale);
+    Vec before;
+    C_MTXMultVec(motion, &top, &before);
+    return difference(ndc, project(previous, before));
+  }
+  case MotionProbe::Tentacle: {
+    Mtx bones[TentacleBones];
+    Mtx previousBones[TentacleBones];
+    tentacle_bones(t, bones);
+    tentacle_bones(previousT, previousBones);
+    const Vec local = tentacle_probe_local(camera, bones[TentacleBones - 1]);
+    Vec now;
+    Vec before;
+    C_MTXMultVec(bones[TentacleBones - 1], &local, &now);
+    C_MTXMultVec(previousBones[TentacleBones - 1], &local, &before);
+    return difference(project(camera, now), project(previous, before));
+  }
+  default:
+    return std::nullopt;
+  }
 }
 
 void draw_scene(u32 frame, const SceneOptions& options) {

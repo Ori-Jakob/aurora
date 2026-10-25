@@ -86,6 +86,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/scene/classifier.hpp
         lib/render/scene/classify.cpp
         lib/render/scene/classify.hpp
+        lib/render/scene/motion.cpp
+        lib/render/scene/motion.hpp
         lib/render/shader_resolve.cpp
         lib/render/shader_resolve.hpp
         lib/render/shaders.cpp

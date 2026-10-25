@@ -2,6 +2,7 @@
 
 #include "../hints.hpp"
 #include "../scene/classifier.hpp"
+#include "../scene/motion.hpp"
 #include "../../gfx/recording.hpp"
 #include "../../gfx/scene_targets.hpp"
 #include "../../logging.hpp"
@@ -124,15 +125,19 @@ bool on_route(const scene::DrawClass& cls) noexcept {
   return g_active;
 }
 
-void stamp(gx::DrawData& draw, const scene::DrawClass& cls) noexcept {
-  if (!g_active || draw.instanceCount == 0 || cls.offscreen || (cls.key.window >= scene::Window::Post && !g_debugId)) {
+void stamp(gx::DrawData& draw, const gx::PipelineConfig& config, const scene::DrawClass& cls) noexcept {
+  if (!g_active) {
+    return;
+  }
+  const scene::motion::DrawMotion motion = scene::motion::draw_motion(draw, config, cls);
+  if (draw.instanceCount == 0 || cls.offscreen || (cls.key.window >= scene::Window::Post && !g_debugId)) {
     return;
   }
   if (!ensure_frame()) {
     ++g_frame.dropped;
     return;
   }
-  DrawRecord record{.frameOff = g_frameLoc};
+  DrawRecord record{.frameOff = g_frameLoc, .flags = motion.flags, .prevMtxOff = motion.prevMtxOff};
   if (cls.key.object.valid) {
     record.objectLo = static_cast<uint32_t>(cls.key.object.id);
     record.objectHi = static_cast<uint32_t>(cls.key.object.id >> 32);
@@ -153,6 +158,28 @@ void stamp(gx::DrawData& draw, const scene::DrawClass& cls) noexcept {
   draw.immediateData._pad = loc;
   ++g_frame.records;
   count_code(g_frame, record);
+}
+
+bool set_camera_frame(const scene::motion::MotionFrame& frame) noexcept {
+  if (!g_active) {
+    return false;
+  }
+  struct CameraFrame {
+    FrameRecord header;
+    scene::motion::MotionFrame tail;
+  };
+  static_assert(sizeof(CameraFrame) == 128 && offsetof(CameraFrame, tail) == sizeof(FrameRecord));
+  const CameraFrame block{
+      .header = {.frameSeq = static_cast<uint32_t>(detail::live_scene_hints().hintFrame),
+                 .flags = frame_flag::HasCamera},
+      .tail = frame,
+  };
+  const uint32_t loc = locator(g_push(bytes_of(block)));
+  if (loc == 0) {
+    return false;
+  }
+  g_frameLoc = loc;
+  return true;
 }
 
 namespace testing {
