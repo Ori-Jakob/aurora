@@ -231,14 +231,19 @@ inline void bump(std::atomic_uint64_t& counter, uint64_t n = 1) noexcept {
 
 class CpuZoneScope {
 public:
-  explicit CpuZoneScope(CpuZone zone) noexcept
-  : m_zone(zone), m_timed(((g_cpuZoneTimed.load(std::memory_order_relaxed) >> zone) & 1u) != 0) {
+  // A lookup split from its build adds time without counting a second call
+  explicit CpuZoneScope(CpuZone zone, bool countCall = true) noexcept
+  : m_zone(zone)
+  , m_timed(((g_cpuZoneTimed.load(std::memory_order_relaxed) >> zone) & 1u) != 0)
+  , m_countCall(countCall) {
     if (m_timed) {
       m_start = std::chrono::steady_clock::now();
     }
   }
   ~CpuZoneScope() {
-    bump(g_cpuZoneCalls[m_zone]);
+    if (m_countCall) {
+      bump(g_cpuZoneCalls[m_zone]);
+    }
     if (m_timed) {
       const auto elapsed = std::chrono::steady_clock::now() - m_start;
       bump(g_cpuZoneNs[m_zone],
@@ -252,6 +257,7 @@ private:
   std::chrono::steady_clock::time_point m_start{};
   CpuZone m_zone;
   bool m_timed;
+  bool m_countCall;
 };
 
 FogRangeLutKey fog_range_lut_key() noexcept {
@@ -759,6 +765,8 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
   const auto targetLayoutKey = gfx::get_render_target_layout().key;
   const bool pipelineValid = cache.hasPipeline && (state.dirty & DirtyPipeline) == 0 && cache.fmt == fmt &&
                              cache.lineMode == lineMode && cache.targetLayoutKey == targetLayoutKey;
+  // Looked up after the textures resolve, so bound-texture state can join the config
+  bool lookupPipeline = false;
   if (!pipelineValid) {
     ZoneScopedN("build pipeline");
     const CpuZoneScope build{CpuZonePipelineBuild};
@@ -772,13 +780,14 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
         std::memcmp(&cache.nextConfig, &cache.config, sizeof(PipelineConfig)) != 0) {
       cache.config = cache.nextConfig;
       cache.shaderInfo = build_shader_info(cache.config.shaderConfig);
-      cache.pipelineRef = gfx::pipeline_ref(cache.config);
+      lookupPipeline = true;
       cache.lookupBlocking = lookupBlocking;
     }
     cache.targetLayoutKey = targetLayoutKey;
     cache.fmt = fmt;
     cache.lineMode = lineMode;
-    cache.hasPipeline = true;
+    // Only the lookup below sets it, so a draw that leaves early forces a lookup next time
+    cache.hasPipeline = !lookupPipeline;
     state.dirty = (state.dirty & ~DirtyPipeline) | DirtyUniform;
     if (!hadPipeline || prevSampledTextures != cache.shaderInfo.sampledTextures ||
         prevSampledIndTextures != cache.shaderInfo.sampledIndTextures) {
@@ -800,6 +809,13 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     if (cache.bindGroups.textureBindGroup != prevBindGroup) {
       state.dirty |= DirtyUniform;
     }
+  }
+
+  if (lookupPipeline) {
+    ZoneScopedN("look up pipeline");
+    const CpuZoneScope lookup{CpuZonePipelineBuild, false};
+    cache.pipelineRef = gfx::pipeline_ref(cache.config);
+    cache.hasPipeline = true;
   }
 
   const bool uniformValid = (state.dirty & DirtyUniform) == 0 && cache.uniformRange.size != 0;

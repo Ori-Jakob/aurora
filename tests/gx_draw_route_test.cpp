@@ -12,6 +12,8 @@ extern uint32_t g_testPipelineBuildCount;
 extern uint32_t g_testShaderInfoCount;
 extern uint32_t g_testUniformBuildCount;
 extern u32 g_testLastUniformInfoSize;
+extern uint32_t g_testResolveCount;
+extern u32 g_testLastResolveInfoSize;
 extern GXCompare g_testPopulateDepthFunc;
 extern u32 g_testPopulateTevStageCount;
 } // namespace aurora::gx
@@ -22,6 +24,7 @@ extern bool g_testMergeDraws;
 extern bool g_testNormalAttachment;
 extern uint32_t g_testPipelineRefCount;
 extern PipelineRef g_testLastPipelineRef;
+extern uint32_t g_testResolvesAtLookup;
 extern uint32_t g_testMergedDrawCount;
 extern uint64_t g_testPushedVertexBytes;
 extern uint64_t g_testPushedIndexBytes;
@@ -35,10 +38,12 @@ namespace gfx = aurora::gfx;
 namespace hints = aurora::gx::hints;
 namespace route = aurora::gx::draw_route;
 using aurora::gx::g_gxState;
+using aurora::gx::g_testLastResolveInfoSize;
 using aurora::gx::g_testLastUniformInfoSize;
 using aurora::gx::g_testPipelineBuildCount;
 using aurora::gx::g_testPopulateDepthFunc;
 using aurora::gx::g_testPopulateTevStageCount;
+using aurora::gx::g_testResolveCount;
 using aurora::gx::g_testShaderInfoCount;
 using aurora::gx::g_testUniformBuildCount;
 
@@ -111,10 +116,13 @@ protected:
     gfx::g_testPushedIndexBytes = 0;
     gfx::g_testPipelineRefCount = 0;
     gfx::g_testLastPipelineRef = 0;
+    gfx::g_testResolvesAtLookup = 0;
     g_testPipelineBuildCount = 0;
     g_testShaderInfoCount = 0;
     g_testUniformBuildCount = 0;
     g_testLastUniformInfoSize = 0;
+    g_testResolveCount = 0;
+    g_testLastResolveInfoSize = 0;
   }
 
   void TearDown() override {
@@ -130,8 +138,9 @@ protected:
   }
 
   // The first draw looks the pipeline up; the second rebuilds after the change and must look up again
-  void expect_rebuild_looks_up(void (*change)()) {
+  void expect_rebuild_looks_up(void (*change)(), bool rebinds) {
     gfx::g_testMergeDraws = false;
+    const CpuZoneDelta zones;
     triangle();
     decode();
     change();
@@ -143,6 +152,13 @@ protected:
     EXPECT_EQ(gfx::g_testLastDraw.pipeline, gfx::g_testLastPipelineRef);
     EXPECT_EQ(g_testLastUniformInfoSize, 2u);
     EXPECT_EQ(g_gxState.dirty, 0u);
+    EXPECT_EQ(zones.calls(fifo::CpuZonePipelineBuild), 2u);
+    // Without a rebind the lookup must still run, so it cannot hang off the bind block
+    EXPECT_EQ(zones.calls(fifo::CpuZoneBindGroupBuild), rebinds ? 2u : 1u);
+    const uint32_t resolves = rebinds ? 2u : 1u;
+    EXPECT_EQ(g_testResolveCount, resolves);
+    EXPECT_EQ(gfx::g_testResolvesAtLookup, resolves);
+    EXPECT_EQ(g_testLastResolveInfoSize, resolves);
   }
 
   void install_router(bool withPush = false) {
@@ -504,32 +520,94 @@ TEST_F(GXDrawRouteTest, PipelineRebuildWithSameConfigSkipsLookup) {
 }
 
 TEST_F(GXDrawRouteTest, PipelineRebuildWithChangedConfigLooksUp) {
-  expect_rebuild_looks_up([] {
-    g_testPopulateDepthFunc = GX_LEQUAL;
-    g_gxState.dirty |= aurora::gx::DirtyPipeline;
-  });
+  expect_rebuild_looks_up(
+      [] {
+        g_testPopulateDepthFunc = GX_LEQUAL;
+        g_gxState.dirty |= aurora::gx::DirtyPipeline;
+      },
+      false);
 }
 
 TEST_F(GXDrawRouteTest, PipelineRebuildWithChangedShaderConfigLooksUp) {
-  expect_rebuild_looks_up([] {
-    g_testPopulateTevStageCount = 2;
-    g_gxState.dirty |= aurora::gx::DirtyPipeline;
-  });
+  expect_rebuild_looks_up(
+      [] {
+        g_testPopulateTevStageCount = 2;
+        g_gxState.dirty |= aurora::gx::DirtyPipeline;
+      },
+      false);
 }
 
 TEST_F(GXDrawRouteTest, PipelineRebuildAfterLayoutChangeLooksUp) {
-  expect_rebuild_looks_up([] { gfx::g_testNormalAttachment = true; });
+  expect_rebuild_looks_up([] { gfx::g_testNormalAttachment = true; }, false);
 }
 
 TEST_F(GXDrawRouteTest, PipelineRebuildAfterBlockingFlipLooksUp) {
-  expect_rebuild_looks_up([] {
-    gfx::set_blocking_pipelines(true);
-    g_gxState.dirty |= aurora::gx::DirtyPipeline;
-  });
+  expect_rebuild_looks_up(
+      [] {
+        gfx::set_blocking_pipelines(true);
+        g_gxState.dirty |= aurora::gx::DirtyPipeline;
+      },
+      false);
 }
 
 TEST_F(GXDrawRouteTest, PipelineRebuildAfterInvalidateDrawCacheLooksUp) {
-  expect_rebuild_looks_up([] { fifo::invalidate_draw_cache(); });
+  expect_rebuild_looks_up([] { fifo::invalidate_draw_cache(); }, true);
+}
+
+TEST_F(GXDrawRouteTest, PipelineRebuildWithChangedConfigLooksUpAfterResolve) {
+  expect_rebuild_looks_up(
+      [] {
+        g_testPopulateDepthFunc = GX_LEQUAL;
+        g_gxState.dirty |= aurora::gx::DirtyPipeline | aurora::gx::DirtyTextures;
+      },
+      true);
+}
+
+TEST_F(GXDrawRouteTest, PipelineLookupFollowsTextureResolve) {
+  triangle();
+  decode();
+  EXPECT_EQ(g_testResolveCount, 1u);
+  EXPECT_EQ(gfx::g_testResolvesAtLookup, 1u);
+  EXPECT_EQ(g_testLastResolveInfoSize, 1u);
+  EXPECT_EQ(gfx::g_testPipelineRefCount, 1u);
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, gfx::g_testLastPipelineRef);
+}
+
+TEST_F(GXDrawRouteTest, TextureChangeKeepsPipelineRef) {
+  gfx::g_testMergeDraws = false;
+  const CpuZoneDelta zones;
+  triangle();
+  decode();
+  const auto ref = gfx::g_testLastDraw.pipeline;
+  g_gxState.dirty |= aurora::gx::DirtyTextures;
+  triangle();
+  decode();
+  EXPECT_EQ(g_testResolveCount, 2u);
+  EXPECT_EQ(gfx::g_testPipelineRefCount, 1u);
+  EXPECT_EQ(zones.calls(fifo::CpuZonePipelineBuild), 1u);
+  EXPECT_EQ(zones.calls(fifo::CpuZoneBindGroupBuild), 2u);
+  EXPECT_EQ(zones.calls(fifo::CpuZoneUniformBuild), 1u);
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, ref);
+  EXPECT_EQ(g_gxState.dirty, 0u);
+}
+
+TEST_F(GXDrawRouteTest, EndFrameRebindsWithoutLookup) {
+  gfx::g_testMergeDraws = false;
+  const CpuZoneDelta zones;
+  triangle();
+  decode();
+  const auto ref = gfx::g_testLastDraw.pipeline;
+  // No begin_frame: it would arm publishing, and this fixture decodes by hand
+  fifo::end_frame();
+  triangle();
+  decode();
+  EXPECT_EQ(g_testResolveCount, 2u);
+  EXPECT_EQ(gfx::g_testPipelineRefCount, 1u);
+  EXPECT_EQ(zones.calls(fifo::CpuZonePipelineBuild), 1u);
+  EXPECT_EQ(zones.calls(fifo::CpuZoneBindGroupBuild), 2u);
+  EXPECT_EQ(zones.calls(fifo::CpuZoneUniformBuild), 2u);
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, ref);
+  EXPECT_EQ(g_gxState.dirty, 0u);
 }
 
 TEST_F(GXDrawRouteTest, CpuZonesCountDrawWork) {

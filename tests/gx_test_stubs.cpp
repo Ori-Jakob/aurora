@@ -139,6 +139,9 @@ uint32_t g_testShaderInfoCount = 0;
 uint32_t g_testUniformBuildCount = 0;
 // Each shader info build returns its own uniform size, so this shows which build a uniform was made from
 u32 g_testLastUniformInfoSize = 0;
+uint32_t g_testResolveCount = 0;
+// The shader info the last resolve saw, so a test can tie it to the same draw's build
+u32 g_testLastResolveInfoSize = 0;
 // Written into every populated config, so a test can make a rebuild produce a different config
 GXCompare g_testPopulateDepthFunc = GX_NEVER;
 u32 g_testPopulateTevStageCount = 0;
@@ -155,7 +158,10 @@ gfx::Range build_draw_uniform(const ShaderInfo& info) noexcept {
   return {.size = 1};
 }
 void clear_draw_uniforms() noexcept {}
-void resolve_sampled_textures(const ShaderInfo& info) noexcept {}
+void resolve_sampled_textures(const ShaderInfo& info) noexcept {
+  ++g_testResolveCount;
+  g_testLastResolveInfoSize = info.uniformSize;
+}
 } // namespace aurora::gx
 
 // --- Buffer push stubs ---
@@ -331,8 +337,11 @@ void push_draw_command<clear::DrawData>(clear::DrawData data) {
 uint32_t g_testPipelineRefCount = 0;
 // Every lookup returns a new nonzero ref, so a draw's ref shows which lookup it kept
 PipelineRef g_testLastPipelineRef = 0;
+// Resolves seen by the last lookup, so a test can tell whether it came after the draw's resolve
+uint32_t g_testResolvesAtLookup = 0;
 template <>
 PipelineRef pipeline_ref<gx::PipelineConfig>(const gx::PipelineConfig& config) {
+  g_testResolvesAtLookup = gx::g_testResolveCount;
   g_testLastPipelineRef = ++g_testPipelineRefCount;
   return g_testLastPipelineRef;
 }
