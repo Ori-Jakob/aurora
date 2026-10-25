@@ -1624,6 +1624,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     fragmentFn += "\n    prev.a = 1.0;";
   }
 
+  CHECK(vtxOutIdx <= info.varyings, "GX shader emits {} inter-stage locations, planned {}", vtxOutIdx, info.varyings);
   std::string fragmentOutput;
   std::string_view fragmentOutputType = "@location(0) vec4f"sv;
   std::string fragmentReturn = "\n    return prev;"s;

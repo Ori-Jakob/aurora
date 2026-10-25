@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include "gx_shader_corpus.hpp"
+
 #include "gfx/recording.hpp"
 #include "gfx/resources.hpp"
 #include "gx/gx.hpp"
@@ -7,10 +9,12 @@
 #include "gx/render_ext.hpp"
 #include "gx/shader_info.hpp"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <span>
@@ -415,6 +419,91 @@ TEST_F(GxShaderExtTest, LitNormalTargetDeclaresNormalVarying) {
   EXPECT_FALSE(vertex_output(untargeted).empty());
   EXPECT_EQ(vertex_output(untargeted).find("mv_nrm"), std::string::npos);
   EXPECT_EQ(untargeted.find("in.mv_nrm"), std::string::npos);
+}
+
+size_t location_count(const std::string& text) { return count(vertex_output(text), "@location("); }
+
+// NRM, two unlit vertex-colour channels and eight MTX3x4 texgens: every legacy varying at once
+ShaderConfig worst_case_varyings() {
+  std::array<Site, MaxTexCoord> sites{};
+  for (u32 i = 0; i < sites.size(); ++i) {
+    sites[i] = {i, i};
+  }
+  ShaderConfig config = config_with(sites);
+  config.attrs[GX_VA_NRM] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32};
+  config.colorChannels[GX_COLOR1] = {.matSrc = GX_SRC_VTX};
+  config.colorChannels[GX_ALPHA1] = {.matSrc = GX_SRC_VTX};
+  for (auto& tcg : config.tcgs) {
+    tcg.type = GX_TG_MTX3x4;
+  }
+  config.tevStages[0].colorPass = {GX_CC_ZERO, GX_CC_RASC, GX_CC_TEXC, GX_CC_ZERO};
+  config.tevStages[0].channelId = GX_COLOR0A0;
+  config.tevStages[1].colorPass = {GX_CC_ZERO, GX_CC_RASC, GX_CC_TEXC, GX_CC_CPREV};
+  config.tevStages[1].channelId = GX_COLOR1A1;
+  return config;
+}
+
+size_t check_varyings(std::span<const corpus::Entry> entries) {
+  size_t maxLocations = 0;
+  for (const corpus::Entry& entry : entries) {
+    const ShaderConfig config = corpus::decode(entry.record);
+    const DstAlphaMode mode = corpus::decode_variant(entry.record).dstAlphaMode;
+    const u32 planned = build_shader_info(config).varyings;
+    EXPECT_LE(planned, MaxGxVaryings) << entry.label;
+    for (const ShaderTargets targets : {ShaderTargets{}, ShaderTargets{.normal = 1}}) {
+      const size_t locations = location_count(build_shader_source(config, mode, targets));
+      EXPECT_EQ(locations, varying_count(config, targets)) << entry.label << " normal " << targets.normal;
+      EXPECT_LE(locations, planned) << entry.label << " normal " << targets.normal;
+      maxLocations = std::max(maxLocations, locations);
+    }
+  }
+  return maxLocations;
+}
+
+TEST_F(GxShaderExtTest, VaryingCountMatchesGenerator) {
+  const size_t maxLocations = check_varyings(corpus::generate_synthetic());
+  EXPECT_GT(maxLocations, 0u);
+  RecordProperty("maxVaryings", static_cast<int>(maxLocations));
+}
+
+TEST_F(GxShaderExtTest, VaryingWorstCaseFitsBudget) {
+  const ShaderConfig config = worst_case_varyings();
+  const ShaderInfo info = build_shader_info(config);
+  ASSERT_FALSE(info.lightingEnabled);
+  EXPECT_EQ(info.sampledColorChannels.count(), 2u);
+  EXPECT_EQ(info.sampledTexCoords.count(), MaxTexCoord);
+  EXPECT_EQ(static_cast<u32>(info.varyings), 11u);
+  EXPECT_LE(static_cast<u32>(info.varyings), MaxGxVaryings);
+  const std::string text = build_shader_source(config, DstAlphaMode::None, ShaderTargets{.normal = 1});
+  EXPECT_EQ(location_count(text), 11u);
+  EXPECT_EQ(count(vertex_output(text), "_uvw: vec3f,"), MaxTexCoord);
+  EXPECT_EQ(varying_count(config, ShaderTargets{.normal = 1}), 11u);
+}
+
+TEST_F(GxShaderExtTest, LitDrawWithNormalTargetCountsNormal) {
+  ShaderConfig config = worst_case_varyings();
+  config.colorChannels[GX_COLOR0] = {.matSrc = GX_SRC_REG, .ambSrc = GX_SRC_REG, .lightingEnabled = true};
+  const ShaderInfo info = build_shader_info(config);
+  ASSERT_TRUE(info.lightingEnabled);
+  EXPECT_EQ(static_cast<u32>(info.varyings), 11u);
+  EXPECT_EQ(location_count(build_shader_source(config, DstAlphaMode::None, ShaderTargets{.normal = 1})), 11u);
+  EXPECT_EQ(varying_count(config, ShaderTargets{.normal = 1}), 11u);
+  EXPECT_EQ(location_count(build_shader_source(config, DstAlphaMode::None, ShaderTargets{})), 10u);
+  EXPECT_EQ(varying_count(config, ShaderTargets{}), 10u);
+}
+
+TEST_F(GxShaderExtTest, LocalCorpusVaryingsFit) {
+  const char* path = std::getenv("AURORA_GX_SHADER_CORPUS");
+  if (path == nullptr || *path == '\0') {
+    GTEST_SKIP() << "AURORA_GX_SHADER_CORPUS is not set";
+  }
+  std::string error;
+  const auto entries = corpus::read_corpus(path, &error);
+  ASSERT_TRUE(entries.has_value()) << error;
+  ASSERT_FALSE(entries->empty());
+  const size_t maxLocations = check_varyings(*entries);
+  RecordProperty("records", static_cast<int>(entries->size()));
+  RecordProperty("maxVaryings", static_cast<int>(maxLocations));
 }
 } // namespace
 } // namespace aurora::gx

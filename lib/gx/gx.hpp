@@ -67,6 +67,8 @@ constexpr u32 MaxVtxFmt = GX_MAX_VTXFMT;
 constexpr u32 MaxPnMtx = (GX_PNMTX9 / 3) + 1;
 constexpr u32 MaxIndexAttr = 12; // VA_POS -> VA_TEX7
 constexpr u32 MaxUniformSize = 3840;
+// Inter-stage locations a GX shader may use; compat guarantees 15 and core 16, so built-ins keep headroom
+constexpr u32 MaxGxVaryings = 14;
 constexpr u32 XfRegCount = 0x58; // 0x1000-0x1057
 
 enum DirtyFlag : u8 {
@@ -560,6 +562,8 @@ struct ShaderInfo {
   std::bitset<MaxTextures> stochasticTextures;
   std::bitset<MaxIndTexMtxs> usedIndTexMtxs;
   u32 uniformSize = 0;
+  // Worst case over every scene layout; config-only
+  u8 varyings = 0;
   bool usesFog : 1 = false;
   bool lightingEnabled : 1 = false;
   u8 lineMode : 2 = 0;

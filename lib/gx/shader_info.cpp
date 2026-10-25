@@ -418,11 +418,25 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
   }
   info.stochasticTextures = std::bitset<MaxTextures>{config.ext.stochasticMask} & info.stochasticEligible;
   info.uniformSize += info.stochasticTextures.count() * sizeof(Vec4<float>);
+  // A milestone that adds varyings must widen this bound and add a drop rule
+  static_assert(1 + MaxColorChannels / 2 + MaxTexCoord <= MaxGxVaryings);
+  info.varyings = static_cast<u8>((config.attrs[GX_VA_NRM].attrType != GX_NONE || EnableNormalVisualization ? 1 : 0) +
+                                  info.sampledColorChannels.count() + info.sampledTexCoords.count());
   info.uniformSize = gfx::align_uniform(info.uniformSize);
   if (info.uniformSize > MaxUniformSize) {
     Log.fatal("Uniform size exceeds maximum: {} > {}", info.uniformSize, MaxUniformSize);
   }
   return info;
+}
+
+static u32 count_varyings(const ShaderConfig& config, const ShaderInfo& info, const ShaderTargets& targets) noexcept {
+  const bool normal =
+      (targets.normal != UINT32_MAX && config.attrs[GX_VA_NRM].attrType != GX_NONE) || EnableNormalVisualization;
+  return (normal ? 1u : 0u) + static_cast<u32>(info.sampledColorChannels.count() + info.sampledTexCoords.count());
+}
+
+u32 varying_count(const ShaderConfig& config, const ShaderTargets& targets) noexcept {
+  return count_varyings(config, build_shader_info(config), targets);
 }
 
 static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
