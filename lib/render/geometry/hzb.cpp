@@ -14,6 +14,7 @@
 
 namespace aurora::render::detail::hzb {
 namespace {
+[[maybe_unused]] constexpr Module Log{"aurora::render::hzb"};
 static_assert(gx::UseReversedZ);
 
 constexpr size_t CacheCapacity = 4;
