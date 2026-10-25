@@ -345,6 +345,7 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
   const auto blendState = to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp,
                                          config.dstAlpha, options.dstAlphaMode == DstAlphaMode::DualSource);
   const ShaderTargets targets = shader_targets(layout);
+  const uint32_t normalTarget = normal_target(config.shaderConfig, targets);
   const bool opaque = effectively_opaque(config);
   // Coverage only grows, so overlapping translucents keep the strongest
   static const wgpu::BlendState ReactiveBlend{
@@ -357,7 +358,7 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
   };
   std::array<wgpu::ColorTargetState, gfx::MaxColorAttachments> colorTargets{};
   for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
-    bool writes = i == targets.normal && writesDepth;
+    bool writes = i == normalTarget && writesDepth;
     if (i == targets.debugId) {
       writes = options.colorUpdate;
     } else if (i == targets.motion) {

@@ -846,7 +846,7 @@ absl::flat_hash_set<gfx::ShaderRef> s_seenShaders;
 
 HashType shader_hash(const ShaderConfig& config, DstAlphaMode dstAlphaMode, const ShaderTargets& targets) noexcept {
   auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(targets.normal, xxh3_hash(config)));
-  for (const uint32_t target : {targets.debugId, targets.motion, targets.reactive}) {
+  for (const uint32_t target : {targets.debugId, targets.motion, targets.reactive, targets.gbufferNormal}) {
     if (target != UINT32_MAX) {
       hash = xxh3_hash(target, hash);
     }
@@ -869,7 +869,9 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
 std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlphaMode,
                                 const ShaderTargets& targets) noexcept {
   ZoneScoped;
-  const uint32_t normalAttachment = targets.normal;
+  // The receiver normal reuses the legacy normal path; only its alpha differs
+  const uint32_t nrmTarget = normal_target(config, targets);
+  const bool receiverNormal = nrmTarget != UINT32_MAX && nrmTarget != targets.normal;
   const auto hash = shader_hash(config, dstAlphaMode, targets);
   const auto info = build_shader_info(config);
   if (EnableDebugPrints && !s_seenShaders.contains(hash)) {
@@ -1058,7 +1060,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
       "\n    let nrm_tmp = vec4f({}, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
       "\n    let mv_nrm = select(nrm_tmp, normalize(nrm_tmp), dot(nrm_tmp, nrm_tmp) > 1e-10);",
       vtx_attr(config, GX_VA_NRM));
-  const bool useNormalTarget = normalAttachment != UINT32_MAX && config.attrs[GX_VA_NRM].attrType != GX_NONE;
+  const bool useNormalTarget = nrmTarget != UINT32_MAX && config.attrs[GX_VA_NRM].attrType != GX_NONE;
   if (useNormalTarget || EnableNormalVisualization) {
     vtxOutAttrs += fmt::format("\n    @location({}) mv_nrm: vec3f,", vtxOutIdx++);
     vtxXfrAttrsPre += "\n    out.mv_nrm = mv_nrm;";
@@ -1698,14 +1700,20 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
   std::string_view fragmentOutputType = "@location(0) vec4f"sv;
   std::string fragmentReturn = "\n    return prev;"s;
   std::vector<OutputMember> members;
-  if (normalAttachment != UINT32_MAX) {
+  if (nrmTarget != UINT32_MAX) {
+    const std::string_view alpha =
+        receiverNormal ? "gbuffer_rx_alpha(imm._pad, nrm_len_sq)"sv : "select(0.0, 1.0, nrm_len_sq > 1e-10)"sv;
     std::string assignment =
-        useNormalTarget ? "\n    let nrm_len_sq = dot(in.mv_nrm, in.mv_nrm);"
-                          "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm), nrm_len_sq > 1e-10);"
-                          "\n    out.normal = vec4f(unit_nrm * 0.5 + 0.5, select(0.0, 1.0, nrm_len_sq > 1e-10));"s
+        useNormalTarget ? fmt::format(
+                              "\n    let nrm_len_sq = dot(in.mv_nrm, in.mv_nrm);"
+                              "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm), nrm_len_sq > 1e-10);"
+                              "\n    out.normal = vec4f(unit_nrm * 0.5 + 0.5, {});",
+                              alpha)
                         : "\n    out.normal = vec4f(0.5, 0.5, 0.5, 0.0);"s;
-    members.push_back(
-        {normalAttachment, fmt::format("    @location({}) normal: vec4f,\n", normalAttachment), std::move(assignment)});
+    if (useNormalTarget && receiverNormal) {
+      uniformPre += "\n" + receiver_alpha_wgsl();
+    }
+    members.push_back({nrmTarget, fmt::format("    @location({}) normal: vec4f,\n", nrmTarget), std::move(assignment)});
   }
   if (targets.debugId != UINT32_MAX) {
     members.push_back({targets.debugId, fmt::format("    @location({}) debug_id: u32,\n", targets.debugId),
@@ -2141,9 +2149,17 @@ ShaderTargets shader_targets(const gfx::RenderTargetLayout& layout) noexcept {
     }
   }
   if (gfx::layout_has_gbuffer(layout)) {
-    targets.normal = UINT32_MAX;
+    targets.gbufferNormal = std::exchange(targets.normal, UINT32_MAX);
   }
   return targets;
+}
+
+std::string receiver_alpha_wgsl() {
+  return fmt::format(
+      "fn gbuffer_rx_alpha(rec: u32, nrm_len_sq: f32) -> f32 {{ "
+      "let flags = select(0u, abuf[rec + {}u], rec != 0u); "
+      "return f32(select(0u, (flags >> {}u) & 3u, nrm_len_sq > 1e-10)) / 3.0; }}",
+      render_ext::DrawRecordFlagsWord, render_ext::DrawRecordReceiverShift);
 }
 
 wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout,

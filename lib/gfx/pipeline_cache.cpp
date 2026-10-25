@@ -26,6 +26,7 @@
 #include <ranges>
 #include <variant>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include <SDL3/SDL_iostream.h>
@@ -1225,6 +1226,16 @@ RenderTargetLayout pipeline_base_layout(RenderTargetLayout layout) noexcept {
   return layout;
 }
 
+// An output row under a layout without its targets would duplicate the ext-0 pipeline, blob included
+template <typename Config>
+static bool admitted(const Config& config, const RenderTargetLayout& layout) noexcept {
+  if constexpr (std::is_same_v<Config, gx::PipelineConfig>) {
+    return gx::render_ext::output_admitted(config.shaderConfig.ext, layout);
+  } else {
+    return true;
+  }
+}
+
 WarmProgress warm_known_pipelines(const RenderTargetLayout& layout, ShaderType type) {
   std::vector<KnownPipeline> known;
   {
@@ -1239,6 +1250,9 @@ WarmProgress warm_known_pipelines(const RenderTargetLayout& layout, ShaderType t
   for (const auto& pipeline : known) {
     std::visit(
         [&](const auto& config) {
+          if (!admitted(config, layout)) {
+            return;
+          }
           const PipelineRef ref = resolve_pipeline(pipeline.type, config, layout, PipelinePriority::Background);
           ++progress.total;
           progress.ready += pipeline_state(ref) != PipelineState::Pending ? 1 : 0;
@@ -1274,8 +1288,10 @@ void rebuild_pipeline_cache() {
   for (const auto& pipeline : known) {
     std::visit(
         [&](const auto& config) {
-          resolve_pipeline(pipeline.type, config, scene, PipelinePriority::Background);
-          if (offscreen.key != scene.key) {
+          if (admitted(config, scene)) {
+            resolve_pipeline(pipeline.type, config, scene, PipelinePriority::Background);
+          }
+          if (offscreen.key != scene.key && admitted(config, offscreen)) {
             resolve_pipeline(pipeline.type, config, offscreen, PipelinePriority::Background);
           }
         },

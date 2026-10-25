@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../gfx/scene_targets.hpp"
 #include "gx.hpp"
 #include "pipeline.hpp"
 
@@ -109,6 +110,15 @@ inline PipelineConfig fallback_config(const PipelineConfig& config) noexcept {
   fallback.shaderConfig.ext.output = 0;
   fallback.shaderConfig.ext.velocity = 0;
   return fallback;
+}
+
+inline bool needs_gbuffer(const RenderExtConfig& ext) noexcept {
+  return ext.output != 0 || ext.velocity != 0 || ext.fwdEnv != 0;
+}
+
+// Output bits mean something only under the M7 targets; elsewhere their text and targets are the ext-0 pipeline's
+inline bool output_admitted(const RenderExtConfig& ext, const gfx::RenderTargetLayout& layout) noexcept {
+  return !needs_gbuffer(ext) || gfx::layout_has_gbuffer(layout);
 }
 
 struct Stats {

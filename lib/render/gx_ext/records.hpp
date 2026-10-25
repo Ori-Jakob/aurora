@@ -76,11 +76,15 @@ struct Stats {
   std::array<uint64_t, 4> codes{};
 };
 
+// Bit 1 stays reserved for a later velocity window
+enum DrawInput : uint32_t { InWindow = 1u << 0 };
+
 using PushFn = gfx::Range (*)(std::span<const uint8_t> bytes) noexcept;
 
 // Game thread, while the FIFO is idle
 void apply_frame_state(const detail::FrameState& state) noexcept;
 [[nodiscard]] Stats stats() noexcept;
+[[nodiscard]] bool gbuffer() noexcept;
 void shutdown() noexcept;
 
 // FIFO thread

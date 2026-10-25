@@ -60,8 +60,7 @@ gx::render_ext::StochasticParams record_params(const material::MaterialRecord& r
   return params;
 }
 
-gx::RenderExtConfig derive(void*, const gx::PipelineConfig&, const gx::ShaderInfo& info, const gfx::RenderTargetLayout&,
-                           gx::render_ext::StochasticLanes& lanes) noexcept {
+u8 stochastic_mask(const gx::ShaderInfo& info, gx::render_ext::StochasticLanes& lanes) noexcept {
   const material::Snapshot* snapshot = g_snapshot.get();
   u8 mask = 0;
   for (u32 i = 0; i < gx::MaxTextures; ++i) {
@@ -85,7 +84,19 @@ gx::RenderExtConfig derive(void*, const gx::PipelineConfig&, const gx::ShaderInf
     lanes[i] = gx::render_ext::pack(params);
     mask |= static_cast<u8>(1u << i);
   }
-  return {.stochasticMask = mask};
+  return mask;
+}
+
+gx::RenderExtConfig derive(void*, const gx::PipelineConfig& config, const gx::ShaderInfo& info,
+                           const gfx::RenderTargetLayout& layout, gx::render_ext::StochasticLanes& lanes) noexcept {
+  gx::RenderExtConfig ext{};
+  if (g_active) {
+    ext.stochasticMask = stochastic_mask(info, lanes);
+  }
+  if (gfx::layout_has_gbuffer(layout)) {
+    ext.output = output_for(config, (gx::render_ext::g_drawInputs & records::InWindow) != 0);
+  }
+  return ext;
 }
 
 const gx::render_ext::Hooks kHooks{.derive = &derive};
@@ -93,10 +104,13 @@ const gx::render_ext::Hooks kHooks{.derive = &derive};
 void set_active(bool active, bool force) noexcept {
   g_active = active;
   g_force = force;
-  gx::render_ext::set_hooks(active ? &kHooks : nullptr);
   gx::texture::invalidate_bindings();
 }
 } // namespace
+
+uint8_t output_for(const gx::PipelineConfig& c, bool inWindow) noexcept {
+  return inWindow && ((c.depthCompare && c.depthUpdate) || c.colorUpdate) ? 1 : 0;
+}
 
 void apply_frame_state(const detail::FrameState& state) noexcept {
   records::apply_frame_state(state);
@@ -115,6 +129,7 @@ void apply_frame_state(const detail::FrameState& state) noexcept {
   if (want != g_active || force != g_force || (want && generationChanged)) {
     set_active(want, force);
   }
+  gx::render_ext::set_hooks(g_active || records::gbuffer() ? &kHooks : nullptr);
 }
 
 void shutdown() noexcept {

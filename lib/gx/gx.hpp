@@ -585,11 +585,20 @@ struct ShaderTargets {
   // Motion target; a layout property like normal, so the 3-argument form never has it
   uint32_t motion = UINT32_MAX;
   uint32_t reactive = UINT32_MAX;
+  uint32_t gbufferNormal = UINT32_MAX;
 };
+inline uint32_t normal_target(const ShaderConfig& config, const ShaderTargets& targets) noexcept {
+  if (targets.normal != UINT32_MAX) {
+    return targets.normal;
+  }
+  return config.ext.output >= 1 ? targets.gbufferNormal : UINT32_MAX;
+}
 // Under a G-buffer layout ext = 0 text writes no normal; the receiver normal belongs to output draws (M7-W5)
 ShaderTargets shader_targets(const gfx::RenderTargetLayout& layout) noexcept;
 std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlphaMode,
                                 const ShaderTargets& targets) noexcept;
+// The gbuffer receiver read, shared with the device test
+std::string receiver_alpha_wgsl();
 wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout,
                                 DstAlphaMode dstAlphaMode) noexcept;
 GXBindGroups build_bind_groups(const ShaderInfo& info, bool baseLevel = false) noexcept;

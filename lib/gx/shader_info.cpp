@@ -430,8 +430,8 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
 }
 
 static u32 count_varyings(const ShaderConfig& config, const ShaderInfo& info, const ShaderTargets& targets) noexcept {
-  const bool normal =
-      (targets.normal != UINT32_MAX && config.attrs[GX_VA_NRM].attrType != GX_NONE) || EnableNormalVisualization;
+  const bool normal = (normal_target(config, targets) != UINT32_MAX && config.attrs[GX_VA_NRM].attrType != GX_NONE) ||
+                      EnableNormalVisualization;
   return (normal ? 1u : 0u) + static_cast<u32>(info.sampledColorChannels.count() + info.sampledTexCoords.count()) +
          (targets.motion != UINT32_MAX ? MotionVaryings : 0u);
 }

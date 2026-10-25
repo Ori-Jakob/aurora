@@ -43,7 +43,24 @@ std::span<const uint8_t> bytes_of(const T& value) noexcept {
   return {reinterpret_cast<const uint8_t*>(&value), sizeof(T)};
 }
 
-uint32_t draw_inputs(const scene::DrawClass&) noexcept { return 0; }
+bool in_window(const scene::DrawClass& cls) noexcept {
+  return cls.key.window == scene::Window::Opaque && !cls.offscreen;
+}
+
+uint32_t draw_inputs(const scene::DrawClass& cls) noexcept { return in_window(cls) ? InWindow : 0u; }
+
+uint32_t receiver_code(const scene::DrawClass& cls) noexcept {
+  constexpr uint32_t NonReceivers = scene::category::Overlay | scene::category::Particle | scene::category::NoAo |
+                                    scene::category::Sky | scene::category::Ui | scene::category::FakeShadow;
+  const uint32_t categories = cls.key.categories;
+  if (cls.kind != scene::Kind::MainOpaque || !in_window(cls) || (categories & NonReceivers) != 0) {
+    return 0;
+  }
+  if ((categories & scene::category::NoShadowReceive) != 0) {
+    return 1;
+  }
+  return (categories & scene::category::CloudReceiver) != 0 ? 2 : 3;
+}
 
 bool has_debug_id(const gfx::RenderTargetLayout& layout) noexcept {
   for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
@@ -106,11 +123,14 @@ void apply_frame_state(const detail::FrameState&) noexcept {
 
 Stats stats() noexcept { return g_totals; }
 
+bool gbuffer() noexcept { return g_gbuffer; }
+
 void shutdown() noexcept {
   fold();
   if (g_totals.records != 0) {
-    Log.info("Render records: {} draws, {} reused, {} dropped over {} frames", g_totals.records, g_totals.reused,
-             g_totals.dropped, g_totals.frames);
+    const auto& codes = g_totals.codes;
+    Log.info("Render records: {} draws, {} reused, {} dropped over {} frames, codes {}/{}/{}/{}", g_totals.records,
+             g_totals.reused, g_totals.dropped, g_totals.frames, codes[0], codes[1], codes[2], codes[3]);
   }
   g_active = false;
   g_gbuffer = false;
@@ -137,7 +157,9 @@ void stamp(gx::DrawData& draw, const gx::PipelineConfig& config, const scene::Dr
     ++g_frame.dropped;
     return;
   }
-  DrawRecord record{.frameOff = g_frameLoc, .flags = motion.flags, .prevMtxOff = motion.prevMtxOff};
+  DrawRecord record{.frameOff = g_frameLoc,
+                    .flags = motion.flags | (receiver_code(cls) << flag::ReceiverShift),
+                    .prevMtxOff = motion.prevMtxOff};
   if (cls.key.object.valid) {
     record.objectLo = static_cast<uint32_t>(cls.key.object.id);
     record.objectHi = static_cast<uint32_t>(cls.key.object.id >> 32);

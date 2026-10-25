@@ -2,8 +2,10 @@
 
 #include "gx_shader_corpus.hpp"
 
+#include "gfx/frame_packet.hpp"
 #include "gfx/recording.hpp"
 #include "gfx/resources.hpp"
+#include "gfx/scene_targets.hpp"
 #include "gx/gx.hpp"
 #include "gx/pipeline.hpp"
 #include "gx/render_ext.hpp"
@@ -461,6 +463,15 @@ size_t check_varyings(std::span<const corpus::Entry> entries) {
       EXPECT_LE(locations, planned) << entry.label << " normal " << targets.normal;
       maxLocations = std::max(maxLocations, locations);
     }
+    if (mode != DstAlphaMode::DualSource) {
+      ShaderConfig marker = config;
+      marker.ext.output = 1;
+      const ShaderTargets gbuffer{.motion = 2, .reactive = 3, .gbufferNormal = 1};
+      const size_t locations = location_count(build_shader_source(marker, mode, gbuffer));
+      EXPECT_EQ(locations, varying_count(marker, gbuffer)) << entry.label << " receiver normal";
+      EXPECT_LE(locations, planned) << entry.label << " receiver normal";
+      maxLocations = std::max(maxLocations, locations);
+    }
   }
   return maxLocations;
 }
@@ -592,6 +603,124 @@ TEST_F(GxShaderExtTest, ReactiveNeedsReactiveTarget) {
   const std::string both = build_shader_source(config, DstAlphaMode::None, ShaderTargets{.motion = 2, .reactive = 3});
   EXPECT_LT(fragment_output(both).find("motion: vec2f"), fragment_output(both).find("reactive: vec4f"));
   EXPECT_LT(both.find("out.motion ="), both.find("out.reactive ="));
+}
+ShaderConfig lit_normal_config() {
+  ShaderConfig config = single_site();
+  config.attrs[GX_VA_NRM] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32};
+  config.colorChannels[GX_COLOR0] = {.matSrc = GX_SRC_REG, .ambSrc = GX_SRC_REG, .lightingEnabled = true};
+  config.tevStages[0].colorPass = {GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASC, GX_CC_ZERO};
+  config.tevStages[0].channelId = GX_COLOR0A0;
+  return config;
+}
+
+ShaderConfig with_output(ShaderConfig config, u8 output) {
+  config.ext.output = output;
+  return config;
+}
+
+constexpr ShaderTargets GbufferTargets{.motion = 2, .reactive = 3, .gbufferNormal = 1};
+
+TEST_F(GxShaderExtTest, OutputRowsAdmittedOnlyUnderGbufferLayouts) {
+  const gfx::SceneLayoutBase base{
+      .color = wgpu::TextureFormat::BGRA8Unorm,
+      .depth = wgpu::TextureFormat::Depth32Float,
+      .size = {64, 64, 1},
+      .samples = 1,
+  };
+  const gfx::RenderTargetLayout gbuffer = gfx::compose_scene_layout({.gbuffer = true}, base);
+  gfx::RenderTargetLayout offscreen = gbuffer;
+  offscreen.colorAttachmentCount = 1;
+  gfx::detail::finalize_render_target_layout(offscreen);
+  const std::array without{gfx::compose_scene_layout({}, base), gfx::compose_scene_layout({.normal = true}, base),
+                           gfx::compose_scene_layout({.normal = true, .debugId = true}, base), offscreen};
+  const std::array with{gbuffer, gfx::compose_scene_layout({.gbuffer = true, .debugId = true}, base)};
+  const std::array plain{RenderExtConfig{}, RenderExtConfig{.stochasticMask = 0b101}, RenderExtConfig{.pom = 1}};
+  const std::array marked{RenderExtConfig{.output = 1}, RenderExtConfig{.output = 2}, RenderExtConfig{.velocity = 1},
+                          RenderExtConfig{.fwdEnv = 1}, RenderExtConfig{.output = 1, .stochasticMask = 1}};
+  for (const RenderExtConfig& ext : plain) {
+    EXPECT_FALSE(render_ext::needs_gbuffer(ext));
+    for (const auto& layout : without) {
+      EXPECT_TRUE(render_ext::output_admitted(ext, layout));
+    }
+    for (const auto& layout : with) {
+      EXPECT_TRUE(render_ext::output_admitted(ext, layout));
+    }
+  }
+  for (const RenderExtConfig& ext : marked) {
+    EXPECT_TRUE(render_ext::needs_gbuffer(ext));
+    for (const auto& layout : without) {
+      EXPECT_FALSE(render_ext::output_admitted(ext, layout)) << layout.colorAttachmentCount;
+    }
+    for (const auto& layout : with) {
+      EXPECT_TRUE(render_ext::output_admitted(ext, layout)) << layout.colorAttachmentCount;
+    }
+  }
+  const ShaderTargets targets = shader_targets(gbuffer);
+  EXPECT_EQ(targets.normal, UINT32_MAX);
+  EXPECT_EQ(targets.gbufferNormal, 1u);
+  EXPECT_EQ(shader_targets(without[1]).gbufferNormal, UINT32_MAX);
+  EXPECT_EQ(shader_targets(without[1]).normal, 1u);
+}
+
+TEST_F(GxShaderExtTest, GbufferNormalAlphaCarriesReceiverCode) {
+  const std::string helper = receiver_alpha_wgsl();
+  EXPECT_NE(helper.find("fn gbuffer_rx_alpha(rec: u32, nrm_len_sq: f32) -> f32"), std::string::npos);
+  EXPECT_NE(helper.find("abuf[rec + 1u]"), std::string::npos);
+  EXPECT_NE(helper.find(">> 6u) & 3u"), std::string::npos);
+  EXPECT_NE(helper.find("rec != 0u"), std::string::npos);
+  EXPECT_NE(helper.find("nrm_len_sq > 1e-10"), std::string::npos);
+
+  const ShaderConfig lit = lit_normal_config();
+  ShaderConfig unlit = single_site();
+  unlit.attrs[GX_VA_NRM] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32};
+  for (const ShaderConfig& config : {lit, unlit}) {
+    for (const auto mode : {DstAlphaMode::None, DstAlphaMode::Replace}) {
+      const std::string marker = build_shader_source(with_output(config, 1), mode, GbufferTargets);
+      EXPECT_NE(fragment_output(marker).find("@location(1) normal: vec4f,"), std::string::npos);
+      EXPECT_EQ(count(marker, "out.normal = vec4f(unit_nrm * 0.5 + 0.5, gbuffer_rx_alpha(imm._pad, nrm_len_sq));"), 1u);
+      EXPECT_EQ(count(marker, helper), 1u);
+      EXPECT_EQ(marker.find("select(0.0, 1.0, nrm_len_sq > 1e-10)"), std::string::npos);
+
+      const std::string plain = build_shader_source(config, mode, GbufferTargets);
+      EXPECT_EQ(fragment_output(plain).find("normal: vec4f"), std::string::npos);
+      EXPECT_EQ(plain.find("gbuffer_rx_alpha"), std::string::npos);
+      EXPECT_EQ(plain, build_shader_source(config, mode, ShaderTargets{.motion = 2, .reactive = 3}));
+
+      for (const u8 output : {u8{1}, u8{2}}) {
+        EXPECT_EQ(build_shader_source(with_output(config, output), mode), build_shader_source(config, mode));
+        EXPECT_EQ(build_shader_source(with_output(config, output), mode, 1u), build_shader_source(config, mode, 1u));
+        EXPECT_EQ(build_shader_source(with_output(config, output), mode, ShaderTargets{.normal = 1, .debugId = 2}),
+                  build_shader_source(config, mode, ShaderTargets{.normal = 1, .debugId = 2}));
+      }
+    }
+  }
+
+  const std::string noNormal = build_shader_source(with_output(single_site(), 1), DstAlphaMode::None, GbufferTargets);
+  EXPECT_NE(fragment_output(noNormal).find("@location(1) normal: vec4f,"), std::string::npos);
+  EXPECT_NE(noNormal.find("out.normal = vec4f(0.5, 0.5, 0.5, 0.0);"), std::string::npos);
+  EXPECT_EQ(noNormal.find("gbuffer_rx_alpha"), std::string::npos);
+  EXPECT_EQ(noNormal.find("mv_nrm:"), std::string::npos);
+}
+
+TEST_F(GxShaderExtTest, GbufferLitDrawCarriesNormalVarying) {
+  const ShaderConfig lit = lit_normal_config();
+  ASSERT_TRUE(build_shader_info(lit).lightingEnabled);
+  const ShaderConfig marker = with_output(lit, 1);
+  const std::string text = build_shader_source(marker, DstAlphaMode::None, GbufferTargets);
+  EXPECT_EQ(count(vertex_output(text), "mv_nrm: vec3f,"), 1u);
+  EXPECT_EQ(count(text, "out.mv_nrm = mv_nrm;"), 1u);
+  EXPECT_EQ(count(text, "let nrm_len_sq = dot(in.mv_nrm, in.mv_nrm);"), 1u);
+  EXPECT_EQ(location_count(text), varying_count(marker, GbufferTargets));
+  EXPECT_EQ(varying_count(marker, GbufferTargets), varying_count(lit, GbufferTargets) + 1);
+  EXPECT_LE(location_count(text), static_cast<size_t>(build_shader_info(marker).varyings));
+
+  const std::string plain = build_shader_source(lit, DstAlphaMode::None, GbufferTargets);
+  EXPECT_EQ(vertex_output(plain).find("mv_nrm"), std::string::npos);
+  EXPECT_EQ(location_count(plain), varying_count(lit, GbufferTargets));
+
+  const ShaderTargets legacy{.normal = 1};
+  EXPECT_EQ(varying_count(marker, legacy), varying_count(lit, legacy));
+  EXPECT_EQ(location_count(build_shader_source(marker, DstAlphaMode::None, legacy)), varying_count(marker, legacy));
 }
 } // namespace
 } // namespace aurora::gx

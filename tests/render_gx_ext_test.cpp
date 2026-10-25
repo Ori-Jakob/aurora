@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 
+#include "gfx/scene_targets.hpp"
+#include "gx/draw_route.hpp"
 #include "gx/gx.hpp"
+#include "gx/hints.hpp"
 #include "gx/render_ext.hpp"
 #include "gx/texture.hpp"
 #include "render/frame_state.hpp"
@@ -433,7 +436,7 @@ TEST_F(RenderGxExt, RecordsActiveFollowsLayout) {
   apply_frame_state(frame(false, false));
   gx::render_ext::g_drawInputs = 5;
   EXPECT_TRUE(records::on_route(draw_class()));
-  EXPECT_EQ(gx::render_ext::g_drawInputs, 0u);
+  EXPECT_EQ(gx::render_ext::g_drawInputs, records::InWindow);
   const uint32_t a = stamp(draw_class(scene::Window::Opaque, 1));
   EXPECT_NE(a, 0u);
   EXPECT_EQ(stamp(draw_class(scene::Window::Opaque, 1)), a);
@@ -454,6 +457,223 @@ TEST_F(RenderGxExt, RecordsActiveFollowsLayout) {
   apply_frame_state(frame(false, false));
   EXPECT_FALSE(records::on_route(draw_class()));
   EXPECT_EQ(stamp(draw_class(scene::Window::Opaque, 1)), 0u);
+}
+scene::DrawClass receiver_class(uint32_t categories, scene::Kind kind = scene::Kind::MainOpaque,
+                                scene::Window window = scene::Window::Opaque) {
+  scene::DrawClass cls = draw_class(window, 1);
+  cls.kind = kind;
+  cls.key.categories = categories;
+  return cls;
+}
+
+uint32_t stamped_code(const scene::DrawClass& cls) {
+  const uint32_t locator = stamp(cls);
+  EXPECT_NE(locator, 0u);
+  const uint32_t flags = FakeStorage::at<records::DrawRecord>(locator).flags;
+  return (flags & records::flag::ReceiverMask) >> records::flag::ReceiverShift;
+}
+
+TEST_F(RenderGxExt, ReceiverCodesFollowCategories) {
+  namespace cat = scene::category;
+  records::testing::set_push(&FakeStorage::push);
+  records::testing::set_active(true, true, false);
+  EXPECT_EQ(stamped_code(receiver_class(0)), 3u);
+  EXPECT_EQ(stamped_code(receiver_class(cat::Static | cat::Terrain)), 3u);
+  EXPECT_EQ(stamped_code(receiver_class(cat::NoShadowReceive)), 1u);
+  EXPECT_EQ(stamped_code(receiver_class(cat::NoShadowReceive | cat::CloudReceiver)), 1u);
+  EXPECT_EQ(stamped_code(receiver_class(cat::CloudReceiver | cat::Foliage)), 2u);
+  for (const uint32_t category : {cat::Overlay, cat::Particle, cat::NoAo, cat::Sky, cat::Ui, cat::FakeShadow}) {
+    EXPECT_EQ(stamped_code(receiver_class(category)), 0u) << category;
+    EXPECT_EQ(stamped_code(receiver_class(category | cat::CloudReceiver)), 0u) << category;
+  }
+  for (const scene::Kind kind : {scene::Kind::MainBlended, scene::Kind::Overlay, scene::Kind::Sky, scene::Kind::Foreign,
+                                 scene::Kind::MainDepthOnly}) {
+    EXPECT_EQ(stamped_code(receiver_class(cat::Terrain, kind)), 0u) << static_cast<int>(kind);
+  }
+  for (const scene::Window window : {scene::Window::PreScene, scene::Window::Translucent}) {
+    EXPECT_EQ(stamped_code(receiver_class(cat::Terrain, scene::Kind::MainOpaque, window)), 0u)
+        << static_cast<int>(window);
+  }
+  scene::DrawClass offscreen = receiver_class(cat::Terrain);
+  offscreen.offscreen = true;
+  EXPECT_EQ(stamp(offscreen), 0u);
+
+  apply_frame_state(frame(false, false));
+  const records::Stats stats = records::stats();
+  EXPECT_EQ(stats.codes[1], 2u);
+  EXPECT_EQ(stats.codes[2], 1u);
+  EXPECT_EQ(stats.codes[3], 2u);
+  EXPECT_EQ(stats.codes[0], 19u);
+}
+
+// C_MTXPerspective(60, 4:3, 1, 1000), as GXSetProjection receives it
+Mat4x4<float> perspective() {
+  Mat4x4<float> proj{};
+  proj.m0[0] = 1.2990381f;
+  proj.m1[1] = 1.7320508f;
+  proj.m2[2] = -1.f / 999.f;
+  proj.m2[3] = -1000.f / 999.f;
+  proj.m3[2] = -1.f;
+  return proj;
+}
+
+gfx::RenderTargetLayout scene_layout(bool gbuffer) {
+  return gfx::compose_scene_layout({.gbuffer = gbuffer}, {.color = wgpu::TextureFormat::BGRA8Unorm,
+                                                          .depth = wgpu::TextureFormat::Depth32Float,
+                                                          .size = {64, 64, 1},
+                                                          .samples = 1});
+}
+
+gx::PipelineConfig writer(bool depth, bool color) {
+  gx::PipelineConfig config{};
+  config.depthCompare = true;
+  config.depthUpdate = depth;
+  config.colorUpdate = color;
+  return config;
+}
+
+uint8_t derived_output(const gx::PipelineConfig& config, const gfx::RenderTargetLayout& layout) {
+  const gx::render_ext::Hooks* hooks = gx::render_ext::hooks();
+  EXPECT_NE(hooks, nullptr);
+  if (hooks == nullptr) {
+    return 0xFF;
+  }
+  gx::render_ext::StochasticLanes lanes{};
+  const gx::RenderExtConfig ext = hooks->derive(hooks->userData, config, gx::ShaderInfo{}, layout, lanes);
+  EXPECT_EQ(ext.stochasticMask, 0u);
+  return ext.output;
+}
+
+TEST_F(RenderGxExt, OpaqueParticleAndNoAoKeepCodeZero) {
+  const ScopedTargets targets;
+  const ScopedHints hints;
+  records::testing::set_push(&FakeStorage::push);
+  webgpu::g_graphicsConfig.gbuffer = true;
+  apply_frame_state(frame(false, false));
+  ASSERT_TRUE(records::gbuffer());
+  const gx::hints::Sink& sink = *gx::hints::sink();
+  const gx::draw_route::Router& router = *gx::draw_route::router();
+  const gx::hints::Camera main{
+      .role = AURORA_CAMERA_MAIN,
+      .proj = perspective(),
+      .type = GX_PERSPECTIVE,
+      .gxProj = gx::hints::gx_projection(perspective(), GX_PERSPECTIVE),
+  };
+  sink.camera(sink.userData, main);
+  sink.stage(sink.userData, Stage::SceneBegin);
+  gx::GXState& state = gx::g_gxState;
+  state.proj = main.gxProj;
+  state.depthCompare = true;
+  state.depthUpdate = true;
+  state.colorUpdate = true;
+  state.blendMode = GX_BM_NONE;
+  const gfx::RenderTargetLayout gbuffer = scene_layout(true);
+  const auto routed = [&](uint32_t expectedCode) {
+    EXPECT_EQ(router.route(router.userData, {.prim = GX_TRIANGLES, .fmt = GX_VTXFMT0, .vtxCount = 3}).route,
+              gx::draw_route::Route::Push);
+    EXPECT_EQ(gx::render_ext::g_drawInputs, records::InWindow);
+    const gx::PipelineConfig config = writer(true, true);
+    EXPECT_EQ(derived_output(config, gbuffer), 1u);
+    gx::DrawData draw{};
+    draw.instanceCount = 1;
+    router.push(router.userData, draw, config, gx::ShaderInfo{});
+    ASSERT_NE(draw.immediateData._pad, 0u);
+    const uint32_t flags = FakeStorage::at<records::DrawRecord>(draw.immediateData._pad).flags;
+    EXPECT_EQ((flags & records::flag::ReceiverMask) >> records::flag::ReceiverShift, expectedCode);
+  };
+
+  sink.objectBegin(sink.userData, {.id = 1, .generation = 1, .categories = AURORA_CAT_PARTICLE});
+  routed(0);
+  sink.objectEnd(sink.userData);
+  sink.scopePush(sink.userData, {.categories = AURORA_CAT_NO_AO});
+  sink.objectBegin(sink.userData, {.id = 2, .generation = 1, .categories = AURORA_CAT_STATIC});
+  routed(0);
+  sink.objectEnd(sink.userData);
+  sink.scopePop(sink.userData);
+  sink.objectBegin(sink.userData, {.id = 3, .generation = 1, .categories = AURORA_CAT_STATIC | AURORA_CAT_TERRAIN});
+  routed(3);
+  sink.objectEnd(sink.userData);
+}
+
+TEST_F(RenderGxExt, OutputMarksInWindowWritersOnly) {
+  const ScopedTargets targets;
+  const ScopedHints hints;
+  webgpu::g_graphicsConfig.gbuffer = true;
+  apply_frame_state(frame(false, false));
+  const gfx::RenderTargetLayout gbuffer = scene_layout(true);
+  const gfx::RenderTargetLayout legacy = scene_layout(false);
+  ASSERT_TRUE(gfx::layout_has_gbuffer(gbuffer));
+  const gx::PipelineConfig depthOnly = writer(true, false);
+  const gx::PipelineConfig colorOnly = writer(false, true);
+  const gx::PipelineConfig both = writer(true, true);
+  gx::PipelineConfig noTest = writer(true, false);
+  noTest.depthCompare = false;
+
+  for (const scene::Kind kind : {scene::Kind::MainOpaque, scene::Kind::MainBlended, scene::Kind::Overlay,
+                                 scene::Kind::Sky, scene::Kind::Foreign, scene::Kind::MainDepthOnly}) {
+    scene::DrawClass cls = draw_class();
+    cls.kind = kind;
+    cls.key.role = kind == scene::Kind::Sky ? scene::Role::Sky : scene::Role::Main;
+    records::on_route(cls);
+    EXPECT_EQ(gx::render_ext::g_drawInputs, records::InWindow);
+    for (const gx::PipelineConfig& config : {depthOnly, colorOnly, both}) {
+      EXPECT_EQ(derived_output(config, gbuffer), 1u) << static_cast<int>(kind);
+      EXPECT_EQ(derived_output(config, legacy), 0u) << static_cast<int>(kind);
+    }
+    EXPECT_EQ(derived_output(writer(false, false), gbuffer), 0u);
+    EXPECT_EQ(derived_output(noTest, gbuffer), 0u);
+  }
+
+  scene::DrawClass offscreen = draw_class();
+  offscreen.offscreen = true;
+  for (const scene::DrawClass& cls : {draw_class(scene::Window::PreScene), draw_class(scene::Window::Translucent),
+                                      draw_class(scene::Window::Post), offscreen}) {
+    records::on_route(cls);
+    EXPECT_EQ(gx::render_ext::g_drawInputs, 0u);
+    EXPECT_EQ(derived_output(both, gbuffer), 0u);
+  }
+
+  EXPECT_EQ(output_for(both, true), 1u);
+  EXPECT_EQ(output_for(depthOnly, true), 1u);
+  EXPECT_EQ(output_for(colorOnly, true), 1u);
+  EXPECT_EQ(output_for(noTest, true), 0u);
+  EXPECT_EQ(output_for(both, false), 0u);
+}
+
+TEST_F(RenderGxExt, HooksInstalledForGbufferWithoutStochastic) {
+  const ScopedTargets targets;
+  const ScopedHints hints;
+  add(Flagged);
+  apply_frame_state(frame(false, false));
+  EXPECT_EQ(gx::render_ext::hooks(), nullptr);
+
+  webgpu::g_graphicsConfig.gbuffer = true;
+  const uint64_t generation = gx::texture::current_bind_generation();
+  apply_frame_state(frame(false, false));
+  const gx::render_ext::Hooks* hooks = gx::render_ext::hooks();
+  ASSERT_NE(hooks, nullptr);
+  EXPECT_FALSE(testing::active());
+  EXPECT_EQ(gx::texture::current_bind_generation(), generation);
+  gx::g_gxState.textures[0].material = material_ref(FlaggedKey);
+  gx::render_ext::StochasticLanes lanes{};
+  EXPECT_EQ(hooks->derive(hooks->userData, writer(true, true), eligible(1), scene_layout(true), lanes).stochasticMask,
+            0u);
+
+  apply_frame_state(frame(true, true));
+  EXPECT_TRUE(testing::active());
+  EXPECT_EQ(gx::render_ext::hooks(), hooks);
+  EXPECT_EQ(hooks->derive(hooks->userData, writer(true, true), eligible(1), scene_layout(true), lanes).stochasticMask,
+            1u);
+
+  webgpu::g_graphicsConfig.gbuffer = false;
+  apply_frame_state(frame(false, false));
+  EXPECT_EQ(gx::render_ext::hooks(), nullptr);
+
+  webgpu::g_graphicsConfig.gbuffer = true;
+  detail::remove_hints();
+  apply_frame_state(frame(false, false));
+  EXPECT_FALSE(records::gbuffer());
+  EXPECT_EQ(gx::render_ext::hooks(), nullptr);
 }
 } // namespace
 } // namespace aurora::render::gx_ext

@@ -14,7 +14,9 @@
 #include "gx/render_ext.hpp"
 #include "gx/shader_info.hpp"
 
+#include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -546,6 +548,84 @@ TEST_F(GxShaderExtDevice, GbufferPipelineFailureIsCaptured) {
   EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
 }
 
+gfx::RenderTargetLayout gbuffer_id_layout() {
+  return gfx::compose_scene_layout({.gbuffer = true, .debugId = true}, {.color = wgpu::TextureFormat::BGRA8Unorm,
+                                                                        .depth = wgpu::TextureFormat::Depth32Float,
+                                                                        .size = {64, 64, 1},
+                                                                        .samples = 1});
+}
+
+ShaderConfig with_output(ShaderConfig config, u8 output) {
+  config.ext.output = output;
+  return config;
+}
+
+bool has_normal(const ShaderConfig& config) { return config.attrs[GX_VA_NRM].attrType != GX_NONE; }
+
+TEST_F(GxShaderExtDevice, GbufferMarkerValidates) {
+  constexpr size_t PerClass = 8;
+  ASSERT_TRUE(start({.backend = wgpu::BackendType::Null, .core = true}, true));
+  gfx::set_blocking_pipelines(true);
+  std::array<std::vector<ShaderConfig>, 3> classes;
+  for (const ShaderConfig& config : legacy_valid_configs(*m_device)) {
+    const size_t index = !has_normal(config) ? 2 : build_shader_info(config).lightingEnabled ? 0 : 1;
+    if (classes[index].size() < PerClass) {
+      classes[index].push_back(config);
+    }
+  }
+  const uint64_t failures = gbuffer_pipeline_failures();
+  size_t checked = 0;
+  for (size_t index = 0; index < classes.size(); ++index) {
+    ASSERT_FALSE(classes[index].empty()) << "class " << index;
+    for (const gfx::RenderTargetLayout& layout : {gbuffer_layout(), gbuffer_id_layout()}) {
+      const ShaderTargets targets = shader_targets(layout);
+      ASSERT_NE(targets.gbufferNormal, UINT32_MAX);
+      for (const ShaderConfig& base : classes[index]) {
+        for (const u8 output : {u8{0}, u8{1}}) {
+          const ShaderConfig config = with_output(base, output);
+          for (const auto mode : {DstAlphaMode::None, DstAlphaMode::Replace}) {
+            const std::string text = build_shader_source(config, mode, targets);
+            EXPECT_EQ(text.find("gbuffer_rx_alpha(imm._pad") != std::string::npos, output == 1 && index != 2);
+            const auto error = module_error(*m_device, text);
+            EXPECT_FALSE(error.has_value())
+                << "class " << index << " output " << int{output} << ": " << error.value_or("");
+            PipelineConfig pipeline = pipeline_for(config);
+            pipeline.dstAlpha = mode == DstAlphaMode::Replace ? 0x80 : UINT32_MAX;
+            EXPECT_EQ(gfx::pipeline_state(gfx::find_debug_pipeline(pipeline, layout)), gfx::PipelineState::Ready)
+                << "class " << index << " output " << int{output};
+            ++checked;
+          }
+        }
+      }
+    }
+  }
+  EXPECT_EQ(gbuffer_pipeline_failures(), failures);
+  EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
+  RecordProperty("checked", static_cast<int>(checked));
+}
+
+TEST_F(GxShaderExtDevice, WarmSkipsOutputRowsWithoutTargets) {
+  ASSERT_TRUE(start({.backend = wgpu::BackendType::Null, .core = true}, true));
+  gfx::set_blocking_pipelines(true);
+  const std::vector<ShaderConfig> configs = legacy_valid_configs(*m_device, 1);
+  ASSERT_FALSE(configs.empty());
+  const gfx::RenderTargetLayout gbuffer = gbuffer_layout();
+  const std::array without{scene_layout(), debug_id_layout(true)};
+  const auto known = [](const gfx::RenderTargetLayout& layout) {
+    return gfx::warm_known_pipelines(layout, gfx::ShaderType::GX).total;
+  };
+  const uint32_t before = known(gbuffer);
+  const std::array<uint32_t, 2> beforeWithout{known(without[0]), known(without[1])};
+  const PipelineConfig plain = pipeline_for(configs.front());
+  const PipelineConfig marker = pipeline_for(with_output(configs.front(), 1));
+  EXPECT_EQ(gfx::pipeline_state(gfx::find_pipeline(plain, gbuffer)), gfx::PipelineState::Ready);
+  EXPECT_EQ(gfx::pipeline_state(gfx::find_pipeline(marker, gbuffer)), gfx::PipelineState::Ready);
+  EXPECT_EQ(known(gbuffer), before + 2);
+  for (size_t i = 0; i < without.size(); ++i) {
+    EXPECT_EQ(known(without[i]), beforeWithout[i] + 1) << i;
+  }
+}
+
 TEST_F(GxShaderExtDevice, MotionPipelinesCompileOnBackend) {
   const auto backend = hardware_backend();
   if (!backend) {
@@ -728,6 +808,116 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     EXPECT_GE(v[3], 0.f) << "point " << i;
   }
   EXPECT_NEAR((*values)[3], 1.f / 3.f, 1e-4f) << "centroid";
+}
+TEST_F(GxShaderExtDevice, ReceiverAlphaRoundTripsThroughRgb10a2) {
+  const auto backend = hardware_backend();
+  if (!backend) {
+    GTEST_SKIP() << "AURORA_TEST_BACKEND names no hardware backend";
+  }
+  if (!start({.backend = *backend, .core = true, .allowCpu = false}, false)) {
+    GTEST_SKIP() << "no adapter";
+  }
+  constexpr uint32_t Width = 6;
+  const std::string text = "@group(0) @binding(0) var<storage, read> abuf: array<u32>;\n" + receiver_alpha_wgsl() + R"(
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+    let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4f(p * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+    let x = u32(pos.x);
+    let rec = select(select(4u + x * 8u, 0u, x == 4u), 28u, x == 5u);
+    let nrm = select(vec3f(0.0, 0.0, 1.0), vec3f(0.0), x == 5u);
+    let nrm_len_sq = dot(nrm, nrm);
+    return vec4f(nrm * 0.5 + 0.5, gbuffer_rx_alpha(rec, nrm_len_sq));
+}
+)";
+  std::array<uint32_t, 40> words{};
+  words.fill(0xFFFFFFFFu);
+  for (uint32_t code = 0; code < 4; ++code) {
+    words[4 + code * 8 + render_ext::DrawRecordFlagsWord] = (code << render_ext::DrawRecordReceiverShift) | 0xFF3Fu;
+  }
+  const wgpu::BufferDescriptor bufferDescriptor{.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                                                .size = sizeof(words)};
+  const wgpu::Buffer records = m_device->device.CreateBuffer(&bufferDescriptor);
+  m_device->queue.WriteBuffer(records, 0, words.data(), sizeof(words));
+  const wgpu::TextureDescriptor textureDescriptor{
+      .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc,
+      .size = {Width, 1, 1},
+      .format = wgpu::TextureFormat::RGB10A2Unorm,
+  };
+  const wgpu::Texture target = m_device->device.CreateTexture(&textureDescriptor);
+
+  const wgpu::ShaderSourceWGSL wgsl{wgpu::ShaderSourceWGSL::Init{.code = text.c_str()}};
+  const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl};
+  const wgpu::ShaderModule module = m_device->device.CreateShaderModule(&moduleDescriptor);
+  const wgpu::ColorTargetState colorTarget{.format = wgpu::TextureFormat::RGB10A2Unorm};
+  const wgpu::FragmentState fragment{
+      .module = module, .entryPoint = "fs_main", .targetCount = 1, .targets = &colorTarget};
+  const wgpu::RenderPipelineDescriptor pipelineDescriptor{
+      .vertex = {.module = module, .entryPoint = "vs_main"},
+      .fragment = &fragment,
+  };
+  const wgpu::RenderPipeline pipeline = m_device->device.CreateRenderPipeline(&pipelineDescriptor);
+  const wgpu::BindGroupEntry entry{.binding = 0, .buffer = records, .size = sizeof(words)};
+  const wgpu::BindGroupDescriptor groupDescriptor{
+      .layout = pipeline.GetBindGroupLayout(0), .entryCount = 1, .entries = &entry};
+  const wgpu::BindGroup group = m_device->device.CreateBindGroup(&groupDescriptor);
+
+  const wgpu::RenderPassColorAttachment attachment{
+      .view = target.CreateView(),
+      .loadOp = wgpu::LoadOp::Clear,
+      .storeOp = wgpu::StoreOp::Store,
+      .clearValue = {0.0, 0.0, 0.0, 0.0},
+  };
+  const wgpu::RenderPassDescriptor passDescriptor{.colorAttachmentCount = 1, .colorAttachments = &attachment};
+  const wgpu::CommandEncoder encoder = m_device->device.CreateCommandEncoder();
+  const wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&passDescriptor);
+  pass.SetPipeline(pipeline);
+  pass.SetBindGroup(0, group);
+  pass.Draw(3);
+  pass.End();
+  const wgpu::CommandBuffer commands = encoder.Finish();
+  m_device->queue.Submit(1, &commands);
+
+  const std::vector<float> texels = test::read_texture_mip(*m_device, target, 0);
+  ASSERT_EQ(texels.size(), Width);
+  constexpr std::array<uint32_t, Width> Expected{0, 1, 2, 3, 0, 0};
+  for (uint32_t x = 0; x < Width; ++x) {
+    EXPECT_EQ(std::bit_cast<uint32_t>(texels[x]) >> 30, Expected[x]) << "x " << x;
+  }
+}
+
+TEST_F(GxShaderExtDevice, GbufferMarkerPipelinesCompileOnBackend) {
+  const auto backend = hardware_backend();
+  if (!backend) {
+    GTEST_SKIP() << "AURORA_TEST_BACKEND names no hardware backend";
+  }
+  if (!start({.backend = *backend, .core = true, .allowCpu = false}, true)) {
+    GTEST_SKIP() << "no adapter";
+  }
+  const gfx::RenderTargetLayout layout = gbuffer_layout();
+  std::vector<ShaderConfig> configs = legacy_valid_configs(*m_device);
+  // Normals first, so the receiver path is what compiles
+  std::ranges::stable_partition(configs, has_normal);
+  ASSERT_GE(configs.size(), 64u);
+  ASSERT_TRUE(has_normal(configs.front()));
+  configs.resize(64);
+  const uint64_t failures = gbuffer_pipeline_failures();
+  size_t compiled = 0;
+  for (const ShaderConfig& config : configs) {
+    const PipelineConfig marker = pipeline_for(with_output(config, 1));
+    for (const PipelineConfig& variant : {marker, blended(marker)}) {
+      const bool built = static_cast<bool>(create_pipeline(variant, layout).main);
+      EXPECT_TRUE(built);
+      compiled += built ? 1 : 0;
+    }
+  }
+  EXPECT_EQ(gbuffer_pipeline_failures(), failures);
+  RecordProperty("compiled", static_cast<int>(compiled));
 }
 } // namespace
 } // namespace aurora::gx
