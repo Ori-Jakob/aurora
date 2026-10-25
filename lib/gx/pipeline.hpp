@@ -3,6 +3,9 @@
 #include "../gfx/pipeline_cache.hpp"
 #include "gx.hpp"
 
+#include <optional>
+#include <span>
+
 namespace aurora::gx {
 struct DrawData {
   gfx::PipelineRef pipeline;
@@ -17,7 +20,11 @@ struct DrawData {
   uint32_t dstAlpha;
 };
 
-constexpr uint32_t GXPipelineConfigVersion = 13;
+constexpr uint32_t GXPipelineConfigVersion = 14;
+// Bumped when a stored ext != 0 config would mean or normalize differently; WGSL text changes never need it
+constexpr uint32_t RenderShaderRev = 1;
+static_assert(GXPipelineConfigVersion < 0x10000);
+constexpr uint32_t GXExtRowVersion = (RenderShaderRev << 16) | GXPipelineConfigVersion;
 struct PipelineConfig {
   uint32_t version = GXPipelineConfigVersion;
   uint32_t msaaSamples = 1; // deprecated
@@ -34,6 +41,11 @@ struct PipelineConfig {
   bool depthCompare, depthUpdate, alphaUpdate, colorUpdate;
 };
 static_assert(std::has_unique_object_representations_v<PipelineConfig>);
+
+constexpr uint32_t persisted_version(const PipelineConfig& config) noexcept {
+  return config.shaderConfig.ext == RenderExtConfig{} ? config.version : GXExtRowVersion;
+}
+std::optional<PipelineConfig> migrate_v13_config(std::span<const uint8_t> bytes) noexcept;
 
 struct PipelineOptions {
   DstAlphaMode dstAlphaMode = DstAlphaMode::None;

@@ -7,6 +7,7 @@
 #include "../../gfx/resources.hpp"
 #include "../../gx/gx.hpp"
 #include "../../gx/pipeline.hpp"
+#include "../../gx/render_ext.hpp"
 #include "../../gx/shader_info.hpp"
 #include "../../logging.hpp"
 
@@ -102,6 +103,8 @@ bool make_view_variant(const gx::PipelineConfig& config, const gx::ShaderInfo& i
     }
   }
   out = config;
+  // A pending ext draw may carry the legacy ref, so variants keyed by it must not hold texture bits
+  out.shaderConfig.ext = gx::render_ext::without_texture_bits(out.shaderConfig.ext);
   gx::TevStage& stage = out.shaderConfig.tevStages[shader.tevStageCount - 1];
   stage.colorPass = {GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_KONST};
   stage.colorOp.op = GX_TEV_ADD;

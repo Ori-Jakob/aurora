@@ -5,6 +5,7 @@
 #include "../webgpu/gpu.hpp"
 #include "gx.hpp"
 #include "gx_fmt.hpp"
+#include "hex_wgsl.hpp"
 #include "shader_info.hpp"
 
 #include <dolphin/gx/GXEnum.h>
@@ -78,17 +79,6 @@ std::string alpha_bump_sel(size_t stageIdx, const ShaderConfig& config, const Te
   case GX_ITF_3:
     return tev_mask_expr(baseCoord, 0xF8u);
   }
-}
-
-bool uses_texture_sample(const TevStage& stage) noexcept {
-  if (stage.texMapId == GX_TEXMAP_NULL) {
-    return false;
-  }
-  const auto& c = stage.colorPass;
-  const auto& a = stage.alphaPass;
-  return c.a == GX_CC_TEXC || c.a == GX_CC_TEXA || c.b == GX_CC_TEXC || c.b == GX_CC_TEXA || c.c == GX_CC_TEXC ||
-         c.c == GX_CC_TEXA || c.d == GX_CC_TEXC || c.d == GX_CC_TEXA || a.a == GX_CA_TEXA || a.b == GX_CA_TEXA ||
-         a.c == GX_CA_TEXA || a.d == GX_CA_TEXA;
 }
 
 std::string color_arg_reg(GXTevColorArg arg, size_t stageIdx, const ShaderConfig& config, const TevStage& stage) {
@@ -1313,6 +1303,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
   if (info.usedIndStages.any()) {
     fragmentFnPre += "\n    var t_TexCoord = vec2f(0.0);";
   }
+  std::bitset<MaxTextures * MaxTexCoord> hexSites;
   for (int i = 0; i < config.tevStageCount; ++i) {
     const auto& stage = config.tevStages[i];
     const bool needsIndirectCoord = stage.indTexMtxId != GX_ITM_OFF;
@@ -1481,9 +1472,20 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
 
     CHECK(stage.texMapId != GX_TEXMAP_NULL, "unmapped texture for stage {}", i);
     CHECK(stage.texCoordId != GX_TEXCOORD_NULL, "unmapped texcoord for stage {}", i);
-    if (uvIn.empty()) {
+    const bool direct = uvIn.empty();
+    if (direct) {
       // No indirect texturing
       uvIn = fmt::format("tex{0}_uv", underlying(stage.texCoordId));
+    }
+    if (direct && info.stochasticTextures.test(stage.texMapId)) {
+      const u32 map = underlying(stage.texMapId);
+      const u32 coord = underlying(stage.texCoordId);
+      if (!hexSites.test(map * MaxTexCoord + coord)) {
+        hexSites.set(map * MaxTexCoord + coord);
+        fragmentFnPre += hex_site(map, coord);
+      }
+      fragmentFnPre += fmt::format("\n    var sampled{} = hex{}_{};", i, map, coord);
+      continue;
     }
     fragmentFnPre +=
         fmt::format("\n    var sampled{0} = textureSampleBias(tex{1}, tex{1}_samp, {2}, ubuf.tex{1}_size_bias.z);", i,
@@ -1558,6 +1560,14 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
         "@group(2) @binding({2})\n"
         "var tex{0}_samp: sampler;",
         i, i * 2, i * 2 + 1);
+  }
+  if (info.stochasticTextures.any()) {
+    for (u32 i = 0; i < MaxTextures; ++i) {
+      if (info.stochasticTextures.test(i)) {
+        uniBufAttrs += fmt::format("\n    tex{}_hex: vec4f,", i);
+      }
+    }
+    append_hex_module(uniformPre, static_cast<uint32_t>(info.stochasticTextures.to_ulong()));
   }
   if (!prevColorNormalized && !prevAlphaNormalized) {
     fragmentFn += "\n    prev = tev_overflow_vec4f(prev);";

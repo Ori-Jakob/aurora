@@ -13,6 +13,7 @@
 #include "debug/views.hpp"
 #include "geometry/compact.hpp"
 #include "geometry/hzb.hpp"
+#include "gx_ext/ext_provider.hpp"
 #include "material/gx_lookup.hpp"
 #include "systems/dispatch.hpp"
 #include "systems/systems.hpp"
@@ -104,6 +105,7 @@ void shutdown() noexcept {
   material::remove_gx_lookup();
   clear_after_frame_callbacks();
   remove_hints();
+  gx_ext::shutdown();
   systems::shutdown();
   debug::shutdown_classification();
   debug::shutdown();

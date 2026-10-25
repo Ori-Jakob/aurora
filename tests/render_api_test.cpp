@@ -13,10 +13,12 @@
 #include <imgui.h>
 #endif
 
+#include <array>
 #include <limits>
 #include <random>
 #include <set>
 #include <string_view>
+#include <utility>
 
 namespace aurora::render::test {
 namespace {
@@ -209,6 +211,21 @@ TEST_F(RenderApiTest, UnbuiltFeaturesReportNotImplemented) {
       EXPECT_EQ(evaluate_support(feature, option, Settings{}, env(caps, none)), unsupported(Reason::NotImplemented))
           << feature_name(feature) << " option " << int{option};
     }
+  }
+}
+
+TEST_F(RenderApiTest, MaterialFeaturesBuiltByDefault) {
+  const BuiltOptions& built = detail::default_built_options();
+  const std::array<std::pair<Caps, uint32_t>, 3> devices{{{full_caps(), 1}, {compat_caps(), 1}, {full_caps(), 4}}};
+  for (const auto& [caps, msaa] : devices) {
+    EXPECT_EQ(evaluate_support(Feature::TextureMaterials, 1, Settings{}, env(caps, built, msaa)), Supported);
+    EXPECT_EQ(evaluate_support(Feature::StochasticTiling, 1, Settings{}, env(caps, built, msaa)), Supported);
+    EXPECT_EQ(evaluate_support(Feature::LegacyMatMaps, 1, Settings{}, env(caps, built, msaa)),
+              unsupported(Reason::NotImplemented));
+    const Settings clamped =
+        clamp_settings({.textureMaterials = true, .stochasticTiling = true}, env(caps, built, msaa));
+    EXPECT_TRUE(clamped.textureMaterials) << msaa;
+    EXPECT_TRUE(clamped.stochasticTiling) << msaa;
   }
 }
 

@@ -13,6 +13,7 @@
 #include "hints.hpp"
 #include "pipeline.hpp"
 #include "regs.hpp"
+#include "render_ext.hpp"
 #include "shader_info.hpp"
 #include "texture.hpp"
 
@@ -153,6 +154,10 @@ struct DrawCache {
   bool lookupBlocking = false;
   ShaderInfo shaderInfo{};
   gfx::PipelineRef pipelineRef{};
+  // A compiled legacy pipeline drawn while the ext variant compiles; 0 when none is ready
+  gfx::PipelineRef fallbackRef{};
+  uint64_t extEpoch = 0;
+  bool extWaiting = false;
   GXBindGroups bindGroups{};
   uint64_t bindGeneration = 0;
   GXVtxFmt fmt = GX_MAX_VTXFMT;
@@ -259,6 +264,14 @@ private:
   bool m_timed;
   bool m_countCall;
 };
+
+void note_failed_variant() noexcept {
+  render_ext::g_stats.failedVariants.fetch_add(1, std::memory_order_relaxed);
+  static bool warned = false;
+  if (!std::exchange(warned, true)) {
+    Log.warn("GX ext pipeline failed to compile; its draws use the legacy pipeline");
+  }
+}
 
 FogRangeLutKey fog_range_lut_key() noexcept {
   const auto& state = g_gxState.fog;
@@ -774,6 +787,8 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     const auto prevSampledTextures = cache.shaderInfo.sampledTextures;
     const auto prevSampledIndTextures = cache.shaderInfo.sampledIndTextures;
     populate_pipeline_config(cache.nextConfig, prim, fmt);
+    // populate zeroes ext, so the skip compares base fields only
+    cache.nextConfig.shaderConfig.ext = cache.config.shaderConfig.ext;
     const bool lookupBlocking = gfx::blocking_pipelines();
     // A byte-equal config under the same layout and lookup mode resolves to the same pipeline
     if (!hadPipeline || cache.targetLayoutKey != targetLayoutKey || cache.lookupBlocking != lookupBlocking ||
@@ -797,9 +812,11 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
 
   const bool bindGroupsValid =
       (state.dirty & DirtyTextures) == 0 && cache.bindGeneration == texture::current_bind_generation();
+  bool bindsRebuilt = false;
   if (!bindGroupsValid) {
     ZoneScopedN("build bind groups");
     const CpuZoneScope build{CpuZoneBindGroupBuild};
+    bindsRebuilt = true;
     const auto prevBindGroup = cache.bindGroups.textureBindGroup;
     resolve_sampled_textures(cache.shaderInfo);
     cache.bindGroups = build_bind_groups(cache.shaderInfo);
@@ -811,11 +828,62 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     }
   }
 
+  // A stale carried mask must still clear when the new config has no eligible map
+  if ((lookupPipeline || bindsRebuilt) &&
+      (cache.shaderInfo.stochasticEligible.any() || cache.config.shaderConfig.ext != RenderExtConfig{})) {
+    ZoneScopedN("derive render ext");
+    render_ext::StochasticLanes lanes{};
+    RenderExtConfig ext{};
+    if (const auto* hooks = render_ext::hooks(); hooks != nullptr && hooks->derive != nullptr) {
+      ext = hooks->derive(hooks->userData, cache.config, cache.shaderInfo, targetLayoutKey, lanes);
+    }
+    for (u32 i = 0; i < MaxTextures; ++i) {
+      if ((ext.stochasticMask >> i & 1u) != 0 && !render_ext::stochastic_bind_ok(state.textures[i])) {
+        ext.stochasticMask &= static_cast<u8>(~(1u << i));
+      }
+    }
+    ext = render_ext::normalize(ext, cache.shaderInfo);
+    const bool lanesChanged = render_ext::store_lanes(lanes, ext.stochasticMask);
+    if (ext != cache.config.shaderConfig.ext) {
+      const ShaderInfo previous = cache.shaderInfo;
+      cache.config.shaderConfig.ext = ext;
+      cache.shaderInfo = build_shader_info(cache.config.shaderConfig);
+      CHECK(cache.shaderInfo.sampledTextures == previous.sampledTextures &&
+                cache.shaderInfo.sampledIndTextures == previous.sampledIndTextures &&
+                cache.shaderInfo.sampledTexCoords == previous.sampledTexCoords,
+            "render ext changed the sampled textures");
+      lookupPipeline = true;
+      cache.hasPipeline = false;
+      state.dirty |= DirtyUniform;
+    } else if (lanesChanged) {
+      state.dirty |= DirtyUniform;
+    }
+  }
+
   if (lookupPipeline) {
     ZoneScopedN("look up pipeline");
-    const CpuZoneScope lookup{CpuZonePipelineBuild, false};
+    const CpuZoneScope lookup{CpuZonePipelineBuild, pipelineValid};
     cache.pipelineRef = gfx::pipeline_ref(cache.config);
     cache.hasPipeline = true;
+    cache.fallbackRef = 0;
+    cache.extWaiting = false;
+    if (cache.config.shaderConfig.ext != RenderExtConfig{}) {
+      const uint64_t epoch = gfx::pipeline_epoch();
+      switch (gfx::pipeline_state(cache.pipelineRef)) {
+      case gfx::PipelineState::Ready:
+        break;
+      case gfx::PipelineState::Failed:
+        cache.pipelineRef = gfx::pipeline_ref(render_ext::legacy_config(cache.config));
+        note_failed_variant();
+        break;
+      case gfx::PipelineState::Pending:
+        cache.extWaiting = true;
+        cache.extEpoch = epoch;
+        cache.fallbackRef =
+            gfx::ready_pipeline(render_ext::legacy_config(cache.config), gfx::get_render_target_layout());
+        break;
+      }
+    }
   }
 
   const bool uniformValid = (state.dirty & DirtyUniform) == 0 && cache.uniformRange.size != 0;
@@ -848,9 +916,30 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
   } else if (prim == GX_POINTS) {
     instanceCount = vtxCount;
   }
+  if (cache.extWaiting) {
+    const uint64_t epoch = gfx::pipeline_epoch();
+    if (epoch != cache.extEpoch) {
+      cache.extEpoch = epoch;
+      const gfx::PipelineState pipelineState = gfx::pipeline_state(cache.pipelineRef);
+      if (pipelineState != gfx::PipelineState::Pending) {
+        cache.extWaiting = false;
+        cache.fallbackRef = 0;
+        if (pipelineState == gfx::PipelineState::Failed) {
+          cache.pipelineRef = gfx::pipeline_ref(render_ext::legacy_config(cache.config));
+          note_failed_variant();
+        }
+      } else if (cache.fallbackRef == 0) {
+        cache.fallbackRef =
+            gfx::ready_pipeline(render_ext::legacy_config(cache.config), gfx::get_render_target_layout());
+      }
+    }
+    if (cache.extWaiting) {
+      bump(cache.fallbackRef != 0 ? render_ext::g_stats.fallbackDraws : render_ext::g_stats.pendingDraws);
+    }
+  }
   cache.lastDrawFmt = fmt;
   DrawData draw{
-      .pipeline = cache.pipelineRef,
+      .pipeline = cache.fallbackRef != 0 ? cache.fallbackRef : cache.pipelineRef,
       .bindGroups = cache.bindGroups,
       .vertRange = vertRange,
       .idxRange = idxRange,

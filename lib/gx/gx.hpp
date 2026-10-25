@@ -497,6 +497,23 @@ struct AttrConfig {
 
 enum class DstAlphaMode : u8 { None, Replace, DualSource };
 
+// Bit meanings are frozen at config v14; a stored config that would mean or normalize differently bumps RenderShaderRev
+struct RenderExtConfig {
+  u8 output : 2 = 0;
+  u8 velocity : 1 = 0;
+  u8 tessFetch : 1 = 0;
+  u8 pom : 1 = 0;
+  u8 fwdEnv : 1 = 0;
+  u8 pad0 : 2 = 0;
+  u8 stochasticMask = 0;
+  u8 layer0 = 0;
+  u8 layer1 = 0;
+
+  bool operator==(const RenderExtConfig&) const = default;
+};
+static_assert(sizeof(RenderExtConfig) == 4);
+static_assert(std::has_unique_object_representations_v<RenderExtConfig>);
+
 struct ShaderConfig {
   u8 fogType = GX_FOG_NONE;
   u8 vtxStride = 0;
@@ -513,10 +530,12 @@ struct ShaderConfig {
   AlphaCompare alphaCompare;
   std::array<IndStage, MaxIndStages> indStages{};
   u32 numIndStages = 0;
+  RenderExtConfig ext{};
 
   bool operator==(const ShaderConfig& rhs) const { return memcmp(this, &rhs, sizeof(*this)) == 0; }
 };
 static_assert(std::has_unique_object_representations_v<ShaderConfig>);
+static_assert(offsetof(ShaderConfig, ext) + sizeof(RenderExtConfig) == sizeof(ShaderConfig));
 
 struct PipelineConfig;
 struct PipelineOptions;
@@ -536,6 +555,8 @@ struct ShaderInfo {
   std::bitset<MaxVtxAttr> indexAttr;
   std::bitset<MaxIndStages> usedIndStages;
   std::bitset<MaxTextures> sampledIndTextures;
+  std::bitset<MaxTextures> stochasticEligible;
+  std::bitset<MaxTextures> stochasticTextures;
   std::bitset<MaxIndTexMtxs> usedIndTexMtxs;
   u32 uniformSize = 0;
   bool usesFog : 1 = false;

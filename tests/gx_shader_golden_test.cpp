@@ -488,7 +488,8 @@ std::filesystem::path temp_file(std::string_view name) {
 
 TEST(GxShaderCorpusTest, ShaderConfigLayoutIsKnown) {
   // A new legacy field must bump the record format, so this has to fail before the fixture silently drifts.
-  static_assert(sizeof(ShaderConfig) == 2720);
+  // ext is a fork field the records never carry, so RecordSize stays 868
+  static_assert(sizeof(ShaderConfig) == 2724);
   EXPECT_EQ(RecordSize, 868u);
 }
 
@@ -680,6 +681,12 @@ TEST(GxShaderCorpusTest, ImportDerivesPipelineVariants) {
   const auto notLegacy = import_blob(blob_from(padded, 5), out);
   EXPECT_GT(notLegacy.notLegacy, 0u);
   EXPECT_EQ(notLegacy.accepted, 0u);
+
+  auto stochastic = pc;
+  stochastic.shaderConfig.ext.stochasticMask = 1;
+  const auto extRow = import_blob(blob_from(stochastic, 7), out);
+  EXPECT_GT(extRow.notLegacy, 0u);
+  EXPECT_EQ(extRow.accepted, 0u);
 
   auto badBool = blob_from(pc, 6);
   badBool.bytes[offsetof(PipelineConfig, alphaUpdate)] = 2;

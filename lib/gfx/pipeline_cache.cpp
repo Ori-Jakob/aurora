@@ -5,6 +5,8 @@
 #include "resources.hpp"
 #include "hash.hpp"
 #include "../gx/pipeline.hpp"
+#include "../gx/render_ext.hpp"
+#include "../gx/shader_info.hpp"
 #include "../io.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
@@ -24,6 +26,7 @@
 #include <ranges>
 #include <variant>
 #include <thread>
+#include <vector>
 
 #include <SDL3/SDL_iostream.h>
 #include <absl/container/flat_hash_map.h>
@@ -92,6 +95,7 @@ static std::deque<PendingPipeline> g_backgroundPipelineQueue;
 static absl::flat_hash_set<PipelineRef> g_pendingPipelines;
 static std::atomic_bool g_gpuCachePrunePending = false;
 static std::atomic_bool g_blockingPipelines = false;
+static std::atomic_uint64_t g_pipelineEpoch = 0;
 
 static sqlite3* g_pipelineCacheDb = nullptr;
 static sqlite3_stmt* g_pipelineCacheLoadStmt = nullptr;
@@ -352,6 +356,24 @@ static AtomicStatRef createdPipelines{detail::resources().stats.createdPipelines
 #endif
 
 template <typename PipelineConfig>
+static uint32_t row_version(const PipelineConfig& config) {
+  return config.version;
+}
+
+static uint32_t row_version(const gx::PipelineConfig& config) { return gx::persisted_version(config); }
+
+template <typename PipelineConfig>
+static bool canonical_row(const PipelineConfig&) {
+  return true;
+}
+
+static bool canonical_row(const gx::PipelineConfig& config) {
+  const gx::RenderExtConfig& ext = config.shaderConfig.ext;
+  return ext == gx::RenderExtConfig{} ||
+         gx::render_ext::normalize(ext, gx::build_shader_info(config.shaderConfig)) == ext;
+}
+
+template <typename PipelineConfig>
 static PipelineCacheWrite make_pipeline_cache_write(ShaderType type, PipelineRef hash, const PipelineConfig& config,
                                                     uint32_t firstFrameUsed) {
   static_assert(std::has_unique_object_representations_v<PipelineConfig>);
@@ -359,7 +381,7 @@ static PipelineCacheWrite make_pipeline_cache_write(ShaderType type, PipelineRef
   PipelineCacheWrite write{
       .type = type,
       .hash = hash,
-      .configVersion = config.version,
+      .configVersion = row_version(config),
       .config = ByteBuffer(sizeof(config)),
       .firstFrameUsed = firstFrameUsed,
   };
@@ -428,6 +450,7 @@ static std::optional<PendingPipeline> take_pending_pipeline(PipelineRef hash) {
 }
 
 static void notify_pipeline_ready(bool queued, uint32_t pipelineCount) {
+  g_pipelineEpoch.fetch_add(1, std::memory_order_release);
   createdPipelines += pipelineCount;
   if (queued && --queuedPipelines == 0 && g_gpuCachePrunePending.exchange(false, std::memory_order_acq_rel)) {
     // Prune GPU cache entries after fully loading the pipeline cache.
@@ -829,6 +852,59 @@ INSERT INTO aurora_schema VALUES ({});)",
   return true;
 }
 
+static void migrate_v13_gx_rows() {
+  constexpr uint32_t V13Version = 13;
+  constexpr size_t V13Size = 2772;
+  bool failed = false;
+  size_t migrated = 0;
+  {
+    sqlite::Transaction tx(g_pipelineCacheDb, Log, true);
+    if (!tx) {
+      return;
+    }
+    sqlite3_stmt* select = nullptr;
+    const auto query = fmt::format(
+        "SELECT config, first_frame_used FROM pipeline_cache WHERE type = {} AND config_version = {} AND "
+        "config_size = {}",
+        underlying(ShaderType::GX), V13Version, V13Size);
+    if (sqlite3_prepare_v2(g_pipelineCacheDb, query.c_str(), -1, &select, nullptr) != SQLITE_OK) {
+      Log.warn("Failed to read version {} GX pipeline cache rows: {}", V13Version, sqlite3_errmsg(g_pipelineCacheDb));
+      return;
+    }
+    std::vector<PipelineCacheWrite> writes;
+    int ret = SQLITE_OK;
+    while ((ret = sqlite3_step(select)) == SQLITE_ROW) {
+      const auto* blob = static_cast<const uint8_t*>(sqlite3_column_blob(select, 0));
+      const auto size = sqlite3_column_bytes(select, 0);
+      const auto firstFrameUsed = std::clamp<sqlite3_int64>(sqlite3_column_int64(select, 1), 0, UINT32_MAX);
+      if (blob == nullptr || size <= 0) {
+        continue;
+      }
+      const auto config = gx::migrate_v13_config({blob, static_cast<size_t>(size)});
+      if (!config) {
+        continue;
+      }
+      writes.push_back(make_pipeline_cache_write(ShaderType::GX,
+                                                 xxh3_hash(*config, static_cast<HashType>(ShaderType::GX)), *config,
+                                                 static_cast<uint32_t>(firstFrameUsed)));
+    }
+    failed = ret != SQLITE_DONE;
+    sqlite3_finalize(select);
+    for (size_t i = 0; !failed && i < writes.size(); ++i) {
+      failed = !write_pipeline_cache_record(writes[i]);
+    }
+    if (!failed && !writes.empty()) {
+      tx.commit();
+      migrated = writes.size();
+    }
+  }
+  if (failed) {
+    Log.warn("Failed to migrate version {} GX pipeline cache rows; they will be pruned", V13Version);
+  } else if (migrated != 0) {
+    Log.info("Migrated {} GX pipeline cache rows from config version {}", migrated, V13Version);
+  }
+}
+
 static void prune_old_pipeline_cache_versions() {
   if (!prepare_pipeline_cache_db()) {
     return;
@@ -843,11 +919,23 @@ static void prune_old_pipeline_cache_versions() {
     return;
   }
 
+  migrate_v13_gx_rows();
   const auto gxDelete = fmt::format("DELETE FROM pipeline_cache WHERE type = {} AND config_version < {}",
                                     underlying(ShaderType::GX), gx::GXPipelineConfigVersion);
   ret = sqlite::exec(g_pipelineCacheDb, gxDelete.c_str());
   if (ret != SQLITE_OK) {
     Log.error("Failed to prune GX pipeline cache rows: {}", sqlite3_errmsg(g_pipelineCacheDb));
+    pipeline_cache_abort();
+    return;
+  }
+  // Only older revisions of this base; newer builds' rows stay for them
+  const auto gxExtDelete = fmt::format(
+      "DELETE FROM pipeline_cache WHERE type = {} AND config_version > 65535 AND (config_version & 65535) = {} AND "
+      "(config_version >> 16) BETWEEN 1 AND {}",
+      underlying(ShaderType::GX), gx::GXPipelineConfigVersion, gx::RenderShaderRev - 1);
+  ret = sqlite::exec(g_pipelineCacheDb, gxExtDelete.c_str());
+  if (ret != SQLITE_OK) {
+    Log.error("Failed to prune GX ext pipeline cache rows: {}", sqlite3_errmsg(g_pipelineCacheDb));
     pipeline_cache_abort();
     return;
   }
@@ -1027,7 +1115,7 @@ static size_t load_pipeline_cache_entries(ShaderType type, uint32_t configVersio
 
     PipelineConfig config;
     std::memcpy(&config, configBlob, sizeof(config));
-    if (config.version != configVersion) {
+    if (config.version != (configVersion & 0xFFFF) || row_version(config) != configVersion || !canonical_row(config)) {
       continue;
     }
 
@@ -1061,6 +1149,7 @@ static size_t load_pipeline_cache() {
   acceptedRows +=
       load_pipeline_cache_entries<clear::PipelineConfig>(ShaderType::Clear, clear::ClearPipelineConfigVersion);
   acceptedRows += load_pipeline_cache_entries<gx::PipelineConfig>(ShaderType::GX, gx::GXPipelineConfigVersion);
+  acceptedRows += load_pipeline_cache_entries<gx::PipelineConfig>(ShaderType::GX, gx::GXExtRowVersion);
   return acceptedRows;
 }
 
@@ -1144,6 +1233,11 @@ void rebuild_pipeline_cache() {
     }
   }
   std::ranges::sort(known, {}, &KnownPipeline::firstFrameUsed);
+  // Legacy pipelines warm first; ext rows still warm so Dawn's prune keeps their blobs
+  std::ranges::stable_partition(known, [](const KnownPipeline& pipeline) {
+    const auto* config = std::get_if<gx::PipelineConfig>(&pipeline.config);
+    return config == nullptr || config->shaderConfig.ext == gx::RenderExtConfig{};
+  });
   for (const auto& pipeline : known) {
     std::visit(
         [&](const auto& config) {
@@ -1228,6 +1322,24 @@ bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline) {
   }
   pipeline = it->second;
   return true;
+}
+
+PipelineState pipeline_state(PipelineRef ref) noexcept {
+  std::lock_guard guard{g_pipelineMutex};
+  const auto it = g_pipelines.find(ref);
+  if (it == g_pipelines.end()) {
+    return PipelineState::Pending;
+  }
+  return it->second.main ? PipelineState::Ready : PipelineState::Failed;
+}
+
+uint64_t pipeline_epoch() noexcept { return g_pipelineEpoch.load(std::memory_order_acquire); }
+
+PipelineRef ready_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) noexcept {
+  const auto runtimeKey = xxh3_hash(layout.key, xxh3_hash(config, static_cast<HashType>(ShaderType::GX)));
+  std::lock_guard guard{g_pipelineMutex};
+  const auto it = g_pipelines.find(runtimeKey);
+  return it != g_pipelines.end() && it->second.main ? runtimeKey : 0;
 }
 
 } // namespace aurora::gfx

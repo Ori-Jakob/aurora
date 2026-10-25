@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bitset>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -145,13 +146,19 @@ u32 g_testLastResolveInfoSize = 0;
 // Written into every populated config, so a test can make a rebuild produce a different config
 GXCompare g_testPopulateDepthFunc = GX_NEVER;
 u32 g_testPopulateTevStageCount = 0;
+std::bitset<MaxTextures> g_testStochasticEligible;
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
   ++g_testPipelineBuildCount;
   config.depthFunc = g_testPopulateDepthFunc;
   config.shaderConfig.tevStageCount = g_testPopulateTevStageCount;
 }
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept { return {}; }
-ShaderInfo build_shader_info(const ShaderConfig& config) noexcept { return {.uniformSize = ++g_testShaderInfoCount}; }
+ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
+  ShaderInfo info{.uniformSize = ++g_testShaderInfoCount};
+  info.stochasticEligible = g_testStochasticEligible;
+  info.stochasticTextures = std::bitset<MaxTextures>{config.ext.stochasticMask} & g_testStochasticEligible;
+  return info;
+}
 gfx::Range build_draw_uniform(const ShaderInfo& info) noexcept {
   ++g_testUniformBuildCount;
   g_testLastUniformInfoSize = info.uniformSize;
@@ -339,11 +346,27 @@ uint32_t g_testPipelineRefCount = 0;
 PipelineRef g_testLastPipelineRef = 0;
 // Resolves seen by the last lookup, so a test can tell whether it came after the draw's resolve
 uint32_t g_testResolvesAtLookup = 0;
+gx::RenderExtConfig g_testLastLookupExt{};
 template <>
 PipelineRef pipeline_ref<gx::PipelineConfig>(const gx::PipelineConfig& config) {
   g_testResolvesAtLookup = gx::g_testResolveCount;
+  g_testLastLookupExt = config.shaderConfig.ext;
   g_testLastPipelineRef = ++g_testPipelineRefCount;
   return g_testLastPipelineRef;
+}
+PipelineState g_testPipelineState = PipelineState::Ready;
+uint64_t g_testPipelineEpoch = 0;
+uint32_t g_testPipelineStateQueries = 0;
+PipelineRef g_testReadyLegacyRef = 0;
+uint32_t g_testReadyProbes = 0;
+PipelineState pipeline_state(PipelineRef ref) noexcept {
+  ++g_testPipelineStateQueries;
+  return g_testPipelineState;
+}
+uint64_t pipeline_epoch() noexcept { return g_testPipelineEpoch; }
+PipelineRef ready_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) noexcept {
+  ++g_testReadyProbes;
+  return g_testReadyLegacyRef;
 }
 bool g_testBlockingPipelines = false;
 void set_blocking_pipelines(bool blocking) noexcept { g_testBlockingPipelines = blocking; }

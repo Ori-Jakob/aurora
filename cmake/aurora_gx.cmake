@@ -21,6 +21,9 @@ add_library(aurora_gx STATIC
         lib/gx/fifo.cpp
         lib/gx/gx.cpp
         lib/gx/draw_route.hpp
+        lib/gx/hex_wgsl.cpp
+        lib/gx/hex_wgsl.hpp
+        lib/gx/render_ext.hpp
         lib/gx/gpu_channel.cpp
         lib/gx/gpu_channel.hpp
         lib/gx/hints.cpp

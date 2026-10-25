@@ -298,6 +298,7 @@ if (AURORA_ENABLE_GX)
     target_sources(render_tests PRIVATE render_classify_glue_test.cpp)
     target_link_libraries(render_tests PRIVATE absl::flat_hash_map)
     target_sources(render_tests PRIVATE render_views_test.cpp)
+    target_sources(render_tests PRIVATE render_gx_ext_test.cpp)
   endif ()
   aurora_copy_runtime_dlls(render_tests)
   gtest_discover_tests(render_tests)
@@ -320,7 +321,7 @@ if (AURORA_ENABLE_GX)
   target_link_libraries(gx_shader_corpus PRIVATE gx_shader_corpus_lib)
   aurora_copy_runtime_dlls(gx_shader_corpus)
 
-  add_executable(gx_shader_golden_tests gx_shader_golden_test.cpp)
+  add_executable(gx_shader_golden_tests gx_shader_golden_test.cpp gx_shader_ext_test.cpp)
   target_compile_definitions(gx_shader_golden_tests PRIVATE
     AURORA_GX_SHADER_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/shaders/gx_shader_golden.txt"
     AURORA_GX_SHADER_GOLDEN_OUT="${CMAKE_CURRENT_BINARY_DIR}/gx_shader_golden_out"
@@ -434,10 +435,11 @@ if (AURORA_ENABLE_GX)
     gtest_discover_tests(render_jobs_tests PROPERTIES TIMEOUT 60)
 
     file(GLOB_RECURSE _render_test_wgsl CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/shaders/render/*.wgsl")
-    add_executable(render_shaders_tests render_shaders_test.cpp render_test_device.cpp)
+    add_executable(render_shaders_tests render_shaders_test.cpp render_test_device.cpp gx_shader_ext_device_test.cpp)
     target_include_directories(render_shaders_tests PRIVATE ../include ../lib)
     target_compile_definitions(render_shaders_tests PRIVATE AURORA TARGET_PC=1 AURORA_ENABLE_RENDER=1)
-    target_link_libraries(render_shaders_tests PRIVATE aurora::gx aurora::vi absl::flat_hash_map gtest gtest_main)
+    target_link_libraries(render_shaders_tests PRIVATE aurora::gx aurora::vi absl::flat_hash_map gx_shader_corpus_lib gtest
+      gtest_main)
     aurora_embed_wgsl(render_shaders_tests
       ROOT "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/shaders/render"
       TABLE embedded_test_shaders

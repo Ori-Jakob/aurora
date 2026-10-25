@@ -48,4 +48,11 @@ PipelineRef find_debug_pipeline(const gx::PipelineConfig& config, const RenderTa
 
 bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline);
 
+enum class PipelineState : uint8_t { Pending, Ready, Failed };
+// Failed means the entry exists with no main pipeline, which render() skips
+PipelineState pipeline_state(PipelineRef ref) noexcept;
+uint64_t pipeline_epoch() noexcept;
+// The ref only if that GX pipeline is already compiled; never queues, remembers or persists
+PipelineRef ready_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) noexcept;
+
 } // namespace aurora::gfx

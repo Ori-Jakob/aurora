@@ -4,11 +4,18 @@
 #include "../gfx/resources.hpp"
 #include "../gfx/pipeline_cache.hpp"
 #include "../gfx/resource_cache.hpp"
+#include "../webgpu/error_scope.hpp"
 
 #include "gx_fmt.hpp"
 #include "shader_info.hpp"
 
+#include <array>
 #include <atomic>
+#include <cstddef>
+#include <cstring>
+#include <mutex>
+#include <optional>
+#include <string>
 
 #include <tracy/Tracy.hpp>
 
@@ -31,13 +38,19 @@ struct Counters {
 inline void count(std::atomic_uint64_t& c, uint64_t n = 1) noexcept {
   c.store(c.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
 }
-} // namespace
 
-gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout) {
-  ZoneScoped;
+gfx::CompiledPipeline create_unchecked(const PipelineConfig& config, const gfx::RenderTargetLayout& layout,
+                                       std::optional<std::string>* moduleError = nullptr) {
   const auto hash = xxh3_hash(layout.key, xxh3_hash(config, static_cast<HashType>(gfx::ShaderType::GX)));
-  const auto create = [&](const PipelineOptions& options, const char* passName) {
+  const auto create = [&](const PipelineOptions& options, const char* passName) -> wgpu::RenderPipeline {
+    if (moduleError != nullptr) {
+      webgpu::push_error_scopes();
+    }
     const auto shader = build_shader(config.shaderConfig, layout, options.dstAlphaMode);
+    // Release devices skip validation, so no pipeline may be built from a module that failed to compile
+    if (moduleError != nullptr && (*moduleError = webgpu::pop_error_scopes())) {
+      return {};
+    }
     const auto label = fmt::format("GX Pipeline {:x} {}", hash, passName);
     return build_pipeline(config, layout, options, {}, shader, label.c_str());
   };
@@ -73,6 +86,51 @@ gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::R
   }
   pipeline.main = create(options, "main");
   if (!pipeline.main) {
+    return {};
+  }
+  return pipeline;
+}
+} // namespace
+
+// The v13 splice depends on these offsets
+static_assert(sizeof(PipelineConfig) == 2776);
+static_assert(offsetof(PipelineConfig, depthFunc) == 2732);
+
+std::optional<PipelineConfig> migrate_v13_config(std::span<const uint8_t> bytes) noexcept {
+  constexpr size_t V13Size = 2772;
+  constexpr size_t ExtOffset = offsetof(PipelineConfig, shaderConfig) + offsetof(ShaderConfig, ext);
+  static_assert(ExtOffset == 2728);
+  uint32_t version = 0;
+  if (bytes.size() != V13Size) {
+    return std::nullopt;
+  }
+  std::memcpy(&version, bytes.data(), sizeof(version));
+  if (version != 13) {
+    return std::nullopt;
+  }
+  std::array<uint8_t, sizeof(PipelineConfig)> spliced{};
+  std::memcpy(spliced.data(), bytes.data(), ExtOffset);
+  std::memcpy(spliced.data() + ExtOffset + sizeof(RenderExtConfig), bytes.data() + ExtOffset, V13Size - ExtOffset);
+  PipelineConfig config;
+  std::memcpy(&config, spliced.data(), sizeof(config));
+  config.version = GXPipelineConfigVersion;
+  return config;
+}
+
+gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout) {
+  ZoneScoped;
+  if (config.shaderConfig.ext == RenderExtConfig{}) {
+    return create_unchecked(config, layout);
+  }
+  // A failed ext variant leaves an entry with no main pipeline, which render() skips and the FIFO replaces with legacy
+  std::lock_guard lock{webgpu::error_scope_mutex()};
+  webgpu::push_error_scopes();
+  std::optional<std::string> moduleError;
+  gfx::CompiledPipeline pipeline = create_unchecked(config, layout, &moduleError);
+  const std::optional<std::string> error = webgpu::pop_error_scopes();
+  if (moduleError || error) {
+    const auto hash = xxh3_hash(layout.key, xxh3_hash(config, static_cast<HashType>(gfx::ShaderType::GX)));
+    Log.warn("GX ext pipeline {:x} failed: {}", hash, moduleError ? *moduleError : *error);
     return {};
   }
   return pipeline;

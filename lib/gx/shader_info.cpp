@@ -2,6 +2,7 @@
 
 #include "../gfx/frame.hpp"
 #include "../gfx/recording.hpp"
+#include "render_ext.hpp"
 
 #include <array>
 #include <cmath>
@@ -217,7 +218,50 @@ u32 line_texcoord_mask() noexcept {
   }
   return mask;
 }
+
+std::bitset<MaxTextures> stochastic_eligible(const ShaderConfig& config, const ShaderInfo& info) noexcept {
+  if (config.lineMode != 0) {
+    return {};
+  }
+  std::bitset<MaxTextures> direct;
+  std::bitset<MaxTextures> blocked;
+  for (u32 i = 0; i < config.tevStageCount; ++i) {
+    const auto& stage = config.tevStages[i];
+    if (!uses_texture_sample(stage) || stage.texMapId > GX_TEXMAP7) {
+      continue;
+    }
+    const u32 map = stage.texMapId;
+    const bool tevCoord = stage.indTexMtxId != GX_ITM_OFF || stage.indTexWrapS != GX_ITW_OFF ||
+                          stage.indTexWrapT != GX_ITW_OFF || stage.indTexAddPrev;
+    if (tevCoord || stage.texCoordId == GX_TEXCOORD_NULL) {
+      blocked.set(map);
+      continue;
+    }
+    const auto& tcg = config.tcgs[stage.texCoordId];
+    if (tcg.type != GX_TG_MTX2x4 || tcg.src < GX_TG_TEX0 || tcg.src > GX_TG_TEX7) {
+      blocked.set(map);
+      continue;
+    }
+    direct.set(map);
+  }
+  return direct & ~blocked & ~info.sampledIndTextures & info.sampledTextures;
+}
 } // namespace
+
+bool uses_texture_sample(const TevStage& stage) noexcept {
+  if (stage.texMapId == GX_TEXMAP_NULL) {
+    return false;
+  }
+  const auto& c = stage.colorPass;
+  const auto& a = stage.alphaPass;
+  return c.a == GX_CC_TEXC || c.a == GX_CC_TEXA || c.b == GX_CC_TEXC || c.b == GX_CC_TEXA || c.c == GX_CC_TEXC ||
+         c.c == GX_CC_TEXA || c.d == GX_CC_TEXC || c.d == GX_CC_TEXA || a.a == GX_CA_TEXA || a.b == GX_CA_TEXA ||
+         a.c == GX_CA_TEXA || a.d == GX_CA_TEXA;
+}
+
+bool stochastic_fits(u32 unalignedUniformSize, u32 maps) noexcept {
+  return gfx::align_uniform(unalignedUniformSize + maps * sizeof(Vec4<float>)) <= MaxUniformSize;
+}
 
 ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
   ZoneScoped;
@@ -366,6 +410,14 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     info.uniformSize += MaxIndTexMtxs * sizeof(Mat2x4<float>);
   }
   info.uniformSize += info.sampledTextures.count() * sizeof(Vec4<float>);
+  info.stochasticEligible = stochastic_eligible(config, info);
+  if (info.stochasticEligible.any() &&
+      !stochastic_fits(info.uniformSize, static_cast<u32>(info.stochasticEligible.count()))) {
+    info.stochasticEligible.reset();
+    render_ext::g_stats.budgetDrops.fetch_add(1, std::memory_order_relaxed);
+  }
+  info.stochasticTextures = std::bitset<MaxTextures>{config.ext.stochasticMask} & info.stochasticEligible;
+  info.uniformSize += info.stochasticTextures.count() * sizeof(Vec4<float>);
   info.uniformSize = gfx::align_uniform(info.uniformSize);
   if (info.uniformSize > MaxUniformSize) {
     Log.fatal("Uniform size exceeds maximum: {} > {}", info.uniformSize, MaxUniformSize);
@@ -494,6 +546,11 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
     }
     buf.append(texture_size_bias(get_texture(static_cast<GXTexMapID>(i))));
   }
+  for (int i = 0; i < info.stochasticTextures.size(); ++i) {
+    if (info.stochasticTextures.test(i)) {
+      buf.append(render_ext::g_stochasticUniforms[i]);
+    }
+  }
 }
 
 gfx::Range build_uniform(const ShaderInfo& info) noexcept {
@@ -554,4 +611,12 @@ void clear_draw_uniforms() noexcept {
     entry.range = {};
   }
 }
+
+namespace testing {
+std::vector<uint8_t> uniform_bytes(const ShaderInfo& info) noexcept {
+  ByteBuffer buf;
+  fill_uniform(buf, info);
+  return {buf.data(), buf.data() + buf.size()};
+}
+} // namespace testing
 } // namespace aurora::gx

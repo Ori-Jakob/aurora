@@ -13,6 +13,7 @@
 
 #if AURORA_ENABLE_RENDER
 #include "debug/debug.hpp"
+#include "gx_ext/ext_provider.hpp"
 #include "hints.hpp"
 #include "scene/classify.hpp"
 #endif
@@ -95,7 +96,13 @@ constexpr std::array ClampOrder{
 };
 static_assert(ClampOrder.size() == FeatureCount - 2);
 
-constexpr BuiltOptions DefaultBuiltOptions{};
+// Hex tiling ships in M6; which textures use it is the material registry's call
+constexpr BuiltOptions DefaultBuiltOptions = [] {
+  BuiltOptions built{};
+  built[static_cast<size_t>(Feature::TextureMaterials)] = 1u << 1;
+  built[static_cast<size_t>(Feature::StochasticTiling)] = 1u << 1;
+  return built;
+}();
 
 constexpr uint32_t CompanionSampledTextures = 16;
 constexpr uint32_t TessellationVertexStorageBuffers = 4;
@@ -707,6 +714,7 @@ std::shared_ptr<const FrameState> latch_frame() {
 #if AURORA_ENABLE_RENDER
   // The FIFO worker is idle until fifo::begin_frame
   scene::apply_frame_state(*g_frameState);
+  gx_ext::apply_frame_state(*g_frameState);
 #endif
   return g_frameState;
 }

@@ -285,6 +285,19 @@ TEST_F(RenderViews, VariantRewritesOnlyLastColour) {
   EXPECT_EQ(std::memcmp(&restored, &config, sizeof(config)), 0);
 }
 
+TEST_F(RenderViews, VariantDropsTextureExtBits) {
+  gx::PipelineConfig config = two_stage_config();
+  config.shaderConfig.ext = {.output = 2, .pom = 1, .stochasticMask = 1, .layer0 = 1, .layer1 = 2};
+  const gx::ShaderInfo info = gx::build_shader_info(config.shaderConfig);
+  gx::PipelineConfig variant{};
+  ASSERT_TRUE(make_view_variant(config, info, variant));
+  EXPECT_EQ(variant.shaderConfig.ext.stochasticMask, 0u);
+  EXPECT_EQ(variant.shaderConfig.ext.layer0, 0u);
+  EXPECT_EQ(variant.shaderConfig.ext.layer1, 0u);
+  EXPECT_EQ(variant.shaderConfig.ext.pom, 0u);
+  EXPECT_EQ(variant.shaderConfig.ext.output, 2u);
+}
+
 TEST_F(RenderViews, VariantSkipsPackedAlphaCompare) {
   gx::PipelineConfig config = two_stage_config();
   config.shaderConfig.tevStages[1].alphaOp.op = GX_TEV_COMP_R8_GT;

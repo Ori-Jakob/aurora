@@ -6,6 +6,7 @@
 #include "../gfx/hash.hpp"
 #include "../gfx/pipeline_cache.hpp"
 #include "../internal.hpp"
+#include "../webgpu/error_scope.hpp"
 #include "../webgpu/gpu.hpp"
 
 #include <absl/container/flat_hash_map.h>
@@ -82,8 +83,8 @@ using RuntimeSources = std::vector<std::pair<std::string, std::shared_ptr<const 
 
 std::mutex g_mutex;
 std::condition_variable g_cv;
-// Dawn has no device lock without ImplicitDeviceSynchronization, so this file adds at most one creating thread
-std::mutex g_deviceMutex;
+// Shared with GX ext pipeline creation, so error scopes never interleave across creating threads
+std::mutex& g_deviceMutex = webgpu::error_scope_mutex();
 bool g_initialized = false;
 bool g_shuttingDown = false;
 std::atomic_uint64_t g_session = 0;
@@ -151,44 +152,9 @@ bool warn_once(std::string_view key) {
 
 struct WaitState {
   std::mutex mutex;
-  std::optional<std::string> error;
   std::vector<std::pair<uint64_t, uint64_t>> positions;
   std::vector<std::string> messages;
 };
-
-// Requires g_deviceMutex held. State is shared with the callback, which Dawn may still run after a timeout
-std::optional<std::string> pop_error_scope() {
-  auto state = std::make_shared<WaitState>();
-  const wgpu::Future future = webgpu::g_device.PopErrorScope(
-      wgpu::CallbackMode::WaitAnyOnly,
-      [state](wgpu::PopErrorScopeStatus status, wgpu::ErrorType type, wgpu::StringView message) {
-        std::lock_guard lock{state->mutex};
-        if (status != wgpu::PopErrorScopeStatus::Success) {
-          state->error = "error scope lost";
-        } else if (type != wgpu::ErrorType::NoError) {
-          state->error = std::string{std::string_view{message}};
-        }
-      });
-  if (webgpu::g_instance.WaitAny(future, DawnWaitNs) != wgpu::WaitStatus::Success) {
-    return "timed out";
-  }
-  std::lock_guard lock{state->mutex};
-  return state->error;
-}
-
-std::optional<std::string> pop_error_scopes() {
-  const std::optional<std::string> internal = pop_error_scope();
-  const std::optional<std::string> validation = pop_error_scope();
-  if (internal && validation) {
-    return *validation + "\n" + *internal;
-  }
-  return validation ? validation : internal;
-}
-
-void push_error_scopes() {
-  webgpu::g_device.PushErrorScope(wgpu::ErrorFilter::Validation);
-  webgpu::g_device.PushErrorScope(wgpu::ErrorFilter::Internal);
-}
 
 // Requires g_deviceMutex held.
 std::string compilation_errors(const wgpu::ShaderModule& module, const ResolvedSource& source) {
@@ -228,9 +194,9 @@ std::string compilation_errors(const wgpu::ShaderModule& module, const ResolvedS
 wgpu::ShaderModule create_module_locked(const std::string& label, const ResolvedSource& source, std::string& error) {
   const wgpu::ShaderSourceWGSL wgsl{wgpu::ShaderSourceWGSL::Init{.code = source.text.c_str()}};
   const wgpu::ShaderModuleDescriptor descriptor{.nextInChain = &wgsl, .label = label.c_str()};
-  push_error_scopes();
+  webgpu::push_error_scopes();
   wgpu::ShaderModule module = webgpu::g_device.CreateShaderModule(&descriptor);
-  const std::optional<std::string> scopeError = pop_error_scopes();
+  const std::optional<std::string> scopeError = webgpu::pop_error_scopes();
   if (!scopeError) {
     return module;
   }
@@ -358,9 +324,9 @@ void create_pipeline(const Request& request, const Descriptor& descriptor, bool 
   std::optional<std::string> error;
   {
     std::lock_guard device{g_deviceMutex};
-    push_error_scopes();
+    webgpu::push_error_scopes();
     auto pipeline = create(descriptor);
-    error = pop_error_scopes();
+    error = webgpu::pop_error_scopes();
     if (!error) {
       complete(slot, wgpu::CreatePipelineAsyncStatus::Success, std::move(pipeline), {});
       return;
