@@ -35,6 +35,10 @@ namespace {
 wgpu::Sampler sEmptySampler;
 wgpu::Texture sEmptyTexture;
 wgpu::TextureView sEmptyTextureView;
+wgpu::Texture sNeutralWhite;
+wgpu::Texture sNeutralClear;
+wgpu::TextureView sNeutralWhiteView;
+wgpu::TextureView sNeutralClearView;
 wgpu::BindGroupLayout sTextureBindGroupLayout;
 wgpu::PipelineLayout sPipelineLayout;
 
@@ -495,9 +499,36 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   };
 }
 
-GXBindGroups build_bind_groups(const ShaderInfo& info, bool baseLevel) noexcept {
-  ZoneScoped;
+namespace detail {
+void fill_texture_entries(const ShaderInfo& info, u8 whiteMask, u8 clearMask, bool baseLevel,
+                          const TextureFillViews& views,
+                          std::span<WGPUBindGroupEntry, MaxTextures * 2> entries) noexcept {
+  for (u32 i = 0; i < MaxTextures; ++i) {
+    const auto& tex = g_gxState.textures[i];
+    WGPUBindGroupEntry& textureEntry = entries[i * 2];
+    WGPUBindGroupEntry& samplerEntry = entries[i * 2 + 1];
+    textureEntry.binding = i * 2;
+    samplerEntry.binding = i * 2 + 1;
+    if (tex && (info.sampledTextures[i] || info.sampledIndTextures[i])) {
+      if (((whiteMask | clearMask) >> i & 1u) != 0) {
+        textureEntry.textureView = (whiteMask >> i & 1u) != 0 ? views.white : views.clear;
+        // A 1x1 constant samples the same at any coordinate or lod, so the default sampler is enough
+        samplerEntry.sampler = views.emptySampler;
+        continue;
+      }
+      textureEntry.textureView = tex.ref->sampleTextureView.Get();
+      // Indirect offsets keep level 0 too, so generated mips never filter them
+      samplerEntry.sampler = gfx::sampler_ref(tex.get_descriptor(baseLevel || info.sampledIndTextures[i])).Get();
+    } else {
+      textureEntry.textureView = views.empty;
+      samplerEntry.sampler = views.emptySampler;
+    }
+  }
+}
+} // namespace detail
 
+static GXBindGroups texture_bind_groups(const ShaderInfo& info, u8 whiteMask, u8 clearMask, bool baseLevel,
+                                        const char* label) noexcept {
   if (!info.sampledTextures.any() && !info.sampledIndTextures.any()) {
     // Don't bother re-binding anything
     return {};
@@ -505,23 +536,16 @@ GXBindGroups build_bind_groups(const ShaderInfo& info, bool baseLevel) noexcept 
 
   // Using C WGPU types instead of C++ wrappers to avoid destructor overhead
   std::array<WGPUBindGroupEntry, MaxTextures * 2> textureEntries{};
-  for (u32 i = 0; i < MaxTextures; ++i) {
-    const auto& tex = g_gxState.textures[i];
-    WGPUBindGroupEntry& textureEntry = textureEntries[i * 2];
-    WGPUBindGroupEntry& samplerEntry = textureEntries[i * 2 + 1];
-    textureEntry.binding = i * 2;
-    samplerEntry.binding = i * 2 + 1;
-    if (tex && (info.sampledTextures[i] || info.sampledIndTextures[i])) {
-      textureEntry.textureView = tex.ref->sampleTextureView.Get();
-      // Indirect offsets keep level 0 too, so generated mips never filter them
-      samplerEntry.sampler = gfx::sampler_ref(tex.get_descriptor(baseLevel || info.sampledIndTextures[i])).Get();
-    } else {
-      textureEntry.textureView = sEmptyTextureView.Get();
-      samplerEntry.sampler = sEmptySampler.Get();
-    }
-  }
+  detail::fill_texture_entries(info, whiteMask, clearMask, baseLevel,
+                               {
+                                   .empty = sEmptyTextureView.Get(),
+                                   .white = sNeutralWhiteView.Get(),
+                                   .clear = sNeutralClearView.Get(),
+                                   .emptySampler = sEmptySampler.Get(),
+                               },
+                               textureEntries);
   const WGPUBindGroupDescriptor textureBindGroupDescriptor{
-      .label = {"GX Texture Bind Group", WGPU_STRLEN},
+      .label = {label, WGPU_STRLEN},
       .layout = sTextureBindGroupLayout.Get(),
       .entryCount = textureEntries.size(),
       .entries = textureEntries.data(),
@@ -529,6 +553,16 @@ GXBindGroups build_bind_groups(const ShaderInfo& info, bool baseLevel) noexcept 
   return {
       .textureBindGroup = gfx::bind_group_ref(textureBindGroupDescriptor),
   };
+}
+
+GXBindGroups build_bind_groups(const ShaderInfo& info, bool baseLevel) noexcept {
+  ZoneScoped;
+  return texture_bind_groups(info, 0, 0, baseLevel, "GX Texture Bind Group");
+}
+
+GXBindGroups build_neutral_bind_groups(const ShaderInfo& info, u8 whiteMask, u8 clearMask, bool baseLevel) noexcept {
+  ZoneScoped;
+  return texture_bind_groups(info, whiteMask, clearMask, baseLevel, "GX Neutral Texture Bind Group");
 }
 
 void initialize() noexcept {
@@ -572,6 +606,26 @@ void initialize() noexcept {
     sEmptyTextureView = sEmptyTexture.CreateView();
   }
   {
+    // Constant stand-ins for fake shadow textures; clear keeps RGB at 1 so alpha-blended decals vanish
+    const auto create_neutral = [](const char* label, std::array<u8, 4> texel, wgpu::Texture& texture,
+                                   wgpu::TextureView& view) {
+      const wgpu::TextureDescriptor descriptor{
+          .label = label,
+          .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
+          .size = {1, 1},
+          .format = wgpu::TextureFormat::RGBA8Unorm,
+      };
+      texture = g_device.CreateTexture(&descriptor);
+      const wgpu::TexelCopyTextureInfo destination{.texture = texture};
+      const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = 4, .rowsPerImage = 1};
+      const wgpu::Extent3D size{1, 1};
+      webgpu::g_queue.WriteTexture(&destination, texel.data(), texel.size(), &layout, &size);
+      view = texture.CreateView();
+    };
+    create_neutral("GX Neutral White", {255, 255, 255, 255}, sNeutralWhite, sNeutralWhiteView);
+    create_neutral("GX Neutral Clear", {255, 255, 255, 0}, sNeutralClear, sNeutralClearView);
+  }
+  {
     std::array<wgpu::BindGroupEntry, MaxTextures * 2> entries;
     for (u32 i = 0; i < MaxTextures; ++i) {
       entries[i * 2] = {
@@ -610,6 +664,10 @@ void initialize() noexcept {
 void shutdown() noexcept {
   // TODO we should probably store this all in g_state.gx instead
   sTextureBindGroupLayout = {};
+  sNeutralWhiteView = {};
+  sNeutralClearView = {};
+  sNeutralWhite = {};
+  sNeutralClear = {};
   for (auto& item : g_gxState.textures) {
     item.ref.reset();
   }

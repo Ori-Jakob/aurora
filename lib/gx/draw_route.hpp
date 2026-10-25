@@ -31,7 +31,7 @@ struct Decision {
 
 struct Router {
   Decision (*route)(void* userData, const Query& query) noexcept = nullptr;
-  // True when the hook changed the pipeline or uniform, so later draws must not merge into this one
+  // True when the hook changed the pipeline, bind groups, uniform or instance count, so later draws must not merge
   bool (*push)(void* userData, DrawData& draw, const PipelineConfig& config, const ShaderInfo& info) noexcept = nullptr;
   void* userData = nullptr;
 };

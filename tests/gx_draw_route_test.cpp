@@ -333,10 +333,14 @@ protected:
     return {.route = route::Route::Push, .breakMerge = test.queries.size() == test.breakAt};
   }
 
-  static bool on_push(void* userData, aurora::gx::DrawData&, const aurora::gx::PipelineConfig&,
+  static bool on_push(void* userData, aurora::gx::DrawData& draw, const aurora::gx::PipelineConfig&,
                       const aurora::gx::ShaderInfo&) noexcept {
     auto& test = *static_cast<GXDrawRouteTest*>(userData);
-    return ++test.pushes == test.substituteAt;
+    ++test.pushes;
+    if (test.pushes == test.emptyAt || test.pushes == test.emptyQuietAt) {
+      draw.instanceCount = 0;
+    }
+    return test.pushes == test.substituteAt || test.pushes == test.emptyAt;
   }
 
   HintRecorder recorder;
@@ -346,6 +350,9 @@ protected:
   // 1-based query and push numbers; 0 never matches
   size_t breakAt = 0;
   size_t substituteAt = 0;
+  size_t emptyAt = 0;
+  // Breaks the router contract on purpose so merge_target's own empty-draw test is what stops the merge
+  size_t emptyQuietAt = 0;
   size_t pushes = 0;
 };
 
@@ -559,6 +566,34 @@ TEST_F(GXDrawRouteTest, PushHookNotCalledForMergedFollowers) {
   EXPECT_EQ(gfx::g_testMergedDrawCount, 1u);
   EXPECT_EQ(pushes, 1u);
   EXPECT_EQ(fifo::draw_route_stats().substituted, 0u);
+}
+
+TEST_F(GXDrawRouteTest, PushHookEmptyDrawIsNeverMergeTarget) {
+  emptyQuietAt = 1;
+  install_router(true);
+  triangle();
+  triangle();
+  decode();
+  EXPECT_EQ(gfx::g_testDrawCount, 2u);
+  EXPECT_EQ(gfx::g_testMergedDrawCount, 0u);
+  EXPECT_EQ(gfx::g_testLastDraw.instanceCount, 1u);
+  EXPECT_EQ(pushes, 2u);
+  EXPECT_EQ(fifo::draw_route_stats().substituted, 0u);
+}
+
+TEST_F(GXDrawRouteTest, PushHookEmptyDrawBreaksMerge) {
+  emptyAt = 1;
+  install_router(true);
+  triangle();
+  triangle();
+  triangle();
+  decode();
+  EXPECT_EQ(gfx::g_testDrawCount, 2u);
+  EXPECT_EQ(gfx::g_testMergedDrawCount, 1u);
+  EXPECT_EQ(gfx::g_testLastDraw.instanceCount, 1u);
+  EXPECT_EQ(gfx::g_testLastDraw.vtxCount, 6u);
+  EXPECT_EQ(pushes, 2u);
+  EXPECT_EQ(fifo::draw_route_stats().substituted, 1u);
 }
 
 TEST_F(GXDrawRouteTest, InvalidateDrawCacheForcesRebuild) {

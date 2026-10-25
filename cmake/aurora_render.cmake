@@ -31,6 +31,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/debug/textures.hpp
         lib/render/debug/views.cpp
         lib/render/debug/views.hpp
+        lib/render/fakeshadow/texture_gate.cpp
+        lib/render/fakeshadow/texture_gate.hpp
         lib/render/geometry/compact.cpp
         lib/render/geometry/compact.hpp
         lib/render/geometry/hzb.cpp

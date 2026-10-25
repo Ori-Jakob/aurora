@@ -1,5 +1,6 @@
 #include "classify.hpp"
 
+#include "../fakeshadow/texture_gate.hpp"
 #include "../frame_state.hpp"
 #include "../hints.hpp"
 #include "../../gx/draw_route.hpp"
@@ -133,7 +134,8 @@ gx::draw_route::Decision route(void*, const gx::draw_route::Query& query) noexce
   if (cls.suppressed) {
     return {.route = gx::draw_route::Route::Suppress};
   }
-  const bool breakMerge = cls.keyChanged && identity_collecting();
+  // A merged follower skips the push hook, so a changed class after a flagged lead must start its own command
+  const bool breakMerge = cls.keyChanged && (identity_collecting() || fakeshadow::lead_flagged());
   if (breakMerge) {
     g_classifier.count_merge_break();
   }
@@ -143,12 +145,15 @@ gx::draw_route::Decision route(void*, const gx::draw_route::Query& query) noexce
 // The router ran first for this same draw, so the classifier's last draw is the one being pushed
 bool push(void*, gx::DrawData& draw, const gx::PipelineConfig& config, const gx::ShaderInfo& info) noexcept {
   const DrawClass& cls = g_classifier.last();
-  const bool changed = g_hooks != nullptr && g_hooks->push != nullptr && g_hooks->push(draw, config, info, cls);
+  const fakeshadow::Edit gate = fakeshadow::push(draw, config, info, cls);
+  // An empty draw has nothing to recolour
+  const bool changed = gate != fakeshadow::Edit::Skipped && g_hooks != nullptr && g_hooks->push != nullptr &&
+                       g_hooks->push(draw, config, info, cls);
   // Last, so the inspector records the draw that is actually pushed
   if (g_observer != nullptr && g_observer->observe != nullptr) {
     g_observer->observe(draw, config, info, cls);
   }
-  return changed;
+  return changed || gate != fakeshadow::Edit::Untouched;
 }
 
 constexpr gx::draw_route::Router g_router{.route = &route, .push = &push, .userData = nullptr};
@@ -159,6 +164,7 @@ void install() noexcept {
     g_classifier.reserve();
   }
   g_env = read_identity_env();
+  fakeshadow::install();
   apply_merge_key();
   gx::draw_route::set_router(&g_router);
 }
@@ -167,11 +173,13 @@ void remove() noexcept {
   if (gx::draw_route::router() == &g_router) {
     gx::draw_route::set_router(nullptr);
   }
+  fakeshadow::remove();
   reset();
 }
 
 void reset() noexcept {
   g_classifier.reset();
+  fakeshadow::reset_frame();
   g_sealed = false;
   std::shared_ptr<const FrameReport> previous;
   std::lock_guard lock{g_reportMutex};
@@ -190,6 +198,7 @@ void apply_frame_state(const detail::FrameState& state) noexcept {
   if (g_hooks != nullptr && g_hooks->beginFrame != nullptr) {
     g_hooks->beginFrame(state);
   }
+  fakeshadow::begin_frame(state);
   g_classifier.set_record(state.inspectorOpen || g_request.records);
   g_classifier.set_objects(state.inspectorOpen || g_request.objects);
   apply_merge_key();
@@ -200,6 +209,7 @@ void seal_frame() noexcept {
     return;
   }
   g_classifier.end_frame();
+  fakeshadow::seal();
   const FrameStats& stats = g_classifier.stats();
   warn_counts(stats);
   const detail::SceneHints& hints = detail::live_scene_hints();
@@ -301,6 +311,7 @@ void reset() noexcept {
   g_request = {};
   g_hooks = nullptr;
   g_observer = nullptr;
+  fakeshadow::testing::reset();
   scene::reset();
 }
 } // namespace testing

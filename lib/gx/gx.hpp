@@ -13,6 +13,7 @@
 #include <memory>
 #include <array>
 #include <cfloat>
+#include <span>
 
 #define M_PIF 3.14159265358979323846f
 
@@ -581,6 +582,22 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
 wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout,
                                 DstAlphaMode dstAlphaMode) noexcept;
 GXBindGroups build_bind_groups(const ShaderInfo& info, bool baseLevel = false) noexcept;
+// build_bind_groups with masked slots bound to 1x1 white or clear; the uniform keeps the real sizes
+GXBindGroups build_neutral_bind_groups(const ShaderInfo& info, u8 whiteMask, u8 clearMask,
+                                       bool baseLevel = false) noexcept;
+
+namespace detail {
+struct TextureFillViews {
+  WGPUTextureView empty = nullptr;
+  WGPUTextureView white = nullptr;
+  WGPUTextureView clear = nullptr;
+  WGPUSampler emptySampler = nullptr;
+};
+// Takes the views explicitly so tests and later layouts can fill entries without gx::initialize
+void fill_texture_entries(const ShaderInfo& info, u8 whiteMask, u8 clearMask, bool baseLevel,
+                          const TextureFillViews& views,
+                          std::span<WGPUBindGroupEntry, MaxTextures * 2> entries) noexcept;
+} // namespace detail
 
 u8 comp_type_size(GXAttr attr, GXCompType type) noexcept;
 u8 comp_cnt_count(GXAttr attr, GXCompCnt cnt) noexcept;
