@@ -297,48 +297,23 @@ TextureKeys hash_texture_source(const GXTexObj_& obj, const GXTlutObj_* tlut, bo
     }
   }
   if (buildSourceKey) {
-    const size_t baseBytes = texture::texture_source_size(obj.format(), obj.width(), obj.height(), 1);
-    keys.sourceKey = aurora::texture::TextureSourceKey{
-        .textureHash = XXH64(textureData.data(), baseBytes, 0),
-        .width = obj.width(),
-        .height = obj.height(),
-        .format = obj.format(),
-        .hasTlut = is_palette_format(obj.format()),
-    };
+    if (const auto base = texture::hash_source_base(obj.format(), obj.width(), obj.height(), textureData)) {
+      keys.sourceKey = aurora::texture::TextureSourceKey{
+          .textureHash = base->textureHash,
+          .width = obj.width(),
+          .height = obj.height(),
+          .format = obj.format(),
+          .hasTlut = is_palette_format(obj.format()),
+      };
+      minTlutIndex = base->minTlutIndex;
+      maxTlutIndex = base->maxTlutIndex;
 
-    switch (obj.format()) {
-    case GX_TF_C4:
-      for (size_t i = 0; i < baseBytes; ++i) {
-        minTlutIndex = std::min(
-            {minTlutIndex, static_cast<uint32_t>(textureData[i] & 0xf), static_cast<uint32_t>(textureData[i] >> 4)});
-        maxTlutIndex = std::max(
-            {maxTlutIndex, static_cast<uint32_t>(textureData[i] & 0xf), static_cast<uint32_t>(textureData[i] >> 4)});
+      if (s_sourceKeyCache.size() >= SourceKeyCacheMaxEntries) {
+        s_sourceKeyCache.clear();
       }
-      break;
-    case GX_TF_C8:
-      for (size_t i = 0; i < baseBytes; ++i) {
-        minTlutIndex = std::min(minTlutIndex, static_cast<uint32_t>(textureData[i]));
-        maxTlutIndex = std::max(maxTlutIndex, static_cast<uint32_t>(textureData[i]));
-      }
-      break;
-    case GX_TF_C14X2:
-      for (size_t i = 0; i + sizeof(uint16_t) <= baseBytes; i += sizeof(uint16_t)) {
-        uint16_t value = 0;
-        std::memcpy(&value, textureData.data() + i, sizeof(value));
-        const uint32_t index = bswap(value) & 0x3fff;
-        minTlutIndex = std::min(minTlutIndex, index);
-        maxTlutIndex = std::max(maxTlutIndex, index);
-      }
-      break;
-    default:
-      break;
+      s_sourceKeyCache.emplace(SourceKeyCacheKey{keys.contentKey.textureHash},
+                               SourceKeyCacheEntry{*keys.sourceKey, minTlutIndex, maxTlutIndex});
     }
-
-    if (s_sourceKeyCache.size() >= SourceKeyCacheMaxEntries) {
-      s_sourceKeyCache.clear();
-    }
-    s_sourceKeyCache.emplace(SourceKeyCacheKey{keys.contentKey.textureHash},
-                             SourceKeyCacheEntry{*keys.sourceKey, minTlutIndex, maxTlutIndex});
   }
 
   if (tlut != nullptr) {
@@ -350,11 +325,9 @@ TextureKeys hash_texture_source(const GXTexObj_& obj, const GXTlutObj_* tlut, bo
     keys.contentKey.tlutEntries = tlut->numEntries;
     s_stats.hashedBytes += tlutBytes;
 
-    if (keys.sourceKey.has_value() && minTlutIndex != UINT32_MAX) {
-      const size_t tlutOffset = static_cast<size_t>(minTlutIndex) * sizeof(uint16_t);
-      const size_t referencedBytes = static_cast<size_t>(maxTlutIndex + 1 - minTlutIndex) * sizeof(uint16_t);
-      if (tlutOffset + referencedBytes <= tlutBytes) {
-        keys.sourceKey->tlutHash = XXH64(tlutData.data() + tlutOffset, referencedBytes, 0);
+    if (keys.sourceKey.has_value()) {
+      if (const auto tlutHash = texture::hash_referenced_tlut(minTlutIndex, maxTlutIndex, tlutData)) {
+        keys.sourceKey->tlutHash = *tlutHash;
       }
     }
   }
@@ -603,6 +576,57 @@ size_t texture_source_size(u32 format, u32 width, u32 height, u32 mipCount) noex
 }
 
 size_t tlut_source_size(u16 numEntries) noexcept { return static_cast<size_t>(numEntries) * sizeof(u16); }
+
+std::optional<SourceBaseHash> hash_source_base(u32 format, u32 width, u32 height,
+                                               std::span<const uint8_t> texture) noexcept {
+  const size_t baseBytes = texture_source_size(format, width, height, 1);
+  if (baseBytes == 0 || texture.size() < baseBytes) {
+    return std::nullopt;
+  }
+
+  SourceBaseHash base{.textureHash = XXH64(texture.data(), baseBytes, 0)};
+  switch (format) {
+  case GX_TF_C4:
+    for (size_t i = 0; i < baseBytes; ++i) {
+      base.minTlutIndex = std::min(
+          {base.minTlutIndex, static_cast<uint32_t>(texture[i] & 0xf), static_cast<uint32_t>(texture[i] >> 4)});
+      base.maxTlutIndex = std::max(
+          {base.maxTlutIndex, static_cast<uint32_t>(texture[i] & 0xf), static_cast<uint32_t>(texture[i] >> 4)});
+    }
+    break;
+  case GX_TF_C8:
+    for (size_t i = 0; i < baseBytes; ++i) {
+      base.minTlutIndex = std::min(base.minTlutIndex, static_cast<uint32_t>(texture[i]));
+      base.maxTlutIndex = std::max(base.maxTlutIndex, static_cast<uint32_t>(texture[i]));
+    }
+    break;
+  case GX_TF_C14X2:
+    for (size_t i = 0; i + sizeof(uint16_t) <= baseBytes; i += sizeof(uint16_t)) {
+      uint16_t value = 0;
+      std::memcpy(&value, texture.data() + i, sizeof(value));
+      const uint32_t index = bswap(value) & 0x3fff;
+      base.minTlutIndex = std::min(base.minTlutIndex, index);
+      base.maxTlutIndex = std::max(base.maxTlutIndex, index);
+    }
+    break;
+  default:
+    break;
+  }
+  return base;
+}
+
+std::optional<uint64_t> hash_referenced_tlut(uint32_t minIndex, uint32_t maxIndex,
+                                             std::span<const uint8_t> tlut) noexcept {
+  if (minIndex == UINT32_MAX) {
+    return std::nullopt;
+  }
+  const size_t tlutOffset = static_cast<size_t>(minIndex) * sizeof(uint16_t);
+  const size_t referencedBytes = static_cast<size_t>(maxIndex + 1 - minIndex) * sizeof(uint16_t);
+  if (tlutOffset + referencedBytes > tlut.size()) {
+    return std::nullopt;
+  }
+  return XXH64(tlut.data() + tlutOffset, referencedBytes, 0);
+}
 
 void invalidate_bindings() noexcept { s_pendingInvalidations.fetch_add(1, std::memory_order_release); }
 
@@ -904,3 +928,30 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
   }
 }
 } // namespace aurora::gx
+
+namespace aurora::texture {
+std::optional<TextureSourceKey> compute_source_key(uint32_t format, uint32_t width, uint32_t height,
+                                                   std::span<const uint8_t> texture,
+                                                   std::span<const uint8_t> tlut) noexcept {
+  if (width > 0xFFFF || height > 0xFFFF) {
+    return std::nullopt;
+  }
+  const auto base = gx::texture::hash_source_base(format, width, height, texture);
+  if (!base) {
+    return std::nullopt;
+  }
+  const bool hasTlut = gx::is_palette_format(format);
+  if (hasTlut && tlut.empty()) {
+    return std::nullopt;
+  }
+  return TextureSourceKey{
+      .textureHash = base->textureHash,
+      .tlutHash =
+          hasTlut ? gx::texture::hash_referenced_tlut(base->minTlutIndex, base->maxTlutIndex, tlut).value_or(0) : 0,
+      .width = width,
+      .height = height,
+      .format = format,
+      .hasTlut = hasTlut,
+  };
+}
+} // namespace aurora::texture

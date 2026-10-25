@@ -61,6 +61,13 @@ struct ReplacementGroup {
 /// Returns nullopt if the filename is invalid.
 std::optional<TextureSourceKey> parse_replacement_filename(std::string_view filename) noexcept;
 
+/// Computes the source key the draw path builds for any texture GX can describe, from its base level and TLUT bytes.
+/// Returns nullopt for an unlisted format, a zero or over 0xFFFF dimension, a short base level, or a palette format
+/// without a TLUT.
+std::optional<TextureSourceKey> compute_source_key(uint32_t format, uint32_t width, uint32_t height,
+                                                   std::span<const uint8_t> texture,
+                                                   std::span<const uint8_t> tlut = {}) noexcept;
+
 /// Callback source for replacement files that do not live on the filesystem.
 ///
 /// read() loads the entire encoded file at `path` into outBytes, returning false if the file is

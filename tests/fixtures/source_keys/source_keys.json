@@ -1,0 +1,1049 @@
+{
+  "version": 1,
+  "generator": {
+    "tool": "texture_key.py fixture --write",
+    "rules": [
+      "splitmix64 next(): state += 0x9e3779b97f4a7c15; z = state; z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9; z = (z ^ (z >> 27)) * 0x94d049bb133111eb; return z ^ (z >> 31), all mod 2^64, state starts at the seed",
+      "texture {seed, size}: next() values as 8 little-endian bytes each, truncated to size",
+      "texture {seed, size, indices: [lo, hi]}: one next() r per index (C4 2 per byte, C8 1, C14X2 1 per 2 bytes); index = lo + r % (hi - lo + 1), except the first is lo and the last is hi; C4 packs the earlier index in the high nibble, C14X2 stores (r >> 62) << 14 | index big-endian",
+      "tlut {seed, entries}: bytes as texture {seed, size: 2 * entries}; null passes an empty TLUT",
+      "key null: compute_source_key returns nullopt; hashes are 16-digit lowercase hex",
+      "baseSize: texture_source_size(format, width, height, 1)"
+    ]
+  },
+  "cases": [
+    {
+      "name": "I4 8x8",
+      "format": 0,
+      "width": 8,
+      "height": 8,
+      "baseSize": 32,
+      "texture": {
+        "seed": 1,
+        "size": 32
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "443e82a1b5ea9ad5",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "I4 13x7",
+      "format": 0,
+      "width": 13,
+      "height": 7,
+      "baseSize": 64,
+      "texture": {
+        "seed": 2,
+        "size": 64
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "4a448b9b131e3354",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "I8 8x8",
+      "format": 1,
+      "width": 8,
+      "height": 8,
+      "baseSize": 64,
+      "texture": {
+        "seed": 3,
+        "size": 64
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "6a8ede90e8919f04",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "I8 13x7",
+      "format": 1,
+      "width": 13,
+      "height": 7,
+      "baseSize": 128,
+      "texture": {
+        "seed": 4,
+        "size": 128
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "c9c70683d483afbf",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "IA4 8x8",
+      "format": 2,
+      "width": 8,
+      "height": 8,
+      "baseSize": 64,
+      "texture": {
+        "seed": 5,
+        "size": 64
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "0f9d4a7177dd0c61",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "IA4 13x7",
+      "format": 2,
+      "width": 13,
+      "height": 7,
+      "baseSize": 128,
+      "texture": {
+        "seed": 6,
+        "size": 128
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "92223954e779de42",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "IA8 8x8",
+      "format": 3,
+      "width": 8,
+      "height": 8,
+      "baseSize": 128,
+      "texture": {
+        "seed": 7,
+        "size": 128
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "a6c9e2e6369fdacc",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "IA8 13x7",
+      "format": 3,
+      "width": 13,
+      "height": 7,
+      "baseSize": 256,
+      "texture": {
+        "seed": 8,
+        "size": 256
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "f15a84ba17b68c82",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "RGB565 8x8",
+      "format": 4,
+      "width": 8,
+      "height": 8,
+      "baseSize": 128,
+      "texture": {
+        "seed": 9,
+        "size": 128
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "04375e1e048b0612",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "RGB565 13x7",
+      "format": 4,
+      "width": 13,
+      "height": 7,
+      "baseSize": 256,
+      "texture": {
+        "seed": 10,
+        "size": 256
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "fcdb92cc8c8bf6d0",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "RGB5A3 8x8",
+      "format": 5,
+      "width": 8,
+      "height": 8,
+      "baseSize": 128,
+      "texture": {
+        "seed": 11,
+        "size": 128
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "f1a2b500f39deb98",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "RGB5A3 13x7",
+      "format": 5,
+      "width": 13,
+      "height": 7,
+      "baseSize": 256,
+      "texture": {
+        "seed": 12,
+        "size": 256
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "46303e136674a212",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "RGBA8 8x8",
+      "format": 6,
+      "width": 8,
+      "height": 8,
+      "baseSize": 256,
+      "texture": {
+        "seed": 13,
+        "size": 256
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "14f6f219f5825686",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "RGBA8 13x7",
+      "format": 6,
+      "width": 13,
+      "height": 7,
+      "baseSize": 512,
+      "texture": {
+        "seed": 14,
+        "size": 512
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "319d1139dea0dfcd",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "CMPR 8x8",
+      "format": 14,
+      "width": 8,
+      "height": 8,
+      "baseSize": 32,
+      "texture": {
+        "seed": 15,
+        "size": 32
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "ff4e7bc5f30eb900",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "CMPR 13x7",
+      "format": 14,
+      "width": 13,
+      "height": 7,
+      "baseSize": 64,
+      "texture": {
+        "seed": 16,
+        "size": 64
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "8774958e4cd98a83",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "R8_PC 8x8",
+      "format": 65,
+      "width": 8,
+      "height": 8,
+      "baseSize": 64,
+      "texture": {
+        "seed": 17,
+        "size": 64
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "e2bb48c8270d8d01",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "R8_PC 13x7",
+      "format": 65,
+      "width": 13,
+      "height": 7,
+      "baseSize": 91,
+      "texture": {
+        "seed": 18,
+        "size": 91
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "2dc5d77b355d8581",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "RG8_PC 8x8",
+      "format": 67,
+      "width": 8,
+      "height": 8,
+      "baseSize": 128,
+      "texture": {
+        "seed": 19,
+        "size": 128
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "35fd7f3bd6d23870",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "RG8_PC 13x7",
+      "format": 67,
+      "width": 13,
+      "height": 7,
+      "baseSize": 182,
+      "texture": {
+        "seed": 20,
+        "size": 182
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "e711e255124dc4be",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "RGBA8_PC 8x8",
+      "format": 70,
+      "width": 8,
+      "height": 8,
+      "baseSize": 256,
+      "texture": {
+        "seed": 21,
+        "size": 256
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "3c2122754c8b4004",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "RGBA8_PC 13x7",
+      "format": 70,
+      "width": 13,
+      "height": 7,
+      "baseSize": 364,
+      "texture": {
+        "seed": 22,
+        "size": 364
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "f4153d2da5e6a0a3",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "BC1_PC 8x8",
+      "format": 78,
+      "width": 8,
+      "height": 8,
+      "baseSize": 32,
+      "texture": {
+        "seed": 23,
+        "size": 32
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "a839c933397b7285",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "BC1_PC 13x7",
+      "format": 78,
+      "width": 13,
+      "height": 7,
+      "baseSize": 64,
+      "texture": {
+        "seed": 24,
+        "size": 64
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "59869bef78198c01",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "I4 1x1",
+      "format": 0,
+      "width": 1,
+      "height": 1,
+      "baseSize": 32,
+      "texture": {
+        "seed": 25,
+        "size": 32
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "cfe25662aeb53856",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "RGBA8 1x1",
+      "format": 6,
+      "width": 1,
+      "height": 1,
+      "baseSize": 64,
+      "texture": {
+        "seed": 26,
+        "size": 64
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "12f001aaecd641a5",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "CMPR 1x1",
+      "format": 14,
+      "width": 1,
+      "height": 1,
+      "baseSize": 32,
+      "texture": {
+        "seed": 27,
+        "size": 32
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "8f4393cad7d15295",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "BC1_PC 1x1",
+      "format": 78,
+      "width": 1,
+      "height": 1,
+      "baseSize": 8,
+      "texture": {
+        "seed": 28,
+        "size": 8
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "8f8dc1970578dc26",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "CMPR 102x120",
+      "format": 14,
+      "width": 102,
+      "height": 120,
+      "baseSize": 6240,
+      "texture": {
+        "seed": 101,
+        "size": 6240
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "92889f1bd3a97db1",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "C4 indices 3..9, 16 entries",
+      "format": 8,
+      "width": 8,
+      "height": 8,
+      "baseSize": 32,
+      "texture": {
+        "seed": 201,
+        "size": 32,
+        "indices": [
+          3,
+          9
+        ]
+      },
+      "tlut": {
+        "seed": 202,
+        "entries": 16
+      },
+      "key": {
+        "textureHash": "3d7da8d23ccba1b5",
+        "tlutHash": "58f2a0b17974285d",
+        "hasTlut": true
+      }
+    },
+    {
+      "name": "C4 indices 3..9 overrun 8 entries",
+      "format": 8,
+      "width": 8,
+      "height": 8,
+      "baseSize": 32,
+      "texture": {
+        "seed": 201,
+        "size": 32,
+        "indices": [
+          3,
+          9
+        ]
+      },
+      "tlut": {
+        "seed": 202,
+        "entries": 8
+      },
+      "key": {
+        "textureHash": "3d7da8d23ccba1b5",
+        "tlutHash": "0000000000000000",
+        "hasTlut": true
+      }
+    },
+    {
+      "name": "C8 full index range",
+      "format": 9,
+      "width": 16,
+      "height": 16,
+      "baseSize": 256,
+      "texture": {
+        "seed": 203,
+        "size": 256,
+        "indices": [
+          0,
+          255
+        ]
+      },
+      "tlut": {
+        "seed": 204,
+        "entries": 256
+      },
+      "key": {
+        "textureHash": "5d0be944987abe00",
+        "tlutHash": "f93f068f08b5c9c4",
+        "hasTlut": true
+      }
+    },
+    {
+      "name": "C8 indices 200..255",
+      "format": 9,
+      "width": 16,
+      "height": 16,
+      "baseSize": 256,
+      "texture": {
+        "seed": 205,
+        "size": 256,
+        "indices": [
+          200,
+          255
+        ]
+      },
+      "tlut": {
+        "seed": 206,
+        "entries": 256
+      },
+      "key": {
+        "textureHash": "45b0583c2717e2b8",
+        "tlutHash": "50252967dd6ce100",
+        "hasTlut": true
+      }
+    },
+    {
+      "name": "C8 indices 4..40 overrun 16 entries",
+      "format": 9,
+      "width": 8,
+      "height": 8,
+      "baseSize": 64,
+      "texture": {
+        "seed": 207,
+        "size": 64,
+        "indices": [
+          4,
+          40
+        ]
+      },
+      "tlut": {
+        "seed": 208,
+        "entries": 16
+      },
+      "key": {
+        "textureHash": "f1eca1a2878863fe",
+        "tlutHash": "0000000000000000",
+        "hasTlut": true
+      }
+    },
+    {
+      "name": "C14X2 indices 1000..1100 noisy top bits",
+      "format": 10,
+      "width": 16,
+      "height": 8,
+      "baseSize": 256,
+      "texture": {
+        "seed": 209,
+        "size": 256,
+        "indices": [
+          1000,
+          1100
+        ]
+      },
+      "tlut": {
+        "seed": 210,
+        "entries": 2048
+      },
+      "key": {
+        "textureHash": "22edbff519b7ad7e",
+        "tlutHash": "16f333c91752cbe8",
+        "hasTlut": true
+      }
+    },
+    {
+      "name": "C8 without TLUT",
+      "format": 9,
+      "width": 8,
+      "height": 8,
+      "baseSize": 64,
+      "texture": {
+        "seed": 211,
+        "size": 64,
+        "indices": [
+          0,
+          255
+        ]
+      },
+      "tlut": null,
+      "key": null
+    },
+    {
+      "name": "CMPR 16x16 exact",
+      "format": 14,
+      "width": 16,
+      "height": 16,
+      "baseSize": 128,
+      "texture": {
+        "seed": 301,
+        "size": 128
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "498472063f821473",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "CMPR 16x16 plus 64 bytes",
+      "format": 14,
+      "width": 16,
+      "height": 16,
+      "baseSize": 128,
+      "texture": {
+        "seed": 301,
+        "size": 192
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "498472063f821473",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "RGBA8_PC 65535x1",
+      "format": 70,
+      "width": 65535,
+      "height": 1,
+      "baseSize": 262140,
+      "texture": {
+        "seed": 302,
+        "size": 262140
+      },
+      "tlut": null,
+      "key": {
+        "textureHash": "06227867da3c494c",
+        "tlutHash": "0000000000000000",
+        "hasTlut": false
+      }
+    },
+    {
+      "name": "RGBA8_PC 65536x1",
+      "format": 70,
+      "width": 65536,
+      "height": 1,
+      "baseSize": 262144,
+      "texture": {
+        "seed": 303,
+        "size": 262144
+      },
+      "tlut": null,
+      "key": null
+    },
+    {
+      "name": "I8 1x65536",
+      "format": 1,
+      "width": 1,
+      "height": 65536,
+      "baseSize": 524288,
+      "texture": {
+        "seed": 304,
+        "size": 524288
+      },
+      "tlut": null,
+      "key": null
+    },
+    {
+      "name": "format 7",
+      "format": 7,
+      "width": 8,
+      "height": 8,
+      "baseSize": 0,
+      "texture": {
+        "seed": 305,
+        "size": 64
+      },
+      "tlut": null,
+      "key": null
+    },
+    {
+      "name": "Z8",
+      "format": 17,
+      "width": 8,
+      "height": 8,
+      "baseSize": 0,
+      "texture": {
+        "seed": 306,
+        "size": 64
+      },
+      "tlut": null,
+      "key": null
+    },
+    {
+      "name": "RGB565 8x8 short by 1",
+      "format": 4,
+      "width": 8,
+      "height": 8,
+      "baseSize": 128,
+      "texture": {
+        "seed": 307,
+        "size": 127
+      },
+      "tlut": null,
+      "key": null
+    },
+    {
+      "name": "I8 width 0",
+      "format": 1,
+      "width": 0,
+      "height": 8,
+      "baseSize": 0,
+      "texture": {
+        "seed": 308,
+        "size": 32
+      },
+      "tlut": null,
+      "key": null
+    }
+  ],
+  "names": [
+    {
+      "name": "tex1_128x128_0017919ec19004f3_14.dds",
+      "key": {
+        "textureHash": "0017919ec19004f3",
+        "tlutHash": "0000000000000000",
+        "width": 128,
+        "height": 128,
+        "format": 14,
+        "hasTlut": false
+      },
+      "canonical": "tex1_128x128_0017919ec19004f3_14"
+    },
+    {
+      "name": "tex1_128x128_m_005c13647e8d4744_14.dds",
+      "key": {
+        "textureHash": "005c13647e8d4744",
+        "tlutHash": "0000000000000000",
+        "width": 128,
+        "height": 128,
+        "format": 14,
+        "hasTlut": false
+      },
+      "canonical": "tex1_128x128_005c13647e8d4744_14"
+    },
+    {
+      "name": "tex1_256x256_289bd6f7a88282d2_81df6185a52bd4da_9.dds",
+      "key": {
+        "textureHash": "289bd6f7a88282d2",
+        "tlutHash": "81df6185a52bd4da",
+        "width": 256,
+        "height": 256,
+        "format": 9,
+        "hasTlut": true
+      },
+      "canonical": "tex1_256x256_289bd6f7a88282d2_81df6185a52bd4da_9"
+    },
+    {
+      "name": "tex1_102x120_f3773035018b6280_459566e922a89796_9.dds",
+      "key": {
+        "textureHash": "f3773035018b6280",
+        "tlutHash": "459566e922a89796",
+        "width": 102,
+        "height": 120,
+        "format": 9,
+        "hasTlut": true
+      },
+      "canonical": "tex1_102x120_f3773035018b6280_459566e922a89796_9"
+    },
+    {
+      "name": "tex1_112x144_a1c955530b5dc510_2.dds",
+      "key": {
+        "textureHash": "a1c955530b5dc510",
+        "tlutHash": "0000000000000000",
+        "width": 112,
+        "height": 144,
+        "format": 2,
+        "hasTlut": false
+      },
+      "canonical": "tex1_112x144_a1c955530b5dc510_2"
+    },
+    {
+      "name": "tex1_16x16_$_fedcba9876543210_8.dds",
+      "key": {
+        "textureHash": "ffffffffffffffff",
+        "tlutHash": "fedcba9876543210",
+        "width": 16,
+        "height": 16,
+        "format": 8,
+        "hasTlut": true
+      },
+      "canonical": "tex1_16x16_$_fedcba9876543210_8"
+    },
+    {
+      "name": "tex1_16x16_0123456789abcdef_$_9.dds",
+      "key": {
+        "textureHash": "0123456789abcdef",
+        "tlutHash": "fffffffffffffffe",
+        "width": 16,
+        "height": 16,
+        "format": 9,
+        "hasTlut": true
+      },
+      "canonical": "tex1_16x16_0123456789abcdef_$_9"
+    },
+    {
+      "name": "tex1_8x8_m_$_$_10.dds",
+      "key": {
+        "textureHash": "ffffffffffffffff",
+        "tlutHash": "fffffffffffffffe",
+        "width": 8,
+        "height": 8,
+        "format": 10,
+        "hasTlut": true
+      },
+      "canonical": "tex1_8x8_$_$_10"
+    },
+    {
+      "name": "tex1_256x256_0123456789abcdef_14_arb.dds",
+      "key": {
+        "textureHash": "0123456789abcdef",
+        "tlutHash": "0000000000000000",
+        "width": 256,
+        "height": 256,
+        "format": 14,
+        "hasTlut": false
+      },
+      "canonical": "tex1_256x256_0123456789abcdef_14"
+    },
+    {
+      "name": "tex1_128x128_0017919EC19004F3_14.PNG",
+      "key": {
+        "textureHash": "0017919ec19004f3",
+        "tlutHash": "0000000000000000",
+        "width": 128,
+        "height": 128,
+        "format": 14,
+        "hasTlut": false
+      },
+      "canonical": "tex1_128x128_0017919ec19004f3_14"
+    },
+    {
+      "name": "tex1_8x8_1f_6.dds",
+      "key": {
+        "textureHash": "000000000000001f",
+        "tlutHash": "0000000000000000",
+        "width": 8,
+        "height": 8,
+        "format": 6,
+        "hasTlut": false
+      },
+      "canonical": "tex1_8x8_000000000000001f_6"
+    },
+    {
+      "name": "tex1_8x8_10123456789abcdef0_6.dds",
+      "key": {
+        "textureHash": "123456789abcdef0",
+        "tlutHash": "0000000000000000",
+        "width": 8,
+        "height": 8,
+        "format": 6,
+        "hasTlut": false
+      },
+      "canonical": "tex1_8x8_123456789abcdef0_6"
+    },
+    {
+      "name": "tex1_8x8_14_arb.dds",
+      "key": {
+        "textureHash": "0000000000000014",
+        "tlutHash": "0000000000000000",
+        "width": 8,
+        "height": 8,
+        "format": 14,
+        "hasTlut": false
+      },
+      "canonical": "tex1_8x8_0000000000000014_14"
+    },
+    {
+      "name": "tex1_8x8_0123456789abcdef_1_4.dds",
+      "key": {
+        "textureHash": "0123456789abcdef",
+        "tlutHash": "0000000000000001",
+        "width": 8,
+        "height": 8,
+        "format": 4,
+        "hasTlut": true
+      },
+      "canonical": "tex1_8x8_0123456789abcdef_0000000000000001_4"
+    },
+    {
+      "name": "tex1_4294967295x1_0123456789abcdef_4294967295.dds",
+      "key": {
+        "textureHash": "0123456789abcdef",
+        "tlutHash": "0000000000000000",
+        "width": 4294967295,
+        "height": 1,
+        "format": 4294967295,
+        "hasTlut": false
+      },
+      "canonical": "tex1_4294967295x1_0123456789abcdef_4294967295"
+    },
+    {
+      "name": "tex1_0x8_0123456789abcdef_14.dds",
+      "key": {
+        "textureHash": "0123456789abcdef",
+        "tlutHash": "0000000000000000",
+        "width": 0,
+        "height": 8,
+        "format": 14,
+        "hasTlut": false
+      },
+      "canonical": "tex1_0x8_0123456789abcdef_14"
+    },
+    {
+      "name": "tex1_+8x8_0123456789abcdef_14.dds",
+      "key": null
+    },
+    {
+      "name": "tex1_8x8_0x1f_14.dds",
+      "key": null
+    },
+    {
+      "name": "tex1_8x8_0123456789abcdef_ 14.dds",
+      "key": null
+    },
+    {
+      "name": "tex1_\uff18x8_0123456789abcdef_14.dds",
+      "key": null
+    },
+    {
+      "name": "tex1_8x8_0123456789abcdef_4294967296.dds",
+      "key": null
+    },
+    {
+      "name": "tex1_8x8__14.dds",
+      "key": null
+    },
+    {
+      "name": "tex1_8x8_0123456789abcdef_14_.dds",
+      "key": null
+    },
+    {
+      "name": "tex1_128x128_0017919ec19004f3_14_mip1.dds",
+      "key": null
+    },
+    {
+      "name": "tex1_128x128_0017919ec19004f3_14.mat.dds",
+      "key": null
+    },
+    {
+      "name": "tex1_128x128_0017919ec19004f3_14.jpg",
+      "key": null
+    },
+    {
+      "name": "tex1_128x128_0017919ec19004f3_14",
+      "key": null
+    },
+    {
+      "name": "tex1_8x8_m_14.dds",
+      "key": null
+    },
+    {
+      "name": "tex1_8x8_m_0123456789abcdef_0123456789abcdef_9_arb.dds",
+      "key": null
+    },
+    {
+      "name": "tex2_8x8_0123456789abcdef_14.dds",
+      "key": null
+    }
+  ]
+}

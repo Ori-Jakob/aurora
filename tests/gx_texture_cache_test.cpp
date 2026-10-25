@@ -242,6 +242,63 @@ TEST_F(GxTextureCacheTest, SourceReplacementReusesContentHashPass) {
   EXPECT_EQ(texture_stats().replacementHits, 1);
 }
 
+TEST_F(GxTextureCacheTest, DrawPathKeyMatchesComputeSourceKey) {
+  std::array<uint8_t, 16> rgba{};
+  std::array<uint8_t, 32> cmpr{};
+  std::array<uint8_t, 256> indices{};
+  std::array<uint8_t, 512> palette{};
+  for (size_t i = 0; i < rgba.size(); ++i) {
+    rgba[i] = static_cast<uint8_t>(i * 7 + 1);
+  }
+  for (size_t i = 0; i < cmpr.size(); ++i) {
+    cmpr[i] = static_cast<uint8_t>(i * 13 + 5);
+  }
+  for (size_t i = 0; i < indices.size(); ++i) {
+    indices[i] = static_cast<uint8_t>(5 + i % 5);
+  }
+  for (size_t i = 0; i < palette.size(); ++i) {
+    palette[i] = static_cast<uint8_t>(i * 3);
+  }
+
+  {
+    SCOPED_TRACE("RGBA8_PC 2x2");
+    const auto key = aurora::texture::compute_source_key(GX_TF_RGBA8_PC, 2, 2, rgba);
+    ASSERT_TRUE(key.has_value());
+    const auto replacement = testing::make_texture_handle(8, 8);
+    testing::set_source_replacement(*key, replacement);
+    EXPECT_EQ(texture::resolve_static_texture(make_texture(rgba.data(), 1)), replacement);
+    EXPECT_EQ(texture_stats().replacementHits, 1);
+    EXPECT_EQ(texture_stats().hashedBytes, rgba.size());
+  }
+  texture::end_frame();
+  {
+    SCOPED_TRACE("CMPR 8x8");
+    const auto key = aurora::texture::compute_source_key(GX_TF_CMPR, 8, 8, cmpr);
+    ASSERT_TRUE(key.has_value());
+    const auto replacement = testing::make_texture_handle(8, 8);
+    testing::set_source_replacement(*key, replacement);
+    EXPECT_EQ(texture::resolve_static_texture(make_texture(cmpr.data(), 2, GX_TF_CMPR, 8, 8)), replacement);
+    EXPECT_EQ(texture_stats().replacementHits, 1);
+    EXPECT_EQ(texture_stats().hashedBytes, cmpr.size());
+  }
+  texture::end_frame();
+  {
+    SCOPED_TRACE("C8 16x16");
+    const auto key = aurora::texture::compute_source_key(GX_TF_C8, 16, 16, indices, palette);
+    ASSERT_TRUE(key.has_value());
+    EXPECT_TRUE(key->hasTlut);
+    EXPECT_EQ(key->tlutHash, XXH64(palette.data() + 5 * sizeof(uint16_t), 5 * sizeof(uint16_t), 0));
+    const auto replacement = testing::make_texture_handle(8, 8);
+    testing::set_source_replacement(*key, replacement);
+    EXPECT_EQ(texture::resolve_static_palette_texture(make_texture(indices.data(), 3, GX_TF_C8, 16, 16),
+                                                      make_tlut(palette.data(), 1, 256)),
+              replacement);
+    EXPECT_EQ(texture_stats().replacementHits, 1);
+    EXPECT_EQ(texture_stats().hashedBytes, indices.size() + palette.size());
+  }
+  EXPECT_EQ(testing::texture_allocations(), 0);
+}
+
 TEST_F(GxTextureCacheTest, TlutRefreshInvalidatesBoundPaletteTexture) {
   std::array<uint8_t, 32> indices{};
   std::array<uint8_t, 32> palette{};

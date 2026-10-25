@@ -6,9 +6,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <ostream>
 #include <set>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -490,6 +492,145 @@ TEST_F(MaterialContractTest, ClampedChainMirrorsPackLayout) {
   // GZ2 packs stop downscaling at the 16x16 native size, so their tails repeat it.
   check_chain({}, {64, 32, 16, 16, 16});
   check_chain("mat", {32, 16, 16, 16});
+}
+
+struct SplitMix64 {
+  uint64_t state = 0;
+
+  uint64_t next() noexcept {
+    state += 0x9e3779b97f4a7c15ull;
+    uint64_t z = state;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
+  }
+};
+
+std::vector<uint8_t> splitmix64_bytes(uint64_t seed, size_t size) {
+  SplitMix64 rng{seed};
+  std::vector<uint8_t> out;
+  out.reserve(size + sizeof(uint64_t));
+  while (out.size() < size) {
+    const uint64_t value = rng.next();
+    for (size_t i = 0; i < sizeof(value); ++i) {
+      out.push_back(static_cast<uint8_t>(value >> (i * 8)));
+    }
+  }
+  out.resize(size);
+  return out;
+}
+
+std::vector<uint8_t> palette_bytes(uint32_t format, uint64_t seed, size_t size, uint32_t lo, uint32_t hi) {
+  const size_t count = format == GX_TF_C4 ? size * 2 : format == GX_TF_C8 ? size : size / 2;
+  SplitMix64 rng{seed};
+  std::vector<uint8_t> out;
+  for (size_t i = 0; i < count; ++i) {
+    const uint64_t r = rng.next();
+    const uint32_t index = i == 0 ? lo : i == count - 1 ? hi : lo + static_cast<uint32_t>(r % (hi - lo + 1));
+    if (format == GX_TF_C4) {
+      if (i % 2 == 0) {
+        out.push_back(static_cast<uint8_t>(index << 4));
+      } else {
+        out.back() |= static_cast<uint8_t>(index);
+      }
+    } else if (format == GX_TF_C8) {
+      out.push_back(static_cast<uint8_t>(index));
+    } else {
+      const uint32_t value = static_cast<uint32_t>(r >> 62) << 14 | index;
+      out.push_back(static_cast<uint8_t>(value >> 8));
+      out.push_back(static_cast<uint8_t>(value));
+    }
+  }
+  return out;
+}
+
+Json load_source_key_fixture() {
+  const auto bytes = read_file(std::filesystem::path{AURORA_TEST_FIXTURES_DIR} / "source_keys" / "source_keys.json");
+  EXPECT_TRUE(bytes.has_value());
+  const std::string text = bytes ? std::string{bytes->begin(), bytes->end()} : std::string{};
+  const JsonParse parsed = parse_json(text);
+  EXPECT_TRUE(parsed.value.has_value()) << parsed.error.detail;
+  EXPECT_EQ(parsed.value ? int_of(*parsed.value, "version") : 0, 1);
+  return parsed.value.value_or(Json{});
+}
+
+std::string hex_of(uint64_t value) { return fmt::format("{:016x}", value); }
+
+TEST(SourceKeyParity, KeysMatchPythonFixture) {
+  const Json fixture = load_source_key_fixture();
+  const auto& cases = array_of(fixture, "cases");
+  ASSERT_FALSE(cases.empty());
+  for (const Json& entry : cases) {
+    SCOPED_TRACE(text_of(entry, "name"));
+    const auto format = static_cast<uint32_t>(int_of(entry, "format"));
+    const auto width = static_cast<uint32_t>(int_of(entry, "width"));
+    const auto height = static_cast<uint32_t>(int_of(entry, "height"));
+    const Json* textureSpec = entry.find("texture");
+    ASSERT_NE(textureSpec, nullptr);
+    const auto seed = static_cast<uint64_t>(int_of(*textureSpec, "seed"));
+    const auto size = static_cast<size_t>(int_of(*textureSpec, "size"));
+    std::vector<uint8_t> texture;
+    if (const auto& indices = array_of(*textureSpec, "indices"); !indices.empty()) {
+      ASSERT_EQ(indices.size(), 2u);
+      texture = palette_bytes(format, seed, size, static_cast<uint32_t>(indices[0].number),
+                              static_cast<uint32_t>(indices[1].number));
+    } else {
+      texture = splitmix64_bytes(seed, size);
+    }
+    ASSERT_EQ(texture.size(), size);
+    std::vector<uint8_t> tlut;
+    if (const Json* tlutSpec = entry.find("tlut"); tlutSpec != nullptr && tlutSpec->type == Json::Type::Object) {
+      tlut = splitmix64_bytes(static_cast<uint64_t>(int_of(*tlutSpec, "seed")),
+                              static_cast<size_t>(int_of(*tlutSpec, "entries")) * sizeof(uint16_t));
+    }
+
+    const auto key = texture::compute_source_key(format, width, height, texture, tlut);
+    const Json* expected = entry.find("key");
+    ASSERT_NE(expected, nullptr);
+    if (expected->type == Json::Type::Null) {
+      EXPECT_FALSE(key.has_value());
+      continue;
+    }
+    ASSERT_TRUE(key.has_value());
+    EXPECT_EQ(hex_of(key->textureHash), text_of(*expected, "textureHash"));
+    EXPECT_EQ(hex_of(key->tlutHash), text_of(*expected, "tlutHash"));
+    EXPECT_EQ(key->hasTlut, bool_of(*expected, "hasTlut"));
+    EXPECT_EQ(key->width, width);
+    EXPECT_EQ(key->height, height);
+    EXPECT_EQ(key->format, format);
+
+    const auto baseSize = static_cast<size_t>(int_of(entry, "baseSize"));
+    ASSERT_GT(baseSize, 0u);
+    ASSERT_LE(baseSize, texture.size());
+    const std::span<const uint8_t> bytes{texture};
+    EXPECT_EQ(texture::compute_source_key(format, width, height, bytes.first(baseSize), tlut), key);
+    EXPECT_FALSE(texture::compute_source_key(format, width, height, bytes.first(baseSize - 1), tlut).has_value());
+  }
+}
+
+TEST(SourceKeyParity, NamesMatchPythonFixture) {
+  const Json fixture = load_source_key_fixture();
+  const auto& names = array_of(fixture, "names");
+  ASSERT_FALSE(names.empty());
+  for (const Json& entry : names) {
+    const std::string name = text_of(entry, "name");
+    SCOPED_TRACE(name);
+    const auto parsed = texture::parse_replacement_filename(name);
+    const Json* expected = entry.find("key");
+    ASSERT_NE(expected, nullptr);
+    if (expected->type == Json::Type::Null) {
+      EXPECT_FALSE(parsed.has_value());
+      continue;
+    }
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(hex_of(parsed->textureHash), text_of(*expected, "textureHash"));
+    EXPECT_EQ(hex_of(parsed->tlutHash), text_of(*expected, "tlutHash"));
+    EXPECT_EQ(parsed->width, static_cast<uint32_t>(int_of(*expected, "width")));
+    EXPECT_EQ(parsed->height, static_cast<uint32_t>(int_of(*expected, "height")));
+    EXPECT_EQ(parsed->format, static_cast<uint32_t>(int_of(*expected, "format")));
+    EXPECT_EQ(parsed->hasTlut, bool_of(*expected, "hasTlut"));
+    EXPECT_EQ(canonical_key(*parsed), text_of(entry, "canonical"));
+  }
 }
 } // namespace
 } // namespace aurora::test::c1

@@ -4,6 +4,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
+#include <span>
 
 namespace aurora::gx {
 struct TextureStats {
@@ -38,6 +40,17 @@ constexpr uint64_t ReplacementPublishBudgetBytes = 12ull * 1024ull * 1024ull;
 
 size_t texture_source_size(u32 format, u32 width, u32 height, u32 mipCount) noexcept;
 size_t tlut_source_size(u16 numEntries) noexcept;
+
+struct SourceBaseHash {
+  uint64_t textureHash = 0;
+  uint32_t minTlutIndex = UINT32_MAX;
+  uint32_t maxTlutIndex = 0;
+};
+
+std::optional<SourceBaseHash> hash_source_base(u32 format, u32 width, u32 height,
+                                               std::span<const uint8_t> texture) noexcept;
+std::optional<uint64_t> hash_referenced_tlut(uint32_t minIndex, uint32_t maxIndex,
+                                             std::span<const uint8_t> tlut) noexcept;
 
 void invalidate_bindings() noexcept;
 uint64_t current_bind_generation() noexcept;

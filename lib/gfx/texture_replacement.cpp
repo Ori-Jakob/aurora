@@ -311,84 +311,6 @@ std::optional<std::pair<uint32_t, uint32_t>> parse_dimensions(std::string_view t
   return std::pair{*width, *height};
 }
 
-uint32_t texture_base_level_size(const GXTexObj_& obj) noexcept {
-  switch (obj.format()) {
-  case GX_TF_R8_PC:
-    return obj.width() * obj.height();
-  case GX_TF_RG8_PC:
-    return obj.width() * obj.height() * 2;
-  case GX_TF_RGBA8_PC:
-    return obj.width() * obj.height() * 4;
-  case GX_TF_BC1_PC:
-    return ((obj.width() + 3) / 4) * ((obj.height() + 3) / 4) * 8;
-  default:
-    return GXGetTexBufferSize(obj.width(), obj.height(), obj.format(), false, 0);
-  }
-}
-
-ArrayRef<uint8_t> tlut_bytes(const GXTlutObj_& tlut) noexcept {
-  return {static_cast<const uint8_t*>(tlut.data), static_cast<size_t>(tlut.numEntries) * sizeof(uint16_t)};
-}
-
-std::optional<uint64_t> compute_referenced_tlut_hash(const GXTexObj_& obj, ArrayRef<uint8_t> tlutData) noexcept {
-  const uint32_t textureSize = texture_base_level_size(obj);
-  const auto* textureData = static_cast<const uint8_t*>(obj.data);
-  if (!gx::is_palette_format(obj.format()) || !obj.has_data() || textureSize == 0 || tlutData.empty()) {
-    return std::nullopt;
-  }
-
-  uint32_t minIndex = 0xffff;
-  uint32_t maxIndex = 0;
-  switch (obj.format()) {
-  case GX_TF_C4:
-    for (uint32_t i = 0; i < textureSize; ++i) {
-      const uint32_t lowNibble = textureData[i] & 0xf;
-      const uint32_t highNibble = textureData[i] >> 4;
-      minIndex = std::min({minIndex, lowNibble, highNibble});
-      maxIndex = std::max({maxIndex, lowNibble, highNibble});
-    }
-    break;
-  case GX_TF_C8:
-    for (uint32_t i = 0; i < textureSize; ++i) {
-      const uint32_t index = textureData[i];
-      minIndex = std::min(minIndex, index);
-      maxIndex = std::max(maxIndex, index);
-    }
-    break;
-  case GX_TF_C14X2:
-    for (uint32_t i = 0; i + sizeof(uint16_t) <= textureSize; i += sizeof(uint16_t)) {
-      uint16_t value = 0;
-      std::memcpy(&value, textureData + i, sizeof(value));
-      const uint32_t index = bswap(value) & 0x3fff;
-      minIndex = std::min(minIndex, index);
-      maxIndex = std::max(maxIndex, index);
-    }
-    break;
-  default:
-    return std::nullopt;
-  }
-
-  size_t tlutSize = 2 * (static_cast<size_t>(maxIndex) + 1 - minIndex);
-  const size_t tlutOffset = 2 * static_cast<size_t>(minIndex);
-  if (tlutOffset + tlutSize > tlutData.size()) {
-    return std::nullopt;
-  }
-  return XXH64(tlutData.data() + tlutOffset, tlutSize, 0);
-}
-
-std::optional<uint64_t> compute_referenced_tlut_hash(const GXTexObj_& obj) noexcept {
-  if (!gx::is_palette_format(obj.format()) || obj.tlut >= gx::g_gxState.loadedTluts.size()) {
-    return std::nullopt;
-  }
-
-  const auto& tlut = gx::g_gxState.loadedTluts[obj.tlut];
-  if (tlut.data == nullptr) {
-    return std::nullopt;
-  }
-
-  return compute_referenced_tlut_hash(obj, tlut_bytes(tlut));
-}
-
 const GXTlutObj_* get_loaded_tlut(const GXTexObj_& obj) noexcept {
   if (!gx::is_palette_format(obj.format()) || obj.tlut >= gx::g_gxState.loadedTluts.size()) {
     return nullptr;
@@ -398,33 +320,28 @@ const GXTlutObj_* get_loaded_tlut(const GXTexObj_& obj) noexcept {
   return tlut.data != nullptr ? &tlut : nullptr;
 }
 
-TextureSourceKey build_source_key_base(const GXTexObj_& obj) noexcept {
+TextureSourceKey build_source_key(const GXTexObj_& obj, const GXTlutObj_* tlut) noexcept {
   TextureSourceKey key{
       .width = obj.width(),
       .height = obj.height(),
       .format = obj.format(),
       .hasTlut = gx::is_palette_format(obj.format()),
   };
-
-  const uint32_t textureSize = texture_base_level_size(obj);
-  if (obj.has_data() && textureSize != 0) {
-    key.textureHash = XXH64(obj.data, textureSize, 0);
+  if (!obj.has_data()) {
+    return key;
   }
-  return key;
-}
 
-TextureSourceKey build_source_key(const GXTexObj_& obj) noexcept {
-  auto key = build_source_key_base(obj);
-  if (key.hasTlut) {
-    key.tlutHash = compute_referenced_tlut_hash(obj).value_or(0);
+  const size_t baseBytes = gx::texture::texture_source_size(obj.format(), obj.width(), obj.height(), 1);
+  const auto base = gx::texture::hash_source_base(obj.format(), obj.width(), obj.height(),
+                                                  {static_cast<const uint8_t*>(obj.data), baseBytes});
+  if (!base) {
+    return key;
   }
-  return key;
-}
-
-TextureSourceKey build_source_key(const GXTexObj_& obj, const GXTlutObj_& tlut) noexcept {
-  auto key = build_source_key_base(obj);
-  if (key.hasTlut && tlut.data != nullptr) {
-    key.tlutHash = compute_referenced_tlut_hash(obj, tlut_bytes(tlut)).value_or(0);
+  key.textureHash = base->textureHash;
+  if (key.hasTlut && tlut != nullptr && tlut->data != nullptr) {
+    const std::span<const uint8_t> tlutData{static_cast<const uint8_t*>(tlut->data),
+                                            gx::texture::tlut_source_size(tlut->numEntries)};
+    key.tlutHash = gx::texture::hash_referenced_tlut(base->minTlutIndex, base->maxTlutIndex, tlutData).value_or(0);
   }
   return key;
 }
@@ -1891,7 +1808,7 @@ bool has_replacement(const GXTexObj_& obj) noexcept {
     return false;
   }
 
-  return find_source_replacement_key_locked(build_source_key(obj)).has_value();
+  return find_source_replacement_key_locked(build_source_key(obj, get_loaded_tlut(obj))).has_value();
 }
 
 bool has_replacement(const GXTexObj_& obj, const GXTlutObj_& tlut) noexcept {
@@ -1911,11 +1828,11 @@ bool has_replacement(const GXTexObj_& obj, const GXTlutObj_& tlut) noexcept {
     return false;
   }
 
-  return find_source_replacement_key_locked(build_source_key(obj, tlut)).has_value();
+  return find_source_replacement_key_locked(build_source_key(obj, &tlut)).has_value();
 }
 
 std::string build_texture_replacement_name(const GXTexObj_& obj) noexcept {
-  return format_replacement_filename(build_source_key(obj));
+  return format_replacement_filename(build_source_key(obj, get_loaded_tlut(obj)));
 }
 
 std::string build_texture_replacement_name(const TextureSourceKey& sourceKey) noexcept {

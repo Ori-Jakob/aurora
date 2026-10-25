@@ -152,6 +152,76 @@ TEST_F(ReplacementStreamingTest, StaleFailureDoesNotPoisonNewRegistration) {
   texture::unregister_replacement(newRegistration);
 }
 
+TEST_F(ReplacementStreamingTest, GameThreadKeyMatchesComputeSourceKey) {
+  const std::array<uint8_t, 4> pixel{1, 2, 3, 4};
+  const texture::RawTextureReplacement raw{.bytes = pixel, .width = 1, .height = 1, .gxFormat = GX_TF_RGBA8_PC};
+  const auto make_obj = [](const void* data, u32 format, u32 width, u32 height) {
+    GXTexObj_ obj{};
+    obj.data = data;
+    obj.mWidth = width;
+    obj.mHeight = height;
+    obj.mFormat = format;
+    obj.tlut = GX_TLUT0;
+    return obj;
+  };
+  const auto make_tlut = [](const std::array<uint8_t, 512>& palette) {
+    GXTlutObj_ tlut{};
+    tlut.data = palette.data();
+    tlut.numEntries = 256;
+    tlut.format = GX_TL_RGB5A3;
+    return tlut;
+  };
+
+  std::array<uint8_t, 32> cmpr{};
+  for (size_t i = 0; i < cmpr.size(); ++i) {
+    cmpr[i] = static_cast<uint8_t>(i * 11 + 3);
+  }
+  const auto cmprObj = make_obj(cmpr.data(), GX_TF_CMPR, 8, 8);
+  const auto cmprKey = texture::compute_source_key(GX_TF_CMPR, 8, 8, cmpr);
+  ASSERT_TRUE(cmprKey.has_value());
+  EXPECT_FALSE(has_replacement(cmprObj));
+  ASSERT_NE(texture::register_replacement(*cmprKey, raw).id, 0u);
+  EXPECT_TRUE(has_replacement(cmprObj));
+  EXPECT_EQ(build_texture_replacement_name(cmprObj), build_texture_replacement_name(*cmprKey));
+
+  std::array<uint8_t, 256> indices{};
+  for (size_t i = 0; i < indices.size(); ++i) {
+    indices[i] = static_cast<uint8_t>(5 + i % 5);
+  }
+  std::array<uint8_t, 512> paletteA{};
+  for (size_t i = 0; i < paletteA.size(); ++i) {
+    paletteA[i] = static_cast<uint8_t>(i * 3);
+  }
+  auto paletteB = paletteA;
+  paletteB[7 * sizeof(uint16_t)] ^= 0xff;
+  auto paletteC = paletteA;
+  paletteC[100 * sizeof(uint16_t)] ^= 0xff;
+  const auto c8Obj = make_obj(indices.data(), GX_TF_C8, 16, 16);
+  const auto c8Key = texture::compute_source_key(GX_TF_C8, 16, 16, indices, paletteA);
+  ASSERT_TRUE(c8Key.has_value());
+  ASSERT_NE(texture::register_replacement(*c8Key, raw).id, 0u);
+  EXPECT_TRUE(has_replacement(c8Obj, make_tlut(paletteA)));
+  EXPECT_TRUE(has_replacement(c8Obj, make_tlut(paletteC)));
+  EXPECT_FALSE(has_replacement(c8Obj, make_tlut(paletteB)));
+  EXPECT_FALSE(has_replacement(c8Obj));
+
+  auto anyTlut = *c8Key;
+  anyTlut.tlutHash = texture::kWildcardTlutHash;
+  ASSERT_NE(texture::register_replacement(anyTlut, raw).id, 0u);
+  EXPECT_TRUE(has_replacement(c8Obj, make_tlut(paletteB)));
+  EXPECT_TRUE(has_replacement(c8Obj));
+
+  const auto emptyObj = make_obj(nullptr, GX_TF_RGBA8_PC, 4, 4);
+  EXPECT_FALSE(has_replacement(emptyObj));
+  ASSERT_NE(texture::register_replacement(
+                texture::TextureSourceKey{
+                    .textureHash = texture::kWildcardTextureHash, .width = 4, .height = 4, .format = GX_TF_RGBA8_PC},
+                raw)
+                .id,
+            0u);
+  EXPECT_TRUE(has_replacement(emptyObj));
+}
+
 template <typename T>
 void write_u32(std::vector<uint8_t>& bytes, size_t offset, T value) {
   const uint32_t word = static_cast<uint32_t>(value);
