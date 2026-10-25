@@ -12,6 +12,7 @@
 #include "gx/render_ext.hpp"
 #include "gx/shader_info.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -112,6 +113,38 @@ std::optional<wgpu::BackendType> hardware_backend() {
     return std::nullopt;
   }
   return backend;
+}
+
+std::optional<std::vector<float>> run_float_compute(test::TestDevice& device, const std::string& text,
+                                                    uint32_t invocations, uint32_t fields) {
+  const wgpu::ShaderSourceWGSL wgsl{wgpu::ShaderSourceWGSL::Init{.code = text.c_str()}};
+  const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl};
+  const wgpu::ShaderModule module = device.device.CreateShaderModule(&moduleDescriptor);
+  const wgpu::ComputePipelineDescriptor pipelineDescriptor{.compute = {.module = module, .entryPoint = "main"}};
+  const wgpu::ComputePipeline pipeline = device.device.CreateComputePipeline(&pipelineDescriptor);
+  const uint64_t size = uint64_t{invocations} * fields * sizeof(float);
+  const wgpu::BufferDescriptor bufferDescriptor{.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc,
+                                                .size = size};
+  const wgpu::Buffer output = device.device.CreateBuffer(&bufferDescriptor);
+  const wgpu::BindGroupEntry entry{.binding = 0, .buffer = output, .size = size};
+  const wgpu::BindGroupDescriptor groupDescriptor{
+      .layout = pipeline.GetBindGroupLayout(0), .entryCount = 1, .entries = &entry};
+  const wgpu::BindGroup group = device.device.CreateBindGroup(&groupDescriptor);
+  const wgpu::CommandEncoder encoder = device.device.CreateCommandEncoder();
+  const wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
+  pass.SetPipeline(pipeline);
+  pass.SetBindGroup(0, group);
+  pass.DispatchWorkgroups(invocations / 64);
+  pass.End();
+  const wgpu::CommandBuffer commands = encoder.Finish();
+  device.queue.Submit(1, &commands);
+  const auto words = test::read_buffer(device, output, 0, size);
+  if (!words || words->size() != uint64_t{invocations} * fields) {
+    return std::nullopt;
+  }
+  std::vector<float> values(words->size());
+  std::memcpy(values.data(), words->data(), size);
+  return values;
 }
 
 class GxShaderExtDevice : public ::testing::Test {
@@ -290,35 +323,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     out_words[i * 6u + 5u] = min(min(a.bary.x, a.bary.y), min(a.bary.z, min(min(b.bary.x, b.bary.y), b.bary.z)));
 }
 )";
-  const wgpu::ShaderSourceWGSL wgsl{wgpu::ShaderSourceWGSL::Init{.code = text.c_str()}};
-  const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl};
-  const wgpu::ShaderModule module = m_device->device.CreateShaderModule(&moduleDescriptor);
-  const wgpu::ComputePipelineDescriptor pipelineDescriptor{.compute = {.module = module, .entryPoint = "main"}};
-  const wgpu::ComputePipeline pipeline = m_device->device.CreateComputePipeline(&pipelineDescriptor);
-  constexpr uint64_t Size = Points * Fields * sizeof(float);
-  const wgpu::BufferDescriptor bufferDescriptor{.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc,
-                                                .size = Size};
-  const wgpu::Buffer output = m_device->device.CreateBuffer(&bufferDescriptor);
-  const wgpu::BindGroupEntry entry{.binding = 0, .buffer = output, .size = Size};
-  const wgpu::BindGroupDescriptor groupDescriptor{
-      .layout = pipeline.GetBindGroupLayout(0), .entryCount = 1, .entries = &entry};
-  const wgpu::BindGroup group = m_device->device.CreateBindGroup(&groupDescriptor);
-  const wgpu::CommandEncoder encoder = m_device->device.CreateCommandEncoder();
-  const wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
-  pass.SetPipeline(pipeline);
-  pass.SetBindGroup(0, group);
-  pass.DispatchWorkgroups(Points / 64);
-  pass.End();
-  const wgpu::CommandBuffer commands = encoder.Finish();
-  m_device->queue.Submit(1, &commands);
-  const auto words = test::read_buffer(*m_device, output, 0, Size);
-  ASSERT_TRUE(words.has_value());
-  ASSERT_EQ(words->size(), Points * Fields);
-  std::vector<float> values(words->size());
-  std::memcpy(values.data(), words->data(), Size);
+  const auto values = run_float_compute(*m_device, text, Points, Fields);
+  ASSERT_TRUE(values.has_value());
   size_t checked = 0;
   for (uint32_t i = 0; i < Points; ++i) {
-    const float* v = &values[i * Fields];
+    const float* v = &(*values)[i * Fields];
     EXPECT_NEAR(v[4], 3.f, 1e-4f) << i;
     // A step that crosses a lattice edge changes the tap set, so only steps inside one triangle compare
     if (v[5] < 0.01f) {
@@ -330,6 +339,75 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     ++checked;
   }
   EXPECT_GE(checked, Points / 2);
+}
+
+TEST_F(GxShaderExtDevice, HexWeightsStayFiniteAtHighSharpness) {
+  const auto backend =
+      test::parse_test_backend(std::getenv("AURORA_TEST_BACKEND")).value_or(wgpu::BackendType::Undefined);
+  if (!start({.backend = backend, .core = true}, false)) {
+    GTEST_SKIP() << "no adapter";
+  }
+  if (m_device->adapterInfo.backendType == wgpu::BackendType::Null) {
+    GTEST_SKIP() << "the null backend runs no shaders";
+  }
+  constexpr uint32_t Points = 1024;
+  constexpr uint32_t Fields = 4;
+  constexpr std::array<float, 3> Exponents{7.f, 16.f, 32.f};
+  std::string text;
+  append_hex_common(text);
+  text += R"(
+@group(0) @binding(0) var<storage, read_write> out_words: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+    let i = id.x % 1024u;
+    let k = id.x / 1024u;
+    let e = select(select(7.0, 16.0, k == 1u), 32.0, k == 2u);
+    let uv = vec2f(f32(i % 32u), f32(i / 32u)) * 0.0731 + vec2f(0.113, -1.29);
+    let bary = select(hex_taps(uv, 1.0, 1.0, vec2f(256.0)).bary, vec3f(1.0 / 3.0), i == 0u);
+    let grey = vec4f(0.5, 0.5, 0.5, 1.0);
+    let g = hex_weights(bary, grey, grey, grey, 0.6, e);
+    let shade = g.x * grey + g.y * grey + g.z * grey;
+    let c0 = vec4f(0.9, 0.2, 0.1, 1.0);
+    let c1 = vec4f(0.1, 0.6, 0.3, 1.0);
+    let c2 = vec4f(0.3, 0.3, 0.8, 1.0);
+    let w = hex_weights(bary, c0, c1, c2, 0.6, e);
+    let lw = vec3f(0.299, 0.587, 0.114);
+    let lum = vec3f(dot(c0.rgb, lw), dot(c1.rgb, lw), dot(c2.rgb, lw));
+    let prior = mix(vec3f(1.0), lum, 0.6) * pow(max(bary, vec3f(0.0)), vec3f(e));
+    let priorSum = prior.x + prior.y + prior.z;
+    let d = abs(w - prior / max(priorSum, 1e-6));
+    out_words[id.x * 4u + 0u] = shade.r;
+    out_words[id.x * 4u + 1u] = g.x + g.y + g.z;
+    out_words[id.x * 4u + 2u] = priorSum;
+    out_words[id.x * 4u + 3u] = max(d.x, max(d.y, d.z));
+}
+)";
+  const auto values = run_float_compute(*m_device, text, Points * static_cast<uint32_t>(Exponents.size()), Fields);
+  ASSERT_TRUE(values.has_value());
+  for (size_t k = 0; k < Exponents.size(); ++k) {
+    size_t underflowed = 0;
+    size_t compared = 0;
+    for (uint32_t i = 0; i < Points; ++i) {
+      const float* v = &(*values)[(k * Points + i) * Fields];
+      EXPECT_NEAR(v[0], 0.5f, 1e-3f) << "exponent " << Exponents[k] << " point " << i;
+      EXPECT_NEAR(v[1], 1.f, 1e-4f) << "exponent " << Exponents[k] << " point " << i;
+      if (v[2] < 1e-6f) {
+        ++underflowed;
+      } else if (v[2] > 1e-4f) {
+        // Where the unscaled weights never neared the epsilon, the scaled ones must give the same blend
+        EXPECT_LT(v[3], 2e-4f) << "exponent " << Exponents[k] << " point " << i;
+        ++compared;
+      }
+    }
+    EXPECT_GE(compared, Points / 8) << "exponent " << Exponents[k];
+    if (Exponents[k] >= 16.f) {
+      EXPECT_GE(underflowed, 1u) << "exponent " << Exponents[k];
+    }
+    if (Exponents[k] >= 32.f) {
+      EXPECT_GE(underflowed, Points / 4) << "exponent " << Exponents[k];
+    }
+  }
 }
 } // namespace
 } // namespace aurora::gx

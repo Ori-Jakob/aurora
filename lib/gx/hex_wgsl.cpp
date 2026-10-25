@@ -87,7 +87,9 @@ fn hex_taps(uv: vec2f, invScale: f32, rotation: f32, texSize: vec2f) -> HexTaps 
 fn hex_weights(bary: vec3f, c0: vec4f, c1: vec4f, c2: vec4f, contrast: f32, exponent: f32) -> vec3f {
     let lw = vec3f(0.299, 0.587, 0.114);
     let lum = vec3f(dot(c0.rgb, lw), dot(c1.rgb, lw), dot(c2.rgb, lw));
-    let w = mix(vec3f(1.0), lum, contrast) * pow(max(bary, vec3f(0.0)), vec3f(exponent));
+    let b = max(bary, vec3f(0.0));
+    // The largest base is 1 so high exponents cannot underflow; the common factor cancels in the normalisation
+    let w = mix(vec3f(1.0), lum, contrast) * pow(b / max(b.x, max(b.y, b.z)), vec3f(exponent));
     return w / max(w.x + w.y + w.z, 1e-6);
 }
 )";
