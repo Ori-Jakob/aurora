@@ -14,11 +14,13 @@
 
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace aurora::gx {
@@ -56,6 +58,13 @@ std::vector<HexCase> collect_hex_cases() {
 const std::vector<HexCase>& hex_cases() {
   static const std::vector<HexCase> cases = collect_hex_cases();
   return cases;
+}
+
+bool in_allow_class(const corpus::Record& record) {
+  const corpus::Variant variant = corpus::decode_variant(record);
+  const ShaderConfig config = corpus::decode(record);
+  return variant.normalAttachment != UINT32_MAX && config.attrs[GX_VA_NRM].attrType != GX_NONE &&
+         build_shader_info(config).lightingEnabled;
 }
 
 std::optional<std::string> module_error(test::TestDevice& device, const std::string& text) {
@@ -197,9 +206,7 @@ TEST_F(GxShaderExtDevice, HexValidatesWhereLegacyValidates) {
       legacy.ext = {};
       const auto legacyError = module_error(
           *m_device, build_shader_source(legacy, item.variant.dstAlphaMode, item.variant.normalAttachment));
-      if (legacyError) {
-        continue;
-      }
+      EXPECT_FALSE(legacyError.has_value()) << "core " << core << ": " << legacyError.value_or("");
       const std::string text =
           build_shader_source(item.config, item.variant.dstAlphaMode, item.variant.normalAttachment);
       ASSERT_NE(text.find("fn hex_tex"), std::string::npos);
@@ -208,6 +215,50 @@ TEST_F(GxShaderExtDevice, HexValidatesWhereLegacyValidates) {
       ++validated;
     }
     EXPECT_GE(validated, MinHexConfigs) << "core " << core;
+    EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
+    m_device.reset();
+  }
+}
+
+TEST_F(GxShaderExtDevice, LitNormalTargetValidates) {
+  std::vector<corpus::Entry> local;
+  if (const char* path = std::getenv("AURORA_GX_SHADER_CORPUS"); path != nullptr && *path != '\0') {
+    std::string error;
+    auto entries = corpus::read_corpus(path, &error);
+    ASSERT_TRUE(entries.has_value()) << error;
+    local = std::move(*entries);
+  }
+  const std::vector<corpus::Entry> synthetic = corpus::generate_synthetic();
+  for (const bool core : {true, false}) {
+    ASSERT_TRUE(start({.backend = wgpu::BackendType::Null, .core = core}, false)) << "core " << core;
+    const auto validate_class = [&](const std::vector<corpus::Entry>& entries) {
+      std::pair<size_t, size_t> counts{};
+      for (const corpus::Entry& entry : entries) {
+        if (corpus::validate(entry.record) || !in_allow_class(entry.record)) {
+          continue;
+        }
+        const ShaderConfig config = corpus::decode(entry.record);
+        if (module_error(*m_device, build_shader_source(config, corpus::decode_variant(entry.record).dstAlphaMode))) {
+          ++counts.second;
+          continue;
+        }
+        const auto error = module_error(*m_device, corpus::generate_wgsl(entry.record));
+        EXPECT_FALSE(error.has_value()) << "core " << core << " " << entry.label << ": " << error.value_or("");
+        ++counts.first;
+      }
+      return counts;
+    };
+    const auto [count, untargetedInvalid] = validate_class(synthetic);
+    EXPECT_GE(count, 1u) << "core " << core;
+    std::printf("core %d: synthetic allow class %zu validated, %zu with invalid untargeted text\n", core ? 1 : 0, count,
+                untargetedInvalid);
+    RecordProperty("allowClass", static_cast<int>(count));
+    if (!local.empty()) {
+      const auto [localCount, localUntargetedInvalid] = validate_class(local);
+      std::printf("core %d: local allow class %zu validated, %zu with invalid untargeted text\n", core ? 1 : 0,
+                  localCount, localUntargetedInvalid);
+      RecordProperty("localAllowClass", static_cast<int>(localCount));
+    }
     EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
     m_device.reset();
   }

@@ -77,6 +77,12 @@ std::string uniform_struct(const std::string& text) {
   return begin == std::string::npos || end == std::string::npos ? std::string{} : text.substr(begin, end - begin);
 }
 
+std::string vertex_output(const std::string& text) {
+  const size_t begin = text.find("struct VertexOutput {");
+  const size_t end = text.find("};", begin);
+  return begin == std::string::npos || end == std::string::npos ? std::string{} : text.substr(begin, end - begin);
+}
+
 Vec4<float> read_vec4(std::span<const uint8_t> bytes, size_t offset) {
   Vec4<float> value{};
   std::memcpy(&value, bytes.data() + offset, sizeof(value));
@@ -372,6 +378,25 @@ TEST_F(GxShaderExtTest, UniformTailMatchesLanes) {
   EXPECT_TRUE(read_vec4(extBytes, tail - 16) == (Vec4<float>{64.f, 128.f, 0.f, 0.f}));
   EXPECT_TRUE(read_vec4(extBytes, tail - 32) == (Vec4<float>{32.f, 16.f, 0.f, 0.f}));
   EXPECT_TRUE(std::equal(legacyBytes.begin(), legacyBytes.end(), extBytes.begin()));
+}
+
+TEST_F(GxShaderExtTest, LitNormalTargetDeclaresNormalVarying) {
+  ShaderConfig config = single_site();
+  config.attrs[GX_VA_NRM] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32};
+  config.colorChannels[GX_COLOR0] = {.matSrc = GX_SRC_REG, .ambSrc = GX_SRC_REG, .lightingEnabled = true};
+  config.tevStages[0].colorPass = {GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASC, GX_CC_ZERO};
+  config.tevStages[0].channelId = GX_COLOR0A0;
+  ASSERT_TRUE(build_shader_info(config).lightingEnabled);
+  for (const auto mode : {DstAlphaMode::None, DstAlphaMode::Replace}) {
+    const std::string text = build_shader_source(config, mode, 1u);
+    EXPECT_NE(vertex_output(text).find("mv_nrm: vec3f,"), std::string::npos) << static_cast<int>(mode);
+    EXPECT_NE(text.find("out.mv_nrm = mv_nrm;"), std::string::npos) << static_cast<int>(mode);
+    EXPECT_NE(text.find("dot(in.mv_nrm, in.mv_nrm)"), std::string::npos) << static_cast<int>(mode);
+  }
+  const std::string untargeted = build_shader_source(config, DstAlphaMode::None, UINT32_MAX);
+  EXPECT_FALSE(vertex_output(untargeted).empty());
+  EXPECT_EQ(vertex_output(untargeted).find("mv_nrm"), std::string::npos);
+  EXPECT_EQ(untargeted.find("in.mv_nrm"), std::string::npos);
 }
 } // namespace
 } // namespace aurora::gx

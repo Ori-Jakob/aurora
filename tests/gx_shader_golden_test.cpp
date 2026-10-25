@@ -8,13 +8,17 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <type_traits>
 #include <vector>
 
@@ -486,6 +490,100 @@ std::filesystem::path temp_file(std::string_view name) {
   return std::filesystem::temp_directory_path() / fmt::format("aurora_gx_shader_corpus_{}", name);
 }
 
+constexpr std::string_view AllowHeader = "# aurora gx shader g2 allow v1";
+constexpr std::string_view AllowEntry = "lit-normal-target";
+
+struct AllowList {
+  std::vector<std::string> entries;
+  std::vector<GoldenLine> lines;
+};
+
+std::filesystem::path allow_path() {
+  return std::filesystem::path{AURORA_GX_SHADER_GOLDEN}.parent_path() / "gx_shader_g2_allow.txt";
+}
+
+std::optional<uint64_t> parse_number(std::string_view text, int base) {
+  uint64_t value = 0;
+  const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), value, base);
+  if (text.empty() || ec != std::errc{} || end != text.data() + text.size()) {
+    return std::nullopt;
+  }
+  return value;
+}
+
+std::optional<AllowList> parse_allow(std::string_view text, std::string& error) {
+  AllowList list;
+  size_t number = 0;
+  while (!text.empty()) {
+    const size_t end = text.find('\n');
+    std::string_view line = text.substr(0, end);
+    text = end == std::string_view::npos ? std::string_view{} : text.substr(end + 1);
+    ++number;
+    if (!line.empty() && line.back() == '\r') {
+      line.remove_suffix(1);
+    }
+    if (number == 1) {
+      if (line != AllowHeader) {
+        error = "missing or wrong header";
+        return std::nullopt;
+      }
+      continue;
+    }
+    if (line.empty()) {
+      continue;
+    }
+    std::vector<std::string_view> fields;
+    for (size_t start = 0; start <= line.size();) {
+      const size_t space = std::min(line.find(' ', start), line.size());
+      fields.push_back(line.substr(start, space - start));
+      start = space + 1;
+    }
+    const auto key = fields[0].size() == 16 ? parse_number(fields[0], 16) : std::nullopt;
+    if (!key) {
+      if (fields.size() < 3 || !list.lines.empty() ||
+          std::find(list.entries.begin(), list.entries.end(), fields[0]) != list.entries.end()) {
+        error = fmt::format("line {}: malformed entry", number);
+        return std::nullopt;
+      }
+      list.entries.emplace_back(fields[0]);
+      continue;
+    }
+    const auto hash = fields.size() == 4 && fields[1].size() == 16 ? parse_number(fields[1], 16) : std::nullopt;
+    const auto size = fields.size() == 4 ? parse_number(fields[2], 10) : std::nullopt;
+    if (!hash || !size || std::find(list.entries.begin(), list.entries.end(), fields[3]) == list.entries.end()) {
+      error = fmt::format("line {}: malformed key line", number);
+      return std::nullopt;
+    }
+    if (!list.lines.empty() && *key <= list.lines.back().key) {
+      error = fmt::format("line {}: keys are not strictly ascending", number);
+      return std::nullopt;
+    }
+    list.lines.push_back({*key, *hash, *size, std::string{fields[3]}});
+  }
+  if (number == 0) {
+    error = "missing or wrong header";
+    return std::nullopt;
+  }
+  return list;
+}
+
+bool in_allow_class(const Record& record) {
+  const Variant variant = decode_variant(record);
+  const ShaderConfig config = decode(record);
+  return variant.normalAttachment != UINT32_MAX && config.attrs[GX_VA_NRM].attrType != GX_NONE &&
+         build_shader_info(config).lightingEnabled;
+}
+
+std::map<uint64_t, std::string> allow_class(const std::vector<Entry>& entries) {
+  std::map<uint64_t, std::string> keys;
+  for (const auto& entry : entries) {
+    if (in_allow_class(entry.record)) {
+      keys.emplace(record_key(entry.record), entry.label);
+    }
+  }
+  return keys;
+}
+
 TEST(GxShaderCorpusTest, ShaderConfigLayoutIsKnown) {
   // A new legacy field must bump the record format, so this has to fail before the fixture silently drifts.
   // ext is a fork field the records never carry, so RecordSize stays 868
@@ -752,17 +850,44 @@ TEST(GxShaderGoldenTest, FixtureIsWellFormed) {
   }
 }
 
+TEST(GxShaderGoldenTest, AllowListIsWellFormed) {
+  std::string error;
+  const auto allow = parse_allow(read_text(allow_path()), error);
+  ASSERT_TRUE(allow.has_value()) << allow_path().string() << ": " << error;
+  ASSERT_EQ(allow->entries.size(), 1u);
+  EXPECT_EQ(allow->entries.front(), AllowEntry);
+  auto classKeys = allow_class(synthetic());
+  EXPECT_FALSE(classKeys.empty());
+  for (const auto& line : allow->lines) {
+    EXPECT_EQ(line.label, AllowEntry);
+    if (classKeys.erase(line.key) == 0) {
+      ADD_FAILURE() << fmt::format("allow-listed key {:016x} is outside the synthetic allow class", line.key);
+    }
+  }
+  for (const auto& [key, label] : classKeys) {
+    ADD_FAILURE() << fmt::format("allow class key {:016x} ({}) is not listed", key, label);
+  }
+}
+
 TEST(GxShaderGoldenTest, MatchesFixture) {
   std::string error;
   const auto fixture = parse_golden(read_text(AURORA_GX_SHADER_GOLDEN), &error);
   ASSERT_TRUE(fixture.has_value()) << error;
+  const auto allow = parse_allow(read_text(allow_path()), error);
+  ASSERT_TRUE(allow.has_value()) << allow_path().string() << ": " << error;
   auto entries = synthetic();
   sort_and_dedupe(entries);
   const auto actual = golden_lines(entries);
+  const auto classKeys = allow_class(entries);
 
   std::map<uint64_t, const GoldenLine*> expected;
   for (const auto& line : *fixture) {
     expected.emplace(line.key, &line);
+  }
+  // Upstream's text for these records is invalid WGSL (6c8e4c5); the fixture keeps it so merges still compare
+  std::map<uint64_t, const GoldenLine*> allowed;
+  for (const auto& line : allow->lines) {
+    allowed.emplace(line.key, &line);
   }
   std::vector<uint64_t> offending;
   for (const auto& line : actual) {
@@ -772,7 +897,19 @@ TEST(GxShaderGoldenTest, MatchesFixture) {
       offending.push_back(line.key);
       continue;
     }
-    if (it->second->wgslHash != line.wgslHash || it->second->wgslSize != line.wgslSize) {
+    const GoldenLine* want = it->second;
+    const bool inClass = classKeys.contains(line.key);
+    if (const auto listed = allowed.find(line.key); listed != allowed.end()) {
+      if (!inClass) {
+        ADD_FAILURE() << fmt::format("allow-listed key {:016x} ({}) is outside the allow class", line.key, line.label);
+      }
+      want = listed->second;
+      allowed.erase(listed);
+    } else if (inClass) {
+      ADD_FAILURE() << fmt::format("allow class key {:016x} ({}) is not listed: run regen-golden", line.key,
+                                   line.label);
+    }
+    if (want->wgslHash != line.wgslHash || want->wgslSize != line.wgslSize) {
       ADD_FAILURE() << fmt::format(
           "WGSL changed for {:016x} ({}): G2 violation, legacy shader text must match upstream", line.key, line.label);
       offending.push_back(line.key);
@@ -781,6 +918,9 @@ TEST(GxShaderGoldenTest, MatchesFixture) {
   }
   for (const auto& [key, line] : expected) {
     ADD_FAILURE() << fmt::format("missing key {:016x} ({}): generator coverage was lost", key, line->label);
+  }
+  for (const auto& listed : allowed) {
+    ADD_FAILURE() << fmt::format("allow-listed key {:016x} is not a synthetic record", listed.first);
   }
   if (!::testing::Test::HasFailure()) {
     return;
