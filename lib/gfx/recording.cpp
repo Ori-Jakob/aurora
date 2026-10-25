@@ -1572,6 +1572,23 @@ Range push_channel_storage(std::span<const uint8_t> bytes) noexcept {
   return range;
 }
 
+Range push_storage_packed(std::span<const uint8_t> bytes) noexcept {
+  if (!g_recorder.active()) {
+    return {};
+  }
+  AURORA_ASSERT(bytes.size() % 4 == 0, "packed storage pushes must be whole words");
+  ByteBuffer& storage = current_frame_packet().storage;
+  // Never at word 0, so readers can treat a zero offset as none
+  const size_t begin = std::max(AURORA_ALIGN(storage.size(), size_t{16}), size_t{16});
+  if (!storage.owned() && begin + bytes.size() > storage.capacity()) {
+    return {};
+  }
+  if (begin > storage.size()) {
+    storage.append_zeroes(begin - storage.size());
+  }
+  return push(storage, bytes.data(), bytes.size(), 0);
+}
+
 Range reserve_channel_storage(size_t length, bool zero) noexcept {
   if (!g_recorder.active()) {
     return {};

@@ -59,6 +59,7 @@ struct SlotRecord {
 
 struct DrawRecord {
   uint32_t index = 0;
+  uint32_t locator = 0;
   uint32_t categories = 0;
   uint64_t objectId = 0;
   uint32_t slotBegin = 0;
@@ -96,6 +97,7 @@ struct Overflow {
 struct TexturesReport {
   uint64_t sequence = 0;
   std::vector<DrawRecord> draws;
+  std::vector<uint32_t> stamped;
   std::vector<SlotRecord> slots;
   std::vector<KeyRow> keys;
   Overflow overflow;
@@ -114,7 +116,7 @@ void draw_tab();
 void set_pick_enabled(bool enabled) noexcept;
 [[nodiscard]] pick::ArmState arm_state() noexcept;
 [[nodiscard]] std::shared_ptr<const TexturesReport> latest_report() noexcept;
-[[nodiscard]] std::shared_ptr<const TexturesReport> report_for(uint8_t sequence) noexcept;
+[[nodiscard]] std::shared_ptr<const TexturesReport> report_for(uint32_t sequence) noexcept;
 [[nodiscard]] uint32_t flagged_seen(const SeenSet& seen, const material::Snapshot* snapshot) noexcept;
 
 // FIFO thread

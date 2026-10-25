@@ -90,6 +90,7 @@ struct RowId {
 
 struct Live {
   std::vector<DrawRecord> draws;
+  std::vector<uint32_t> stamped;
   std::vector<SlotRecord> slots;
   std::vector<KeyRow> keys;
   absl::flat_hash_map<RowId, uint32_t> rows;
@@ -336,6 +337,7 @@ void note_config(Live& live, const gx::DrawData& draw, const gx::PipelineConfig&
 void reserve_live() {
   Live& live = g_live;
   live.draws.reserve(MaxDraws);
+  live.stamped.reserve(MaxDraws);
   live.slots.reserve(MaxSlots);
   live.keys.reserve(MaxKeyRows);
   live.rows.clear();
@@ -356,6 +358,7 @@ void seal() {
     auto report = std::make_shared<TexturesReport>();
     report->sequence = g_sequence;
     report->draws.assign(live.draws.begin(), live.draws.end());
+    report->stamped.assign(live.stamped.begin(), live.stamped.end());
     report->slots.assign(live.slots.begin(), live.slots.end());
     report->keys.assign(live.keys.begin(), live.keys.end());
     report->overflow = live.overflow;
@@ -375,6 +378,7 @@ void seal() {
     }
   }
   live.draws.clear();
+  live.stamped.clear();
   live.slots.clear();
   live.keys.clear();
   live.warm.clear();
@@ -467,7 +471,7 @@ void update_pick_params() {
   if (!pick::pass_registered()) {
     return;
   }
-  pick::Params params;
+  pick::Params params{.sequence = static_cast<uint32_t>(g_sequence)};
   if (g_arm == pick::ArmState::Armed && ImGui::GetCurrentContext() != nullptr) {
     const ImGuiIO& io = ImGui::GetIO();
     if (!io.WantCaptureMouse && ImGui::IsMousePosValid(&io.MousePos)) {
@@ -476,23 +480,37 @@ void update_pick_params() {
           {io.MousePos.x, io.MousePos.y}, {io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y},
           {surface.width, surface.height}, {webgpu::g_frameBuffer.size.width, webgpu::g_frameBuffer.size.height});
       if (pixel) {
-        params = {pixel->x, pixel->y, 1};
+        params = {pixel->x, pixel->y, 1, params.sequence};
       }
     }
   }
   pick::set_params(params);
 }
 
+std::optional<Hover> resolve_pick(const pick::Readback& readback) {
+  const auto report = readback.locator != 0 ? report_for(readback.sequence) : nullptr;
+  if (report == nullptr) {
+    return std::nullopt;
+  }
+  // Unstamped draws carry 0 and break the order, so only stamped ones are searched
+  const auto it = std::ranges::lower_bound(report->stamped, readback.locator, {},
+                                           [&](uint32_t entry) { return report->draws[entry].locator; });
+  if (it == report->stamped.end() || report->draws[*it].locator != readback.locator) {
+    return std::nullopt;
+  }
+  return Hover{.sequence = report->sequence, .record = *it, .valid = true};
+}
+
 void resolve_readback() {
-  const auto value = pick::take_readback();
-  if (!value || g_hover.pinned) {
+  const auto readback = pick::take_readback();
+  if (!readback || g_hover.pinned) {
     return;
   }
-  const auto decoded = pick::decode_id(*value);
-  g_hover.valid = decoded.has_value();
-  if (decoded) {
-    g_hover.sequence = decoded->sequence;
-    g_hover.record = decoded->record;
+  const auto hit = resolve_pick(*readback);
+  g_hover.valid = hit.has_value();
+  if (hit) {
+    g_hover.sequence = hit->sequence;
+    g_hover.record = hit->record;
   }
 }
 
@@ -633,7 +651,7 @@ void draw_key_table(const TexturesReport& report) {
 void draw_hover() {
   ImGui::SeparatorText("Picked draw");
   ImGui::Checkbox("Pin", &g_hover.pinned);
-  const auto report = g_hover.valid ? report_for(static_cast<uint8_t>(g_hover.sequence)) : nullptr;
+  const auto report = g_hover.valid ? report_for(static_cast<uint32_t>(g_hover.sequence)) : nullptr;
   if (report == nullptr || g_hover.record >= report->draws.size()) {
     ImGui::TextUnformatted(g_arm == pick::ArmState::Armed ? "Nothing under the cursor" : "Tick Pick to pick draws");
     return;
@@ -870,9 +888,9 @@ std::shared_ptr<const TexturesReport> latest_report() noexcept {
   return g_ring[(g_ringNext + ReportRing - 1) % ReportRing];
 }
 
-std::shared_ptr<const TexturesReport> report_for(uint8_t sequence) noexcept {
+std::shared_ptr<const TexturesReport> report_for(uint32_t sequence) noexcept {
   for (const auto& report : g_ring) {
-    if (report != nullptr && static_cast<uint8_t>(report->sequence) == sequence) {
+    if (report != nullptr && static_cast<uint32_t>(report->sequence) == sequence) {
       return report;
     }
   }
@@ -905,6 +923,7 @@ void observe(gx::DrawData& draw, const gx::PipelineConfig& config, const gx::Sha
   const auto record = static_cast<uint32_t>(live.draws.size());
   DrawRecord& out = live.draws.emplace_back();
   out.index = cls.index;
+  out.locator = draw.immediateData._pad;
   out.role = cls.key.role;
   out.window = cls.key.window;
   out.categories = cls.key.categories;
@@ -926,8 +945,8 @@ void observe(gx::DrawData& draw, const gx::PipelineConfig& config, const gx::Sha
     record_slot(live, i, config, info, cls.mainClass, (neutral >> i & 1u) != 0);
     ++out.slotCount;
   }
-  if (g_arm == pick::ArmState::Armed && out.inSpan && draw.instanceCount != 0) {
-    draw.immediateData._pad = pick::encode_id(g_sequence, record);
+  if (g_arm == pick::ArmState::Armed && out.locator != 0) {
+    live.stamped.push_back(record);
   }
 }
 

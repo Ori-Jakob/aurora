@@ -8,6 +8,7 @@
 #include "render/debug/textures.hpp"
 #include "render/fakeshadow/texture_gate.hpp"
 #include "render/frame_state.hpp"
+#include "render/gx_ext/records.hpp"
 #include "render/hints.hpp"
 #include "render/material/gx_lookup.hpp"
 #include "render/material/registry.hpp"
@@ -75,6 +76,13 @@ gx::GXBindGroups neutral_stub(const gx::ShaderInfo&, uint8_t whiteMask, uint8_t 
   return {.textureBindGroup = 0x200000u + whiteMask * 0x100u + clearMask};
 }
 
+uint32_t g_recordPushes = 0;
+
+gfx::Range record_push(std::span<const uint8_t> bytes) noexcept {
+  ++g_recordPushes;
+  return {16 * g_recordPushes, static_cast<uint32_t>(bytes.size())};
+}
+
 class TextureInspector : public ::testing::Test {
 protected:
   void SetUp() override { reset_all(); }
@@ -89,6 +97,8 @@ protected:
     gx::guest_memory::set_hooks(nullptr);
     gx::g_gxState = {};
     g_pointerData = nullptr;
+    gx_ext::records::testing::reset();
+    g_recordPushes = 0;
   }
 
   static void load(uint32_t slot, const std::vector<uint8_t>& bytes, uint32_t id) {
@@ -108,10 +118,27 @@ protected:
     return draw;
   }
 
-  void observe_draw(const gx::ShaderInfo& info, const scene::DrawClass& cls, uint32_t instances = 1) {
+  void observe_draw(const gx::ShaderInfo& info, const scene::DrawClass& cls, uint32_t instances = 1,
+                    uint32_t locator = 0) {
     gx::DrawData draw = draw_data(instances);
+    draw.immediateData._pad = locator;
     observe(draw, m_config, info, cls);
     m_lastPad = draw.immediateData._pad;
+  }
+
+  // Records first, as scene::push stamps them before the observer runs
+  void stamp_and_observe(const gx::ShaderInfo& info, const scene::DrawClass& cls, uint32_t instances = 1) {
+    gx::DrawData draw = draw_data(instances);
+    gx_ext::records::stamp(draw, cls);
+    observe(draw, m_config, info, cls);
+    m_lastPad = draw.immediateData._pad;
+  }
+
+  // Seals the frame observed so far, then resolves one readback against it at the next latch
+  static testing::HoverState pick_at(uint32_t locator, uint64_t sequence) {
+    pick::testing::set_readback({.locator = locator, .sequence = static_cast<uint32_t>(sequence)});
+    on_latch();
+    return testing::hover();
   }
 
   static const KeyRow* find_row(const TexturesReport& report, const texture::TextureSourceKey& key) {
@@ -304,70 +331,124 @@ TEST_F(TextureInspector, SealsBeforeReserve) {
   EXPECT_NE(latest_report(), first);
 }
 
-TEST_F(TextureInspector, PickIdEncodesFrameAndDraw) {
+TEST_F(TextureInspector, PickUsesRecordLocator) {
   testing::force_visible(1);
   on_latch();
   testing::set_arm_state(pick::ArmState::Armed);
   const uint64_t sequence = testing::sequence();
-  observe_draw(sampling({}), span_draw(0));
-  EXPECT_EQ(m_lastPad, pick::encode_id(sequence, 0));
-  observe_draw(sampling({}), span_draw(1));
-  const uint32_t id = m_lastPad;
-  EXPECT_EQ(id, pick::encode_id(sequence, 1));
-  scene::DrawClass offscreen = span_draw(2);
-  offscreen.offscreen = true;
-  observe_draw(sampling({}), offscreen);
+  observe_draw(sampling({}), span_draw(0), 1, 12);
+  EXPECT_EQ(m_lastPad, 12u);
+  observe_draw(sampling({}), span_draw(1), 1, 20);
+  observe_draw(sampling({}), span_draw(2));
   EXPECT_EQ(m_lastPad, 0u);
-  const auto decoded = pick::decode_id(id);
-  ASSERT_TRUE(decoded.has_value());
-  EXPECT_EQ(decoded->sequence, static_cast<uint8_t>(sequence));
-  EXPECT_EQ(decoded->record, 1u);
-  EXPECT_FALSE(pick::decode_id(0).has_value());
   testing::set_arm_state(pick::ArmState::Off);
+  observe_draw(sampling({}), span_draw(3), 1, 40);
   on_latch();
-  const auto report = report_for(decoded->sequence);
+  const auto report = report_for(static_cast<uint32_t>(sequence));
   ASSERT_NE(report, nullptr);
-  ASSERT_GT(report->draws.size(), decoded->record);
-  EXPECT_EQ(report->draws[decoded->record].index, 1u);
-  EXPECT_TRUE(report->draws[decoded->record].inSpan);
-  EXPECT_FALSE(report->draws[2].inSpan);
+  ASSERT_EQ(report->draws.size(), 4u);
+  EXPECT_EQ(report->draws[0].locator, 12u);
+  EXPECT_EQ(report->draws[1].locator, 20u);
+  EXPECT_EQ(report->draws[2].locator, 0u);
+  EXPECT_EQ(report->draws[3].locator, 40u);
+  EXPECT_EQ(report->stamped, (std::vector<uint32_t>{0, 1}));
+
+  const testing::HoverState hover = pick_at(20, sequence);
+  EXPECT_TRUE(hover.valid);
+  EXPECT_EQ(hover.sequence, sequence);
+  EXPECT_EQ(hover.record, 1u);
+  EXPECT_EQ(report->draws[hover.record].index, 1u);
+  EXPECT_FALSE(pick_at(40, sequence).valid);
+  EXPECT_FALSE(pick_at(0, sequence).valid);
 }
 
-TEST_F(TextureInspector, EmptyDrawIsNeverStamped) {
+TEST_F(TextureInspector, PickResolvesAgainstEncodingFrame) {
   testing::force_visible(1);
   on_latch();
   testing::set_arm_state(pick::ArmState::Armed);
-  observe_draw(sampling({}), span_draw(0), 0);
+  const uint64_t first = testing::sequence();
+  observe_draw(sampling({}), span_draw(0), 1, 10);
+  observe_draw(sampling({}), span_draw(1), 1, 20);
+  testing::set_arm_state(pick::ArmState::Off);
+  on_latch();
+  testing::set_arm_state(pick::ArmState::Armed);
+  const uint64_t second = testing::sequence();
+  ASSERT_NE(second, first);
+  observe_draw(sampling({}), span_draw(5), 1, 20);
+  testing::set_arm_state(pick::ArmState::Off);
+  on_latch();
+
+  testing::HoverState hover = pick_at(20, first);
+  EXPECT_TRUE(hover.valid);
+  EXPECT_EQ(hover.sequence, first);
+  EXPECT_EQ(hover.record, 1u);
+  hover = pick_at(20, second);
+  EXPECT_TRUE(hover.valid);
+  EXPECT_EQ(hover.sequence, second);
+  EXPECT_EQ(hover.record, 0u);
+  EXPECT_EQ(report_for(static_cast<uint32_t>(second))->draws[hover.record].index, 5u);
+  EXPECT_FALSE(pick_at(10, second).valid);
+  EXPECT_FALSE(pick_at(20, second + 100).valid);
+}
+
+TEST_F(TextureInspector, PickSkipsUnstampedEntries) {
+  testing::force_visible(1);
+  on_latch();
+  testing::set_arm_state(pick::ArmState::Armed);
+  const uint64_t sequence = testing::sequence();
+  constexpr std::array<uint32_t, 8> Locators{0, 0, 5, 9, 0, 0, 20, 30};
+  for (uint32_t i = 0; i < Locators.size(); ++i) {
+    observe_draw(sampling({}), span_draw(i), 1, Locators[i]);
+  }
+  testing::set_arm_state(pick::ArmState::Off);
+  on_latch();
+  EXPECT_EQ(latest_report()->stamped, (std::vector<uint32_t>{2, 3, 6, 7}));
+  EXPECT_EQ(pick_at(9, sequence).record, 3u);
+  EXPECT_EQ(pick_at(20, sequence).record, 6u);
+  EXPECT_EQ(pick_at(30, sequence).record, 7u);
+  EXPECT_EQ(pick_at(5, sequence).record, 2u);
+  EXPECT_FALSE(pick_at(7, sequence).valid);
+  EXPECT_FALSE(pick_at(31, sequence).valid);
+}
+
+TEST_F(TextureInspector, EmptyDrawIsNeverStamped) {
+  gx_ext::records::testing::set_push(&record_push);
+  gx_ext::records::testing::set_active(true, false, true);
+  testing::force_visible(1);
+  on_latch();
+  testing::set_arm_state(pick::ArmState::Armed);
+  stamp_and_observe(sampling({}), span_draw(0), 0);
   EXPECT_EQ(m_lastPad, 0u);
-  observe_draw(sampling({}), span_draw(1), 1);
+  stamp_and_observe(sampling({}), span_draw(1), 1);
   EXPECT_NE(m_lastPad, 0u);
   testing::set_arm_state(pick::ArmState::Off);
   on_latch();
   EXPECT_EQ(latest_report()->draws.size(), 2u);
+  EXPECT_EQ(latest_report()->stamped, (std::vector<uint32_t>{1}));
 }
 
 TEST_F(TextureInspector, ReadbackMovesHoverUnlessPinned) {
   testing::force_visible(1);
   on_latch();
+  testing::set_arm_state(pick::ArmState::Armed);
   const uint64_t sequence = testing::sequence();
-  pick::testing::set_readback(pick::encode_id(sequence, 1));
+  for (uint32_t i = 0; i < 3; ++i) {
+    observe_draw(sampling({}), span_draw(i), 1, 8 * (i + 1));
+  }
+  testing::set_arm_state(pick::ArmState::Off);
   on_latch();
-  testing::HoverState hover = testing::hover();
+  testing::HoverState hover = pick_at(16, sequence);
   EXPECT_TRUE(hover.valid);
-  EXPECT_EQ(hover.sequence, sequence & 0xFF);
+  EXPECT_EQ(hover.sequence, sequence);
   EXPECT_EQ(hover.record, 1u);
 
   testing::set_hover_pinned(true);
-  pick::testing::set_readback(pick::encode_id(sequence, 2));
-  on_latch();
-  hover = testing::hover();
+  hover = pick_at(24, sequence);
   EXPECT_TRUE(hover.valid);
   EXPECT_EQ(hover.record, 1u);
 
   testing::set_hover_pinned(false);
-  pick::testing::set_readback(0);
-  on_latch();
-  EXPECT_FALSE(testing::hover().valid);
+  EXPECT_FALSE(pick_at(0, sequence).valid);
 }
 
 TEST_F(TextureInspector, HiddenTabInstallsNothing) {
@@ -543,6 +624,8 @@ TEST_F(TextureInspector, NeutralColumnFollowsGateDecision) {
   fakeshadow::testing::set_neutral_builder(&neutral_stub);
   fakeshadow::set_force(fakeshadow::Gate::Light, fakeshadow::Force::On);
   fakeshadow::begin_frame(detail::FrameState{});
+  gx_ext::records::testing::set_push(&record_push);
+  gx_ext::records::testing::set_active(true, false, true);
   testing::force_visible(1);
   on_latch();
   testing::set_arm_state(pick::ArmState::Armed);
@@ -565,6 +648,7 @@ TEST_F(TextureInspector, NeutralColumnFollowsGateDecision) {
     cls.key.categories = categories;
     gx::DrawData draw = draw_data();
     fakeshadow::push(draw, m_config, info, cls);
+    gx_ext::records::stamp(draw, cls);
     observe(draw, m_config, info, cls);
     return draw;
   };

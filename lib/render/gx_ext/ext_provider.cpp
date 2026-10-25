@@ -1,4 +1,5 @@
 #include "ext_provider.hpp"
+#include "records.hpp"
 
 #include "../frame_state.hpp"
 #include "../material/registry.hpp"
@@ -59,7 +60,7 @@ gx::render_ext::StochasticParams record_params(const material::MaterialRecord& r
   return params;
 }
 
-gx::RenderExtConfig derive(void*, const gx::PipelineConfig&, const gx::ShaderInfo& info, uint64_t,
+gx::RenderExtConfig derive(void*, const gx::PipelineConfig&, const gx::ShaderInfo& info, const gfx::RenderTargetLayout&,
                            gx::render_ext::StochasticLanes& lanes) noexcept {
   const material::Snapshot* snapshot = g_snapshot.get();
   u8 mask = 0;
@@ -98,6 +99,7 @@ void set_active(bool active, bool force) noexcept {
 } // namespace
 
 void apply_frame_state(const detail::FrameState& state) noexcept {
+  records::apply_frame_state(state);
   if (!g_envRead) {
     g_envRead = true;
     g_env = read_env();
@@ -116,6 +118,7 @@ void apply_frame_state(const detail::FrameState& state) noexcept {
 }
 
 void shutdown() noexcept {
+  records::shutdown();
   gx::render_ext::set_hooks(nullptr);
   g_snapshot.reset();
   g_active = false;
@@ -129,6 +132,7 @@ bool active() noexcept { return g_active; }
 
 void reset() noexcept {
   shutdown();
+  records::testing::reset();
   g_testForce = false;
   g_envRead = false;
   g_env = EnvMode::Unset;

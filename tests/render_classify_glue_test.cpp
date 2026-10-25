@@ -6,6 +6,7 @@
 #include "gx/pipeline.hpp"
 #include "hint_bytes.hpp"
 #include "render/frame_state.hpp"
+#include "render/gx_ext/records.hpp"
 #include "render/hints.hpp"
 #include "render/scene/classify.hpp"
 #include "render/settings.hpp"
@@ -55,6 +56,7 @@ protected:
   void TearDown() override {
     detail::remove_hints();
     detail::testing::reset_hints();
+    gx_ext::records::testing::reset();
     testing::reset();
     detail::testing::reset();
     gx::g_gxState = {};
@@ -423,6 +425,67 @@ TEST_F(RenderClassifyGlue, ObserverRunsLast) {
   testing::reset();
   EXPECT_FALSE(router->push(router->userData, data, config, info));
   EXPECT_EQ(ObserverProbe::order, "ovo");
+}
+
+TEST_F(RenderClassifyGlue, RecordsBreakMergeOnClassChange) {
+  main_scene();
+  begin_object(1);
+  draw();
+  end_object();
+  begin_object(2);
+  EXPECT_FALSE(draw().breakMerge);
+
+  gx_ext::records::testing::set_active(true, true, false);
+  end_object();
+  begin_object(3);
+  EXPECT_TRUE(draw().breakMerge);
+  EXPECT_FALSE(draw().breakMerge);
+  end_object();
+  begin_object(4);
+  EXPECT_TRUE(draw().breakMerge);
+  EXPECT_EQ(stats().mergeBreaks, 2u);
+  EXPECT_FALSE(identity_collecting());
+}
+
+struct RecordProbe {
+  static inline uint32_t pushes = 0;
+  static inline uint32_t observedPad = 0;
+
+  static gfx::Range push(std::span<const uint8_t> bytes) noexcept {
+    ++pushes;
+    return {16 * pushes, static_cast<uint32_t>(bytes.size())};
+  }
+  static void observe(gx::DrawData& draw, const gx::PipelineConfig&, const gx::ShaderInfo&, const DrawClass&) noexcept {
+    observedPad = draw.immediateData._pad;
+  }
+};
+
+TEST_F(RenderClassifyGlue, RecordStampPrecedesObserver) {
+  const gx::draw_route::Router* router = gx::draw_route::router();
+  ASSERT_NE(router, nullptr);
+  static constexpr ObserverHooks Observer{.observe = &RecordProbe::observe};
+  RecordProbe::pushes = 0;
+  RecordProbe::observedPad = 0;
+  gx_ext::records::testing::set_push(&RecordProbe::push);
+  gx_ext::records::testing::set_active(true, true, false);
+  set_observer_hooks(&Observer);
+  main_scene();
+  begin_object(0x42);
+  draw();
+  const gx::PipelineConfig config{};
+  const gx::ShaderInfo info{};
+  gx::DrawData data{};
+  data.instanceCount = 1;
+  EXPECT_FALSE(router->push(router->userData, data, config, info));
+  EXPECT_EQ(RecordProbe::pushes, 2u);
+  EXPECT_EQ(data.immediateData._pad, 32u / 4);
+  EXPECT_EQ(RecordProbe::observedPad, data.immediateData._pad);
+
+  gx::DrawData empty{};
+  draw();
+  EXPECT_FALSE(router->push(router->userData, empty, config, info));
+  EXPECT_EQ(empty.immediateData._pad, 0u);
+  EXPECT_EQ(RecordProbe::observedPad, 0u);
 }
 
 TEST_F(RenderClassifyGlue, IdentityDemandStartsCollection) {

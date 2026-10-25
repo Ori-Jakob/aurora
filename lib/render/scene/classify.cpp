@@ -2,6 +2,7 @@
 
 #include "../fakeshadow/texture_gate.hpp"
 #include "../frame_state.hpp"
+#include "../gx_ext/records.hpp"
 #include "../hints.hpp"
 #include "../../gx/draw_route.hpp"
 #include "../../gx/gx.hpp"
@@ -134,8 +135,10 @@ gx::draw_route::Decision route(void*, const gx::draw_route::Query& query) noexce
   if (cls.suppressed) {
     return {.route = gx::draw_route::Route::Suppress};
   }
+  // Each command carries one draw record, so a changed class must start its own command
+  const bool records = gx_ext::records::on_route(cls);
   // A merged follower skips the push hook, so a changed class after a flagged lead must start its own command
-  const bool breakMerge = cls.keyChanged && (identity_collecting() || fakeshadow::lead_flagged());
+  const bool breakMerge = cls.keyChanged && (identity_collecting() || records || fakeshadow::lead_flagged());
   if (breakMerge) {
     g_classifier.count_merge_break();
   }
@@ -149,6 +152,8 @@ bool push(void*, gx::DrawData& draw, const gx::PipelineConfig& config, const gx:
   // An empty draw has nothing to recolour
   const bool changed = gate != fakeshadow::Edit::Skipped && g_hooks != nullptr && g_hooks->push != nullptr &&
                        g_hooks->push(draw, config, info, cls);
+  // Before the inspector's observer, which reads the record locator
+  gx_ext::records::stamp(draw, cls);
   // Last, so the inspector records the draw that is actually pushed
   if (g_observer != nullptr && g_observer->observe != nullptr) {
     g_observer->observe(draw, config, info, cls);

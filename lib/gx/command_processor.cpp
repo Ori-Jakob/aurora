@@ -158,6 +158,7 @@ struct DrawCache {
   gfx::PipelineRef fallbackRef{};
   uint64_t extEpoch = 0;
   bool extWaiting = false;
+  u32 extInputs = 0;
   GXBindGroups bindGroups{};
   uint64_t bindGeneration = 0;
   // Binds holding generated mips depend on the draw class, so a class flip rebuilds them
@@ -793,7 +794,8 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
   }
 
   const u8 lineMode = line_mode_for_prim(prim);
-  const auto targetLayoutKey = gfx::get_render_target_layout().key;
+  const gfx::RenderTargetLayout targetLayout = gfx::get_render_target_layout();
+  const uint64_t targetLayoutKey = targetLayout.key;
   const bool pipelineValid = cache.hasPipeline && (state.dirty & DirtyPipeline) == 0 && cache.fmt == fmt &&
                              cache.lineMode == lineMode && cache.targetLayoutKey == targetLayoutKey;
   // Looked up after the textures resolve, so bound-texture state can join the config
@@ -850,14 +852,18 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     }
   }
 
+  const u32 extInputs = render_ext::g_drawInputs;
+  // A class change under the same GX state can change the derived bits, so it re-derives without a rebind
+  const bool extInputsChanged = std::exchange(cache.extInputs, extInputs) != extInputs;
   // A stale carried mask must still clear when the new config has no eligible map
-  if ((lookupPipeline || bindsRebuilt) &&
-      (cache.shaderInfo.stochasticEligible.any() || cache.config.shaderConfig.ext != RenderExtConfig{})) {
+  if ((lookupPipeline || bindsRebuilt || extInputsChanged) &&
+      (cache.shaderInfo.stochasticEligible.any() || cache.config.shaderConfig.ext != RenderExtConfig{} ||
+       extInputs != 0)) {
     ZoneScopedN("derive render ext");
     render_ext::StochasticLanes lanes{};
     RenderExtConfig ext{};
     if (const auto* hooks = render_ext::hooks(); hooks != nullptr && hooks->derive != nullptr) {
-      ext = hooks->derive(hooks->userData, cache.config, cache.shaderInfo, targetLayoutKey, lanes);
+      ext = hooks->derive(hooks->userData, cache.config, cache.shaderInfo, targetLayout, lanes);
     }
     for (u32 i = 0; i < MaxTextures; ++i) {
       if ((ext.stochasticMask >> i & 1u) != 0 && !render_ext::stochastic_bind_ok(state.textures[i])) {
@@ -895,14 +901,14 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
       case gfx::PipelineState::Ready:
         break;
       case gfx::PipelineState::Failed:
-        cache.pipelineRef = gfx::pipeline_ref(render_ext::legacy_config(cache.config));
+        cache.pipelineRef = gfx::pipeline_ref(render_ext::fallback_config(cache.config));
         note_failed_variant();
         break;
       case gfx::PipelineState::Pending:
         cache.extWaiting = true;
         cache.extEpoch = epoch;
         cache.fallbackRef =
-            gfx::ready_pipeline(render_ext::legacy_config(cache.config), gfx::get_render_target_layout());
+            gfx::ready_pipeline(render_ext::fallback_config(cache.config), gfx::get_render_target_layout());
         break;
       }
     }
@@ -947,12 +953,12 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
         cache.extWaiting = false;
         cache.fallbackRef = 0;
         if (pipelineState == gfx::PipelineState::Failed) {
-          cache.pipelineRef = gfx::pipeline_ref(render_ext::legacy_config(cache.config));
+          cache.pipelineRef = gfx::pipeline_ref(render_ext::fallback_config(cache.config));
           note_failed_variant();
         }
       } else if (cache.fallbackRef == 0) {
         cache.fallbackRef =
-            gfx::ready_pipeline(render_ext::legacy_config(cache.config), gfx::get_render_target_layout());
+            gfx::ready_pipeline(render_ext::fallback_config(cache.config), gfx::get_render_target_layout());
       }
     }
     if (cache.extWaiting) {

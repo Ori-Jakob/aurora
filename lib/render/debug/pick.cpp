@@ -27,12 +27,13 @@ enum class SlotState : uint8_t { Available, CopySubmitted, MapPending };
 struct Slot {
   wgpu::Buffer buffer;
   SlotState state = SlotState::Available;
+  uint32_t sequence = 0;
 };
 
 std::mutex g_mutex;
 std::array<Slot, SlotCount> g_slots;
 size_t g_nextSlot = 0;
-std::optional<uint32_t> g_latest;
+std::optional<Readback> g_latest;
 std::atomic_uint64_t g_generation{1};
 
 // Game thread
@@ -57,7 +58,7 @@ void complete(size_t index, uint64_t generation, const wgpu::Buffer& buffer, wgp
     return;
   }
   if (value) {
-    g_latest = value;
+    g_latest = Readback{*value, g_slots[index].sequence};
   }
   g_slots[index].state = SlotState::Available;
 }
@@ -98,6 +99,7 @@ void encode_pick(detail::PassContext& ctx, const void*) {
       slot.buffer = ctx.device().CreateBuffer(&descriptor);
     }
     slot.state = SlotState::CopySubmitted;
+    slot.sequence = params.sequence;
     buffer = slot.buffer;
     g_nextSlot = (index + 1) % SlotCount;
   }
@@ -285,15 +287,15 @@ void set_params(const Params& params) {
   }
 }
 
-std::optional<uint32_t> take_readback() noexcept {
+std::optional<Readback> take_readback() noexcept {
   std::lock_guard lock{g_mutex};
   return std::exchange(g_latest, std::nullopt);
 }
 
 namespace testing {
-void set_readback(uint32_t value) noexcept {
+void set_readback(const Readback& readback) noexcept {
   std::lock_guard lock{g_mutex};
-  g_latest = value;
+  g_latest = readback;
 }
 } // namespace testing
 } // namespace aurora::render::debug::pick

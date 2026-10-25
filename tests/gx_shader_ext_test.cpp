@@ -180,6 +180,24 @@ TEST_F(GxShaderExtTest, PersistedVersionTagsExtRows) {
   EXPECT_EQ(persisted_version(render_ext::legacy_config(config)), GXExtRowVersion);
 }
 
+TEST_F(GxShaderExtTest, FallbackConfigClearsOutputAndVelocity) {
+  PipelineConfig config{};
+  config.shaderConfig.ext = {.output = 2, .velocity = 1, .pom = 1, .stochasticMask = 0b11, .layer0 = 1, .layer1 = 2};
+  EXPECT_TRUE(render_ext::fallback_config(config).shaderConfig.ext == RenderExtConfig{});
+  EXPECT_EQ(persisted_version(render_ext::fallback_config(config)), 14u);
+  const RenderExtConfig legacy = render_ext::legacy_config(config).shaderConfig.ext;
+  EXPECT_EQ(legacy.output, 2u);
+  EXPECT_EQ(legacy.velocity, 1u);
+
+  for (const RenderExtConfig ext : {RenderExtConfig{}, RenderExtConfig{.stochasticMask = 0b101},
+                                    RenderExtConfig{.pom = 1, .layer0 = 3, .layer1 = 4}}) {
+    config.shaderConfig.ext = ext;
+    const PipelineConfig fallback = render_ext::fallback_config(config);
+    const PipelineConfig expected = render_ext::legacy_config(config);
+    EXPECT_EQ(std::memcmp(&fallback, &expected, sizeof(PipelineConfig)), 0);
+  }
+}
+
 TEST_F(GxShaderExtTest, NormalizeKeepsOnlyEligibleStochastic) {
   const ShaderInfo info = build_shader_info(single_site());
   ASSERT_EQ(info.stochasticEligible.to_ulong(), 1u);

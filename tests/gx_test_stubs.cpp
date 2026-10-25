@@ -365,6 +365,7 @@ uint64_t g_testPipelineEpoch = 0;
 uint32_t g_testPipelineStateQueries = 0;
 PipelineRef g_testReadyLegacyRef = 0;
 uint32_t g_testReadyProbes = 0;
+gx::RenderExtConfig g_testLastReadyExt{};
 PipelineState pipeline_state(PipelineRef ref) noexcept {
   ++g_testPipelineStateQueries;
   return g_testPipelineState;
@@ -372,6 +373,7 @@ PipelineState pipeline_state(PipelineRef ref) noexcept {
 uint64_t pipeline_epoch() noexcept { return g_testPipelineEpoch; }
 PipelineRef ready_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) noexcept {
   ++g_testReadyProbes;
+  g_testLastReadyExt = config.shaderConfig.ext;
   return g_testReadyLegacyRef;
 }
 bool g_testBlockingPipelines = false;

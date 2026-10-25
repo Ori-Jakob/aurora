@@ -172,6 +172,32 @@ TEST_F(GfxChannelStorageTest, PushesOutsideRecordingReturnEmpty) {
   constexpr std::array<uint8_t, 4> Word{1, 2, 3, 4};
   EXPECT_EQ(push_channel_storage(Word), Range{});
   EXPECT_EQ(reserve_channel_storage(4, true), Range{});
+  EXPECT_EQ(push_storage_packed(Word), Range{});
+}
+
+TEST_F(GfxChannelStorageTest, PackedPushesAlignTo16SkipWordZeroAndNeverOverrun) {
+  constexpr std::array<uint8_t, 8> Words{1, 2, 3, 4, 5, 6, 7, 8};
+  const Range first = push_storage_packed(Words);
+  EXPECT_EQ(first.offset, 16u);
+  EXPECT_EQ(first.size, 8u);
+  ASSERT_EQ(frame.storage.size(), 24u);
+  EXPECT_EQ(std::vector<uint8_t>(frame.storage.data(), frame.storage.data() + 16), std::vector<uint8_t>(16, 0));
+  EXPECT_EQ(std::vector<uint8_t>(frame.storage.data() + 16, frame.storage.data() + 24),
+            std::vector<uint8_t>(Words.begin(), Words.end()));
+  EXPECT_EQ(push_storage_packed(Words).offset, 32u);
+
+  frame.storage = {};
+  constexpr std::array<uint8_t, 3> Three{1, 2, 3};
+  EXPECT_EQ(push_storage(Three.data(), Three.size()).offset, 0u);
+  EXPECT_EQ(push_storage_packed(Words).offset, 16u);
+
+  std::vector<uint8_t> staging(1024);
+  frame.storage = ByteBuffer{staging.data(), staging.size()};
+  const std::vector<uint8_t> bytes(1000, 9);
+  EXPECT_EQ(push_storage_packed(bytes).offset, 16u);
+  EXPECT_EQ(push_storage_packed(Words), Range{});
+  EXPECT_EQ(frame.storage.size(), 1016u);
+  frame.storage = {};
 }
 
 TEST_F(GfxRecordingTest, CreateRestoreReturnsToEfb) {

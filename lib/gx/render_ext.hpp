@@ -45,8 +45,8 @@ inline bool store_lanes(const StochasticLanes& lanes, u8 mask) noexcept {
 }
 
 struct Hooks {
-  RenderExtConfig (*derive)(void* userData, const PipelineConfig& config, const ShaderInfo& info, uint64_t layoutKey,
-                            StochasticLanes& lanes) noexcept = nullptr;
+  RenderExtConfig (*derive)(void* userData, const PipelineConfig& config, const ShaderInfo& info,
+                            const gfx::RenderTargetLayout& layout, StochasticLanes& lanes) noexcept = nullptr;
   void* userData = nullptr;
 };
 
@@ -55,6 +55,13 @@ inline std::atomic<const Hooks*> g_hooks{nullptr};
 // Swapped only while the FIFO is drained, like draw_route::set_router
 inline void set_hooks(const Hooks* hooks) noexcept { g_hooks.store(hooks, std::memory_order_release); }
 inline const Hooks* hooks() noexcept { return g_hooks.load(std::memory_order_acquire); }
+
+// FIFO thread only; the router stores the routed draw's class inputs here and derive reads them
+inline u32 g_drawInputs = 0;
+// abuf layout of the record that DrawImmediateData::_pad locates; 0 means no record
+inline constexpr u32 DrawRecordWords = 8;
+inline constexpr u32 DrawRecordFlagsWord = 1;
+inline constexpr u32 DrawRecordReceiverShift = 6;
 
 inline bool stochastic_bind_ok(const gfx::TextureBind& bind) noexcept {
   return bind.ref != nullptr && !bind.ref->attachmentTextureView && bind.texObj.wrap_s() == GX_REPEAT &&
@@ -78,6 +85,14 @@ inline PipelineConfig legacy_config(const PipelineConfig& config) noexcept {
   PipelineConfig legacy = config;
   legacy.shaderConfig.ext = without_texture_bits(legacy.shaderConfig.ext);
   return legacy;
+}
+
+// Draws as plain GX under the same layout; later milestones clear their own output bits here too
+inline PipelineConfig fallback_config(const PipelineConfig& config) noexcept {
+  PipelineConfig fallback = legacy_config(config);
+  fallback.shaderConfig.ext.output = 0;
+  fallback.shaderConfig.ext.velocity = 0;
+  return fallback;
 }
 
 struct Stats {

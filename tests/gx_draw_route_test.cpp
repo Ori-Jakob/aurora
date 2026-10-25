@@ -40,6 +40,7 @@ extern uint64_t g_testPipelineEpoch;
 extern uint32_t g_testPipelineStateQueries;
 extern PipelineRef g_testReadyLegacyRef;
 extern uint32_t g_testReadyProbes;
+extern gx::RenderExtConfig g_testLastReadyExt;
 namespace testing {
 void reset_stub_ranges() noexcept;
 } // namespace testing
@@ -128,8 +129,8 @@ void set_projection(GXProjectionType type) {
 aurora::Vec4<float> g_hookLane{1.f, 0.f, 0.6f, 7.f};
 
 // Flags every eligible slot whose bound material carries the stochastic bit, as the render module's provider does
-RenderExtConfig flag_hook(void*, const aurora::gx::PipelineConfig&, const aurora::gx::ShaderInfo& info, uint64_t,
-                          render_ext::StochasticLanes& lanes) noexcept {
+RenderExtConfig flag_hook(void*, const aurora::gx::PipelineConfig&, const aurora::gx::ShaderInfo& info,
+                          const gfx::RenderTargetLayout&, render_ext::StochasticLanes& lanes) noexcept {
   RenderExtConfig ext;
   for (u32 i = 0; i < aurora::gx::MaxTextures; ++i) {
     if (info.stochasticEligible.test(i) && (g_gxState.textures[i].material.flags & 1u) != 0) {
@@ -141,6 +142,19 @@ RenderExtConfig flag_hook(void*, const aurora::gx::PipelineConfig&, const aurora
 }
 
 constexpr render_ext::Hooks FlagHook{.derive = &flag_hook};
+
+uint32_t g_deriveCalls = 0;
+
+// Adds an output bit while the routed draw has class inputs, as the G-buffer receiver rule does
+RenderExtConfig input_hook(void* userData, const aurora::gx::PipelineConfig& config, const aurora::gx::ShaderInfo& info,
+                           const gfx::RenderTargetLayout& layout, render_ext::StochasticLanes& lanes) noexcept {
+  ++g_deriveCalls;
+  RenderExtConfig ext = flag_hook(userData, config, info, layout, lanes);
+  ext.output = render_ext::g_drawInputs != 0 ? 1 : 0;
+  return ext;
+}
+
+constexpr render_ext::Hooks InputHook{.derive = &input_hook};
 
 struct ExtStats {
   uint64_t fallbackDraws = render_ext::g_stats.fallbackDraws.load();
@@ -191,11 +205,14 @@ protected:
     gfx::g_testLastLookupExt = {};
     gfx::g_testPipelineStateQueries = 0;
     gfx::g_testReadyProbes = 0;
+    gfx::g_testLastReadyExt = {};
+    g_deriveCalls = 0;
   }
 
   void TearDown() override {
     render_ext::set_hooks(nullptr);
     render_ext::g_stochasticUniforms = {};
+    render_ext::g_drawInputs = 0;
     g_testStochasticEligible.reset();
     g_testSampledTextures.reset();
     g_testLastBindBaseLevel = false;
@@ -1075,6 +1092,155 @@ TEST_F(GXDrawRouteTest, FailedVariantLooksUpLegacy) {
   EXPECT_EQ(gfx::g_testLastDraw.pipeline, gfx::g_testLastPipelineRef);
   EXPECT_EQ(gfx::g_testReadyProbes, 0u);
   EXPECT_EQ(stats.failed(), 1u);
+}
+
+TEST_F(GXDrawRouteTest, DrawInputsChangeRederivesWithoutRebind) {
+  gfx::g_testMergeDraws = false;
+  render_ext::set_hooks(&InputHook);
+  triangle();
+  decode();
+  EXPECT_EQ(gfx::g_testPipelineRefCount, 1u);
+  EXPECT_TRUE(gfx::g_testLastLookupExt == RenderExtConfig{});
+  // The draw cache carries the previous test's ext into the first lookup, which may derive once to clear it
+  g_deriveCalls = 0;
+
+  const CpuZoneDelta zones;
+  render_ext::g_drawInputs = 1;
+  triangle();
+  decode();
+  EXPECT_EQ(g_deriveCalls, 1u);
+  EXPECT_EQ(zones.calls(fifo::CpuZoneBindGroupBuild), 0u);
+  EXPECT_EQ(gfx::g_testPipelineRefCount, 2u);
+  EXPECT_EQ(gfx::g_testLastLookupExt.output, 1u);
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, gfx::g_testLastPipelineRef);
+
+  triangle();
+  decode();
+  EXPECT_EQ(g_deriveCalls, 1u);
+  EXPECT_EQ(gfx::g_testPipelineRefCount, 2u);
+
+  render_ext::g_drawInputs = 0;
+  triangle();
+  decode();
+  EXPECT_EQ(g_deriveCalls, 2u);
+  EXPECT_EQ(gfx::g_testPipelineRefCount, 3u);
+  EXPECT_TRUE(gfx::g_testLastLookupExt == RenderExtConfig{});
+  EXPECT_EQ(zones.calls(fifo::CpuZoneBindGroupBuild), 0u);
+  EXPECT_EQ(g_gxState.dirty, 0u);
+}
+
+TEST_F(GXDrawRouteTest, ZeroDrawInputsKeepDeriveGate) {
+  gfx::g_testMergeDraws = false;
+  render_ext::set_hooks(&InputHook);
+  triangle();
+  decode();
+  g_deriveCalls = 0;
+  g_gxState.dirty |= aurora::gx::DirtyTextures;
+  triangle();
+  decode();
+  EXPECT_EQ(g_deriveCalls, 0u);
+  EXPECT_EQ(gfx::g_testPipelineRefCount, 1u);
+
+  g_testStochasticEligible = 1;
+  g_gxState.textures[0] = repeat_bind(1);
+  g_testPopulateDepthFunc = GX_LEQUAL;
+  g_gxState.dirty |= aurora::gx::DirtyPipeline;
+  triangle();
+  decode();
+  EXPECT_EQ(g_deriveCalls, 1u);
+  EXPECT_EQ(gfx::g_testLastLookupExt.stochasticMask, 1u);
+  EXPECT_EQ(gfx::g_testLastLookupExt.output, 0u);
+  triangle();
+  decode();
+  EXPECT_EQ(g_deriveCalls, 1u);
+  g_gxState.dirty |= aurora::gx::DirtyTextures;
+  triangle();
+  decode();
+  EXPECT_EQ(g_deriveCalls, 2u);
+  EXPECT_EQ(gfx::g_testPipelineRefCount, 2u);
+}
+
+TEST_F(GXDrawRouteTest, DrawInputsDeriveWithoutEligibleMaps) {
+  gfx::g_testMergeDraws = false;
+  render_ext::set_hooks(&InputHook);
+  render_ext::g_drawInputs = 1;
+  triangle();
+  decode();
+  EXPECT_EQ(g_deriveCalls, 1u);
+  EXPECT_EQ(gfx::g_testPipelineRefCount, 1u);
+  EXPECT_TRUE(gfx::g_testLastLookupExt == (RenderExtConfig{.output = 1}));
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, gfx::g_testLastPipelineRef);
+
+  g_gxState.dirty |= aurora::gx::DirtyTextures;
+  triangle();
+  decode();
+  EXPECT_EQ(g_deriveCalls, 2u);
+  EXPECT_EQ(gfx::g_testPipelineRefCount, 1u);
+}
+
+TEST_F(GXDrawRouteTest, FailedOutputVariantLooksUpExtZero) {
+  const ExtStats stats;
+  render_ext::set_hooks(&InputHook);
+  render_ext::g_drawInputs = 1;
+  g_testStochasticEligible = 1;
+  g_gxState.textures[0] = repeat_bind(1);
+  gfx::g_testPipelineState = gfx::PipelineState::Failed;
+  triangle();
+  decode();
+  EXPECT_EQ(gfx::g_testPipelineRefCount, 2u);
+  EXPECT_TRUE(gfx::g_testLastLookupExt == RenderExtConfig{});
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, gfx::g_testLastPipelineRef);
+  EXPECT_EQ(gfx::g_testReadyProbes, 0u);
+  EXPECT_EQ(stats.failed(), 1u);
+}
+
+TEST_F(GXDrawRouteTest, PendingOutputVariantProbesExtZero) {
+  gfx::g_testMergeDraws = false;
+  const ExtStats stats;
+  render_ext::set_hooks(&InputHook);
+  render_ext::g_drawInputs = 1;
+  gfx::g_testPipelineState = gfx::PipelineState::Pending;
+  triangle();
+  decode();
+  EXPECT_EQ(gfx::g_testLastLookupExt.output, 1u);
+  EXPECT_EQ(gfx::g_testReadyProbes, 1u);
+  EXPECT_TRUE(gfx::g_testLastReadyExt == RenderExtConfig{});
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, gfx::g_testLastPipelineRef);
+  EXPECT_EQ(stats.pending(), 1u);
+
+  gfx::g_testLastReadyExt = {.output = 3};
+  gfx::g_testPipelineEpoch = 1;
+  gfx::g_testReadyLegacyRef = 77;
+  triangle();
+  decode();
+  EXPECT_EQ(gfx::g_testReadyProbes, 2u);
+  EXPECT_TRUE(gfx::g_testLastReadyExt == RenderExtConfig{});
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, 77u);
+  EXPECT_EQ(gfx::g_testPipelineRefCount, 1u);
+  EXPECT_EQ(stats.fallback(), 1u);
+}
+
+TEST_F(GXDrawRouteTest, PendingOutputVariantThatFailsLooksUpExtZero) {
+  gfx::g_testMergeDraws = false;
+  const ExtStats stats;
+  render_ext::set_hooks(&InputHook);
+  render_ext::g_drawInputs = 1;
+  gfx::g_testPipelineState = gfx::PipelineState::Pending;
+  gfx::g_testReadyLegacyRef = 77;
+  triangle();
+  decode();
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, 77u);
+  EXPECT_EQ(gfx::g_testPipelineRefCount, 1u);
+
+  gfx::g_testPipelineEpoch = 1;
+  gfx::g_testPipelineState = gfx::PipelineState::Failed;
+  triangle();
+  decode();
+  EXPECT_EQ(gfx::g_testPipelineRefCount, 2u);
+  EXPECT_TRUE(gfx::g_testLastLookupExt == RenderExtConfig{});
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, gfx::g_testLastPipelineRef);
+  EXPECT_EQ(stats.failed(), 1u);
+  EXPECT_EQ(stats.fallback(), 1u);
 }
 
 TEST_F(GXDrawRouteTest, RegistryRepublishRelooks) {

@@ -120,6 +120,8 @@ Range push_storage(const T& data) {
   return push_storage(reinterpret_cast<const uint8_t*>(&data), sizeof(T));
 }
 Range push_channel_storage(std::span<const uint8_t> bytes) noexcept;
+// 16-byte aligned and never at offset 0, so 0 can mean none; refused instead of grown when mapped staging is full
+Range push_storage_packed(std::span<const uint8_t> bytes) noexcept;
 Range reserve_channel_storage(size_t length, bool zero) noexcept;
 uint64_t last_channel_storage_bytes() noexcept;
 inline constexpr uint32_t DispatchMaxInputs = 8;
