@@ -87,6 +87,7 @@ struct RenderPass {
   wgpu::TextureView copySourceView;
   wgpu::TextureView copySourceDepthView;
   wgpu::Texture copySourceNormalTexture;
+  wgpu::Texture copySourceFogTexture;
   uint32_t msaaSamples = 1;
 
   TextureHandle resolveTarget;
@@ -97,6 +98,7 @@ struct RenderPass {
   wgpu::Texture snapshotColorDst;
   wgpu::TextureView snapshotDepthDst;
   wgpu::Texture snapshotNormalDst;
+  wgpu::Texture snapshotFogDst;
   float clearDepthValue = 1.f;
   wgpu::LoadOp depthLoadOp = wgpu::LoadOp::Undefined;
   wgpu::StoreOp depthStoreOp = wgpu::StoreOp::Store;
@@ -114,7 +116,9 @@ struct RenderPass {
   std::vector<tex_palette_conv::ConvRequest> paletteConvs;
 
   RenderTargetLayout target_layout() const noexcept;
-  bool has_consumer() const { return resolveTarget || snapshotColorDst || snapshotDepthDst || snapshotNormalDst; }
+  bool has_consumer() const {
+    return resolveTarget || snapshotColorDst || snapshotDepthDst || snapshotNormalDst || snapshotFogDst;
+  }
   bool has_content() const {
     if (hasDraws || clearDepth) {
       return true;

@@ -11,6 +11,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <span>
 #include <vector>
 
 namespace render_demo {
@@ -101,6 +102,7 @@ aurora::render::gpu::Handle sBoxPositions = aurora::render::gpu::InvalidHandle;
 std::vector<u8> sGroundTexture;
 GXTexObj sGroundTexObj;
 std::vector<std::vector<SkinnedVertex>> sTentacle;
+FogResolveCounts sFogResolves;
 
 // aurora has no GXMatrixIndex1x8; the FIFO byte is identical
 void emit_matrix_index(u8 index) { GXParam1u8(index); }
@@ -577,6 +579,21 @@ Vec tentacle_probe_local(const SceneCamera& camera, const Mtx bone) noexcept {
   const f32 r = radius * std::cos(step / 2.f) / std::cos(phi - mid);
   return {r * std::cos(phi), Height, r * std::sin(phi)};
 }
+
+void resolve_fog_records() {
+  aurora::gfx::ResolvedTargets out;
+  const bool resolved = aurora::gfx::resolve_pass({.color = false, .fog = true}, out);
+  const aurora::gfx::RenderTargetLayout layout = aurora::gfx::scene_render_target_layout();
+  const auto attachments = std::span{layout.colorAttachments}.first(layout.colorAttachmentCount);
+  const bool live = std::ranges::any_of(attachments, [](const aurora::gfx::ColorAttachmentLayout& color) {
+    return color.semantic == aurora::gfx::ColorAttachmentSemantic::Fog;
+  });
+  ++sFogResolves.checked;
+  sFogResolves.live += live ? 1 : 0;
+  if (!resolved || static_cast<bool>(out.fog) != live) {
+    ++sFogResolves.mismatches;
+  }
+}
 } // namespace
 
 bool init_scene() {
@@ -671,6 +688,8 @@ std::optional<std::array<f32, 2>> motion_probe_expected(MotionProbe probe, u32 f
 
 const std::array<FogParams, 2>& fog_bands() noexcept { return FogBands; }
 
+FogResolveCounts fog_resolve_counts() noexcept { return sFogResolves; }
+
 void draw_scene(u32 frame, const SceneOptions& options) {
   // Not gated on hints_enabled() so the off capture proves emitters add only hint bytes; real producers do gate on it
   set_hint_emission(options.hints);
@@ -720,6 +739,9 @@ void draw_scene(u32 frame, const SceneOptions& options) {
     draw_capture_only_box(view, eye, target);
   }
   hint_stage(AURORA_STAGE_OPAQUE_DONE);
+  if (options.fogBands) {
+    resolve_fog_records();
+  }
 
   // The water never reads K1; the policy gives the decoder and tevPolicyDraws a producer that CI runs
   AuroraTevPolicy waterPolicy{};

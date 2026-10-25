@@ -169,8 +169,15 @@ std::optional<std::string> motion_check_failure(const render_demo::GraphPassRepo
   return std::nullopt;
 }
 
-std::optional<std::string> fog_check_failure(const render_demo::GraphPassReport& report, bool nullBackend) {
+std::optional<std::string> fog_check_failure(const render_demo::GraphPassReport& report,
+                                             const render_demo::FogResolveCounts& resolves, bool nullBackend) {
   using namespace render_demo;
+  char text[160];
+  if (resolves.checked == 0 || resolves.mismatches != 0) {
+    std::snprintf(text, sizeof(text), "%u of %u fog resolves disagreed with the scene layout", resolves.mismatches,
+                  resolves.checked);
+    return std::string{text};
+  }
   // The null backend runs no shaders, so its values say nothing
   if (nullBackend) {
     return std::nullopt;
@@ -187,7 +194,6 @@ std::optional<std::string> fog_check_failure(const render_demo::GraphPassReport&
   }
   const double pixels = static_cast<double>(w[FogWidth]) * w[FogHeight];
   const double geometry = w[FogGeometry];
-  char text[160];
   if (w[FogRgbMismatch] != 0 || w[FogQMismatch] != 0 || w[FogSkyNonZero] != 0) {
     std::snprintf(text, sizeof(text), "%u colour and %u q mismatches, %u records on sky pixels", w[FogRgbMismatch],
                   w[FogQMismatch], w[FogSkyNonZero]);
@@ -752,8 +758,9 @@ int main(int argc, char* argv[]) {
         "%.6g), reactive ground %.3g water %.3g\n",
         status.c_str(), m[32], m[0], m[1], m[8], m[9], m[16], m[17], m[2], m[26]);
   }
+  const render_demo::FogResolveCounts fogResolves = render_demo::fog_resolve_counts();
   const std::optional<std::string> fogFailure =
-      options.fogCheck ? fog_check_failure(graphReport, info.backend == BACKEND_NULL) : std::nullopt;
+      options.fogCheck ? fog_check_failure(graphReport, fogResolves, info.backend == BACKEND_NULL) : std::nullopt;
   if (options.fogCheck) {
     const std::string status = fogFailure                     ? "FAILED: " + *fogFailure
                                : info.backend == BACKEND_NULL ? std::string{"skipped (null backend)"}
@@ -761,11 +768,12 @@ int main(int argc, char* argv[]) {
     const auto& f = graphReport.fog;
     std::printf(
         "render_demo: fog check %s: geometry %u, no record %u, sky records %u, band 0 %u (q %u-%u), band 1 "
-        "%u, colour mismatches %u, q mismatches %u, max error %.4g/127\n",
+        "%u, colour mismatches %u, q mismatches %u, max error %.4g/127, resolves %u (%u live, %u wrong)\n",
         status.c_str(), f[render_demo::FogGeometry], f[render_demo::FogZeroOnGeometry], f[render_demo::FogSkyNonZero],
         f[render_demo::FogBand0], 127 - f[render_demo::FogBand0QMinInv], f[render_demo::FogBand0QMax],
         f[render_demo::FogBand1], f[render_demo::FogRgbMismatch], f[render_demo::FogQMismatch],
-        std::bit_cast<float>(f[render_demo::FogMaxErrorBits]) * 127.f);
+        std::bit_cast<float>(f[render_demo::FogMaxErrorBits]) * 127.f, fogResolves.checked, fogResolves.live,
+        fogResolves.mismatches);
   }
   if (options.gpuCull != 0) {
     print_cull_report(graphReport.cull, frame, options.cullTimings);

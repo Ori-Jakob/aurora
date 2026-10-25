@@ -29,10 +29,17 @@ struct SceneCamera {
 
 enum class MotionProbe : u32 { Ground, Box, Tentacle, Water };
 
+struct FogResolveCounts {
+  u32 checked = 0;
+  u32 live = 0;
+  u32 mismatches = 0;
+};
+
 SceneCamera scene_camera(u32 frame) noexcept;
 std::array<std::array<f32, 2>, 4> motion_probe_points(u32 frame) noexcept;
 std::optional<std::array<f32, 2>> motion_probe_expected(MotionProbe probe, u32 frame, std::array<f32, 2> ndc) noexcept;
 const std::array<FogParams, 2>& fog_bands() noexcept;
+FogResolveCounts fog_resolve_counts() noexcept;
 uint32_t gpu_uploads_per_frame(const SceneOptions& options) noexcept;
 bool init_scene();
 void draw_scene(u32 frame, const SceneOptions& options);

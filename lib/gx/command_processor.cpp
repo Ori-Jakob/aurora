@@ -277,7 +277,7 @@ void note_failed_variant() noexcept {
   }
 }
 
-FogRangeLutKey fog_range_lut_key() noexcept {
+FogRangeLutKey fog_range_lut_key(u32 targetWidth) noexcept {
   const auto& state = g_gxState.fog;
   const f32 logicalWidth = std::max(g_gxState.logicalViewport.width, 1.f);
   const f32 renderWidth = std::max(g_gxState.renderViewport.width, 1.f);
@@ -286,7 +286,7 @@ FogRangeLutKey fog_range_lut_key() noexcept {
       .rangeCenter = ((static_cast<f32>(state.rangeCenter) - g_gxState.logicalViewport.left) / logicalWidth) * 2.f -
                      1.f + (g_gxState.renderViewport.left / renderWidth) * 2.f,
       .renderWidth = renderWidth,
-      .targetWidth = gfx::get_render_target_size().x,
+      .targetWidth = targetWidth,
   };
 }
 
@@ -922,7 +922,7 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     state.dirty &= ~DirtyUniform;
   }
   if (cache.config.shaderConfig.fogRangeEnabled) {
-    const auto key = fog_range_lut_key();
+    const auto key = fog_range_lut_key(gfx::get_render_target_size().x);
     if (!cache.hasFogRange || cache.fogRangeKey != key) {
       ZoneScopedN("push fog range lut");
       const CpuZoneScope build{CpuZoneFogLut};
@@ -1537,6 +1537,11 @@ ImmutableArrayStats immutable_array_stats() noexcept {
 }
 
 namespace testing {
+FogRangeLutProbe fog_range_lut(uint32_t targetWidth) noexcept {
+  const FogRangeLutKey key = fog_range_lut_key(targetWidth);
+  return {.rangeCenter = key.rangeCenter, .renderWidth = key.renderWidth, .factors = build_fog_range_lut(key)};
+}
+
 void reset_draw_route_stats() noexcept {
   g_routed.store(0, std::memory_order_relaxed);
   g_suppressed.store(0, std::memory_order_relaxed);

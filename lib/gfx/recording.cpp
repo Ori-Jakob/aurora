@@ -31,6 +31,7 @@
 #include <new>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -185,6 +186,7 @@ struct PassSnapshotEntry {
   webgpu::TextureWithSampler color;
   webgpu::TextureWithSampler depth; // R32Float raw depth
   webgpu::TextureWithSampler normal;
+  webgpu::TextureWithSampler fog;
 };
 struct PassSnapshotPool {
   std::vector<PassSnapshotEntry> entries;
@@ -193,7 +195,7 @@ struct PassSnapshotPool {
 std::array<PassSnapshotPool, FrameSlotCount> g_passSnapshotPools;
 
 PassSnapshotEntry& acquire_pass_snapshot(uint32_t width, uint32_t height, bool wantColor, bool wantDepth,
-                                         bool wantNormal) {
+                                         bool wantNormal, bool wantFog) {
   auto& pool = g_passSnapshotPools[g_recorder.frameSlot];
   if (pool.used == pool.entries.size()) {
     pool.entries.emplace_back();
@@ -257,6 +259,25 @@ PassSnapshotEntry& acquire_pass_snapshot(uint32_t width, uint32_t height, bool w
         .view = std::move(view),
         .size = size,
         .format = webgpu::NormalBufferFormat,
+    };
+  }
+  if (wantFog && (!entry.fog.texture || entry.fog.size.width != width || entry.fog.size.height != height)) {
+    const wgpu::TextureDescriptor desc{
+        .label = "Pass Snapshot Fog",
+        .usage = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc,
+        .dimension = wgpu::TextureDimension::e2D,
+        .size = size,
+        .format = webgpu::FogRecordFormat,
+        .mipLevelCount = 1,
+        .sampleCount = 1,
+    };
+    auto texture = webgpu::g_device.CreateTexture(&desc);
+    auto view = texture.CreateView();
+    entry.fog = webgpu::TextureWithSampler{
+        .texture = std::move(texture),
+        .view = std::move(view),
+        .size = size,
+        .format = webgpu::FogRecordFormat,
     };
   }
   return entry;
@@ -1344,14 +1365,18 @@ bool resolve_pass(const ResolveDesc& desc, ResolvedTargets& out) {
   const uint32_t width = prevPass.colorAttachments[SceneColorAttachmentIndex].size.width;
   const uint32_t height = prevPass.colorAttachments[SceneColorAttachmentIndex].size.height;
   const bool wantNormal = desc.normal && prevPass.copySourceNormalTexture;
+  const auto attachments = std::span{prevPass.colorAttachments}.first(prevPass.colorAttachmentCount);
+  const bool wantFog = desc.fog && !g_recorder.inOffscreen && std::ranges::any_of(attachments, [](const auto& color) {
+                         return color.semantic == ColorAttachmentSemantic::Fog;
+                       });
   // A request under the G-buffer reads its normal, so it must not leave a sticky legacy buffer behind
   if (detail::should_arm_mod_normal(desc.normal, g_recorder.inOffscreen, webgpu::normal_present(),
                                     webgpu::g_hasCoreFeatures, webgpu::g_graphicsConfig.msaaSamples)) {
     g_recorder.normalRequested = true;
   }
   // Requesting no snapshots is a plain pass break (or offscreen close, discarding its output).
-  if (desc.color || wantDepth || wantNormal) {
-    auto& entry = acquire_pass_snapshot(width, height, desc.color, wantDepth, wantNormal);
+  if (desc.color || wantDepth || wantNormal || wantFog) {
+    auto& entry = acquire_pass_snapshot(width, height, desc.color, wantDepth, wantNormal, wantFog);
     if (desc.color) {
       prevPass.snapshotColorDst = entry.color.texture;
       out.colorTexture = entry.color.texture;
@@ -1367,6 +1392,12 @@ bool resolve_pass(const ResolveDesc& desc, ResolvedTargets& out) {
       prevPass.snapshotNormalDst = entry.normal.texture;
       out.normalTexture = entry.normal.texture;
       out.normal = entry.normal.view;
+    }
+    if (wantFog) {
+      prevPass.copySourceFogTexture = webgpu::g_fogRecordBuffer.texture;
+      prevPass.snapshotFogDst = entry.fog.texture;
+      out.fogTexture = entry.fog.texture;
+      out.fog = entry.fog.view;
     }
   }
   out.width = width;

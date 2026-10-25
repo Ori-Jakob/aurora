@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdint>
+#include <vector>
 
 namespace aurora::gx::fifo {
 
@@ -87,6 +88,12 @@ void load_array_gpu(uint8_t attr, uint64_t handle, uint32_t byteOffset) noexcept
 void end_gpu_frame() noexcept;
 
 namespace testing {
+struct FogRangeLutProbe {
+  float rangeCenter;
+  float renderWidth;
+  std::vector<float> factors;
+};
+FogRangeLutProbe fog_range_lut(uint32_t targetWidth) noexcept;
 void reset_draw_route_stats() noexcept;
 void reset_array_upload_stats() noexcept;
 void set_immutable_array_mode(ImmutableArrayMode mode) noexcept;

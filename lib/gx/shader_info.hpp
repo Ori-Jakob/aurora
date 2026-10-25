@@ -2,6 +2,7 @@
 
 #include "gx.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -15,6 +16,20 @@ inline constexpr size_t DrawUniformReuseDepth = 1;
 gfx::Range build_draw_uniform(const ShaderInfo& info) noexcept;
 void clear_draw_uniforms() noexcept;
 u8 color_channel(GXChannelID id) noexcept;
+
+// Matches AuroraGxFog in aurora/gx_fog.wgsl
+struct FogParams {
+  Fog fog;
+  u32 type;
+  u32 rangeEnabled;
+  f32 renderWidth;
+  f32 viewportZNear;
+  f32 viewportZFar;
+  u32 pad[3] = {};
+};
+static_assert(offsetof(FogParams, type) == 80 && offsetof(FogParams, viewportZFar) == 96 && sizeof(FogParams) == 112);
+Fog make_fog_uniform() noexcept;
+FogParams current_fog_params() noexcept; // FIFO thread
 
 namespace testing {
 // The exact bytes fill_uniform produces; tests compare them with the WGSL member order

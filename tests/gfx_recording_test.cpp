@@ -321,6 +321,36 @@ TEST_F(GfxRecordingTest, EfbPassCarriesGBufferTargets) {
   next_frame();
 }
 
+TEST_F(GfxRecordingTest, ResolveFogNullWithoutFogTarget) {
+  const auto noFogSnapshot = [this] {
+    return std::ranges::none_of(frame.renderPasses, [](const detail::RenderPass& pass) {
+      return static_cast<bool>(pass.snapshotFogDst) || static_cast<bool>(pass.copySourceFogTexture);
+    });
+  };
+  ResolvedTargets out;
+  ASSERT_TRUE(resolve_pass({.color = false, .fog = true}, out));
+  EXPECT_FALSE(out.fog);
+  EXPECT_FALSE(out.fogTexture);
+  EXPECT_TRUE(noFogSnapshot());
+
+  struct TierReset {
+    ~TierReset() { webgpu::g_graphicsConfig.gbuffer = false; }
+  } tierReset;
+  webgpu::g_graphicsConfig.gbuffer = true;
+  next_frame();
+  const auto& first = frame.renderPasses.front();
+  ASSERT_EQ(first.colorAttachmentCount, 5u);
+  EXPECT_EQ(first.colorAttachments[4].semantic, ColorAttachmentSemantic::Fog);
+  seed(320, 180);
+  ASSERT_TRUE(create_pass(320, 180));
+  ASSERT_TRUE(resolve_pass({.color = false, .fog = true}, out));
+  EXPECT_FALSE(is_offscreen());
+  EXPECT_FALSE(out.fog);
+  EXPECT_FALSE(out.fogTexture);
+  EXPECT_TRUE(noFogSnapshot());
+  next_frame();
+}
+
 TEST(GfxRecordingArmTest, ShouldArmModNormal) {
   EXPECT_TRUE(detail::should_arm_mod_normal(true, false, false, true, 1));
   EXPECT_FALSE(detail::should_arm_mod_normal(true, false, true, true, 1));

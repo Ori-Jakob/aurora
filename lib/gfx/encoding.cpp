@@ -351,6 +351,21 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
     };
     cmd.CopyTextureToTexture(&src, &dst, &size);
   }
+  if (passInfo.snapshotFogDst) {
+    const webgpu::gpu_prof::Zone zone{cmd, "Fog snapshot"};
+    const wgpu::TexelCopyTextureInfo src{
+        .texture = passInfo.copySourceFogTexture,
+    };
+    const wgpu::TexelCopyTextureInfo dst{
+        .texture = passInfo.snapshotFogDst,
+    };
+    const wgpu::Extent3D size{
+        .width = passInfo.colorAttachments[SceneColorAttachmentIndex].size.width,
+        .height = passInfo.colorAttachments[SceneColorAttachmentIndex].size.height,
+        .depthOrArrayLayers = 1,
+    };
+    cmd.CopyTextureToTexture(&src, &dst, &size);
+  }
 }
 
 constexpr uint32_t align_down_copy_offset(uint32_t value) noexcept { return value & ~3u; }

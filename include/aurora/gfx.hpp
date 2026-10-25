@@ -151,6 +151,7 @@ struct ResolveDesc {
   bool color = true;
   bool depth = false;
   bool normal = false;
+  bool fog = false;
 };
 
 struct ResolvedTargets {
@@ -163,6 +164,9 @@ struct ResolvedTargets {
   // RGB10A2Unorm snapshot; null when not requested or unavailable
   wgpu::Texture normalTexture;
   wgpu::TextureView normal;
+  // RGBA8Uint fog record snapshot; null unless the scene layout has a fog target
+  wgpu::Texture fogTexture;
+  wgpu::TextureView fog;
   wgpu::TextureFormat colorFormat = wgpu::TextureFormat::Undefined;
   uint32_t width = 0;
   uint32_t height = 0;
@@ -184,6 +188,13 @@ struct ResolvedTargets {
 /// also be null in offscreen passes and when unsupported by the device. The
 /// normal attachment is also present while the base G-buffer tier is live, and
 /// a request made then does not enable it.
+///
+/// **Fog records:**
+/// Fog records are snapshotted only while the scene layout carries a fog target;
+/// a request never enables one. They are null in offscreen passes and without
+/// the base G-buffer. Records are all zero before SCENE_BEGIN, final at
+/// OPAQUE_DONE and valid until the first colour draw after the opaque window,
+/// so resolve them at or right after OPAQUE_DONE.
 bool resolve_pass(const ResolveDesc& desc, ResolvedTargets& out);
 
 /// Opens an offscreen render pass (GXCreateFrameBuffer semantics): cleared

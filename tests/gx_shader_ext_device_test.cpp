@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "gx_fog_reference.hpp"
 #include "gx_shader_corpus.hpp"
 #include "render_test_device.hpp"
 
@@ -9,21 +10,27 @@
 #include "gfx/pipeline_cache.hpp"
 #include "gfx/resources.hpp"
 #include "gfx/scene_targets.hpp"
+#include "gx/command_processor.hpp"
 #include "gx/hex_wgsl.hpp"
 #include "gx/pipeline.hpp"
 #include "gx/render_ext.hpp"
 #include "gx/shader_info.hpp"
+#include "render/shaders_embed.hpp"
 
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cctype>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -1005,6 +1012,563 @@ TEST_F(GxShaderExtDevice, FogTargetPipelinesCreate) {
   }
   EXPECT_EQ(gbuffer_pipeline_failures(), failures);
   EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
+}
+
+std::string_view gx_fog_library() {
+  for (const render::shaders::EmbeddedShader& shader : render::shaders::embedded_library()) {
+    if (std::string_view{shader.id} == "aurora/gx_fog") {
+      return {reinterpret_cast<const char*>(shader.data), shader.size};
+    }
+  }
+  return {};
+}
+
+// A wrapped library line folds back into the single line the generator emits
+std::string fold_lines(std::string_view text) {
+  std::string out;
+  for (size_t i = 0; i < text.size(); ++i) {
+    if (text[i] != '\r' && text[i] != '\n') {
+      out += text[i];
+      continue;
+    }
+    while (i + 1 < text.size() && std::isspace(static_cast<unsigned char>(text[i + 1])) != 0) {
+      ++i;
+    }
+    out += ' ';
+  }
+  return out;
+}
+
+std::string replace_all(std::string text, std::string_view from, std::string_view to) {
+  for (size_t at = text.find(from); at != std::string::npos; at = text.find(from, at + to.size())) {
+    text.replace(at, from.size(), to);
+  }
+  return text;
+}
+
+std::string between(std::string_view text, std::string_view prefix, std::string_view suffix) {
+  const size_t start = text.find(prefix);
+  if (start == std::string_view::npos) {
+    return {};
+  }
+  const size_t end = text.find(suffix, start + prefix.size());
+  if (end == std::string_view::npos) {
+    return {};
+  }
+  return std::string{text.substr(start + prefix.size(), end - start - prefix.size())};
+}
+
+std::string as_library(std::string_view gx) {
+  return replace_all(replace_all(std::string{gx}, "(1.0 - in.pos.z)", "zw"), "ubuf.fog.", "fog.");
+}
+
+std::string fog_record_text(const ShaderConfig& config) {
+  return build_shader_source(with_output(config, 1), DstAlphaMode::None, ShaderTargets{.fog = 1});
+}
+
+std::string fog_label(const ShaderConfig& config) {
+  return "fog " + std::to_string(config.fogType) + " range " + std::to_string(config.fogRangeEnabled ? 1 : 0);
+}
+
+TEST(GxFog, LibraryPinsGxCurves) {
+  const std::string library = fold_lines(gx_fog_library());
+  ASSERT_FALSE(library.empty());
+  const std::vector<ShaderConfig> configs = fog_family_configs();
+  ASSERT_GE(configs.size(), MinFogConfigs);
+  size_t pinned = 0;
+  for (const ShaderConfig& config : configs) {
+    if (config.fogType == GX_FOG_NONE) {
+      continue;
+    }
+    const std::string text = fog_record_text(config);
+    const std::string label = fog_label(config);
+    const std::string base = between(text, "var fogBase = ", ";");
+    const std::string clamp = between(text, "var fogF = ", ";");
+    const std::string curve = between(text, "var fogZ = ", ";");
+    const std::string mix = between(text, "prev = vec4f(mix(", ", prev.a);");
+    const std::string record = between(text, "out.fog = ", ";");
+    ASSERT_FALSE(base.empty() || clamp.empty() || curve.empty() || mix.empty() || record.empty()) << label;
+    EXPECT_NE(library.find("fogBase = " + as_library(base) + ";"), std::string::npos) << label << ": " << base;
+    EXPECT_NE(library.find("fogF = " + as_library(clamp) + ";"), std::string::npos) << label << ": " << clamp;
+    EXPECT_NE(library.find("fogZ = " + as_library(curve) + ";"), std::string::npos) << label << ": " << curve;
+    EXPECT_NE(library.find(replace_all(as_library("mix(" + mix), "prev.rgb", "rgb")), std::string::npos)
+        << label << ": " << mix;
+    if ((config.fogType & 7) == GX_FOG_PERSP_REVEXP2) {
+      EXPECT_NE(text.find("\n    fogF = 1.0 - fogF;"), std::string::npos) << label;
+      EXPECT_NE(library.find("fogF = 1.0 - fogF;"), std::string::npos) << label;
+    }
+    if (config.fogRangeEnabled) {
+      EXPECT_NE(text.find("fogBase *= bitcast<f32>(abuf[imm.fog_range_base + u32(in.pos.x)]);"), std::string::npos)
+          << label;
+      EXPECT_NE(library.find("fogBase *= aurora_gx_fog_range_factor(fog, pixel_x);"), std::string::npos) << label;
+    }
+    const std::string lock = config.fogType == GX_FOG_PERSP_LIN ? " | 0u)" : " | 1u)";
+    ASSERT_TRUE(record.ends_with(lock)) << label << ": " << record;
+    EXPECT_NE(library.find(as_library(record.substr(0, record.size() - lock.size())) + " | lock)"), std::string::npos)
+        << label << ": " << record;
+    ++pinned;
+  }
+  EXPECT_EQ(pinned, 2 * (FogTypes.size() - 1));
+}
+
+struct FogStateGuard {
+  FogState fog = g_gxState.fog;
+  gfx::Viewport logical = g_gxState.logicalViewport;
+  gfx::Viewport render = g_gxState.renderViewport;
+
+  ~FogStateGuard() {
+    g_gxState.fog = fog;
+    g_gxState.logicalViewport = logical;
+    g_gxState.renderViewport = render;
+  }
+};
+
+TEST(GxFog, FogParamsLayout) {
+  EXPECT_EQ(offsetof(FogParams, type), 80u);
+  EXPECT_EQ(offsetof(FogParams, viewportZFar), 96u);
+  EXPECT_EQ(sizeof(FogParams), 112u);
+  const FogStateGuard guard;
+  auto& state = g_gxState.fog;
+  state.type = GX_FOG_PERSP_EXP;
+  state.a = 0.375f;
+  state.b = 1.25f;
+  state.c = -0.125f;
+  state.color = {17.f / 255.f, 34.f / 255.f, 51.f / 255.f, 1.f};
+  state.rangeK = {260, 270, 280, 290, 300, 310, 320, 330, 340, 350};
+  state.rangeCenter = 0x140;
+  state.rangeEnabled = true;
+  g_gxState.logicalViewport = {40.f, 0.f, 560.f, 420.f, 0.2f, 0.9f};
+  g_gxState.renderViewport = {20.f, 0.f, 1200.f, 900.f, 0.2f, 0.9f};
+
+  const FogParams params = current_fog_params();
+  EXPECT_LE(std::abs(std::bit_cast<int32_t>(params.fog.rangeCenter) - std::bit_cast<int32_t>(0.033333335f)), 1)
+      << params.fog.rangeCenter;
+  EXPECT_EQ(params.fog.color, (Vec4<float>{17.f / 255.f, 34.f / 255.f, 51.f / 255.f, 1.f}));
+  EXPECT_EQ(params.fog.a, 0.375f);
+  EXPECT_EQ(params.fog.b, 1.25f);
+  EXPECT_EQ(params.fog.c, -0.125f);
+  constexpr std::array<float, 12> RangeK{270.f / 64.f, 260.f / 64.f, 290.f / 64.f, 280.f / 64.f,
+                                         310.f / 64.f, 300.f / 64.f, 330.f / 64.f, 320.f / 64.f,
+                                         350.f / 64.f, 340.f / 64.f, 340.f / 64.f, 340.f / 64.f};
+  for (size_t i = 0; i < RangeK.size(); ++i) {
+    EXPECT_EQ(params.fog.rangeK[i / 4][i % 4], RangeK[i]) << i;
+  }
+  EXPECT_EQ(params.type, u32{GX_FOG_PERSP_EXP});
+  EXPECT_EQ(params.rangeEnabled, 1u);
+  EXPECT_EQ(params.renderWidth, 1200.f);
+  EXPECT_EQ(params.viewportZNear, 0.2f);
+  EXPECT_EQ(params.viewportZFar, 0.9f);
+  EXPECT_EQ(params.pad[0] | params.pad[1] | params.pad[2], 0u);
+
+  const fifo::testing::FogRangeLutProbe probe = fifo::testing::fog_range_lut(1200);
+  EXPECT_EQ(probe.rangeCenter, params.fog.rangeCenter);
+  EXPECT_EQ(probe.renderWidth, params.renderWidth);
+  EXPECT_EQ(probe.factors.size(), 1200u);
+
+  const std::vector<ShaderConfig> configs = fog_family_configs();
+  const auto found = std::ranges::find_if(
+      configs, [](const ShaderConfig& config) { return config.fogType == GX_FOG_PERSP_EXP && config.fogRangeEnabled; });
+  ASSERT_NE(found, configs.end());
+  const ShaderInfo info = build_shader_info(*found);
+  ASSERT_TRUE(info.usesFog);
+  const std::array<float, 20> literal{
+      17.f / 255.f, 34.f / 255.f, 51.f / 255.f, 1.f,       0.375f,    1.25f,     -0.125f,   params.fog.rangeCenter,
+      RangeK[0],    RangeK[1],    RangeK[2],    RangeK[3], RangeK[4], RangeK[5], RangeK[6], RangeK[7],
+      RangeK[8],    RangeK[9],    RangeK[10],   RangeK[11]};
+  std::array<uint8_t, sizeof(literal)> literalBytes{};
+  std::memcpy(literalBytes.data(), literal.data(), sizeof(literal));
+  const std::vector<uint8_t> bytes = testing::uniform_bytes(info);
+  EXPECT_FALSE(std::ranges::search(bytes, literalBytes).empty());
+
+  g_gxState.renderViewport.width = 0.f;
+  EXPECT_EQ(current_fog_params().renderWidth, 1.f);
+  EXPECT_EQ(fifo::testing::fog_range_lut(16).renderWidth, 1.f);
+}
+
+TEST_F(GxShaderExtDevice, GxFogLibraryValidates) {
+  const std::string_view library = gx_fog_library();
+  ASSERT_FALSE(library.empty());
+  const std::string text = std::string{library} + R"(
+@group(0) @binding(0) var<uniform> fog: AuroraGxFog;
+@group(0) @binding(1) var<storage, read_write> out_words: array<u32>;
+
+@compute @workgroup_size(1)
+fn main() {
+    let w = aurora_gx_fog_weight(fog, aurora_gx_fog_zw(fog, vec4f(0.0, 0.0, 0.25, 1.0)), 10.5);
+    let rgb = aurora_gx_fog_apply(fog, vec3f(0.25), w);
+    let rec = aurora_gx_fog_record(fog, w);
+    out_words[0] = bitcast<u32>(rgb.x + aurora_gx_fog_range_factor(fog, 3.5)) + rec.a;
+}
+)";
+  for (const bool core : {true, false}) {
+    ASSERT_TRUE(start({.backend = wgpu::BackendType::Null, .core = core}, false)) << "core " << core;
+    const auto error = module_error(*m_device, text);
+    EXPECT_FALSE(error.has_value()) << "core " << core << ": " << error.value_or("");
+    EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
+    m_device.reset();
+  }
+}
+
+struct FogSweepSet {
+  float start;
+  float end;
+  float nearZ;
+  float farZ;
+  s16 center;
+  std::array<u16, 10> table;
+};
+
+constexpr std::array<u16, 10> TpRangeTable{260, 269, 278, 287, 296, 305, 314, 323, 332, 340};
+constexpr std::array<u16, 10> SteepRangeTable{64, 96, 128, 160, 192, 224, 256, 288, 320, 352};
+constexpr std::array<FogSweepSet, 6> FogSweepSets{{
+    {-3000.f, 25000.f, 1.f, 160000.f, 0x100, SteepRangeTable},
+    {500.f, 120000.f, 1.f, 160000.f, 0x140, TpRangeTable},
+    {0.f, 9500.f, 1.f, 160000.f, 0x0C0, SteepRangeTable},
+    {750.f, 1750.f, 10.f, 30000.f, 0x180, SteepRangeTable},
+    {0.1f, 0.9f, 0.f, 1.f, 0x140, SteepRangeTable},
+    {1000.f, 1000.f, 1.f, 160000.f, 0x140, SteepRangeTable},
+}};
+constexpr std::array<u32, 2> FogSweepWidths{640, 2560};
+constexpr std::array<std::array<float, 2>, 2> FogSweepDepthRanges{{{0.f, 1.f}, {0.2f, 0.9f}}};
+constexpr std::array<u32, 5> FogSweepBytes{0, 1, 127, 254, 255};
+constexpr u32 FogSweepDepths = 64;
+constexpr u32 FogSweepColumns = 16;
+constexpr u32 FogSweepBlockSamples = FogSweepDepths * FogSweepColumns;
+constexpr u32 FogSweepBlocks =
+    FogSweepSets.size() * FogSweepWidths.size() * FogSweepDepthRanges.size() * FogSweepBytes.size();
+constexpr u32 FogSweepSamples = FogSweepBlocks * FogSweepBlockSamples;
+constexpr u32 FogSweepFields = 6;
+
+constexpr std::string_view FogSweepHarness = R"(
+struct GxIn {
+    pos: vec4f,
+}
+
+struct GxImm {
+    fog_range_base: u32,
+}
+
+struct GxOut {
+    fog: vec4u,
+}
+
+struct GxSample {
+    w: f32,
+    rgb: vec3f,
+    rec: vec4u,
+}
+)";
+
+constexpr std::string_view FogSweepMain = R"(
+@group(0) @binding(0) var<storage, read> gx_blocks: array<GxFogBlock>;
+@group(0) @binding(1) var<storage, read> abuf: array<u32>;
+@group(0) @binding(2) var<storage, read> samples: array<vec4f>;
+@group(0) @binding(3) var<storage, read> fogs: array<AuroraGxFog>;
+@group(0) @binding(4) var<storage, read> lut_bases: array<u32>;
+@group(0) @binding(5) var<storage, read_write> out_words: array<u32>;
+
+fn pack_record(rec: vec4u) -> u32 {
+    return select(rec.r | (rec.g << 8u) | (rec.b << 16u) | (rec.a << 24u), 0xFFFFFFFFu, any(rec > vec4u(255u)));
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+    _ = abuf[0];
+    let i = id.x;
+    let block = i / 1024u;
+    let s = samples[i];
+    let color = fract(vec3f(f32(i) * 0.1371, f32(i) * 0.0713, f32(i) * 0.0291));
+    let gx = gx_fog(GxIn(vec4f(s.x, 0.5, s.y, 1.0)), gx_blocks[block], GxImm(lut_bases[block]), color);
+    let fog = fogs[block];
+    let w = aurora_gx_fog_weight(fog, 1.0 - s.y, s.x);
+    let d = abs(gx.rgb - aurora_gx_fog_apply(fog, color, w));
+    out_words[i * 6u] = bitcast<u32>(gx.w);
+    out_words[i * 6u + 1u] = pack_record(gx.rec);
+    out_words[i * 6u + 2u] = bitcast<u32>(w);
+    out_words[i * 6u + 3u] = pack_record(aurora_gx_fog_record(fog, w));
+    out_words[i * 6u + 4u] = bitcast<u32>(max(d.x, max(d.y, d.z)));
+    out_words[i * 6u + 5u] = bitcast<u32>(aurora_gx_fog_zw(fog, vec4f(0.0, 0.0, s.z, s.w)));
+}
+)";
+
+// The generator's own fog block and record line, reading the GX uniform's view of the same bytes
+std::string spliced_gx_fog(const ShaderConfig& config) {
+  const std::string text = fog_record_text(config);
+  std::string out{FogSweepHarness};
+  std::string block;
+  std::string weight = "0.0";
+  if (config.fogType != GX_FOG_NONE) {
+    const size_t fogStruct = text.find("struct Fog {");
+    const size_t fogStructEnd = text.find("\n}", fogStruct);
+    const size_t start = text.find((config.fogType & 0x08) != 0 ? "    // Orthographic fog" : "    // Perspective fog");
+    const size_t mix = text.find("    prev = vec4f(mix(prev.rgb, ubuf.fog.color.rgb", start);
+    if (fogStruct == std::string::npos || fogStructEnd == std::string::npos || start == std::string::npos ||
+        mix == std::string::npos) {
+      return {};
+    }
+    out += "\n" + text.substr(fogStruct, fogStructEnd + 2 - fogStruct) + "\n";
+    out += "\nstruct GxFogBlock {\n    fog: Fog,\n    tail: array<vec4u, 2>,\n}\n";
+    block = text.substr(start, text.find('\n', mix) - start) + "\n";
+    weight = "clamp(fogZ, 0.0, 1.0)";
+  } else {
+    out += "\nstruct GxFogBlock {\n    words: array<vec4u, 7>,\n}\n";
+  }
+  const std::string record = between(text, "out.fog = ", ";");
+  if (record.empty()) {
+    return {};
+  }
+  out +=
+      "\nfn gx_fog(in: GxIn, ubuf: GxFogBlock, imm: GxImm, color: vec3f) -> GxSample {\n"
+      "    var prev = vec4f(color, 1.0);\n"
+      "    var out: GxOut;\n" +
+      block + "    out.fog = " + record + ";\n    return GxSample(" + weight + ", prev.rgb, out.fog);\n}\n";
+  return out;
+}
+
+struct FogSweepInputs {
+  std::vector<FogParams> params;
+  std::vector<std::array<float, 4>> samples;
+  std::vector<f32> lut;
+  std::vector<u32> lutBases;
+  std::vector<double> factors;
+};
+
+// Half the depths step evenly through the viewport range, half aim at fog weights across the clamp
+double sweep_zw(const FogParams& params, u32 depth, float znear, float zfar) {
+  const double a = params.fog.a;
+  const double c = params.fog.c;
+  double zw = zfar - (depth % 32 + 0.37) / 32.0 * (zfar - znear);
+  if (depth >= 32 && a != 0.0) {
+    const double f = -0.05 + 1.1 * (depth - 32) / 31.0;
+    if ((params.type & 0x08) != 0) {
+      zw = (f + c) / a;
+    } else if (f + c > 1e-9) {
+      zw = params.fog.b - a / (f + c);
+    }
+  }
+  // On the 2^-24 grid both zw and 1 - zw are exact floats, so in.pos.z carries zw without rounding
+  return std::nearbyint(std::clamp(zw, double{znear}, double{zfar}) * 16777216.0) / 16777216.0;
+}
+
+FogSweepInputs fog_sweep_inputs(u8 type, bool range) {
+  FogSweepInputs inputs;
+  inputs.params.reserve(FogSweepBlocks);
+  inputs.samples.reserve(FogSweepSamples);
+  inputs.factors.reserve(FogSweepBlocks * FogSweepColumns);
+  for (const FogSweepSet& set : FogSweepSets) {
+    for (const u32 width : FogSweepWidths) {
+      const u32 lutBase = static_cast<u32>(inputs.lut.size());
+      for (const auto& [znear, zfar] : FogSweepDepthRanges) {
+        for (const u32 k : FogSweepBytes) {
+          const fog_reference::Registers registers =
+              fog_reference::fog_params(type, set.start, set.end, set.nearZ, set.farZ);
+          auto& state = g_gxState.fog;
+          state.type = static_cast<GXFogType>(type);
+          state.a = registers.a;
+          state.b = registers.b;
+          state.c = registers.c;
+          state.color = {static_cast<float>(k) / 255.f, static_cast<float>(255 - k) / 255.f,
+                         static_cast<float>(k) / 255.f, 1.f};
+          state.rangeK = set.table;
+          state.rangeCenter = set.center;
+          state.rangeEnabled = range;
+          g_gxState.logicalViewport = {0.f, 0.f, 640.f, 480.f, znear, zfar};
+          g_gxState.renderViewport = {0.f, 0.f, static_cast<float>(width), width * 0.75f, znear, zfar};
+          const FogParams params = current_fog_params();
+          inputs.params.push_back(params);
+          if (inputs.lut.size() == lutBase) {
+            const std::vector<f32> factors = fifo::testing::fog_range_lut(width).factors;
+            inputs.lut.insert(inputs.lut.end(), factors.begin(), factors.end());
+          }
+          inputs.lutBases.push_back(lutBase);
+          for (u32 column = 0; column < FogSweepColumns; ++column) {
+            inputs.factors.push_back(fog_reference::range_factor(set.table, params.fog.rangeCenter, params.renderWidth,
+                                                                 column * (width - 1) / (FogSweepColumns - 1)));
+          }
+          for (u32 depth = 0; depth < FogSweepDepths; ++depth) {
+            const double zw = sweep_zw(params, depth, znear, zfar);
+            const double ndc = (zfar - zw) / (zfar - znear);
+            const float clipW = 1.f + 0.37f * static_cast<float>(depth % 7);
+            for (u32 column = 0; column < FogSweepColumns; ++column) {
+              const u32 x = column * (width - 1) / (FogSweepColumns - 1);
+              inputs.samples.push_back(
+                  {static_cast<float>(x) + 0.5f, static_cast<float>(1.0 - zw), static_cast<float>(ndc * clipW), clipW});
+            }
+          }
+        }
+      }
+    }
+  }
+  return inputs;
+}
+
+wgpu::Buffer storage_buffer(test::TestDevice& device, const void* data, uint64_t size) {
+  const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                                          .size = size};
+  const wgpu::Buffer buffer = device.device.CreateBuffer(&descriptor);
+  device.queue.WriteBuffer(buffer, 0, data, size);
+  return buffer;
+}
+
+// 0 exact, 1 one code off within 1e-3 of a .5 boundary, 2 wrong
+int judge_q(u32 q, double wRef) {
+  const double x = std::clamp(wRef, 0.0, 1.0) * 127.0;
+  const u32 expected = fog_reference::quantize(wRef);
+  if (q == expected) {
+    return 0;
+  }
+  const bool nearHalf = std::abs(x - std::floor(x) - 0.5) < 1e-3;
+  return nearHalf && (q + 1 == expected || q == expected + 1) ? 1 : 2;
+}
+
+TEST_F(GxShaderExtDevice, GxFogMatchesGxOnSweep) {
+  const auto backend = hardware_backend();
+  const bool hardware = backend.has_value() && start({.backend = *backend, .core = true, .allowCpu = false}, false);
+  if (!hardware) {
+    ASSERT_TRUE(start({.backend = wgpu::BackendType::Null, .core = true}, false));
+  }
+  const std::string_view library = gx_fog_library();
+  ASSERT_FALSE(library.empty());
+  const std::vector<ShaderConfig> configs = fog_family_configs();
+  ASSERT_GE(configs.size(), MinFogConfigs);
+  const FogStateGuard guard;
+
+  size_t fogged = 0;
+  size_t gxExempt = 0;
+  size_t libraryExempt = 0;
+  size_t failures = 0;
+  double maxWeightDelta = 0.0;
+  double maxZwError = 0.0;
+  const auto fail = [&failures](const std::string& message) {
+    if (failures++ < 16) {
+      ADD_FAILURE() << message;
+    }
+  };
+  for (const ShaderConfig& config : configs) {
+    const std::string label = fog_label(config);
+    const std::string spliced = spliced_gx_fog(config);
+    ASSERT_FALSE(spliced.empty()) << label;
+    const std::string text = std::string{library} + spliced + std::string{FogSweepMain};
+    const auto error = module_error(*m_device, text);
+    ASSERT_FALSE(error.has_value()) << label << ": " << error.value_or("") << "\n" << text;
+
+    const FogSweepInputs inputs = fog_sweep_inputs(config.fogType, config.fogRangeEnabled);
+    ASSERT_EQ(inputs.params.size(), FogSweepBlocks);
+    ASSERT_EQ(inputs.samples.size(), FogSweepSamples);
+    const wgpu::ShaderSourceWGSL wgsl{wgpu::ShaderSourceWGSL::Init{.code = text.c_str()}};
+    const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl};
+    const wgpu::ShaderModule module = m_device->device.CreateShaderModule(&moduleDescriptor);
+    const wgpu::ComputePipelineDescriptor pipelineDescriptor{.compute = {.module = module, .entryPoint = "main"}};
+    const wgpu::ComputePipeline pipeline = m_device->device.CreateComputePipeline(&pipelineDescriptor);
+    const uint64_t paramsSize = inputs.params.size() * sizeof(FogParams);
+    const uint64_t lutSize = inputs.lut.size() * sizeof(f32);
+    const uint64_t samplesSize = inputs.samples.size() * sizeof(inputs.samples[0]);
+    const uint64_t basesSize = inputs.lutBases.size() * sizeof(u32);
+    const uint64_t outputSize = uint64_t{FogSweepSamples} * FogSweepFields * sizeof(u32);
+    const wgpu::Buffer params = storage_buffer(*m_device, inputs.params.data(), paramsSize);
+    const wgpu::Buffer lut = storage_buffer(*m_device, inputs.lut.data(), lutSize);
+    const wgpu::Buffer samples = storage_buffer(*m_device, inputs.samples.data(), samplesSize);
+    const wgpu::Buffer bases = storage_buffer(*m_device, inputs.lutBases.data(), basesSize);
+    const wgpu::BufferDescriptor outputDescriptor{.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc,
+                                                  .size = outputSize};
+    const wgpu::Buffer output = m_device->device.CreateBuffer(&outputDescriptor);
+    const std::array<wgpu::BindGroupEntry, 6> entries{{
+        {.binding = 0, .buffer = params, .size = paramsSize},
+        {.binding = 1, .buffer = lut, .size = lutSize},
+        {.binding = 2, .buffer = samples, .size = samplesSize},
+        {.binding = 3, .buffer = params, .size = paramsSize},
+        {.binding = 4, .buffer = bases, .size = basesSize},
+        {.binding = 5, .buffer = output, .size = outputSize},
+    }};
+    const wgpu::BindGroupDescriptor groupDescriptor{
+        .layout = pipeline.GetBindGroupLayout(0), .entryCount = entries.size(), .entries = entries.data()};
+    const wgpu::BindGroup group = m_device->device.CreateBindGroup(&groupDescriptor);
+    const wgpu::CommandEncoder encoder = m_device->device.CreateCommandEncoder();
+    const wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
+    pass.SetPipeline(pipeline);
+    pass.SetBindGroup(0, group);
+    pass.DispatchWorkgroups(FogSweepSamples / 64);
+    pass.End();
+    const wgpu::CommandBuffer commands = encoder.Finish();
+    m_device->queue.Submit(1, &commands);
+    if (!hardware) {
+      continue;
+    }
+    const auto words = test::read_buffer(*m_device, output, 0, outputSize);
+    ASSERT_TRUE(words.has_value() && words->size() == uint64_t{FogSweepSamples} * FogSweepFields) << label;
+
+    for (u32 i = 0; i < FogSweepSamples; ++i) {
+      const u32 block = i / FogSweepBlockSamples;
+      const u32 column = i % FogSweepColumns;
+      const FogParams& fog = inputs.params[block];
+      const auto& sample = inputs.samples[i];
+      const u32* v = &(*words)[size_t{i} * FogSweepFields];
+      const float gxW = std::bit_cast<float>(v[0]);
+      const float libraryW = std::bit_cast<float>(v[2]);
+      const std::string where = label + " block " + std::to_string(block) + " sample " + std::to_string(i);
+      const double zwRef =
+          fog_reference::zw_ref(double{sample[2]} / double{sample[3]}, fog.viewportZNear, fog.viewportZFar);
+      const double zwError = std::abs(double{std::bit_cast<float>(v[5])} - zwRef);
+      maxZwError = std::max(maxZwError, zwError);
+      if (zwError > 1e-6 || std::abs((1.0 - double{sample[1]}) - zwRef) > 1e-6) {
+        fail(where + ": zw " + std::to_string(std::bit_cast<float>(v[5])) + " against " + std::to_string(zwRef));
+      }
+      const double weightDelta = std::abs(double{gxW} - double{libraryW});
+      maxWeightDelta = std::max(maxWeightDelta, weightDelta);
+      if (weightDelta > 1.0 / 16384.0 || std::bit_cast<float>(v[4]) > 1.f / 255.f) {
+        fail(where + ": weights " + std::to_string(gxW) + " and " + std::to_string(libraryW) + ", colour delta " +
+             std::to_string(std::bit_cast<float>(v[4])));
+      }
+      if (v[1] == 0xFFFFFFFFu || v[3] == 0xFFFFFFFFu) {
+        fail(where + ": record component above 255");
+        continue;
+      }
+      if (config.fogType == GX_FOG_NONE) {
+        if (v[1] != 0 || v[3] != 0 || gxW != 0.f || libraryW != 0.f) {
+          fail(where + ": unfogged record or weight is not zero");
+        }
+        continue;
+      }
+      ++fogged;
+      const double factor = config.fogRangeEnabled ? inputs.factors[block * FogSweepColumns + column] : 1.0;
+      const double wRef =
+          fog_reference::weight(config.fogType, fog.fog.a, fog.fog.b, fog.fog.c, 1.0 - double{sample[1]}, factor);
+      const u32 k = FogSweepBytes[block % FogSweepBytes.size()];
+      const u32 rgb = k | (255 - k) << 8 | k << 16;
+      const u32 lock = config.fogType != GX_FOG_PERSP_LIN ? 1u : 0u;
+      for (const auto& [packed, exempt, name] :
+           {std::tuple{v[1], &gxExempt, "GX"}, std::tuple{v[3], &libraryExempt, "library"}}) {
+        const u32 a = packed >> 24;
+        if ((packed & 0xFFFFFFu) != rgb || (a & 1u) != lock || (a >> 1) > 127) {
+          fail(where + ": " + name + " record " + std::to_string(packed));
+          continue;
+        }
+        const int verdict = judge_q(a >> 1, wRef);
+        if (verdict == 1) {
+          ++*exempt;
+        } else if (verdict == 2) {
+          fail(where + ": " + name + " q " + std::to_string(a >> 1) + " against w " + std::to_string(wRef));
+        }
+      }
+      if ((v[1] & 0x01FFFFFFu) != (v[3] & 0x01FFFFFFu)) {
+        fail(where + ": library rgb or lock differs from GX");
+      }
+    }
+  }
+  if (!hardware) {
+    GTEST_SKIP() << "the null backend runs no shaders; the harness validated";
+  }
+  EXPECT_EQ(failures, 0u);
+  EXPECT_GT(fogged, 0u);
+  EXPECT_LE(gxExempt * 100, fogged);
+  EXPECT_LE(libraryExempt * 100, fogged);
+  std::printf(
+      "GxFogMatchesGxOnSweep: %zu fogged samples, exemptions GX %zu library %zu, max |dw| %.3g, max zw "
+      "error %.3g\n",
+      fogged, gxExempt, libraryExempt, maxWeightDelta, maxZwError);
+  RecordProperty("fogged", static_cast<int>(fogged));
+  RecordProperty("gxExempt", static_cast<int>(gxExempt));
+  RecordProperty("libraryExempt", static_cast<int>(libraryExempt));
 }
 } // namespace
 } // namespace aurora::gx
