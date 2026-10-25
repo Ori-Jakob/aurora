@@ -1,4 +1,5 @@
 #include "debug.hpp"
+#include "fake_shadows.hpp"
 #include "textures.hpp"
 
 #include "../frame_state.hpp"
@@ -77,9 +78,11 @@ void initialize() {
   register_vram_source("GPU heap", &gpu_heap_bytes);
   register_vram_source("Transient pool", &transient_bytes);
   textures::initialize();
+  fake_shadows::initialize();
 }
 
 void shutdown() {
+  fake_shadows::shutdown();
   textures::shutdown();
   g_tabs.clear();
   g_vramSources.clear();
@@ -179,6 +182,7 @@ const TimingAverages& timing_averages() noexcept { return g_averages; }
 void on_latch() noexcept {
   g_latch.fetch_add(1, std::memory_order_relaxed);
   textures::on_latch();
+  fake_shadows::on_latch();
 }
 
 bool inspector_open() noexcept {

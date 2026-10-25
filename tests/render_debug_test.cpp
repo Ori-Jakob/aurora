@@ -341,6 +341,10 @@ TEST_F(RenderDebugWindow, DrawsEveryTabHeadless) {
   const ImGuiFrame imgui;
   debug::initialize();
   ASSERT_GE(debug::tabs().size(), 2u);
+  const auto tabs = debug::tabs();
+  for (const std::string_view name : {"Textures", "Fake shadows"}) {
+    EXPECT_NE(std::ranges::find(tabs, name, &debug::Tab::name), tabs.end()) << name;
+  }
   for (const debug::Tab& tab : debug::tabs()) {
     imgui.frame([&] {
       ImGui::Begin("t");
@@ -489,7 +493,7 @@ TEST_F(RenderDebugWindow, TabRegistryOrdersAndReplaces) {
   for (const debug::Tab& tab : debug::tabs()) {
     names.push_back(tab.name);
   }
-  EXPECT_EQ(names, (std::vector<std::string>{"Overview", "Alpha", "Graph", "Textures", "Zeta"}));
+  EXPECT_EQ(names, (std::vector<std::string>{"Overview", "Alpha", "Graph", "Textures", "Zeta", "Fake shadows"}));
   const auto tabs = debug::tabs();
   const auto zeta = std::ranges::find(tabs, std::string{"Zeta"}, &debug::Tab::name);
   ASSERT_NE(zeta, tabs.end());
@@ -497,6 +501,9 @@ TEST_F(RenderDebugWindow, TabRegistryOrdersAndReplaces) {
   const auto textures = std::ranges::find(tabs, std::string{"Textures"}, &debug::Tab::name);
   ASSERT_NE(textures, tabs.end());
   EXPECT_EQ(textures->order, debug::TexturesTabOrder);
+  const auto fakeShadows = std::ranges::find(tabs, std::string{"Fake shadows"}, &debug::Tab::name);
+  ASSERT_NE(fakeShadows, tabs.end());
+  EXPECT_EQ(fakeShadows->order, debug::FakeShadowsTabOrder);
 }
 
 TEST_F(RenderDebugWindow, TabVisibleFollowsSelection) {

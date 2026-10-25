@@ -6,9 +6,13 @@
 #include "render/debug/debug.hpp"
 #include "render/debug/pick.hpp"
 #include "render/debug/textures.hpp"
+#include "render/fakeshadow/texture_gate.hpp"
+#include "render/frame_state.hpp"
+#include "render/hints.hpp"
 #include "render/material/gx_lookup.hpp"
 #include "render/material/registry.hpp"
 #include "render/scene/classify.hpp"
+#include "render/settings.hpp"
 #include "gfx/frame_packet.hpp"
 #include "gfx/pipeline_cache.hpp"
 
@@ -65,6 +69,10 @@ bool pointer_probe(const GXTexObj_& obj) noexcept { return obj.data == g_pointer
 
 std::span<const uint8_t> resolve_same(void*, gx::guest_memory::Kind, uint64_t address, size_t size) noexcept {
   return {reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(address)), size};
+}
+
+gx::GXBindGroups neutral_stub(const gx::ShaderInfo&, uint8_t whiteMask, uint8_t clearMask, bool) noexcept {
+  return {.textureBindGroup = 0x200000u + whiteMask * 0x100u + clearMask};
 }
 
 class TextureInspector : public ::testing::Test {
@@ -480,6 +488,107 @@ TEST_F(TextureInspector, OverflowCountsWithoutAllocating) {
   on_latch();
   EXPECT_EQ(latest_report()->keys.size(), MaxKeyRows);
   EXPECT_EQ(latest_report()->overflow.keys, 3u);
+}
+
+TEST_F(TextureInspector, NeutralColumnFollowsGateDecision) {
+  struct Hints {
+    Hints() {
+      detail::testing::set_hints_override(1);
+      detail::install_hints();
+    }
+    ~Hints() {
+      detail::remove_hints();
+      detail::testing::reset_hints();
+      detail::testing::reset();
+    }
+  } hints;
+  constexpr uint8_t Light = 1u << static_cast<uint32_t>(fakeshadow::Gate::Light);
+  const std::array rules{
+      fakeshadow::Rule{.materialId = 7,
+                       .neutral = fakeshadow::Neutral::Clear,
+                       .gateBit = Light,
+                       .scopeMask = scene::category::Terrain,
+                       .scoped = true},
+      fakeshadow::Rule{.materialId = 8,
+                       .neutral = fakeshadow::Neutral::Skip,
+                       .gateBit = Light,
+                       .scopeMask = scene::category::Water,
+                       .scoped = true},
+  };
+  fakeshadow::testing::set_rules(rules);
+  fakeshadow::testing::set_neutral_builder(&neutral_stub);
+  fakeshadow::set_force(fakeshadow::Gate::Light, fakeshadow::Force::On);
+  fakeshadow::begin_frame(detail::FrameState{});
+  testing::force_visible(1);
+  on_latch();
+  testing::set_arm_state(pick::ArmState::Armed);
+  m_config.blendMode = GX_BM_BLEND;
+  m_config.blendFacSrc = GX_BL_SRCALPHA;
+  m_config.blendFacDst = GX_BL_INVSRCALPHA;
+  const auto shade = pattern(10);
+  const auto plain = pattern(11);
+  load(0, shade, 70);
+  load(1, plain, 71);
+  const auto bind = [](uint32_t slot, uint32_t id) {
+    gfx::TextureBind& texture = gx::g_gxState.textures[slot];
+    texture.ref =
+        std::make_shared<gfx::TextureRef>(wgpu::Texture{}, wgpu::TextureView{}, wgpu::TextureView{},
+                                          wgpu::Extent3D{Side, Side, 1}, wgpu::TextureFormat::RGBA8Unorm, 1, GX_TF_I8);
+    texture.material = {id, 0};
+  };
+  const auto push = [this](const gx::ShaderInfo& info, uint32_t index, uint32_t categories) {
+    scene::DrawClass cls = span_draw(index);
+    cls.key.categories = categories;
+    gx::DrawData draw = draw_data();
+    fakeshadow::push(draw, m_config, info, cls);
+    observe(draw, m_config, info, cls);
+    return draw;
+  };
+  bind(0, 7);
+  bind(1, 0);
+  const gx::DrawData cleared = push(sampling({0, 1}), 0, scene::category::Terrain);
+  EXPECT_EQ(cleared.bindGroups.textureBindGroup, 0x200001u);
+  EXPECT_NE(cleared.immediateData._pad, 0u);
+  push(sampling({0, 1}), 1, scene::category::Water);
+  bind(0, 8);
+  const gx::DrawData skipped = push(sampling({0}), 2, scene::category::Water);
+  EXPECT_EQ(skipped.instanceCount, 0u);
+  EXPECT_EQ(skipped.immediateData._pad, 0u);
+  testing::set_arm_state(pick::ArmState::Off);
+  on_latch();
+
+  const auto report = latest_report();
+  ASSERT_NE(report, nullptr);
+  ASSERT_EQ(report->draws.size(), 3u);
+  ASSERT_EQ(report->slots.size(), 5u);
+  EXPECT_FALSE(report->draws[0].skipped);
+  EXPECT_FALSE(report->draws[1].skipped);
+  EXPECT_TRUE(report->draws[2].skipped);
+  EXPECT_TRUE(report->slots[0].neutral);
+  EXPECT_FALSE(report->slots[1].neutral);
+  EXPECT_FALSE(report->slots[2].neutral);
+  EXPECT_FALSE(report->slots[3].neutral);
+  EXPECT_TRUE(report->slots[4].neutral);
+  const KeyRow* shadeRow = find_row(*report, key_of(shade));
+  const KeyRow* plainRow = find_row(*report, key_of(plain));
+  ASSERT_NE(shadeRow, nullptr);
+  ASSERT_NE(plainRow, nullptr);
+  EXPECT_EQ(shadeRow->draws, 3u);
+  EXPECT_EQ(shadeRow->neutralDraws, 2u);
+  EXPECT_EQ(plainRow->draws, 2u);
+  EXPECT_EQ(plainRow->neutralDraws, 0u);
+
+  fakeshadow::set_force(fakeshadow::Gate::Light, fakeshadow::Force::Off);
+  fakeshadow::begin_frame(detail::FrameState{});
+  bind(0, 7);
+  const gx::DrawData kept = push(sampling({0, 1}), 0, scene::category::Terrain);
+  EXPECT_EQ(kept.bindGroups.textureBindGroup, 0u);
+  on_latch();
+  const auto off = latest_report();
+  ASSERT_NE(off, nullptr);
+  ASSERT_EQ(off->slots.size(), 2u);
+  EXPECT_FALSE(off->slots[0].neutral);
+  EXPECT_EQ(find_row(*off, key_of(shade))->neutralDraws, 0u);
 }
 
 TEST_F(TextureInspector, FlaggedSeenCountsIntersection) {

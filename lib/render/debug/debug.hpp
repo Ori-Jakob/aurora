@@ -22,6 +22,7 @@ inline constexpr int ViewsTabOrder = 20;
 inline constexpr int SceneTabOrder = 30;
 inline constexpr int LightsTabOrder = 40;
 inline constexpr int TexturesTabOrder = 50;
+inline constexpr int FakeShadowsTabOrder = 55;
 inline constexpr int ShadowsTabOrder = 60;
 inline constexpr int AtmosphereTabOrder = 70;
 inline constexpr int GrassTerrainTabOrder = 80;

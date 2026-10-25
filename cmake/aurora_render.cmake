@@ -20,6 +20,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/debug/class_view.cpp
         lib/render/debug/debug.hpp
         lib/render/debug/debug_window.cpp
+        lib/render/debug/fake_shadows.cpp
+        lib/render/debug/fake_shadows.hpp
         lib/render/debug/graph_dump.cpp
         lib/render/debug/graph_inspection.hpp
         lib/render/debug/graph_tab.cpp

@@ -54,6 +54,7 @@ struct SlotRecord {
   bool stochastic = false;
   bool indirect = false;
   bool pointerReplacement = false;
+  bool neutral = false;
 };
 
 struct DrawRecord {
@@ -66,6 +67,7 @@ struct DrawRecord {
   scene::Window window = scene::Window::PreScene;
   bool mainClass = false;
   bool inSpan = false;
+  bool skipped = false;
 };
 
 struct KeyRow {
@@ -73,6 +75,7 @@ struct KeyRow {
   gfx::TextureMaterialRef material;
   uint32_t draws = 0;
   uint32_t mainDraws = 0;
+  uint32_t neutralDraws = 0;
   uint16_t width = 0;
   uint16_t height = 0;
   uint8_t format = 0;

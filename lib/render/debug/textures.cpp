@@ -3,6 +3,7 @@
 #include "debug.hpp"
 #include "views.hpp"
 
+#include "../fakeshadow/texture_gate.hpp"
 #include "../material/registry.hpp"
 #include "../material/user_layer.hpp"
 #include "../scene/classify.hpp"
@@ -128,6 +129,7 @@ struct Ui {
   std::array<char, 64> filter{};
   bool mainOnly = false;
   bool registeredOnly = false;
+  bool neutralOnly = false;
   std::array<char, 72> className{};
   std::string message;
 };
@@ -286,13 +288,14 @@ uint32_t upsert_row(Live& live, SlotRecord& slot, const GXTexObj_& obj, const GX
   KeyRow& entry = live.keys[row];
   ++entry.draws;
   entry.mainDraws += main ? 1 : 0;
+  entry.neutralDraws += slot.neutral ? 1 : 0;
   entry.replaced |= slot.replaced;
   entry.stochastic |= slot.stochastic;
   return row;
 }
 
-void record_slot(Live& live, uint32_t index, const gx::PipelineConfig& config, const gx::ShaderInfo& info,
-                 bool main) noexcept {
+void record_slot(Live& live, uint32_t index, const gx::PipelineConfig& config, const gx::ShaderInfo& info, bool main,
+                 bool neutral) noexcept {
   const GXTexObj_& obj = gx::g_gxState.loadedTextures[index];
   const gfx::TextureBind& bind = gx::g_gxState.textures[index];
   SlotRecord& slot = live.slots.emplace_back();
@@ -307,6 +310,7 @@ void record_slot(Live& live, uint32_t index, const gx::PipelineConfig& config, c
   slot.replaced = bind.ref && bind.ref->isReplacement;
   slot.stochastic = (config.shaderConfig.ext.stochasticMask >> index & 1u) != 0;
   slot.indirect = info.sampledIndTextures.test(index);
+  slot.neutral = neutral;
   const GXTlutObj_* tlut = nullptr;
   if (slot.kind == SlotKind::Palette) {
     const auto tlutIndex = static_cast<size_t>(obj.tlut);
@@ -557,7 +561,7 @@ void draw_status(const TexturesReport* report) {
 }
 
 bool row_passes(const KeyRow& row, const material::Snapshot* snapshot, std::string_view stem) {
-  if (g_ui.mainOnly && row.mainDraws == 0) {
+  if ((g_ui.mainOnly && row.mainDraws == 0) || (g_ui.neutralOnly && row.neutralDraws == 0)) {
     return false;
   }
   if (g_ui.registeredOnly && (row.state != KeyState::Ready || snapshot == nullptr || snapshot->find(row.key) == 0)) {
@@ -574,13 +578,16 @@ void draw_key_table(const TexturesReport& report) {
   ImGui::Checkbox("Main draws", &g_ui.mainOnly);
   ImGui::SameLine();
   ImGui::Checkbox("Registered", &g_ui.registeredOnly);
+  ImGui::SameLine();
+  ImGui::Checkbox("Neutralized", &g_ui.neutralOnly);
   const material::Snapshot* snapshot = material::latched_raw();
   const ImVec2 size{0.f, ImGui::GetTextLineHeightWithSpacing() * TableRows};
-  if (!ImGui::BeginTable("##texture_keys", 9, TableFlags, size)) {
+  if (!ImGui::BeginTable("##texture_keys", 10, TableFlags, size)) {
     return;
   }
   ImGui::TableSetupScrollFreeze(0, 1);
-  for (const char* header : {"Key", "Size", "Fmt", "Kind", "Draws", "Main", "Repl", "Bind", "Registry"}) {
+  for (const char* header :
+       {"Key", "Size", "Fmt", "Kind", "Draws", "Main", "Neutralized", "Repl", "Bind", "Registry"}) {
     ImGui::TableSetupColumn(header);
   }
   ImGui::TableHeadersRow();
@@ -610,6 +617,8 @@ void draw_key_table(const TexturesReport& report) {
     ImGui::TableNextColumn();
     ImGui::Text("%u", row.mainDraws);
     ImGui::TableNextColumn();
+    ImGui::Text("%u", row.neutralDraws);
+    ImGui::TableNextColumn();
     text(row.pointerReplacement ? "pointer" : row.replaced ? "yes" : "");
     ImGui::TableNextColumn();
     ImGui::Text("%u/%08x%s", row.material.id, row.material.flags, row.stochastic ? " hex" : "");
@@ -630,15 +639,16 @@ void draw_hover() {
     return;
   }
   const DrawRecord& draw = report->draws[g_hover.record];
-  ImGui::Text("Draw %u: %s, %s, object %llx%s", draw.index, std::string{scene::role_name(draw.role)}.c_str(),
+  ImGui::Text("Draw %u: %s, %s, object %llx%s%s", draw.index, std::string{scene::role_name(draw.role)}.c_str(),
               std::string{scene::window_name(draw.window)}.c_str(), static_cast<unsigned long long>(draw.objectId),
-              draw.mainClass ? ", main" : "");
+              draw.mainClass ? ", main" : "", draw.skipped ? ", skipped" : "");
   for (uint32_t i = 0; i < draw.slotCount && draw.slotBegin + i < report->slots.size(); ++i) {
     const SlotRecord& slot = report->slots[draw.slotBegin + i];
     const KeyRow* row = slot.row < report->keys.size() ? &report->keys[slot.row] : nullptr;
-    const std::string label = fmt::format(
-        "tex{} {} {}x{}{}{}##slot{}", slot.texmap, row != nullptr ? key_text(*row) : std::string{kind_name(slot.kind)},
-        slot.width, slot.height, slot.indirect ? " ind" : "", slot.stochastic ? " hex" : "", i);
+    const std::string label =
+        fmt::format("tex{} {} {}x{}{}{}{}##slot{}", slot.texmap,
+                    row != nullptr ? key_text(*row) : std::string{kind_name(slot.kind)}, slot.width, slot.height,
+                    slot.indirect ? " ind" : "", slot.stochastic ? " hex" : "", slot.neutral ? " neutral" : "", i);
     if (ImGui::Selectable(label.c_str()) && row != nullptr) {
       select_row(*row);
     }
@@ -902,6 +912,9 @@ void observe(gx::DrawData& draw, const gx::PipelineConfig& config, const gx::Sha
   out.mainClass = cls.mainClass;
   out.inSpan = in_view_span(cls);
   out.slotBegin = static_cast<uint32_t>(live.slots.size());
+  const fakeshadow::DrawEdit& edit = fakeshadow::last_edit();
+  const uint8_t neutral = edit.applied ? static_cast<uint8_t>(edit.white | edit.clear | edit.skip) : 0;
+  out.skipped = edit.applied && edit.edit == fakeshadow::Edit::Skipped;
   for (uint32_t i = 0; i < gx::MaxTextures; ++i) {
     if (!info.sampledTextures.test(i)) {
       continue;
@@ -910,7 +923,7 @@ void observe(gx::DrawData& draw, const gx::PipelineConfig& config, const gx::Sha
       ++live.overflow.slots;
       continue;
     }
-    record_slot(live, i, config, info, cls.mainClass);
+    record_slot(live, i, config, info, cls.mainClass, (neutral >> i & 1u) != 0);
     ++out.slotCount;
   }
   if (g_arm == pick::ArmState::Armed && out.inSpan && draw.instanceCount != 0) {
