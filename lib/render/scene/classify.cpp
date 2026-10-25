@@ -57,6 +57,7 @@ int g_override = -1;
 bool g_demand = false;
 ReportRequest g_request;
 const ViewHooks* g_hooks = nullptr;
+const ObserverHooks* g_observer = nullptr;
 
 std::mutex g_reportMutex;
 std::shared_ptr<const FrameReport> g_report;
@@ -141,7 +142,13 @@ gx::draw_route::Decision route(void*, const gx::draw_route::Query& query) noexce
 
 // The router ran first for this same draw, so the classifier's last draw is the one being pushed
 bool push(void*, gx::DrawData& draw, const gx::PipelineConfig& config, const gx::ShaderInfo& info) noexcept {
-  return g_hooks != nullptr && g_hooks->push != nullptr && g_hooks->push(draw, config, info, g_classifier.last());
+  const DrawClass& cls = g_classifier.last();
+  const bool changed = g_hooks != nullptr && g_hooks->push != nullptr && g_hooks->push(draw, config, info, cls);
+  // Last, so the inspector records the draw that is actually pushed
+  if (g_observer != nullptr && g_observer->observe != nullptr) {
+    g_observer->observe(draw, config, info, cls);
+  }
+  return changed;
 }
 
 constexpr gx::draw_route::Router g_router{.route = &route, .push = &push, .userData = nullptr};
@@ -215,6 +222,8 @@ void seal_frame() noexcept {
 void request_report(const ReportRequest& request) noexcept { g_request = request; }
 
 void set_view_hooks(const ViewHooks* hooks) noexcept { g_hooks = hooks; }
+
+void set_observer_hooks(const ObserverHooks* hooks) noexcept { g_observer = hooks; }
 
 void set_identity_demand(bool demand) noexcept { g_demand = demand; }
 
@@ -291,6 +300,7 @@ void reset() noexcept {
   g_demand = false;
   g_request = {};
   g_hooks = nullptr;
+  g_observer = nullptr;
   scene::reset();
 }
 } // namespace testing

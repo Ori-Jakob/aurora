@@ -41,6 +41,11 @@ struct ViewHooks {
                const DrawClass& cls) noexcept = nullptr;
 };
 
+struct ObserverHooks {
+  void (*observe)(gx::DrawData& draw, const gx::PipelineConfig& config, const gx::ShaderInfo& info,
+                  const DrawClass& cls) noexcept = nullptr;
+};
+
 // Game thread while the FIFO is idle
 void install() noexcept;
 void remove() noexcept;
@@ -50,6 +55,7 @@ void apply_frame_state(const detail::FrameState& state) noexcept;
 void seal_frame() noexcept;
 void request_report(const ReportRequest& request) noexcept;
 void set_view_hooks(const ViewHooks* hooks) noexcept;
+void set_observer_hooks(const ObserverHooks* hooks) noexcept;
 void set_identity_demand(bool demand) noexcept;
 
 // FIFO thread

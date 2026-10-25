@@ -1215,9 +1215,42 @@ PipelineRef find_pipeline(const rmlui::PipelineConfig& config) {
 }
 #endif
 
+RenderTargetLayout pipeline_base_layout(RenderTargetLayout layout) noexcept {
+  const uint32_t count = layout.colorAttachmentCount;
+  if (count > 1 && layout.colorAttachments[count - 1].semantic == ColorAttachmentSemantic::DebugId) {
+    layout.colorAttachments[count - 1] = {};
+    layout.colorAttachmentCount = count - 1;
+    detail::finalize_render_target_layout(layout);
+  }
+  return layout;
+}
+
+WarmProgress warm_known_pipelines(const RenderTargetLayout& layout, ShaderType type) {
+  std::vector<KnownPipeline> known;
+  {
+    std::lock_guard lock{g_pipelineMutex};
+    for (const auto& pipeline : g_knownPipelines | std::views::values) {
+      if (pipeline.type == type) {
+        known.push_back(pipeline);
+      }
+    }
+  }
+  WarmProgress progress;
+  for (const auto& pipeline : known) {
+    std::visit(
+        [&](const auto& config) {
+          const PipelineRef ref = resolve_pipeline(pipeline.type, config, layout, PipelinePriority::Background);
+          ++progress.total;
+          progress.ready += pipeline_state(ref) != PipelineState::Pending ? 1 : 0;
+        },
+        pipeline.config);
+  }
+  return progress;
+}
+
 void rebuild_pipeline_cache() {
   ZoneScoped;
-  const auto scene = scene_render_target_layout();
+  const auto scene = pipeline_base_layout(scene_render_target_layout());
   auto offscreen = scene;
   offscreen.colorAttachmentCount = 1;
   offscreen.sampleCount = 1;
@@ -1303,7 +1336,7 @@ void begin_pipeline_frame() {
   if (!g_hasPipelineThread) {
     g_pipelinesPerFrame = 0;
   }
-  if (g_pipelineLayoutKey != scene_render_target_layout().key) {
+  if (g_pipelineLayoutKey != pipeline_base_layout(scene_render_target_layout()).key) {
     rebuild_pipeline_cache();
   }
 }

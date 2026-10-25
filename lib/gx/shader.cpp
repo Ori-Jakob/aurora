@@ -842,8 +842,17 @@ absl::flat_hash_set<gfx::ShaderRef> s_seenShaders;
 
 std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlphaMode,
                                 uint32_t normalAttachment) noexcept {
+  return build_shader_source(config, dstAlphaMode, ShaderTargets{.normal = normalAttachment});
+}
+
+std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlphaMode,
+                                const ShaderTargets& targets) noexcept {
   ZoneScoped;
-  const auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(normalAttachment, xxh3_hash(config)));
+  const uint32_t normalAttachment = targets.normal;
+  auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(normalAttachment, xxh3_hash(config)));
+  if (targets.debugId != UINT32_MAX) {
+    hash = xxh3_hash(targets.debugId, hash);
+  }
   const auto info = build_shader_info(config);
   if (EnableDebugPrints && !s_seenShaders.contains(hash)) {
     s_seenShaders.insert(hash);
@@ -1617,13 +1626,15 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
   std::string fragmentOutput;
   std::string_view fragmentOutputType = "@location(0) vec4f"sv;
   std::string fragmentReturn = "\n    return prev;"s;
-  if (normalAttachment != UINT32_MAX) {
-    fragmentOutput = fmt::format(
-        "\nstruct FragmentOutput {{\n"
-        "    @location(0) color: vec4f,\n"
-        "    @location({}) normal: vec4f,\n"
-        "}};\n",
-        normalAttachment);
+  if (normalAttachment != UINT32_MAX || targets.debugId != UINT32_MAX) {
+    fragmentOutput = "\nstruct FragmentOutput {\n    @location(0) color: vec4f,\n";
+    if (normalAttachment != UINT32_MAX) {
+      fragmentOutput += fmt::format("    @location({}) normal: vec4f,\n", normalAttachment);
+    }
+    if (targets.debugId != UINT32_MAX) {
+      fragmentOutput += fmt::format("    @location({}) debug_id: u32,\n", targets.debugId);
+    }
+    fragmentOutput += "};\n";
     fragmentOutputType = "FragmentOutput"sv;
     fragmentReturn = "\n    var out: FragmentOutput;\n    out.color = prev;";
     if (useNormalTarget) {
@@ -1631,8 +1642,11 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
           "\n    let nrm_len_sq = dot(in.mv_nrm, in.mv_nrm);"
           "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm), nrm_len_sq > 1e-10);"
           "\n    out.normal = vec4f(unit_nrm * 0.5 + 0.5, select(0.0, 1.0, nrm_len_sq > 1e-10));";
-    } else {
+    } else if (normalAttachment != UINT32_MAX) {
       fragmentReturn += "\n    out.normal = vec4f(0.5, 0.5, 0.5, 0.0);";
+    }
+    if (targets.debugId != UINT32_MAX) {
+      fragmentReturn += "\n    out.debug_id = imm._pad;";
     }
     fragmentReturn += "\n    return out;";
   }
@@ -2031,14 +2045,19 @@ fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
 wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout,
                                 DstAlphaMode dstAlphaMode) noexcept {
   ZoneScoped;
-  uint32_t normalAttachment = UINT32_MAX;
+  ShaderTargets targets;
   for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
     if (layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::Normal) {
-      normalAttachment = i;
+      targets.normal = i;
+    } else if (layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::DebugId) {
+      targets.debugId = i;
     }
   }
-  const auto shaderSource = build_shader_source(config, dstAlphaMode, normalAttachment);
-  const auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(normalAttachment, xxh3_hash(config)));
+  const auto shaderSource = build_shader_source(config, dstAlphaMode, targets);
+  auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(targets.normal, xxh3_hash(config)));
+  if (targets.debugId != UINT32_MAX) {
+    hash = xxh3_hash(targets.debugId, hash);
+  }
   wgpu::ShaderSourceWGSL wgslDescriptor{};
   wgslDescriptor.code = shaderSource.c_str();
   const auto label = fmt::format("GX Shader {:x}", hash);

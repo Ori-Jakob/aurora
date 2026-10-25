@@ -714,6 +714,29 @@ TEST(GxShaderCorpusTest, VariantsReachGenerator) {
   EXPECT_TRUE(texts[4].starts_with("enable dual_source_blending;\n"));
 }
 
+TEST(GxShaderGoldenTest, DebugIdOutputNeedsTarget) {
+  const ShaderConfig config = decode(base_record());
+  const std::string legacy = build_shader_source(config, DstAlphaMode::None);
+  EXPECT_EQ(legacy.find("debug_id"), std::string::npos);
+  EXPECT_EQ(build_shader_source(config, DstAlphaMode::None, ShaderTargets{}), legacy);
+  EXPECT_EQ(build_shader_source(config, DstAlphaMode::Replace, ShaderTargets{.normal = 1}),
+            build_shader_source(config, DstAlphaMode::Replace, 1u));
+
+  const std::string ids = build_shader_source(config, DstAlphaMode::None, ShaderTargets{.debugId = 1});
+  EXPECT_NE(ids.find("@location(1) debug_id: u32,"), std::string::npos);
+  EXPECT_NE(ids.find("out.debug_id = imm._pad;"), std::string::npos);
+  EXPECT_EQ(ids.find("out.normal"), std::string::npos);
+
+  const std::string both = build_shader_source(config, DstAlphaMode::None, ShaderTargets{.normal = 1, .debugId = 2});
+  EXPECT_NE(both.find("@location(1) normal: vec4f,"), std::string::npos);
+  EXPECT_NE(both.find("@location(2) debug_id: u32,"), std::string::npos);
+  EXPECT_LT(both.find("out.normal"), both.find("out.debug_id"));
+
+  const std::string dual = build_shader_source(config, DstAlphaMode::DualSource, ShaderTargets{.debugId = 1});
+  EXPECT_EQ(dual.find("debug_id"), std::string::npos);
+  EXPECT_EQ(dual, build_shader_source(config, DstAlphaMode::DualSource));
+}
+
 TEST(GxShaderGoldenTest, FixtureIsWellFormed) {
   const auto text = read_text(AURORA_GX_SHADER_GOLDEN);
   ASSERT_FALSE(text.empty()) << "missing fixture " << AURORA_GX_SHADER_GOLDEN;

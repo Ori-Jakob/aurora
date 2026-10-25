@@ -108,6 +108,9 @@ void set_efb_targets(RenderPass& pass) {
     if (color.semantic == ColorAttachmentSemantic::Normal) {
       color.size = webgpu::g_normalBuffer.size;
       color.view = webgpu::g_normalBuffer.view;
+    } else if (color.semantic == ColorAttachmentSemantic::DebugId) {
+      color.size = webgpu::g_debugIdBuffer.size;
+      color.view = webgpu::g_debugIdBuffer.view;
     } else {
       AURORA_ASSERT(false, "Scene render-target attachment {} has no backing texture", i);
     }
@@ -1157,6 +1160,8 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
     color.loadOp = wgpu::LoadOp::Undefined;
     if (color.semantic == ColorAttachmentSemantic::Normal && clearDepth && fullTarget) {
       color.clear = true;
+    } else if (color.semantic == ColorAttachmentSemantic::DebugId) {
+      color.clear = clearColor && fullTarget;
     } else {
       color.clear = false;
     }

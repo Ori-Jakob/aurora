@@ -12,6 +12,7 @@ struct SDL_Window;
 
 namespace aurora::webgpu {
 inline constexpr wgpu::TextureFormat NormalBufferFormat = wgpu::TextureFormat::RGB10A2Unorm;
+inline constexpr wgpu::TextureFormat DebugIdBufferFormat = wgpu::TextureFormat::R32Uint;
 
 struct GraphicsConfig {
   wgpu::SurfaceConfiguration surfaceConfiguration;
@@ -19,6 +20,7 @@ struct GraphicsConfig {
   uint32_t msaaSamples;
   uint16_t textureAnisotropy;
   bool normalBuffer = false;
+  bool debugIdBuffer = false;
 };
 struct TextureWithSampler {
   wgpu::Texture texture;
@@ -51,6 +53,7 @@ extern TextureWithSampler g_frameBuffer;
 extern TextureWithSampler g_frameBufferResolved;
 extern TextureWithSampler g_depthBuffer;
 extern TextureWithSampler g_normalBuffer;
+extern TextureWithSampler g_debugIdBuffer;
 extern wgpu::RenderPipeline g_CopyPipeline;
 extern wgpu::RenderPipeline g_CopyPremultipliedAlphaPipeline;
 extern wgpu::BindGroup g_CopyBindGroup;
@@ -70,6 +73,7 @@ bool refresh_surface(bool recreate = true);
 void resize_swapchain(uint32_t width, uint32_t height, uint32_t nativeWidth, uint32_t nativeHeight, bool force = false);
 TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool multisampled);
 bool enable_normal_buffer();
+bool set_debug_id_buffer(bool enabled);
 const TextureWithSampler& present_source() noexcept;
 wgpu::BindGroup create_copy_bind_group(const TextureWithSampler& source);
 void set_resampler(AuroraSampler sampler) noexcept;

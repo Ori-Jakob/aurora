@@ -5,6 +5,11 @@
 #include "gfx/clear.hpp"
 #include "gfx/frame_packet.hpp"
 #include "gfx/hash.hpp"
+#include "gfx/pipeline_cache.hpp"
+#if AURORA_ENABLE_RENDER
+#include "render/graph.hpp"
+#endif
+#include "webgpu/gpu.hpp"
 
 #include <array>
 #include <cstdint>
@@ -124,6 +129,68 @@ TEST(RenderTargetLayoutTest, KeyMemoMatchesUncachedHash) {
   }
   EXPECT_NE(keys[12], keys[11]);
   EXPECT_NE(keys[14], keys[11]);
+}
+
+TEST(RenderTargetLayoutTest, DebugIdTierCosts12Bytes) {
+  auto& config = webgpu::g_graphicsConfig;
+  const webgpu::GraphicsConfig savedConfig = config;
+  const webgpu::TextureWithSampler savedFrame = webgpu::g_frameBuffer;
+  config.surfaceConfiguration.format = wgpu::TextureFormat::RGBA8Unorm;
+  config.depthFormat = wgpu::TextureFormat::Depth32Float;
+  config.msaaSamples = 1;
+  config.normalBuffer = false;
+  config.debugIdBuffer = false;
+  webgpu::g_frameBuffer.size = {640, 480, 1};
+  webgpu::g_frameBuffer.format = wgpu::TextureFormat::RGBA8Unorm;
+  webgpu::g_normalBuffer.size = {640, 480, 1};
+  webgpu::g_normalBuffer.format = webgpu::NormalBufferFormat;
+  webgpu::g_debugIdBuffer.size = {640, 480, 1};
+  webgpu::g_debugIdBuffer.format = webgpu::DebugIdBufferFormat;
+#if AURORA_ENABLE_RENDER
+  const auto cost = [](const RenderTargetLayout& layout) {
+    std::vector<wgpu::TextureFormat> formats;
+    for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
+      formats.push_back(layout.colorAttachments[i].format);
+    }
+    return render::detail::color_bytes_per_sample(formats);
+  };
+#endif
+
+  const auto off = scene_render_target_layout();
+  ASSERT_EQ(off.colorAttachmentCount, 1u);
+  EXPECT_EQ(off.key, reference_key(off));
+  EXPECT_EQ(pipeline_base_layout(off).key, off.key);
+#if AURORA_ENABLE_RENDER
+  EXPECT_EQ(cost(off), 8u);
+#endif
+
+  config.debugIdBuffer = true;
+  const auto on = scene_render_target_layout();
+  ASSERT_EQ(on.colorAttachmentCount, 2u);
+  EXPECT_EQ(on.colorAttachments[0].semantic, ColorAttachmentSemantic::SceneColor);
+  EXPECT_EQ(on.colorAttachments[1].semantic, ColorAttachmentSemantic::DebugId);
+  EXPECT_EQ(on.colorAttachments[1].format, wgpu::TextureFormat::R32Uint);
+  EXPECT_NE(on.key, off.key);
+  EXPECT_EQ(pipeline_base_layout(on).key, off.key);
+#if AURORA_ENABLE_RENDER
+  EXPECT_EQ(cost(on), 12u);
+#endif
+
+  config.normalBuffer = true;
+  const auto both = scene_render_target_layout();
+  ASSERT_EQ(both.colorAttachmentCount, 3u);
+  EXPECT_EQ(both.colorAttachments[1].semantic, ColorAttachmentSemantic::Normal);
+  EXPECT_EQ(both.colorAttachments[2].semantic, ColorAttachmentSemantic::DebugId);
+#if AURORA_ENABLE_RENDER
+  EXPECT_EQ(cost(both), 20u);
+#endif
+  config.debugIdBuffer = false;
+  EXPECT_EQ(pipeline_base_layout(both).key, scene_render_target_layout().key);
+
+  config = savedConfig;
+  webgpu::g_frameBuffer = savedFrame;
+  webgpu::g_normalBuffer = {};
+  webgpu::g_debugIdBuffer = {};
 }
 
 } // namespace

@@ -35,6 +35,7 @@ struct Tab {
   std::string name;
   int order = 0;
   TabDrawFn draw = nullptr;
+  uint64_t shownLatch = 0;
 };
 
 struct VramCounter {
@@ -69,6 +70,7 @@ const TimingAverages& timing_averages() noexcept;
 
 void on_latch() noexcept;
 bool inspector_open() noexcept;
+bool tab_visible(std::string_view name) noexcept;
 
 void record_stage_cull(const detail::CompiledGraph& graph, Stage stage, uint64_t frameId,
                        std::span<const detail::FrameCullReason> reasons);

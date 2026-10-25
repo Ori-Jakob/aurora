@@ -54,6 +54,11 @@ GraphEnvironment gather_graph_environment() {
     env.gxUsage[gx_index(GxResource::Normal)] =
         wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc;
   }
+  if (config.debugIdBuffer) {
+    env.gxFormats[gx_index(GxResource::DebugId)] = webgpu::DebugIdBufferFormat;
+    env.gxUsage[gx_index(GxResource::DebugId)] =
+        wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc;
+  }
   env.gxSampleCount = config.msaaSamples;
   env.profile = webgpu::g_featureProfile;
   env.inspectorOpen = debug::inspector_open();

@@ -342,11 +342,13 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
                                          config.dstAlpha, options.dstAlphaMode == DstAlphaMode::DualSource);
   std::array<wgpu::ColorTargetState, gfx::MaxColorAttachments> colorTargets{};
   for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
+    const gfx::ColorAttachmentSemantic semantic = layout.colorAttachments[i].semantic;
+    const bool writes = semantic == gfx::ColorAttachmentSemantic::DebugId
+                            ? options.colorUpdate
+                            : semantic == gfx::ColorAttachmentSemantic::Normal && writesDepth;
     colorTargets[i] = {
         .format = layout.colorAttachments[i].format,
-        .writeMask = layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::Normal && writesDepth
-                         ? wgpu::ColorWriteMask::All
-                         : wgpu::ColorWriteMask::None,
+        .writeMask = writes ? wgpu::ColorWriteMask::All : wgpu::ColorWriteMask::None,
     };
   }
   colorTargets[gfx::SceneColorAttachmentIndex].blend = &blendState;

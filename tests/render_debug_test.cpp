@@ -489,8 +489,44 @@ TEST_F(RenderDebugWindow, TabRegistryOrdersAndReplaces) {
   for (const debug::Tab& tab : debug::tabs()) {
     names.push_back(tab.name);
   }
-  EXPECT_EQ(names, (std::vector<std::string>{"Overview", "Alpha", "Graph", "Zeta"}));
-  EXPECT_EQ(debug::tabs().back().order, 50);
+  EXPECT_EQ(names, (std::vector<std::string>{"Overview", "Alpha", "Graph", "Textures", "Zeta"}));
+  const auto tabs = debug::tabs();
+  const auto zeta = std::ranges::find(tabs, std::string{"Zeta"}, &debug::Tab::name);
+  ASSERT_NE(zeta, tabs.end());
+  EXPECT_EQ(zeta->order, 50);
+  const auto textures = std::ranges::find(tabs, std::string{"Textures"}, &debug::Tab::name);
+  ASSERT_NE(textures, tabs.end());
+  EXPECT_EQ(textures->order, debug::TexturesTabOrder);
+}
+
+TEST_F(RenderDebugWindow, TabVisibleFollowsSelection) {
+  debug::register_tab("Alpha", 5, draw_nothing);
+  debug::register_tab("Textures", debug::TexturesTabOrder, draw_nothing);
+  EXPECT_FALSE(debug::tab_visible("Textures"));
+  bool open = true;
+  {
+    const ImGuiFrame imgui;
+    for (int i = 0; i < 2; ++i) {
+      imgui.frame([&] { draw_debug_window(&open); });
+      debug::on_latch();
+    }
+    EXPECT_TRUE(debug::tab_visible("Alpha"));
+    EXPECT_FALSE(debug::tab_visible("Textures"));
+  }
+  debug::register_tab("Alpha", 60, draw_nothing);
+  {
+    const ImGuiFrame imgui;
+    for (int i = 0; i < 2; ++i) {
+      imgui.frame([&] { draw_debug_window(&open); });
+      debug::on_latch();
+    }
+    EXPECT_TRUE(debug::tab_visible("Textures"));
+    EXPECT_FALSE(debug::tab_visible("Alpha"));
+  }
+  debug::on_latch();
+  debug::on_latch();
+  EXPECT_FALSE(debug::tab_visible("Textures"));
+  EXPECT_FALSE(debug::tab_visible("Missing"));
 }
 
 TEST_F(RenderDebugWindow, SceneTabRegisteredAtSceneOrder) {
@@ -501,7 +537,13 @@ TEST_F(RenderDebugWindow, SceneTabRegisteredAtSceneOrder) {
   ASSERT_NE(scene, tabs.end());
   EXPECT_EQ(scene->order, debug::SceneTabOrder);
   EXPECT_EQ(scene->draw, &debug::draw_scene_tab);
-  EXPECT_EQ(tabs.back().name, "Scene");
+  EXPECT_TRUE(std::ranges::is_sorted(tabs, {}, &debug::Tab::order));
+  const auto graph = std::ranges::find(tabs, std::string{"Graph"}, &debug::Tab::name);
+  const auto textures = std::ranges::find(tabs, std::string{"Textures"}, &debug::Tab::name);
+  ASSERT_NE(graph, tabs.end());
+  ASSERT_NE(textures, tabs.end());
+  EXPECT_LT(graph, scene);
+  EXPECT_LT(scene, textures);
 }
 
 TEST_F(RenderDebugWindow, SceneTabDrawsHeadless) {

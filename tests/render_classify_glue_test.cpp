@@ -13,6 +13,7 @@
 
 #include <cmath>
 #include <limits>
+#include <string>
 
 namespace aurora::render::scene {
 namespace {
@@ -374,6 +375,54 @@ TEST_F(RenderClassifyGlue, PushForwardsToViewHooks) {
   set_view_hooks(nullptr);
   EXPECT_FALSE(router->push(router->userData, data, config, info));
   EXPECT_EQ(PushProbe::pushes, 1);
+}
+
+struct ObserverProbe {
+  static inline std::string order;
+  static inline uint32_t pipeline = 0;
+  static inline uint32_t index = UINT32_MAX;
+
+  static bool push(gx::DrawData& draw, const gx::PipelineConfig&, const gx::ShaderInfo&, const DrawClass&) noexcept {
+    order += 'v';
+    draw.pipeline = 99;
+    return true;
+  }
+  static void observe(gx::DrawData& draw, const gx::PipelineConfig&, const gx::ShaderInfo&,
+                      const DrawClass& cls) noexcept {
+    order += 'o';
+    pipeline = static_cast<uint32_t>(draw.pipeline);
+    index = cls.index;
+  }
+};
+
+TEST_F(RenderClassifyGlue, ObserverRunsLast) {
+  const gx::draw_route::Router* router = gx::draw_route::router();
+  ASSERT_NE(router, nullptr);
+  const gx::PipelineConfig config{};
+  const gx::ShaderInfo info{};
+  static constexpr ObserverHooks Observer{.observe = &ObserverProbe::observe};
+  static constexpr ViewHooks Hooks{.push = &ObserverProbe::push};
+  ObserverProbe::order.clear();
+  set_observer_hooks(&Observer);
+  main_scene();
+  draw();
+  gx::DrawData data{};
+  data.pipeline = 7;
+  EXPECT_FALSE(router->push(router->userData, data, config, info));
+  EXPECT_EQ(ObserverProbe::order, "o");
+  EXPECT_EQ(ObserverProbe::pipeline, 7u);
+  EXPECT_EQ(ObserverProbe::index, last().index);
+
+  set_view_hooks(&Hooks);
+  draw();
+  EXPECT_TRUE(router->push(router->userData, data, config, info));
+  EXPECT_EQ(ObserverProbe::order, "ovo");
+  EXPECT_EQ(ObserverProbe::pipeline, 99u);
+  EXPECT_EQ(ObserverProbe::index, last().index);
+
+  testing::reset();
+  EXPECT_FALSE(router->push(router->userData, data, config, info));
+  EXPECT_EQ(ObserverProbe::order, "ovo");
 }
 
 TEST_F(RenderClassifyGlue, IdentityDemandStartsCollection) {

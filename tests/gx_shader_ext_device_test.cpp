@@ -3,6 +3,7 @@
 #include "gx_shader_corpus.hpp"
 #include "render_test_device.hpp"
 
+#include "gfx/clear.hpp"
 #include "gfx/frame_packet.hpp"
 #include "gfx/pipeline_cache.hpp"
 #include "gfx/resources.hpp"
@@ -71,6 +72,18 @@ gfx::RenderTargetLayout scene_layout() {
       .depthStencilFormat = wgpu::TextureFormat::Depth32Float,
       .sampleCount = 1,
   };
+  gfx::detail::finalize_render_target_layout(layout);
+  return layout;
+}
+
+gfx::RenderTargetLayout debug_id_layout(bool normal) {
+  gfx::RenderTargetLayout layout = scene_layout();
+  if (normal) {
+    layout.colorAttachments[layout.colorAttachmentCount++] = {gfx::ColorAttachmentSemantic::Normal,
+                                                              wgpu::TextureFormat::RGB10A2Unorm};
+  }
+  layout.colorAttachments[layout.colorAttachmentCount++] = {gfx::ColorAttachmentSemantic::DebugId,
+                                                            wgpu::TextureFormat::R32Uint};
   gfx::detail::finalize_render_target_layout(layout);
   return layout;
 }
@@ -218,6 +231,32 @@ TEST_F(GxShaderExtDevice, HexPipelinesCompileOnBackend) {
   }
   EXPECT_GE(compiled, MinHexConfigs);
   ::testing::Test::RecordProperty("compiled", static_cast<int>(compiled));
+
+  ASSERT_FALSE(hex_cases().empty());
+  const PipelineConfig hex = pipeline_for(hex_cases().front().config);
+  PipelineConfig legacy = hex;
+  legacy.shaderConfig.ext = {};
+  PipelineConfig replace = legacy;
+  replace.dstAlpha = 0x80;
+  PipelineConfig prepass = replace;
+  prepass.blendMode = GX_BM_BLEND;
+  prepass.blendFacSrc = GX_BL_SRCALPHA;
+  prepass.blendFacDst = GX_BL_INVSRCALPHA;
+  m_device->device.PushErrorScope(wgpu::ErrorFilter::Validation);
+  for (const bool normal : {false, true}) {
+    const gfx::RenderTargetLayout ids = debug_id_layout(normal);
+    for (const PipelineConfig& config : {hex, legacy, replace, prepass}) {
+      EXPECT_TRUE(static_cast<bool>(create_pipeline(config, ids).main)) << normal;
+    }
+    EXPECT_TRUE(static_cast<bool>(create_pipeline(prepass, ids).prepass)) << normal;
+    for (uint32_t bits = 0; bits < 8; ++bits) {
+      const gfx::clear::PipelineConfig clear{
+          .clearColor = (bits & 1) != 0, .clearAlpha = (bits & 2) != 0, .clearDepth = (bits & 4) != 0};
+      EXPECT_TRUE(static_cast<bool>(gfx::clear::create_pipeline(clear, ids))) << normal << " " << bits;
+    }
+  }
+  const auto error = test::pop_validation_error(*m_device);
+  EXPECT_FALSE(error.has_value()) << error.value_or("");
 }
 
 TEST_F(GxShaderExtDevice, HexTapsPreserveTexelLength) {

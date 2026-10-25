@@ -55,4 +55,13 @@ uint64_t pipeline_epoch() noexcept;
 // The ref only if that GX pipeline is already compiled; never queues, remembers or persists
 PipelineRef ready_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) noexcept;
 
+// The inspector's pick target comes and goes, so warm-up tracks the layout without it
+RenderTargetLayout pipeline_base_layout(RenderTargetLayout layout) noexcept;
+
+struct WarmProgress {
+  uint32_t ready = 0;
+  uint32_t total = 0;
+};
+WarmProgress warm_known_pipelines(const RenderTargetLayout& layout, ShaderType type);
+
 } // namespace aurora::gfx

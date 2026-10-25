@@ -24,7 +24,11 @@ if (AURORA_ENABLE_RENDER)
         lib/render/debug/graph_inspection.hpp
         lib/render/debug/graph_tab.cpp
         lib/render/debug/overview_tab.cpp
+        lib/render/debug/pick.cpp
+        lib/render/debug/pick.hpp
         lib/render/debug/scene_tab.cpp
+        lib/render/debug/textures.cpp
+        lib/render/debug/textures.hpp
         lib/render/debug/views.cpp
         lib/render/debug/views.hpp
         lib/render/geometry/compact.cpp
@@ -63,6 +67,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/material/registry.cpp
         lib/render/material/registry.hpp
         lib/render/material/schema_text.cpp
+        lib/render/material/user_layer.cpp
+        lib/render/material/user_layer.hpp
         lib/render/scene/classifier.cpp
         lib/render/scene/classifier.hpp
         lib/render/scene/classify.cpp

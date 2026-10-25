@@ -16,6 +16,8 @@ enum class ColorAttachmentSemantic : uint8_t {
   SceneColor,
   Normal,
   Auxiliary,
+  // Inspector pick ids; always the last scene attachment
+  DebugId,
 };
 
 struct ColorAttachmentLayout {

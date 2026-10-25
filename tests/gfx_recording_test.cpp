@@ -193,6 +193,50 @@ TEST_F(GfxRecordingTest, EfbPassUsesDiscoveredSceneLayout) {
   EXPECT_EQ(targetLayout.colorAttachments[SceneColorAttachmentIndex].semantic, ColorAttachmentSemantic::SceneColor);
 }
 
+TEST_F(GfxRecordingTest, EfbPassCarriesDebugIdLast) {
+  webgpu::g_graphicsConfig.debugIdBuffer = true;
+  webgpu::g_debugIdBuffer.format = webgpu::DebugIdBufferFormat;
+  const auto debug_id = [&]() -> const detail::RenderPass::ColorAttachment& {
+    const auto& pass = frame.renderPasses.back();
+    return pass.colorAttachments[pass.colorAttachmentCount - 1];
+  };
+  const auto resolve = [](ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth) {
+    auto target = std::make_shared<TextureRef>(wgpu::Texture{}, wgpu::TextureView{}, wgpu::TextureView{},
+                                               wgpu::Extent3D{640, 480, 1}, ColorFormat, 1, GX_TF_RGBA8);
+    resolve_pass_into(std::move(target), rect, clearColor, clearAlpha, clearDepth, {}, 1.f, GX_TF_RGBA8,
+                      GX_PF_RGBA6_Z24);
+  };
+
+  // A zero-size EFB makes every rect full and leaves nothing to draw, so no clear draw needs a pipeline
+  webgpu::g_frameBuffer.size = {0, 0, 1};
+  next_frame();
+  {
+    const auto& first = frame.renderPasses.front();
+    ASSERT_EQ(first.colorAttachmentCount, 2u);
+    EXPECT_EQ(first.colorAttachments[1].semantic, ColorAttachmentSemantic::DebugId);
+    EXPECT_EQ(first.colorAttachments[1].format, wgpu::TextureFormat::R32Uint);
+    EXPECT_TRUE(first.colorAttachments[1].clear);
+  }
+  resolve({0, 0, 0, 0}, true, true, false);
+  EXPECT_EQ(debug_id().semantic, ColorAttachmentSemantic::DebugId);
+  EXPECT_TRUE(debug_id().clear);
+  resolve({0, 0, 0, 0}, false, false, true);
+  EXPECT_FALSE(debug_id().clear);
+  resolve({0, 0, 0, 0}, true, false, false);
+  EXPECT_TRUE(debug_id().clear);
+
+  // A rect past the right edge is partial with nothing to draw
+  webgpu::g_frameBuffer.size = {640, 480, 1};
+  next_frame();
+  resolve({640, 0, 16, 480}, true, true, true);
+  EXPECT_FALSE(debug_id().clear);
+  resolve({0, 0, 640, 480}, false, false, false);
+  EXPECT_FALSE(debug_id().clear);
+
+  webgpu::g_graphicsConfig.debugIdBuffer = false;
+  webgpu::g_debugIdBuffer = {};
+}
+
 TEST_F(GfxRecordingTest, CopiedOffscreenPassIsRetainedOnRestore) {
   seed(320, 180);
   begin_offscreen(320, 180);

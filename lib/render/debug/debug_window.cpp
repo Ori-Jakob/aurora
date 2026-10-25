@@ -1,4 +1,5 @@
 #include "debug.hpp"
+#include "textures.hpp"
 
 #include "../frame_state.hpp"
 #include "../gpu_heap.hpp"
@@ -75,9 +76,11 @@ void initialize() {
   register_tab("Graph", GraphTabOrder, &draw_graph_tab);
   register_vram_source("GPU heap", &gpu_heap_bytes);
   register_vram_source("Transient pool", &transient_bytes);
+  textures::initialize();
 }
 
 void shutdown() {
+  textures::shutdown();
   g_tabs.clear();
   g_vramSources.clear();
   g_averages = {};
@@ -119,9 +122,10 @@ void draw_window(bool* open) {
     if (g_tabs.empty()) {
       ImGui::TextUnformatted("Renderer module not initialized");
     } else if (ImGui::BeginTabBar("##renderer_tabs")) {
-      for (const Tab& tab : g_tabs) {
+      for (Tab& tab : g_tabs) {
         ImGui::PushID(tab.name.c_str());
         if (ImGui::BeginTabItem(tab.name.c_str())) {
+          tab.shownLatch = g_latch.load(std::memory_order_relaxed) + 1;
           if (tab.draw != nullptr) {
             tab.draw();
           }
@@ -172,11 +176,22 @@ std::string graph_dump_json(bool includeFrameState) {
 
 const TimingAverages& timing_averages() noexcept { return g_averages; }
 
-void on_latch() noexcept { g_latch.fetch_add(1, std::memory_order_relaxed); }
+void on_latch() noexcept {
+  g_latch.fetch_add(1, std::memory_order_relaxed);
+  textures::on_latch();
+}
 
 bool inspector_open() noexcept {
   return g_everDrawn.load(std::memory_order_acquire) &&
          g_latch.load(std::memory_order_relaxed) - g_lastDrawnLatch.load(std::memory_order_relaxed) <= 2;
+}
+
+bool tab_visible(std::string_view name) noexcept {
+  if (!inspector_open()) {
+    return false;
+  }
+  const auto it = std::ranges::find(g_tabs, name, &Tab::name);
+  return it != g_tabs.end() && it->shownLatch != 0 && g_latch.load(std::memory_order_relaxed) + 1 - it->shownLatch <= 2;
 }
 
 void record_stage_cull(const detail::CompiledGraph& graph, Stage stage, uint64_t frameId,

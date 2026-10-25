@@ -603,6 +603,15 @@ RenderTargetLayout scene_render_target_layout() noexcept {
         .height = webgpu::g_normalBuffer.size.height,
     };
   }
+  // Last, so later targets go before it and the base layout stays a prefix
+  if (webgpu::g_graphicsConfig.debugIdBuffer) {
+    layout.colorAttachments[layout.colorAttachmentCount++] = {
+        .semantic = ColorAttachmentSemantic::DebugId,
+        .format = webgpu::g_debugIdBuffer.format,
+        .width = webgpu::g_debugIdBuffer.size.width,
+        .height = webgpu::g_debugIdBuffer.size.height,
+    };
+  }
   finalize_render_target_layout(layout);
   return layout;
 }
