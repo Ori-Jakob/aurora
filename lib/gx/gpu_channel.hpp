@@ -77,6 +77,7 @@ void reset_decoder() noexcept;
 void wait_systems() noexcept;
 void write_preamble(std::vector<uint8_t>& out);
 bool uncaptured_gpu_state() noexcept;
+uint64_t preamble_flush_bytes() noexcept;
 render::gpu::Stats stats() noexcept;
 
 namespace testing {

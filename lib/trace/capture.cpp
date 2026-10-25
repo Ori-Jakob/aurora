@@ -208,6 +208,7 @@ void on_frame_begin() noexcept {
     return;
   }
   std::lock_guard lock{g_mutex};
+  uint64_t replayFlushBytes = 0;
   if (g_phase.load(std::memory_order_relaxed) == Phase::Pending) {
     gx::reset_texture_caches();
     gfx::texture_replacement::set_bypass(true);
@@ -226,6 +227,7 @@ void on_frame_begin() noexcept {
         Log.warn("A live GPU system keeps state on the GPU only, so replays of this trace may diverge");
       }
     }
+    replayFlushBytes = gx::gpu_channel::preamble_flush_bytes();
     gx::guest_memory::set_hooks(&RecordHooks);
     gx::fifo::set_process_observer(&RecordObserver);
     gx::fifo::set_synchronous_publish(true);
@@ -233,7 +235,9 @@ void on_frame_begin() noexcept {
     g_status.state = CaptureState::Capturing;
   }
 
-  const auto config = current_render_config();
+  auto config = current_render_config();
+  // Replay stages the preamble's state shadows in frame 0, which live never paid for
+  config.streamingStorageMiB += static_cast<uint32_t>((replayFlushBytes + 1024 * 1024 - 1) / (1024 * 1024));
   g_frameViSize = {config.viFbWidth, config.viEfbHeight};
   g_frameStorageMisses = render::gpu::stats().storageMisses;
   g_session.begin_frame(gfx::current_frame(), config);

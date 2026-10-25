@@ -18,10 +18,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -417,6 +419,11 @@ struct StreamGroup {
 };
 StreamGroup g_streamGroup;
 uint32_t g_computeSegments = 0;
+wgpu::Buffer g_computeScratch;
+std::atomic_uint64_t g_binderFailures{0};
+std::atomic_uint64_t g_droppedCopies{0};
+bool g_warnedBinder = false;
+bool g_warnedCopy = false;
 
 const wgpu::BindGroup& stream_group(const FramePacket& frame) {
   const auto& res = resources();
@@ -448,13 +455,26 @@ bool zero_groups(const ComputeEntry& entry) noexcept {
   return std::ranges::find(entry.groups, 0u) != entry.groups.end();
 }
 
+void count_failure(std::atomic_uint64_t& counter, bool& warned, std::string_view message) noexcept {
+  counter.fetch_add(1, std::memory_order_relaxed);
+  if (!std::exchange(warned, true)) {
+    Log.warn("{}", message);
+  }
+}
+
 void encode_compute(wgpu::CommandEncoder& cmd, FramePacket& frame, const ComputeBatch& batch) {
   ZoneScoped;
   const auto& res = resources();
+  bool dispatches = false;
   for (const auto& entry : batch.entries) {
     if (entry.kind == ComputeEntry::Kind::Dispatch && entry.range.size > 0) {
       cmd.ClearBuffer(res.storageBuffer, entry.range.offset, entry.range.size);
     }
+    dispatches = dispatches || entry.kind == ComputeEntry::Kind::Dispatch;
+  }
+  // Stateless kernels share the scratch as their state binding, so nothing they write outlives the op
+  if (dispatches && g_computeScratch) {
+    cmd.ClearBuffer(g_computeScratch, 0, g_computeScratch.GetSize());
   }
   wgpu::ComputePassEncoder pass;
   const auto end_pass = [&] {
@@ -472,6 +492,8 @@ void encode_compute(wgpu::CommandEncoder& cmd, FramePacket& frame, const Compute
         cmd.CopyBufferToBuffer(staging_buffer(frame.stagingBuffer),
                                staging_layout(frame.sizes).storage + entry.range.offset, dst.buffer,
                                dst.base + entry.dstOffset, entry.range.size);
+      } else {
+        count_failure(g_droppedCopies, g_warnedCopy, "GPU system state copy dropped: its destination is not placed");
       }
       continue;
     }
@@ -492,6 +514,9 @@ void encode_compute(wgpu::CommandEncoder& cmd, FramePacket& frame, const Compute
     pass.SetBindGroup(1, stream_group(frame), 1, &offset);
     if (entry.bind(entry.payload.data(), pass)) {
       pass.DispatchWorkgroups(entry.groups[0], entry.groups[1], entry.groups[2]);
+    } else {
+      count_failure(g_binderFailures, g_warnedBinder,
+                    "GPU dispatch skipped: its kernel or state could not be bound, so its output stays zero");
     }
   }
   end_pass();
@@ -531,7 +556,20 @@ void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op)
   }
 }
 
-void release_compute_encoding() noexcept { g_streamGroup = {}; }
+void release_compute_encoding() noexcept {
+  g_streamGroup = {};
+  g_warnedBinder = false;
+  g_warnedCopy = false;
+}
+
+void set_compute_scratch(wgpu::Buffer buffer) noexcept { g_computeScratch = std::move(buffer); }
+
+ComputeFailures compute_failures() noexcept {
+  return {
+      .binds = g_binderFailures.load(std::memory_order_relaxed),
+      .copies = g_droppedCopies.load(std::memory_order_relaxed),
+  };
+}
 
 namespace testing {
 uint32_t compute_segments_encoded() noexcept { return g_computeSegments; }

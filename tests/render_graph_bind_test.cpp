@@ -2448,6 +2448,13 @@ TEST_F(GraphBindTest, WritableBlocksOfOneRegionBind) {
   ASSERT_EQ(run_frame(frame, 1), std::nullopt);
   EXPECT_EQ(passes[0].calls, 1);
   EXPECT_EQ(count_logs(LOG_WARNING, "binds one buffer writable"), 0u);
+
+  Caps d3d11 = caps();
+  d3d11.backend = BACKEND_D3D11;
+  webgpu::set_caps(std::move(d3d11));
+  ASSERT_EQ(run_frame(frame, 2), std::nullopt);
+  EXPECT_EQ(passes[0].calls, 1);
+  EXPECT_EQ(count_logs(LOG_WARNING, "single-UAV limit"), 1u);
 }
 
 TEST_F(GraphBindTest, DifferentRegionsBind) {
@@ -2799,7 +2806,21 @@ protected:
   std::unique_ptr<test::ScopedGlobalDevice> m_globals;
 };
 
+// Triangle k covers only texel k of a 16-texel row, so each record's vertex base picks the texel it lights
+constexpr std::string_view SlotVertexWgsl = R"(
+@vertex
+fn vs(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+  let left = -1.0 + f32(index / 3u) * 0.125;
+  let corner = index % 3u;
+  if (corner == 2u) {
+    return vec4<f32>(left + 0.125, 0.0, 0.0, 1.0);
+  }
+  return vec4<f32>(left, select(-1.0, 1.0, corner == 1u), 0.0, 1.0);
+}
+)";
+
 TEST_F(IndirectGpu, MultiDrawMatchesLoop) {
+  constexpr uint32_t Texels = 16;
   const wgpu::Device& device = m_device->device;
   const auto make_buffer = [&](wgpu::BufferUsage usage, const void* data, uint64_t size) {
     const wgpu::BufferDescriptor descriptor{.usage = usage | wgpu::BufferUsage::CopyDst, .size = size};
@@ -2809,18 +2830,25 @@ TEST_F(IndirectGpu, MultiDrawMatchesLoop) {
   };
   std::array<indirect::DrawArgs, 8> draws{};
   std::array<indirect::DrawIndexedArgs, 8> indexedDraws{};
-  for (const size_t slot : {1, 4, 6}) {
-    draws[slot] = indirect::make_draw(3, 1, 0, 3, 1);
+  constexpr std::array<uint32_t, 3> DrawSlots{1, 4, 6};
+  constexpr std::array<uint32_t, 3> IndexedSlots{0, 3, 7};
+  for (const uint32_t slot : DrawSlots) {
+    draws[slot] = indirect::make_draw(3, 1, 3 * slot, 3 * 8, 1);
   }
-  for (const size_t slot : {0, 3, 7}) {
-    indexedDraws[slot] = indirect::make_draw_indexed(3, 1, 0, 0, 3, 1);
+  constexpr uint32_t IndexCount = 3 * 8;
+  std::array<uint32_t, IndexCount> indexList{};
+  for (uint32_t i = 0; i < IndexCount; ++i) {
+    indexList[i] = i;
   }
-  constexpr std::array<uint32_t, 4> Indices{0, 1, 2, 0};
+  for (const uint32_t slot : IndexedSlots) {
+    indexedDraws[slot] =
+        indirect::make_draw_indexed(3, 1, 3 * slot, static_cast<int32_t>(3 * (slot + 1)), IndexCount, 1);
+  }
   const wgpu::Buffer drawArgs = make_buffer(wgpu::BufferUsage::Indirect, draws.data(), sizeof(draws));
   const wgpu::Buffer indexedArgs = make_buffer(wgpu::BufferUsage::Indirect, indexedDraws.data(), sizeof(indexedDraws));
-  const wgpu::Buffer indices = make_buffer(wgpu::BufferUsage::Index, Indices.data(), sizeof(Indices));
+  const wgpu::Buffer indices = make_buffer(wgpu::BufferUsage::Index, indexList.data(), sizeof(indexList));
 
-  const std::string code = std::string{WhiteFragmentWgsl} + std::string{FullscreenVertexWgsl};
+  const std::string code = std::string{WhiteFragmentWgsl} + std::string{SlotVertexWgsl};
   const wgpu::ShaderSourceWGSL wgsl{wgpu::ShaderSourceWGSL::Init{.code = code.c_str()}};
   const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl};
   const wgpu::ShaderModule module = device.CreateShaderModule(&moduleDescriptor);
@@ -2841,7 +2869,7 @@ TEST_F(IndirectGpu, MultiDrawMatchesLoop) {
   const auto render = [&](bool indexed, uint32_t& encoded) -> std::optional<std::vector<uint32_t>> {
     const wgpu::TextureDescriptor textureDescriptor{
         .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc,
-        .size = {1, 1, 1},
+        .size = {Texels, 1, 1},
         .format = TextureFormat::RGBA16Float,
     };
     const wgpu::Texture texture = device.CreateTexture(&textureDescriptor);
@@ -2859,7 +2887,7 @@ TEST_F(IndirectGpu, MultiDrawMatchesLoop) {
     const wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&passDescriptor);
     pass.SetPipeline(pipeline);
     if (indexed) {
-      indirect::bind_indices(pass, BufferView{.buffer = indices, .size = sizeof(Indices)});
+      indirect::bind_indices(pass, BufferView{.buffer = indices, .size = sizeof(indexList)});
       encoded =
           indirect::draw_indexed_slots(pass, BufferView{.buffer = indexedArgs, .size = sizeof(indexedDraws)}, 0, 8);
     } else {
@@ -2868,19 +2896,29 @@ TEST_F(IndirectGpu, MultiDrawMatchesLoop) {
     pass.End();
     const wgpu::TexelCopyTextureInfo source{.texture = texture};
     const wgpu::TexelCopyBufferInfo destination{.layout = {.bytesPerRow = 256, .rowsPerImage = 1}, .buffer = texels};
-    const wgpu::Extent3D extent{1, 1, 1};
+    const wgpu::Extent3D extent{Texels, 1, 1};
     encoder.CopyTextureToBuffer(&source, &destination, &extent);
     const wgpu::CommandBuffer commands = encoder.Finish();
     m_device->queue.Submit(1, &commands);
-    return test::read_buffer(*m_device, texels, 0, 8);
+    return test::read_buffer(*m_device, texels, 0, Texels * 8);
   };
+  const auto image_of = [&](std::span<const uint32_t> lit) {
+    std::vector<uint32_t> words(Texels * 2, 0);
+    for (const uint32_t texel : lit) {
+      words[texel * 2] = 0x3C003C00u;
+      words[texel * 2 + 1] = 0x3C003C00u;
+    }
+    return words;
+  };
+  const std::array<std::vector<uint32_t>, 2> expected{image_of(std::array<uint32_t, 3>{1, 4, 6}),
+                                                      image_of(std::array<uint32_t, 3>{1, 7, 15})};
 
-  std::vector<bool> modes;
+  std::vector<bool> modes{false};
   if (caps().multiDrawIndirect) {
     modes.push_back(true);
   }
-  modes.push_back(false);
   ::testing::Test::RecordProperty("multiDrawIndirect", caps().multiDrawIndirect ? 1 : 0);
+  std::array<std::vector<uint32_t>, 2> loopImages;
   for (const bool multiDraw : modes) {
     Caps mode = caps();
     mode.multiDrawIndirect = multiDraw;
@@ -2888,11 +2926,15 @@ TEST_F(IndirectGpu, MultiDrawMatchesLoop) {
     for (const bool indexed : {false, true}) {
       SCOPED_TRACE(std::string{multiDraw ? "multi-draw" : "loop"} + (indexed ? ", indexed" : ""));
       uint32_t encoded = 0;
-      const auto texel = render(indexed, encoded);
-      ASSERT_TRUE(texel);
+      const auto image = render(indexed, encoded);
+      ASSERT_TRUE(image);
       EXPECT_EQ(encoded, multiDraw ? 1u : 8u);
-      EXPECT_EQ((*texel)[0], 0x42004200u);
-      EXPECT_EQ((*texel)[1], 0x42004200u);
+      EXPECT_EQ(*image, expected[indexed]);
+      if (multiDraw) {
+        EXPECT_EQ(*image, loopImages[indexed]);
+      } else {
+        loopImages[indexed] = *image;
+      }
     }
   }
 }

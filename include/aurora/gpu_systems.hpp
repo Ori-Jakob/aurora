@@ -56,6 +56,7 @@ struct Stats {
   uint64_t created = 0, destroyed = 0, updates = 0, updateBytes = 0;
   uint32_t liveSystems = 0;
   uint64_t dispatches = 0, dispatchesRefused = 0, dispatchesRejected = 0, persistentCopies = 0;
+  uint64_t binderFailures = 0, droppedCopies = 0;
 };
 
 bool systems_available() noexcept;

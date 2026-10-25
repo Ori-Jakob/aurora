@@ -220,6 +220,15 @@ aurora::render::gpu::SystemStatus settled_status(aurora::render::gpu::SystemId s
   return status;
 }
 
+// The copy kernel compiles asynchronously, so frame 0 waits for it and every frame then dispatches
+void settle_gpu_demo(const GpuDemo& demo) {
+  if (demo.copy == aurora::render::gpu::InvalidSystem) {
+    return;
+  }
+  GXDrawDone();
+  settled_status(demo.copy);
+}
+
 struct GpuReport {
   aurora::render::gpu::Stats stats;
   std::string systems;
@@ -573,6 +582,9 @@ int main(int argc, char* argv[]) {
       continue;
     }
     decodingChanged |= aurora::render::hints_enabled() != decoding;
+    if (frame == 0) {
+      settle_gpu_demo(gpuDemo);
+    }
     update_gpu_demo(gpuDemo, frame);
     render_demo::draw_scene(frame, sceneOptions);
     aurora_end_frame();

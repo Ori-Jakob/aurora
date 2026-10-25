@@ -40,6 +40,7 @@ void reset_stub_ranges() noexcept;
 namespace detail {
 extern ChannelBudget g_testChannelBudget;
 extern uint64_t g_testChannelDemand;
+extern ComputeFailures g_testComputeFailures;
 } // namespace detail
 } // namespace aurora::gfx
 
@@ -1190,4 +1191,41 @@ TEST_F(GXGpuChannelTest, FailedUpdateMarksStateUncaptured) {
   gpu::destroy_system(stateful);
   decode();
   EXPECT_FALSE(channel::uncaptured_gpu_state());
+}
+
+TEST_F(GXGpuChannelTest, RejectedDispatchStillTakesOwedFlush) {
+  FakeBackend fake;
+  fake.hooks = true;
+  const auto backend = fake.backend();
+  channel::set_system_backend(&backend);
+  const auto stateful =
+      gpu::create_system({.name = "state", .wgsl = kSource, .kernels = kTwoKernels, .persistentBytes = 16});
+  const std::array<u32, 2> words{1, 2};
+  gpu::update_persistent(stateful, 0, words.data(), sizeof(words));
+  decode();
+  next_frame();
+  const auto uploaded = gpu::upload(kTriangle.data(), sizeof(kTriangle));
+  ASSERT_TRUE(gpu::dispatch(stateful, 0, {}, uploaded, {1, 1, 1}));
+  decode();
+  EXPECT_EQ(channel::lookup(uploaded).state, channel::HandleState::Failed);
+  EXPECT_EQ(gpu::stats().dispatchesRejected, 1u);
+  EXPECT_EQ(gpu::stats().persistentCopies, 1u);
+  gpu::update_persistent(stateful, 0, words.data(), 4);
+  decode();
+  ASSERT_EQ(fake.events.size(), 3u);
+  EXPECT_EQ(fake.events[1].what, "update 0 16");
+  EXPECT_EQ(fake.events[2].what, "update 0 4");
+  EXPECT_EQ(gpu::stats().persistentCopies, 2u);
+}
+
+TEST_F(GXGpuChannelTest, DroppedStateCopyMarksStateUncaptured) {
+  FakeBackend fake;
+  const auto backend = fake.backend();
+  channel::set_system_backend(&backend);
+  gpu::create_system({.name = "state", .wgsl = kSource, .kernels = kTwoKernels, .persistentBytes = 16});
+  decode();
+  EXPECT_FALSE(channel::uncaptured_gpu_state());
+  aurora::gfx::detail::g_testComputeFailures.copies = 1;
+  EXPECT_TRUE(channel::uncaptured_gpu_state());
+  aurora::gfx::detail::g_testComputeFailures = {};
 }

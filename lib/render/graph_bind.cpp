@@ -16,6 +16,8 @@
 #include "../webgpu/gpu.hpp"
 #include "../webgpu/gpu_prof.hpp"
 
+#include <aurora/render_caps.hpp>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -664,7 +666,15 @@ constexpr bool reads_only(Access access) noexcept {
          access == Access::Index || access == Access::Indirect;
 }
 
-std::optional<std::pair<size_t, size_t>> scope_alias(const BoundPass& pass) noexcept {
+struct ScopeAlias {
+  size_t first = 0;
+  size_t second = 0;
+  bool singleUav = false;
+};
+
+std::optional<ScopeAlias> scope_alias(const BoundPass& pass) noexcept {
+  // Dawn's D3D11 backend is measured to break two writable bindings of one buffer even when they are disjoint
+  const bool singleUav = caps().backend == BACKEND_D3D11;
   const auto checked = [&](size_t index) {
     const BoundUse& bound = pass.bound[index];
     const Access access = pass.uses[index].access;
@@ -685,10 +695,13 @@ std::optional<std::pair<size_t, size_t>> scope_alias(const BoundPass& pass) noex
       const bool writesB = writes_storage(pass.uses[j].access);
       if (writesA && writesB) {
         if (a.offset < b.offset + b.size && b.offset < a.offset + a.size) {
-          return std::pair{i, j};
+          return ScopeAlias{.first = i, .second = j};
+        }
+        if (singleUav) {
+          return ScopeAlias{.first = i, .second = j, .singleUav = true};
         }
       } else if (writesA || writesB) {
-        return writesA ? std::pair{i, j} : std::pair{j, i};
+        return writesA ? ScopeAlias{.first = i, .second = j} : ScopeAlias{.first = j, .second = i};
       }
     }
   }
@@ -891,11 +904,16 @@ bool bind_pass(const StageData& stage, BoundPass& pass) {
   if (!pass.plan->manual &&
       (node.passKind == PassKind::Compute || node.passKind == PassKind::Render || node.passKind == PassKind::Encoder)) {
     if (const auto alias = scope_alias(pass)) {
+      const std::string& first = graph.resources[pass.uses[alias->first].resource].name;
+      const std::string& second = graph.resources[pass.uses[alias->second].resource].name;
       log_once(fmt::format("{}@alias", node.name),
-               fmt::format("render graph: '{}' binds one buffer writable through '{}' and read-only through '{}'; "
-                           "declare the read StorageRW or use another region; skipped",
-                           node.name, graph.resources[pass.uses[alias->first].resource].name,
-                           graph.resources[pass.uses[alias->second].resource].name));
+               alias->singleUav
+                   ? fmt::format("render graph: '{}' binds one buffer writable through '{}' and '{}', past the D3D11 "
+                                 "single-UAV limit of one writable binding per buffer; use another region; skipped",
+                                 node.name, first, second)
+                   : fmt::format("render graph: '{}' binds one buffer writable through '{}' and read-only through "
+                                 "'{}'; declare the read StorageRW or use another region; skipped",
+                                 node.name, first, second));
       return false;
     }
   }

@@ -227,6 +227,10 @@ SystemStatus backend_status(void*, uint64_t id) noexcept {
   if (slot.fixed != SystemStatus::Pending) {
     return slot.fixed;
   }
+  // Placement fails on the worker after create returns; this gates producers only, never recorded content
+  if (slot.stateBytes != 0 && gpu_heap::block_state(slot.state) == gpu_heap::BlockState::Failed) {
+    return SystemStatus::Failed;
+  }
   bool ready = true;
   for (uint32_t i = 0; i < slot.kernelCount; ++i) {
     switch (shaders::status(slot.pipelines[i])) {

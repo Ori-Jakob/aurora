@@ -2,6 +2,7 @@
 
 #include "systems.hpp"
 
+#include "../../gfx/frame.hpp"
 #include "../../gfx/pipeline_cache.hpp"
 #include "../../internal.hpp"
 #include "../../webgpu/gpu.hpp"
@@ -161,10 +162,11 @@ gfx::detail::CopyDestination state_target(const StateRef& ref) {
 void initialize_dispatch() {
   const wgpu::BufferDescriptor bufferDescriptor{
       .label = "GPU system dummy state",
-      .usage = wgpu::BufferUsage::Storage,
+      .usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
       .size = DummyStateBytes,
   };
   g_dummyState = webgpu::g_device.CreateBuffer(&bufferDescriptor);
+  gfx::detail::set_compute_scratch(g_dummyState);
   const wgpu::BindGroupEntry entry{.binding = 0, .buffer = g_dummyState, .offset = 0, .size = DummyStateBytes};
   const wgpu::BindGroupDescriptor groupDescriptor{
       .label = "GPU system dummy state",
@@ -176,6 +178,7 @@ void initialize_dispatch() {
 }
 
 void shutdown_dispatch() noexcept {
+  gfx::detail::set_compute_scratch({});
   g_dummyGroup = {};
   g_dummyState = {};
   g_workerPipelines.clear();

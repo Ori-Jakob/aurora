@@ -24,6 +24,12 @@ void grow_streaming_storage_now(uint64_t storage) noexcept;
 wgpu::BindGroupLayout compute_empty_layout() noexcept;
 wgpu::BindGroup compute_empty_group() noexcept;
 wgpu::BindGroupLayout compute_stream_layout() noexcept;
+struct ComputeFailures {
+  uint64_t binds = 0;
+  uint64_t copies = 0;
+};
+ComputeFailures compute_failures() noexcept;
+void set_compute_scratch(wgpu::Buffer buffer) noexcept;
 
 namespace testing {
 StreamingSizes requested_streaming_sizes() noexcept;

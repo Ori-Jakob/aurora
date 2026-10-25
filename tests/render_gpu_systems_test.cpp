@@ -15,8 +15,10 @@
 #include "render/shaders.hpp"
 #include "render/systems/dispatch.hpp"
 #include "render/systems/systems.hpp"
+#include "webgpu/caps.hpp"
 
 #include <aurora/gpu_systems.hpp>
+#include <dolphin/gx.h>
 
 #include <algorithm>
 #include <array>
@@ -28,6 +30,8 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+extern "C" void __GXSetDirtyState();
 
 namespace aurora::render {
 namespace {
@@ -304,6 +308,27 @@ TEST_F(RenderGpuSystems, StatefulSystemReadyFromNextFrame) {
   EXPECT_EQ(gpu::system_status(id), SystemStatus::Ready);
 }
 
+TEST_F(RenderGpuSystems, FailedStateBlockFailsStatus) {
+  Caps limited = caps();
+  limited.limits.maxStorageBufferBindingSize = 64 * 1024;
+  webgpu::set_caps(std::move(limited));
+  constexpr uint32_t StateBytes = 48 * 1024;
+  gpu::SystemId placed = gpu::InvalidSystem;
+  gpu::SystemId failed = gpu::InvalidSystem;
+  create_and_decode({.name = "placed", .wgsl = NoopSource, .kernels = MainKernel, .persistentBytes = StateBytes},
+                    placed);
+  create_and_decode({.name = "failed", .wgsl = NoopSource, .kernels = MainKernel, .persistentBytes = StateBytes},
+                    failed);
+  channel::end_frame();
+  EXPECT_EQ(gpu::system_status(failed), SystemStatus::Ready);
+  gpu_heap::begin_frame_worker();
+  systems::KernelSlot slot;
+  ASSERT_TRUE(systems::kernel_slot(failed, 0, slot));
+  ASSERT_EQ(gpu_heap::block_state(slot.state), gpu_heap::BlockState::Failed);
+  EXPECT_EQ(gpu::system_status(placed), SystemStatus::Ready);
+  EXPECT_EQ(gpu::system_status(failed), SystemStatus::Failed);
+}
+
 std::vector<uint8_t> upload_bytes(uint64_t handle, std::span<const uint8_t> data) {
   std::vector<uint8_t> payload(wire::GpuUploadHeader + data.size());
   wire::Writer out{payload};
@@ -529,6 +554,116 @@ TEST_F(RenderSystemsDispatch, CreationFrameUpdateFlushesBeforeFirstDispatch) {
   EXPECT_EQ(entries[2].dstOffset, 8u);
   EXPECT_EQ(entries[2].range.size, 4u);
   EXPECT_EQ(gpu::stats().persistentCopies, 2u);
+}
+
+std::vector<uint8_t> load_array_bytes(uint8_t attr, uint64_t handle) {
+  std::vector<uint8_t> payload(wire::LoadArrayGpuV1);
+  wire::Writer out{payload};
+  out.u16(1);
+  out.u8(attr);
+  out.u64(handle);
+  out.u32(0);
+  return hint(GX_AURORA_LOAD_ARRAY_GPU, payload);
+}
+
+// Holds both job workers so kernel compiles stay queued until release is set
+class WorkerGate {
+public:
+  WorkerGate() {
+    for (jobs::JobHandle& job : m_jobs) {
+      job = jobs::submit([this](const jobs::JobContext& context) {
+        m_started.fetch_add(1, std::memory_order_relaxed);
+        while (!m_release.load(std::memory_order_acquire) && !context.cancelled()) {
+          std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+      });
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    while (m_started.load(std::memory_order_relaxed) < m_jobs.size() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+  }
+  ~WorkerGate() {
+    release();
+    for (const jobs::JobHandle& job : m_jobs) {
+      job.wait();
+    }
+  }
+  WorkerGate(const WorkerGate&) = delete;
+  WorkerGate& operator=(const WorkerGate&) = delete;
+
+  [[nodiscard]] bool holding() const noexcept { return m_started.load(std::memory_order_relaxed) == m_jobs.size(); }
+  void release() noexcept { m_release.store(true, std::memory_order_release); }
+
+private:
+  std::array<jobs::JobHandle, 2> m_jobs;
+  std::atomic_uint32_t m_started{0};
+  std::atomic_bool m_release{false};
+};
+
+TEST_F(RenderSystemsDispatch, PendingKernelRejectsWithoutBlocking) {
+  gfx::set_blocking_pipelines(false);
+  WorkerGate gate;
+  ASSERT_TRUE(gate.holding());
+  const auto id = gpu::create_system({.name = "copy", .library = "systems/copy", .kernels = CopyKernel});
+  decode_pending();
+  ASSERT_EQ(gpu::system_status(id), SystemStatus::Pending);
+  const std::array<uint8_t, 16> data{};
+  process(upload_bytes(handle_at(1), data));
+  process(reserve_bytes(handle_at(2), 16));
+  const std::array<uint64_t, 1> inputs{handle_at(1)};
+  process(dispatch_bytes(id, 0, handle_at(2), {4, 1, 1}, inputs));
+  EXPECT_EQ(gpu::stats().dispatchesRejected, 1u);
+  EXPECT_EQ(gpu::stats().dispatches, 0u);
+  EXPECT_EQ(channel::lookup(handle_at(2)).state, channel::HandleState::Failed);
+  EXPECT_TRUE(pending_entries().empty());
+  EXPECT_EQ(gfx::detail::testing::pending_compute_entries(), 0u);
+
+  GXInit(nullptr, 0);
+  gx::fifo::clear_buffer();
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  __GXSetDirtyState();
+  decode_pending();
+  process(load_array_bytes(GX_VA_POS, handle_at(2)));
+  GXBegin(GX_TRIANGLES, GX_VTXFMT0, 3);
+  GXPosition1x8(0);
+  GXPosition1x8(1);
+  GXPosition1x8(2);
+  GXEnd();
+  decode_pending();
+  EXPECT_EQ(gpu::stats().suppressedDraws, 1u);
+}
+
+TEST_F(RenderSystemsDispatch, PendingKernelWaitsUnderBlocking) {
+  gfx::set_blocking_pipelines(false);
+  WorkerGate gate;
+  ASSERT_TRUE(gate.holding());
+  const auto id = gpu::create_system({.name = "copy", .library = "systems/copy", .kernels = CopyKernel});
+  decode_pending();
+  ASSERT_EQ(gpu::system_status(id), SystemStatus::Pending);
+  const std::array<uint8_t, 16> data{};
+  process(upload_bytes(handle_at(1), data));
+  process(reserve_bytes(handle_at(2), 16));
+  gfx::set_blocking_pipelines(true);
+  std::atomic_bool waited{false};
+  std::thread releaser{[&] {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    while (shaders::testing::waiters() == 0 && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+    waited = shaders::testing::waiters() != 0;
+    gate.release();
+  }};
+  const std::array<uint64_t, 1> inputs{handle_at(1)};
+  process(dispatch_bytes(id, 0, handle_at(2), {4, 1, 1}, inputs));
+  releaser.join();
+  EXPECT_TRUE(waited);
+  EXPECT_EQ(gpu::stats().dispatchesRejected, 0u);
+  EXPECT_EQ(gpu::stats().dispatches, 1u);
+  EXPECT_EQ(channel::lookup(handle_at(2)).state, channel::HandleState::Written);
+  EXPECT_EQ(pending_entries().size(), 1u);
 }
 } // namespace
 } // namespace aurora::render

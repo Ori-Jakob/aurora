@@ -1278,8 +1278,11 @@ TEST(RenderShadersGpu, ComputeBatchEncodesInOrder) {
   batch.entries.push_back(ComputeRig::dispatch(3, r4, step));
   batch.entries.push_back(ComputeRig::dispatch(4, r5, step, {0, 1, 1}));
   const uint32_t segments = gfx::detail::testing::compute_segments_encoded();
+  const gfx::detail::ComputeFailures failures = gfx::detail::compute_failures();
   const std::vector<uint32_t> words = rig.encode(batch);
   EXPECT_EQ(gfx::detail::testing::compute_segments_encoded(), segments + 2);
+  EXPECT_EQ(gfx::detail::compute_failures().binds, failures.binds + 1);
+  EXPECT_EQ(gfx::detail::compute_failures().copies, failures.copies);
   if (rig.null) {
     GTEST_SKIP() << "the null backend runs no shaders";
   }

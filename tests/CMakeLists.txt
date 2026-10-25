@@ -590,7 +590,7 @@ if (TARGET render_demo)
 
   # GPU-system commands decode in core, so these run with the render module off too
   if (AURORA_ENABLE_RENDER)
-    set(_gpu_systems "dispatches [1-9][0-9]*, systems ready 2/2")
+    set(_gpu_systems "dispatches 120, systems ready 2/2")
     set(_gpu_reserves 4)
   else ()
     set(_gpu_systems "dispatches 0, systems unavailable")

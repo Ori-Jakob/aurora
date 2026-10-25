@@ -314,6 +314,8 @@ ChannelBudget channel_budget() noexcept { return g_testChannelBudget; }
 void request_channel_storage(uint64_t bytesPerFrame) noexcept {
   g_testChannelDemand = std::max(g_testChannelDemand, bytesPerFrame);
 }
+ComputeFailures g_testComputeFailures;
+ComputeFailures compute_failures() noexcept { return g_testComputeFailures; }
 } // namespace aurora::gfx::detail
 
 // --- Pipeline/draw command stubs ---

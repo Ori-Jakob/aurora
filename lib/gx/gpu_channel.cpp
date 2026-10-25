@@ -866,6 +866,17 @@ bool on_dispatch(uint64_t system, uint32_t kernel, uint64_t output, std::span<co
   if (slot->persistentBytes != 0 && current_serial() == slot->createdSerial) {
     return fail([&] { return fmt::format("system 0x{:016X} keeps state and was created this frame", system); });
   }
+  const SystemBackend* backend = g_backend.load(std::memory_order_acquire);
+  // The GX thread charged the owed flush once these checks passed, so later rejections must not leave it owed
+  if (std::exchange(slot->pendingFlush, false)) {
+    if (backend == nullptr || backend->update == nullptr ||
+        !backend->update(backend->userData, system, 0, slot->shadow)) {
+      bump(g_storageMisses);
+      slot->stateDiverged = true;
+      return fail([&] { return fmt::format("the state of system 0x{:016X} could not be staged", system); });
+    }
+    bump(g_persistentCopies);
+  }
   const HandleInfo target = output != InvalidHandle ? lookup(output) : HandleInfo{};
   if (output != InvalidHandle && target.state != HandleState::Reserved) {
     return fail([&] { return fmt::format("output 0x{:016X} is not a reserve awaiting its writer", output); });
@@ -881,17 +892,8 @@ bool on_dispatch(uint64_t system, uint32_t kernel, uint64_t output, std::span<co
     }
     ranges[i] = {info.range.offset, AURORA_ALIGN(info.range.size, 4u)};
   }
-  const SystemBackend* backend = g_backend.load(std::memory_order_acquire);
   if (backend == nullptr || backend->dispatch == nullptr) {
     return fail([] { return std::string{"no dispatch backend is installed"}; });
-  }
-  if (std::exchange(slot->pendingFlush, false)) {
-    if (backend->update == nullptr || !backend->update(backend->userData, system, 0, slot->shadow)) {
-      bump(g_storageMisses);
-      slot->stateDiverged = true;
-      return fail([&] { return fmt::format("the state of system 0x{:016X} could not be staged", system); });
-    }
-    bump(g_persistentCopies);
   }
   const DispatchDecode desc{
       .system = system,
@@ -1019,9 +1021,23 @@ void write_preamble(std::vector<uint8_t>& out) {
 }
 
 bool uncaptured_gpu_state() noexcept {
-  return std::ranges::any_of(g_fifo.slots, [](const FifoSlot& slot) {
-    return slot.live && ((slot.flags & SystemGpuOnlyState) != 0 || slot.dispatched || slot.stateDiverged);
+  // The worker cannot name the system whose state copy it dropped, so a dropped copy flags every stateful system
+  const bool copiesDropped = gfx::detail::compute_failures().copies != 0;
+  return std::ranges::any_of(g_fifo.slots, [&](const FifoSlot& slot) {
+    return slot.live && ((slot.flags & SystemGpuOnlyState) != 0 || slot.dispatched || slot.stateDiverged ||
+                         (copiesDropped && slot.persistentBytes != 0));
   });
+}
+
+uint64_t preamble_flush_bytes() noexcept {
+  const uint64_t alignment = std::max<uint64_t>(gfx::detail::channel_budget().alignment, 4);
+  uint64_t bytes = 0;
+  for (const FifoSlot& slot : g_fifo.slots) {
+    if (slot.live && slot.shadowWritten) {
+      bytes += AURORA_ALIGN(uint64_t{slot.shadow.size()}, alignment) + alignment;
+    }
+  }
+  return bytes;
 }
 
 Stats stats() noexcept {
@@ -1049,6 +1065,8 @@ Stats stats() noexcept {
       .dispatchesRefused = load(g_dispatchesRefused),
       .dispatchesRejected = load(g_dispatchesRejected),
       .persistentCopies = load(g_persistentCopies),
+      .binderFailures = gfx::detail::compute_failures().binds,
+      .droppedCopies = gfx::detail::compute_failures().copies,
   };
 }
 
