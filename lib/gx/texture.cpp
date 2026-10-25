@@ -77,18 +77,21 @@ struct TextureContentKey {
   XXH128_hash_t tlutHash{};
   u32 tlutFormat = 0;
   u16 tlutEntries = 0;
+  // Generated and plain variants of the same bytes are different GPU textures
+  bool generatedMips = false;
 
   bool operator==(const TextureContentKey& rhs) const noexcept {
     return textureHash.low64 == rhs.textureHash.low64 && textureHash.high64 == rhs.textureHash.high64 &&
            width == rhs.width && height == rhs.height && format == rhs.format && mipCount == rhs.mipCount &&
            tlutHash.low64 == rhs.tlutHash.low64 && tlutHash.high64 == rhs.tlutHash.high64 &&
-           tlutFormat == rhs.tlutFormat && tlutEntries == rhs.tlutEntries;
+           tlutFormat == rhs.tlutFormat && tlutEntries == rhs.tlutEntries && generatedMips == rhs.generatedMips;
   }
 
   template <typename H>
   friend H AbslHashValue(H h, const TextureContentKey& key) {
     return H::combine(std::move(h), key.textureHash.low64, key.textureHash.high64, key.width, key.height, key.format,
-                      key.mipCount, key.tlutHash.low64, key.tlutHash.high64, key.tlutFormat, key.tlutEntries);
+                      key.mipCount, key.tlutHash.low64, key.tlutHash.high64, key.tlutFormat, key.tlutEntries,
+                      key.generatedMips);
   }
 };
 
@@ -136,6 +139,8 @@ uint64_t s_dynamicReuseBlockedFrame = UINT64_MAX;
 uint64_t s_bindGeneration = 1;
 std::atomic<uint64_t> s_pendingInvalidations = 0;
 std::atomic<uint64_t> s_pendingCacheClears = 0;
+std::atomic_bool s_generateMipsRequest{false};
+bool s_generateMips = false;
 std::atomic<const texture::MaterialLookup*> s_pendingMaterialLookup{nullptr};
 std::atomic<const texture::MaterialLookup*> s_materialLookup{nullptr};
 std::atomic<uint64_t> s_pendingMaterialChanges{0};
@@ -503,6 +508,14 @@ void sweep_object_caches() {
   }
 }
 
+constexpr u32 MinMipTailDim = 8;
+
+// Only GX_LINEAR minification widens; lookup strips such as TEV ramps are thinner than 8 texels
+bool mip_tail_eligible(const GXTexObj_& obj) noexcept {
+  return !obj.has_mips() && obj.min_filter() == GX_LINEAR && std::min(obj.width(), obj.height()) >= MinMipTailDim &&
+         !gfx::is_pc_texture_format(obj.format());
+}
+
 bool use_replacement(std::optional<gfx::texture_replacement::ReplacementResult> replacement, gfx::TextureHandle& handle,
                      uint64_t& replacementId) noexcept {
   if (!replacement.has_value()) {
@@ -648,6 +661,12 @@ std::optional<uint64_t> hash_referenced_tlut(uint32_t minIndex, uint32_t maxInde
 
 void invalidate_bindings() noexcept { s_pendingInvalidations.fetch_add(1, std::memory_order_release); }
 
+void set_generate_missing_mips(bool enabled) noexcept {
+  s_generateMipsRequest.store(enabled, std::memory_order_release);
+}
+
+bool generate_missing_mips_requested() noexcept { return s_generateMipsRequest.load(std::memory_order_acquire); }
+
 void set_material_lookup(const MaterialLookup* lookup) noexcept {
   s_pendingMaterialLookup.store(lookup, std::memory_order_release);
   s_pendingMaterialChanges.fetch_add(1, std::memory_order_release);
@@ -716,6 +735,8 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj, gfx::TextureMate
     if (!keys.has_value()) {
       keys = hash_texture_source(obj, nullptr, BuildSourceKeyForDebug);
     }
+    const bool generate = s_generateMips && replacementId == 0 && mip_tail_eligible(obj);
+    keys->contentKey.generatedMips = generate;
     handle = find_content_texture(keys->contentKey);
     if (!handle) {
 #if DEBUG
@@ -726,9 +747,12 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj, gfx::TextureMate
 #endif
       const size_t sourceBytes = texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count());
       const auto source = guest_memory::read(guest_memory::Kind::Texture, obj.data, sourceBytes);
-      handle = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),
-                                          {source.data(), source.size()}, false, nameStr);
+      handle = generate ? gfx::new_generated_mip_texture_2d(obj.width(), obj.height(), obj.format(),
+                                                            {source.data(), source.size()}, nameStr)
+                        : gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),
+                                                     {source.data(), source.size()}, false, nameStr);
       ++s_stats.misses;
+      s_stats.generatedMipTextures += generate ? 1 : 0;
       s_stats.uploadBytes += texture_handle_size(handle);
       cache_content_texture(std::move(keys->contentKey), handle);
     }
@@ -784,6 +808,8 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
     if (!keys.has_value()) {
       keys = hash_texture_source(obj, &tlut, false);
     }
+    const bool generate = s_generateMips && replacementId == 0 && mip_tail_eligible(obj);
+    keys->contentKey.generatedMips = generate;
     handle = find_content_texture(keys->contentKey);
     if (!handle) {
       const size_t textureBytes = texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count());
@@ -796,11 +822,15 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
       if (converted.data.empty()) {
         return {};
       }
-      handle = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), GX_TF_RGBA8_PC,
-                                          {converted.data.data(), converted.data.size()}, false,
-                                          "GX Static Palette Texture");
+      handle = generate ? gfx::new_generated_mip_texture_2d(obj.width(), obj.height(), GX_TF_RGBA8_PC,
+                                                            {converted.data.data(), converted.data.size()},
+                                                            "GX Static Palette Texture")
+                        : gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), GX_TF_RGBA8_PC,
+                                                     {converted.data.data(), converted.data.size()}, false,
+                                                     "GX Static Palette Texture");
       handle->hasArbitraryMips = converted.hasArbitraryMips;
       ++s_stats.misses;
+      s_stats.generatedMipTextures += generate ? 1 : 0;
       s_stats.uploadBytes += texture_handle_size(handle);
       cache_content_texture(std::move(keys->contentKey), handle);
     }
@@ -837,6 +867,7 @@ void end_frame() noexcept {
   TracyPlot("aurora: textureSourceKeyBuilds", static_cast<int64_t>(s_stats.sourceKeyBuilds));
   TracyPlot("aurora: textureSourceKeyBytes", static_cast<int64_t>(s_stats.sourceKeyBytes));
   TracyPlot("aurora: textureMaterialLookups", static_cast<int64_t>(s_stats.materialLookups));
+  TracyPlot("aurora: textureGeneratedMips", static_cast<int64_t>(s_stats.generatedMipTextures));
 
   s_stats = {};
   s_stats.pendingLoads = streamingStats.pendingLoads;
@@ -856,6 +887,14 @@ void end_frame() noexcept {
     if (rebind) {
       s_pendingCacheClears.fetch_add(1, std::memory_order_relaxed);
     }
+  }
+  if (const bool generateMips = s_generateMipsRequest.load(std::memory_order_acquire); generateMips != s_generateMips) {
+    s_generateMips = generateMips;
+    if (!generateMips) {
+      s_contentCache.erase_if([](const TextureContentKey& key) { return key.generatedMips; });
+    }
+    // Latched with the FIFO drained, so no frame mixes policies and no object entry keeps the old one
+    s_pendingCacheClears.fetch_add(1, std::memory_order_release);
   }
   apply_pending_invalidations();
   sweep_object_caches();
@@ -878,6 +917,8 @@ void shutdown() noexcept {
   s_bindGeneration = 1;
   s_pendingInvalidations.store(0, std::memory_order_release);
   s_pendingCacheClears.store(0, std::memory_order_release);
+  s_generateMipsRequest.store(false, std::memory_order_release);
+  s_generateMips = false;
   s_stats = {};
 }
 

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <vector>
 
 #include <tracy/Tracy.hpp>
 
@@ -108,7 +109,82 @@ bool arb_mip_check(uint32_t width, uint32_t height, uint32_t mips, ArrayRef<uint
   }
   return (totalDiff / static_cast<float>(mips - 1)) > kArbMipThreshold;
 }
+
+struct Taps {
+  uint32_t first;
+  uint32_t count;
+};
+
+Taps source_taps(uint32_t size, uint32_t outSize, uint32_t index) noexcept {
+  if (size == 1) {
+    return {0, 1};
+  }
+  return {2 * index, (size & 1) != 0 && index == outSize - 1 ? 3u : 2u};
+}
+
+void halve(const std::vector<uint16_t>& src, uint32_t width, uint32_t height, std::vector<uint16_t>& dst,
+           uint32_t outWidth, uint32_t outHeight) {
+  dst.resize(size_t{outWidth} * outHeight * 4);
+  for (uint32_t y = 0; y < outHeight; ++y) {
+    const Taps ty = source_taps(height, outHeight, y);
+    for (uint32_t x = 0; x < outWidth; ++x) {
+      const Taps tx = source_taps(width, outWidth, x);
+      const uint32_t count = tx.count * ty.count;
+      std::array<uint32_t, 4> sum{};
+      for (uint32_t sy = ty.first; sy < ty.first + ty.count; ++sy) {
+        const uint16_t* row = src.data() + (size_t{sy} * width + tx.first) * 4;
+        for (uint32_t sx = 0; sx < tx.count; ++sx) {
+          for (uint32_t c = 0; c < 4; ++c) {
+            sum[c] += row[sx * 4 + c];
+          }
+        }
+      }
+      uint16_t* out = dst.data() + (size_t{y} * outWidth + x) * 4;
+      for (uint32_t c = 0; c < 4; ++c) {
+        out[c] = static_cast<uint16_t>((sum[c] + count / 2) / count);
+      }
+    }
+  }
+}
+
+void to_u8(const std::vector<uint16_t>& src, uint8_t* dst) noexcept {
+  for (size_t i = 0; i < src.size(); ++i) {
+    dst[i] = static_cast<uint8_t>(std::min((src[i] + 128u) >> 8, 255u));
+  }
+}
 } // namespace
+
+ByteBuffer box_mip_tail_rgba8(uint32_t width, uint32_t height, ArrayRef<uint8_t> level) noexcept {
+  ZoneScopedN("texture mip tail");
+  if (width == 0 || height == 0 || (width == 1 && height == 1) || level.size() != calc_size_rgba8(width, height)) {
+    return {};
+  }
+  size_t tailBytes = 0;
+  for (uint32_t w = width, h = height; w > 1 || h > 1;) {
+    w = std::max(w >> 1, 1u);
+    h = std::max(h >> 1, 1u);
+    tailBytes += calc_size_rgba8(w, h);
+  }
+
+  ByteBuffer tail{tailBytes};
+  std::vector<uint16_t> current(level.size());
+  for (size_t i = 0; i < current.size(); ++i) {
+    current[i] = static_cast<uint16_t>(level.data()[i] << 8);
+  }
+  std::vector<uint16_t> next;
+  uint8_t* dst = tail.data();
+  while (width > 1 || height > 1) {
+    const uint32_t outWidth = std::max(width >> 1, 1u);
+    const uint32_t outHeight = std::max(height >> 1, 1u);
+    halve(current, width, height, next, outWidth, outHeight);
+    to_u8(next, dst);
+    dst += next.size();
+    current.swap(next);
+    width = outWidth;
+    height = outHeight;
+  }
+  return tail;
+}
 
 // http://www.mindcontrol.org/~hplus/graphics/expand-bits.html
 template <uint8_t v>

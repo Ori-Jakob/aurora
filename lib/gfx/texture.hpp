@@ -43,6 +43,8 @@ struct TextureRef {
   u32 gxFormat;
   bool hasArbitraryMips = false;
   bool isReplacement = false;
+  // Levels past 0 were generated for a mipless GX texture; a content property like hasArbitraryMips
+  bool generatedMips = false;
 
   TextureRef(wgpu::Texture texture, wgpu::TextureView sampleTextureView, wgpu::TextureView attachmentTextureView,
              wgpu::Extent3D size, wgpu::TextureFormat format, uint32_t mipCount, u32 gxFormat)
@@ -61,6 +63,8 @@ TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t m
                                      const char* label) noexcept;
 TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
 TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
+TextureHandle new_generated_mip_texture_2d(uint32_t width, uint32_t height, u32 gxFormat, ArrayRef<uint8_t> data,
+                                           const char* label) noexcept;
 void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept;
 }; // namespace aurora::gfx
 
@@ -149,7 +153,9 @@ struct TextureBind {
   TextureBind(const GXTexObj_& obj, TextureHandle handle, uint64_t bindGeneration = 0) noexcept
   : ref(std::move(handle)), texObj(obj), generation(bindGeneration) {}
   void reset() noexcept { ref.reset(); }
-  [[nodiscard]] wgpu::SamplerDescriptor get_descriptor() const noexcept;
+  [[nodiscard]] wgpu::SamplerDescriptor get_descriptor(bool baseLevel = false) const noexcept;
+  // A mipless GX_LINEAR texture never applied its LOD bias on GX, so its generated levels ignore it
+  [[nodiscard]] float sample_lod_bias() const noexcept;
   operator bool() const noexcept { return ref.operator bool(); }
 };
 } // namespace aurora::gfx

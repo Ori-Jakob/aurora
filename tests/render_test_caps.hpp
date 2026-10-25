@@ -129,6 +129,7 @@ inline Settings everything_on() {
   s.textureMaterials = true;
   s.stochasticTiling = true;
   s.legacyMatMaps = true;
+  s.generateMissingMips = true;
   s.pbr = true;
   s.taa = true;
   s.ao = Quality::Ultra;

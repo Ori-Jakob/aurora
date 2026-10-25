@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <utility>
 
@@ -152,6 +153,33 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
   if (data.size() != UINT32_MAX && offset < data.size()) {
     Log.warn("new_static_texture_2d[{}]: texture used {} bytes, but given {} bytes", label, offset, data.size());
   }
+  return handle;
+}
+
+TextureHandle new_generated_mip_texture_2d(uint32_t width, uint32_t height, u32 gxFormat, ArrayRef<uint8_t> data,
+                                           const char* label) noexcept {
+  ZoneScoped;
+  CHECK(!is_pc_texture_format(gxFormat) || gxFormat == GX_TF_RGBA8_PC,
+        "new_generated_mip_texture_2d[{}]: unsupported format {}", label, gxFormat);
+  ConvertedTexture converted;
+  if (gxFormat != GX_TF_RGBA8_PC) {
+    converted = convert_texture(gxFormat, width, height, 1, data);
+    data = converted.data;
+  }
+  const size_t baseBytes = size_t{width} * height * 4;
+  CHECK(data.size() == baseBytes, "new_generated_mip_texture_2d[{}]: expected {} bytes, got {}", label, baseBytes,
+        data.size());
+  const ByteBuffer tail = box_mip_tail_rgba8(width, height, data);
+  ByteBuffer chain{baseBytes + tail.size()};
+  std::memcpy(chain.data(), data.data(), baseBytes);
+  if (!tail.empty()) {
+    std::memcpy(chain.data() + baseBytes, tail.data(), tail.size());
+  }
+  auto handle =
+      new_static_texture_2d(width, height, full_mip_count(width, height), GX_TF_RGBA8_PC, chain, false, label);
+  // Binds report the game's format, as the legacy upload did
+  handle->gxFormat = gxFormat;
+  handle->generatedMips = true;
   return handle;
 }
 
@@ -303,7 +331,7 @@ void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {
   }
 }
 
-wgpu::SamplerDescriptor TextureBind::get_descriptor() const noexcept {
+wgpu::SamplerDescriptor TextureBind::get_descriptor(bool baseLevel) const noexcept {
   auto [minFilter, mipFilter] = wgpu_filter_mode(texObj.min_filter());
   auto [magFilter, _] = wgpu_filter_mode(texObj.mag_filter());
   const bool mipsEnabled = mipFilter != wgpu::MipmapFilterMode::Undefined;
@@ -319,6 +347,11 @@ wgpu::SamplerDescriptor TextureBind::get_descriptor() const noexcept {
   } else if (mipFilter == wgpu::MipmapFilterMode::Undefined) {
     minLod = 0.f;
     maxLod = 0.f;
+    // Generated levels blend trilinearly; mipsEnabled keeps the GX filter's answer, so anisotropy stays 1
+    if (ref && ref->generatedMips && !baseLevel && texObj.min_filter() == GX_LINEAR) {
+      maxLod = 1000.f;
+      mipFilter = wgpu::MipmapFilterMode::Linear;
+    }
   }
   if ((ref && ref->hasArbitraryMips) || !mipsEnabled) {
     maxAnisotropy = 1;
@@ -339,5 +372,9 @@ wgpu::SamplerDescriptor TextureBind::get_descriptor() const noexcept {
       .lodMaxClamp = maxLod,
       .maxAnisotropy = maxAnisotropy,
   };
+}
+
+float TextureBind::sample_lod_bias() const noexcept {
+  return ref && ref->generatedMips && texObj.min_filter() == GX_LINEAR ? 0.f : texObj.lod_bias();
 }
 } // namespace aurora::gfx

@@ -147,14 +147,20 @@ u32 g_testLastResolveInfoSize = 0;
 GXCompare g_testPopulateDepthFunc = GX_NEVER;
 u32 g_testPopulateTevStageCount = 0;
 std::bitset<MaxTextures> g_testStochasticEligible;
+std::bitset<MaxTextures> g_testSampledTextures;
+bool g_testLastBindBaseLevel = false;
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
   ++g_testPipelineBuildCount;
   config.depthFunc = g_testPopulateDepthFunc;
   config.shaderConfig.tevStageCount = g_testPopulateTevStageCount;
 }
-GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept { return {}; }
+GXBindGroups build_bind_groups(const ShaderInfo& info, bool baseLevel) noexcept {
+  g_testLastBindBaseLevel = baseLevel;
+  return {};
+}
 ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
   ShaderInfo info{.uniformSize = ++g_testShaderInfoCount};
+  info.sampledTextures |= g_testSampledTextures;
   info.stochasticEligible = g_testStochasticEligible;
   info.stochasticTextures = std::bitset<MaxTextures>{config.ext.stochasticMask} & g_testStochasticEligible;
   return info;
@@ -392,7 +398,7 @@ gx::DrawData* get_last_draw_command() {
 
 // --- TextureBind::get_descriptor ---
 namespace aurora::gfx {
-wgpu::SamplerDescriptor TextureBind::get_descriptor() const noexcept { return wgpu::SamplerDescriptor{}; }
+wgpu::SamplerDescriptor TextureBind::get_descriptor(bool) const noexcept { return wgpu::SamplerDescriptor{}; }
 } // namespace aurora::gfx
 
 // --- Texture creation/write/replacement stubs ---

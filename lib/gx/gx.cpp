@@ -493,7 +493,7 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   };
 }
 
-GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
+GXBindGroups build_bind_groups(const ShaderInfo& info, bool baseLevel) noexcept {
   ZoneScoped;
 
   if (!info.sampledTextures.any() && !info.sampledIndTextures.any()) {
@@ -511,7 +511,8 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
     samplerEntry.binding = i * 2 + 1;
     if (tex && (info.sampledTextures[i] || info.sampledIndTextures[i])) {
       textureEntry.textureView = tex.ref->sampleTextureView.Get();
-      samplerEntry.sampler = gfx::sampler_ref(tex.get_descriptor()).Get();
+      // Indirect offsets keep level 0 too, so generated mips never filter them
+      samplerEntry.sampler = gfx::sampler_ref(tex.get_descriptor(baseLevel || info.sampledIndTextures[i])).Get();
     } else {
       textureEntry.textureView = sEmptyTextureView.Get();
       samplerEntry.sampler = sEmptySampler.Get();

@@ -84,7 +84,7 @@ struct TerrainSettings {
 
 struct Settings {
   Preset preset = Preset::Original;
-  bool textureMaterials = true, stochasticTiling = false, legacyMatMaps = false;
+  bool textureMaterials = true, stochasticTiling = false, legacyMatMaps = false, generateMissingMips = false;
   bool pbr = false;
   float legacyBlend = 0.f;
   Exposure exposure = Exposure::MatchLegacy;

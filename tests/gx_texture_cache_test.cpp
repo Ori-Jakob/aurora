@@ -19,6 +19,9 @@ uint64_t texture_allocations();
 uint64_t palette_conversions();
 uint64_t copy_allocations();
 uint64_t source_replacement_queries();
+uint64_t generated_allocations();
+u32 last_generated_format();
+size_t last_generated_bytes();
 gfx::TextureHandle make_texture_handle(uint32_t width, uint32_t height, u32 format = GX_TF_RGBA8_PC);
 void set_replacement(gfx::TextureHandle handle, uint64_t id = 1);
 void set_source_replacement(aurora::texture::TextureSourceKey key, gfx::TextureHandle handle);
@@ -1408,6 +1411,170 @@ TEST_F(GxTextureCacheTest, GuestReadsUnchangedWithMaterials) {
     EXPECT_EQ(withLookup[i].size, plain[i].size);
   }
   EXPECT_EQ(materials.finds, 2);
+}
+
+constexpr u32 HwLinear = 4u << 5;
+constexpr u32 HwLinMipLin = 6u << 5;
+
+GXTexObj_ linear_texture(const void* data, u32 id, u32 format, u32 width, u32 height) {
+  GXTexObj_ obj = make_texture(data, id, format, width, height);
+  obj.mode0 = HwLinear;
+  return obj;
+}
+
+void set_generation(bool enabled) {
+  texture::set_generate_missing_mips(enabled);
+  texture::end_frame();
+}
+
+TEST_F(GxTextureCacheTest, MiplessTextureGetsGeneratedTail) {
+  std::array<uint8_t, 128> pixels{};
+  set_generation(true);
+  const auto handle = texture::resolve_static_texture(linear_texture(pixels.data(), 1, GX_TF_I8, 16, 8));
+
+  ASSERT_NE(handle, nullptr);
+  EXPECT_EQ(testing::generated_allocations(), 1);
+  EXPECT_EQ(testing::texture_allocations(), 0);
+  EXPECT_EQ(handle->mipCount, 5u);
+  EXPECT_TRUE(handle->generatedMips);
+  EXPECT_EQ(testing::last_generated_format(), GX_TF_I8);
+  EXPECT_EQ(testing::last_generated_bytes(), texture::texture_source_size(GX_TF_I8, 16, 8, 1));
+  EXPECT_EQ(texture_stats().generatedMipTextures, 1);
+}
+
+TEST_F(GxTextureCacheTest, GenerationOffKeepsLegacyUpload) {
+  std::array<uint8_t, 128> pixels{};
+  const auto first = texture::resolve_static_texture(linear_texture(pixels.data(), 1, GX_TF_I8, 16, 8));
+  const auto second = texture::resolve_static_texture(linear_texture(pixels.data(), 2, GX_TF_I8, 16, 8));
+
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(first->mipCount, 1u);
+  EXPECT_FALSE(first->generatedMips);
+  EXPECT_EQ(second, first);
+  EXPECT_EQ(testing::texture_allocations(), 1);
+  EXPECT_EQ(testing::generated_allocations(), 0);
+  EXPECT_EQ(texture_stats().contentHits, 1);
+  EXPECT_EQ(texture_stats().generatedMipTextures, 0);
+}
+
+TEST_F(GxTextureCacheTest, IneligibleTexturesKeepLegacyUpload) {
+  std::array<uint8_t, 128> pixels{};
+  std::array<uint8_t, 1024> rgba{};
+  set_generation(true);
+  GXTexObj_ withMips = linear_texture(pixels.data(), 1, GX_TF_I8, 16, 8);
+  withMips.flags |= 1u;
+  GXTexObj_ nearest = make_texture(pixels.data(), 2, GX_TF_I8, 16, 8);
+  GXTexObj_ mipFilter = make_texture(pixels.data(), 3, GX_TF_I8, 16, 8);
+  mipFilter.mode0 = HwLinMipLin;
+  const std::array objects{withMips, nearest, mipFilter, linear_texture(pixels.data(), 4, GX_TF_I8, 16, 4),
+                           linear_texture(rgba.data(), 5, GX_TF_RGBA8_PC, 16, 16)};
+  ASSERT_EQ(withMips.mip_count(), 1u);
+
+  for (const auto& obj : objects) {
+    SCOPED_TRACE(obj.texObjId);
+    const auto handle = texture::resolve_static_texture(obj);
+    ASSERT_NE(handle, nullptr);
+    EXPECT_FALSE(handle->generatedMips);
+    EXPECT_EQ(handle->mipCount, 1u);
+  }
+  EXPECT_EQ(testing::generated_allocations(), 0);
+}
+
+TEST_F(GxTextureCacheTest, GeneratedAndPlainVariantsNeverShare) {
+  std::array<uint8_t, 128> pixels{};
+  set_generation(true);
+  const auto generated = texture::resolve_static_texture(linear_texture(pixels.data(), 1, GX_TF_I8, 16, 8));
+  const auto plain = texture::resolve_static_texture(make_texture(pixels.data(), 2, GX_TF_I8, 16, 8));
+  const auto again = texture::resolve_static_texture(linear_texture(pixels.data(), 3, GX_TF_I8, 16, 8));
+
+  EXPECT_NE(generated, plain);
+  EXPECT_TRUE(generated->generatedMips);
+  EXPECT_FALSE(plain->generatedMips);
+  EXPECT_EQ(again, generated);
+  EXPECT_EQ(testing::generated_allocations(), 1);
+  EXPECT_EQ(testing::texture_allocations(), 1);
+  EXPECT_EQ(texture_stats().contentHits, 1);
+}
+
+TEST_F(GxTextureCacheTest, PaletteTextureGetsGeneratedTail) {
+  std::array<uint8_t, 256> indices{};
+  std::array<uint8_t, 512> palette{};
+  set_generation(true);
+  const auto handle = texture::resolve_static_palette_texture(linear_texture(indices.data(), 1, GX_TF_C8, 16, 16),
+                                                              make_tlut(palette.data(), 1, 256));
+
+  ASSERT_NE(handle, nullptr);
+  EXPECT_TRUE(handle->generatedMips);
+  EXPECT_EQ(testing::generated_allocations(), 1);
+  EXPECT_EQ(testing::last_generated_format(), GX_TF_RGBA8_PC);
+  EXPECT_EQ(testing::last_generated_bytes(), 1024u);
+}
+
+TEST_F(GxTextureCacheTest, PendingReplacementKeepsLegacyUpload) {
+  std::array<uint8_t, 128> pixels{};
+  pixels[3] = 9;
+  const auto key = aurora::texture::compute_source_key(GX_TF_I8, 16, 8, pixels);
+  ASSERT_TRUE(key.has_value());
+  testing::set_source_replacement(*key, {});
+  set_generation(true);
+  const auto handle = texture::resolve_static_texture(linear_texture(pixels.data(), 1, GX_TF_I8, 16, 8));
+
+  ASSERT_NE(handle, nullptr);
+  EXPECT_FALSE(handle->generatedMips);
+  EXPECT_EQ(testing::texture_allocations(), 1);
+  EXPECT_EQ(testing::generated_allocations(), 0);
+}
+
+TEST_F(GxTextureCacheTest, FlipClearsObjectsAndDropsGeneratedContent) {
+  std::array<uint8_t, 128> pixels{};
+  const auto obj = linear_texture(pixels.data(), 1, GX_TF_I8, 16, 8);
+  set_generation(true);
+  const auto generated = texture::resolve_static_texture(obj);
+  ASSERT_TRUE(generated->generatedMips);
+  texture::end_frame();
+  const uint64_t entries = texture_stats().contentCacheEntries;
+  const uint64_t generation = texture::current_bind_generation();
+
+  set_generation(false);
+  EXPECT_EQ(texture_stats().contentCacheEntries, entries - 1);
+  const uint64_t offGeneration = texture::current_bind_generation();
+  EXPECT_GT(offGeneration, generation);
+  const auto plain = texture::resolve_static_texture(obj);
+  EXPECT_FALSE(plain->generatedMips);
+  EXPECT_EQ(testing::texture_allocations(), 1);
+
+  set_generation(true);
+  EXPECT_GT(texture::current_bind_generation(), offGeneration);
+  const auto regenerated = texture::resolve_static_texture(obj);
+  EXPECT_TRUE(regenerated->generatedMips);
+  EXPECT_EQ(testing::generated_allocations(), 2);
+}
+
+TEST_F(GxTextureCacheTest, CopiesAndTlutsNeverGetTails) {
+  uint8_t copyDestination{};
+  uint8_t paletteDestination{};
+  std::array<uint8_t, 256> indices{};
+  std::array<uint8_t, 512> palette{};
+  set_generation(true);
+  copy_texture(&copyDestination, 16, 16);
+  copy_texture(&paletteDestination, 16, 16, GX_TF_I8);
+  g_gxState.loadedTextures[0] = linear_texture(&copyDestination, 1, GX_TF_I8, 16, 16);
+  g_gxState.loadedTextures[1] = linear_texture(&paletteDestination, 2, GX_TF_C8, 16, 16);
+  g_gxState.loadedTextures[2] = linear_texture(indices.data(), 3, GX_TF_C8, 16, 16);
+  g_gxState.loadedTluts[0] = make_tlut(palette.data(), 1, 256);
+  ShaderInfo info{};
+  info.sampledTextures.set(0);
+  info.sampledTextures.set(1);
+  info.sampledTextures.set(2);
+
+  resolve_sampled_textures(info);
+
+  for (u32 i = 0; i < 3; ++i) {
+    SCOPED_TRACE(i);
+    ASSERT_TRUE(g_gxState.textures[i]);
+    EXPECT_EQ(g_gxState.textures[i].ref->generatedMips, i == 2);
+  }
+  EXPECT_EQ(testing::generated_allocations(), 1);
 }
 } // namespace
 } // namespace aurora::gx

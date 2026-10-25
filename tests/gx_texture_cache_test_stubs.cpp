@@ -22,6 +22,9 @@ aurora::gfx::TextureHandle s_sourceReplacement;
 uint64_t s_replacementId = 0;
 uint64_t s_sourceReplacementId = 0;
 uint64_t s_sourceReplacementQueries = 0;
+uint64_t s_generatedAllocations = 0;
+u32 s_lastGeneratedFormat = 0;
+size_t s_lastGeneratedBytes = 0;
 } // namespace
 
 namespace aurora {
@@ -57,12 +60,18 @@ void reset_texture_stubs() {
   s_replacementId = 0;
   s_sourceReplacementId = 0;
   s_sourceReplacementQueries = 0;
+  s_generatedAllocations = 0;
+  s_lastGeneratedFormat = 0;
+  s_lastGeneratedBytes = 0;
 }
 
 uint64_t texture_allocations() { return s_textureAllocations; }
 uint64_t palette_conversions() { return s_paletteConversions; }
 uint64_t copy_allocations() { return s_copyAllocations; }
 uint64_t source_replacement_queries() { return s_sourceReplacementQueries; }
+uint64_t generated_allocations() { return s_generatedAllocations; }
+u32 last_generated_format() { return s_lastGeneratedFormat; }
+size_t last_generated_bytes() { return s_lastGeneratedBytes; }
 void set_replacement(gfx::TextureHandle handle, uint64_t id) {
   s_replacement = std::move(handle);
   s_replacementId = id;
@@ -89,6 +98,17 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
   ++s_textureAllocations;
   auto handle = gx::testing::make_texture_handle(width, height, gxFormat);
   handle->mipCount = mips;
+  return handle;
+}
+
+TextureHandle new_generated_mip_texture_2d(uint32_t width, uint32_t height, u32 gxFormat, ArrayRef<uint8_t> data,
+                                           const char* label) noexcept {
+  ++s_generatedAllocations;
+  s_lastGeneratedFormat = gxFormat;
+  s_lastGeneratedBytes = data.size();
+  auto handle = gx::testing::make_texture_handle(width, height, gxFormat);
+  handle->mipCount = full_mip_count(width, height);
+  handle->generatedMips = true;
   return handle;
 }
 

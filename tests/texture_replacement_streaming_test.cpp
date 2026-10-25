@@ -1410,6 +1410,367 @@ TEST_F(MipRepairTest, SynchronousToggleErasesRepairableResidentChains) {
   EXPECT_TRUE(source.paths.empty());
 }
 
+TEST(MipTailTest, BoxTailMatchesReferenceFilter) {
+  constexpr std::array<std::pair<uint32_t, uint32_t>, 5> Sizes{{{5, 3}, {7, 1}, {1, 9}, {13, 8}, {16, 16}}};
+  for (const auto& [width, height] : Sizes) {
+    SCOPED_TRACE(fmt::format("{}x{}", width, height));
+    const auto level = test_pixels(width, height, width * 31 + height);
+    const auto tail = box_mip_tail_rgba8(width, height, level);
+    const auto expected = reference_box_tail(level, width, height);
+    EXPECT_EQ(tail.size(), calc_texture_size(Format::RGBA8Unorm, width, height, full_mip_count(width, height)) -
+                               calc_texture_size(Format::RGBA8Unorm, width, height, 1));
+    EXPECT_TRUE(tail.size() == expected.size() && std::equal(expected.begin(), expected.end(), tail.data()));
+  }
+  EXPECT_TRUE(box_mip_tail_rgba8(1, 1, test_pixels(1, 1, 1)).empty());
+  const auto pixels = test_pixels(4, 4, 2);
+  EXPECT_TRUE(box_mip_tail_rgba8(4, 4, {pixels.data(), pixels.size() - 4}).empty());
+  EXPECT_TRUE(box_mip_tail_rgba8(0, 4, {}).empty());
+}
+
+TEST(MipTailTest, ReportsCostAt1024) {
+  constexpr uint32_t Size = 1024;
+  const auto level = test_pixels(Size, Size, 5);
+  int64_t best = INT64_MAX;
+  for (int run = 0; run < 3; ++run) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto tail = box_mip_tail_rgba8(Size, Size, level);
+    const auto micros =
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+    best = std::min<int64_t>(best, micros);
+    ASSERT_EQ(tail.size(), calc_texture_size(Format::RGBA8Unorm, Size, Size, full_mip_count(Size, Size)) -
+                               calc_texture_size(Format::RGBA8Unorm, Size, Size, 1));
+  }
+  std::printf("box mip tail at %ux%u: %lld us (best of 3)\n", Size, Size, static_cast<long long>(best));
+}
+
+constexpr u32 HwRepeat = GX_REPEAT | GX_REPEAT << 2;
+constexpr u32 HwLinearMin = 4u << 5;
+constexpr u32 HwLinMipLinMin = 6u << 5;
+constexpr u32 HwLinearMag = 1u << 4;
+constexpr u32 HwAniso4 = 2u << 19;
+
+TextureBind sampler_bind(u32 mode0, bool generatedMips, bool replacement = false) {
+  TextureBind bind;
+  bind.ref =
+      std::make_shared<TextureRef>(wgpu::Texture{}, wgpu::TextureView{}, wgpu::TextureView{}, wgpu::Extent3D{16, 16, 1},
+                                   Format::RGBA8Unorm, full_mip_count(16, 16), GX_TF_I8);
+  bind.ref->generatedMips = generatedMips;
+  bind.ref->isReplacement = replacement;
+  bind.texObj.mode0 = mode0;
+  return bind;
+}
+
+bool same_sampling(const wgpu::SamplerDescriptor& lhs, const wgpu::SamplerDescriptor& rhs) {
+  return lhs.addressModeU == rhs.addressModeU && lhs.addressModeV == rhs.addressModeV &&
+         lhs.addressModeW == rhs.addressModeW && lhs.magFilter == rhs.magFilter && lhs.minFilter == rhs.minFilter &&
+         lhs.mipmapFilter == rhs.mipmapFilter && lhs.lodMinClamp == rhs.lodMinClamp &&
+         lhs.lodMaxClamp == rhs.lodMaxClamp && lhs.compare == rhs.compare && lhs.maxAnisotropy == rhs.maxAnisotropy;
+}
+
+class GeneratedMipSamplerTest : public ::testing::Test {
+protected:
+  void SetUp() override { webgpu::g_graphicsConfig.textureAnisotropy = 16; }
+  void TearDown() override { webgpu::g_graphicsConfig.textureAnisotropy = m_savedAnisotropy; }
+
+private:
+  decltype(webgpu::g_graphicsConfig.textureAnisotropy) m_savedAnisotropy = webgpu::g_graphicsConfig.textureAnisotropy;
+};
+
+TEST_F(GeneratedMipSamplerTest, LinearMiplessWidensOnlyWithGeneratedMips) {
+  constexpr u32 Mode0 = HwRepeat | HwLinearMag | HwLinearMin | HwAniso4;
+  const auto legacy = sampler_bind(Mode0, false).get_descriptor();
+  EXPECT_EQ(legacy.lodMinClamp, 0.f);
+  EXPECT_EQ(legacy.lodMaxClamp, 0.f);
+  EXPECT_EQ(legacy.mipmapFilter, wgpu::MipmapFilterMode::Undefined);
+  EXPECT_EQ(legacy.maxAnisotropy, 1u);
+
+  const auto generated = sampler_bind(Mode0, true);
+  const auto widened = generated.get_descriptor();
+  EXPECT_EQ(widened.lodMinClamp, 0.f);
+  EXPECT_EQ(widened.lodMaxClamp, 1000.f);
+  EXPECT_EQ(widened.mipmapFilter, wgpu::MipmapFilterMode::Linear);
+  EXPECT_EQ(widened.maxAnisotropy, 1u);
+  EXPECT_EQ(widened.minFilter, legacy.minFilter);
+  EXPECT_EQ(widened.magFilter, legacy.magFilter);
+  EXPECT_TRUE(same_sampling(generated.get_descriptor(true), legacy));
+}
+
+TEST_F(GeneratedMipSamplerTest, OtherFiltersKeepLegacyDescriptor) {
+  struct Case {
+    u32 mode0;
+    bool replacement;
+  };
+  constexpr std::array Cases{
+      Case{HwRepeat | HwAniso4, false},
+      Case{HwRepeat | HwLinearMag | HwLinMipLinMin | HwAniso4, false},
+      Case{HwRepeat | HwLinearMag | HwLinearMin | HwAniso4, true},
+  };
+  for (const auto& entry : Cases) {
+    SCOPED_TRACE(entry.mode0);
+    const auto plain = sampler_bind(entry.mode0, false, entry.replacement).get_descriptor();
+    const auto generated = sampler_bind(entry.mode0, true, entry.replacement).get_descriptor();
+    EXPECT_TRUE(same_sampling(plain, generated));
+  }
+}
+
+TEST_F(GeneratedMipSamplerTest, GeneratedMipsIgnoreLodBias) {
+  constexpr u32 HalfBias = 16u << 9;
+  EXPECT_EQ(sampler_bind(HwRepeat | HwLinearMin | HalfBias, true).sample_lod_bias(), 0.f);
+  EXPECT_EQ(sampler_bind(HwRepeat | HwLinearMin | HalfBias, false).sample_lod_bias(), 0.5f);
+  EXPECT_EQ(sampler_bind(HwRepeat | HalfBias, true).sample_lod_bias(), 0.5f);
+}
+
+class MipGenerationTest : public MipRepairTest {
+protected:
+  // After shutdown, so no resident chain re-queues a read from a source the test body already destroyed
+  void TearDown() override {
+    MipRepairTest::TearDown();
+    set_mip_generation(false);
+  }
+
+  void write_base(const std::filesystem::path& path, uint32_t seed) const {
+    std::filesystem::create_directories(path.parent_path());
+    const auto bytes = rgba8_dds(16, 16, test_pixels(16, 16, seed));
+    std::ofstream file(path, std::ios::binary);
+    file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  }
+};
+
+std::vector<uint8_t> generated_tail(uint32_t width, uint32_t height, const std::vector<uint8_t>& level) {
+  const auto tail = box_mip_tail_rgba8(width, height, level);
+  return std::vector<uint8_t>(tail.data(), tail.data() + tail.size());
+}
+
+TEST_F(MipGenerationTest, MiplessChainGeneratesFromBase) {
+  const auto chain = write_chain("tex1_16x8_000000000000f001_6", {{16, 8}});
+  ScopedWarningCapture capture;
+  ChainReport off;
+  const auto legacy = testing::load_replacement_file(chain.path, false, &off);
+  ASSERT_TRUE(legacy.has_value());
+  EXPECT_EQ(legacy->mips, 1u);
+  EXPECT_TRUE(holds_bytes(*legacy, chain.levels[0]));
+  EXPECT_EQ(off.verdict, ChainVerdict::Mipless);
+  EXPECT_EQ(off.generatable, mip_repair_built());
+  EXPECT_FALSE(off.generated);
+  if (!mip_repair_built()) {
+    GTEST_SKIP() << "render module disabled";
+  }
+
+  ChainReport on;
+  const auto generated = testing::load_replacement_file(chain.path, false, &on, true);
+  ASSERT_TRUE(generated.has_value());
+  EXPECT_EQ(generated->mips, 5u);
+  const auto tail = generated_tail(16, 8, chain.levels[0]);
+  EXPECT_TRUE(holds_bytes(*generated, joined({&chain.levels[0], &tail})));
+  EXPECT_EQ(on.verdict, ChainVerdict::Mipless);
+  EXPECT_TRUE(on.generatable);
+  EXPECT_TRUE(on.generated);
+  EXPECT_FALSE(on.repaired);
+  EXPECT_EQ(on.generatedLevels, 4u);
+  EXPECT_EQ(capture.warnings(), 0u);
+  EXPECT_EQ(capture.debugs("generated 4 mips for"), 1u);
+}
+
+TEST_F(MipGenerationTest, ShortChainGeneratesFromLastLevel) {
+  const auto chain = write_chain("tex1_16x16_000000000000f002_6", {{16, 16}, {8, 8}});
+  ChainReport off;
+  const auto legacy = testing::load_replacement_file(chain.path, false, &off);
+  ASSERT_TRUE(legacy.has_value());
+  EXPECT_EQ(legacy->mips, 2u);
+  EXPECT_EQ(off.verdict, ChainVerdict::Short);
+  if (!mip_repair_built()) {
+    GTEST_SKIP() << "render module disabled";
+  }
+
+  ChainReport on;
+  const auto generated = testing::load_replacement_file(chain.path, false, &on, true);
+  ASSERT_TRUE(generated.has_value());
+  EXPECT_EQ(generated->mips, 5u);
+  const auto tail = generated_tail(8, 8, chain.levels[1]);
+  EXPECT_TRUE(holds_bytes(*generated, joined({&chain.levels[0], &chain.levels[1], &tail})));
+  EXPECT_EQ(on.verdict, ChainVerdict::Short);
+  EXPECT_EQ(on.keptLevels, 2u);
+  EXPECT_EQ(on.generatedLevels, 3u);
+  EXPECT_TRUE(on.generated);
+  EXPECT_FALSE(on.repaired);
+}
+
+TEST_F(MipGenerationTest, RepairAndGenerationGatesAreIndependent) {
+  if (!mip_repair_built()) {
+    GTEST_SKIP() << "render module disabled";
+  }
+  const auto clamped = write_chain("tex1_16x16_000000000000f003_6", {{16, 16}, {8, 8}, {8, 8}});
+  const auto mipless = write_chain("tex1_16x16_000000000000f004_6", {{16, 16}});
+  struct Case {
+    const Chain* chain;
+    bool repair;
+    bool generate;
+    uint32_t mips;
+  };
+  const std::array cases{
+      Case{&clamped, false, true, 2},
+      Case{&clamped, true, false, 5},
+      Case{&mipless, true, false, 1},
+      Case{&mipless, false, true, 5},
+  };
+  for (const auto& entry : cases) {
+    SCOPED_TRACE(
+        fmt::format("{} repair {} generate {}", entry.chain->path.filename().string(), entry.repair, entry.generate));
+    ChainReport report;
+    const auto loaded = testing::load_replacement_file(entry.chain->path, entry.repair, &report, entry.generate);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(loaded->mips, entry.mips);
+    EXPECT_EQ(report.repaired, entry.chain == &clamped && entry.repair);
+    EXPECT_EQ(report.generated, entry.chain == &mipless && entry.generate);
+  }
+}
+
+TEST_F(MipGenerationTest, ExcludedDirectoriesNeverGenerate) {
+  if (!mip_repair_built()) {
+    GTEST_SKIP() << "render module disabled";
+  }
+  testing::set_workers_paused(true);
+  constexpr std::array<std::string_view, 1> Excluded{"ui"};
+  const auto root = m_dir / "pack";
+  write_base(root / "UI" / "tex1_16x16_000000000000f005_6.dds", 1);
+  write_base(root / "env" / "tex1_16x16_000000000000f006_6.dds", 2);
+  ScopedCachePath cachePath{m_dir / "cache"};
+  const auto group = texture::load_replacement_directory(root, {.noGeneratedMipDirs = Excluded});
+  ASSERT_EQ(group.registrations.size(), 2u);
+  for (const auto& registration : group.registrations) {
+    const bool ui = std::get<texture::TextureSourceKey>(registration.key).textureHash == 0xf005;
+    SCOPED_TRACE(ui);
+    ChainReport report;
+    const auto loaded = testing::load_replacement_texture(registration, false, &report, true);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(report.verdict, ChainVerdict::Mipless);
+    EXPECT_EQ(report.generatable, !ui);
+    EXPECT_EQ(report.generated, !ui);
+    EXPECT_EQ(loaded->mips, ui ? 1u : 5u);
+  }
+  texture::unregister_replacements(group);
+
+  MapSource source;
+  const std::string uiPath = "mod/UI/tex1_16x16_000000000000f007_6.dds";
+  const std::string envPath = "mod/env/tex1_16x16_000000000000f008_6.dds";
+  source.files[uiPath] = rgba8_dds(16, 16, test_pixels(16, 16, 3));
+  source.files[envPath] = rgba8_dds(16, 16, test_pixels(16, 16, 4));
+  for (const auto& [path, ui] : {std::pair{uiPath, true}, std::pair{envPath, false}}) {
+    SCOPED_TRACE(path);
+    const auto registration =
+        texture::register_virtual_replacement(path, source.callbacks(), {.noGeneratedMipDirs = Excluded});
+    ASSERT_NE(registration.id, 0u);
+    ChainReport report;
+    const auto loaded = testing::load_replacement_texture(registration, false, &report, true);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(report.generatable, !ui);
+    EXPECT_EQ(loaded->mips, ui ? 1u : 5u);
+    texture::unregister_replacement(registration);
+  }
+}
+
+TEST_F(MipGenerationTest, ArbBaseStaysMipless) {
+  const auto chain = write_chain("tex1_16x16_000000000000f009_6_arb", {{16, 16}});
+  ChainReport report;
+  const auto loaded = testing::load_replacement_file(chain.path, true, &report, true);
+  ASSERT_TRUE(loaded.has_value());
+  EXPECT_EQ(loaded->mips, 1u);
+  EXPECT_TRUE(holds_bytes(*loaded, chain.levels[0]));
+  EXPECT_EQ(report.verdict, ChainVerdict::Mipless);
+  EXPECT_FALSE(report.generatable);
+  EXPECT_FALSE(report.generated);
+}
+
+TEST_F(MipGenerationTest, StaleCompletionIsRequeued) {
+  if (!mip_repair_built()) {
+    GTEST_SKIP() << "render module disabled";
+  }
+  testing::set_workers_paused(true);
+  MapSource source;
+  source.files[virtual_name(0xf00a)] = rgba8_dds(128, 128, test_pixels(128, 128, 1));
+  source.gatePath = virtual_name(0xf00a);
+  const auto registration = texture::register_virtual_replacement(virtual_name(0xf00a), source.callbacks());
+  ASSERT_NE(registration.id, 0u);
+  GXTexObj_ obj{};
+  const auto key = std::get<texture::TextureSourceKey>(registration.key);
+  ASSERT_TRUE(find_source_replacement(obj, key).has_value());
+
+  testing::set_workers_paused(false);
+  ASSERT_TRUE(source.wait_for_gate());
+  set_mip_generation(true);
+  source.release_gate();
+  // The full load and the thumbnail probe of the mipless base
+  ASSERT_TRUE(testing::wait_for_completions(registration.id, 2, 2000));
+  const auto stats = process_streaming();
+  EXPECT_EQ(stats.publishes, 0u);
+  EXPECT_EQ(stats.pendingLoads, 1u);
+  EXPECT_FALSE(testing::resident_chain(registration.key).has_value());
+  EXPECT_TRUE(testing::wait_for_completions(registration.id, 1, 2000));
+}
+
+TEST_F(MipGenerationTest, ToggleRequeuesOnlyGeneratableResidentChains) {
+  RecordingSource source;
+  testing::set_workers_paused(true);
+  const auto png_name = [](uint32_t hash) { return fmt::format("tex1_16x16_{:016x}_6.png", hash); };
+  const auto register_png = [&](uint32_t hash) {
+    return texture::register_virtual_replacement(png_name(hash), {.read = &RecordingSource::read, .userData = &source});
+  };
+  const auto generatable = register_png(0xf010);
+  const auto repairable = register_png(0xf011);
+  const auto complete = register_png(0xf012);
+  const auto shadowed = register_png(0xf013);
+  const auto selected = register_png(0xf013);
+  const ChainReport mipless{.verdict = ChainVerdict::Mipless, .generatable = true};
+  ASSERT_TRUE(testing::seed_resident_full(generatable, Format::RGBA8Unorm, 16, 16, 1, mipless));
+  ASSERT_TRUE(testing::seed_resident_full(repairable, Format::RGBA8Unorm, 16, 16, 2,
+                                          {.verdict = ChainVerdict::Clamped, .repairable = true}));
+  ASSERT_TRUE(
+      testing::seed_resident_full(complete, Format::RGBA8Unorm, 16, 16, 5, {.verdict = ChainVerdict::Complete}));
+  ASSERT_TRUE(testing::seed_resident_full(shadowed, Format::RGBA8Unorm, 16, 16, 1, mipless));
+
+  set_mip_generation(true);
+  set_mip_generation(true);
+  testing::set_workers_paused(false);
+  EXPECT_TRUE(testing::wait_for_completions(generatable.id, 1, 2000));
+  EXPECT_FALSE(testing::wait_for_completions(repairable.id, 1, 200));
+  EXPECT_FALSE(testing::wait_for_completions(complete.id, 1, 0));
+  EXPECT_FALSE(testing::wait_for_completions(shadowed.id, 1, 0));
+  EXPECT_FALSE(testing::wait_for_completions(selected.id, 1, 0));
+  EXPECT_FALSE(testing::wait_for_completions(generatable.id, 2, 0));
+  {
+    std::lock_guard lock{source.mutex};
+    EXPECT_EQ(source.paths, std::vector<std::string>{png_name(0xf010)});
+  }
+  const auto resident = testing::resident_chain(generatable.key);
+  ASSERT_TRUE(resident.has_value());
+  EXPECT_TRUE(resident->generatable);
+  EXPECT_TRUE(testing::resident_chain(repairable.key).has_value());
+  EXPECT_TRUE(testing::resident_chain(complete.key).has_value());
+}
+
+TEST_F(MipGenerationTest, SynchronousToggleErasesGeneratableResidentChains) {
+  RecordingSource source;
+  set_synchronous_loads(true);
+  const auto png_name = [](uint32_t hash) { return fmt::format("tex1_16x16_{:016x}_6.png", hash); };
+  const auto generatable =
+      texture::register_virtual_replacement(png_name(0xf014), {.read = &RecordingSource::read, .userData = &source});
+  const auto complete =
+      texture::register_virtual_replacement(png_name(0xf015), {.read = &RecordingSource::read, .userData = &source});
+  ASSERT_TRUE(testing::seed_resident_full(generatable, Format::RGBA8Unorm, 16, 16, 2,
+                                          {.verdict = ChainVerdict::Short, .generatable = true}));
+  ASSERT_TRUE(
+      testing::seed_resident_full(complete, Format::RGBA8Unorm, 16, 16, 5, {.verdict = ChainVerdict::Complete}));
+
+  set_mip_generation(true);
+  EXPECT_FALSE(testing::resident_chain(generatable.key).has_value());
+  const auto kept = testing::resident_chain(complete.key);
+  ASSERT_TRUE(kept.has_value());
+  EXPECT_EQ(kept->verdict, ChainVerdict::Complete);
+  EXPECT_FALSE(testing::wait_for_completions(generatable.id, 1, 200));
+  std::lock_guard lock{source.mutex};
+  EXPECT_TRUE(source.paths.empty());
+}
+
 class ReplacementPackSweep : public MipRepairTest {};
 
 double srgb_to_linear(double value) {
@@ -1539,9 +1900,23 @@ TEST_F(ReplacementPackSweep, HasNoMipWarnings) {
   BcCapsGuard caps{true};
   testing::set_workers_paused(true);
   ScopedWarningCapture capture;
-  const auto group = texture::load_replacement_directory(root);
+  constexpr std::array<std::string_view, 1> NoGeneratedMipDirs{"UI"};
+  const auto group = texture::load_replacement_directory(root, {.noGeneratedMipDirs = NoGeneratedMipDirs});
   ASSERT_FALSE(group.registrations.empty());
   const auto paths = base_paths_by_name(root);
+  const auto in_ui_dir = [&](const std::string& name) {
+    const auto path = paths.find(name);
+    if (path == paths.end()) {
+      return false;
+    }
+    const auto relative = path->second.parent_path().lexically_relative(root);
+    return std::any_of(relative.begin(), relative.end(), [](const std::filesystem::path& component) {
+      auto text = component.string();
+      std::transform(text.begin(), text.end(), text.begin(),
+                     [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+      return text == "ui";
+    });
+  };
 
   std::map<ChainVerdict, size_t> verdicts;
   std::vector<double> repairMicros;
@@ -1550,19 +1925,33 @@ TEST_F(ReplacementPackSweep, HasNoMipWarnings) {
   std::vector<double> linearDelta;
   std::vector<double> encodeDelta;
   size_t failures = 0;
+  size_t uiCandidates = 0;
+  size_t uiGeneratable = 0;
+  std::vector<std::string> generatedNames;
   for (const auto& registration : group.registrations) {
     ChainReport report;
-    const auto loaded = testing::load_replacement_texture(registration, true, &report);
+    const auto loaded = testing::load_replacement_texture(registration, true, &report, true);
     ++verdicts[report.verdict];
     if (!loaded.has_value()) {
       ++failures;
       continue;
     }
+    const auto& key = std::get<texture::TextureSourceKey>(registration.key);
+    const auto name = build_texture_replacement_name(key);
+    const bool ui = in_ui_dir(name);
+    if (ui && (report.verdict == ChainVerdict::Mipless || report.verdict == ChainVerdict::Short)) {
+      ++uiCandidates;
+    }
+    if (report.generatable) {
+      EXPECT_TRUE(report.generated) << name;
+      EXPECT_EQ(loaded->mips, full_mip_count(loaded->width, loaded->height)) << name;
+      uiGeneratable += ui ? 1 : 0;
+      const auto path = paths.find(name);
+      generatedNames.push_back(path != paths.end() ? path->second.lexically_relative(root).generic_string() : name);
+    }
     if (report.verdict != ChainVerdict::Clamped && report.verdict != ChainVerdict::Invalid) {
       continue;
     }
-    const auto& key = std::get<texture::TextureSourceKey>(registration.key);
-    const auto name = build_texture_replacement_name(key);
     EXPECT_TRUE(report.repaired) << name;
     EXPECT_EQ(loaded->mips, full_mip_count(loaded->width, loaded->height)) << name;
     EXPECT_EQ(report.keptLevels + report.generatedLevels, report.fullLevels) << name;
@@ -1628,6 +2017,7 @@ TEST_F(ReplacementPackSweep, HasNoMipWarnings) {
   }
   EXPECT_EQ(warnings.size(), 0u);
   EXPECT_EQ(failures, 0u);
+  EXPECT_EQ(uiGeneratable, 0u);
   constexpr std::array<std::string_view, 8> VerdictNames{"Unprobed", "Mipless", "Internal", "Complete",
                                                          "Short",    "Clamped", "Invalid",  "Broken"};
   std::string histogram;
@@ -1637,6 +2027,11 @@ TEST_F(ReplacementPackSweep, HasNoMipWarnings) {
   std::printf("registrations %zu, failures %zu, verdicts:%s\n", group.registrations.size(), failures,
               histogram.c_str());
   std::printf("repair time: %s\n", summarize(repairMicros, 0.001, " ms").c_str());
+  std::printf("generated %zu, UI generatable %zu (UI mipless or short %zu)\n", generatedNames.size(), uiGeneratable,
+              uiCandidates);
+  for (size_t i = 0; i < std::min<size_t>(generatedNames.size(), 5); ++i) {
+    std::printf("  generated %s\n", generatedNames[i].c_str());
+  }
   std::sort(slowest.begin(), slowest.end(), std::greater<>{});
   for (size_t i = 0; i < std::min<size_t>(slowest.size(), 3); ++i) {
     std::printf("  %.3f ms %s\n", slowest[i].first * 0.001, slowest[i].second.c_str());

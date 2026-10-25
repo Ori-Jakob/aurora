@@ -20,6 +20,8 @@ extern u32 g_testLastResolveInfoSize;
 extern GXCompare g_testPopulateDepthFunc;
 extern u32 g_testPopulateTevStageCount;
 extern std::bitset<MaxTextures> g_testStochasticEligible;
+extern std::bitset<MaxTextures> g_testSampledTextures;
+extern bool g_testLastBindBaseLevel;
 } // namespace aurora::gx
 
 namespace aurora::gfx {
@@ -49,12 +51,14 @@ namespace hints = aurora::gx::hints;
 namespace route = aurora::gx::draw_route;
 namespace render_ext = aurora::gx::render_ext;
 using aurora::gx::g_gxState;
+using aurora::gx::g_testLastBindBaseLevel;
 using aurora::gx::g_testLastResolveInfoSize;
 using aurora::gx::g_testLastUniformInfoSize;
 using aurora::gx::g_testPipelineBuildCount;
 using aurora::gx::g_testPopulateDepthFunc;
 using aurora::gx::g_testPopulateTevStageCount;
 using aurora::gx::g_testResolveCount;
+using aurora::gx::g_testSampledTextures;
 using aurora::gx::g_testShaderInfoCount;
 using aurora::gx::g_testStochasticEligible;
 using aurora::gx::g_testUniformBuildCount;
@@ -108,6 +112,17 @@ gfx::TextureBind repeat_bind(uint32_t flags) {
   bind.texObj.mode0 = GX_REPEAT | GX_REPEAT << 2;
   bind.material = {flags != 0 ? 1u : 0u, flags};
   return bind;
+}
+
+gfx::TextureBind mip_bind(bool generatedMips) {
+  gfx::TextureBind bind = repeat_bind(0);
+  bind.ref->generatedMips = generatedMips;
+  return bind;
+}
+
+void set_projection(GXProjectionType type) {
+  f32 mtx[4][4]{};
+  GXSetProjection(mtx, type);
 }
 
 aurora::Vec4<float> g_hookLane{1.f, 0.f, 0.6f, 7.f};
@@ -182,6 +197,8 @@ protected:
     render_ext::set_hooks(nullptr);
     render_ext::g_stochasticUniforms = {};
     g_testStochasticEligible.reset();
+    g_testSampledTextures.reset();
+    g_testLastBindBaseLevel = false;
     gfx::g_testPipelineState = gfx::PipelineState::Ready;
     gfx::g_testPipelineEpoch = 0;
     gfx::g_testReadyLegacyRef = 0;
@@ -671,6 +688,83 @@ TEST_F(GXDrawRouteTest, EndFrameRebindsWithoutLookup) {
   EXPECT_EQ(zones.calls(fifo::CpuZoneUniformBuild), 2u);
   EXPECT_EQ(gfx::g_testLastDraw.pipeline, ref);
   EXPECT_EQ(g_gxState.dirty, 0u);
+}
+
+TEST_F(GXDrawRouteTest, DrawClassFlipRebindsOnlyGeneratedMips) {
+  gfx::g_testMergeDraws = false;
+  g_testSampledTextures = 1;
+  for (const bool generatedMips : {false, true}) {
+    SCOPED_TRACE(generatedMips);
+    g_gxState.textures[0] = mip_bind(generatedMips);
+    set_projection(GX_PERSPECTIVE);
+    GXSetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
+    triangle();
+    decode();
+    g_gxState.dirty |= aurora::gx::DirtyTextures;
+    triangle();
+    decode();
+    EXPECT_FALSE(g_testLastBindBaseLevel);
+    const uint32_t rebinds = generatedMips ? 1u : 0u;
+
+    const CpuZoneDelta zones;
+    set_projection(GX_ORTHOGRAPHIC);
+    triangle();
+    decode();
+    EXPECT_EQ(zones.calls(fifo::CpuZoneBindGroupBuild), rebinds);
+    EXPECT_EQ(g_testLastBindBaseLevel, generatedMips);
+
+    set_projection(GX_ORTHOGRAPHIC);
+    triangle();
+    decode();
+    EXPECT_EQ(zones.calls(fifo::CpuZoneBindGroupBuild), rebinds);
+
+    set_projection(GX_PERSPECTIVE);
+    triangle();
+    decode();
+    EXPECT_EQ(zones.calls(fifo::CpuZoneBindGroupBuild), 2 * rebinds);
+    EXPECT_FALSE(g_testLastBindBaseLevel);
+
+    GXSetAlphaCompare(GX_GEQUAL, 0x80, GX_AOP_AND, GX_ALWAYS, 0);
+    triangle();
+    decode();
+    EXPECT_EQ(zones.calls(fifo::CpuZoneBindGroupBuild), 3 * rebinds);
+    EXPECT_EQ(g_testLastBindBaseLevel, generatedMips);
+
+    GXSetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
+    triangle();
+    decode();
+    EXPECT_EQ(zones.calls(fifo::CpuZoneBindGroupBuild), 4 * rebinds);
+    EXPECT_FALSE(g_testLastBindBaseLevel);
+    EXPECT_EQ(g_gxState.dirty, 0u);
+  }
+}
+
+TEST_F(GXDrawRouteTest, FullProjectionLoadReclassifiesDraw) {
+  gfx::g_testMergeDraws = false;
+  g_testSampledTextures = 1;
+  g_gxState.textures[0] = mip_bind(true);
+  set_projection(GX_PERSPECTIVE);
+  triangle();
+  decode();
+  g_gxState.dirty |= aurora::gx::DirtyTextures;
+  triangle();
+  decode();
+  ASSERT_FALSE(g_testLastBindBaseLevel);
+
+  const CpuZoneDelta zones;
+  const f32 ortho[16]{1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, -1.f, 0.f, 0.f, 0.f, 0.f, 1.f};
+  GXSetProjectionFull(ortho);
+  triangle();
+  decode();
+  EXPECT_EQ(zones.calls(fifo::CpuZoneBindGroupBuild), 1u);
+  EXPECT_TRUE(g_testLastBindBaseLevel);
+
+  const f32 perspective[16]{1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, -1.f, -1.f, 0.f, 0.f, -1.f, 0.f};
+  GXSetProjectionFull(perspective);
+  triangle();
+  decode();
+  EXPECT_EQ(zones.calls(fifo::CpuZoneBindGroupBuild), 2u);
+  EXPECT_FALSE(g_testLastBindBaseLevel);
 }
 
 TEST_F(GXDrawRouteTest, StochasticHookAbsentKeepsCounts) {

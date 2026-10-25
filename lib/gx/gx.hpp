@@ -574,7 +574,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
                                 uint32_t normalAttachment = UINT32_MAX) noexcept;
 wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout,
                                 DstAlphaMode dstAlphaMode) noexcept;
-GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept;
+GXBindGroups build_bind_groups(const ShaderInfo& info, bool baseLevel = false) noexcept;
 
 u8 comp_type_size(GXAttr attr, GXCompType type) noexcept;
 u8 comp_cnt_count(GXAttr attr, GXCompCnt cnt) noexcept;

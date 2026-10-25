@@ -160,6 +160,9 @@ struct DrawCache {
   bool extWaiting = false;
   GXBindGroups bindGroups{};
   uint64_t bindGeneration = 0;
+  // Binds holding generated mips depend on the draw class, so a class flip rebuilds them
+  bool baseLevelBinds = false;
+  bool bindsGeneratedMips = false;
   GXVtxFmt fmt = GX_MAX_VTXFMT;
   u8 lineMode = 0;
   bool hasPipeline = false;
@@ -747,6 +750,21 @@ static u32 calc_vtx_size(GXVtxFmt fmt) noexcept {
   return vtxSize;
 }
 
+// 2D and alpha-tested draws sample level 0 like the mipless original; projType goes stale on a full load
+static bool draw_keeps_base_level() noexcept {
+  return g_gxState.proj[3][3] != 0.f || static_cast<bool>(g_gxState.alphaCompare);
+}
+
+static bool binds_generated_mips(const ShaderInfo& info) noexcept {
+  const auto sampled = info.sampledTextures | info.sampledIndTextures;
+  for (u32 i = 0; i < MaxTextures; ++i) {
+    if (sampled.test(i) && g_gxState.textures[i].ref && g_gxState.textures[i].ref->generatedMips) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
                          u32 numIndices) noexcept {
   ZoneScoped;
@@ -810,8 +828,10 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     }
   }
 
-  const bool bindGroupsValid =
-      (state.dirty & DirtyTextures) == 0 && cache.bindGeneration == texture::current_bind_generation();
+  const bool baseLevel = draw_keeps_base_level();
+  const bool bindGroupsValid = (state.dirty & DirtyTextures) == 0 &&
+                               cache.bindGeneration == texture::current_bind_generation() &&
+                               (!cache.bindsGeneratedMips || cache.baseLevelBinds == baseLevel);
   bool bindsRebuilt = false;
   if (!bindGroupsValid) {
     ZoneScopedN("build bind groups");
@@ -819,8 +839,10 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     bindsRebuilt = true;
     const auto prevBindGroup = cache.bindGroups.textureBindGroup;
     resolve_sampled_textures(cache.shaderInfo);
-    cache.bindGroups = build_bind_groups(cache.shaderInfo);
+    cache.bindGroups = build_bind_groups(cache.shaderInfo, baseLevel);
     cache.bindGeneration = texture::current_bind_generation();
+    cache.baseLevelBinds = baseLevel;
+    cache.bindsGeneratedMips = binds_generated_mips(cache.shaderInfo);
     state.dirty &= ~DirtyTextures;
     // For texture_size_bias uniform
     if (cache.bindGroups.textureBindGroup != prevBindGroup) {

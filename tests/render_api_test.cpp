@@ -71,6 +71,7 @@ Settings random_settings(std::mt19937& rng) {
   s.textureMaterials = random_bool(rng);
   s.stochasticTiling = random_bool(rng);
   s.legacyMatMaps = random_bool(rng);
+  s.generateMissingMips = random_bool(rng);
   s.pbr = random_bool(rng);
   s.legacyBlend = random_float(rng);
   s.exposure = random_enum(rng, Exposure::Manual);
@@ -226,6 +227,19 @@ TEST_F(RenderApiTest, MaterialFeaturesBuiltByDefault) {
         clamp_settings({.textureMaterials = true, .stochasticTiling = true}, env(caps, built, msaa));
     EXPECT_TRUE(clamped.textureMaterials) << msaa;
     EXPECT_TRUE(clamped.stochasticTiling) << msaa;
+  }
+}
+
+TEST_F(RenderApiTest, GenerateMissingMipsIsNeverClamped) {
+  const BuiltOptions all = built_all();
+  const Settings request{.generateMissingMips = true};
+  const std::array envs{env(full_caps(), all), env(Caps{}, all), detail::SupportEnv{full_caps(), 1, all, false}};
+  for (size_t i = 0; i < envs.size(); ++i) {
+    EXPECT_TRUE(clamp_settings(request, envs[i]).generateMissingMips) << "env " << i;
+  }
+  for (size_t i = 0; i < FeatureCount; ++i) {
+    EXPECT_EQ(feature_enabled(request, feature_at(i)), feature_enabled(Settings{}, feature_at(i)))
+        << feature_name(feature_at(i));
   }
 }
 

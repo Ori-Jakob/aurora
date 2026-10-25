@@ -34,6 +34,7 @@ struct TextureStats {
   uint64_t sourceKeyBuilds = 0;
   uint64_t sourceKeyBytes = 0;
   uint64_t materialLookups = 0;
+  uint64_t generatedMipTextures = 0;
 };
 
 const TextureStats& texture_stats() noexcept;
@@ -72,6 +73,9 @@ void invalidate_replacement(uint64_t replacementId) noexcept;
 void set_material_lookup(const MaterialLookup* lookup) noexcept;
 uint64_t source_key_builds_total() noexcept;
 void end_frame() noexcept;
+// Any thread; end_frame latches it with the FIFO drained
+void set_generate_missing_mips(bool enabled) noexcept;
+bool generate_missing_mips_requested() noexcept;
 void shutdown() noexcept;
 
 GXState::CopyTextureRef resolve_copy_texture(const GXState::CopyTextureKey& key) noexcept;

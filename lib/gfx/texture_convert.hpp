@@ -3,6 +3,8 @@
 #include "texture.hpp"
 #include "../webgpu/gpu.hpp"
 
+#include <algorithm>
+
 namespace aurora::gfx {
 inline bool is_pc_texture_format(u32 gxFormat) noexcept {
   return (gxFormat & _GX_TF_PC) != 0;
@@ -56,5 +58,16 @@ ConvertedTexture convert_texture_palette(u32 textureFormat, uint32_t width, uint
                                          ArrayRef<uint8_t> textureData, GXTlutFmt tlutFormat, uint16_t tlutEntries,
                                          ArrayRef<uint8_t> tlutData);
 ConvertedTexture convert_tlut(u32 format, uint32_t width, ArrayRef<uint8_t> data);
+constexpr uint32_t full_mip_count(uint32_t width, uint32_t height) noexcept {
+  uint32_t count = 1;
+  while (width > 1 || height > 1) {
+    width = std::max(width >> 1, 1u);
+    height = std::max(height >> 1, 1u);
+    ++count;
+  }
+  return count;
+}
+// W8's stored-space box filter: every level below width x height down to 1x1, concatenated; empty on bad input
+ByteBuffer box_mip_tail_rgba8(uint32_t width, uint32_t height, ArrayRef<uint8_t> level) noexcept;
 GXTexFmt tlut_texture_format(GXTlutFmt format) noexcept;
 } // namespace aurora::gfx

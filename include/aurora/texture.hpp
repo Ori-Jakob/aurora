@@ -46,6 +46,8 @@ struct RawTextureReplacement {
 
 struct ReplacementOptions {
   int32_t priority = 0;
+  // Directory names (any depth, ASCII case-insensitive) whose bases never get generated mips; read only during the call
+  std::span<const std::string_view> noGeneratedMipDirs = {};
 };
 
 struct ReplacementRegistration {

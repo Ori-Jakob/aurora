@@ -9,6 +9,7 @@
 #include "../gfx/frame.hpp"
 #include "../gfx/recording.hpp"
 #include "../gfx/texture_replacement.hpp"
+#include "../gx/texture.hpp"
 #include "../logging.hpp"
 #include "../webgpu/caps.hpp"
 
@@ -19,11 +20,14 @@
 #include "scene/classify.hpp"
 #endif
 
+#include <SDL3/SDL_stdinc.h>
+
 #include <algorithm>
 #include <cmath>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace aurora::render::detail {
@@ -288,6 +292,19 @@ bool module_features_effective(const Settings& settings) noexcept {
   constexpr FeatureMask MaterialFeatures =
       bit(Feature::TextureMaterials) | bit(Feature::StochasticTiling) | bit(Feature::LegacyMatMaps);
   return (enabled_features(settings) & ~MaterialFeatures) != 0;
+}
+
+// A verification hook like AURORA_RENDER_STOCHASTIC; gxreplay applies Settings only for --debug-view
+bool generate_mips_env() noexcept {
+  static const bool enabled = [] {
+    const char* value = SDL_getenv("AURORA_RENDER_GENERATE_MIPS");
+    if (value == nullptr || std::string_view{value} != "on") {
+      return false;
+    }
+    Log.warn("AURORA_RENDER_GENERATE_MIPS=on: generating missing mips regardless of settings");
+    return true;
+  }();
+  return enabled;
 }
 
 void log_latched_settings(uint64_t generation, FeatureMask previous, const Settings& latched) {
@@ -674,6 +691,9 @@ std::shared_ptr<const FrameState> latch_frame() {
   }
   // Unconditional so the value latched at init also reaches the loader
   gfx::texture_replacement::set_mip_repair(latched_settings().textureMaterials);
+  const bool generateMips = latched_settings().generateMissingMips || generate_mips_env();
+  gx::texture::set_generate_missing_mips(generateMips);
+  gfx::texture_replacement::set_mip_generation(generateMips);
   std::shared_ptr<const CompiledGraph> graph = g_frameState ? g_frameState->graph : nullptr;
   bool inspectorOpen = false;
 #if AURORA_ENABLE_RENDER

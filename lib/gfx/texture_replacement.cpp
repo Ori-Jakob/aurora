@@ -86,6 +86,7 @@ struct ReplacementEntry {
   std::shared_ptr<VirtualReadState> virtualReadState;
   std::optional<gfx::ConvertedTexture> thumbnail;
   bool thumbnailIncludesBase = false;
+  bool allowMipGeneration = true;
 };
 
 enum class Tier {
@@ -111,6 +112,7 @@ struct EntryLoadSnapshot {
   std::string virtualPath;
   VirtualFileSource source;
   std::shared_ptr<VirtualReadState> virtualReadState;
+  bool allowMipGeneration = true;
 };
 
 struct LoadJob {
@@ -125,6 +127,7 @@ struct LoadCompletion {
   bool thumbnailStored = false;
   ChainReport chain{};
   bool repairEnabled = false;
+  bool generateEnabled = false;
 };
 
 struct SourceKeyHash {
@@ -148,6 +151,7 @@ std::mutex s_registryMutex;
 std::atomic_bool s_bypass{false};
 std::atomic_bool s_synchronousLoads{false};
 std::atomic_bool s_mipRepair{false};
+std::atomic_bool s_mipGenerate{false};
 absl::flat_hash_map<ReplacementKey, std::vector<ReplacementEntry>, ReplacementKeyHash> s_entriesByKey;
 absl::flat_hash_map<ReplacementKey, SelectedCache, ReplacementKeyHash> s_cacheByKey;
 absl::flat_hash_set<uint64_t> s_failedIds;
@@ -248,6 +252,17 @@ std::vector<std::string> path_components(const std::filesystem::path& root, cons
     components.push_back(io::fs_path_to_string(component));
   }
   return components;
+}
+
+bool mip_generation_allowed(std::span<const std::string> dirs, std::span<const std::string_view> excluded) noexcept {
+  for (const auto& dir : dirs) {
+    for (const auto name : excluded) {
+      if (iequals_ascii(dir, name)) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 struct ReplacementCandidate {
@@ -590,6 +605,12 @@ struct VirtualTextureSource {
 
 uint8_t level_count_u8(uint64_t count) noexcept { return static_cast<uint8_t>(std::min<uint64_t>(count, UINT8_MAX)); }
 
+struct MipPolicy {
+  bool repair = false;
+  bool generate = false;
+  bool generationAllowed = true;
+};
+
 bool is_arbitrary_mip_name(std::string_view name) noexcept {
   const size_t slash = name.find_last_of("/\\");
   const size_t start = slash == std::string_view::npos ? 0 : slash + 1;
@@ -631,7 +652,7 @@ std::optional<gfx::ConvertedTexture> rebuild_mip_chain(const gfx::ConvertedTextu
     return std::nullopt;
   }
 
-  const uint32_t mips = gfx::texture_replacement::full_mip_count(base.width, base.height);
+  const uint32_t mips = gfx::full_mip_count(base.width, base.height);
   const uint64_t n = gfx::calc_texture_size(base.format, base.width, base.height, mips);
   if (n == 0) {
     return std::nullopt;
@@ -659,7 +680,6 @@ std::optional<gfx::ConvertedTexture> rebuild_mip_chain(const gfx::ConvertedTextu
   }
 
   report.generatedLevels = level_count_u8(mips - 1 - kept.size());
-  report.repaired = true;
   report.repairMicros = static_cast<uint32_t>(std::min<int64_t>(micros, UINT32_MAX));
   return gfx::ConvertedTexture{
       .format = base.format,
@@ -685,7 +705,8 @@ struct InvalidMip {
 };
 
 template <typename Source>
-std::optional<gfx::ConvertedTexture> load_encoded_replacement(Source&& src, bool repair, ChainReport& report) noexcept {
+std::optional<gfx::ConvertedTexture> load_encoded_replacement(Source&& src, MipPolicy policy,
+                                                              ChainReport& report) noexcept {
   report = {};
   auto base = src.load_base();
   if (!base.has_value()) {
@@ -706,7 +727,7 @@ std::optional<gfx::ConvertedTexture> load_encoded_replacement(Source&& src, bool
     return std::nullopt;
   }
 
-  const uint32_t fullLevels = gfx::texture_replacement::full_mip_count(base->width, base->height);
+  const uint32_t fullLevels = gfx::full_mip_count(base->width, base->height);
   report.format = base->format;
   report.fullLevels = level_count_u8(fullLevels);
   if (base->mips > 1) {
@@ -775,15 +796,29 @@ std::optional<gfx::ConvertedTexture> load_encoded_replacement(Source&& src, bool
   }
   report.verdict = verdict;
   report.keptLevels = level_count_u8(keptLevels);
-  report.repairable = (verdict == ChainVerdict::Clamped || verdict == ChainVerdict::Invalid) &&
-                      chain_repairable(base->format, more.empty() ? *base : more.back(), src.name());
-  if (repair && report.repairable) {
+  const bool repairableChain = chain_repairable(base->format, more.empty() ? *base : more.back(), src.name());
+  report.repairable = (verdict == ChainVerdict::Clamped || verdict == ChainVerdict::Invalid) && repairableChain;
+  report.generatable = (verdict == ChainVerdict::Mipless || verdict == ChainVerdict::Short) &&
+                       policy.generationAllowed && repairableChain;
+  const bool repair = policy.repair && report.repairable;
+  if (repair || (policy.generate && report.generatable)) {
     if (auto rebuilt = rebuild_mip_chain(*base, more, report); rebuilt.has_value()) {
-      Log.debug("texture_replacement: rebuilt {} mips for {} in {} us", report.generatedLevels, src.name(),
-                report.repairMicros);
+      if (repair) {
+        report.repaired = true;
+        Log.debug("texture_replacement: rebuilt {} mips for {} in {} us", report.generatedLevels, src.name(),
+                  report.repairMicros);
+      } else {
+        report.generated = true;
+        Log.debug("texture_replacement: generated {} mips for {} in {} us", report.generatedLevels, src.name(),
+                  report.repairMicros);
+      }
       return rebuilt;
     }
-    Log.warn("texture_replacement: could not rebuild mips for {}", src.name());
+    if (repair) {
+      Log.warn("texture_replacement: could not rebuild mips for {}", src.name());
+    } else {
+      Log.warn("texture_replacement: could not generate mips for {}", src.name());
+    }
   }
   if (verdict == ChainVerdict::Clamped) {
     Log.debug("texture_replacement: mip chain for {} clamps at {}x{} from mip {}", src.name(), prevWidth, prevHeight,
@@ -835,12 +870,12 @@ std::optional<gfx::ConvertedTexture> load_encoded_replacement(Source&& src, bool
   };
 }
 
-std::optional<gfx::ConvertedTexture> load_file_replacement(const EntryLoadSnapshot& entry, bool repair,
+std::optional<gfx::ConvertedTexture> load_file_replacement(const EntryLoadSnapshot& entry, MipPolicy policy,
                                                            ChainReport& report) noexcept {
-  return load_encoded_replacement(FileTextureSource{.path = entry.path}, repair, report);
+  return load_encoded_replacement(FileTextureSource{.path = entry.path}, policy, report);
 }
 
-std::optional<gfx::ConvertedTexture> load_virtual_replacement(const EntryLoadSnapshot& entry, bool repair,
+std::optional<gfx::ConvertedTexture> load_virtual_replacement(const EntryLoadSnapshot& entry, MipPolicy policy,
                                                               ChainReport& report) noexcept {
   return load_encoded_replacement(
       VirtualTextureSource{
@@ -848,7 +883,21 @@ std::optional<gfx::ConvertedTexture> load_virtual_replacement(const EntryLoadSna
           .source = entry.source,
           .readState = entry.virtualReadState,
       },
-      repair, report);
+      policy, report);
+}
+
+std::optional<gfx::ConvertedTexture> load_snapshot(const EntryLoadSnapshot& entry, MipPolicy policy,
+                                                   ChainReport& report) noexcept {
+  return entry.kind == EntryKind::File ? load_file_replacement(entry, policy, report)
+                                       : load_virtual_replacement(entry, policy, report);
+}
+
+MipPolicy current_mip_policy(const EntryLoadSnapshot& entry) noexcept {
+  return {
+      .repair = s_mipRepair.load(std::memory_order_acquire),
+      .generate = s_mipGenerate.load(std::memory_order_acquire),
+      .generationAllowed = entry.allowMipGeneration,
+  };
 }
 
 EntryLoadSnapshot snapshot_entry(const ReplacementKey& key, const ReplacementEntry& entry) {
@@ -861,6 +910,7 @@ EntryLoadSnapshot snapshot_entry(const ReplacementKey& key, const ReplacementEnt
       .virtualPath = entry.virtualPath,
       .source = entry.source,
       .virtualReadState = entry.virtualReadState,
+      .allowMipGeneration = entry.allowMipGeneration,
   };
 }
 
@@ -915,16 +965,15 @@ void worker_main(std::stop_token token) {
     bool thumbnailIncludesBase = false;
     bool thumbnailStored = false;
     ChainReport chain;
-    bool repairEnabled = false;
+    MipPolicy policy;
     if (job.tier == Tier::Thumbnail) {
       if (auto thumbnail = load_thumbnail(job.entry); thumbnail.has_value()) {
         texture = std::move(thumbnail->texture);
         thumbnailIncludesBase = thumbnail->includesBase;
       }
     } else if (job.entry.kind == EntryKind::File || job.entry.kind == EntryKind::Virtual) {
-      repairEnabled = s_mipRepair.load(std::memory_order_acquire);
-      texture = job.entry.kind == EntryKind::File ? load_file_replacement(job.entry, repairEnabled, chain)
-                                                  : load_virtual_replacement(job.entry, repairEnabled, chain);
+      policy = current_mip_policy(job.entry);
+      texture = load_snapshot(job.entry, policy, chain);
     }
 
     if (job.tier == Tier::Thumbnail && texture.has_value() && usable_as_legacy_base(texture->format) &&
@@ -949,7 +998,8 @@ void worker_main(std::stop_token token) {
             .texture = job.tier == Tier::Full ? std::move(texture) : std::nullopt,
             .thumbnailStored = thumbnailStored,
             .chain = chain,
-            .repairEnabled = repairEnabled,
+            .repairEnabled = policy.repair,
+            .generateEnabled = policy.generate,
         });
       }
     }
@@ -1239,9 +1289,7 @@ gfx::TextureHandle load_entry_handle(const ReplacementKey& key, const Replacemen
   gfx::TextureHandle handle;
   if (entry.kind == EntryKind::File || entry.kind == EntryKind::Virtual) {
     const auto snapshot = snapshot_entry(key, entry);
-    const bool repair = s_mipRepair.load(std::memory_order_acquire);
-    const auto replacement = entry.kind == EntryKind::File ? load_file_replacement(snapshot, repair, chain)
-                                                           : load_virtual_replacement(snapshot, repair, chain);
+    const auto replacement = load_snapshot(snapshot, current_mip_policy(snapshot), chain);
     if (!replacement.has_value()) {
       s_failedIds.insert(entry.id);
       return {};
@@ -1473,7 +1521,7 @@ void clear_replacement_runtime_state_locked(std::vector<std::shared_ptr<VirtualR
 bool is_source_key(const ReplacementKey& key) noexcept { return std::holds_alternative<TextureSourceKey>(key); }
 
 ReplacementRegistration register_file_replacement(TextureSourceKey key, std::filesystem::path path,
-                                                  ReplacementOptions options) {
+                                                  ReplacementOptions options, bool allowMipGeneration) {
   std::lock_guard lk(s_registryMutex);
   ReplacementKey replacementKey{key};
   ReplacementRegistration registration{
@@ -1489,6 +1537,7 @@ ReplacementRegistration register_file_replacement(TextureSourceKey key, std::fil
       .kind = EntryKind::File,
       .label = fmt::format("TextureReplacement {}", io::fs_path_to_string(path.filename())),
       .path = std::move(path),
+      .allowMipGeneration = allowMipGeneration,
   });
   ++s_sourceEntryCount;
   const auto snapshot = snapshot_entry(replacementKey, entries.back());
@@ -1553,6 +1602,33 @@ const CompanionSet* find_companion_set_locked(TextureSourceKey key) noexcept {
     }
   }
   return nullptr;
+}
+
+void reload_dependent_chains(bool ChainReport::* dependsOn) noexcept {
+  const bool async = gx::texture::AsyncTextureReplacements && !s_synchronousLoads.load(std::memory_order_relaxed);
+  std::lock_guard lk(s_registryMutex);
+  std::vector<ReplacementKey> erased;
+  for (const auto& [key, cache] : s_cacheByKey) {
+    if (cache.tier != Tier::Full || !(cache.chain.*dependsOn)) {
+      continue;
+    }
+    const auto* entry = find_selected_entry_locked(key);
+    if (entry == nullptr || entry->id != cache.id) {
+      continue;
+    }
+    if (async) {
+      queue_full_load(snapshot_entry(key, *entry));
+    } else {
+      erased.push_back(key);
+    }
+  }
+  for (const auto& key : erased) {
+    erase_cache_locked(key);
+  }
+  if (!erased.empty()) {
+    gx::clear_static_texture_cache();
+    gx::texture::invalidate_bindings();
+  }
 }
 } // namespace
 
@@ -1789,6 +1865,14 @@ ReplacementRegistration register_virtual_replacement(std::string_view path, Virt
     return {};
   }
 
+  std::vector<std::string> dirs;
+  for (size_t start = 0; slash != std::string_view::npos && start < slash;) {
+    const size_t end = std::min(path.find('/', start), slash);
+    dirs.emplace_back(path.substr(start, end - start));
+    start = end + 1;
+  }
+  const bool allowMipGeneration = mip_generation_allowed(dirs, options.noGeneratedMipDirs);
+
   std::lock_guard lk(s_registryMutex);
   ReplacementKey replacementKey{*parsed};
   ReplacementRegistration registration{
@@ -1806,6 +1890,7 @@ ReplacementRegistration register_virtual_replacement(std::string_view path, Virt
       .virtualPath = std::string{path},
       .source = source,
       .virtualReadState = std::make_shared<VirtualReadState>(),
+      .allowMipGeneration = allowMipGeneration,
   });
   ++s_sourceEntryCount;
   const auto snapshot = snapshot_entry(replacementKey, entries.back());
@@ -1885,7 +1970,9 @@ ReplacementGroup load_replacement_directory(const std::filesystem::path& root, R
       continue;
     }
     registeredKeys.insert(*parsed);
-    group.registrations.push_back(register_file_replacement(*parsed, candidate.path, options));
+    const std::span<const std::string> dirs{candidate.components.data(), candidate.components.size() - 1};
+    group.registrations.push_back(register_file_replacement(*parsed, candidate.path, options,
+                                                            mip_generation_allowed(dirs, options.noGeneratedMipDirs)));
   }
 
   std::vector<CompanionName> companionNames;
@@ -2041,8 +2128,11 @@ StreamingStats process_streaming() noexcept {
       std::lock_guard lock{s_registryMutex};
       const auto* entry = find_selected_entry_locked(completion.entry.key);
       selected = entry != nullptr && entry->id == completion.entry.id;
-      stale = selected && completion.chain.repairable &&
-              completion.repairEnabled != s_mipRepair.load(std::memory_order_acquire);
+      stale =
+          selected &&
+          ((completion.chain.repairable && completion.repairEnabled != s_mipRepair.load(std::memory_order_acquire)) ||
+           (completion.chain.generatable &&
+            completion.generateEnabled != s_mipGenerate.load(std::memory_order_acquire)));
       if (selected && !stale && !completion.texture.has_value()) {
         s_failedIds.insert(completion.entry.id);
       }
@@ -2277,30 +2367,15 @@ void set_mip_repair(bool enabled) noexcept {
       s_mipRepair.exchange(enabled, std::memory_order_acq_rel) == enabled) {
     return;
   }
-  const bool async = gx::texture::AsyncTextureReplacements && !s_synchronousLoads.load(std::memory_order_relaxed);
-  std::lock_guard lk(s_registryMutex);
-  std::vector<ReplacementKey> erased;
-  for (const auto& [key, cache] : s_cacheByKey) {
-    if (cache.tier != Tier::Full || !cache.chain.repairable) {
-      continue;
-    }
-    const auto* entry = find_selected_entry_locked(key);
-    if (entry == nullptr || entry->id != cache.id) {
-      continue;
-    }
-    if (async) {
-      queue_full_load(snapshot_entry(key, *entry));
-    } else {
-      erased.push_back(key);
-    }
+  reload_dependent_chains(&ChainReport::repairable);
+}
+
+void set_mip_generation(bool enabled) noexcept {
+  if (s_mipGenerate.load(std::memory_order_relaxed) == enabled ||
+      s_mipGenerate.exchange(enabled, std::memory_order_acq_rel) == enabled) {
+    return;
   }
-  for (const auto& key : erased) {
-    erase_cache_locked(key);
-  }
-  if (!erased.empty()) {
-    gx::clear_static_texture_cache();
-    gx::texture::invalidate_bindings();
-  }
+  reload_dependent_chains(&ChainReport::generatable);
 }
 
 bool mip_repair_built() noexcept { return AURORA_ENABLE_RENDER != 0; }
@@ -2383,7 +2458,7 @@ load_replacement_texture(const texture::ReplacementRegistration& registration) n
 }
 
 std::optional<ConvertedTexture> load_replacement_texture(const texture::ReplacementRegistration& registration,
-                                                         bool repair, ChainReport* report) noexcept {
+                                                         bool repair, ChainReport* report, bool generate) noexcept {
   std::optional<EntryLoadSnapshot> snapshot;
   {
     std::lock_guard lock{s_registryMutex};
@@ -2396,8 +2471,8 @@ std::optional<ConvertedTexture> load_replacement_texture(const texture::Replacem
     return std::nullopt;
   }
   ChainReport chain;
-  auto texture = snapshot->kind == EntryKind::File ? load_file_replacement(*snapshot, repair, chain)
-                                                   : load_virtual_replacement(*snapshot, repair, chain);
+  auto texture = load_snapshot(
+      *snapshot, {.repair = repair, .generate = generate, .generationAllowed = snapshot->allowMipGeneration}, chain);
   if (report != nullptr) {
     *report = chain;
   }
@@ -2405,9 +2480,10 @@ std::optional<ConvertedTexture> load_replacement_texture(const texture::Replacem
 }
 
 std::optional<ConvertedTexture> load_replacement_file(const std::filesystem::path& path, bool repair,
-                                                      ChainReport* report) noexcept {
+                                                      ChainReport* report, bool generate) noexcept {
   ChainReport chain;
-  auto texture = load_encoded_replacement(FileTextureSource{.path = path}, repair, chain);
+  auto texture =
+      load_encoded_replacement(FileTextureSource{.path = path}, {.repair = repair, .generate = generate}, chain);
   if (report != nullptr) {
     *report = chain;
   }
@@ -2450,6 +2526,8 @@ std::optional<ChainReport> resident_chain(const texture::ReplacementKey& key) no
   }
   return it->second.chain;
 }
+
+bool mip_generation() noexcept { return s_mipGenerate.load(std::memory_order_acquire); }
 
 bool has_thumbnail(uint64_t id) noexcept {
   std::lock_guard lock{s_registryMutex};

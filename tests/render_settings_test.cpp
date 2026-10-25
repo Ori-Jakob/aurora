@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "gfx/frame.hpp"
+#include "gfx/texture_replacement.hpp"
 #include "render/frame_state.hpp"
 #include "render/graph.hpp"
 #include "render/module.hpp"
@@ -13,6 +14,11 @@
 #include <cstdint>
 #include <random>
 #include <thread>
+
+// gx/texture.hpp needs absl, which render-off builds of this target do not link
+namespace aurora::gx::texture {
+bool generate_missing_mips_requested() noexcept;
+} // namespace aurora::gx::texture
 
 namespace aurora::render::test {
 namespace {
@@ -167,6 +173,26 @@ TEST_F(RenderLatchTest, OnlyMaterialFeaturesKeepLegacyStorageSize) {
   gfx::detail::testing::reset_streaming_request();
 }
 #endif
+
+TEST_F(RenderLatchTest, MipGenerationReachesTexturesWithoutStorage) {
+#if AURORA_ENABLE_RENDER
+  gfx::detail::testing::reset_streaming_request();
+#endif
+  apply_settings({.generateMissingMips = true});
+  latch_frame();
+  EXPECT_TRUE(effective_settings().generateMissingMips);
+  EXPECT_TRUE(gx::texture::generate_missing_mips_requested());
+  EXPECT_TRUE(gfx::texture_replacement::testing::mip_generation());
+#if AURORA_ENABLE_RENDER
+  EXPECT_EQ(gfx::detail::testing::requested_streaming_sizes().storage, gfx::StorageBufferSize);
+#endif
+
+  apply_settings({});
+  latch_frame();
+  EXPECT_FALSE(effective_settings().generateMissingMips);
+  EXPECT_FALSE(gx::texture::generate_missing_mips_requested());
+  EXPECT_FALSE(gfx::texture_replacement::testing::mip_generation());
+}
 
 TEST_F(RenderLatchTest, ApplyFromAnotherThread) {
   constexpr int Iterations = 1000;
