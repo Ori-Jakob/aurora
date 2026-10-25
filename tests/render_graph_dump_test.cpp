@@ -15,6 +15,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -49,6 +50,15 @@ void expect_matches_fixture(std::string_view name, const std::string& actual) {
   ASSERT_NE(expectedDoc, nullptr) << name;
   EXPECT_TRUE(yyjson_equals(yyjson_doc_get_root(actualDoc.get()), yyjson_doc_get_root(expectedDoc.get())))
       << name << " differs; the output is in " << AURORA_RENDER_FIXTURE_OUT;
+}
+
+// Checkouts may turn the fixtures into CRLF, so carriage returns are dropped before comparing
+void expect_text_matches_fixture(std::string_view name, const std::string& actual) {
+  write_actual(name, actual);
+  std::string expected = read_text(std::filesystem::path{AURORA_RENDER_FIXTURES_DIR} / name);
+  ASSERT_FALSE(expected.empty()) << "missing fixture " << name;
+  std::erase(expected, '\r');
+  EXPECT_EQ(actual, expected) << name << " differs; the output is in " << AURORA_RENDER_FIXTURE_OUT;
 }
 
 GraphInspection format_inspection() {
@@ -230,8 +240,8 @@ bool has_edge(const GraphInspection& graph, uint32_t from, uint32_t to, std::str
   });
 }
 
-TEST(RenderGraphDump, CompiledGraphMatchesFixture) {
-  const std::vector<DeclareBody> bodies{
+std::shared_ptr<CompiledGraph> compile_basic_graph() {
+  static const std::vector<DeclareBody> bodies{
       [](InternalPassBuilder& b) {
         b.after("phase.prepare");
         b.create("test.tex", absolute_rgba8(), Access::StorageWrite);
@@ -275,7 +285,11 @@ TEST(RenderGraphDump, CompiledGraphMatchesFixture) {
         .state = &bodies[i],
     });
   }
-  const auto compiled = compile_graph(planned::planned_inputs(planned::full_limits(), descs, {}));
+  return compile_graph(planned::planned_inputs(planned::full_limits(), descs, {}));
+}
+
+TEST(RenderGraphDump, CompiledGraphMatchesFixture) {
+  const auto compiled = compile_basic_graph();
   const GraphInspection graph = inspect(*compiled);
   expect_matches_fixture("graph_dump_basic.json", format_graph_json(graph));
 
@@ -321,6 +335,30 @@ TEST(RenderGraphDump, CompiledGraphMatchesFixture) {
   EXPECT_EQ(graph.graphHash, compiled->graphHash);
   EXPECT_EQ(graph.stages.size(), StageCount);
   EXPECT_TRUE(std::ranges::is_sorted(graph.resources, {}, &debug::InspectResource::name));
+}
+
+TEST(RenderGraphDump, DotMatchesFixture) {
+  const auto compiled = compile_basic_graph();
+  const std::string dot = debug::format_graph_dot(inspect(*compiled));
+  expect_text_matches_fixture("graph_dump_basic.dot", dot);
+  EXPECT_EQ(dot.find('\r'), std::string::npos);
+  EXPECT_TRUE(dot.starts_with("digraph render_graph {\n"));
+  EXPECT_TRUE(dot.ends_with("}\n"));
+}
+
+TEST(RenderGraphDump, DotEscapesNames) {
+  GraphInspection graph = format_inspection();
+  graph.passes[2].name = "te\"st\\x";
+  const debug::FrameCullSnapshot frame{.frameId = 1, .graphHash = 0xab, .reasons = {"NotEnabled"}};
+  graph.passes[0].frameSlot = 0;
+  const std::string dot = debug::format_graph_dot(graph, &frame);
+  EXPECT_NE(dot.find("label=\"te\\\"st\\\\x\\nNoConsumer\""), std::string::npos) << dot;
+  EXPECT_NE(dot.find("style=dashed"), std::string::npos);
+  EXPECT_NE(dot.find("last frame: NotEnabled"), std::string::npos);
+  EXPECT_NE(dot.find("n0 -> n2 [label=\"gx.color\"]"), std::string::npos);
+  EXPECT_NE(dot.find("n1 -> n2 [style=dotted]"), std::string::npos);
+  EXPECT_NE(dot.find("n0 -> n1;"), std::string::npos);
+  EXPECT_NE(dot.find("subgraph cluster_1 {\n    label=\"OpaqueDone\";"), std::string::npos);
 }
 
 void declare_depth_reader(PassBuilder& builder, void*) {

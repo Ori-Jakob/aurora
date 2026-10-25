@@ -17,11 +17,17 @@ target_sources(aurora_gx PRIVATE
 )
 if (AURORA_ENABLE_RENDER)
     target_sources(aurora_gx PRIVATE
+        lib/render/debug/capture.cpp
+        lib/render/debug/capture.hpp
         lib/render/debug/class_view.cpp
         lib/render/debug/debug.hpp
         lib/render/debug/debug_window.cpp
+        lib/render/debug/dual_source.cpp
+        lib/render/debug/dual_source.hpp
         lib/render/debug/fake_shadows.cpp
         lib/render/debug/fake_shadows.hpp
+        lib/render/debug/gbuf_view.cpp
+        lib/render/debug/gbuf_view.hpp
         lib/render/debug/graph_dump.cpp
         lib/render/debug/graph_inspection.hpp
         lib/render/debug/graph_tab.cpp
@@ -33,6 +39,7 @@ if (AURORA_ENABLE_RENDER)
         lib/render/debug/textures.hpp
         lib/render/debug/views.cpp
         lib/render/debug/views.hpp
+        lib/render/debug/views_tab.cpp
         lib/render/fakeshadow/texture_gate.cpp
         lib/render/fakeshadow/texture_gate.hpp
         lib/render/geometry/compact.cpp

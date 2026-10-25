@@ -93,4 +93,5 @@ struct FrameCullSnapshot {
 
 std::string format_graph_json(const GraphInspection& graph, const FrameCullSnapshot* frame = nullptr,
                               const webgpu::gpu_prof::FrameTimes* timings = nullptr);
+std::string format_graph_dot(const GraphInspection& graph, const FrameCullSnapshot* frame = nullptr);
 } // namespace aurora::render::debug

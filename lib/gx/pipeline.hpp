@@ -62,6 +62,10 @@ struct BindCounts {
 void reset_pass_bindings() noexcept;
 void add_encode_ns(uint64_t ns) noexcept;
 BindCounts bind_counts() noexcept;
+struct DstAlphaCounts {
+  uint64_t dstAlphaDraws, prepassDraws, dualSourcePipelines, prepassPipelines;
+};
+DstAlphaCounts dst_alpha_counts() noexcept;
 
 void queue_surface(const u8* dlStart, uint32_t dlSize, bool bigEndian) noexcept;
 } // namespace aurora::gx

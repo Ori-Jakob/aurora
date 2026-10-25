@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace aurora::render::debug {
 namespace {
@@ -97,6 +98,44 @@ void write_pass(const Writer& w, yyjson_mut_val* passes, const InspectPass& pass
     w.add(entry, "resource", std::string_view{write.resource});
     w.add(entry, "access", std::string_view{write.access});
   }
+}
+
+std::string dot_escape(std::string_view text) {
+  std::string out;
+  out.reserve(text.size());
+  for (const char c : text) {
+    if (c == '"' || c == '\\') {
+      out += '\\';
+    }
+    out += c;
+  }
+  return out;
+}
+
+std::optional<std::string_view> frame_reason(const InspectPass& pass, const FrameCullSnapshot* frame) {
+  if (frame == nullptr || !pass.frameSlot) {
+    return std::nullopt;
+  }
+  if (*pass.frameSlot >= frame->reasons.size()) {
+    return StageNotRun;
+  }
+  const std::optional<std::string>& reason = frame->reasons[*pass.frameSlot];
+  return reason ? std::optional<std::string_view>{*reason} : std::nullopt;
+}
+
+void write_dot_node(std::string& out, const InspectPass& pass, size_t index, const FrameCullSnapshot* frame) {
+  std::string label = dot_escape(pass.name);
+  bool dashed = false;
+  if (!pass.active) {
+    label += "\\n" + dot_escape(pass.cull.value_or("inactive"));
+    dashed = true;
+  } else if (const std::optional<std::string_view> reason = frame_reason(pass, frame)) {
+    label += "\\nlast frame: " + dot_escape(*reason);
+    dashed = true;
+  }
+  const bool chain = !pass.kind.has_value();
+  out += fmt::format("    n{} [label=\"{}\"{}{}];\n", index, label, chain ? ", shape=ellipse" : "",
+                     dashed ? ", style=dashed" : "");
 }
 
 void write_resource(const Writer& w, yyjson_mut_val* resources, const InspectResource& resource) {
@@ -203,5 +242,40 @@ std::string format_graph_json(const GraphInspection& graph, const FrameCullSnaps
     }
   }
   return json::write(doc.get(), true);
+}
+
+std::string format_graph_dot(const GraphInspection& graph, const FrameCullSnapshot* frame) {
+  std::string out = fmt::format("digraph render_graph {{\n  label=\"0x{:016x}\";\n  rankdir=LR;\n  node [shape=box];\n",
+                                graph.graphHash);
+  std::vector<bool> written(graph.passes.size(), false);
+  for (size_t s = 0; s < graph.stages.size(); ++s) {
+    const InspectStage& stage = graph.stages[s];
+    out += fmt::format("  subgraph cluster_{} {{\n    label=\"{}\";\n", s, dot_escape(stage.name));
+    for (size_t i = 0; i < graph.passes.size(); ++i) {
+      if (!written[i] && graph.passes[i].stage == stage.name) {
+        write_dot_node(out, graph.passes[i], i, frame);
+        written[i] = true;
+      }
+    }
+    out += "  }\n";
+  }
+  for (size_t i = 0; i < graph.passes.size(); ++i) {
+    if (!written[i]) {
+      write_dot_node(out, graph.passes[i], i, frame);
+    }
+  }
+  for (const InspectEdge& edge : graph.edges) {
+    std::string attributes;
+    if (edge.kind == "Anchor" || edge.kind == "Bound") {
+      attributes = " [style=dotted]";
+    } else if (edge.kind == "Raw" || edge.kind == "War" || edge.kind == "Waw") {
+      const std::string resource = dot_escape(edge.resource.value_or(std::string{}));
+      attributes = edge.kind == "Raw" ? fmt::format(" [label=\"{}\"]", resource)
+                                      : fmt::format(" [label=\"{} {}\"]", edge.kind, resource);
+    }
+    out += fmt::format("  n{} -> n{}{};\n", edge.from, edge.to, attributes);
+  }
+  out += "}\n";
+  return out;
 }
 } // namespace aurora::render::debug

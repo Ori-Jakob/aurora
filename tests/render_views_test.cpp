@@ -153,6 +153,63 @@ TEST_F(RenderViews, ParseView) {
   }
 }
 
+TEST_F(RenderViews, GbufViewTableFollowsClassRange) {
+  EXPECT_EQ(FirstGbufView, LastReservedClassView + 1);
+  std::set<std::string_view> names;
+  for (const DebugView& view : ClassViews) {
+    names.insert(view.name);
+  }
+  uint16_t expected = FirstGbufView;
+  for (const GbufView& view : GbufViews) {
+    EXPECT_EQ(view.id, expected++);
+    EXPECT_TRUE(names.insert(view.name).second) << view.name;
+    EXPECT_EQ(find_gbuf_view(view.id), &view);
+    EXPECT_EQ(find_view(view.id), nullptr);
+    EXPECT_TRUE(view.resource.starts_with("gbuf.") || view.resource.starts_with("gx.")) << view.resource;
+    EXPECT_EQ(view.uintSource, view.resource == "gbuf.fog") << view.name;
+    EXPECT_EQ(view.mode, static_cast<uint32_t>(view.id - FirstGbufView));
+  }
+  EXPECT_EQ(expected, 23u);
+  EXPECT_EQ(find_gbuf_view(LastReservedClassView), nullptr);
+  EXPECT_EQ(find_gbuf_view(23), nullptr);
+  EXPECT_EQ(find_gbuf_view(16)->stage, Stage::PrePost);
+  EXPECT_EQ(find_gbuf_view(18)->anchor, "phase.composite");
+  EXPECT_EQ(find_gbuf_view(22)->label, "G-buffer: receiver code");
+}
+
+TEST_F(RenderViews, ParseGbufViewNames) {
+  const auto id = [](std::string_view text) {
+    const auto selection = parse_view(text);
+    return selection ? std::optional{selection->id} : std::nullopt;
+  };
+  for (const GbufView& view : GbufViews) {
+    EXPECT_EQ(id(view.name), view.id) << view.name;
+    EXPECT_EQ(id(view.name.substr(view.name.find('.') + 1)), view.id) << view.name;
+  }
+  EXPECT_EQ(id("motion"), 16u);
+  EXPECT_EQ(id("fog"), 18u);
+  EXPECT_EQ(id("fog.color"), 19u);
+  EXPECT_EQ(id("gx.normal.code"), 22u);
+  EXPECT_EQ(id("normal"), 21u);
+  EXPECT_EQ(id("17"), 17u);
+  EXPECT_EQ(parse_view("gbuf.motion")->bit, 0u);
+  for (const std::string_view bad : {"gbuf.", "gbuf.fog.", "fog.colour", "gx.motion"}) {
+    EXPECT_EQ(id(bad), std::nullopt) << bad;
+  }
+}
+
+TEST_F(RenderViews, GbufIdSelectsNoClassView) {
+  for (const GbufView& view : GbufViews) {
+    begin_view_frame(frame_with_view(view.id));
+    EXPECT_EQ(testing::active_view(), ClassView::Off) << view.name;
+    EXPECT_FALSE(scene::identity_collecting()) << view.name;
+  }
+  set_view_override(FirstGbufView);
+  EXPECT_EQ(selected_view_id(Settings{.debugView = 2}), FirstGbufView);
+  set_view_override(0);
+  EXPECT_EQ(selected_view_id(Settings{.debugView = 2}), 2u);
+}
+
 TEST_F(RenderViews, PalettesAreDistinct) {
   EXPECT_TRUE(all_distinct(RoleColors));
   EXPECT_TRUE(all_distinct(KindColors));

@@ -1,6 +1,7 @@
 #include "debug.hpp"
 #include "fake_shadows.hpp"
 #include "textures.hpp"
+#include "views.hpp"
 
 #include "../frame_state.hpp"
 #include "../gpu_heap.hpp"
@@ -183,6 +184,7 @@ void on_latch() noexcept {
   g_latch.fetch_add(1, std::memory_order_relaxed);
   textures::on_latch();
   fake_shadows::on_latch();
+  views_on_latch();
 }
 
 bool inspector_open() noexcept {

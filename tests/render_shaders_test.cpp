@@ -415,6 +415,14 @@ TEST_F(RenderShaders, LibraryShadersCompile) {
   }
 }
 
+TEST_F(RenderShaders, GbufViewUintVariantCompiles) {
+  const std::array<std::string_view, 1> defines{"SOURCE_UINT"};
+  std::string error;
+  EXPECT_TRUE(validate_module("debug/gbuf_view", defines, error)) << error;
+  EXPECT_TRUE(validate_module("debug/gbuf_view", {}, error)) << error;
+  EXPECT_TRUE(validate_module("aurora/gbuffer", {}, error)) << error;
+}
+
 TEST_F(RenderShaders, NeverReadyIsNeverReady) {
   EXPECT_TRUE(NeverReady);
   EXPECT_EQ(status(NeverReady), PipelineStatus::Failed);

@@ -1,0 +1,99 @@
+digraph render_graph {
+  label="0xb1243e7db832f305";
+  rankdir=LR;
+  node [shape=box];
+  subgraph cluster_0 {
+    label="SceneBegin";
+    n0 [label="gx@SceneBegin", shape=ellipse];
+    n1 [label="phase.scene_prep", shape=ellipse];
+  }
+  subgraph cluster_1 {
+    label="OpaqueDone";
+    n2 [label="gx@OpaqueDone", shape=ellipse];
+    n3 [label="phase.capture", shape=ellipse];
+    n4 [label="phase.geometry", shape=ellipse];
+    n5 [label="phase.prepare", shape=ellipse];
+    n6 [label="test.write"];
+    n7 [label="phase.ao", shape=ellipse];
+    n8 [label="test.read"];
+    n9 [label="phase.cloud_shadows", shape=ellipse];
+    n10 [label="phase.shadows", shape=ellipse];
+    n11 [label="phase.gi", shape=ellipse];
+    n12 [label="phase.lighting", shape=ellipse];
+    n13 [label="phase.reflections", shape=ellipse];
+    n14 [label="phase.exposure", shape=ellipse];
+    n15 [label="phase.sky", shape=ellipse];
+    n16 [label="phase.volumetrics", shape=ellipse];
+    n17 [label="phase.composite", shape=ellipse];
+    n18 [label="test.sink"];
+    n19 [label="gx.overlay", shape=ellipse];
+    n20 [label="test.dummy"];
+    n21 [label="test.orphan\nNoConsumer", style=dashed];
+    n22 [label="test.missing\nMissingInput", style=dashed];
+  }
+  subgraph cluster_2 {
+    label="PrePost";
+    n23 [label="gx@PrePost", shape=ellipse];
+    n24 [label="phase.pre_taa", shape=ellipse];
+    n25 [label="phase.taa", shape=ellipse];
+    n26 [label="phase.post_taa", shape=ellipse];
+  }
+  subgraph cluster_3 {
+    label="SceneEnd";
+    n27 [label="gx@SceneEnd", shape=ellipse];
+    n28 [label="phase.scene_end", shape=ellipse];
+  }
+  subgraph cluster_4 {
+    label="BeforeHud";
+    n29 [label="gx@BeforeHud", shape=ellipse];
+    n30 [label="phase.before_hud", shape=ellipse];
+  }
+  subgraph cluster_5 {
+    label="FrameEnd";
+    n31 [label="gx@FrameEnd", shape=ellipse];
+    n32 [label="phase.frame_end", shape=ellipse];
+  }
+  subgraph cluster_6 {
+    label="AfterFrame";
+    n33 [label="phase.after_frame", shape=ellipse];
+  }
+  n0 -> n1;
+  n2 -> n3;
+  n2 -> n18 [label="gx.color"];
+  n2 -> n19 [label="Waw gbuf.debug_id"];
+  n2 -> n19 [label="Waw gbuf.fog"];
+  n2 -> n19 [label="Waw gbuf.motion"];
+  n2 -> n19 [label="Waw gbuf.reactive"];
+  n2 -> n19 [label="Waw gbuf.surface"];
+  n2 -> n19 [label="Waw gx.depth"];
+  n2 -> n19 [label="Waw gx.normal"];
+  n3 -> n4;
+  n4 -> n5;
+  n5 -> n6 [style=dotted];
+  n5 -> n7;
+  n6 -> n7 [style=dotted];
+  n6 -> n8 [label="test.tex"];
+  n7 -> n8 [style=dotted];
+  n7 -> n9;
+  n8 -> n9 [style=dotted];
+  n8 -> n18 [label="test.buf"];
+  n9 -> n10;
+  n10 -> n11;
+  n11 -> n12;
+  n12 -> n13;
+  n13 -> n14;
+  n14 -> n15;
+  n15 -> n16;
+  n16 -> n17;
+  n17 -> n18 [style=dotted];
+  n17 -> n19;
+  n18 -> n19 [style=dotted];
+  n18 -> n19 [label="Waw gx.color"];
+  n19 -> n20 [style=dotted];
+  n23 -> n24;
+  n24 -> n25;
+  n25 -> n26;
+  n27 -> n28;
+  n29 -> n30;
+  n31 -> n32;
+}

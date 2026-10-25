@@ -33,7 +33,11 @@ BoundState g_bound;
 
 struct Counters {
   std::atomic_uint64_t draws, texturedDraws, uniformBinds, textureBinds, indexBinds, encodeNs;
+  std::atomic_uint64_t dstAlphaDraws, prepassDraws;
 } g_counts;
+// MRT turns dual-source into an alpha prepass; these counts measure that cost
+std::atomic_uint64_t g_dualSourcePipelines{0};
+std::atomic_uint64_t g_prepassPipelines{0};
 
 inline void count(std::atomic_uint64_t& c, uint64_t n = 1) noexcept {
   c.store(c.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
@@ -71,6 +75,7 @@ gfx::CompiledPipeline create_unchecked(const PipelineConfig& config, const gfx::
       options.dstAlphaMode = DstAlphaMode::Replace;
     } else if (webgpu::g_dualSourceBlendingSupported && layout.colorAttachmentCount == 1) {
       options.dstAlphaMode = DstAlphaMode::DualSource;
+      g_dualSourcePipelines.fetch_add(1, std::memory_order_relaxed);
     } else {
       // Write alpha before RGB, no depth write
       auto alpha = options;
@@ -81,6 +86,7 @@ gfx::CompiledPipeline create_unchecked(const PipelineConfig& config, const gfx::
       if (!pipeline.prepass) {
         return {};
       }
+      g_prepassPipelines.fetch_add(1, std::memory_order_relaxed);
       options.alphaUpdate = false;
     }
   }
@@ -173,6 +179,7 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   if (data.dstAlpha != UINT32_MAX) {
     const wgpu::Color color{0.f, 0.f, 0.f, data.dstAlpha / 255.f};
     pass.SetBlendConstant(&color);
+    count(g_counts.dstAlphaDraws);
   }
   const auto draw = [&] {
     if (data.indexCount == 0) {
@@ -185,6 +192,7 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   if (pipeline.prepass) {
     gfx::bind_pipeline(pipeline.prepass, pass);
     draw();
+    count(g_counts.prepassDraws);
   }
   gfx::bind_pipeline(pipeline.main, pass);
   draw();
@@ -202,6 +210,15 @@ BindCounts bind_counts() noexcept {
       .textureBinds = g_counts.textureBinds.load(std::memory_order_relaxed),
       .indexBinds = g_counts.indexBinds.load(std::memory_order_relaxed),
       .encodeNs = g_counts.encodeNs.load(std::memory_order_relaxed),
+  };
+}
+
+DstAlphaCounts dst_alpha_counts() noexcept {
+  return {
+      .dstAlphaDraws = g_counts.dstAlphaDraws.load(std::memory_order_relaxed),
+      .prepassDraws = g_counts.prepassDraws.load(std::memory_order_relaxed),
+      .dualSourcePipelines = g_dualSourcePipelines.load(std::memory_order_relaxed),
+      .prepassPipelines = g_prepassPipelines.load(std::memory_order_relaxed),
   };
 }
 

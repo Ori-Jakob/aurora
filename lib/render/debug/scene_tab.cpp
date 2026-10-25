@@ -115,7 +115,10 @@ void draw_view_controls() {
   ImGui::SeparatorText("View");
   const uint16_t current = view_override();
   const DebugView* selected = find_view(current);
-  const std::string preview = selected != nullptr ? std::string{selected->label} : std::string{"Off"};
+  const GbufView* gbuf = find_gbuf_view(current);
+  const std::string preview = selected != nullptr ? std::string{selected->label}
+                              : gbuf != nullptr   ? std::string{gbuf->label}
+                                                  : std::string{"Off"};
   if (ImGui::BeginCombo("Debug view", preview.c_str())) {
     if (ImGui::Selectable("Off", current == 0)) {
       set_view_override(0);

@@ -33,6 +33,7 @@ enum class ClassView : uint16_t {
 };
 // Ids up to this one belong to classification; later ids are other views and select nothing here
 inline constexpr uint16_t LastReservedClassView = 15;
+inline constexpr uint16_t FirstGbufView = 16;
 
 struct DebugView {
   uint16_t id = 0;
@@ -49,6 +50,28 @@ inline constexpr std::array<DebugView, 8> ClassViews{{
     {6, "class.object", "Classification: object"},
     {7, "class.scope", "Classification: scope"},
     {8, "class.bit", "Classification: one category"},
+}};
+
+struct GbufView {
+  uint16_t id = 0;
+  std::string_view name;
+  std::string_view label;
+  std::string_view resource;
+  std::string_view anchor;
+  Stage stage = Stage::OpaqueDone;
+  uint32_t mode = 0;
+  bool uintSource = false;
+};
+
+// Ids after the classification range; each snapshots one scene target and replaces the frame's RGB before the HUD
+inline constexpr std::array<GbufView, 7> GbufViews{{
+    {16, "gbuf.motion", "G-buffer: motion", "gbuf.motion", "phase.post_taa", Stage::PrePost, 0, false},
+    {17, "gbuf.reactive", "G-buffer: reactive", "gbuf.reactive", "phase.post_taa", Stage::PrePost, 1, false},
+    {18, "gbuf.fog", "Fog record: weight", "gbuf.fog", "phase.composite", Stage::OpaqueDone, 2, true},
+    {19, "gbuf.fog.color", "Fog record: colour", "gbuf.fog", "phase.composite", Stage::OpaqueDone, 3, true},
+    {20, "gbuf.fog.lock", "Fog record: lock", "gbuf.fog", "phase.composite", Stage::OpaqueDone, 4, true},
+    {21, "gx.normal", "G-buffer: normal", "gx.normal", "phase.composite", Stage::OpaqueDone, 5, false},
+    {22, "gx.normal.code", "G-buffer: receiver code", "gx.normal", "phase.composite", Stage::OpaqueDone, 6, false},
 }};
 
 struct ViewSelection {
@@ -106,6 +129,15 @@ inline constexpr std::array<CategoryColor, 14> CategoryColors{{
   return nullptr;
 }
 
+[[nodiscard]] constexpr const GbufView* find_gbuf_view(uint16_t id) noexcept {
+  for (const GbufView& view : GbufViews) {
+    if (view.id == id) {
+      return &view;
+    }
+  }
+  return nullptr;
+}
+
 [[nodiscard]] constexpr std::optional<uint32_t> category_bit(std::string_view name) noexcept {
   for (uint32_t bit = 0; bit < 32; ++bit) {
     const std::string_view candidate = scene::category_name(bit);
@@ -132,6 +164,11 @@ inline constexpr std::array<CategoryColor, 14> CategoryColors{{
   }
   for (const DebugView& view : ClassViews) {
     if (text == view.name || text == view.name.substr(Prefix.size())) {
+      return select(view.id);
+    }
+  }
+  for (const GbufView& view : GbufViews) {
+    if (text == view.name || text == view.name.substr(view.name.find('.') + 1)) {
       return select(view.id);
     }
   }
@@ -215,6 +252,9 @@ void set_view_bit(uint32_t bit) noexcept;
 void initialize_classification();
 void shutdown_classification() noexcept;
 void draw_scene_tab();
+void draw_views_tab();
+void views_on_latch();
+[[nodiscard]] uint16_t selected_view_id(const Settings& settings) noexcept;
 
 // Only colour may change, because alpha feeds the alpha test, blending and EFB alpha; such variants are refused
 [[nodiscard]] bool make_view_variant(const gx::PipelineConfig& config, const gx::ShaderInfo& info,

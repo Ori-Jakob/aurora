@@ -1,3 +1,4 @@
+#include "capture.hpp"
 #include "debug.hpp"
 
 #include "../frame_state.hpp"
@@ -138,19 +139,28 @@ void draw_bar(float first, float last) {
   ImGui::Dummy({width, height});
 }
 
-void dump_json() {
-  const std::string json = graph_dump_json(true);
-  const auto path =
-      io::fs_path_from_string(g_config.cachePath != nullptr ? g_config.cachePath : ".") / "render_graph.json";
-  if (json.empty()) {
+void write_dump(std::string_view name, const std::string& text) {
+  const auto path = io::fs_path_from_string(g_config.cachePath != nullptr ? g_config.cachePath : ".") / name;
+  if (text.empty()) {
     g_state.dumpFailed = true;
     g_state.dumpStatus = "Failed to format the graph dump";
     return;
   }
-  const bool written = io::write_file_atomic(path, {reinterpret_cast<const uint8_t*>(json.data()), json.size()});
+  const bool written = io::write_file_atomic(path, {reinterpret_cast<const uint8_t*>(text.data()), text.size()});
   g_state.dumpFailed = !written;
   g_state.dumpStatus = written ? "Wrote " + io::fs_path_to_string(path)
                                : "Failed to write " + io::fs_path_to_string(path) + ": " + SDL_GetError();
+}
+
+void dump_json() { write_dump("render_graph.json", graph_dump_json(true)); }
+
+void dump_dot(const GraphInspection& inspection, const FrameCullSnapshot* cull) {
+  write_dump("render_graph.dot", format_graph_dot(inspection, cull));
+}
+
+bool is_buffer(const GraphInspection& inspection, std::string_view name) {
+  const auto it = std::ranges::find(inspection.resources, name, &InspectResource::name);
+  return it != inspection.resources.end() && it->type == "buffer";
 }
 
 void draw_header(const GraphInspection& inspection, const FrameCullSnapshot* cull) {
@@ -192,6 +202,10 @@ void draw_header(const GraphInspection& inspection, const FrameCullSnapshot* cul
   ImGui::SameLine();
   if (ImGui::Button("Dump JSON")) {
     dump_json();
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Dump DOT")) {
+    dump_dot(inspection, cull);
   }
   if (!g_state.dumpStatus.empty()) {
     if (g_state.dumpFailed) {
@@ -386,8 +400,23 @@ void draw_detail(const GraphInspection& inspection, const FrameCullSnapshot* cul
       ImGui::BulletText("reads %s as %s (%s, %s)", read.resource.c_str(), read.access.c_str(), read.missing.c_str(),
                         read.binding.c_str());
     }
-    for (const InspectWrite& write : pass.writes) {
+    for (size_t w = 0; w < pass.writes.size(); ++w) {
+      const InspectWrite& write = pass.writes[w];
       ImGui::BulletText("writes %s as %s", write.resource.c_str(), write.access.c_str());
+      if (is_buffer(inspection, write.resource)) {
+        continue;
+      }
+      ImGui::SameLine();
+      ImGui::PushID(static_cast<int>(w));
+      if (ImGui::SmallButton("Capture")) {
+        const bool queued =
+            capture::request({.resource = write.resource, .anchor = pass.name, .dir = capture::default_dir()})
+                .has_value();
+        g_state.dumpFailed = !queued;
+        g_state.dumpStatus = queued ? "Capture of " + write.resource + " after " + pass.name + " requested"
+                                    : std::string{"Every capture slot is busy"};
+      }
+      ImGui::PopID();
     }
     for (const InspectEdge& edge : inspection.edges) {
       if (edge.to != index && edge.from != index) {
