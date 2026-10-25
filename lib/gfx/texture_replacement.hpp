@@ -1,6 +1,7 @@
 #pragma once
 
 #include "texture.hpp"
+#include "texture_convert.hpp"
 #include <aurora/texture.hpp>
 #include <filesystem>
 #include <optional>
@@ -18,6 +19,44 @@ struct StreamingStats {
   uint64_t publishes = 0;
   uint64_t publishBytes = 0;
 };
+
+constexpr wgpu::TextureFormat legacy_storage_format(wgpu::TextureFormat format) noexcept {
+  switch (format) {
+  case wgpu::TextureFormat::RGBA8UnormSrgb:
+    return wgpu::TextureFormat::RGBA8Unorm;
+  case wgpu::TextureFormat::BGRA8UnormSrgb:
+    return wgpu::TextureFormat::BGRA8Unorm;
+  case wgpu::TextureFormat::BC1RGBAUnormSrgb:
+    return wgpu::TextureFormat::BC1RGBAUnorm;
+  case wgpu::TextureFormat::BC3RGBAUnormSrgb:
+    return wgpu::TextureFormat::BC3RGBAUnorm;
+  case wgpu::TextureFormat::BC7RGBAUnormSrgb:
+    return wgpu::TextureFormat::BC7RGBAUnorm;
+  default:
+    return format;
+  }
+}
+
+constexpr bool legacy_base_accepts(wgpu::TextureFormat format) noexcept {
+  switch (format) {
+  case wgpu::TextureFormat::BC4RUnorm:
+  case wgpu::TextureFormat::BC4RSnorm:
+  case wgpu::TextureFormat::BC5RGSnorm:
+  case wgpu::TextureFormat::BC6HRGBUfloat:
+  case wgpu::TextureFormat::BC6HRGBFloat:
+    return false;
+  default:
+    return true;
+  }
+}
+
+struct ReplacementTextureDescriptors {
+  wgpu::TextureDescriptor texture;
+  wgpu::TextureViewDescriptor view;
+};
+
+ReplacementTextureDescriptors replacement_texture_descriptors(const ConvertedTexture& replacement,
+                                                              std::string_view label) noexcept;
 
 void shutdown() noexcept;
 StreamingStats process_streaming() noexcept;
@@ -59,5 +98,7 @@ namespace testing {
 void set_workers_paused(bool paused) noexcept;
 void set_worker_count(uint32_t count) noexcept;
 bool wait_for_completions(uint64_t id, uint32_t count, uint32_t timeoutMs) noexcept;
+std::optional<ConvertedTexture> load_replacement_texture(const texture::ReplacementRegistration& registration) noexcept;
+bool has_thumbnail(uint64_t id) noexcept;
 } // namespace testing
 } // namespace aurora::gfx::texture_replacement

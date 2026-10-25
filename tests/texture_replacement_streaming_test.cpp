@@ -1,8 +1,10 @@
 #include "gfx/dds_io.hpp"
 #include "gfx/texture_replacement.hpp"
 #include "internal.hpp"
+#include "webgpu/gpu.hpp"
 
 #include <aurora/texture.hpp>
+#include <fmt/format.h>
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -13,9 +15,14 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
+#include <map>
 #include <mutex>
+#include <set>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace aurora::gfx::texture_replacement {
@@ -281,6 +288,306 @@ TEST(DdsMipTailTest, RejectsMiplessLargeTextureButKeepsSmallWholeTexture) {
   ASSERT_EQ(tail->texture.data.size(), smallPixels.size());
   EXPECT_TRUE(
       std::equal(tail->texture.data.data(), tail->texture.data.data() + tail->texture.data.size(), smallPixels.data()));
+}
+
+using Format = wgpu::TextureFormat;
+
+std::vector<uint8_t> make_dx10_dds(uint32_t dxgi, uint32_t width, uint32_t height, uint32_t mips, size_t dataSize,
+                                   uint8_t seed = 0) {
+  std::vector<uint8_t> bytes(148 + dataSize);
+  write_u32(bytes, 0, 0x20534444u);
+  write_u32(bytes, 4, 124u);
+  write_u32(bytes, 8, 0x81007u | (mips > 1 ? 0x20000u : 0u));
+  write_u32(bytes, 12, height);
+  write_u32(bytes, 16, width);
+  write_u32(bytes, 28, mips);
+  write_u32(bytes, 76, 32u);
+  write_u32(bytes, 80, 0x4u);
+  write_u32(bytes, 84, 0x30315844u);
+  write_u32(bytes, 108, 0x1000u | (mips > 1 ? 0x400008u : 0u));
+  write_u32(bytes, 128, dxgi);
+  write_u32(bytes, 132, 3u);
+  write_u32(bytes, 140, 1u);
+  for (size_t i = 0; i < dataSize; ++i) {
+    bytes[148 + i] = static_cast<uint8_t>(i * 7 + seed);
+  }
+  return bytes;
+}
+
+std::vector<uint8_t> make_dds(uint32_t dxgi, Format format, uint32_t width, uint32_t height, uint32_t mips = 1,
+                              uint8_t seed = 0) {
+  return make_dx10_dds(dxgi, width, height, mips, calc_texture_size(format, width, height, mips), seed);
+}
+
+std::string virtual_name(uint32_t hash) { return fmt::format("tex1_16x16_{:016x}_14.dds", hash); }
+
+std::string virtual_mip_name(uint32_t hash, uint32_t mip) {
+  return fmt::format("tex1_16x16_{:016x}_14_mip{}.dds", hash, mip);
+}
+
+struct MapSource {
+  std::map<std::string, std::vector<uint8_t>, std::less<>> files;
+
+  static bool read(void* userData, const char* path, std::vector<uint8_t>& outBytes) {
+    const auto& source = *static_cast<const MapSource*>(userData);
+    const auto it = source.files.find(std::string_view{path});
+    if (it == source.files.end()) {
+      return false;
+    }
+    outBytes = it->second;
+    return true;
+  }
+
+  texture::VirtualFileSource callbacks() { return {.read = &MapSource::read, .userData = this}; }
+};
+
+class BcCapsGuard {
+public:
+  explicit BcCapsGuard(bool supported) : m_saved(webgpu::g_bcTexturesSupported) {
+    webgpu::g_bcTexturesSupported = supported;
+  }
+  ~BcCapsGuard() { webgpu::g_bcTexturesSupported = m_saved; }
+  BcCapsGuard(const BcCapsGuard&) = delete;
+  BcCapsGuard& operator=(const BcCapsGuard&) = delete;
+
+private:
+  bool m_saved;
+};
+
+struct CodeFormat {
+  uint32_t code;
+  Format format;
+};
+
+constexpr std::array<CodeFormat, 10> AddedCodes{{
+    {29, Format::RGBA8UnormSrgb},
+    {72, Format::BC1RGBAUnormSrgb},
+    {78, Format::BC3RGBAUnormSrgb},
+    {80, Format::BC4RUnorm},
+    {81, Format::BC4RSnorm},
+    {84, Format::BC5RGSnorm},
+    {91, Format::BGRA8UnormSrgb},
+    {95, Format::BC6HRGBUfloat},
+    {96, Format::BC6HRGBFloat},
+    {99, Format::BC7RGBAUnormSrgb},
+}};
+
+TEST(DdsFormatTest, Dx10CodeSweep) {
+  std::set<uint32_t> expected{28, 29, 71, 72, 77, 78, 80, 81, 83, 84, 87, 91, 95, 96, 98, 99};
+  for (uint32_t astc = 134; astc <= 186; astc += 4) {
+    expected.insert(astc);
+    expected.insert(astc + 1);
+  }
+  std::set<uint32_t> accepted;
+  for (uint32_t code = 0; code < 256; ++code) {
+    SCOPED_TRACE(code);
+    const auto bytes = make_dx10_dds(code, 4, 4, 1, 64);
+    const auto converted = dds::parse_dds_bytes({bytes.data(), bytes.size()});
+    if (!converted) {
+      continue;
+    }
+    accepted.insert(code);
+    uint64_t blockBytes = 16;
+    if (code == 28 || code == 29 || code == 87 || code == 91) {
+      blockBytes = 64;
+    } else if (code == 71 || code == 72 || code == 80 || code == 81) {
+      blockBytes = 8;
+    }
+    EXPECT_EQ(calc_texture_size(converted->format, 4, 4, 1), blockBytes);
+    EXPECT_EQ(converted->data.size(), blockBytes);
+  }
+  EXPECT_EQ(accepted, expected);
+}
+
+TEST(DdsFormatTest, MapsToExactFormatAndTailKeepsIt) {
+  for (const auto& [code, format] : AddedCodes) {
+    SCOPED_TRACE(code);
+    const auto bytes = make_dds(code, format, 128, 128, 8, static_cast<uint8_t>(code));
+    const auto full = dds::parse_dds_bytes({bytes.data(), bytes.size()});
+    ASSERT_TRUE(full.has_value());
+    EXPECT_EQ(full->format, format);
+    EXPECT_EQ(full->mips, 8u);
+    const auto tail = dds::parse_dds_mip_tail({bytes.data(), bytes.size()}, 64);
+    ASSERT_TRUE(tail.has_value());
+    EXPECT_FALSE(tail->includesBase);
+    EXPECT_EQ(tail->texture.format, format);
+    EXPECT_EQ(tail->texture.width, 64u);
+    EXPECT_EQ(tail->texture.mips, 7u);
+    EXPECT_EQ(tail->texture.data.size(), calc_texture_size(format, 64, 64, 7));
+  }
+}
+
+constexpr bool keeps_pre_w5_formats() {
+  constexpr std::array Formats{Format::RGBA8Unorm,        Format::BGRA8Unorm,       Format::BC1RGBAUnorm,
+                               Format::BC3RGBAUnorm,      Format::BC5RGUnorm,       Format::BC7RGBAUnorm,
+                               Format::ASTC4x4Unorm,      Format::ASTC4x4UnormSrgb, Format::ASTC8x8UnormSrgb,
+                               Format::ASTC12x12UnormSrgb};
+  for (const auto format : Formats) {
+    if (legacy_storage_format(format) != format || !legacy_base_accepts(format)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+TEST(DdsFormatTest, LegacyStorageFormatKeepsRawBits) {
+  static_assert(legacy_storage_format(Format::RGBA8UnormSrgb) == Format::RGBA8Unorm);
+  static_assert(legacy_storage_format(Format::BGRA8UnormSrgb) == Format::BGRA8Unorm);
+  static_assert(legacy_storage_format(Format::BC1RGBAUnormSrgb) == Format::BC1RGBAUnorm);
+  static_assert(legacy_storage_format(Format::BC3RGBAUnormSrgb) == Format::BC3RGBAUnorm);
+  static_assert(legacy_storage_format(Format::BC7RGBAUnormSrgb) == Format::BC7RGBAUnorm);
+  static_assert(legacy_storage_format(Format::BC4RUnorm) == Format::BC4RUnorm);
+  static_assert(legacy_storage_format(Format::BC6HRGBFloat) == Format::BC6HRGBFloat);
+  static_assert(keeps_pre_w5_formats());
+  static_assert(!legacy_base_accepts(Format::BC4RUnorm) && !legacy_base_accepts(Format::BC4RSnorm) &&
+                !legacy_base_accepts(Format::BC5RGSnorm) && !legacy_base_accepts(Format::BC6HRGBUfloat) &&
+                !legacy_base_accepts(Format::BC6HRGBFloat));
+  static_assert(legacy_base_accepts(Format::BC7RGBAUnormSrgb) && legacy_base_accepts(Format::RGBA8UnormSrgb) &&
+                legacy_base_accepts(Format::BGRA8UnormSrgb) && legacy_base_accepts(Format::BC1RGBAUnormSrgb) &&
+                legacy_base_accepts(Format::BC3RGBAUnormSrgb));
+  SUCCEED();
+}
+
+TEST_F(ReplacementStreamingTest, SrgbBaseLoadsWithExactFormat) {
+  BcCapsGuard caps{true};
+  testing::set_workers_paused(true);
+  constexpr std::array<CodeFormat, 5> Srgb{{
+      {29, Format::RGBA8UnormSrgb},
+      {72, Format::BC1RGBAUnormSrgb},
+      {78, Format::BC3RGBAUnormSrgb},
+      {91, Format::BGRA8UnormSrgb},
+      {99, Format::BC7RGBAUnormSrgb},
+  }};
+  for (const auto& [code, format] : Srgb) {
+    SCOPED_TRACE(code);
+    MapSource source;
+    const auto base = make_dds(code, format, 16, 16, 1, 1);
+    const auto mip1 = make_dds(code, format, 8, 8, 1, 2);
+    source.files[virtual_name(code)] = base;
+    source.files[virtual_mip_name(code, 1)] = mip1;
+    const auto registration = texture::register_virtual_replacement(virtual_name(code), source.callbacks());
+    ASSERT_NE(registration.id, 0u);
+    const auto loaded = testing::load_replacement_texture(registration);
+    texture::unregister_replacement(registration);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(loaded->format, format);
+    EXPECT_EQ(loaded->width, 16u);
+    EXPECT_EQ(loaded->mips, 2u);
+    std::vector<uint8_t> expected(base.begin() + 148, base.end());
+    expected.insert(expected.end(), mip1.begin() + 148, mip1.end());
+    ASSERT_EQ(loaded->data.size(), expected.size());
+    EXPECT_TRUE(std::equal(expected.begin(), expected.end(), loaded->data.data()));
+  }
+}
+
+TEST_F(ReplacementStreamingTest, MixedSrgbChainStopsAtFormatChange) {
+  BcCapsGuard caps{true};
+  testing::set_workers_paused(true);
+  MapSource source;
+  source.files[virtual_name(0x99)] = make_dds(99, Format::BC7RGBAUnormSrgb, 16, 16);
+  source.files[virtual_mip_name(0x99, 1)] = make_dds(98, Format::BC7RGBAUnorm, 8, 8);
+  source.files[virtual_mip_name(0x99, 2)] = make_dds(99, Format::BC7RGBAUnormSrgb, 4, 4);
+  const auto registration = texture::register_virtual_replacement(virtual_name(0x99), source.callbacks());
+  ASSERT_NE(registration.id, 0u);
+  const auto loaded = testing::load_replacement_texture(registration);
+  texture::unregister_replacement(registration);
+  ASSERT_TRUE(loaded.has_value());
+  EXPECT_EQ(loaded->format, Format::BC7RGBAUnormSrgb);
+  EXPECT_EQ(loaded->mips, 1u);
+  EXPECT_EQ(loaded->data.size(), calc_texture_size(Format::BC7RGBAUnormSrgb, 16, 16, 1));
+}
+
+TEST_F(ReplacementStreamingTest, MaterialOnlyFormatsAreRejectedAsBase) {
+  BcCapsGuard caps{true};
+  testing::set_workers_paused(true);
+  constexpr std::array<CodeFormat, 6> Bases{{
+      {80, Format::BC4RUnorm},
+      {81, Format::BC4RSnorm},
+      {84, Format::BC5RGSnorm},
+      {95, Format::BC6HRGBUfloat},
+      {96, Format::BC6HRGBFloat},
+      {83, Format::BC5RGUnorm},
+  }};
+  for (const auto& [code, format] : Bases) {
+    SCOPED_TRACE(code);
+    MapSource source;
+    source.files[virtual_name(code)] = make_dds(code, format, 8, 8);
+    const auto registration = texture::register_virtual_replacement(virtual_name(code), source.callbacks());
+    ASSERT_NE(registration.id, 0u);
+    const auto loaded = testing::load_replacement_texture(registration);
+    texture::unregister_replacement(registration);
+    EXPECT_EQ(loaded.has_value(), code == 83);
+    if (loaded) {
+      EXPECT_EQ(loaded->format, format);
+    }
+  }
+}
+
+TEST_F(ReplacementStreamingTest, BcRejectedWithoutCaps) {
+  BcCapsGuard caps{false};
+  testing::set_workers_paused(true);
+  constexpr std::array<CodeFormat, 4> Bases{{
+      {98, Format::BC7RGBAUnorm},
+      {99, Format::BC7RGBAUnormSrgb},
+      {80, Format::BC4RUnorm},
+      {29, Format::RGBA8UnormSrgb},
+  }};
+  for (const auto& [code, format] : Bases) {
+    SCOPED_TRACE(code);
+    MapSource source;
+    source.files[virtual_name(code)] = make_dds(code, format, 8, 8);
+    const auto registration = texture::register_virtual_replacement(virtual_name(code), source.callbacks());
+    ASSERT_NE(registration.id, 0u);
+    const auto loaded = testing::load_replacement_texture(registration);
+    texture::unregister_replacement(registration);
+    EXPECT_EQ(loaded.has_value(), code == 29);
+  }
+}
+
+TEST_F(ReplacementStreamingTest, DescriptorsUseStorageTwin) {
+  constexpr std::array<std::pair<Format, Format>, 7> Cases{{
+      {Format::BC7RGBAUnormSrgb, Format::BC7RGBAUnorm},
+      {Format::BC1RGBAUnormSrgb, Format::BC1RGBAUnorm},
+      {Format::BC3RGBAUnormSrgb, Format::BC3RGBAUnorm},
+      {Format::RGBA8UnormSrgb, Format::RGBA8Unorm},
+      {Format::BGRA8UnormSrgb, Format::BGRA8Unorm},
+      {Format::BC7RGBAUnorm, Format::BC7RGBAUnorm},
+      {Format::ASTC4x4UnormSrgb, Format::ASTC4x4UnormSrgb},
+  }};
+  for (const auto& [format, storage] : Cases) {
+    SCOPED_TRACE(static_cast<uint32_t>(format));
+    const ConvertedTexture texture{.format = format, .width = 32, .height = 16, .mips = 3};
+    const auto descriptors = replacement_texture_descriptors(texture, "replacement");
+    EXPECT_EQ(descriptors.texture.format, storage);
+    EXPECT_EQ(descriptors.view.format, storage);
+    EXPECT_EQ(descriptors.texture.viewFormatCount, 0u);
+    EXPECT_EQ(descriptors.texture.viewFormats, nullptr);
+    EXPECT_EQ(descriptors.texture.usage, wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst);
+    EXPECT_EQ(descriptors.texture.size.width, 32u);
+    EXPECT_EQ(descriptors.texture.size.height, 16u);
+    EXPECT_EQ(descriptors.texture.size.depthOrArrayLayers, 1u);
+    EXPECT_EQ(descriptors.texture.mipLevelCount, 3u);
+    EXPECT_EQ(descriptors.view.mipLevelCount, 3u);
+    EXPECT_EQ(descriptors.view.dimension, wgpu::TextureViewDimension::e2D);
+    EXPECT_EQ(std::string_view{descriptors.texture.label}, "replacement");
+  }
+}
+
+TEST_F(ReplacementStreamingTest, MaterialOnlyBaseNeverStoresThumbnail) {
+  BcCapsGuard caps{true};
+  MapSource source;
+  source.files[virtual_name(0x80)] = make_dds(80, Format::BC4RUnorm, 8, 8);
+  source.files[virtual_name(0x98)] = make_dds(98, Format::BC7RGBAUnorm, 8, 8);
+  const auto bc4 = texture::register_virtual_replacement(virtual_name(0x80), source.callbacks());
+  const auto control = texture::register_virtual_replacement(virtual_name(0x98), source.callbacks());
+  ASSERT_NE(bc4.id, 0u);
+  ASSERT_NE(control.id, 0u);
+  ASSERT_TRUE(testing::wait_for_completions(bc4.id, 1, 2000));
+  ASSERT_TRUE(testing::wait_for_completions(control.id, 1, 2000));
+  EXPECT_FALSE(testing::has_thumbnail(bc4.id));
+  EXPECT_TRUE(testing::has_thumbnail(control.id));
+  const std::array registrations{bc4, control};
+  texture::unregister_replacements(registrations);
 }
 
 constexpr std::string_view StemA = "tex1_16x16_000000000000a001_14";

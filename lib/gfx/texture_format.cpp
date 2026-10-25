@@ -23,16 +23,26 @@ TextureFormatInfo format_info(wgpu::TextureFormat format) noexcept {
   case wgpu::TextureFormat::R16Sint:
     return {1, 1, 2, false};
   case wgpu::TextureFormat::RGBA8Unorm:
+  case wgpu::TextureFormat::RGBA8UnormSrgb:
   case wgpu::TextureFormat::BGRA8Unorm:
+  case wgpu::TextureFormat::BGRA8UnormSrgb:
   case wgpu::TextureFormat::R32Float:
   case wgpu::TextureFormat::Depth24Plus:
   case wgpu::TextureFormat::Depth32Float:
     return {1, 1, 4, false};
   case wgpu::TextureFormat::BC1RGBAUnorm:
+  case wgpu::TextureFormat::BC1RGBAUnormSrgb:
+  case wgpu::TextureFormat::BC4RUnorm:
+  case wgpu::TextureFormat::BC4RSnorm:
     return {4, 4, 8, true};
   case wgpu::TextureFormat::BC3RGBAUnorm:
+  case wgpu::TextureFormat::BC3RGBAUnormSrgb:
   case wgpu::TextureFormat::BC5RGUnorm:
+  case wgpu::TextureFormat::BC5RGSnorm:
+  case wgpu::TextureFormat::BC6HRGBUfloat:
+  case wgpu::TextureFormat::BC6HRGBFloat:
   case wgpu::TextureFormat::BC7RGBAUnorm:
+  case wgpu::TextureFormat::BC7RGBAUnormSrgb:
     return {4, 4, 16, true};
   case wgpu::TextureFormat::ASTC4x4Unorm:
   case wgpu::TextureFormat::ASTC4x4UnormSrgb:

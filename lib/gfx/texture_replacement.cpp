@@ -468,6 +468,10 @@ constexpr bool is_unsupported_texture_format(wgpu::TextureFormat format) {
   }
 }
 
+bool usable_as_legacy_base(wgpu::TextureFormat format) noexcept {
+  return gfx::texture_replacement::legacy_base_accepts(format) && !is_unsupported_texture_format(format);
+}
+
 bool validate_texture_size(wgpu::TextureFormat format, uint32_t width, uint32_t height,
                            std::string_view label) noexcept {
   if (gfx::is_block_aligned(format, width, height)) {
@@ -582,6 +586,11 @@ std::optional<gfx::ConvertedTexture> load_encoded_replacement(Source&& src) noex
     Log.warn("texture_replacement: failed to load texture {}", src.name());
     return std::nullopt;
   }
+  if (!gfx::texture_replacement::legacy_base_accepts(base->format)) {
+    Log.warn("texture_replacement: {} uses format {}, which is only valid for material maps", src.name(),
+             static_cast<uint32_t>(base->format));
+    return std::nullopt;
+  }
   if (is_unsupported_texture_format(base->format)) {
     Log.warn("texture_replacement: failed to load texture {} due to unsupported format: {}", src.name(),
              static_cast<uint32_t>(base->format));
@@ -608,6 +617,9 @@ std::optional<gfx::ConvertedTexture> load_encoded_replacement(Source&& src) noex
     if (!ok) {
       if (!lvl.has_value()) {
         Log.warn("texture_replacement: could not load mip {}", src.mip_name());
+      } else if (lvl->format != base->format) {
+        Log.warn("texture_replacement: mip {} has format {}, base has {}", src.mip_name(),
+                 static_cast<uint32_t>(lvl->format), static_cast<uint32_t>(base->format));
       } else {
         Log.warn("texture_replacement: expected {}x{} for mip {}, got {}x{}", ew, eh, src.mip_name(), lvl->width,
                  lvl->height);
@@ -751,7 +763,7 @@ void worker_main(std::stop_token token) {
       texture = load_virtual_replacement(job.entry);
     }
 
-    if (job.tier == Tier::Thumbnail && texture.has_value() && !is_unsupported_texture_format(texture->format) &&
+    if (job.tier == Tier::Thumbnail && texture.has_value() && usable_as_legacy_base(texture->format) &&
         validate_texture_size(texture->format, texture->width, texture->height, job.entry.label)) {
       std::lock_guard lock{s_registryMutex};
       if (auto* entry = find_entry_locked(job.entry.key, job.entry.id); entry != nullptr) {
@@ -909,31 +921,14 @@ std::string entry_path_for_log(const ReplacementEntry& entry) {
 gfx::TextureHandle create_converted_texture_handle(const EntryLoadSnapshot& entry,
                                                    const gfx::ConvertedTexture& replacement) noexcept {
   const auto label = entry.label.empty() ? fmt::format("TextureReplacement {}", entry.id) : entry.label;
-  const wgpu::Extent3D size{
-      .width = replacement.width,
-      .height = replacement.height,
-      .depthOrArrayLayers = 1,
-  };
-  const wgpu::TextureDescriptor textureDescriptor{
-      .label = label.c_str(),
-      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
-      .dimension = wgpu::TextureDimension::e2D,
-      .size = size,
-      .format = replacement.format,
-      .mipLevelCount = replacement.mips,
-      .sampleCount = 1,
-  };
-  auto texture = webgpu::g_device.CreateTexture(&textureDescriptor);
+  auto descriptors = gfx::texture_replacement::replacement_texture_descriptors(replacement, label);
+  auto texture = webgpu::g_device.CreateTexture(&descriptors.texture);
   const auto viewLabel = fmt::format("{} view", label);
-  const wgpu::TextureViewDescriptor textureViewDescriptor{
-      .label = viewLabel.c_str(),
-      .format = replacement.format,
-      .dimension = wgpu::TextureViewDimension::e2D,
-      .mipLevelCount = replacement.mips,
-  };
-  auto textureView = texture.CreateView(&textureViewDescriptor);
-  auto handle = std::make_shared<gfx::TextureRef>(std::move(texture), std::move(textureView), wgpu::TextureView{}, size,
-                                                  replacement.format, replacement.mips, gfx::InvalidTextureFormat);
+  descriptors.view.label = viewLabel.c_str();
+  auto textureView = texture.CreateView(&descriptors.view);
+  auto handle = std::make_shared<gfx::TextureRef>(std::move(texture), std::move(textureView), wgpu::TextureView{},
+                                                  descriptors.texture.size, descriptors.texture.format,
+                                                  replacement.mips, gfx::InvalidTextureFormat);
   handle->isReplacement = true;
   aurora::gfx::write_texture(*handle, replacement.data);
   return handle;
@@ -1113,7 +1108,7 @@ find_replacement_for_key_locked(const ReplacementKey& key) noexcept {
     if (entry->kind != EntryKind::Raw && !s_synchronousLoads.load(std::memory_order_relaxed)) {
       gfx::TextureHandle thumbnailHandle;
       Tier tier = Tier::Thumbnail;
-      if (entry->thumbnail.has_value() && !is_unsupported_texture_format(entry->thumbnail->format) &&
+      if (entry->thumbnail.has_value() && usable_as_legacy_base(entry->thumbnail->format) &&
           validate_texture_size(entry->thumbnail->format, entry->thumbnail->width, entry->thumbnail->height,
                                 entry->label)) {
         const auto snapshot = snapshot_entry(key, *entry);
@@ -1790,6 +1785,30 @@ void shutdown() noexcept {
   stop_worker_pool();
 }
 
+ReplacementTextureDescriptors replacement_texture_descriptors(const ConvertedTexture& replacement,
+                                                              std::string_view label) noexcept {
+  // The TEV reads raw replacement bits, so sRGB-tagged files are stored as their Unorm twin
+  const auto format = legacy_storage_format(replacement.format);
+  return {
+      .texture =
+          wgpu::TextureDescriptor{
+              .label = label,
+              .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
+              .dimension = wgpu::TextureDimension::e2D,
+              .size = {.width = replacement.width, .height = replacement.height, .depthOrArrayLayers = 1},
+              .format = format,
+              .mipLevelCount = replacement.mips,
+              .sampleCount = 1,
+          },
+      .view =
+          wgpu::TextureViewDescriptor{
+              .format = format,
+              .dimension = wgpu::TextureViewDimension::e2D,
+              .mipLevelCount = replacement.mips,
+          },
+  };
+}
+
 StreamingStats process_streaming() noexcept {
   if constexpr (!gx::texture::AsyncTextureReplacements) {
     return {};
@@ -2142,6 +2161,34 @@ bool wait_for_completions(uint64_t id, uint32_t count, uint32_t timeoutMs) noexc
     return std::count_if(s_workerCompletions.begin(), s_workerCompletions.end(),
                          [id](const LoadCompletion& completion) { return completion.entry.id == id; }) >= count;
   });
+}
+
+std::optional<ConvertedTexture>
+load_replacement_texture(const texture::ReplacementRegistration& registration) noexcept {
+  std::optional<EntryLoadSnapshot> snapshot;
+  {
+    std::lock_guard lock{s_registryMutex};
+    if (const auto* entry = find_entry_locked(registration.key, registration.id);
+        entry != nullptr && entry->kind != EntryKind::Raw) {
+      snapshot = snapshot_entry(registration.key, *entry);
+    }
+  }
+  if (!snapshot) {
+    return std::nullopt;
+  }
+  return snapshot->kind == EntryKind::File ? load_file_replacement(*snapshot) : load_virtual_replacement(*snapshot);
+}
+
+bool has_thumbnail(uint64_t id) noexcept {
+  std::lock_guard lock{s_registryMutex};
+  for (const auto& [key, entries] : s_entriesByKey) {
+    for (const auto& entry : entries) {
+      if (entry.id == id) {
+        return entry.thumbnail.has_value();
+      }
+    }
+  }
+  return false;
 }
 } // namespace testing
 } // namespace aurora::gfx::texture_replacement

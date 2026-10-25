@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -15,6 +16,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace aurora::test::c1 {
@@ -441,13 +443,19 @@ TEST_F(MaterialContractTest, DdsIoParsesSupportedFormats) {
     EXPECT_EQ(converted->height, static_cast<uint32_t>(int_of(entry, "height")));
     EXPECT_EQ(converted->mips, static_cast<uint32_t>(int_of(entry, "mips")));
     const int64_t code = int_of(entry, "dxgi", 83);
-    if (code == 98) {
-      EXPECT_EQ(converted->format, wgpu::TextureFormat::BC7RGBAUnorm);
-    } else if (code == 83) {
-      EXPECT_EQ(converted->format, wgpu::TextureFormat::BC5RGUnorm);
-    } else {
+    constexpr std::array<std::pair<int64_t, wgpu::TextureFormat>, 5> Formats{{
+        {98, wgpu::TextureFormat::BC7RGBAUnorm},
+        {99, wgpu::TextureFormat::BC7RGBAUnormSrgb},
+        {83, wgpu::TextureFormat::BC5RGUnorm},
+        {80, wgpu::TextureFormat::BC4RUnorm},
+        {95, wgpu::TextureFormat::BC6HRGBUfloat},
+    }};
+    const auto it = std::find_if(Formats.begin(), Formats.end(), [code](const auto& row) { return row.first == code; });
+    if (it == Formats.end()) {
       ADD_FAILURE() << "parsed unexpected DXGI format " << code;
+      continue;
     }
+    EXPECT_EQ(converted->format, it->second);
   }
 }
 
