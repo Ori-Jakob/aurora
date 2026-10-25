@@ -558,6 +558,49 @@ TEST_F(ReplacementStreamingTest, MaterialOnlyFormatsAreRejectedAsBase) {
   }
 }
 
+struct CapturedLogs {
+  std::mutex mutex;
+  std::vector<std::pair<AuroraLogLevel, std::string>> lines;
+};
+
+CapturedLogs g_capturedLogs;
+
+void capture_log(AuroraLogLevel level, const char*, const char* message, unsigned int len) {
+  std::lock_guard lock{g_capturedLogs.mutex};
+  g_capturedLogs.lines.emplace_back(level, std::string{message, len});
+}
+
+// Restores the previous log callback even when an assertion leaves the test early
+class ScopedWarningCapture {
+public:
+  ScopedWarningCapture() noexcept : m_previous(g_config.logCallback) {
+    {
+      std::lock_guard lock{g_capturedLogs.mutex};
+      g_capturedLogs.lines.clear();
+    }
+    g_config.logCallback = &capture_log;
+  }
+  ~ScopedWarningCapture() { g_config.logCallback = m_previous; }
+  ScopedWarningCapture(const ScopedWarningCapture&) = delete;
+  ScopedWarningCapture& operator=(const ScopedWarningCapture&) = delete;
+
+  [[nodiscard]] std::vector<std::string> lines(AuroraLogLevel level, std::string_view text = {}) const {
+    std::lock_guard lock{g_capturedLogs.mutex};
+    std::vector<std::string> out;
+    for (const auto& [lineLevel, line] : g_capturedLogs.lines) {
+      if (lineLevel == level && line.find(text) != std::string::npos) {
+        out.push_back(line);
+      }
+    }
+    return out;
+  }
+  [[nodiscard]] size_t warnings(std::string_view text = {}) const { return lines(LOG_WARNING, text).size(); }
+  [[nodiscard]] size_t debugs(std::string_view text) const { return lines(LOG_DEBUG, text).size(); }
+
+private:
+  AuroraLogCallback m_previous;
+};
+
 TEST_F(ReplacementStreamingTest, BcRejectedWithoutCaps) {
   BcCapsGuard caps{false};
   testing::set_workers_paused(true);
@@ -573,9 +616,13 @@ TEST_F(ReplacementStreamingTest, BcRejectedWithoutCaps) {
     source.files[virtual_name(code)] = make_dds(code, format, 8, 8);
     const auto registration = texture::register_virtual_replacement(virtual_name(code), source.callbacks());
     ASSERT_NE(registration.id, 0u);
+    ScopedWarningCapture capture;
     const auto loaded = testing::load_replacement_texture(registration);
     texture::unregister_replacement(registration);
     EXPECT_EQ(loaded.has_value(), code == 29);
+    // The material-map check runs before the BC caps check, so code 80 never reaches the format warning
+    EXPECT_EQ(capture.warnings("only valid for material maps"), code == 80 ? 1u : 0u);
+    EXPECT_EQ(capture.warnings("unsupported format"), code == 98 || code == 99 ? 1u : 0u);
   }
 }
 
@@ -913,49 +960,6 @@ TEST_F(CompanionScanTest, PackManifestsFollowGroup) {
   EXPECT_TRUE(removed.manifests.empty());
   EXPECT_EQ(removed.generation, report.generation + 1);
 }
-
-struct CapturedLogs {
-  std::mutex mutex;
-  std::vector<std::pair<AuroraLogLevel, std::string>> lines;
-};
-
-CapturedLogs g_capturedLogs;
-
-void capture_log(AuroraLogLevel level, const char*, const char* message, unsigned int len) {
-  std::lock_guard lock{g_capturedLogs.mutex};
-  g_capturedLogs.lines.emplace_back(level, std::string{message, len});
-}
-
-// Restores the previous log callback even when an assertion leaves the test early
-class ScopedWarningCapture {
-public:
-  ScopedWarningCapture() noexcept : m_previous(g_config.logCallback) {
-    {
-      std::lock_guard lock{g_capturedLogs.mutex};
-      g_capturedLogs.lines.clear();
-    }
-    g_config.logCallback = &capture_log;
-  }
-  ~ScopedWarningCapture() { g_config.logCallback = m_previous; }
-  ScopedWarningCapture(const ScopedWarningCapture&) = delete;
-  ScopedWarningCapture& operator=(const ScopedWarningCapture&) = delete;
-
-  [[nodiscard]] std::vector<std::string> lines(AuroraLogLevel level, std::string_view text = {}) const {
-    std::lock_guard lock{g_capturedLogs.mutex};
-    std::vector<std::string> out;
-    for (const auto& [lineLevel, line] : g_capturedLogs.lines) {
-      if (lineLevel == level && line.find(text) != std::string::npos) {
-        out.push_back(line);
-      }
-    }
-    return out;
-  }
-  [[nodiscard]] size_t warnings(std::string_view text = {}) const { return lines(LOG_WARNING, text).size(); }
-  [[nodiscard]] size_t debugs(std::string_view text) const { return lines(LOG_DEBUG, text).size(); }
-
-private:
-  AuroraLogCallback m_previous;
-};
 
 // load_replacement_directory builds the dump root from cachePath even with dumps off
 class ScopedCachePath {

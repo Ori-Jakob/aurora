@@ -67,7 +67,6 @@ public:
   [[nodiscard]] uint64_t session_registration() const noexcept { return m_sessionId; }
   [[nodiscard]] std::string text() const;
   [[nodiscard]] bool has_entry(const texture::TextureSourceKey& key) const;
-  [[nodiscard]] std::string entry_json(const texture::TextureSourceKey& key) const;
   [[nodiscard]] UserEntry read_entry(const texture::TextureSourceKey& key) const;
 
   static texture::TextureSourceKey entry_key(texture::TextureSourceKey key) noexcept;

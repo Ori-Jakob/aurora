@@ -346,6 +346,30 @@ TEST_F(TextureInspector, EmptyDrawIsNeverStamped) {
   EXPECT_EQ(latest_report()->draws.size(), 2u);
 }
 
+TEST_F(TextureInspector, ReadbackMovesHoverUnlessPinned) {
+  testing::force_visible(1);
+  on_latch();
+  const uint64_t sequence = testing::sequence();
+  pick::testing::set_readback(pick::encode_id(sequence, 1));
+  on_latch();
+  testing::HoverState hover = testing::hover();
+  EXPECT_TRUE(hover.valid);
+  EXPECT_EQ(hover.sequence, sequence & 0xFF);
+  EXPECT_EQ(hover.record, 1u);
+
+  testing::set_hover_pinned(true);
+  pick::testing::set_readback(pick::encode_id(sequence, 2));
+  on_latch();
+  hover = testing::hover();
+  EXPECT_TRUE(hover.valid);
+  EXPECT_EQ(hover.record, 1u);
+
+  testing::set_hover_pinned(false);
+  pick::testing::set_readback(0);
+  on_latch();
+  EXPECT_FALSE(testing::hover().valid);
+}
+
 TEST_F(TextureInspector, HiddenTabInstallsNothing) {
   set_pick_enabled(true);
   testing::force_visible(0);

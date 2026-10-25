@@ -18,7 +18,6 @@
 
 namespace aurora::render::debug::pick {
 namespace {
-[[maybe_unused]] constexpr Module Log{"aurora::render::pick"};
 constexpr TexRef Source{0};
 constexpr size_t SlotCount = 3;
 constexpr uint64_t ReadbackBytes = sizeof(uint32_t);

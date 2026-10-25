@@ -78,6 +78,7 @@ std::optional<TextureSourceKey> parse_replacement_filename(std::string_view file
 /// Computes the source key the draw path builds for any texture GX can describe, from its base level and TLUT bytes.
 /// Returns nullopt for an unlisted format, a zero or over 0xFFFF dimension, a short base level, or a palette format
 /// without a TLUT.
+/// C14X2 keys intentionally differ from Dolphin's: they hash the TLUT range the full 14-bit indices reference.
 std::optional<TextureSourceKey> compute_source_key(uint32_t format, uint32_t width, uint32_t height,
                                                    std::span<const uint8_t> texture,
                                                    std::span<const uint8_t> tlut = {}) noexcept;

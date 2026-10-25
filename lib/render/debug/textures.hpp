@@ -128,15 +128,22 @@ struct Capacities {
   size_t keys = 0;
 };
 
+struct HoverState {
+  uint64_t sequence = 0;
+  uint32_t record = 0;
+  bool valid = false;
+};
+
 void reset() noexcept;
 void force_visible(int value) noexcept;
 void set_hash_budget(uint64_t bytes) noexcept;
 void set_arm_state(pick::ArmState state) noexcept;
 void set_pointer_probe(bool (*probe)(const GXTexObj_& obj) noexcept) noexcept;
+void set_hover_pinned(bool pinned) noexcept;
 [[nodiscard]] bool observer_installed() noexcept;
 [[nodiscard]] size_t memo_size() noexcept;
 [[nodiscard]] uint64_t sequence() noexcept;
 [[nodiscard]] Capacities live_capacities() noexcept;
-[[nodiscard]] uint32_t warm_configs() noexcept;
+[[nodiscard]] HoverState hover() noexcept;
 } // namespace testing
 } // namespace aurora::render::debug::textures

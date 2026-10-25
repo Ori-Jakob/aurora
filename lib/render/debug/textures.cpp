@@ -951,6 +951,8 @@ void set_pointer_probe(bool (*probe)(const GXTexObj_& obj) noexcept) noexcept {
   g_pointerProbe = probe != nullptr ? probe : &default_pointer_probe;
 }
 
+void set_hover_pinned(bool pinned) noexcept { g_hover.pinned = pinned; }
+
 bool observer_installed() noexcept { return g_installed; }
 
 size_t memo_size() noexcept { return g_memo.size(); }
@@ -961,6 +963,6 @@ Capacities live_capacities() noexcept {
   return {.draws = g_live.draws.capacity(), .slots = g_live.slots.capacity(), .keys = g_live.keys.capacity()};
 }
 
-uint32_t warm_configs() noexcept { return static_cast<uint32_t>(g_live.warm.size()); }
+HoverState hover() noexcept { return {.sequence = g_hover.sequence, .record = g_hover.record, .valid = g_hover.valid}; }
 } // namespace testing
 } // namespace aurora::render::debug::textures

@@ -52,18 +52,19 @@ public:
     }
   }
 
-  void commit() {
+  bool commit() {
     if (!m_active) {
-      return;
+      return false;
     }
 
     const auto ret = sqlite3_exec(m_db, "COMMIT", nullptr, nullptr, nullptr);
     if (ret != SQLITE_OK) {
       m_log.error("Failed to commit transaction: {}", sqlite3_errmsg(m_db));
-      return;
+      return false;
     }
 
     m_active = false;
+    return true;
   }
 
   explicit operator bool() const { return m_active; }

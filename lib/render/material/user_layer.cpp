@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdlib>
 #include <system_error>
 #include <utility>
 
@@ -171,21 +170,6 @@ yyjson_mut_val* UserLayer::entry(const texture::TextureSourceKey& key, bool crea
 }
 
 bool UserLayer::has_entry(const texture::TextureSourceKey& key) const { return entry(key, false) != nullptr; }
-
-std::string UserLayer::entry_json(const texture::TextureSourceKey& key) const {
-  yyjson_mut_val* value = entry(key, false);
-  if (value == nullptr) {
-    return {};
-  }
-  size_t length = 0;
-  char* text = yyjson_mut_val_write(value, YYJSON_WRITE_PRETTY_TWO_SPACES, &length);
-  if (text == nullptr) {
-    return {};
-  }
-  std::string out{text, length};
-  std::free(text);
-  return out;
-}
 
 UserEntry UserLayer::read_entry(const texture::TextureSourceKey& key) const {
   UserEntry out;

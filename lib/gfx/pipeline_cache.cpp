@@ -894,8 +894,8 @@ static void migrate_v13_gx_rows() {
       failed = !write_pipeline_cache_record(writes[i]);
     }
     if (!failed && !writes.empty()) {
-      tx.commit();
-      migrated = writes.size();
+      failed = !tx.commit();
+      migrated = failed ? 0 : writes.size();
     }
   }
   if (failed) {

@@ -89,7 +89,8 @@ fn hex_weights(bary: vec3f, c0: vec4f, c1: vec4f, c2: vec4f, contrast: f32, expo
     let lum = vec3f(dot(c0.rgb, lw), dot(c1.rgb, lw), dot(c2.rgb, lw));
     let b = max(bary, vec3f(0.0));
     // The largest base is 1 so high exponents cannot underflow; the common factor cancels in the normalisation
-    let w = mix(vec3f(1.0), lum, contrast) * pow(b / max(b.x, max(b.y, b.z)), vec3f(exponent));
+    // Black taps at full contrast would otherwise zero every weight and clear the blended alpha
+    let w = max(mix(vec3f(1.0), lum, contrast), vec3f(1e-3)) * pow(b / max(b.x, max(b.y, b.z)), vec3f(exponent));
     return w / max(w.x + w.y + w.z, 1e-6);
 }
 )";

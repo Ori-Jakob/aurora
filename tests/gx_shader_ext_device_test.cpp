@@ -409,5 +409,47 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     }
   }
 }
+
+TEST_F(GxShaderExtDevice, HexWeightsKeepAlphaOnBlackTaps) {
+  const auto backend =
+      test::parse_test_backend(std::getenv("AURORA_TEST_BACKEND")).value_or(wgpu::BackendType::Undefined);
+  if (!start({.backend = backend, .core = true}, false)) {
+    GTEST_SKIP() << "no adapter";
+  }
+  if (m_device->adapterInfo.backendType == wgpu::BackendType::Null) {
+    GTEST_SKIP() << "the null backend runs no shaders";
+  }
+  constexpr uint32_t Points = 256;
+  constexpr uint32_t Fields = 4;
+  std::string text;
+  append_hex_common(text);
+  text += R"(
+@group(0) @binding(0) var<storage, read_write> out_words: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+    let i = id.x;
+    let uv = vec2f(f32(i % 16u), f32(i / 16u)) * 0.0731 + vec2f(0.113, -1.29);
+    let bary = select(hex_taps(uv, 1.0, 1.0, vec2f(256.0)).bary, vec3f(1.0 / 3.0), i == 0u);
+    let black = vec4f(0.0, 0.0, 0.0, 0.75);
+    let w = hex_weights(bary, black, black, black, 1.0, 32.0);
+    let c = w.x * black + w.y * black + w.z * black;
+    out_words[i * 4u + 0u] = w.x + w.y + w.z;
+    out_words[i * 4u + 1u] = c.a;
+    out_words[i * 4u + 2u] = max(c.r, max(c.g, c.b));
+    out_words[i * 4u + 3u] = min(w.x, min(w.y, w.z));
+}
+)";
+  const auto values = run_float_compute(*m_device, text, Points, Fields);
+  ASSERT_TRUE(values.has_value());
+  for (uint32_t i = 0; i < Points; ++i) {
+    const float* v = &(*values)[i * Fields];
+    EXPECT_NEAR(v[0], 1.f, 1e-4f) << "point " << i;
+    EXPECT_NEAR(v[1], 0.75f, 1e-4f) << "point " << i;
+    EXPECT_EQ(v[2], 0.f) << "point " << i;
+    EXPECT_GE(v[3], 0.f) << "point " << i;
+  }
+  EXPECT_NEAR((*values)[3], 1.f / 3.f, 1e-4f) << "centroid";
+}
 } // namespace
 } // namespace aurora::gx
