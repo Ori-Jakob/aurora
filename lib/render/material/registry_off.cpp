@@ -59,4 +59,8 @@ std::string format_material_key(const TextureSourceKey& key) { return render::ma
 std::optional<TextureSourceKey> parse_material_key(std::string_view text) {
   return render::material::parse_key_text(text);
 }
+
+MaterialUsage material_usage() { return {}; }
+
+uint64_t material_hits(std::string_view) { return 0; }
 } // namespace aurora::texture

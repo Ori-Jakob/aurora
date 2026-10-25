@@ -51,6 +51,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/jobs.cpp
         lib/render/jobs.hpp
         lib/render/json.hpp
+        lib/render/material/gx_lookup.cpp
+        lib/render/material/gx_lookup.hpp
         lib/render/material/key_text.hpp
         lib/render/material/manifest.cpp
         lib/render/material/manifest.hpp

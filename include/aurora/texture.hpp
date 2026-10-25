@@ -181,6 +181,16 @@ std::string find_material_json(const TextureSourceKey& key, bool pretty = false)
 std::string format_material_key(const TextureSourceKey& key);
 std::optional<TextureSourceKey> parse_material_key(std::string_view text);
 
+struct MaterialUsage {
+  uint32_t materialCount = 0;
+  uint64_t sourceKeyBuilds = 0;
+  uint64_t materialLookups = 0;
+  uint64_t materialHits = 0;
+};
+
+MaterialUsage material_usage();
+uint64_t material_hits(std::string_view canonicalKey);
+
 } // namespace aurora::texture
 
 #endif

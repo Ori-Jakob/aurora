@@ -21,6 +21,7 @@ std::optional<aurora::texture::TextureSourceKey> s_sourceKey;
 aurora::gfx::TextureHandle s_sourceReplacement;
 uint64_t s_replacementId = 0;
 uint64_t s_sourceReplacementId = 0;
+uint64_t s_sourceReplacementQueries = 0;
 } // namespace
 
 namespace aurora {
@@ -55,11 +56,13 @@ void reset_texture_stubs() {
   s_sourceReplacement.reset();
   s_replacementId = 0;
   s_sourceReplacementId = 0;
+  s_sourceReplacementQueries = 0;
 }
 
 uint64_t texture_allocations() { return s_textureAllocations; }
 uint64_t palette_conversions() { return s_paletteConversions; }
 uint64_t copy_allocations() { return s_copyAllocations; }
+uint64_t source_replacement_queries() { return s_sourceReplacementQueries; }
 void set_replacement(gfx::TextureHandle handle, uint64_t id) {
   s_replacement = std::move(handle);
   s_replacementId = id;
@@ -137,6 +140,7 @@ bool should_build_source_key() noexcept { return s_sourceKey.has_value(); }
 
 std::optional<ReplacementResult> find_source_replacement(const GXTexObj_& obj,
                                                          const aurora::texture::TextureSourceKey& sourceKey) noexcept {
+  ++s_sourceReplacementQueries;
   return s_sourceKey.has_value() && sourceKey == *s_sourceKey
              ? std::optional{ReplacementResult{.handle = s_sourceReplacement, .id = s_sourceReplacementId}}
              : std::nullopt;

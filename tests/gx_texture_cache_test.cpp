@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -17,6 +18,7 @@ void reset_texture_stubs();
 uint64_t texture_allocations();
 uint64_t palette_conversions();
 uint64_t copy_allocations();
+uint64_t source_replacement_queries();
 gfx::TextureHandle make_texture_handle(uint32_t width, uint32_t height, u32 format = GX_TF_RGBA8_PC);
 void set_replacement(gfx::TextureHandle handle, uint64_t id = 1);
 void set_source_replacement(aurora::texture::TextureSourceKey key, gfx::TextureHandle handle);
@@ -987,6 +989,425 @@ TEST_F(GxDynamicPaletteTest, LiveBindingFromEarlierFrameKeepsItsTarget) {
   EXPECT_NE(g_gxState.textures[1].ref, first);
   EXPECT_EQ(g_gxState.textures[0].ref, first);
   EXPECT_EQ(testing::palette_conversions(), 2);
+}
+
+struct LatchedLookup {
+  explicit LatchedLookup(gfx::TextureMaterialRef initial) : current(initial), pending(initial) {}
+  LatchedLookup(const LatchedLookup&) = delete;
+  LatchedLookup& operator=(const LatchedLookup&) = delete;
+
+  static gfx::TextureMaterialRef find(void* userData, const aurora::texture::TextureSourceKey& key) noexcept {
+    auto& self = *static_cast<LatchedLookup*>(userData);
+    ++self.finds;
+    self.keys.push_back(key);
+    return self.current;
+  }
+
+  static bool latch(void* userData) noexcept {
+    auto& self = *static_cast<LatchedLookup*>(userData);
+    ++self.latches;
+    self.current = self.pending;
+    return self.rebind;
+  }
+
+  gfx::TextureMaterialRef current;
+  gfx::TextureMaterialRef pending;
+  bool rebind = false;
+  uint64_t finds = 0;
+  uint64_t latches = 0;
+  std::vector<aurora::texture::TextureSourceKey> keys;
+  texture::MaterialLookup lookup{.find = &LatchedLookup::find, .latch = &LatchedLookup::latch, .userData = this};
+};
+
+class ScopedMaterialLookup {
+public:
+  explicit ScopedMaterialLookup(const LatchedLookup& lookup) {
+    texture::set_material_lookup(&lookup.lookup);
+    texture::end_frame();
+  }
+  ~ScopedMaterialLookup() {
+    texture::set_material_lookup(nullptr);
+    texture::end_frame();
+  }
+  ScopedMaterialLookup(const ScopedMaterialLookup&) = delete;
+  ScopedMaterialLookup& operator=(const ScopedMaterialLookup&) = delete;
+};
+
+constexpr gfx::TextureMaterialRef MaterialA{7, 1};
+constexpr gfx::TextureMaterialRef MaterialB{9, 2};
+
+void expect_key(const aurora::texture::TextureSourceKey& actual,
+                const std::optional<aurora::texture::TextureSourceKey>& expected) {
+  ASSERT_TRUE(expected.has_value());
+  EXPECT_EQ(actual.textureHash, expected->textureHash);
+  EXPECT_EQ(actual.tlutHash, expected->tlutHash);
+  EXPECT_EQ(actual.width, expected->width);
+  EXPECT_EQ(actual.height, expected->height);
+  EXPECT_EQ(actual.format, expected->format);
+  EXPECT_EQ(actual.hasTlut, expected->hasTlut);
+}
+
+TEST_F(GxTextureCacheTest, SourceKeyMemoSeparatesShapes) {
+  LatchedLookup materials{MaterialA};
+  ScopedMaterialLookup scope{materials};
+  std::array<uint8_t, 32> zeros{};
+  std::array<uint8_t, 32> palette{};
+  std::array<uint8_t, 4096> bytes{};
+  for (size_t i = 0; i < palette.size(); ++i) {
+    palette[i] = static_cast<uint8_t>(i + 1);
+  }
+  for (size_t i = 0; i < bytes.size(); ++i) {
+    bytes[i] = static_cast<uint8_t>(i * 7 + 3);
+  }
+
+  texture::resolve_static_texture(make_texture(zeros.data(), 1, GX_TF_I4, 8, 8));
+  texture::resolve_static_palette_texture(make_texture(zeros.data(), 2, GX_TF_C4, 8, 8), make_tlut(palette.data(), 1));
+  texture::resolve_static_texture(make_texture(bytes.data(), 3, GX_TF_I8, 8, 16));
+  texture::resolve_static_texture(make_texture(bytes.data(), 4, GX_TF_I8, 16, 8));
+  texture::resolve_static_texture(make_texture(bytes.data(), 5, GX_TF_I8, 64, 64));
+  texture::resolve_static_texture(make_texture(bytes.data(), 6, GX_TF_IA8, 64, 32));
+
+  ASSERT_EQ(materials.keys.size(), 6u);
+  expect_key(materials.keys[0], aurora::texture::compute_source_key(GX_TF_I4, 8, 8, zeros));
+  expect_key(materials.keys[1], aurora::texture::compute_source_key(GX_TF_C4, 8, 8, zeros, palette));
+  expect_key(materials.keys[2], aurora::texture::compute_source_key(GX_TF_I8, 8, 16, bytes));
+  expect_key(materials.keys[3], aurora::texture::compute_source_key(GX_TF_I8, 16, 8, bytes));
+  expect_key(materials.keys[4], aurora::texture::compute_source_key(GX_TF_I8, 64, 64, bytes));
+  expect_key(materials.keys[5], aurora::texture::compute_source_key(GX_TF_IA8, 64, 32, bytes));
+  EXPECT_EQ(texture_stats().sourceKeyBuilds, 6);
+}
+
+TEST_F(GxTextureCacheTest, MaterialLookupBuildsKeysWithoutReplacement) {
+  LatchedLookup materials{MaterialA};
+  ScopedMaterialLookup scope{materials};
+  std::array<uint8_t, 16> pixels{};
+  pixels[3] = 9;
+  const uint64_t buildsTotal = texture::source_key_builds_total();
+
+  gfx::TextureMaterialRef material;
+  texture::resolve_static_texture(make_texture(pixels.data(), 1), &material);
+
+  EXPECT_EQ(material, MaterialA);
+  EXPECT_EQ(texture_stats().sourceKeyBuilds, 1);
+  EXPECT_EQ(texture_stats().sourceKeyBytes, pixels.size());
+  EXPECT_EQ(texture_stats().materialLookups, 1);
+  EXPECT_EQ(texture::source_key_builds_total(), buildsTotal + 1);
+  EXPECT_EQ(testing::source_replacement_queries(), 0);
+  EXPECT_EQ(testing::texture_allocations(), 1);
+  ASSERT_EQ(materials.keys.size(), 1u);
+  expect_key(materials.keys[0], aurora::texture::compute_source_key(GX_TF_RGBA8_PC, 2, 2, pixels));
+}
+
+TEST_F(GxTextureCacheTest, NoLookupBuildsNoKeys) {
+  std::array<uint8_t, 16> pixels{};
+  std::array<uint8_t, 32> indices{};
+  std::array<uint8_t, 32> palette{};
+  const uint64_t buildsTotal = texture::source_key_builds_total();
+
+  gfx::TextureMaterialRef material{3, 3};
+  texture::resolve_static_texture(make_texture(pixels.data(), 1), &material);
+  EXPECT_EQ(material, gfx::TextureMaterialRef{});
+  material = {3, 3};
+  texture::resolve_static_palette_texture(make_texture(indices.data(), 2, GX_TF_C4, 4, 4), make_tlut(palette.data(), 1),
+                                          &material);
+  EXPECT_EQ(material, gfx::TextureMaterialRef{});
+
+  EXPECT_EQ(texture_stats().sourceKeyBuilds, 0);
+  EXPECT_EQ(texture_stats().sourceKeyBytes, 0);
+  EXPECT_EQ(texture_stats().materialLookups, 0);
+  EXPECT_EQ(texture::source_key_builds_total(), buildsTotal);
+  EXPECT_EQ(testing::source_replacement_queries(), 0);
+}
+
+struct ResolveRun {
+  std::vector<size_t> identity;
+  uint64_t allocations = 0;
+  uint64_t uploadBytes = 0;
+  uint64_t contentHits = 0;
+  uint64_t objectHits = 0;
+  uint64_t hashedBytes = 0;
+  uint64_t misses = 0;
+};
+
+ResolveRun resolve_mixed_set() {
+  static std::array<uint8_t, 16> pixelsA{};
+  static std::array<uint8_t, 16> pixelsB{1};
+  static std::array<uint8_t, 32> indices{};
+  static std::array<uint8_t, 32> palette{};
+  std::vector<gfx::TextureHandle> handles;
+  handles.push_back(texture::resolve_static_texture(make_texture(pixelsA.data(), 1)));
+  handles.push_back(texture::resolve_static_texture(make_texture(pixelsA.data(), 2)));
+  handles.push_back(texture::resolve_static_texture(make_texture(pixelsA.data(), 1)));
+  handles.push_back(texture::resolve_static_palette_texture(make_texture(indices.data(), 3, GX_TF_C4, 4, 4),
+                                                            make_tlut(palette.data(), 1)));
+  handles.push_back(texture::resolve_static_palette_texture(make_texture(indices.data(), 4, GX_TF_C4, 4, 4),
+                                                            make_tlut(palette.data(), 2)));
+  handles.push_back(texture::resolve_static_texture(make_texture(pixelsB.data(), 5)));
+
+  ResolveRun run;
+  for (const auto& handle : handles) {
+    run.identity.push_back(static_cast<size_t>(std::find(handles.begin(), handles.end(), handle) - handles.begin()));
+  }
+  run.allocations = testing::texture_allocations();
+  run.uploadBytes = texture_stats().uploadBytes;
+  run.contentHits = texture_stats().contentHits;
+  run.objectHits = texture_stats().objectHits;
+  run.hashedBytes = texture_stats().hashedBytes;
+  run.misses = texture_stats().misses;
+  return run;
+}
+
+TEST_F(GxTextureCacheTest, LookupLeavesHandlesAndStatsUnchanged) {
+  const ResolveRun plain = resolve_mixed_set();
+  texture::shutdown();
+  testing::reset_texture_stubs();
+  texture::end_frame();
+
+  LatchedLookup materials{MaterialA};
+  ResolveRun withLookup;
+  {
+    ScopedMaterialLookup scope{materials};
+    withLookup = resolve_mixed_set();
+  }
+
+  EXPECT_EQ(withLookup.identity, plain.identity);
+  EXPECT_EQ(withLookup.allocations, plain.allocations);
+  EXPECT_EQ(withLookup.uploadBytes, plain.uploadBytes);
+  EXPECT_EQ(withLookup.contentHits, plain.contentHits);
+  EXPECT_EQ(withLookup.objectHits, plain.objectHits);
+  EXPECT_EQ(withLookup.hashedBytes, plain.hashedBytes);
+  EXPECT_EQ(withLookup.misses, plain.misses);
+  EXPECT_EQ(plain.objectHits, 1);
+  EXPECT_EQ(materials.finds, 5);
+}
+
+TEST_F(GxTextureCacheTest, ObjectHitKeepsMaterial) {
+  LatchedLookup materials{MaterialA};
+  ScopedMaterialLookup scope{materials};
+  std::array<uint8_t, 16> pixels{};
+  std::array<uint8_t, 32> indices{};
+  std::array<uint8_t, 32> palette{};
+  const auto obj = make_texture(pixels.data(), 1);
+  const auto paletteObj = make_texture(indices.data(), 2, GX_TF_C4, 4, 4);
+  const auto tlut = make_tlut(palette.data(), 1);
+
+  gfx::TextureMaterialRef first;
+  gfx::TextureMaterialRef firstPalette;
+  texture::resolve_static_texture(obj, &first);
+  texture::resolve_static_palette_texture(paletteObj, tlut, &firstPalette);
+  materials.current = MaterialB;
+  gfx::TextureMaterialRef second;
+  gfx::TextureMaterialRef secondPalette;
+  texture::resolve_static_texture(obj, &second);
+  texture::resolve_static_palette_texture(paletteObj, tlut, &secondPalette);
+
+  EXPECT_EQ(first, MaterialA);
+  EXPECT_EQ(firstPalette, MaterialA);
+  EXPECT_EQ(second, MaterialA);
+  EXPECT_EQ(secondPalette, MaterialA);
+  EXPECT_EQ(texture_stats().objectHits, 2);
+  EXPECT_EQ(texture_stats().materialLookups, 2);
+  EXPECT_EQ(materials.finds, 2);
+}
+
+TEST_F(GxTextureCacheTest, PaletteMaterialKeyUsesReferencedTlutSlice) {
+  LatchedLookup materials{MaterialA};
+  ScopedMaterialLookup scope{materials};
+  std::array<uint8_t, 256> indices{};
+  Palette palette{};
+  for (size_t i = 0; i < indices.size(); ++i) {
+    indices[i] = static_cast<uint8_t>(5 + i % 5);
+  }
+  for (size_t i = 0; i < palette.size(); ++i) {
+    palette[i] = static_cast<uint8_t>(i * 3);
+  }
+  const auto obj = make_texture(indices.data(), 1, GX_TF_C8, 16, 16);
+  auto tlut = make_tlut(palette.data(), 1, 256);
+
+  gfx::TextureMaterialRef material;
+  texture::resolve_static_palette_texture(obj, tlut, &material);
+  EXPECT_EQ(material, MaterialA);
+  ASSERT_EQ(materials.keys.size(), 1u);
+  expect_key(materials.keys[0], aurora::texture::compute_source_key(GX_TF_C8, 16, 16, indices, palette));
+  EXPECT_EQ(materials.keys[0].tlutHash, XXH64(palette.data() + 5 * sizeof(uint16_t), 5 * sizeof(uint16_t), 0));
+  EXPECT_EQ(texture_stats().sourceKeyBytes, indices.size() + 5 * sizeof(uint16_t));
+
+  palette[100] ^= 1;
+  ++tlut.tlutDataVersion;
+  texture::resolve_static_palette_texture(obj, tlut);
+  ASSERT_EQ(materials.keys.size(), 2u);
+  EXPECT_EQ(materials.keys[1].tlutHash, materials.keys[0].tlutHash);
+
+  palette[12] ^= 1;
+  ++tlut.tlutDataVersion;
+  texture::resolve_static_palette_texture(obj, tlut);
+  ASSERT_EQ(materials.keys.size(), 3u);
+  EXPECT_NE(materials.keys[2].tlutHash, materials.keys[0].tlutHash);
+  expect_key(materials.keys[2], aurora::texture::compute_source_key(GX_TF_C8, 16, 16, indices, palette));
+  EXPECT_EQ(texture_stats().sourceKeyBuilds, 1);
+  EXPECT_EQ(texture_stats().sourceKeyBytes, indices.size() + 3 * 5 * sizeof(uint16_t));
+  EXPECT_EQ(testing::texture_allocations(), 3);
+}
+
+TEST_F(GxTextureCacheTest, MaterialChangeLatchesAtFrameEnd) {
+  LatchedLookup materials{MaterialA};
+  LatchedLookup other{{11, 4}};
+  ScopedMaterialLookup scope{materials};
+  materials.latches = 0;
+  std::array<uint8_t, 16> pixels{};
+  pixels[0] = 1;
+
+  gfx::TextureMaterialRef material;
+  texture::resolve_static_texture(make_texture(pixels.data(), 1), &material);
+  EXPECT_EQ(material, MaterialA);
+  materials.pending = MaterialB;
+  materials.rebind = true;
+  texture::set_material_lookup(&materials.lookup);
+  texture::resolve_static_texture(make_texture(pixels.data(), 2), &material);
+  EXPECT_EQ(material, MaterialA);
+  EXPECT_EQ(materials.latches, 0);
+
+  texture::end_frame();
+  EXPECT_EQ(materials.latches, 1);
+  texture::resolve_static_texture(make_texture(pixels.data(), 1), &material);
+  EXPECT_EQ(material, MaterialB);
+
+  texture::set_material_lookup(&other.lookup);
+  texture::resolve_static_texture(make_texture(pixels.data(), 3), &material);
+  EXPECT_EQ(material, MaterialB);
+  EXPECT_EQ(other.finds, 0);
+  EXPECT_EQ(other.latches, 0);
+
+  texture::end_frame();
+  EXPECT_EQ(other.latches, 1);
+  EXPECT_EQ(materials.latches, 1);
+  texture::resolve_static_texture(make_texture(pixels.data(), 4), &material);
+  EXPECT_EQ(material, (gfx::TextureMaterialRef{11, 4}));
+  EXPECT_EQ(other.finds, 1);
+}
+
+TEST_F(GxTextureCacheTest, MaterialChangeRebindsLoadedSlot) {
+  LatchedLookup materials{MaterialA};
+  ScopedMaterialLookup scope{materials};
+  std::array<uint8_t, 16> pixels{};
+  g_gxState.loadedTextures[0] = make_texture(pixels.data(), 1);
+  resolve_sampled_textures(sampling(0));
+  EXPECT_EQ(g_gxState.textures[0].material, MaterialA);
+  const uint64_t generation = g_gxState.textures[0].generation;
+
+  materials.pending = MaterialB;
+  materials.rebind = true;
+  texture::set_material_lookup(&materials.lookup);
+  texture::end_frame();
+  resolve_sampled_textures(sampling(0));
+  EXPECT_EQ(g_gxState.textures[0].material, MaterialB);
+  EXPECT_GT(g_gxState.textures[0].generation, generation);
+  EXPECT_EQ(materials.finds, 2);
+
+  resolve_sampled_textures(sampling(0));
+  EXPECT_EQ(g_gxState.textures[0].material, MaterialB);
+  EXPECT_EQ(materials.finds, 2);
+  EXPECT_EQ(texture_stats().objectHits, 0);
+}
+
+TEST_F(GxTextureCacheTest, FieldOnlyLatchKeepsBindGeneration) {
+  LatchedLookup materials{MaterialA};
+  ScopedMaterialLookup scope{materials};
+  materials.latches = 0;
+  std::array<uint8_t, 16> pixels{};
+  const auto obj = make_texture(pixels.data(), 1);
+  texture::resolve_static_texture(obj);
+  const uint64_t generation = texture::current_bind_generation();
+
+  texture::set_material_lookup(&materials.lookup);
+  texture::end_frame();
+  gfx::TextureMaterialRef material;
+  texture::resolve_static_texture(obj, &material);
+
+  EXPECT_EQ(materials.latches, 1);
+  EXPECT_EQ(texture::current_bind_generation(), generation);
+  EXPECT_EQ(texture_stats().objectHits, 1);
+  EXPECT_EQ(material, MaterialA);
+}
+
+TEST_F(GxTextureCacheTest, EmptyPublishKeepsBindGeneration) {
+  std::array<uint8_t, 16> pixels{};
+  const auto obj = make_texture(pixels.data(), 1);
+  texture::resolve_static_texture(obj);
+  const uint64_t generation = texture::current_bind_generation();
+
+  texture::set_material_lookup(nullptr);
+  texture::end_frame();
+  texture::resolve_static_texture(obj);
+
+  EXPECT_EQ(texture::current_bind_generation(), generation);
+  EXPECT_EQ(texture_stats().objectHits, 1);
+}
+
+TEST_F(GxTextureCacheTest, CopyAndPointerSlotsCarryNoMaterial) {
+  LatchedLookup materials{MaterialA};
+  ScopedMaterialLookup scope{materials};
+  std::array<uint8_t, 16> destination{};
+  uint8_t paletteDestination{};
+  Palette palette{};
+  std::array<uint8_t, 16> pixels{};
+  copy_texture(destination.data(), 2, 2);
+  copy_texture(&paletteDestination, 4, 4, GX_TF_I8);
+  g_gxState.loadedTextures[0] = make_texture(destination.data(), 1);
+  load_copy_palette_texture(1, &paletteDestination, 2, GX_TLUT0);
+  g_gxState.loadedTluts[0] = make_tlut(palette.data(), 1, 256);
+  g_gxState.loadedTextures[2] = make_texture(pixels.data(), 3);
+  testing::set_replacement(testing::make_texture_handle(8, 8));
+  ShaderInfo info{};
+  info.sampledTextures.set(0);
+  info.sampledTextures.set(1);
+  info.sampledTextures.set(2);
+
+  resolve_sampled_textures(info);
+
+  for (u32 i = 0; i < 3; ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_TRUE(g_gxState.textures[i]);
+    EXPECT_EQ(g_gxState.textures[i].material, gfx::TextureMaterialRef{});
+  }
+  EXPECT_EQ(materials.finds, 0);
+  EXPECT_EQ(texture_stats().sourceKeyBuilds, 0);
+}
+
+std::vector<GuestRead> guest_reads_of_resolves() {
+  static std::array<uint8_t, 16> pixels{};
+  static std::array<uint8_t, 32> indices{};
+  static std::array<uint8_t, 32> palette{};
+  ScopedGuestHooks hooks{false};
+  const auto obj = make_texture(pixels.data(), 1);
+  texture::resolve_static_texture(obj);
+  texture::resolve_static_texture(obj);
+  texture::resolve_static_palette_texture(make_texture(indices.data(), 2, GX_TF_C4, 4, 4),
+                                          make_tlut(palette.data(), 1));
+  return sGuestReads;
+}
+
+TEST_F(GxTextureCacheTest, GuestReadsUnchangedWithMaterials) {
+  const std::vector<GuestRead> plain = guest_reads_of_resolves();
+  texture::shutdown();
+  testing::reset_texture_stubs();
+  texture::end_frame();
+
+  LatchedLookup materials{MaterialA};
+  std::vector<GuestRead> withLookup;
+  {
+    ScopedMaterialLookup scope{materials};
+    withLookup = guest_reads_of_resolves();
+  }
+
+  ASSERT_EQ(withLookup.size(), plain.size());
+  for (size_t i = 0; i < plain.size(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(withLookup[i].kind, plain[i].kind);
+    EXPECT_EQ(withLookup[i].address, plain[i].address);
+    EXPECT_EQ(withLookup[i].size, plain[i].size);
+  }
+  EXPECT_EQ(materials.finds, 2);
 }
 } // namespace
 } // namespace aurora::gx

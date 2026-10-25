@@ -13,6 +13,7 @@
 #include "debug/views.hpp"
 #include "geometry/compact.hpp"
 #include "geometry/hzb.hpp"
+#include "material/gx_lookup.hpp"
 #include "systems/dispatch.hpp"
 #include "systems/systems.hpp"
 
@@ -85,6 +86,7 @@ void initialize() {
   debug::initialize();
   debug::initialize_classification();
   install_hints();
+  material::install_gx_lookup();
 #endif
 }
 
@@ -99,6 +101,7 @@ void shutdown() noexcept {
   // Game registrations are dropped first so no callback can reach anything torn down below
   shutdown_external_passes();
   texture::clear_material_manifests();
+  material::remove_gx_lookup();
   clear_after_frame_callbacks();
   remove_hints();
   systems::shutdown();

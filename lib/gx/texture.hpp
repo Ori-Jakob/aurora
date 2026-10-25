@@ -7,6 +7,10 @@
 #include <optional>
 #include <span>
 
+namespace aurora::texture {
+struct TextureSourceKey;
+} // namespace aurora::texture
+
 namespace aurora::gx {
 struct TextureStats {
   uint64_t uploadBytes = 0;
@@ -27,6 +31,9 @@ struct TextureStats {
   uint64_t pendingLoads = 0;
   uint64_t publishes = 0;
   uint64_t publishBytes = 0;
+  uint64_t sourceKeyBuilds = 0;
+  uint64_t sourceKeyBytes = 0;
+  uint64_t materialLookups = 0;
 };
 
 const TextureStats& texture_stats() noexcept;
@@ -52,17 +59,27 @@ std::optional<SourceBaseHash> hash_source_base(u32 format, u32 width, u32 height
 std::optional<uint64_t> hash_referenced_tlut(uint32_t minIndex, uint32_t maxIndex,
                                              std::span<const uint8_t> tlut) noexcept;
 
+// find runs on the FIFO thread and latch on the game thread with the FIFO drained; neither may call gx
+struct MaterialLookup {
+  gfx::TextureMaterialRef (*find)(void*, const aurora::texture::TextureSourceKey&) noexcept = nullptr;
+  bool (*latch)(void*) noexcept = nullptr;
+  void* userData = nullptr;
+};
+
 void invalidate_bindings() noexcept;
 uint64_t current_bind_generation() noexcept;
 void invalidate_replacement(uint64_t replacementId) noexcept;
+void set_material_lookup(const MaterialLookup* lookup) noexcept;
+uint64_t source_key_builds_total() noexcept;
 void end_frame() noexcept;
 void shutdown() noexcept;
 
 GXState::CopyTextureRef resolve_copy_texture(const GXState::CopyTextureKey& key) noexcept;
 
 // Internal resolvers exposed for cache tests.
-gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj);
-gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GXTlutObj_& tlut);
+gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj, gfx::TextureMaterialRef* material = nullptr);
+gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GXTlutObj_& tlut,
+                                                  gfx::TextureMaterialRef* material = nullptr);
 void set_content_cache_budget_for_testing(uint64_t bytes) noexcept;
 void set_copy_cache_budget_for_testing(uint64_t bytes) noexcept;
 } // namespace texture

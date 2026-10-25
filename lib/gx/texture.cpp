@@ -53,6 +53,7 @@ struct CachedTextureEntry {
   u32 tlutDataVersion = 0;
   uint64_t replacementId = 0;
   uint64_t lastUsedFrame = 0;
+  gfx::TextureMaterialRef material;
 };
 
 struct CachedTlutTextureEntry {
@@ -101,14 +102,18 @@ struct SourceKeyCacheEntry {
 
 struct SourceKeyCacheKey {
   XXH128_hash_t hash;
+  u32 width = 0;
+  u32 height = 0;
+  u32 format = 0;
 
   bool operator==(const SourceKeyCacheKey& rhs) const noexcept {
-    return hash.low64 == rhs.hash.low64 && hash.high64 == rhs.hash.high64;
+    return hash.low64 == rhs.hash.low64 && hash.high64 == rhs.hash.high64 && width == rhs.width &&
+           height == rhs.height && format == rhs.format;
   }
 
   template <typename H>
   friend H AbslHashValue(H h, const SourceKeyCacheKey& key) {
-    return H::combine(std::move(h), key.hash.low64, key.hash.high64);
+    return H::combine(std::move(h), key.hash.low64, key.hash.high64, key.width, key.height, key.format);
   }
 };
 
@@ -131,6 +136,10 @@ uint64_t s_dynamicReuseBlockedFrame = UINT64_MAX;
 uint64_t s_bindGeneration = 1;
 std::atomic<uint64_t> s_pendingInvalidations = 0;
 std::atomic<uint64_t> s_pendingCacheClears = 0;
+std::atomic<const texture::MaterialLookup*> s_pendingMaterialLookup{nullptr};
+std::atomic<const texture::MaterialLookup*> s_materialLookup{nullptr};
+std::atomic<uint64_t> s_pendingMaterialChanges{0};
+std::atomic<uint64_t> s_sourceKeyBuildsTotal{0};
 
 #if DEBUG
 constexpr bool BuildSourceKeyForDebug = true;
@@ -197,7 +206,7 @@ void clear_texture_dependency(u32 texObjId, const CachedTextureEntry& entry) {
 }
 
 void store_cached_texture(const GXTexObj_& obj, gfx::TextureHandle handle, u32 tlutObjId = 0, u32 tlutDataVersion = 0,
-                          uint64_t replacementId = 0) {
+                          uint64_t replacementId = 0, gfx::TextureMaterialRef material = {}) {
   if (obj.texObjId == 0) {
     return;
   }
@@ -213,6 +222,7 @@ void store_cached_texture(const GXTexObj_& obj, gfx::TextureHandle handle, u32 t
   entry.tlutDataVersion = tlutDataVersion;
   entry.replacementId = replacementId;
   entry.lastUsedFrame = s_frameCount;
+  entry.material = material;
 
   if (tlutObjId != 0) {
     auto& cache = s_tlutObjectCaches[tlutObjId];
@@ -287,9 +297,14 @@ TextureKeys hash_texture_source(const GXTexObj_& obj, const GXTlutObj_* tlut, bo
 
   uint32_t minTlutIndex = UINT32_MAX;
   uint32_t maxTlutIndex = 0;
+  const SourceKeyCacheKey memoKey{
+      .hash = keys.contentKey.textureHash,
+      .width = keys.contentKey.width,
+      .height = keys.contentKey.height,
+      .format = keys.contentKey.format,
+  };
   if (buildSourceKey) {
-    if (const auto it = s_sourceKeyCache.find(SourceKeyCacheKey{keys.contentKey.textureHash});
-        it != s_sourceKeyCache.end()) {
+    if (const auto it = s_sourceKeyCache.find(memoKey); it != s_sourceKeyCache.end()) {
       keys.sourceKey = it->second.sourceKey;
       minTlutIndex = it->second.minTlutIndex;
       maxTlutIndex = it->second.maxTlutIndex;
@@ -307,12 +322,14 @@ TextureKeys hash_texture_source(const GXTexObj_& obj, const GXTlutObj_* tlut, bo
       };
       minTlutIndex = base->minTlutIndex;
       maxTlutIndex = base->maxTlutIndex;
+      ++s_stats.sourceKeyBuilds;
+      s_sourceKeyBuildsTotal.fetch_add(1, std::memory_order_relaxed);
+      s_stats.sourceKeyBytes += texture::texture_source_size(obj.format(), obj.width(), obj.height(), 1);
 
       if (s_sourceKeyCache.size() >= SourceKeyCacheMaxEntries) {
         s_sourceKeyCache.clear();
       }
-      s_sourceKeyCache.emplace(SourceKeyCacheKey{keys.contentKey.textureHash},
-                               SourceKeyCacheEntry{*keys.sourceKey, minTlutIndex, maxTlutIndex});
+      s_sourceKeyCache.emplace(memoKey, SourceKeyCacheEntry{*keys.sourceKey, minTlutIndex, maxTlutIndex});
     }
   }
 
@@ -328,6 +345,7 @@ TextureKeys hash_texture_source(const GXTexObj_& obj, const GXTlutObj_* tlut, bo
     if (keys.sourceKey.has_value()) {
       if (const auto tlutHash = texture::hash_referenced_tlut(minTlutIndex, maxTlutIndex, tlutData)) {
         keys.sourceKey->tlutHash = *tlutHash;
+        s_stats.sourceKeyBytes += static_cast<uint64_t>(maxTlutIndex + 1 - minTlutIndex) * sizeof(u16);
       }
     }
   }
@@ -630,6 +648,13 @@ std::optional<uint64_t> hash_referenced_tlut(uint32_t minIndex, uint32_t maxInde
 
 void invalidate_bindings() noexcept { s_pendingInvalidations.fetch_add(1, std::memory_order_release); }
 
+void set_material_lookup(const MaterialLookup* lookup) noexcept {
+  s_pendingMaterialLookup.store(lookup, std::memory_order_release);
+  s_pendingMaterialChanges.fetch_add(1, std::memory_order_release);
+}
+
+uint64_t source_key_builds_total() noexcept { return s_sourceKeyBuildsTotal.load(std::memory_order_relaxed); }
+
 uint64_t current_bind_generation() noexcept {
   apply_pending_invalidations();
   return s_bindGeneration;
@@ -654,7 +679,7 @@ void invalidate_replacement(uint64_t replacementId) noexcept {
   }
 }
 
-gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
+gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj, gfx::TextureMaterialRef* material) {
   ZoneScoped;
 
   if (obj.texObjId != 0) {
@@ -663,6 +688,9 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
       if (entry.handle && entry.texDataVersion == obj.texDataVersion && entry.tlutObjId == 0) {
         entry.lastUsedFrame = s_frameCount;
         ++s_stats.objectHits;
+        if (material != nullptr) {
+          *material = entry.material;
+        }
         return entry.handle;
       }
     }
@@ -670,12 +698,18 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
 
   gfx::TextureHandle handle;
   uint64_t replacementId = 0;
+  gfx::TextureMaterialRef ref;
   std::optional<TextureKeys> keys;
   if (!use_replacement(gfx::texture_replacement::find_pointer_replacement(obj), handle, replacementId)) {
-    const bool buildSourceKey = gfx::texture_replacement::should_build_source_key() || BuildSourceKeyForDebug;
-    keys = hash_texture_source(obj, nullptr, buildSourceKey);
-    if (keys->sourceKey.has_value()) {
+    const auto* lookup = s_materialLookup.load(std::memory_order_acquire);
+    const bool replacementKeys = gfx::texture_replacement::should_build_source_key() || BuildSourceKeyForDebug;
+    keys = hash_texture_source(obj, nullptr, replacementKeys || lookup != nullptr);
+    if (replacementKeys && keys->sourceKey.has_value()) {
       use_replacement(gfx::texture_replacement::find_source_replacement(obj, *keys->sourceKey), handle, replacementId);
+    }
+    if (lookup != nullptr && keys->sourceKey.has_value()) {
+      ++s_stats.materialLookups;
+      ref = lookup->find(lookup->userData, *keys->sourceKey);
     }
   }
   if (!handle) {
@@ -700,12 +734,16 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
     }
   }
   if (!obj.no_cache()) {
-    store_cached_texture(obj, handle, 0, 0, replacementId);
+    store_cached_texture(obj, handle, 0, 0, replacementId, ref);
+  }
+  if (material != nullptr) {
+    *material = ref;
   }
   return handle;
 }
 
-gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GXTlutObj_& tlut) {
+gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GXTlutObj_& tlut,
+                                                  gfx::TextureMaterialRef* material) {
   ZoneScoped;
 
   if (obj.texObjId != 0) {
@@ -718,6 +756,9 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
           tlutIt->second.lastUsedFrame = s_frameCount;
         }
         ++s_stats.objectHits;
+        if (material != nullptr) {
+          *material = entry.material;
+        }
         return entry.handle;
       }
     }
@@ -725,11 +766,18 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
 
   gfx::TextureHandle handle;
   uint64_t replacementId = 0;
+  gfx::TextureMaterialRef ref;
   std::optional<TextureKeys> keys;
   if (!use_replacement(gfx::texture_replacement::find_pointer_replacement(obj), handle, replacementId)) {
-    keys = hash_texture_source(obj, &tlut, gfx::texture_replacement::should_build_source_key());
-    if (keys->sourceKey.has_value()) {
+    const auto* lookup = s_materialLookup.load(std::memory_order_acquire);
+    const bool replacementKeys = gfx::texture_replacement::should_build_source_key();
+    keys = hash_texture_source(obj, &tlut, replacementKeys || lookup != nullptr);
+    if (replacementKeys && keys->sourceKey.has_value()) {
       use_replacement(gfx::texture_replacement::find_source_replacement(obj, *keys->sourceKey), handle, replacementId);
+    }
+    if (lookup != nullptr && keys->sourceKey.has_value()) {
+      ++s_stats.materialLookups;
+      ref = lookup->find(lookup->userData, *keys->sourceKey);
     }
   }
   if (!handle) {
@@ -758,7 +806,10 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
     }
   }
   if (!obj.no_cache() && !tlut.no_cache()) {
-    store_cached_texture(obj, handle, tlut.tlutObjId, tlut.tlutDataVersion, replacementId);
+    store_cached_texture(obj, handle, tlut.tlutObjId, tlut.tlutDataVersion, replacementId, ref);
+  }
+  if (material != nullptr) {
+    *material = ref;
   }
   return handle;
 }
@@ -783,12 +834,29 @@ void end_frame() noexcept {
   TracyPlot("aurora: texturePendingReplacementLoads", static_cast<int64_t>(s_stats.pendingLoads));
   TracyPlot("aurora: textureReplacementPublishes", static_cast<int64_t>(s_stats.publishes));
   TracyPlot("aurora: textureReplacementPublishBytes", static_cast<int64_t>(s_stats.publishBytes));
+  TracyPlot("aurora: textureSourceKeyBuilds", static_cast<int64_t>(s_stats.sourceKeyBuilds));
+  TracyPlot("aurora: textureSourceKeyBytes", static_cast<int64_t>(s_stats.sourceKeyBytes));
+  TracyPlot("aurora: textureMaterialLookups", static_cast<int64_t>(s_stats.materialLookups));
 
   s_stats = {};
   s_stats.pendingLoads = streamingStats.pendingLoads;
   s_stats.publishes = streamingStats.publishes;
   s_stats.publishBytes = streamingStats.publishBytes;
   ++s_frameCount;
+  // Applied with the FIFO drained, so no frame mixes old and new material snapshots
+  if (s_pendingMaterialChanges.exchange(0, std::memory_order_acq_rel) != 0) {
+    const auto* next = s_pendingMaterialLookup.load(std::memory_order_acquire);
+    const auto* prev = s_materialLookup.load(std::memory_order_relaxed);
+    const auto* any = next != nullptr ? next : prev;
+    bool rebind = next != prev;
+    if (any != nullptr && any->latch != nullptr) {
+      rebind |= any->latch(any->userData);
+    }
+    s_materialLookup.store(next, std::memory_order_release);
+    if (rebind) {
+      s_pendingCacheClears.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
   apply_pending_invalidations();
   sweep_object_caches();
   s_copyCache.end_frame();
@@ -903,6 +971,7 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
     }
 
     gfx::TextureHandle handle;
+    gfx::TextureMaterialRef material{};
     const auto copyIt = g_gxState.copyTextures.find(obj.data);
     const GXState::CopyTextureRef* copyRef = copyIt != g_gxState.copyTextures.end() ? &copyIt->second : nullptr;
     if (is_palette_format(obj.format())) {
@@ -913,18 +982,19 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
           if (copyRef != nullptr) {
             handle = resolve_dynamic_palette_texture(obj, *copyRef, tlut);
           } else if (obj.has_data()) {
-            handle = texture::resolve_static_palette_texture(obj, tlut);
+            handle = texture::resolve_static_palette_texture(obj, tlut, &material);
           }
         }
       }
     } else if (copyRef != nullptr) {
       handle = copyRef->handle;
     } else if (obj.has_data()) {
-      handle = texture::resolve_static_texture(obj);
+      handle = texture::resolve_static_texture(obj, &material);
     }
 
     obj.mFormat = resolved_format_for_handle(handle);
     textureBind = gfx::TextureBind{obj, std::move(handle), s_bindGeneration};
+    textureBind.material = material;
   }
 }
 } // namespace aurora::gx

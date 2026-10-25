@@ -1,6 +1,7 @@
 #include "material_contract_check.hpp"
 
 #include "io.hpp"
+#include "render/material/gx_lookup.hpp"
 #include "render/material/manifest.hpp"
 #include "render/material/registry.hpp"
 
@@ -1347,6 +1348,65 @@ TEST_F(MaterialRegistryTest, SpanUnregisterPublishesOnce) {
   texture::unregister_material_manifests(stale);
   EXPECT_EQ(material::generation(), generation + 1);
   EXPECT_EQ(g_observed.load(), 2);
+}
+
+TEST_F(MaterialRegistryTest, GxLookupFindsRegisteredKey) {
+  std::array<uint8_t, 32> pixels{};
+  std::array<uint8_t, 64> indices{};
+  std::array<uint8_t, 32> tlutA{};
+  std::array<uint8_t, 32> tlutB{};
+  for (size_t i = 0; i < pixels.size(); ++i) {
+    pixels[i] = static_cast<uint8_t>(i * 11 + 3);
+  }
+  for (size_t i = 0; i < indices.size(); ++i) {
+    indices[i] = static_cast<uint8_t>(2 + i % 3);
+  }
+  tlutB[5] = 1;
+  const auto plain = texture::compute_source_key(GX_TF_CMPR, 8, 8, pixels);
+  const auto palettedA = texture::compute_source_key(GX_TF_C8, 8, 8, indices, tlutA);
+  const auto palettedB = texture::compute_source_key(GX_TF_C8, 8, 8, indices, tlutB);
+  ASSERT_TRUE(plain.has_value() && palettedA.has_value() && palettedB.has_value());
+  ASSERT_NE(palettedA->tlutHash, palettedB->tlutHash);
+  texture::TextureSourceKey anyTlut = *palettedA;
+  anyTlut.tlutHash = texture::kWildcardTlutHash;
+  const std::string plainKey = texture::format_material_key(*plain);
+  const std::string paletteKey = texture::format_material_key(anyTlut);
+
+  add(manifest_with(
+      fmt::format(R"("{}":{{"flags":["stochastic"]}},"{}":{{"flags":["unlit"]}})", plainKey, paletteKey)));
+  const auto wildcard = add(manifest_with(fmt::format(R"("tex1_8x8_$_{}":{{"flags":["cutout"]}})", +GX_TF_CMPR)));
+  EXPECT_EQ(wildcard.status, MaterialManifestStatus::Rejected);
+  material::latch();
+  const auto snap = material::snapshot();
+  const uint16_t plainId = snap->find(*plain);
+  const uint16_t paletteId = snap->find(anyTlut);
+  ASSERT_NE(plainId, 0u);
+  ASSERT_NE(paletteId, 0u);
+  EXPECT_NE(snap->record(plainId).summary & material::Stochastic, 0u);
+  EXPECT_NE(snap->record(paletteId).summary & material::Unlit, 0u);
+  const texture::MaterialUsage before = texture::material_usage();
+  const uint64_t plainHits = texture::material_hits(plainKey);
+  const uint64_t paletteHits = texture::material_hits(paletteKey);
+
+  EXPECT_EQ(material::testing::gx_find(*plain), (gfx::TextureMaterialRef{plainId, snap->record(plainId).summary}));
+  for (const texture::TextureSourceKey& key : {*palettedA, *palettedB}) {
+    EXPECT_EQ(material::testing::gx_find(key), (gfx::TextureMaterialRef{paletteId, snap->record(paletteId).summary}));
+  }
+  texture::TextureSourceKey anyTexture = *plain;
+  anyTexture.textureHash = texture::kWildcardTextureHash;
+  EXPECT_EQ(material::testing::gx_find(anyTexture), gfx::TextureMaterialRef{});
+  texture::TextureSourceKey otherTexture = *plain;
+  otherTexture.textureHash ^= 1;
+  EXPECT_EQ(material::testing::gx_find(otherTexture), gfx::TextureMaterialRef{});
+
+  const texture::MaterialUsage after = texture::material_usage();
+  EXPECT_EQ(after.materialCount, 2u);
+  EXPECT_EQ(after.materialLookups, before.materialLookups + 5);
+  EXPECT_EQ(after.materialHits, before.materialHits + 3);
+  EXPECT_EQ(texture::material_hits(plainKey), plainHits + 1);
+  EXPECT_EQ(texture::material_hits(paletteKey), paletteHits + 2);
+  EXPECT_EQ(texture::material_hits(texture::format_material_key(*palettedB)), paletteHits + 2);
+  EXPECT_EQ(texture::material_hits("tex1_8x8_not_a_key"), 0u);
 }
 } // namespace
 } // namespace aurora::test

@@ -131,10 +131,19 @@ struct GXTlutObj_ {
 static_assert(sizeof(GXTlutObj_) <= sizeof(GXTlutObj), "GXTlutObj too small!");
 
 namespace aurora::gfx {
+// The material registry owns ids and flag bits; zero means none
+struct TextureMaterialRef {
+  uint32_t id = 0;
+  uint32_t flags = 0;
+
+  bool operator==(const TextureMaterialRef&) const = default;
+};
+
 struct TextureBind {
   TextureHandle ref;
   GXTexObj_ texObj;
   uint64_t generation = 0;
+  TextureMaterialRef material;
 
   TextureBind() noexcept = default;
   TextureBind(const GXTexObj_& obj, TextureHandle handle, uint64_t bindGeneration = 0) noexcept
