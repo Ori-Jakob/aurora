@@ -46,7 +46,6 @@ inline bool clears_with_color(ColorAttachmentSemantic semantic) noexcept {
   return semantic == ColorAttachmentSemantic::Reactive || semantic == ColorAttachmentSemantic::Fog;
 }
 
-inline constexpr uint64_t SceneLayoutWarmTimeoutMs = 5000;
 inline constexpr uint32_t SceneLayoutMatchedFrames = 2;
 inline constexpr uint32_t MaxSceneLayoutWarmConfigs = 4096;
 

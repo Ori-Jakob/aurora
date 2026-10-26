@@ -135,9 +135,8 @@ SceneLayoutAction next_scene_layout_action(const SceneLayoutInput& input) noexce
     return SceneLayoutAction::Restart;
   }
   const WarmProgress& progress = input.progress;
-  const bool resolved =
-      input.matchedFrames >= SceneLayoutMatchedFrames && progress.ready + progress.failed == progress.total;
-  if (!resolved && input.elapsedMs < SceneLayoutWarmTimeoutMs) {
+  // No timeout: switching early skips every draw whose pipeline is still compiling
+  if (input.matchedFrames < SceneLayoutMatchedFrames || progress.ready + progress.failed != progress.total) {
     return SceneLayoutAction::None;
   }
   // Leaving the G-buffer needs no new variants, so only the way in can be refused
@@ -240,12 +239,7 @@ void switch_scene_layout(bool want, const SceneLayoutInput& input) {
   const bool warmed = c.warming;
   if (warmed) {
     const WarmProgress& progress = input.progress;
-    const bool resolved =
-        input.matchedFrames >= SceneLayoutMatchedFrames && progress.ready + progress.failed == progress.total;
-    std::string notes = !resolved && input.elapsedMs >= SceneLayoutWarmTimeoutMs ? ", timed out" : "";
-    if (g_warmSet.overflow != 0) {
-      notes += fmt::format(", overflow {}", g_warmSet.overflow);
-    }
+    const std::string notes = g_warmSet.overflow != 0 ? fmt::format(", overflow {}", g_warmSet.overflow) : "";
     Log.info("Scene layout {} after {} ms: {}/{} ready, {} failed{}", tier_name(want), input.elapsedMs, progress.ready,
              progress.total, progress.failed, notes);
     Log.info("Scene layout {}: {} draws skipped while warming", tier_name(want), skipped_draws() - c.skippedAtStart);
@@ -350,6 +344,8 @@ void latch_scene_layout(bool wantGBuffer) {
     c.refused = true;
     break;
   case SceneLayoutAction::Cancel:
+    Log.info("Scene layout {} cancelled after {} ms: {}/{} ready, {} failed", tier_name(c.target), input.elapsedMs,
+             input.progress.ready, input.progress.total, input.progress.failed);
     end_warm();
     break;
   }

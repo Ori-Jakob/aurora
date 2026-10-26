@@ -156,9 +156,10 @@ TEST(SceneLayout, HardFailureRefusesSwitch) {
   input.progress = {.ready = 3, .total = 4, .failed = 1};
   input.hardFailed = 1;
   EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::Refuse);
+  // A refusal waits for the rest of the warm set, as a switch does
   input.progress = {.ready = 1, .total = 4, .failed = 1};
-  input.elapsedMs = SceneLayoutWarmTimeoutMs;
-  EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::Refuse);
+  EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::None);
+  input.progress = {.ready = 3, .total = 4, .failed = 1};
   input.want = false;
   input.live = true;
   EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::Switch);
@@ -192,13 +193,23 @@ TEST_F(SceneLayoutWarmTest, UnmatchedFramesDoNotCount) {
   EXPECT_EQ(layout_warm(), nullptr);
 }
 
-TEST(SceneLayout, SwitchesAfterFiveSeconds) {
+TEST(SceneLayout, SlowWarmNeverSwitchesEarly) {
+  constexpr uint64_t Hour = 60ull * 60ull * 1000ull;
   SceneLayoutInput input = warming_input();
   input.progress = {.ready = 1, .total = 4};
-  input.matchedFrames = 0;
-  input.elapsedMs = SceneLayoutWarmTimeoutMs - 1;
+  for (const uint64_t elapsedMs : {uint64_t{5000}, uint64_t{30000}, Hour}) {
+    input.elapsedMs = elapsedMs;
+    EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::None) << elapsedMs;
+  }
+  input.want = false;
+  input.live = true;
   EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::None);
-  input.elapsedMs = SceneLayoutWarmTimeoutMs;
+  input.want = true;
+  input.live = false;
+  input.progress = {.ready = 4, .total = 4};
+  input.matchedFrames = 0;
+  EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::None);
+  input.matchedFrames = SceneLayoutMatchedFrames;
   EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::Switch);
 }
 
