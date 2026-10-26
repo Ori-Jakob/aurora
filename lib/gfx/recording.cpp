@@ -62,6 +62,7 @@ struct FrameRecorder {
   ClipRect cachedScissor;
   bool suppressRenderWorker = false;
   bool normalRequested = false;
+  bool normalRequestSeen = false;
   uint8_t nextStage = 0;
   uint8_t pendingStageEnd = 0;
   std::array<bool, render::StageCount> stageMarkerSeen{};
@@ -932,6 +933,7 @@ void shutdown_recording() {
   g_lastChannelStorageBytes = 0;
   g_recorder.suppressRenderWorker = false;
   g_recorder.normalRequested = false;
+  g_recorder.normalRequestSeen = false;
   g_recorder.nextStage = 0;
   g_recorder.pendingStageEnd = 0;
   g_recorder.stageMarkerSeen = {};
@@ -983,6 +985,8 @@ void increment_merged_draw_count() noexcept {
 }
 
 uint64_t take_resident_request() noexcept { return g_residentRequest.exchange(0, std::memory_order_relaxed); }
+
+bool take_mod_normal_request() noexcept { return std::exchange(g_recorder.normalRequestSeen, false); }
 
 } // namespace detail
 
@@ -1375,6 +1379,11 @@ bool resolve_pass(const ResolveDesc& desc, ResolvedTargets& out) {
   if (detail::should_arm_mod_normal(desc.normal, g_recorder.inOffscreen, webgpu::normal_present(),
                                     webgpu::g_hasCoreFeatures, webgpu::g_graphicsConfig.msaaSamples)) {
     g_recorder.normalRequested = true;
+  }
+  // Seen under the G-buffer too, so a switch to legacy can warm the layout this request will need
+  if (detail::should_arm_mod_normal(desc.normal, g_recorder.inOffscreen, webgpu::g_graphicsConfig.normalBuffer,
+                                    webgpu::g_hasCoreFeatures, webgpu::g_graphicsConfig.msaaSamples)) {
+    g_recorder.normalRequestSeen = true;
   }
   // Requesting no snapshots is a plain pass break (or offscreen close, discarding its output).
   if (desc.color || wantDepth || wantNormal || wantFog) {

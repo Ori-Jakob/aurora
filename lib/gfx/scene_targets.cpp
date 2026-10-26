@@ -4,6 +4,7 @@
 #include "frame.hpp"
 #include "frame_packet.hpp"
 #include "hash.hpp"
+#include "recording.hpp"
 #include "../gx/render_ext.hpp"
 #include "../logging.hpp"
 #include "../webgpu/gpu.hpp"
@@ -49,6 +50,7 @@ struct Controller {
   bool warming = false;
   bool target = false;
   bool refused = false;
+  bool modNormal = false;
   Clock::time_point start;
   uint64_t skippedAtStart = 0;
   uint32_t matchedFrames = 0;
@@ -191,10 +193,12 @@ WarmTotals warm_totals() {
   return totals;
 }
 
+// The mod arms its normal only after leaving the G-buffer, so its request there decides the legacy layout
+bool pending_normal() noexcept { return webgpu::g_graphicsConfig.normalBuffer || g_controller.modNormal; }
+
 void begin_warm(bool target) {
   Controller& c = g_controller;
-  const RenderTargetLayout pending =
-      pending_scene_layout(webgpu::g_graphicsConfig.normalBuffer, target, live_layout_base());
+  const RenderTargetLayout pending = pending_scene_layout(pending_normal(), target, live_layout_base());
   open_warm(pending, scene_render_target_layout().key);
   c.warming = true;
   c.target = target;
@@ -244,6 +248,10 @@ void switch_scene_layout(bool want, const SceneLayoutInput& input) {
              progress.total, progress.failed, notes);
     Log.info("Scene layout {}: {} draws skipped while warming", tier_name(want), skipped_draws() - c.skippedAtStart);
     end_warm();
+  }
+  // Armed while the G-buffer still owns the texture, so the switch lands on the layout the warm prepared
+  if (!want && c.modNormal) {
+    webgpu::enable_normal_buffer();
   }
   if (!webgpu::set_gbuffer(want)) {
     return;
@@ -305,13 +313,15 @@ void latch_scene_layout(bool wantGBuffer) {
       .supported = webgpu::scene_targets_supported(),
   };
   c.firstLatch = false;
+  // Taken every latch so an old request never counts, then held while the switch to legacy is pending
+  const bool normalRequested = take_mod_normal_request();
+  c.modNormal = live && !input.want && (c.modNormal || normalRequested);
   if (input.want && !live && !input.supported && !std::exchange(g_loggedUnsupported, true)) {
     Log.warn("Scene targets: base G-buffer unavailable on this device");
   }
   step_switch_tracking();
   if (c.warming) {
-    const RenderTargetLayout pending =
-        pending_scene_layout(webgpu::g_graphicsConfig.normalBuffer, c.target, live_layout_base());
+    const RenderTargetLayout pending = pending_scene_layout(pending_normal(), c.target, live_layout_base());
     input.pendingKeyChanged = pending.key != g_layoutWarm.pending.key;
     if (std::exchange(g_warmSet.frameMatched, false)) {
       ++c.matchedFrames;

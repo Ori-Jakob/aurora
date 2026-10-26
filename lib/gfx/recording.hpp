@@ -37,6 +37,7 @@ RecordedFrame end_recording();
 void shutdown_recording();
 void increment_merged_draw_count() noexcept;
 uint64_t take_resident_request() noexcept;
+bool take_mod_normal_request() noexcept;
 bool should_arm_mod_normal(bool requested, bool offscreen, bool normalPresent, bool core, uint32_t msaa) noexcept;
 
 namespace testing {

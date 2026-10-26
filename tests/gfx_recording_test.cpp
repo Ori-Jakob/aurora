@@ -4,7 +4,9 @@
 #include "gfx/frame.hpp"
 #include "gfx/frame_packet.hpp"
 #include "gfx/lru_cache.hpp"
+#include "gfx/pipeline_cache.hpp"
 #include "gfx/recording.hpp"
+#include "gfx/scene_targets.hpp"
 #include "gfx/texture.hpp"
 #if AURORA_ENABLE_RENDER
 #include "gfx/resources.hpp"
@@ -359,6 +361,47 @@ TEST(GfxRecordingArmTest, ShouldArmModNormal) {
   EXPECT_FALSE(detail::should_arm_mod_normal(true, true, false, true, 1));
   EXPECT_FALSE(detail::should_arm_mod_normal(true, false, false, false, 1));
   EXPECT_FALSE(detail::should_arm_mod_normal(true, false, false, true, 4));
+}
+
+TEST_F(GfxRecordingTest, LegacyWarmCarriesModNormalRequest) {
+  struct TierReset {
+    bool core = std::exchange(webgpu::g_hasCoreFeatures, true);
+    ~TierReset() {
+      detail::reset_scene_layout();
+      // Warm requests only queue here, so shutting the cache down drops them unbuilt
+      shutdown_pipeline_cache();
+      webgpu::g_graphicsConfig.gbuffer = false;
+      webgpu::g_hasCoreFeatures = core;
+    }
+  } tierReset;
+  detail::reset_scene_layout();
+  webgpu::g_graphicsConfig.gbuffer = true;
+  next_frame();
+  const SceneLayoutBase base = live_layout_base();
+  const uint64_t legacy = pending_scene_layout(false, false, base).key;
+  const uint64_t legacyNormal = pending_scene_layout(true, false, base).key;
+  ASSERT_NE(legacy, legacyNormal);
+  // The first latch switches at once, so it is spent while the tier already matches
+  detail::latch_scene_layout(true);
+  ResolvedTargets out;
+  ASSERT_TRUE(resolve_pass({.color = false, .normal = true}, out));
+  next_frame();
+
+  // The mod arms its normal only after the switch, so the warm must already target that layout
+  detail::latch_scene_layout(false);
+  ASSERT_NE(layout_warm(), nullptr);
+  EXPECT_EQ(layout_warm()->pending.key, legacyNormal);
+  detail::latch_scene_layout(false);
+  ASSERT_NE(layout_warm(), nullptr);
+  EXPECT_EQ(layout_warm()->pending.key, legacyNormal);
+
+  // Without a request since the last latch, the way out stays plain legacy
+  detail::latch_scene_layout(true);
+  EXPECT_EQ(layout_warm(), nullptr);
+  detail::latch_scene_layout(false);
+  ASSERT_NE(layout_warm(), nullptr);
+  EXPECT_EQ(layout_warm()->pending.key, legacy);
+  EXPECT_FALSE(webgpu::g_graphicsConfig.normalBuffer);
 }
 
 TEST_F(GfxRecordingTest, CopiedOffscreenPassIsRetainedOnRestore) {
