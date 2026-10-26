@@ -91,7 +91,7 @@ struct Settings {
   float exposureBias = 0.f;
   Tonemap tonemap = Tonemap::PbrNeutral;
   bool taa = false;
-  float taaSharpness = 0.25f;
+  float taaSharpness = 0.35f;
   Quality ao = Quality::Off;
   bool ssil = false;
   ShadowSettings shadows;
