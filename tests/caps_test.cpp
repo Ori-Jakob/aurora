@@ -557,6 +557,17 @@ TEST(CapsTest, NativeD3D12StaysOff) {
   EXPECT_EQ(caps.d3dShaderModel, 66u);
 }
 
+TEST(CapsTest, NativeD3D12FalseOnNullBackend) {
+  CapsSource source{};
+  source.nativeD3D12 = true;
+  source.backend = wgpu::BackendType::Null;
+  EXPECT_FALSE(build_caps(source).nativeD3D12);
+  source.backend = wgpu::BackendType::Vulkan;
+  EXPECT_FALSE(build_caps(source).nativeD3D12);
+  source.backend = wgpu::BackendType::D3D12;
+  EXPECT_TRUE(build_caps(source).nativeD3D12);
+}
+
 TEST(CapsTest, BuildCapsIdentity) {
   EXPECT_EQ(aurora_backend(wgpu::BackendType::Undefined), BACKEND_AUTO);
   EXPECT_EQ(aurora_backend(wgpu::BackendType::Null), BACKEND_NULL);

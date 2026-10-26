@@ -15,6 +15,7 @@
 #include "geometry/hzb.hpp"
 #include "gx_ext/ext_provider.hpp"
 #include "material/gx_lookup.hpp"
+#include "native/native.hpp"
 #include "post/taa.hpp"
 #include "post/temporal_resolve.hpp"
 #include "post/upscale/upscale.hpp"
@@ -88,6 +89,7 @@ void initialize() {
            yes_no(tier == Tier::Pbr), yes_no(deviceCaps.core), msaaSamples,
            deviceCaps.limits.maxColorAttachmentBytesPerSample);
 #if AURORA_ENABLE_RENDER
+  native::initialize();
   transient_pool().set_release_listener(&bind_cache_on_release);
   register_gx_resolver(GxResource::Depth, &resolve_gx_depth);
   jobs::initialize(webgpu::g_backendType == wgpu::BackendType::WebGPU ? 0 : jobs::default_worker_count());
@@ -149,6 +151,7 @@ void on_worker_frame_begin([[maybe_unused]] uint64_t frameId, [[maybe_unused]] c
   hzb::worker_tick(frameId);
   taa::worker_tick(frameId);
   systems::tick_worker(frameId);
+  native_worker_frame_begin();
 #endif
 }
 
@@ -214,6 +217,8 @@ UpscaleStatus upscale_status() noexcept {
   return {.active = Upscaler::Off};
 #endif
 }
+
+void reenable_native_upscalers() noexcept { detail::native::reenable_upscalers(); }
 
 bool hints_enabled() noexcept {
 #if AURORA_ENABLE_RENDER

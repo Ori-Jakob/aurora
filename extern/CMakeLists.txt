@@ -16,6 +16,7 @@ endfunction()
 if (AURORA_ENABLE_GX)
   include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/AuroraDawnProvider.cmake)
   set(AURORA_DAWN_IS_SHARED "${AURORA_DAWN_IS_SHARED}" PARENT_SCOPE)
+  set(AURORA_ENABLE_NATIVE_D3D12 "${AURORA_ENABLE_NATIVE_D3D12}" PARENT_SCOPE)
 endif ()
 
 # Abseil is needed for core libraries. It normally comes via Dawn's vendor build.

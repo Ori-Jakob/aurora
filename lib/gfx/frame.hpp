@@ -52,6 +52,7 @@ struct RegisteredEncoderTaskType {
 
 std::optional<RegisteredDrawType> find_runtime_draw_type(DrawTypeId id);
 std::optional<RegisteredEncoderTaskType> find_runtime_encoder_task_type(EncoderTaskId id);
+void stop_render_worker();
 
 } // namespace aurora::gfx::detail
 

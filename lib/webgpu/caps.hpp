@@ -56,6 +56,7 @@ struct CapsSource {
   uint32_t subgroupMaxSize = 0;
   std::span<const wgpu::MemoryHeapInfo> memoryHeaps;
   uint32_t d3dShaderModel = 0;
+  bool nativeD3D12 = false;
 };
 
 std::span<const RequestedFeature> requested_features() noexcept;

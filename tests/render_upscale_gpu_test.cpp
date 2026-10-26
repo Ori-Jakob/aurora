@@ -26,6 +26,12 @@
 #include <string>
 #include <vector>
 
+#if AURORA_ENABLE_NATIVE_D3D12
+#include "render/native/d3d12/device.hpp"
+
+#include <wrl/client.h>
+#endif
+
 namespace aurora::render::detail {
 namespace {
 namespace fsr_pass = upscale::fsr_pass;
@@ -1343,5 +1349,48 @@ TEST_F(FsrGpu, LeavesEfbAlphaUntouched) {
     }
   }
 }
+
+#if AURORA_ENABLE_NATIVE_D3D12
+TEST(NativeD3D12Gpu, DeviceAndQueueComeFromDawn) {
+  namespace d3d12 = native::d3d12;
+  using Microsoft::WRL::ComPtr;
+  const test::TestDeviceOptions options{
+      .backend = test::parse_test_backend(std::getenv("AURORA_TEST_BACKEND")).value_or(wgpu::BackendType::Undefined),
+  };
+  std::string error;
+  const auto device = test::create_test_device(options, error);
+  if (!device) {
+    GTEST_SKIP() << "no adapter: " << error;
+  }
+  if (device->adapterInfo.backendType != wgpu::BackendType::D3D12) {
+    EXPECT_FALSE(d3d12::initialize(device->device, device->adapter));
+    EXPECT_FALSE(d3d12::available());
+    GTEST_SKIP() << "needs the D3D12 backend";
+  }
+  ASSERT_TRUE(d3d12::initialize(device->device, device->adapter));
+  ASSERT_TRUE(d3d12::available());
+  ID3D12Device* native = d3d12::device();
+  ASSERT_NE(native, nullptr);
+  ASSERT_NE(d3d12::queue(), nullptr);
+  ComPtr<ID3D12Device> queueDevice;
+  ASSERT_TRUE(SUCCEEDED(d3d12::queue()->GetDevice(IID_PPV_ARGS(&queueDevice))));
+  ComPtr<IUnknown> nativeIdentity;
+  ComPtr<IUnknown> queueIdentity;
+  ASSERT_TRUE(SUCCEEDED(native->QueryInterface(IID_PPV_ARGS(&nativeIdentity))));
+  ASSERT_TRUE(SUCCEEDED(queueDevice->QueryInterface(IID_PPV_ARGS(&queueIdentity))));
+  EXPECT_EQ(nativeIdentity.Get(), queueIdentity.Get());
+  const DXGI_ADAPTER_DESC1& desc = d3d12::adapter_desc();
+  EXPECT_EQ(desc.VendorId, device->adapterInfo.vendorID);
+  EXPECT_EQ(desc.DeviceId, device->adapterInfo.deviceID);
+  const LUID luid = native->GetAdapterLuid();
+  EXPECT_EQ(luid.LowPart, desc.AdapterLuid.LowPart);
+  EXPECT_EQ(luid.HighPart, desc.AdapterLuid.HighPart);
+  EXPECT_NE(d3d12::driver_version(), 0u);
+  d3d12::shutdown();
+  EXPECT_FALSE(d3d12::available());
+  EXPECT_EQ(d3d12::device(), nullptr);
+  EXPECT_EQ(d3d12::queue(), nullptr);
+}
+#endif
 } // namespace
 } // namespace aurora::render::detail

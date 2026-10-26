@@ -84,6 +84,26 @@ if (AURORA_ENABLE_RENDER)
         lib/render/material/schema_text.cpp
         lib/render/material/user_layer.cpp
         lib/render/material/user_layer.hpp
+    )
+    if (AURORA_ENABLE_NATIVE_D3D12)
+        target_sources(aurora_gx PRIVATE
+            lib/render/native/d3d12/device.cpp
+            lib/render/native/d3d12/device.hpp
+            lib/render/native/d3d12/sentinel.cpp
+            lib/render/native/d3d12/sentinel.hpp
+            lib/render/native/d3d12/teardown.cpp
+            lib/render/native/d3d12/teardown.hpp
+            lib/render/native/native.cpp
+            lib/render/native/native.hpp
+        )
+        target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_NATIVE_D3D12=1)
+        target_compile_definitions(aurora_core PRIVATE AURORA_ENABLE_NATIVE_D3D12=1)
+        target_link_libraries(aurora_gx PRIVATE d3d12 dxgi)
+    else ()
+        target_sources(aurora_gx PRIVATE lib/render/native/native.hpp lib/render/native/native_off.cpp)
+        target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_NATIVE_D3D12=0)
+    endif ()
+    target_sources(aurora_gx PRIVATE
         lib/render/post/taa.cpp
         lib/render/post/taa.hpp
         lib/render/post/temporal_resolve.cpp
@@ -124,6 +144,7 @@ if (AURORA_ENABLE_RENDER)
     target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_RENDER=1)
     target_link_libraries(aurora_gx PRIVATE yyjson::yyjson aurora_bccodec)
 else ()
-    target_sources(aurora_gx PRIVATE lib/render/graph_api_off.cpp lib/render/material/registry_off.cpp)
-    target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_RENDER=0)
+    target_sources(aurora_gx PRIVATE lib/render/graph_api_off.cpp lib/render/material/registry_off.cpp
+        lib/render/native/native.hpp lib/render/native/native_off.cpp)
+    target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_RENDER=0 AURORA_ENABLE_NATIVE_D3D12=0)
 endif ()

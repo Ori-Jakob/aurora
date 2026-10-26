@@ -266,7 +266,7 @@ render::Caps build_caps(const CapsSource& source) {
       .d3d12SharedFence = sharedFence,
       // The Null backend reports every feature, so interop also needs a real D3D12 device
       .d3d12Interop = backend == BACKEND_D3D12 && sharedBuffer && sharedFence,
-      .nativeD3D12 = false,
+      .nativeD3D12 = backend == BACKEND_D3D12 && source.nativeD3D12,
       .d3dShaderModel = source.d3dShaderModel,
       .vramBytes = vram.bytes,
       .vramSource = vram.source,

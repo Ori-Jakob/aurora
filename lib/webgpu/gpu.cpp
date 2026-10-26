@@ -33,6 +33,9 @@
 #include "../dawn/TracyPlatform.hpp"
 #include <dawn/native/DawnNative.h>
 #endif
+#if AURORA_ENABLE_NATIVE_D3D12
+#include "../render/native/native.hpp"
+#endif
 
 namespace aurora::webgpu {
 static Module Log("aurora::gpu");
@@ -243,6 +246,11 @@ render::Caps query_device_caps(std::span<const wgpu::FeatureName> adapterFeature
   // The adapter query at init describes the same adapter, so backend and identity survive a failed device query
   const wgpu::AdapterInfo& ids = infoValid ? info : g_adapterInfo;
   const std::span<const wgpu::FeatureName> features{deviceFeatures.features, deviceFeatures.featureCount};
+#if AURORA_ENABLE_NATIVE_D3D12
+  const bool nativeD3D12 = render::detail::native::initialize_device(g_device, g_adapter);
+#else
+  constexpr bool nativeD3D12 = false;
+#endif
   auto deviceCaps = build_caps({
       .backend = ids.backendType,
       .adapterType = ids.adapterType,
@@ -259,6 +267,7 @@ render::Caps query_device_caps(std::span<const wgpu::FeatureName> adapterFeature
                          ? std::span<const wgpu::MemoryHeapInfo>{memoryHeaps.heapInfo, memoryHeaps.heapCount}
                          : std::span<const wgpu::MemoryHeapInfo>{},
       .d3dShaderModel = infoValid && hasD3D ? d3dProperties.shaderModel : 0,
+      .nativeD3D12 = nativeD3D12,
   });
   log_caps(deviceCaps, describe_feature_requests(adapterFeatures, features, g_featureProfile));
   return deviceCaps;

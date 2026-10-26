@@ -207,6 +207,7 @@ struct UpscaleStatus {
 };
 
 UpscaleStatus upscale_status() noexcept;
+void reenable_native_upscalers() noexcept;
 
 enum class Stage : uint8_t {
   SceneBegin,

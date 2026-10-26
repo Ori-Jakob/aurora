@@ -17,6 +17,7 @@
 #include "../webgpu/gpu_prof.hpp"
 #include "../render/frame_state.hpp"
 #include "../render/module.hpp"
+#include "../render/native/native.hpp"
 #include "../render/stage.hpp"
 
 #include <algorithm>
@@ -572,6 +573,14 @@ std::optional<RegisteredEncoderTaskType> find_runtime_encoder_task_type(EncoderT
   };
 }
 
+void stop_render_worker() {
+  render_worker::synchronize();
+  // Vendor SDKs must be torn down on the thread that created them, before the worker and the device go away
+  render_worker::enqueue_work([] { render::detail::shutdown_native(); });
+  render_worker::synchronize();
+  render_worker::shutdown();
+}
+
 } // namespace detail
 
 wgpu::Device device() noexcept { return g_device; }
@@ -758,8 +767,7 @@ void initialize() {
 }
 
 void shutdown() {
-  render_worker::synchronize();
-  render_worker::shutdown();
+  detail::stop_render_worker();
   render::detail::quiesce();
   g_processEventsQueued.store(false, std::memory_order_release);
   g_lastPresentNs.store(0, std::memory_order_release);
