@@ -174,6 +174,19 @@ TEST(TaaRules, ResolveTargetIsHistoryFormat) {
   EXPECT_EQ(history.extraUsage, wgpu::TextureUsage::TextureBinding);
 }
 
+TEST(TaaRules, ResolveConstantsComeFromHeader) {
+  EXPECT_TRUE(taa::testing::resolve_desc(true).constants.empty());
+  const shaders::RenderPipelineDesc desc = taa::testing::resolve_desc(false);
+  ASSERT_EQ(desc.constants.size(), 3u);
+  EXPECT_EQ(desc.constants[0].name, "MIN_BLEND");
+  EXPECT_EQ(desc.constants[0].value, double{taa::MinBlend});
+  EXPECT_EQ(desc.constants[1].name, "MOVING_SAMPLES");
+  EXPECT_EQ(desc.constants[1].value, double{taa::MovingSamples});
+  EXPECT_EQ(desc.constants[2].name, "CLIP_SCALE");
+  EXPECT_EQ(desc.constants[2].value, double{taa::ClipScale});
+  EXPECT_LT(taa::MovingSamples, 1.f / taa::MinBlend);
+}
+
 struct FrameOptions {
   uint32_t cutEpoch = 0;
   bool camera = true;
@@ -952,6 +965,18 @@ TEST_F(TaaGpu, StaticInputConvergesWithinOneLsb) {
   EXPECT_LE(max_rgb_error(output, input), 1);
   const auto history = read_history();
   EXPECT_GT(history[size_t{24} * Width + 32][3], taa::MovingSamples);
+}
+
+TEST_F(TaaGpu, IsolatedHighlightConverges) {
+  start();
+  const std::vector<Rgba> input = image([](uint32_t x, uint32_t y) {
+    return x % 4 == 1 && y % 4 == 1 ? Rgba{250, 240, 230, 255} : Rgba{20, 30, 40, 255};
+  });
+  std::vector<Rgba> output;
+  for (int i = 0; i < 30; ++i) {
+    output = frame(input);
+  }
+  EXPECT_LE(max_rgb_error(output, input), 1);
 }
 
 TEST_F(TaaGpu, LeavesEfbAlphaUntouched) {

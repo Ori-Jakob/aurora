@@ -87,8 +87,9 @@ struct TaaParams {
 @group(2) @binding(0) var source_tex: texture_2d<f32>;
 @group(2) @binding(1) var history_tex: texture_2d<f32>;
 
-override MIN_BLEND: f32 = 0.015;
-override MOVING_SAMPLES: f32 = 10.0;
+override MIN_BLEND: f32 = 0.1;
+override MOVING_SAMPLES: f32 = 8.0;
+override CLIP_SCALE: f32 = 1.5;
 
 const RCAS_LIMIT: f32 = 0.1875;
 
@@ -122,7 +123,8 @@ fn ycocg_to_rgb(c: vec3f) -> vec3f {
 
 fn clip_towards_aabb_center(history: vec3f, box_min: vec3f, box_max: vec3f) -> vec3f {
   let center = 0.5 * (box_max + box_min);
-  let extent = 0.5 * (box_max - box_min) + 0.00000001;
+  // A quarter 8-bit step: a flatter axis only holds history rounding, which would snap the history to the centre
+  let extent = max(0.5 * (box_max - box_min), vec3f(0.25 / 255.0));
   let offset = history - center;
   let units = max3(abs(offset / extent));
   if (units > 1.0) {
@@ -193,8 +195,11 @@ fn fs_resolve(@builtin(position) frag: vec4f) -> @location(0) vec4f {
     }
   }
   let mean = moment1 / 9.0;
-  let deviation = sqrt(max(moment2 / 9.0 - mean * mean, vec3f(0.0)));
-  history = ycocg_to_rgb(clip_towards_aabb_center(rgb_to_ycocg(history), mean - deviation, mean + deviation));
+  let deviation = CLIP_SCALE * sqrt(max(moment2 / 9.0 - mean * mean, vec3f(0.0)));
+  // The box always holds the pixel itself, so a history that already matches it is never pulled toward the mean
+  let own = rgb_to_ycocg(current);
+  history = ycocg_to_rgb(
+      clip_towards_aabb_center(rgb_to_ycocg(history), min(mean - deviation, own), max(mean + deviation, own)));
 
   let still = all(abs(shift) * 0.5 * size < vec2f(0.01));
   let next = select(min(samples + 1.0, MOVING_SAMPLES), samples + 1.0, still);
