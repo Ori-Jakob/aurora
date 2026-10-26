@@ -51,6 +51,7 @@ inline constexpr uint32_t CloudTap = 1u << 9;
 inline constexpr uint32_t ScreenShadow = 1u << 10;
 inline constexpr uint32_t ScreenAo = 1u << 11;
 inline constexpr uint32_t PrevProjFrame = 1u << 12;
+inline constexpr uint32_t Reactive = gx::render_ext::RecordFlagReactive;
 inline constexpr uint32_t CategoryShift = 16;
 inline constexpr uint32_t CategoryMask = 0xFFu << CategoryShift;
 } // namespace flag

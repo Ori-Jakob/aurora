@@ -507,6 +507,49 @@ TEST_F(RenderGxExt, ReceiverCodesFollowCategories) {
   EXPECT_EQ(stats.codes[0], 19u);
 }
 
+gx::PipelineConfig translucent(bool depthUpdate) {
+  gx::PipelineConfig config{};
+  config.blendMode = GX_BM_BLEND;
+  config.blendFacSrc = GX_BL_SRCALPHA;
+  config.blendFacDst = GX_BL_INVSRCALPHA;
+  config.depthCompare = true;
+  config.depthUpdate = depthUpdate;
+  config.colorUpdate = true;
+  return config;
+}
+
+bool stamped_reactive(scene::Window window, scene::Role role, const gx::PipelineConfig& config) {
+  scene::DrawClass cls = draw_class(window, 1);
+  cls.key.role = role;
+  cls.kind = role == scene::Role::Sky ? scene::Kind::Sky : scene::Kind::MainBlended;
+  gx::DrawData draw{};
+  draw.instanceCount = 1;
+  records::stamp(draw, config, cls);
+  EXPECT_NE(draw.immediateData._pad, 0u);
+  return (FakeStorage::at<records::DrawRecord>(draw.immediateData._pad).flags & records::flag::Reactive) != 0;
+}
+
+TEST_F(RenderGxExt, ReactiveFlagMarksInWindowTranslucentsOnly) {
+  using scene::Role;
+  using scene::Window;
+  records::testing::set_push(&FakeStorage::push);
+  records::testing::set_active(true, true, false);
+  EXPECT_TRUE(stamped_reactive(Window::Opaque, Role::Main, translucent(false)));
+  EXPECT_TRUE(stamped_reactive(Window::Translucent, Role::Main, translucent(false)));
+  EXPECT_TRUE(stamped_reactive(Window::Translucent, Role::None, translucent(false)));
+  EXPECT_FALSE(stamped_reactive(Window::PreScene, Role::Sky, translucent(false)));
+  EXPECT_FALSE(stamped_reactive(Window::PreScene, Role::Main, translucent(false)));
+  EXPECT_FALSE(stamped_reactive(Window::Opaque, Role::Sky, translucent(false)));
+  EXPECT_FALSE(stamped_reactive(Window::Translucent, Role::Sky, translucent(false)));
+  EXPECT_FALSE(stamped_reactive(Window::Translucent, Role::Main, translucent(true)));
+  gx::PipelineConfig opaque = translucent(false);
+  opaque.blendMode = GX_BM_NONE;
+  EXPECT_FALSE(stamped_reactive(Window::Opaque, Role::Main, opaque));
+  gx::PipelineConfig depthOnly = translucent(true);
+  depthOnly.colorUpdate = false;
+  EXPECT_FALSE(stamped_reactive(Window::Opaque, Role::Main, depthOnly));
+}
+
 // C_MTXPerspective(60, 4:3, 1, 1000), as GXSetProjection receives it
 Mat4x4<float> perspective() {
   Mat4x4<float> proj{};

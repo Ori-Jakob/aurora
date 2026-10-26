@@ -70,6 +70,17 @@ struct PipelineOptions {
 constexpr bool writes_fog_record(const PipelineConfig& c, const PipelineOptions& o) noexcept {
   return c.shaderConfig.ext.output != 0 && o.colorUpdate && effectively_opaque(c);
 }
+enum class ReactiveWrite : uint8_t { None, Clear, Raise };
+// A colour writer that replaces the pixel or writes depth leaves something TAA can track, so it clears coverage
+constexpr ReactiveWrite reactive_write(const PipelineConfig& c, const PipelineOptions& o) noexcept {
+  if (!o.colorUpdate) {
+    return ReactiveWrite::None;
+  }
+  return effectively_opaque(c) || (c.depthCompare && o.depthUpdate) ? ReactiveWrite::Clear : ReactiveWrite::Raise;
+}
+constexpr ReactiveWrite reactive_write(const PipelineConfig& c) noexcept {
+  return reactive_write(c, {.colorUpdate = c.colorUpdate, .alphaUpdate = c.alphaUpdate, .depthUpdate = c.depthUpdate});
+}
 
 gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout);
 uint64_t gbuffer_pipeline_failures() noexcept;

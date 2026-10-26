@@ -62,6 +62,12 @@ uint32_t receiver_code(const scene::DrawClass& cls) noexcept {
   return (categories & scene::category::CloudReceiver) != 0 ? 2 : 3;
 }
 
+// Sky and pre-scene translucents lie under the whole scene, so only in-window translucents ask TAA for the frame
+bool raises_reactive(const gx::PipelineConfig& config, const scene::DrawClass& cls) noexcept {
+  const bool window = cls.key.window == scene::Window::Opaque || cls.key.window == scene::Window::Translucent;
+  return window && cls.key.role != scene::Role::Sky && gx::reactive_write(config) == gx::ReactiveWrite::Raise;
+}
+
 bool has_debug_id(const gfx::RenderTargetLayout& layout) noexcept {
   for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
     if (layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::DebugId) {
@@ -158,7 +164,8 @@ void stamp(gx::DrawData& draw, const gx::PipelineConfig& config, const scene::Dr
     return;
   }
   DrawRecord record{.frameOff = g_frameLoc,
-                    .flags = motion.flags | (receiver_code(cls) << flag::ReceiverShift),
+                    .flags = motion.flags | (receiver_code(cls) << flag::ReceiverShift) |
+                             (raises_reactive(config, cls) ? flag::Reactive : 0u),
                     .prevMtxOff = motion.prevMtxOff};
   if (cls.key.object.valid) {
     record.objectLo = static_cast<uint32_t>(cls.key.object.id);

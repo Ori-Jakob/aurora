@@ -72,6 +72,7 @@ inline constexpr u32 MotionSourceObject = 2;
 inline constexpr u32 MotionSourcePalette = 3;
 inline constexpr u32 RecordFlagJitter = 1u << 2;
 inline constexpr u32 RecordFlagPrevProjFrame = 1u << 12;
+inline constexpr u32 RecordFlagReactive = 1u << 13;
 inline constexpr u32 FrameMotionWord = 4;
 inline constexpr u32 FrameMotionJitterWord = 0;
 inline constexpr u32 FrameMotionValidWord = 2;

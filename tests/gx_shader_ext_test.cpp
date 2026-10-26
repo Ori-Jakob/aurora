@@ -597,12 +597,43 @@ TEST_F(GxShaderExtTest, ReactiveNeedsReactiveTarget) {
             std::string::npos);
   const std::string text = build_shader_source(config, DstAlphaMode::Replace, ShaderTargets{.reactive = 3});
   EXPECT_NE(fragment_output(text).find("@location(3) reactive: vec4f,"), std::string::npos);
-  EXPECT_NE(text.find("out.reactive = vec4f(saturate(prev.a));"), std::string::npos);
+  EXPECT_NE(text.find("let reactive_flags = select(0u, load_word(&abuf, imm._pad + 1u), imm._pad != 0u);"),
+            std::string::npos);
+  EXPECT_NE(text.find("out.reactive = vec4f(select(0.0, saturate(prev.a), (reactive_flags & " +
+                      std::to_string(render_ext::RecordFlagReactive) + "u) != 0u));"),
+            std::string::npos);
+  EXPECT_EQ(text.find("out.reactive = vec4f(saturate(prev.a));"), std::string::npos);
   EXPECT_EQ(text.find("mo_cur"), std::string::npos);
   EXPECT_EQ(location_count(text), location_count(wgsl(config)));
   const std::string both = build_shader_source(config, DstAlphaMode::None, ShaderTargets{.motion = 2, .reactive = 3});
   EXPECT_LT(fragment_output(both).find("motion: vec2f"), fragment_output(both).find("reactive: vec4f"));
   EXPECT_LT(both.find("out.motion ="), both.find("out.reactive ="));
+}
+
+TEST_F(GxShaderExtTest, ReactiveWriteClearsUnderOpaqueAndDepthWriters) {
+  const auto rule = [](GXBlendMode mode, GXBlendFactor src, GXBlendFactor dst, bool depthCompare, bool depthUpdate,
+                       bool colorUpdate) {
+    PipelineConfig config{};
+    config.blendMode = mode;
+    config.blendFacSrc = src;
+    config.blendFacDst = dst;
+    config.blendOp = GX_LO_CLEAR;
+    config.depthCompare = depthCompare;
+    config.depthUpdate = depthUpdate;
+    config.colorUpdate = colorUpdate;
+    const ReactiveWrite fromConfig = reactive_write(config);
+    EXPECT_EQ(fromConfig, reactive_write(config, {.colorUpdate = colorUpdate, .depthUpdate = depthUpdate}));
+    return fromConfig;
+  };
+  EXPECT_EQ(rule(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, true, false, true), ReactiveWrite::Clear);
+  EXPECT_EQ(rule(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, false, false, true), ReactiveWrite::Clear);
+  EXPECT_EQ(rule(GX_BM_BLEND, GX_BL_ONE, GX_BL_ZERO, true, false, true), ReactiveWrite::Clear);
+  EXPECT_EQ(rule(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, true, true, true), ReactiveWrite::Clear);
+  EXPECT_EQ(rule(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, true, false, true), ReactiveWrite::Raise);
+  EXPECT_EQ(rule(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, false, true, true), ReactiveWrite::Raise);
+  EXPECT_EQ(rule(GX_BM_SUBTRACT, GX_BL_ONE, GX_BL_ONE, true, false, true), ReactiveWrite::Raise);
+  EXPECT_EQ(rule(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, true, true, false), ReactiveWrite::None);
+  EXPECT_EQ(rule(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, true, false, false), ReactiveWrite::None);
 }
 ShaderConfig lit_normal_config() {
   ShaderConfig config = single_site();

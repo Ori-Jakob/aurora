@@ -1729,8 +1729,11 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
                      render_ext::MotionInvalidNdc)});
   }
   if (targets.reactive != UINT32_MAX) {
-    members.push_back({targets.reactive, fmt::format("    @location({}) reactive: vec4f,\n", targets.reactive),
-                       "\n    out.reactive = vec4f(saturate(prev.a));"s});
+    members.push_back(
+        {targets.reactive, fmt::format("    @location({}) reactive: vec4f,\n", targets.reactive),
+         fmt::format("\n    let reactive_flags = select(0u, load_word(&abuf, imm._pad + {}u), imm._pad != 0u);"
+                     "\n    out.reactive = vec4f(select(0.0, saturate(prev.a), (reactive_flags & {}u) != 0u));",
+                     render_ext::DrawRecordFlagsWord, render_ext::RecordFlagReactive)});
   }
   if (targets.fog != UINT32_MAX && config.ext.output != 0) {
     const u32 lock = config.fogType != GX_FOG_PERSP_LIN ? 1 : 0;
