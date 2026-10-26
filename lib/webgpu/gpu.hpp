@@ -91,7 +91,11 @@ bool set_debug_id_buffer(bool enabled);
 bool set_gbuffer(bool enabled);
 inline bool normal_present() noexcept { return g_graphicsConfig.normalBuffer || g_graphicsConfig.gbuffer; }
 const TextureWithSampler& present_source() noexcept;
+void set_scene_render_size(uint32_t width, uint32_t height);
+bool scene_split_active() noexcept;
 wgpu::Extent3D scene_extent() noexcept;
+const TextureWithSampler& scene_color() noexcept;
+const TextureWithSampler& scene_depth() noexcept;
 const TextureWithSampler& scene_color_for(render::Stage stage) noexcept;
 const TextureWithSampler& scene_depth_for(render::Stage stage) noexcept;
 wgpu::BindGroup create_copy_bind_group(const TextureWithSampler& source);

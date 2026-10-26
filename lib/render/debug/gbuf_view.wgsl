@@ -68,7 +68,8 @@ fn view_color(texel: vec2u) -> vec3f {
 
 @fragment
 fn fs_blit(@builtin(position) position: vec4f) -> @location(0) vec4f {
-  return vec4f(textureLoad(view_source, vec2u(position.xy), 0).rgb, 1.0);
+  let scale = vec2f(textureDimensions(view_source)) / vec2f(aurora_frame.efb_size);
+  return vec4f(textureLoad(view_source, vec2u(position.xy * scale), 0).rgb, 1.0);
 }
 //#endif
 

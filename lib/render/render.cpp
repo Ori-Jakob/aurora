@@ -16,6 +16,7 @@
 #include "gx_ext/ext_provider.hpp"
 #include "material/gx_lookup.hpp"
 #include "post/taa.hpp"
+#include "post/upscale/upscale.hpp"
 #include "scene/motion.hpp"
 #include "systems/dispatch.hpp"
 #include "systems/systems.hpp"
@@ -126,6 +127,7 @@ void shutdown() noexcept {
   jobs::shutdown();
   hzb::shutdown();
   taa::shutdown();
+  upscale::shutdown();
   // Unhooks the release listener before the pool clears, so its last releases have no cache left to evict from
   shutdown_bindings();
   transient_pool().clear();
@@ -199,7 +201,13 @@ std::string_view reason_name(Reason reason) noexcept {
   return index < ReasonNames.size() ? ReasonNames[index] : "Unknown";
 }
 
-UpscaleStatus upscale_status() noexcept { return {.active = Upscaler::Off}; }
+UpscaleStatus upscale_status() noexcept {
+#if AURORA_ENABLE_RENDER
+  return detail::upscale::status();
+#else
+  return {.active = Upscaler::Off};
+#endif
+}
 
 bool hints_enabled() noexcept {
 #if AURORA_ENABLE_RENDER

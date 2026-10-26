@@ -68,6 +68,7 @@ struct Entry {
 std::mutex g_mutex;
 std::array<Entry, MaxRequests> g_entries;
 std::array<std::atomic_bool, MaxRequests> g_armed{};
+std::array<std::atomic_bool, MaxRequests> g_onCompose{};
 uint64_t g_nextGeneration = 1;
 uint32_t g_latch = 0;
 
@@ -154,7 +155,20 @@ void unregister(Entry& entry, size_t index) noexcept {
     detail::unregister_pass(entry.pass);
     entry.pass = detail::InvalidPassId;
   }
+  g_onCompose[index].store(false, std::memory_order_relaxed);
   g_armed[index].store(false, std::memory_order_relaxed);
+}
+
+void set_status(size_t index, Status status, std::string message);
+
+void arm_placed(Entry& entry, size_t index, const Request& request) {
+  entry.latches = 0;
+  if (request.latest) {
+    g_armed[index].store(true, std::memory_order_relaxed);
+    set_status(index, Status::Armed, "capturing every frame; the latest is written at shutdown");
+  } else {
+    set_status(index, Status::Waiting, fmt::format("arming in {} frames", ArmDelay));
+  }
 }
 
 void set_status(size_t index, Status status, std::string message) {
@@ -292,11 +306,18 @@ bool capture_enabled(const detail::StageData&, const void* state) {
   return g_armed[*static_cast<const size_t*>(state)].load(std::memory_order_relaxed);
 }
 
+void capture_texture(size_t index, uint64_t generation, const wgpu::Device& device, const wgpu::CommandEncoder& encoder,
+                     const wgpu::Texture& texture, uint64_t frame);
+
 void encode_capture(detail::PassContext& ctx, const void* state) {
   const size_t index = *static_cast<const size_t*>(state);
   uint64_t generation = 0;
   std::memcpy(&generation, ctx.local().data(), sizeof(generation));
-  const wgpu::Texture texture = ctx.texture(Source);
+  capture_texture(index, generation, ctx.device(), ctx.encoder(), ctx.texture(Source), ctx.frame_id());
+}
+
+void capture_texture(size_t index, uint64_t generation, const wgpu::Device& device, const wgpu::CommandEncoder& encoder,
+                     const wgpu::Texture& texture, uint64_t frame) {
   if (!texture) {
     return;
   }
@@ -337,11 +358,11 @@ void encode_capture(detail::PassContext& ctx, const void* state) {
           .usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
           .size = layout->bufferSize,
       };
-      slot.buffer = ctx.device().CreateBuffer(&descriptor);
+      slot.buffer = device.CreateBuffer(&descriptor);
       slot.size = layout->bufferSize;
     }
     slot.state = SlotState::CopySubmitted;
-    slot.frame = ctx.frame_id();
+    slot.frame = frame;
     slot.layout = *layout;
     slot.format = format;
     buffer = slot.buffer;
@@ -353,7 +374,7 @@ void encode_capture(detail::PassContext& ctx, const void* state) {
       .buffer = buffer,
   };
   const wgpu::Extent3D extent{layout->width, layout->height, 1};
-  ctx.encoder().CopyTextureToBuffer(&source, &destination, &extent);
+  encoder.CopyTextureToBuffer(&source, &destination, &extent);
   detail::queue_after_frame([index, slotIndex, generation, buffer, size = layout->bufferSize] {
     {
       std::lock_guard lock{g_mutex};
@@ -405,12 +426,23 @@ void resolve_entry(size_t index, const detail::CompiledGraph* graph) {
     return;
   }
   if (final_status(status)) {
-    if (entry.pass != detail::InvalidPassId) {
+    if (entry.pass != detail::InvalidPassId || g_onCompose[index].load(std::memory_order_relaxed)) {
       unregister(entry, index);
     }
     return;
   }
-  if (entry.pass == detail::InvalidPassId) {
+  const bool onCompose = g_onCompose[index].load(std::memory_order_relaxed);
+  if (entry.pass == detail::InvalidPassId && !onCompose && request.anchor == SceneComposeAnchor) {
+    if (request.resource != resource::GxColor) {
+      set_status(index, Status::Unavailable, fmt::format("only gx.color is captured at {}", SceneComposeAnchor));
+      return;
+    }
+    g_onCompose[index].store(true, std::memory_order_relaxed);
+    Log.info("Capture {}: armed on the scene compose op at latch {}", label(request), g_latch);
+    arm_placed(entry, index, request);
+    return;
+  }
+  if (entry.pass == detail::InvalidPassId && !onCompose) {
     ++entry.resolves;
     Placement placement;
     switch (place(request.anchor, graph, placement)) {
@@ -430,15 +462,9 @@ void resolve_entry(size_t index, const detail::CompiledGraph* graph) {
       break;
     }
     entry.placement = std::move(placement);
-    entry.latches = 0;
     entry.pass = detail::register_pass(capture_pass_desc(index, entry.placement));
     Log.info("Capture {}: registered in {} at latch {}", label(request), stage_name(entry.placement.stage), g_latch);
-    if (request.latest) {
-      g_armed[index].store(true, std::memory_order_relaxed);
-      set_status(index, Status::Armed, "capturing every frame; the latest is written at shutdown");
-    } else {
-      set_status(index, Status::Waiting, fmt::format("arming in {} frames", ArmDelay));
-    }
+    arm_placed(entry, index, request);
     return;
   }
   if (graph != nullptr) {
@@ -836,7 +862,8 @@ std::optional<size_t> request(Request request) {
   std::lock_guard lock{g_mutex};
   for (size_t index = 0; index < MaxRequests; ++index) {
     Entry& entry = g_entries[index];
-    if ((entry.status != Status::Idle && !final_status(entry.status)) || entry.pass != detail::InvalidPassId) {
+    if ((entry.status != Status::Idle && !final_status(entry.status)) || entry.pass != detail::InvalidPassId ||
+        g_onCompose[index].load(std::memory_order_relaxed)) {
       continue;
     }
     entry.request = std::move(request);
@@ -899,6 +926,20 @@ void on_latch() {
 void resolve(const detail::CompiledGraph* graph) {
   for (size_t index = 0; index < MaxRequests; ++index) {
     resolve_entry(index, graph);
+  }
+}
+
+void after_scene_compose(const wgpu::CommandEncoder& encoder, const wgpu::Texture& texture, uint64_t frame) {
+  for (size_t index = 0; index < MaxRequests; ++index) {
+    if (!g_armed[index].load(std::memory_order_relaxed) || !g_onCompose[index].load(std::memory_order_relaxed)) {
+      continue;
+    }
+    uint64_t generation = 0;
+    {
+      std::lock_guard lock{g_mutex};
+      generation = g_entries[index].generation;
+    }
+    capture_texture(index, generation, webgpu::g_device, encoder, texture, frame);
   }
 }
 
@@ -970,6 +1011,7 @@ void reset() noexcept {
     }
     entry = {};
     g_armed[index].store(false, std::memory_order_relaxed);
+    g_onCompose[index].store(false, std::memory_order_relaxed);
   }
   g_latch = 0;
 }

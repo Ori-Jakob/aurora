@@ -71,7 +71,19 @@ void encode_pick(detail::PassContext& ctx, const void*) {
   }
   std::memcpy(&params, bytes.data(), sizeof(params));
   const wgpu::Texture texture = ctx.texture(Source);
-  if (params.valid == 0 || !texture || params.x >= texture.GetWidth() || params.y >= texture.GetHeight()) {
+  if (params.valid == 0 || !texture) {
+    return;
+  }
+  const wgpu::Extent3D output = webgpu::g_frameBuffer.size;
+  const auto to_render = [](uint32_t pixel, uint32_t outputSize, uint32_t renderSize) {
+    if (outputSize == 0 || outputSize == renderSize) {
+      return pixel;
+    }
+    return static_cast<uint32_t>((2 * uint64_t{pixel} + 1) * renderSize / (2 * uint64_t{outputSize}));
+  };
+  params.x = to_render(params.x, output.width, texture.GetWidth());
+  params.y = to_render(params.y, output.height, texture.GetHeight());
+  if (params.x >= texture.GetWidth() || params.y >= texture.GetHeight()) {
     return;
   }
   size_t index = SlotCount;

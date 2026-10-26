@@ -920,8 +920,9 @@ TEST_F(GfxDispatchTest, OpPayloadCoversEveryType) {
   detail::EncoderTask task;
   render::detail::StageData stage;
   detail::ComputeBatch batch;
+  render::detail::SceneComposeData compose;
   using enum detail::FrameOpType;
-  for (const auto type : {RenderPass, TextureCopy, EncoderTask, RenderStage, Compute}) {
+  for (const auto type : {RenderPass, TextureCopy, EncoderTask, RenderStage, Compute, SceneCompose}) {
     EXPECT_FALSE(detail::op_has_payload({.type = type})) << static_cast<int>(type);
   }
   EXPECT_TRUE(detail::op_has_payload({.type = RenderPass, .renderPass = &pass}));
@@ -929,7 +930,9 @@ TEST_F(GfxDispatchTest, OpPayloadCoversEveryType) {
   EXPECT_TRUE(detail::op_has_payload({.type = EncoderTask, .encoderTask = &task}));
   EXPECT_TRUE(detail::op_has_payload({.type = RenderStage, .stageData = &stage}));
   EXPECT_TRUE(detail::op_has_payload({.type = Compute, .computeBatch = &batch}));
+  EXPECT_TRUE(detail::op_has_payload({.type = SceneCompose, .sceneCompose = &compose}));
   EXPECT_FALSE(detail::op_has_payload({.type = Compute, .renderPass = &pass}));
+  EXPECT_FALSE(detail::op_has_payload({.type = SceneCompose, .computeBatch = &batch}));
 }
 
 #if AURORA_ENABLE_RENDER

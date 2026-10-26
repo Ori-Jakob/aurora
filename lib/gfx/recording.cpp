@@ -66,6 +66,9 @@ struct FrameRecorder {
   uint8_t nextStage = 0;
   uint8_t pendingStageEnd = 0;
   std::array<bool, render::StageCount> stageMarkerSeen{};
+  EfbMode efbMode = EfbMode::Scene;
+  bool composeWanted = false;
+  bool composed = false;
 #ifdef AURORA_GFX_DEBUG_GROUPS
   std::vector<std::string> debugGroupStack;
 #endif
@@ -95,14 +98,42 @@ std::string pass_label(std::string_view kind) {
   return std::string{kind};
 }
 
-void set_efb_targets(RenderPass& pass) {
+const webgpu::TextureWithSampler& efb_color(EfbMode mode) noexcept {
+  return mode == EfbMode::Scene ? webgpu::scene_color() : webgpu::g_frameBuffer;
+}
+
+const webgpu::TextureWithSampler& efb_depth(EfbMode mode) noexcept {
+  return mode == EfbMode::Scene ? webgpu::scene_depth() : webgpu::g_depthBuffer;
+}
+
+void set_single_color_target(RenderPass& pass, wgpu::TextureFormat format, const wgpu::Extent3D size,
+                             wgpu::TextureView view, wgpu::TextureView resolveView = {});
+
+void set_efb_targets(RenderPass& pass, EfbMode mode) {
+  if (mode == EfbMode::Output) {
+    const webgpu::TextureWithSampler& color = webgpu::g_frameBuffer;
+    const webgpu::TextureWithSampler& depth = webgpu::g_depthBuffer;
+    set_single_color_target(pass, webgpu::g_graphicsConfig.surfaceConfiguration.format, color.size, color.view);
+    pass.depthStencilView = depth.view;
+    pass.depthStencilFormat = webgpu::g_graphicsConfig.depthFormat;
+    pass.copySourceTexture = color.texture;
+    pass.copySourceView = color.view;
+    pass.copySourceDepthView = depth.view;
+    pass.copySourceNormalTexture = {};
+    pass.msaaSamples = 1;
+    pass.hasDepth = true;
+    pass.hasStencil = false;
+    return;
+  }
+  const webgpu::TextureWithSampler& sceneTarget = webgpu::scene_color();
+  const webgpu::TextureWithSampler& sceneDepth = webgpu::scene_depth();
   const auto layout = scene_render_target_layout();
   pass.colorAttachmentCount = layout.colorAttachmentCount;
   auto& sceneColor = pass.colorAttachments[SceneColorAttachmentIndex];
   sceneColor.semantic = ColorAttachmentSemantic::SceneColor;
   sceneColor.format = layout.colorAttachments[SceneColorAttachmentIndex].format;
-  sceneColor.size = webgpu::g_frameBuffer.size;
-  sceneColor.view = webgpu::g_frameBuffer.view;
+  sceneColor.size = sceneTarget.size;
+  sceneColor.view = sceneTarget.view;
   sceneColor.resolveView = layout.sampleCount > 1 ? webgpu::g_frameBufferResolved.view : nullptr;
   for (uint32_t i = SceneColorAttachmentIndex + 1; i < layout.colorAttachmentCount; ++i) {
     auto& color = pass.colorAttachments[i];
@@ -130,13 +161,13 @@ void set_efb_targets(RenderPass& pass) {
     color.size = target->size;
     color.view = target->view;
   }
-  pass.depthStencilView = webgpu::g_depthBuffer.view;
+  pass.depthStencilView = sceneDepth.view;
   pass.depthStencilFormat = layout.depthStencilFormat;
   pass.copySourceTexture =
-      webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved.texture : webgpu::g_frameBuffer.texture;
+      webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved.texture : sceneTarget.texture;
   pass.copySourceView =
-      webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved.view : webgpu::g_frameBuffer.view;
-  pass.copySourceDepthView = webgpu::g_depthBuffer.view;
+      webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved.view : sceneTarget.view;
+  pass.copySourceDepthView = sceneDepth.view;
   if (webgpu::normal_present()) {
     pass.copySourceNormalTexture = webgpu::g_normalBuffer.texture;
   }
@@ -146,7 +177,7 @@ void set_efb_targets(RenderPass& pass) {
 }
 
 void set_single_color_target(RenderPass& pass, wgpu::TextureFormat format, const wgpu::Extent3D size,
-                             wgpu::TextureView view, wgpu::TextureView resolveView = {}) {
+                             wgpu::TextureView view, wgpu::TextureView resolveView) {
   auto& color = pass.colorAttachments[SceneColorAttachmentIndex];
   color.semantic = ColorAttachmentSemantic::SceneColor;
   color.format = format;
@@ -315,6 +346,9 @@ FrameOp capture_frame_op(FramePacket& frame, FrameOpType type, uint32_t index) {
       .stageData = type == FrameOpType::RenderStage && index < frame.stages.size() ? &frame.stages[index] : nullptr,
       .computeBatch =
           type == FrameOpType::Compute && index < frame.computeBatches.size() ? &frame.computeBatches[index] : nullptr,
+      .sceneCompose = type == FrameOpType::SceneCompose && index < frame.sceneComposes.size()
+                          ? &frame.sceneComposes[index]
+                          : nullptr,
       .highWater = current_high_water(frame),
   };
   op.textureUploads.reserve(op.highWater.textureUploadCount);
@@ -597,7 +631,7 @@ void restore_efb() {
   } else {
     auto& pass = current_render_passes().emplace_back();
     pass.label = pass_label("EFB");
-    set_efb_targets(pass);
+    set_efb_targets(pass, g_recorder.efbMode);
     for (uint32_t i = 0; i < pass.colorAttachmentCount; ++i) {
       pass.colorAttachments[i].clear = false;
       pass.colorAttachments[i].loadOp = wgpu::LoadOp::Undefined;
@@ -605,7 +639,7 @@ void restore_efb() {
     pass.clearDepth = false;
   }
   ++g_recorder.currentRenderPass;
-  set_efb_targets(current_render_passes()[g_recorder.currentRenderPass]);
+  set_efb_targets(current_render_passes()[g_recorder.currentRenderPass], g_recorder.efbMode);
 
   g_recorder.cachedViewport = g_recorder.suspendedEfbViewport;
   g_recorder.cachedScissor = g_recorder.suspendedEfbScissor;
@@ -724,8 +758,8 @@ webgpu::TextureWithSampler create_stage_depth_snapshot(const wgpu::Extent3D& siz
 
 // EFB passes attach the EFB depth and read it back through the same view; begin_color_pass targets do neither
 bool is_efb_depth_pass(const RenderPass& pass) noexcept {
-  return pass.depthStencilView.Get() == webgpu::g_depthBuffer.view.Get() &&
-         pass.copySourceDepthView.Get() == webgpu::g_depthBuffer.view.Get();
+  const wgpu::TextureView& view = efb_depth(g_recorder.efbMode).view;
+  return pass.depthStencilView.Get() == view.Get() && pass.copySourceDepthView.Get() == view.Get();
 }
 
 render::detail::SceneDepth capture_scene_depth(RenderPass* sealed, const StageBatch& batch) {
@@ -739,24 +773,25 @@ render::detail::SceneDepth capture_scene_depth(RenderPass* sealed, const StageBa
     }
     return depth;
   }
-  depth.attachmentTexture = webgpu::g_depthBuffer.texture;
+  const webgpu::TextureWithSampler& efbDepth = efb_depth(g_recorder.efbMode);
+  depth.attachmentTexture = efbDepth.texture;
   if (sealed != nullptr) {
     depth.attachment = sealed->depthStencilView;
     depth.attachmentFormat = sealed->depthStencilFormat;
     depth.attachmentSamples = sealed->msaaSamples;
     depth.size = sealed->colorAttachments[SceneColorAttachmentIndex].size;
   } else {
-    depth.attachment = webgpu::g_depthBuffer.view;
+    depth.attachment = efbDepth.view;
     depth.attachmentFormat = webgpu::g_graphicsConfig.depthFormat;
     depth.attachmentSamples = webgpu::g_graphicsConfig.msaaSamples;
-    depth.size = webgpu::g_frameBuffer.size;
+    depth.size = efb_color(g_recorder.efbMode).size;
   }
   if (batch.snapshotSlot == UINT8_MAX) {
     return depth;
   }
   if (depth.source == render::DepthSource::Direct) {
-    depth.sampledTexture = webgpu::g_depthBuffer.texture;
-    depth.sampled = sealed != nullptr ? sealed->copySourceDepthView : webgpu::g_depthBuffer.view;
+    depth.sampledTexture = efbDepth.texture;
+    depth.sampled = sealed != nullptr ? sealed->copySourceDepthView : efbDepth.view;
     depth.sampledFormat = depth.attachmentFormat;
     // Direct sampling binds the whole view; a stencil aspect would need a depth-only view
     AURORA_ASSERT(depth.sampledFormat == wgpu::TextureFormat::Depth32Float ||
@@ -815,7 +850,65 @@ bool emit_stage_ops(uint8_t end, uint8_t liveMarker, bool atFinish) {
   return true;
 }
 
+constexpr uint8_t SceneStageEnd = static_cast<uint8_t>(render::Stage::PrePost) + 1;
+
+void open_efb_pass_loading() {
+  auto& pass = current_render_passes().emplace_back();
+  pass.label = pass_label("EFB");
+  set_efb_targets(pass, g_recorder.efbMode);
+  for (uint32_t i = 0; i < pass.colorAttachmentCount; ++i) {
+    pass.colorAttachments[i].clear = false;
+    pass.colorAttachments[i].loadOp = wgpu::LoadOp::Undefined;
+  }
+  pass.clearDepth = false;
+  pass.commands.reserve(2048);
+  g_recorder.currentRenderPass = static_cast<uint32_t>(current_render_passes().size() - 1);
+  g_recorder.cachedViewport = gx::map_logical_viewport(gx::g_gxState.logicalViewport);
+  g_recorder.cachedScissor = gx::map_logical_scissor(gx::g_gxState.logicalScissor);
+  push_command(CommandType::SetViewport, Command::Data{.setViewport = g_recorder.cachedViewport});
+  push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
+  gx::set_logical_viewport(gx::g_gxState.logicalViewport);
+  gx::set_logical_scissor(gx::g_gxState.logicalScissor);
+}
+
+bool switch_pending(uint8_t end) noexcept {
+  return g_recorder.composeWanted && !g_recorder.composed && end >= SceneStageEnd;
+}
+
+// Every path through the frame reaches this once, so the HUD never lands in the scene targets
+void switch_to_output(bool reopen) {
+  auto& frame = current_frame_packet();
+  g_recorder.composed = true;
+  if (g_recorder.currentRenderPass != UINT32_MAX) {
+    auto& pass = current_render_passes()[g_recorder.currentRenderPass];
+    if (!pass.sealed) {
+      pass.discardable = !pass.has_consumer() && !pass.has_content();
+      enqueue_pass(frame, g_recorder.currentRenderPass);
+    }
+  }
+  const auto composeIndex = static_cast<uint32_t>(frame.sceneComposes.size());
+  render::detail::SceneComposeData& data = frame.sceneComposes.emplace_back();
+  data.frameId = frame.frameId;
+  render::detail::prepare_scene_compose(data);
+  emit_op(frame, FrameOpType::SceneCompose, composeIndex);
+  if (data.mode == render::detail::ComposeMode::Split) {
+    g_recorder.efbMode = EfbMode::Output;
+  }
+  g_recorder.currentRenderPass = UINT32_MAX;
+  if (reopen) {
+    open_efb_pass_loading();
+  }
+}
+
 void run_stages_until(uint8_t end, uint8_t liveMarker) {
+  if (switch_pending(end)) {
+    const bool hadScenePass = g_recorder.currentRenderPass != UINT32_MAX;
+    emit_stage_ops(SceneStageEnd, liveMarker, false);
+    switch_to_output(hadScenePass);
+    if (end <= SceneStageEnd) {
+      return;
+    }
+  }
   const bool hadPass = g_recorder.currentRenderPass != UINT32_MAX;
   if (emit_stage_ops(end, liveMarker, false) && hadPass) {
     resume_efb_pass_loading(current_render_passes()[g_recorder.currentRenderPass]);
@@ -859,12 +952,15 @@ void begin_recording(FramePacket& packet, size_t frameSlot) {
   g_recorder.nextStage = 0;
   g_recorder.pendingStageEnd = 0;
   g_recorder.stageMarkerSeen = {};
+  g_recorder.efbMode = EfbMode::Scene;
+  g_recorder.composeWanted = render::detail::scene_compose_wanted();
+  g_recorder.composed = false;
   g_channelStorageBytes = 0;
 
   current_render_passes().emplace_back();
   auto& pass = current_render_passes()[0];
   pass.label = pass_label("EFB");
-  set_efb_targets(pass);
+  set_efb_targets(pass, EfbMode::Scene);
   pass.colorAttachments[SceneColorAttachmentIndex].clearValue = gx::g_gxState.clearColor;
   pass.clearDepthValue = gx::clear_depth_value();
   g_recorder.currentRenderPass = 0;
@@ -937,6 +1033,9 @@ void shutdown_recording() {
   g_recorder.nextStage = 0;
   g_recorder.pendingStageEnd = 0;
   g_recorder.stageMarkerSeen = {};
+  g_recorder.efbMode = EfbMode::Scene;
+  g_recorder.composeWanted = false;
+  g_recorder.composed = false;
 }
 
 namespace testing {
@@ -1531,6 +1630,13 @@ void finish() {
     return;
   }
   AURORA_ASSERT(!g_recorder.inOffscreen, "finish called while offscreen rendering is active");
+  if (switch_pending(LastMarkerStage + 1)) {
+    const bool hadScenePass = g_recorder.currentRenderPass != UINT32_MAX;
+    if (g_recorder.packet->renderState != nullptr) {
+      emit_stage_ops(SceneStageEnd, NoLiveMarker, true);
+    }
+    switch_to_output(hadScenePass);
+  }
   // Built before the final pass is sealed, so the batch's scene depth can still be captured on it
   StageBatch batch = g_recorder.packet->renderState != nullptr
                          ? build_stage_batch(LastMarkerStage + 1, NoLiveMarker, true)
@@ -1551,6 +1657,8 @@ void finish() {
   emit_stage_batch(batch, depth);
   g_recorder.pendingStageEnd = 0;
 }
+
+EfbMode current_efb_mode() noexcept { return g_recorder.efbMode; }
 
 render::DepthSource current_scene_depth_source() noexcept {
   if (g_sceneDepthOverride) {

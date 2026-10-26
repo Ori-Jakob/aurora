@@ -4,6 +4,7 @@
 #include "graph.hpp"
 #include "graph_bind.hpp"
 #include "graph_pool.hpp"
+#include "../internal.hpp"
 #include "../logging.hpp"
 
 #if AURORA_ENABLE_RENDER
@@ -11,6 +12,8 @@
 #include "hints.hpp"
 #include "history_reset.hpp"
 #include "shaders.hpp"
+#include "post/upscale/compose.hpp"
+#include "post/upscale/upscale.hpp"
 #include "../webgpu/gpu_prof.hpp"
 #endif
 
@@ -178,6 +181,30 @@ void after_frame(const FrameState* frame) noexcept {
   if (!has_native_passes(frame)) {
     return;
   }
+}
+
+bool scene_compose_wanted() noexcept {
+#if AURORA_ENABLE_RENDER
+  return upscale::compose_wanted();
+#else
+  return false;
+#endif
+}
+
+void prepare_scene_compose([[maybe_unused]] SceneComposeData& data) {
+#if AURORA_ENABLE_RENDER
+  upscale::compose::prepare(data);
+#else
+  CHECK(false, "Scene compose prepared without the render module");
+#endif
+}
+
+void scene_compose([[maybe_unused]] wgpu::CommandEncoder& cmd, [[maybe_unused]] const SceneComposeData& data) {
+#if AURORA_ENABLE_RENDER
+  upscale::compose::encode(cmd, data);
+#else
+  CHECK(false, "Scene compose encoded without the render module");
+#endif
 }
 
 bool pass_pipelines_ready(const CompiledNode& node) noexcept {

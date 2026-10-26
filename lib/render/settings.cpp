@@ -19,6 +19,7 @@
 #include "gx_ext/ext_provider.hpp"
 #include "hints.hpp"
 #include "post/taa.hpp"
+#include "post/upscale/upscale.hpp"
 #include "scene/classify.hpp"
 #include "scene/motion.hpp"
 #endif
@@ -997,9 +998,8 @@ std::shared_ptr<const FrameState> latch_frame() {
   const bool environmentChanged = environment != g_graphEnvironment;
   const DepthSource sceneDepthSource = gfx::current_scene_depth_source();
   const bool sceneDepthChanged = sceneDepthSource != g_sceneDepthSource;
-  if (graph == nullptr || settingsChanged || passesChanged || externalsChanged || environmentChanged ||
-      sceneDepthChanged) {
-    g_graphEnvironment = std::move(environment);
+  const auto compile_latched = [&](GraphEnvironment latchedEnvironment) -> std::shared_ptr<const CompiledGraph> {
+    g_graphEnvironment = std::move(latchedEnvironment);
     g_sceneDepthSource = sceneDepthSource;
     // An equal graphHash still carries new state and callbacks, so the new object is always published
     std::shared_ptr<CompiledGraph> compiled = compile_graph(
@@ -1008,10 +1008,19 @@ std::shared_ptr<const FrameState> latch_frame() {
     if (compiled) {
       prepare_graph_bindings(*compiled, {&latched_settings(), &caps(), &g_graphEnvironment, sceneDepthSource});
     }
-    graph = compiled ? std::move(compiled) : empty_graph();
+    return compiled ? std::move(compiled) : empty_graph();
+  };
+  if (graph == nullptr || settingsChanged || passesChanged || externalsChanged || environmentChanged ||
+      sceneDepthChanged) {
+    graph = compile_latched(std::move(environment));
   }
   scene::motion::latch(latched_settings(), gfx::layout_has_gbuffer(gfx::scene_render_target_layout()));
   taa::on_latch(latched_settings(), graph.get());
+  if (upscale::on_latch(latched_settings())) {
+    graph = compile_latched(gather_graph_environment());
+    taa::on_latch(latched_settings(), graph.get());
+  }
+  upscale::check_graph(graph.get());
   latch_pass_params();
   inspectorOpen = g_graphEnvironment.inspectorOpen;
 #endif

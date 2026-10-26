@@ -60,6 +60,8 @@ uint32_t stage_depth_snapshot_requests(render::Stage slot) noexcept;
 } // namespace aurora::gfx::detail
 
 namespace aurora::gfx {
+enum class EfbMode : uint8_t { Scene, Output };
+
 struct ColorPassDescriptor {
   const char* label = nullptr;
   wgpu::TextureView colorView;
@@ -228,5 +230,6 @@ void set_scissor(const ClipRect& scissor) noexcept;
 void push_debug_group(std::string label);
 void insert_debug_marker(std::string label);
 void record_stage(render::Stage stage);
+EfbMode current_efb_mode() noexcept;
 render::DepthSource current_scene_depth_source() noexcept;
 } // namespace aurora::gfx

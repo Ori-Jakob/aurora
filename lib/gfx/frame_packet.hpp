@@ -6,7 +6,7 @@
 #include "types.hpp"
 #include "tex_palette_conv.hpp"
 #include "texture.hpp"
-#include "../render/stage_data.hpp"
+#include "../render/stage.hpp"
 
 #include <array>
 #include <cstddef>
@@ -229,6 +229,7 @@ enum class FrameOpType : uint8_t {
   EncoderTask,
   RenderStage,
   Compute,
+  SceneCompose,
 };
 
 struct FrameOp {
@@ -239,6 +240,7 @@ struct FrameOp {
   EncoderTask* encoderTask = nullptr;
   const render::detail::StageData* stageData = nullptr;
   const ComputeBatch* computeBatch = nullptr;
+  const render::detail::SceneComposeData* sceneCompose = nullptr;
   StagingHighWater highWater;
   std::vector<const TextureUpload*> textureUploads;
 };
@@ -255,6 +257,8 @@ inline bool op_has_payload(const FrameOp& op) noexcept {
     return op.stageData != nullptr;
   case FrameOpType::Compute:
     return op.computeBatch != nullptr;
+  case FrameOpType::SceneCompose:
+    return op.sceneCompose != nullptr;
   }
   return false;
 }
@@ -274,6 +278,7 @@ struct FramePacket {
   std::deque<EncoderTask> encoderTasks;
   std::deque<render::detail::StageData> stages;
   std::deque<ComputeBatch> computeBatches;
+  std::deque<render::detail::SceneComposeData> sceneComposes;
   std::deque<FrameOp> ops;
   std::deque<TextureUpload> textureUploads;
 #ifdef AURORA_GFX_DEBUG_GROUPS

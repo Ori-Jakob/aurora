@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../graph.hpp"
+
 #include <aurora/render.hpp>
 
 #include <cstdint>
@@ -11,6 +13,7 @@ struct Resolver {
   uint32_t jitterPhases = 0;
   bool (*wanted)(const Settings& settings) noexcept = nullptr;
   bool (*jitter_ready)() noexcept = nullptr;
+  GraphExtent (*scene_size)(GraphExtent output) noexcept = nullptr;
 };
 
 void install(const Resolver* resolver) noexcept;

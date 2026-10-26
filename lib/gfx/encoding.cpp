@@ -568,6 +568,11 @@ void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op)
       encode_compute(cmd, frame, *op.computeBatch);
     }
     break;
+  case FrameOpType::SceneCompose:
+    if (op.sceneCompose != nullptr) {
+      ::aurora::render::detail::scene_compose(cmd, *op.sceneCompose);
+    }
+    break;
   }
 }
 

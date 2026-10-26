@@ -14,6 +14,7 @@
 #include <aurora/aurora.h>
 #include <aurora/webgpu.hpp>
 #include <aurora/gfx.h>
+#include <aurora/render.hpp>
 #include <magic_enum.hpp>
 #include <webgpu/webgpu_cpp.h>
 #include <SDL3/SDL_stdinc.h>
@@ -49,6 +50,9 @@ TextureWithSampler g_debugIdBuffer;
 TextureWithSampler g_motionBuffer;
 TextureWithSampler g_reactiveBuffer;
 TextureWithSampler g_fogRecordBuffer;
+static TextureWithSampler g_sceneColor;
+static TextureWithSampler g_sceneDepth;
+static wgpu::Extent3D g_sceneRequest{0, 0, 1};
 
 // EFB -> XFB copy pipeline
 static wgpu::BindGroupLayout g_CopyBindGroupLayout;
@@ -486,11 +490,21 @@ const TextureWithSampler& present_source() noexcept {
   return g_graphicsConfig.msaaSamples > 1 ? g_frameBufferResolved : g_frameBuffer;
 }
 
-wgpu::Extent3D scene_extent() noexcept { return g_frameBuffer.size; }
+bool scene_split_active() noexcept { return static_cast<bool>(g_sceneColor.texture); }
 
-const TextureWithSampler& scene_color_for(render::Stage) noexcept { return g_frameBuffer; }
+wgpu::Extent3D scene_extent() noexcept { return scene_split_active() ? g_sceneColor.size : g_frameBuffer.size; }
 
-const TextureWithSampler& scene_depth_for(render::Stage) noexcept { return g_depthBuffer; }
+const TextureWithSampler& scene_color() noexcept { return scene_split_active() ? g_sceneColor : g_frameBuffer; }
+
+const TextureWithSampler& scene_depth() noexcept { return scene_split_active() ? g_sceneDepth : g_depthBuffer; }
+
+const TextureWithSampler& scene_color_for(render::Stage stage) noexcept {
+  return stage <= render::Stage::PrePost ? scene_color() : g_frameBuffer;
+}
+
+const TextureWithSampler& scene_depth_for(render::Stage stage) noexcept {
+  return stage <= render::Stage::PrePost ? scene_depth() : g_depthBuffer;
+}
 
 void set_resampler(AuroraSampler sampler) noexcept {
   switch (sampler) {
@@ -611,8 +625,53 @@ static void create_gbuffer_targets(uint32_t width, uint32_t height) {
 }
 
 bool scene_targets_supported() noexcept {
-  return g_hasCoreFeatures && g_graphicsConfig.msaaSamples == 1 && g_device && g_frameBuffer.size.width != 0 &&
-         g_frameBuffer.size.height != 0;
+  const wgpu::Extent3D scene = scene_extent();
+  return g_hasCoreFeatures && g_graphicsConfig.msaaSamples == 1 && g_device && scene.width != 0 && scene.height != 0;
+}
+
+static void create_scene_size_targets() {
+  const wgpu::Extent3D scene = scene_extent();
+  if (normal_present()) {
+    g_normalBuffer = create_normal_texture(scene.width, scene.height);
+  }
+  if (g_graphicsConfig.gbuffer) {
+    create_gbuffer_targets(scene.width, scene.height);
+  }
+  if (g_graphicsConfig.debugIdBuffer) {
+    g_debugIdBuffer = create_debug_id_texture(scene.width, scene.height);
+  }
+}
+
+static void create_scene_targets() {
+  const wgpu::Extent3D efb = g_frameBuffer.size;
+  const bool split = g_sceneRequest.width != 0 && g_sceneRequest.height != 0 && g_graphicsConfig.msaaSamples == 1 &&
+                     efb.width != 0 && efb.height != 0 &&
+                     (g_sceneRequest.width != efb.width || g_sceneRequest.height != efb.height);
+  if (!split) {
+    // Aliased while no split is live, so legacy frames bind the same textures
+    g_sceneColor = {};
+    g_sceneDepth = {};
+    return;
+  }
+  if (g_sceneColor.texture && g_sceneColor.size.width == g_sceneRequest.width &&
+      g_sceneColor.size.height == g_sceneRequest.height) {
+    return;
+  }
+  g_sceneColor = create_render_texture(g_sceneRequest.width, g_sceneRequest.height, false);
+  g_sceneDepth = create_depth_texture(g_sceneRequest.width, g_sceneRequest.height);
+}
+
+void set_scene_render_size(uint32_t width, uint32_t height) {
+  const wgpu::Extent3D before = scene_extent();
+  g_sceneRequest = {width, height, 1};
+  if (!g_device) {
+    return;
+  }
+  create_scene_targets();
+  const wgpu::Extent3D after = scene_extent();
+  if (after.width != before.width || after.height != before.height) {
+    create_scene_size_targets();
+  }
 }
 
 bool enable_normal_buffer() {
@@ -624,7 +683,8 @@ bool enable_normal_buffer() {
   }
   // Under the G-buffer the texture already exists and the render worker may be reading it
   if (!g_normalBuffer.texture) {
-    g_normalBuffer = create_normal_texture(g_frameBuffer.size.width, g_frameBuffer.size.height);
+    const wgpu::Extent3D scene = scene_extent();
+    g_normalBuffer = create_normal_texture(scene.width, scene.height);
   }
   g_graphicsConfig.normalBuffer = true;
   return true;
@@ -639,8 +699,8 @@ bool set_debug_id_buffer(bool enabled) {
   }
   // The render worker resolves gbuf.debug_id from this global, so it must be idle before the swap
   gfx::gpu_synchronize();
-  g_debugIdBuffer =
-      enabled ? create_debug_id_texture(g_frameBuffer.size.width, g_frameBuffer.size.height) : TextureWithSampler{};
+  const wgpu::Extent3D scene = scene_extent();
+  g_debugIdBuffer = enabled ? create_debug_id_texture(scene.width, scene.height) : TextureWithSampler{};
   g_graphicsConfig.debugIdBuffer = enabled;
   return true;
 }
@@ -655,9 +715,10 @@ bool set_gbuffer(bool enabled) {
   // The render worker resolves these globals, so it must be idle before the swap
   gfx::gpu_synchronize();
   if (enabled) {
-    create_gbuffer_targets(g_frameBuffer.size.width, g_frameBuffer.size.height);
+    const wgpu::Extent3D scene = scene_extent();
+    create_gbuffer_targets(scene.width, scene.height);
     if (!g_normalBuffer.texture) {
-      g_normalBuffer = create_normal_texture(g_frameBuffer.size.width, g_frameBuffer.size.height);
+      g_normalBuffer = create_normal_texture(scene.width, scene.height);
     }
   } else {
     g_motionBuffer = {};
@@ -1317,6 +1378,9 @@ void shutdown() {
   g_frameBuffer = {};
   g_frameBufferResolved = {};
   g_depthBuffer = {};
+  g_sceneColor = {};
+  g_sceneDepth = {};
+  g_sceneRequest = {0, 0, 1};
   g_normalBuffer = {};
   g_graphicsConfig.normalBuffer = false;
   g_debugIdBuffer = {};
@@ -1364,15 +1428,8 @@ static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t 
   g_frameBuffer = create_render_texture(width, height, true);
   g_frameBufferResolved = create_render_texture(width, height, false);
   g_depthBuffer = create_depth_texture(width, height);
-  if (normal_present()) {
-    g_normalBuffer = create_normal_texture(width, height);
-  }
-  if (g_graphicsConfig.gbuffer) {
-    create_gbuffer_targets(width, height);
-  }
-  if (g_graphicsConfig.debugIdBuffer) {
-    g_debugIdBuffer = create_debug_id_texture(width, height);
-  }
+  create_scene_targets();
+  create_scene_size_targets();
   g_CopyBindGroup = create_copy_bind_group(present_source());
 }
 

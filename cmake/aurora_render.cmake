@@ -88,6 +88,10 @@ if (AURORA_ENABLE_RENDER)
         lib/render/post/taa.hpp
         lib/render/post/temporal_resolve.cpp
         lib/render/post/temporal_resolve.hpp
+        lib/render/post/upscale/compose.cpp
+        lib/render/post/upscale/compose.hpp
+        lib/render/post/upscale/upscale.cpp
+        lib/render/post/upscale/upscale.hpp
         lib/render/scene/classifier.cpp
         lib/render/scene/classifier.hpp
         lib/render/scene/classify.cpp

@@ -395,7 +395,8 @@ if (AURORA_ENABLE_GX)
 
     add_executable(render_gpu_tests render_test_device.cpp render_gpu_heap_test.cpp render_graph_pool_test.cpp
       render_graph_bind_test.cpp render_graph_planned.cpp render_graph_api_gpu_test.cpp render_compact_test.cpp
-      render_hzb_test.cpp render_hzb_reference.cpp render_gpu_systems_test.cpp render_taa_test.cpp)
+      render_hzb_test.cpp render_hzb_reference.cpp render_gpu_systems_test.cpp render_taa_test.cpp
+      render_upscale_test.cpp render_upscale_gpu_test.cpp)
     target_include_directories(render_gpu_tests PRIVATE ../include ../lib)
     target_compile_definitions(render_gpu_tests PRIVATE AURORA TARGET_PC=1 AURORA_ENABLE_RENDER=1)
     target_link_libraries(render_gpu_tests PRIVATE aurora::gx aurora::vi absl::flat_hash_map gtest gtest_main)

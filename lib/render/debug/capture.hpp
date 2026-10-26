@@ -23,6 +23,7 @@ inline constexpr uint32_t ArmedLimit = 300;
 inline constexpr uint16_t ChainOrder = 0xFFFF;
 inline constexpr size_t MaxDistinctColors = 64;
 inline constexpr std::string_view Schema = "aurora.render.capture";
+inline constexpr std::string_view SceneComposeAnchor = "scene_compose";
 inline constexpr std::array<std::string_view, MaxRequests> PassNames{
     "debug.capture.0",
     "debug.capture.1",
@@ -113,6 +114,7 @@ void initialize();
 void shutdown() noexcept;
 void on_latch();
 void resolve(const detail::CompiledGraph* graph);
+void after_scene_compose(const wgpu::CommandEncoder& encoder, const wgpu::Texture& texture, uint64_t frame);
 
 namespace testing {
 [[nodiscard]] detail::PassId pass_id(size_t index) noexcept;
