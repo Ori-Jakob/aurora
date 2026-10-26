@@ -59,7 +59,10 @@ fn fs_split(@builtin(position) position: vec4f) -> ComposeOut {
   let texel = clamp(vec2i(floor(scene)), vec2i(0), size - 1);
   let nearest = textureLoad(scene_color, texel, 0);
   var rgb = textureSampleLevel(scene_color, linear_clamp, scene / params.scene_size, 0.0).rgb;
-  if (status.value == 1u) {
+  // Only the native copy test hands over a source at render size, so it is resampled like the scene colour
+  if (status.value == 1u && all(textureDimensions(source_color) == textureDimensions(scene_color))) {
+    rgb = textureSampleLevel(source_color, linear_clamp, scene / params.scene_size, 0.0).rgb;
+  } else if (status.value == 1u) {
     rgb = source_rgb(position.xy);
   }
   var out: ComposeOut;

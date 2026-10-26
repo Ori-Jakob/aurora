@@ -84,6 +84,7 @@ std::array<FramePacket, FrameSlotCount> g_framePackets;
 uint64_t g_nextFrameId = 1;
 // The packet is reset before the submit callback runs, so the submit hooks keep their own reference
 std::shared_ptr<const render::detail::FrameState> g_submitState;
+std::vector<FrameSegment> g_submitSegments;
 render_worker::FrameSlotPool g_frameSlots{FrameSlotCount};
 render_worker::FrameSlotPool g_stagingSlots{StagingBufferCount};
 
@@ -990,6 +991,7 @@ void end_frame(EndFrameCallback callback) {
       }
     }
     auto encoder = std::move(packet.encoder);
+    g_submitSegments = std::move(packet.segments);
     const auto stats = packet.stats;
     auto afterSubmitCallbacks = std::move(packet.afterSubmitCallbacks);
     g_submitState = std::move(packet.renderState);
@@ -1004,6 +1006,7 @@ void end_frame(EndFrameCallback callback) {
     if (callback) {
       callback(encoder, std::move(afterSubmitCallbacks));
     }
+    g_submitSegments.clear();
     g_submitState.reset();
     g_frameSlots.release(frameSlot);
     expire_cached_bind_groups();
@@ -1016,9 +1019,15 @@ uint32_t current_frame() noexcept { return g_frameIndex; }
 
 void after_submit() noexcept { depth_peek::after_submit(); }
 
-void before_submit() noexcept { render::detail::before_submit(g_submitState.get()); }
+void before_submit() noexcept {
+  render::detail::submit_segments(g_submitSegments);
+  render::detail::before_submit(g_submitState.get());
+}
 
-void after_frame() noexcept { render::detail::after_frame(g_submitState.get()); }
+void after_frame() noexcept {
+  render::detail::after_frame(g_submitState.get());
+  render::detail::end_segments(g_submitSegments);
+}
 
 void gpu_synchronize() { render_worker::synchronize(); }
 

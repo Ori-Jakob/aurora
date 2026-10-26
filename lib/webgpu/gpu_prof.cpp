@@ -57,9 +57,15 @@ enum class SlotState : uint8_t {
   Failed,
 };
 
+struct External {
+  const char* name;
+  uint64_t ns;
+};
+
 struct Slot {
   wgpu::Buffer readback;
   std::vector<Event> events;
+  std::vector<External> externals;
   uint32_t passCount = 0;
   uint64_t sequence = 0;
   uint32_t dropped = 0;
@@ -89,6 +95,7 @@ size_t g_emitSlot = 0;
 bool g_frameActive = false;
 bool g_framePending = false;
 uint32_t g_zoneCount = 0;
+uint32_t g_openZones = 0;
 
 std::mutex g_latestMutex;
 FrameTimes g_latest;
@@ -217,6 +224,9 @@ void publish(const Slot& slot) {
   }
   const TimestampBounds bounds = frame_bounds(slot, ts);
   detail::aggregate(slot.events, {ts, QueryCount}, bounds.begin, bounds.end, g_scratch);
+  for (const External& external : slot.externals) {
+    g_scratch.passes.push_back({external.name, static_cast<float>(static_cast<double>(external.ns) * 1e-6)});
+  }
   g_scratch.sequence = slot.sequence;
   g_scratch.dropped = slot.dropped;
   std::lock_guard lock{g_latestMutex};
@@ -462,6 +472,7 @@ void shutdown() {
   for (auto& slot : g_slots) {
     slot.readback = {};
     slot.events.clear();
+    slot.externals.clear();
     slot.passCount = 0;
     slot.sequence = 0;
     slot.dropped = 0;
@@ -496,6 +507,7 @@ void frame_begin(const wgpu::CommandEncoder& encoder) {
   }
   slot.state = SlotState::Recording;
   slot.events.clear();
+  slot.externals.clear();
   slot.passCount = 0;
   slot.sequence = sequence;
   slot.dropped = 0;
@@ -571,6 +583,23 @@ const wgpu::PassTimestampWrites* pass_writes(std::string_view name) {
   return &out;
 }
 
+void report_external(std::string_view name, uint64_t ns) {
+  if (!g_frameActive && !g_framePending) {
+    return;
+  }
+  auto& slot = record_slot();
+  const char* interned = intern_name(name);
+  // Several finished native frames can arrive at once, and only the newest one describes the current cost
+  const auto it = std::ranges::find(slot.externals, interned, &External::name);
+  if (it != slot.externals.end()) {
+    it->ns = ns;
+  } else {
+    slot.externals.push_back({interned, ns});
+  }
+}
+
+bool zone_open() noexcept { return g_openZones != 0; }
+
 bool supported() noexcept { return g_supported; }
 
 void request(uint32_t frames) noexcept {
@@ -623,12 +652,14 @@ Zone::Zone(const wgpu::CommandEncoder& encoder, std::string_view name) {
   encoder.WriteTimestamp(g_querySet, index * 2);
   m_encoder = &encoder;
   m_endQuery = index * 2 + 1;
+  ++g_openZones;
 }
 
 Zone::~Zone() {
   if (m_encoder == nullptr) {
     return;
   }
+  --g_openZones;
   record_slot().events.push_back({nullptr, m_endQuery, EventKind::End});
   m_encoder->WriteTimestamp(g_querySet, m_endQuery);
 }

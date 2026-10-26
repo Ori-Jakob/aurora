@@ -46,6 +46,10 @@ bool prepare_pipelines(ComposeMode mode, wgpu::TextureFormat colorFormat, wgpu::
 void prepare(SceneComposeData& data);
 void encode(wgpu::CommandEncoder& cmd, const SceneComposeData& data);
 void publish_source(const Source& source) noexcept;
+void request_native_step(const gfx::detail::NativeStep& step, const Source& out) noexcept;
+bool take_native_step(gfx::detail::NativeStep& step) noexcept;
+void write_native_status(bool ok) noexcept;
+void drop_native_step() noexcept;
 void shutdown() noexcept;
 
 namespace testing {
@@ -53,6 +57,9 @@ struct Counters {
   uint32_t encoded = 0;
   uint32_t sourced = 0;
   uint32_t skipped = 0;
+  uint32_t native = 0;
+  uint32_t statusWrites = 0;
+  uint32_t lastStatus = 0;
 };
 Counters counters() noexcept;
 void reset() noexcept;

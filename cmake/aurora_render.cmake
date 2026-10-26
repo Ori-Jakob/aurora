@@ -89,6 +89,8 @@ if (AURORA_ENABLE_RENDER)
         target_sources(aurora_gx PRIVATE
             lib/render/native/d3d12/device.cpp
             lib/render/native/d3d12/device.hpp
+            lib/render/native/d3d12/native_step.cpp
+            lib/render/native/d3d12/native_step.hpp
             lib/render/native/d3d12/sentinel.cpp
             lib/render/native/d3d12/sentinel.hpp
             lib/render/native/d3d12/shared_texture.cpp

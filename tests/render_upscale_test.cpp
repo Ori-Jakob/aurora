@@ -3,6 +3,7 @@
 #include "render_fsr_rig.hpp"
 #include "render_test_device.hpp"
 
+#include "gfx/encoding.hpp"
 #include "gfx/frame_packet.hpp"
 #include "gfx/pipeline_cache.hpp"
 #include "gfx/recording.hpp"
@@ -31,6 +32,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace aurora::render::detail {
@@ -890,6 +892,203 @@ TEST_F(FsrGraph, EncodesValidationClean) {
     EXPECT_EQ(fsr_pass::testing::counters().skipped, 0u);
     EXPECT_EQ(fsr_pass::testing::last_frame().params.reactiveMax, fsr_pass::ReactiveMax);
   }
+}
+
+class FrameSegments : public UpscaleTest {
+protected:
+  struct Stub {
+    std::vector<std::string_view> calls;
+    bool inputsOk = true;
+    bool runOk = true;
+    std::optional<bool> outputOk;
+  };
+
+  struct Submitted {
+    bool cut = false;
+    size_t segments = 0;
+  };
+
+  static Stub& stub(void* user) { return *static_cast<Stub*>(user); }
+
+  static bool stub_begin_inputs(void* user) noexcept {
+    stub(user).calls.emplace_back("begin_inputs");
+    return stub(user).inputsOk;
+  }
+
+  static bool stub_run(void* user) noexcept {
+    stub(user).calls.emplace_back("run");
+    return stub(user).runOk;
+  }
+
+  static void stub_begin_output(void* user, bool ok) noexcept {
+    stub(user).calls.emplace_back("begin_output");
+    stub(user).outputOk = ok;
+  }
+
+  static void stub_end_output(void* user) noexcept { stub(user).calls.emplace_back("end_output"); }
+
+  gfx::detail::NativeStep stub_step() {
+    return {
+        .begin_inputs = &stub_begin_inputs,
+        .run = &stub_run,
+        .begin_output = &stub_begin_output,
+        .end_output = &stub_end_output,
+        .user = &m_stub,
+        .name = "stub",
+    };
+  }
+
+  upscale::compose::Source out_source() {
+    if (!m_out) {
+      const wgpu::TextureDescriptor descriptor{
+          .label = "Test native out",
+          .usage = wgpu::TextureUsage::TextureBinding,
+          .size = {OutputWidth, OutputHeight, 1},
+          .format = wgpu::TextureFormat::RGBA8Unorm,
+      };
+      m_out = m_device->device.CreateTexture(&descriptor);
+    }
+    return {.view = m_out.CreateView(), .format = wgpu::TextureFormat::RGBA8Unorm};
+  }
+
+  // Without its staging high water the op copies nothing from the staging buffer these tests never map
+  gfx::detail::FrameOp compose_op() {
+    upscale::testing::set_split_env(2.f);
+    start_frame();
+    gfx::record_stage(Stage::PrePost);
+    end_frame();
+    const auto it = std::ranges::find(m_frame.ops, FrameOpType::SceneCompose, &gfx::detail::FrameOp::type);
+    EXPECT_NE(it, m_frame.ops.end());
+    gfx::detail::FrameOp op = it != m_frame.ops.end() ? *it : gfx::detail::FrameOp{};
+    op.highWater = {};
+    op.textureUploads.clear();
+    return op;
+  }
+
+  Submitted run_frame(const gfx::detail::FrameOp& op, bool residentCopy = false) {
+    m_frame.encoder = m_device->device.CreateCommandEncoder();
+    const WGPUCommandEncoder first = m_frame.encoder.Get();
+    gfx::detail::encode_op(m_frame.encoder, m_frame, op);
+    const Submitted out{.cut = m_frame.encoder.Get() != first, .segments = m_frame.segments.size()};
+    if (residentCopy) {
+      if (!m_buffers[0]) {
+        for (auto& buffer : m_buffers) {
+          const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                                  .size = 64};
+          buffer = m_device->device.CreateBuffer(&descriptor);
+        }
+      }
+      m_frame.encoder.CopyBufferToBuffer(m_buffers[0], 0, m_buffers[1], 0, 64);
+    }
+    std::vector<gfx::detail::FrameSegment> segments = std::move(m_frame.segments);
+    m_frame.segments.clear();
+    const wgpu::CommandBuffer last = m_frame.encoder.Finish();
+    m_frame.encoder = nullptr;
+    submit_segments(segments);
+    for (const auto& segment : segments) {
+      EXPECT_FALSE(segment.buffer);
+    }
+    m_device->queue.Submit(1, &last);
+    end_segments(segments);
+    EXPECT_TRUE(segments.empty());
+    return out;
+  }
+
+  Stub m_stub;
+  wgpu::Texture m_out;
+  std::array<wgpu::Buffer, 2> m_buffers;
+};
+
+TEST_F(FrameSegments, NoStepKeepsSingleSubmit) {
+  const gfx::detail::FrameOp op = compose_op();
+  const uint64_t segmented = testing::segmented_frames();
+  const Submitted submitted = run_frame(op);
+  EXPECT_FALSE(submitted.cut);
+  EXPECT_EQ(submitted.segments, 0u);
+  EXPECT_EQ(testing::segmented_frames(), segmented);
+  EXPECT_EQ(upscale::compose::testing::counters().encoded, 1u);
+  EXPECT_EQ(upscale::compose::testing::counters().statusWrites, 0u);
+}
+
+TEST_F(FrameSegments, StepSplitsAtSceneCompose) {
+  const gfx::detail::FrameOp op = compose_op();
+  const uint64_t segmented = testing::segmented_frames();
+  upscale::compose::request_native_step(stub_step(), out_source());
+  const Submitted submitted = run_frame(op);
+  EXPECT_TRUE(submitted.cut);
+  EXPECT_EQ(submitted.segments, 1u);
+  EXPECT_EQ(testing::segmented_frames(), segmented + 1);
+  EXPECT_EQ(m_stub.calls, (std::vector<std::string_view>{"begin_inputs", "run", "begin_output", "end_output"}));
+  EXPECT_EQ(m_stub.outputOk, true);
+  const auto counters = upscale::compose::testing::counters();
+  EXPECT_EQ(counters.encoded, 1u);
+  EXPECT_EQ(counters.native, 1u);
+  EXPECT_EQ(counters.statusWrites, 1u);
+  EXPECT_EQ(counters.lastStatus, 1u);
+}
+
+TEST_F(FrameSegments, InplaceComposeAlsoCuts) {
+  gfx::detail::FrameOp op = compose_op();
+  ASSERT_NE(op.sceneCompose, nullptr);
+  SceneComposeData data = *op.sceneCompose;
+  data.mode = ComposeMode::InPlace;
+  op.sceneCompose = &data;
+  ASSERT_TRUE(upscale::compose::prepare_pipelines(ComposeMode::InPlace, webgpu::g_frameBuffer.format,
+                                                  webgpu::g_graphicsConfig.depthFormat));
+  upscale::compose::request_native_step(stub_step(), out_source());
+  const Submitted submitted = run_frame(op);
+  EXPECT_TRUE(submitted.cut);
+  EXPECT_EQ(submitted.segments, 1u);
+  EXPECT_EQ(m_stub.calls.size(), 4u);
+  EXPECT_EQ(upscale::compose::testing::counters().native, 1u);
+  EXPECT_EQ(upscale::compose::testing::counters().skipped, 0u);
+}
+
+TEST_F(FrameSegments, ResidentCopiesStayInLastSegment) {
+  const gfx::detail::FrameOp op = compose_op();
+  upscale::compose::request_native_step(stub_step(), out_source());
+  m_device->device.PushErrorScope(wgpu::ErrorFilter::Validation);
+  const Submitted submitted = run_frame(op, true);
+  EXPECT_EQ(test::pop_validation_error(*m_device), std::nullopt);
+  EXPECT_TRUE(submitted.cut);
+  EXPECT_EQ(submitted.segments, 1u);
+}
+
+TEST_F(FrameSegments, FailedStepWritesStatusZero) {
+  const gfx::detail::FrameOp op = compose_op();
+  m_stub.runOk = false;
+  upscale::compose::request_native_step(stub_step(), out_source());
+  run_frame(op);
+  EXPECT_EQ(m_stub.calls, (std::vector<std::string_view>{"begin_inputs", "run", "begin_output", "end_output"}));
+  EXPECT_EQ(m_stub.outputOk, false);
+  EXPECT_EQ(upscale::compose::testing::counters().statusWrites, 1u);
+  EXPECT_EQ(upscale::compose::testing::counters().lastStatus, 0u);
+
+  // A failed BeginAccess still runs the step, so it can end the accesses that did begin
+  m_stub = Stub{.inputsOk = false};
+  upscale::compose::request_native_step(stub_step(), out_source());
+  run_frame(op);
+  EXPECT_EQ(m_stub.calls, (std::vector<std::string_view>{"begin_inputs", "run", "begin_output", "end_output"}));
+  EXPECT_EQ(m_stub.outputOk, false);
+  EXPECT_EQ(upscale::compose::testing::counters().statusWrites, 2u);
+  EXPECT_EQ(upscale::compose::testing::counters().lastStatus, 0u);
+}
+
+TEST_F(FrameSegments, NoStepBindsNoSharedTexture) {
+  const gfx::detail::FrameOp op = compose_op();
+  run_frame(op);
+  EXPECT_EQ(upscale::compose::testing::counters().native, 0u);
+
+  upscale::compose::request_native_step(stub_step(), out_source());
+  std::vector<gfx::detail::FrameSegment> none;
+  submit_segments(none);
+  const Submitted submitted = run_frame(op);
+  EXPECT_FALSE(submitted.cut);
+  EXPECT_TRUE(m_stub.calls.empty());
+  const auto counters = upscale::compose::testing::counters();
+  EXPECT_EQ(counters.encoded, 2u);
+  EXPECT_EQ(counters.native, 0u);
+  EXPECT_EQ(counters.statusWrites, 0u);
 }
 } // namespace
 } // namespace aurora::render::detail

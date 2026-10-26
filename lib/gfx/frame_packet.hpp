@@ -14,6 +14,7 @@
 #include <deque>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace aurora::gfx::detail {
@@ -265,6 +266,21 @@ inline bool op_has_payload(const FrameOp& op) noexcept {
 
 using RenderPassList = std::deque<RenderPass>;
 
+struct NativeStep {
+  bool (*begin_inputs)(void* user) noexcept = nullptr;
+  bool (*run)(void* user) noexcept = nullptr;
+  void (*begin_output)(void* user, bool ok) noexcept = nullptr;
+  void (*end_output)(void* user) noexcept = nullptr;
+  void* user = nullptr;
+  std::string_view name;
+};
+
+struct FrameSegment {
+  wgpu::CommandBuffer buffer;
+  NativeStep step;
+  bool outputBegun = false;
+};
+
 struct ResidentCopy {
   uint32_t src;
   uint32_t dst;
@@ -290,6 +306,7 @@ struct FramePacket {
   ByteBuffer storage;
   ByteBuffer textureUpload;
   wgpu::CommandEncoder encoder;
+  std::vector<FrameSegment> segments;
   std::vector<AfterSubmitCallback> afterSubmitCallbacks;
   std::vector<ResidentCopy> residentCopies;
   std::shared_ptr<const render::detail::FrameState> renderState;

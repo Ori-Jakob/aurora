@@ -24,12 +24,18 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #if AURORA_ENABLE_NATIVE_D3D12
+#include "gfx/encoding.hpp"
+#include "gfx/frame_packet.hpp"
 #include "render/native/d3d12/device.hpp"
+#include "render/native/d3d12/native_step.hpp"
 #include "render/native/d3d12/shared_texture.hpp"
 #include "render/native/d3d12/teardown.hpp"
+#include "render/stage.hpp"
+#include "webgpu/gpu_prof.hpp"
 
 #include <wrl/client.h>
 
@@ -1866,6 +1872,211 @@ TEST_F(NativeFence, WaitCpuBlocksUntilSignal) {
   EXPECT_TRUE(done);
   EXPECT_TRUE(ok);
   EXPECT_GE(fence->completed(), value);
+}
+
+class NativeStepGpu : public NativeInteropGpu {
+protected:
+  static constexpr uint32_t SceneWidth = SharedWidth / 2;
+  static constexpr uint32_t SceneHeight = SharedHeight / 2;
+#ifdef TRACY_ENABLE
+  static constexpr bool TracyCollects = true;
+#else
+  static constexpr bool TracyCollects = false;
+#endif
+
+  struct Evaluator {
+    native::d3d12::SharedTexture* in = nullptr;
+    native::d3d12::SharedTexture* out = nullptr;
+    bool fails = false;
+    uint32_t failures = 0;
+  };
+
+  static bool record_copy(void* user, ID3D12GraphicsCommandList* list) noexcept {
+    const auto& evaluator = *static_cast<const Evaluator*>(user);
+    if (evaluator.fails) {
+      return false;
+    }
+    const auto destination = texture_location(evaluator.out->resource());
+    const auto source = texture_location(evaluator.in->resource());
+    list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    return true;
+  }
+
+  static void record_failure(void* user) noexcept { ++static_cast<Evaluator*>(user)->failures; }
+
+  void SetUp() override {
+    NativeInteropGpu::SetUp();
+    if (!m_started) {
+      return;
+    }
+    jobs::initialize(1);
+    shaders::initialize();
+    gfx::set_blocking_pipelines(true);
+    compose::testing::reset();
+    m_composeStarted = true;
+    const wgpu::TextureDescriptor depth{
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+        .size = {SharedWidth, SharedHeight, 1},
+        .format = DepthFormat,
+    };
+    webgpu::g_depthBuffer.texture = m_device->device.CreateTexture(&depth);
+    webgpu::g_depthBuffer.view = webgpu::g_depthBuffer.texture.CreateView();
+    webgpu::g_depthBuffer.size = depth.size;
+    webgpu::g_depthBuffer.format = DepthFormat;
+    webgpu::set_scene_render_size(SceneWidth, SceneHeight);
+    ASSERT_EQ(webgpu::scene_color().size.width, SceneWidth);
+    ASSERT_TRUE(compose::prepare_pipelines(ComposeMode::Split, ColorFormat, DepthFormat));
+    const compose::Params params = compose::make_params(m_data, {SceneWidth, SceneHeight}, {SharedWidth, SharedHeight});
+    m_device->queue.WriteBuffer(gfx::detail::resources().uniformBuffer, m_data.uniformOffset, &params, sizeof(params));
+    m_in = native::d3d12::SharedTexture::create(
+        {.format = ColorFormat, .width = SceneWidth, .height = SceneHeight, .label = "test.step_in"});
+    m_out = native::d3d12::SharedTexture::create(
+        {.format = ColorFormat, .width = SceneWidth, .height = SceneHeight, .label = "test.step_out"});
+    ASSERT_TRUE(m_in && m_out);
+    m_evaluator = {.in = m_in.get(), .out = m_out.get()};
+    m_runner = native::d3d12::StepRunner::create({
+        .name = "test",
+        .inputState = D3D12_RESOURCE_STATE_COPY_SOURCE,
+        .outputState = D3D12_RESOURCE_STATE_COPY_DEST,
+        .record = &record_copy,
+        .failed = &record_failure,
+        .user = &m_evaluator,
+    });
+    ASSERT_TRUE(m_runner);
+  }
+
+  void TearDown() override {
+    m_runner.reset();
+    m_in.reset();
+    m_out.reset();
+    if (m_timed) {
+      EXPECT_TRUE(webgpu::gpu_prof::wait_idle(5'000'000'000));
+      webgpu::gpu_prof::shutdown();
+      webgpu::gpu_prof::set_always(TracyCollects);
+    }
+    if (m_composeStarted) {
+      compose::shutdown();
+      compose::testing::reset();
+      webgpu::set_scene_render_size(0, 0);
+      shaders::shutdown();
+      jobs::shutdown();
+      gfx::set_blocking_pipelines(false);
+    }
+    NativeInteropGpu::TearDown();
+  }
+
+  void write_scene(uint32_t seed) const {
+    std::vector<uint32_t> words(size_t{SceneWidth} * SceneHeight);
+    for (uint32_t y = 0; y < SceneHeight; ++y) {
+      for (uint32_t x = 0; x < SceneWidth; ++x) {
+        words[size_t{y} * SceneWidth + x] = mix_bits(x + seed * 977u, y + seed * 131u) | 0xFF000000u;
+      }
+    }
+    const wgpu::TexelCopyTextureInfo destination{.texture = webgpu::scene_color().texture};
+    const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = SceneWidth * 4, .rowsPerImage = SceneHeight};
+    const wgpu::Extent3D extent{SceneWidth, SceneHeight, 1};
+    m_device->queue.WriteTexture(&destination, words.data(), words.size() * sizeof(uint32_t), &layout, &extent);
+  }
+
+  // One frame as the worker and the submit callback run it, where the native node's input copy ends segment A
+  void run_frame(bool native) {
+    wgpu::CommandEncoder cmd = m_device->device.CreateCommandEncoder();
+    if (m_timed) {
+      webgpu::gpu_prof::frame_begin(cmd);
+    }
+    if (native) {
+      const std::array inputs{m_in.get()};
+      compose::request_native_step(m_runner->step(inputs, m_out.get()),
+                                   {.view = m_out->view(), .format = m_out->format()});
+      const wgpu::TexelCopyTextureInfo source{.texture = webgpu::scene_color().texture};
+      const wgpu::TexelCopyTextureInfo destination{.texture = m_in->texture()};
+      const wgpu::Extent3D extent{SceneWidth, SceneHeight, 1};
+      cmd.CopyTextureToTexture(&source, &destination, &extent);
+    }
+    gfx::detail::FramePacket frame;
+    const gfx::detail::FrameOp op{.type = gfx::detail::FrameOpType::SceneCompose, .sceneCompose = &m_data};
+    gfx::detail::encode_op(cmd, frame, op);
+    EXPECT_EQ(frame.segments.size(), native ? 1u : 0u);
+    if (m_timed) {
+      webgpu::gpu_prof::frame_end(cmd);
+    }
+    const wgpu::CommandBuffer last = cmd.Finish();
+    submit_segments(frame.segments);
+    m_device->queue.Submit(1, &last);
+    if (m_timed) {
+      webgpu::gpu_prof::after_submit();
+    }
+    end_segments(frame.segments);
+  }
+
+  [[nodiscard]] std::vector<uint32_t> read_output() const { return map_dawn(copy_dawn(webgpu::g_frameBuffer.texture)); }
+
+  SceneComposeData m_data{
+      .mode = ComposeMode::Split,
+      .ratio = {static_cast<float>(SharedWidth) / SceneWidth, static_cast<float>(SharedHeight) / SceneHeight},
+  };
+  std::unique_ptr<native::d3d12::SharedTexture> m_in;
+  std::unique_ptr<native::d3d12::SharedTexture> m_out;
+  std::unique_ptr<native::d3d12::StepRunner> m_runner;
+  Evaluator m_evaluator;
+  bool m_composeStarted = false;
+  bool m_timed = false;
+};
+
+TEST_F(NativeStepGpu, CopyStepOrdersSegments) {
+  for (uint32_t frame = 0; frame < 3; ++frame) {
+    SCOPED_TRACE(frame);
+    write_scene(frame + 5);
+    run_frame(false);
+    const std::vector<uint32_t> bilinear = read_output();
+    ASSERT_EQ(bilinear.size(), size_t{SharedWidth} * SharedHeight);
+    run_frame(true);
+    EXPECT_EQ(read_output(), bilinear);
+  }
+  EXPECT_FALSE(m_runner->failed());
+  EXPECT_EQ(m_evaluator.failures, 0u);
+  const auto counters = compose::testing::counters();
+  EXPECT_EQ(counters.native, 3u);
+  EXPECT_EQ(counters.statusWrites, 3u);
+  EXPECT_EQ(counters.lastStatus, 1u);
+}
+
+TEST_F(NativeStepGpu, FailingStepComposesBilinear) {
+  m_evaluator.fails = true;
+  for (uint32_t frame = 0; frame < 2; ++frame) {
+    SCOPED_TRACE(frame);
+    write_scene(frame + 11);
+    run_frame(false);
+    const std::vector<uint32_t> bilinear = read_output();
+    run_frame(true);
+    EXPECT_EQ(read_output(), bilinear);
+    EXPECT_EQ(compose::testing::counters().lastStatus, 0u);
+  }
+  EXPECT_TRUE(m_runner->failed());
+  EXPECT_EQ(m_evaluator.failures, 1u);
+}
+
+TEST_F(NativeStepGpu, TimestampsReported) {
+  webgpu::gpu_prof::shutdown();
+  webgpu::gpu_prof::set_always(true);
+  webgpu::gpu_prof::initialize();
+  m_timed = true;
+  if (!webgpu::gpu_prof::supported()) {
+    GTEST_SKIP() << "the device has no timestamp queries";
+  }
+  for (uint32_t frame = 0; frame < 3; ++frame) {
+    write_scene(frame);
+    run_frame(true);
+    ASSERT_TRUE(webgpu::gpu_prof::wait_idle(5'000'000'000));
+  }
+  webgpu::gpu_prof::FrameTimes times;
+  ASSERT_TRUE(webgpu::gpu_prof::latest(times));
+  const auto native = std::ranges::find_if(times.passes, [](const webgpu::gpu_prof::PassTime& pass) {
+    return pass.name != nullptr && std::string_view{pass.name} == "native.test";
+  });
+  ASSERT_NE(native, times.passes.end());
+  EXPECT_GT(native->ms, 0.f);
+  EXPECT_LT(native->ms, 100.f);
 }
 #endif
 } // namespace

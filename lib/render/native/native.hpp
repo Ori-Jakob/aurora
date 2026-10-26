@@ -13,4 +13,5 @@ bool initialize_device(const wgpu::Device& device, const wgpu::Adapter& adapter)
 void initialize() noexcept;
 void assert_worker() noexcept;
 void reenable_upscalers() noexcept;
+void encode_test_step(wgpu::CommandEncoder& cmd) noexcept;
 } // namespace aurora::render::detail::native

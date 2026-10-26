@@ -4,13 +4,16 @@
 #include "graph.hpp"
 #include "graph_bind.hpp"
 #include "graph_pool.hpp"
+#include "../gfx/frame_packet.hpp"
 #include "../internal.hpp"
 #include "../logging.hpp"
+#include "../webgpu/gpu.hpp"
 
 #if AURORA_ENABLE_RENDER
 #include "debug/debug.hpp"
 #include "hints.hpp"
 #include "history_reset.hpp"
+#include "native/native.hpp"
 #include "shaders.hpp"
 #include "post/upscale/compose.hpp"
 #include "post/upscale/upscale.hpp"
@@ -20,6 +23,7 @@
 #include <aurora/gfx.h>
 
 #include <array>
+#include <atomic>
 #include <utility>
 #include <vector>
 
@@ -33,6 +37,7 @@ std::array<bool, StageCount> g_warnedMissingMarker{};
 #if AURORA_ENABLE_RENDER
 std::vector<FrameCullReason> g_cullReasons;
 #endif
+std::atomic_uint64_t g_segmentedFrames{0};
 
 const CompiledGraph* stage_graph(const StageData& stage) noexcept {
   return stage.frame != nullptr ? stage.frame->graph.get() : nullptr;
@@ -207,6 +212,48 @@ void scene_compose([[maybe_unused]] wgpu::CommandEncoder& cmd, [[maybe_unused]] 
 #endif
 }
 
+bool take_native_step([[maybe_unused]] wgpu::CommandEncoder& cmd, [[maybe_unused]] const SceneComposeData& data,
+                      [[maybe_unused]] gfx::detail::NativeStep& step) noexcept {
+#if AURORA_ENABLE_RENDER
+  if (data.mode == ComposeMode::Split) {
+    native::encode_test_step(cmd);
+  }
+  return upscale::compose::take_native_step(step);
+#else
+  return false;
+#endif
+}
+
+void submit_segments(std::vector<gfx::detail::FrameSegment>& segments) noexcept {
+  for (gfx::detail::FrameSegment& segment : segments) {
+    const gfx::detail::NativeStep& step = segment.step;
+    const bool inputs = step.begin_inputs(step.user);
+    webgpu::g_queue.Submit(1, &segment.buffer);
+    segment.buffer = nullptr;
+    const bool ok = step.run(step.user) && inputs;
+#if AURORA_ENABLE_RENDER
+    upscale::compose::write_native_status(ok);
+#endif
+    step.begin_output(step.user, ok);
+    segment.outputBegun = true;
+    if (g_segmentedFrames.fetch_add(1, std::memory_order_relaxed) == 0) {
+      Log.info("Native step {}: frames with it are submitted in two segments", step.name);
+    }
+  }
+#if AURORA_ENABLE_RENDER
+  upscale::compose::drop_native_step();
+#endif
+}
+
+void end_segments(std::vector<gfx::detail::FrameSegment>& segments) noexcept {
+  for (gfx::detail::FrameSegment& segment : segments) {
+    if (segment.outputBegun) {
+      segment.step.end_output(segment.step.user);
+    }
+  }
+  segments.clear();
+}
+
 bool pass_pipelines_ready(const CompiledNode& node) noexcept {
   if (node.pipelines != nullptr && node.pipelineIds[0] == 0) {
     return false;
@@ -227,6 +274,8 @@ void reset_frame_cull() noexcept {
 
 namespace testing {
 void reset_missing_marker_warnings() noexcept { g_warnedMissingMarker = {}; }
+
+uint64_t segmented_frames() noexcept { return g_segmentedFrames.load(std::memory_order_relaxed); }
 } // namespace testing
 
 void invalidate_frame_histories() noexcept {

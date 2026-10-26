@@ -1,6 +1,7 @@
 #include "native.hpp"
 
 #include "d3d12/device.hpp"
+#include "d3d12/native_step.hpp"
 #include "d3d12/sentinel.hpp"
 #include "d3d12/teardown.hpp"
 
@@ -40,5 +41,7 @@ void assert_worker() noexcept {
 }
 
 void reenable_upscalers() noexcept { d3d12::sentinel::clear(); }
+
+void encode_test_step(wgpu::CommandEncoder& cmd) noexcept { d3d12::test_step::encode(cmd); }
 } // namespace native
 } // namespace aurora::render::detail

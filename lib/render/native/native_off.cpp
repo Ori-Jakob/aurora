@@ -16,4 +16,6 @@ void initialize() noexcept {}
 void assert_worker() noexcept {}
 
 void reenable_upscalers() noexcept {}
+
+void encode_test_step(wgpu::CommandEncoder&) noexcept {}
 } // namespace aurora::render::detail::native

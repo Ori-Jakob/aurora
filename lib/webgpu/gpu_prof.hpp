@@ -47,6 +47,8 @@ void frame_begin(const wgpu::CommandEncoder& encoder);
 void frame_end(const wgpu::CommandEncoder& encoder);
 void after_submit();
 const wgpu::PassTimestampWrites* pass_writes(std::string_view name);
+void report_external(std::string_view name, uint64_t ns);
+bool zone_open() noexcept;
 
 bool supported() noexcept;
 void request(uint32_t frames) noexcept;

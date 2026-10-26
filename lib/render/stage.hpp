@@ -5,6 +5,13 @@
 #include <aurora/render_graph.hpp>
 #include <webgpu/webgpu_cpp.h>
 
+#include <vector>
+
+namespace aurora::gfx::detail {
+struct NativeStep;
+struct FrameSegment;
+} // namespace aurora::gfx::detail
+
 namespace aurora::render::detail {
 struct CompiledNode;
 
@@ -33,8 +40,12 @@ bool pass_pipelines_ready(const CompiledNode& node) noexcept;
 bool scene_compose_wanted() noexcept;
 void prepare_scene_compose(SceneComposeData& data);
 void scene_compose(wgpu::CommandEncoder& cmd, const SceneComposeData& data);
+bool take_native_step(wgpu::CommandEncoder& cmd, const SceneComposeData& data, gfx::detail::NativeStep& step) noexcept;
+void submit_segments(std::vector<gfx::detail::FrameSegment>& segments) noexcept;
+void end_segments(std::vector<gfx::detail::FrameSegment>& segments) noexcept;
 
 namespace testing {
 void reset_missing_marker_warnings() noexcept;
+uint64_t segmented_frames() noexcept;
 } // namespace testing
 } // namespace aurora::render::detail

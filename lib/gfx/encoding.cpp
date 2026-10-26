@@ -570,6 +570,14 @@ void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op)
     break;
   case FrameOpType::SceneCompose:
     if (op.sceneCompose != nullptr) {
+      if (NativeStep step; ::aurora::render::detail::take_native_step(cmd, *op.sceneCompose, step)) {
+        CHECK(!webgpu::gpu_prof::zone_open(), "Frame encoder cut while a GPU profiler zone is open");
+        // The frame encoder is cut between ops, where no pass or zone is open
+        constexpr wgpu::CommandBufferDescriptor SegmentDescriptor{.label = "Redraw segment"};
+        frame.segments.push_back({.buffer = cmd.Finish(&SegmentDescriptor), .step = step});
+        constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "Redraw encoder"};
+        cmd = g_device.CreateCommandEncoder(&EncoderDescriptor);
+      }
       ::aurora::render::detail::scene_compose(cmd, *op.sceneCompose);
     }
     break;

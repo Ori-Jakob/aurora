@@ -4,6 +4,7 @@
 #include "../../hints.hpp"
 #include "../../debug/capture.hpp"
 
+#include "../../../gfx/frame_packet.hpp"
 #include "../../../gfx/recording.hpp"
 #include "../../../gfx/resources.hpp"
 #include "../../../internal.hpp"
@@ -48,6 +49,7 @@ struct Shared {
   wgpu::Sampler sampler;
   wgpu::Buffer statusOff;
   wgpu::Buffer statusOn;
+  wgpu::Buffer statusNative;
   wgpu::Texture dummy;
   wgpu::TextureView dummyView;
 };
@@ -68,15 +70,26 @@ Shared g_shared;
 std::vector<PipelineEntry> g_pipelines;
 std::atomic_bool g_hold{false};
 
+struct RequestedStep {
+  gfx::detail::NativeStep step;
+  Source out;
+};
+
 // Render worker only
 std::optional<Source> g_source;
+std::optional<RequestedStep> g_requested;
+std::optional<Source> g_nativeOut;
 std::vector<GroupEntry> g_groups;
 uint64_t g_encodes = 0;
 bool g_warnedSkip = false;
+bool g_warnedStaleStep = false;
 
 std::atomic_uint32_t g_encoded{0};
 std::atomic_uint32_t g_sourced{0};
 std::atomic_uint32_t g_skipped{0};
+std::atomic_uint32_t g_nativeBound{0};
+std::atomic_uint32_t g_statusWrites{0};
+std::atomic_uint32_t g_lastStatus{0};
 
 inline void bump(std::atomic_uint32_t& counter) noexcept {
   counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
@@ -173,6 +186,12 @@ bool ensure_shared_locked() {
   shared.sampler = device.CreateSampler(&sampler);
   shared.statusOff = status_buffer(device, 0, "upscale.compose status 0");
   shared.statusOn = status_buffer(device, 1, "upscale.compose status 1");
+  const wgpu::BufferDescriptor nativeStatus{
+      .label = "upscale.compose native status",
+      .usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst,
+      .size = 16,
+  };
+  shared.statusNative = device.CreateBuffer(&nativeStatus);
   const wgpu::TextureDescriptor dummy{
       .label = "upscale.compose empty source",
       .usage = wgpu::TextureUsage::TextureBinding,
@@ -248,7 +267,7 @@ wgpu::BindGroup cached_group(const wgpu::Device& device, const wgpu::BindGroupLa
 }
 
 bool encode_targets(wgpu::CommandEncoder& cmd, const SceneComposeData& data, const Targets& targets,
-                    const std::optional<Source>& source) {
+                    const std::optional<Source>& source, bool native) {
   ++g_encodes;
   const bool split = data.mode == ComposeMode::Split;
   const bool sourced = source.has_value() && static_cast<bool>(source->view);
@@ -266,7 +285,8 @@ bool encode_targets(wgpu::CommandEncoder& cmd, const SceneComposeData& data, con
     return false;
   }
   const wgpu::TextureView sourceView = sourced ? source->view : (split ? targets.sceneColor : shared.dummyView);
-  const wgpu::Buffer& status = sourced ? shared.statusOn : shared.statusOff;
+  const bool nativeStatus = native && sourced;
+  const wgpu::Buffer& status = nativeStatus ? shared.statusNative : (sourced ? shared.statusOn : shared.statusOff);
   const wgpu::BindGroup group = cached_group(webgpu::g_device, split ? shared.splitLayout : shared.inplaceLayout, split,
                                              uniforms, targets, sourceView, status, shared.sampler);
   const wgpu::RenderPassColorAttachment color{
@@ -299,6 +319,9 @@ bool encode_targets(wgpu::CommandEncoder& cmd, const SceneComposeData& data, con
   bump(g_encoded);
   if (sourced) {
     bump(g_sourced);
+  }
+  if (nativeStatus) {
+    bump(g_nativeBound);
   }
   return true;
 }
@@ -362,7 +385,8 @@ void prepare(SceneComposeData& data) {
 }
 
 void encode(wgpu::CommandEncoder& cmd, const SceneComposeData& data) {
-  const std::optional<Source> source = std::exchange(g_source, std::nullopt);
+  const std::optional<Source> published = std::exchange(g_source, std::nullopt);
+  const std::optional<Source> native = std::exchange(g_nativeOut, std::nullopt);
   Targets targets;
   if (data.mode == ComposeMode::Split) {
     targets = {
@@ -378,16 +402,62 @@ void encode(wgpu::CommandEncoder& cmd, const SceneComposeData& data) {
     const webgpu::TextureWithSampler& color = webgpu::scene_color();
     targets = {.colorTexture = color.texture, .color = color.view, .colorFormat = color.format};
   }
-  encode_targets(cmd, data, targets, source);
+  encode_targets(cmd, data, targets, native ? native : published, native.has_value());
 }
 
 void publish_source(const Source& source) noexcept { g_source = source; }
 
+void request_native_step(const gfx::detail::NativeStep& step, const Source& out) noexcept {
+  const bool complete = step.begin_inputs != nullptr && step.run != nullptr && step.begin_output != nullptr &&
+                        step.end_output != nullptr && out.view;
+  CHECK(complete, "Native step {} is missing a callback or its output", step.name);
+  if (complete) {
+    g_requested = RequestedStep{.step = step, .out = out};
+  }
+}
+
+bool take_native_step(gfx::detail::NativeStep& step) noexcept {
+  if (!g_requested) {
+    return false;
+  }
+  step = g_requested->step;
+  g_nativeOut = g_requested->out;
+  g_requested.reset();
+  return true;
+}
+
+void write_native_status(bool ok) noexcept {
+  wgpu::Buffer buffer;
+  {
+    std::lock_guard lock{g_mutex};
+    if (!ensure_shared_locked()) {
+      return;
+    }
+    buffer = g_shared.statusNative;
+  }
+  const std::array<uint32_t, 4> words{ok ? 1u : 0u, 0, 0, 0};
+  webgpu::g_queue.WriteBuffer(buffer, 0, words.data(), sizeof(words));
+  bump(g_statusWrites);
+  g_lastStatus.store(words[0], std::memory_order_relaxed);
+}
+
+void drop_native_step() noexcept {
+  g_nativeOut.reset();
+  if (g_requested && !std::exchange(g_warnedStaleStep, true)) {
+    Log.warn("Native step {} was requested on a frame without a scene compose, so it never ran",
+             g_requested->step.name);
+  }
+  g_requested.reset();
+}
+
 void shutdown() noexcept {
   g_source.reset();
+  g_requested.reset();
+  g_nativeOut.reset();
   g_groups.clear();
   g_encodes = 0;
   g_warnedSkip = false;
+  g_warnedStaleStep = false;
   std::lock_guard lock{g_mutex};
   g_pipelines.clear();
   g_shared = {};
@@ -399,6 +469,9 @@ Counters counters() noexcept {
       .encoded = g_encoded.load(std::memory_order_relaxed),
       .sourced = g_sourced.load(std::memory_order_relaxed),
       .skipped = g_skipped.load(std::memory_order_relaxed),
+      .native = g_nativeBound.load(std::memory_order_relaxed),
+      .statusWrites = g_statusWrites.load(std::memory_order_relaxed),
+      .lastStatus = g_lastStatus.load(std::memory_order_relaxed),
   };
 }
 
@@ -406,6 +479,9 @@ void reset() noexcept {
   g_encoded.store(0, std::memory_order_relaxed);
   g_sourced.store(0, std::memory_order_relaxed);
   g_skipped.store(0, std::memory_order_relaxed);
+  g_nativeBound.store(0, std::memory_order_relaxed);
+  g_statusWrites.store(0, std::memory_order_relaxed);
+  g_lastStatus.store(0, std::memory_order_relaxed);
   g_hold.store(false, std::memory_order_relaxed);
 }
 
@@ -431,7 +507,7 @@ shaders::RenderPipelineDesc pipeline_desc(ComposeMode mode, wgpu::TextureFormat 
 
 bool encode(wgpu::CommandEncoder& cmd, const SceneComposeData& data, const Targets& targets,
             const std::optional<Source>& source) {
-  return encode_targets(cmd, data, targets, source);
+  return encode_targets(cmd, data, targets, source, false);
 }
 } // namespace testing
 } // namespace aurora::render::detail::upscale::compose
