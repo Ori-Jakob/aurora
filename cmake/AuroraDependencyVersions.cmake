@@ -21,3 +21,11 @@ _aurora_dependency_version(AURORA_SDL3_VERSION "3.4.10" "SDL3 prebuilt version t
 _aurora_dependency_version(AURORA_SDL3_REF "refs/tags/release-3.4.10" "SDL3 commit ref (https://github.com/libsdl-org/SDL)")
 _aurora_dependency_version(AURORA_NOD_VERSION "v2.0.0-alpha.12" "nod version tag (https://github.com/encounter/nod/releases)"
         "v2.0.0-alpha.10" "v2.0.0-alpha.11") # Previous versions
+_aurora_dependency_version(AURORA_XESS_VERSION "v3.0.2" "Intel XeSS SDK version tag (https://github.com/intel/xess/releases)")
+_aurora_dependency_version(AURORA_XESS_REF "8fe81bdbbaf00b3c1b733fd0d830c333dc84e6f0" "Intel XeSS commit ref (https://github.com/intel/xess)")
+set(AURORA_XESS_FILES
+    "inc/xess/xess.h=98dc435f5aed252d83a161fc1f86223f20c67eb863214fe3b5cb215a3f6e3319"
+    "inc/xess/xess_d3d12.h=a582a60c3e39ee6fd6aa4871e23082cfb5ec510f98a19fc04acf7a7edb2f6b6c"
+    "bin/libxess.dll=251659dd84a3e84de67c886a4186e01f3eca49b00641906fe38bb6b807e5d5b7"
+    "LICENSE.txt=784be42c39a4a4d03cf85d88e15e59d75828fca773ce45b8dbfffbd7eaf208df"
+    "third-party-programs.txt=e8d8899dbfc4de0e8ca25560be9358e03c1405d7c956d20a1838c3c709b9b51c")

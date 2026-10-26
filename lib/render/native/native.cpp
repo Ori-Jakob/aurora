@@ -6,6 +6,10 @@
 #include "d3d12/teardown.hpp"
 #include "d3d12/upscale_bridge.hpp"
 
+#if AURORA_ENABLE_XESS
+#include "d3d12/xess.hpp"
+#endif
+
 #include "../../gfx/render_worker.hpp"
 #include "../../internal.hpp"
 #include "../../io.hpp"
@@ -41,6 +45,9 @@ void initialize() noexcept {
   const std::filesystem::path directory =
       g_config.cachePath != nullptr ? io::fs_path_from_string(g_config.cachePath) : std::filesystem::path{};
   d3d12::sentinel::open(directory);
+#if AURORA_ENABLE_XESS
+  d3d12::upscale_bridge::register_upscaler(d3d12::xess::upscaler());
+#endif
   d3d12::probe::initialize(directory);
 }
 

@@ -120,6 +120,7 @@ constexpr BuiltOptions DefaultBuiltOptions = [] {
   built[static_cast<size_t>(Feature::Taa)] = 1u << 1;
   // FSR is portable; Auto resolves to it until a native option is built
   built[static_cast<size_t>(Feature::Upscaler)] = (1u << 1) | (1u << 4);
+  built[static_cast<size_t>(Feature::Upscaler)] |= 1u << 3;
   return built;
 }();
 

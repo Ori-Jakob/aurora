@@ -4,6 +4,12 @@ include(${CMAKE_CURRENT_LIST_DIR}/../cmake/AuroraCopyRuntimeDLLs.cmake)
 
 set(CMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE PRE_TEST)
 
+find_package(Git QUIET)
+add_test(NAME VendorHeaders.NoneTracked
+  COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/.. -DGIT_EXECUTABLE=${GIT_EXECUTABLE}
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/vendor_headers_check.cmake)
+set_tests_properties(VendorHeaders.NoneTracked PROPERTIES SKIP_REGULAR_EXPRESSION "VendorHeaders: skipped")
+
 if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
   add_compile_options(/Zc:__cplusplus)
 endif ()
@@ -399,9 +405,13 @@ if (AURORA_ENABLE_GX)
       render_upscale_test.cpp render_upscale_gpu_test.cpp render_native_test.cpp)
     target_include_directories(render_gpu_tests PRIVATE ../include ../lib)
     target_compile_definitions(render_gpu_tests PRIVATE AURORA TARGET_PC=1 AURORA_ENABLE_RENDER=1
-      AURORA_ENABLE_NATIVE_D3D12=$<BOOL:${AURORA_ENABLE_NATIVE_D3D12}>)
+      AURORA_ENABLE_NATIVE_D3D12=$<BOOL:${AURORA_ENABLE_NATIVE_D3D12}> AURORA_ENABLE_XESS=$<BOOL:${AURORA_ENABLE_XESS}>)
+    if (AURORA_ENABLE_XESS)
+      target_include_directories(render_gpu_tests SYSTEM PRIVATE "${AURORA_XESS_INCLUDE_DIR}")
+    endif ()
     target_link_libraries(render_gpu_tests PRIVATE aurora::gx aurora::vi absl::flat_hash_map gtest gtest_main)
     aurora_copy_runtime_dlls(render_gpu_tests)
+    aurora_copy_xess_runtime(render_gpu_tests)
     gtest_discover_tests(render_gpu_tests PROPERTIES TIMEOUT 120)
   endif ()
 

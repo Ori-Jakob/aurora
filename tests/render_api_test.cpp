@@ -657,16 +657,18 @@ TEST_F(RenderApiTest, UpscalerOptionsNotImplementedUntilBuilt) {
   EXPECT_EQ(feature_info(Feature::Upscaler).optionCount, 4);
   const BuiltOptions& built = detail::default_built_options();
   EXPECT_EQ(built[static_cast<size_t>(Feature::Upscaler)],
-            (1u << level(Upscaler::Fsr)) | (1u << level(Upscaler::Auto)));
+            (1u << level(Upscaler::Fsr)) | (1u << level(Upscaler::Xess)) | (1u << level(Upscaler::Auto)));
   const Caps caps = full_caps();
   const UpscalerProbe probe = stub_probe(Available, Available, true);
-  for (const Upscaler upscaler : {Upscaler::Dlss, Upscaler::Xess}) {
-    EXPECT_EQ(evaluate_support(Feature::Upscaler, level(upscaler), Settings{}, upscale_env(caps, built, probe)),
-              unsupported(Reason::NotImplemented))
-        << int{level(upscaler)};
-    EXPECT_EQ(clamped_upscaler(upscaler, upscale_env(caps, built, probe)), Upscaler::Fsr) << int{level(upscaler)};
-  }
-  EXPECT_EQ(clamped_upscaler(Upscaler::Auto, upscale_env(caps, built, probe)), Upscaler::Fsr);
+  EXPECT_EQ(evaluate_support(Feature::Upscaler, level(Upscaler::Dlss), Settings{}, upscale_env(caps, built, probe)),
+            unsupported(Reason::NotImplemented));
+  EXPECT_EQ(clamped_upscaler(Upscaler::Dlss, upscale_env(caps, built, probe)), Upscaler::Fsr);
+  EXPECT_EQ(evaluate_support(Feature::Upscaler, level(Upscaler::Xess), Settings{}, upscale_env(caps, built, probe)),
+            Supported);
+  EXPECT_EQ(clamped_upscaler(Upscaler::Xess, upscale_env(caps, built, probe)), Upscaler::Xess);
+  EXPECT_EQ(clamped_upscaler(Upscaler::Auto, upscale_env(caps, built, probe)), Upscaler::Xess);
+  EXPECT_EQ(clamped_upscaler(Upscaler::Auto, upscale_env(caps, built, stub_probe(Available, Available))),
+            Upscaler::Fsr);
   const BuiltOptions none = built_none();
   for (uint8_t option = 0; option <= feature_info(Feature::Upscaler).optionCount; ++option) {
     EXPECT_EQ(evaluate_support(Feature::Upscaler, option, Settings{}, upscale_env(caps, none, probe)),
@@ -679,10 +681,8 @@ TEST_F(RenderApiTest, UpscalerOptionsNotImplementedUntilBuilt) {
 #if AURORA_ENABLE_RENDER
   detail::testing::set_caps(full_caps());
   detail::set_upscaler_probe(probe);
-  for (const Upscaler upscaler : {Upscaler::Dlss, Upscaler::Xess}) {
-    EXPECT_EQ(feature_support(Feature::Upscaler, level(upscaler)), unsupported(Reason::NotImplemented))
-        << int{level(upscaler)};
-  }
+  EXPECT_EQ(feature_support(Feature::Upscaler, level(Upscaler::Dlss)), unsupported(Reason::NotImplemented));
+  EXPECT_EQ(feature_support(Feature::Upscaler, level(Upscaler::Xess)), Supported);
 #endif
 }
 

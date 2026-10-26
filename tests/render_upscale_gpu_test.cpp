@@ -47,6 +47,11 @@
 #include <chrono>
 #include <cstdio>
 #include <thread>
+
+#if AURORA_ENABLE_XESS
+#include "gfx/render_worker.hpp"
+#include "render/native/d3d12/xess.hpp"
+#endif
 #endif
 
 namespace aurora::render::detail {
@@ -2421,6 +2426,40 @@ TEST_F(NativeUpscaleGpu, SkippedNodeFrameSubmitsClean) {
   EXPECT_EQ(counters.skipped, 0u);
   EXPECT_EQ(m_copy.evaluations(), 0u);
 }
+
+#if AURORA_ENABLE_XESS
+class XessGpu : public NativeInteropGpu {};
+
+TEST_F(XessGpu, ProbeOnD3D12) {
+  namespace xess = native::d3d12::xess;
+  const uint32_t loads = xess::testing::loads();
+  upscale::native_upscale::ProbeResult result;
+  gfx::render_worker::initialize();
+  gfx::render_worker::enqueue_work([&] { result = xess::upscaler().probe(native::d3d12::upscale_bridge::adapter()); });
+  gfx::render_worker::synchronize();
+  gfx::render_worker::shutdown();
+  std::fprintf(stderr, "note: XeSS-SR probe: %s, path '%s'\n",
+               result.support.supported ? "supported" : std::string{reason_name(result.support.reason)}.c_str(),
+               result.path.c_str());
+  ASSERT_NE(result.support.reason, Reason::RuntimeMissing);
+  EXPECT_TRUE(xess::loaded());
+  EXPECT_EQ(xess::testing::loads(), loads + 1);
+  const uint32_t vendor = native::d3d12::adapter_desc().VendorId;
+  if (result.support.supported) {
+    EXPECT_TRUE(result.path == xess::XeFxPath || result.path == xess::CrossVendorPath) << result.path;
+    EXPECT_EQ(result.autoPick, result.path == xess::XeFxPath);
+    if (vendor != xess::IntelVendorId) {
+      EXPECT_EQ(result.path, xess::CrossVendorPath);
+    }
+  } else {
+    EXPECT_TRUE(result.support.reason == Reason::UnsupportedGpu || result.support.reason == Reason::DriverTooOld)
+        << reason_name(result.support.reason);
+    EXPECT_FALSE(result.autoPick);
+  }
+  native::d3d12::run_teardowns();
+  EXPECT_FALSE(xess::loaded());
+}
+#endif
 #endif
 } // namespace
 } // namespace aurora::render::detail
