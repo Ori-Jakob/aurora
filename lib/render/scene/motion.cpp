@@ -540,8 +540,9 @@ void latch(const Settings& settings, bool motionLayoutLive) noexcept {
   const temporal_resolve::Resolver& resolver = temporal_resolve::installed();
   g_jitterActive = g_jitterEnv == testing::JitterEnv::On ||
                    (g_jitterEnv != testing::JitterEnv::Off && resolver.wanted != nullptr && resolver.wanted(settings));
-  g_jitter = g_jitterActive ? detail::halton_jitter(gfx::current_frame() % temporal_resolve::jitter_phases() + 1)
-                            : std::array<float, 2>{};
+  // The hint frame restarts with the hint stream, so a replayed run walks the same phases as the first one
+  const uint64_t phase = render::detail::live_scene_hints().hintFrame % temporal_resolve::jitter_phases() + 1;
+  g_jitter = g_jitterActive ? detail::halton_jitter(static_cast<uint32_t>(phase)) : std::array<float, 2>{};
   if (first) {
     clear_history();
   } else if (g_frame.usable) {

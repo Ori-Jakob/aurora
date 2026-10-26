@@ -393,8 +393,8 @@ TEST_F(TemporalResolve, InstalledResolverOwnsJitterAndSkipsTaa) {
 
 TEST_F(TemporalResolve, JitterPhasesFollowResolver) {
   motion::testing::set_jitter_env(motion::testing::JitterEnv::On);
-  const uint32_t frame = gfx::current_frame();
   begin_hint_frame();
+  const uint32_t frame = static_cast<uint32_t>(live_scene_hints().hintFrame);
   motion::latch(Settings{}, true);
   EXPECT_EQ(motion::frame_jitter(), motion::detail::halton_jitter(frame % 8 + 1));
   for (uint32_t f = 0; f < 64; ++f) {
@@ -406,8 +406,9 @@ TEST_F(TemporalResolve, JitterPhasesFollowResolver) {
   temporal_resolve::install(&StubResolver);
   EXPECT_EQ(temporal_resolve::jitter_phases(), 16u);
   begin_hint_frame();
+  const uint32_t next = static_cast<uint32_t>(live_scene_hints().hintFrame);
   motion::latch(Settings{}, true);
-  EXPECT_EQ(motion::frame_jitter(), motion::detail::halton_jitter(frame % 16 + 1));
+  EXPECT_EQ(motion::frame_jitter(), motion::detail::halton_jitter(next % 16 + 1));
   bool sawPastEight = false;
   for (uint32_t f = 0; f < 64; ++f) {
     const uint32_t phase = f % temporal_resolve::jitter_phases() + 1;
@@ -416,8 +417,8 @@ TEST_F(TemporalResolve, JitterPhasesFollowResolver) {
     sawPastEight = sawPastEight || phase > 8;
   }
   EXPECT_TRUE(sawPastEight);
-  if (frame % 16 >= 8) {
-    EXPECT_NE(motion::detail::halton_jitter(frame % 16 + 1), motion::detail::halton_jitter(frame % 8 + 1));
+  if (next % 16 >= 8) {
+    EXPECT_NE(motion::detail::halton_jitter(next % 16 + 1), motion::detail::halton_jitter(next % 8 + 1));
   }
 }
 

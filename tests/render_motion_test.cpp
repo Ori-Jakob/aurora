@@ -483,23 +483,46 @@ TEST_F(RenderMotionTest, JitterHaltonAndEnv) {
     EXPECT_LT(std::abs(jitter[0]), 0.5f);
     EXPECT_LT(std::abs(jitter[1]), 0.5f);
   }
-  const auto expected = motion::detail::halton_jitter(gfx::current_frame() % 8 + 1);
+  const auto expected = [] {
+    return motion::detail::halton_jitter(static_cast<uint32_t>(detail::live_scene_hints().hintFrame % 8 + 1));
+  };
 
   begin_frame(false);
   EXPECT_FALSE(motion::testing::jitter_active());
   EXPECT_EQ(motion::frame_jitter(), (std::array{0.f, 0.f}));
   begin_frame(true);
   EXPECT_TRUE(motion::testing::jitter_active());
-  EXPECT_EQ(motion::frame_jitter(), expected);
+  EXPECT_EQ(motion::frame_jitter(), expected());
   motion::testing::set_jitter_env(motion::testing::JitterEnv::Off);
   begin_frame(true);
   EXPECT_FALSE(motion::testing::jitter_active());
   motion::testing::set_jitter_env(motion::testing::JitterEnv::On);
   begin_frame(false);
   EXPECT_TRUE(motion::testing::jitter_active());
-  EXPECT_EQ(motion::frame_jitter(), expected);
+  EXPECT_EQ(motion::frame_jitter(), expected());
   begin_frame(false, false);
   EXPECT_FALSE(motion::testing::jitter_active());
+}
+
+TEST_F(RenderMotionTest, JitterPhaseRestartsWithHintStream) {
+  const auto run = [] {
+    std::vector<std::array<float, 2>> jitters;
+    for (uint32_t frame = 0; frame < 12; ++frame) {
+      begin_frame(true);
+      jitters.push_back(motion::frame_jitter());
+    }
+    return jitters;
+  };
+  gx::hints::reset_state();
+  const auto first = run();
+  for (uint32_t frame = 0; frame < 12; ++frame) {
+    EXPECT_EQ(first[frame], motion::detail::halton_jitter((frame + 1) % 8 + 1)) << frame;
+  }
+  for (uint32_t frame = 0; frame < 3; ++frame) {
+    begin_frame(true);
+  }
+  gx::hints::reset_state();
+  EXPECT_EQ(run(), first);
 }
 
 TEST_F(RenderMotionTest, JitterBitOnlyBeforePrePost) {
