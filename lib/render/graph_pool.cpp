@@ -464,16 +464,29 @@ void TransientPool::materialize(const std::shared_ptr<const CompiledGraph>& grap
   // An empty graph has no extents, so it never counts as a resize
   const bool efbResized = known(plan.efbSize) && known(m_efbSize) && plan.efbSize != m_efbSize;
   const bool outputResized = known(plan.outputSize) && known(m_outputSize) && plan.outputSize != m_outputSize;
+  const bool sceneResized = known(plan.sceneSize) && known(m_sceneSize) && plan.sceneSize != m_sceneSize;
   if (known(plan.efbSize)) {
     m_efbSize = plan.efbSize;
   }
   if (known(plan.outputSize)) {
     m_outputSize = plan.outputSize;
   }
+  if (known(plan.sceneSize)) {
+    m_sceneSize = plan.sceneSize;
+  }
   const auto stale = [&](SizeClass sizeClass) {
-    return (efbResized && sizeClass == SizeClass::Efb) || (outputResized && sizeClass == SizeClass::Output);
+    switch (sizeClass) {
+    case SizeClass::Efb:
+      return efbResized || sceneResized;
+    case SizeClass::OutputEfb:
+      return efbResized;
+    case SizeClass::Output:
+      return outputResized;
+    default:
+      return false;
+    }
   };
-  if (efbResized || outputResized) {
+  if (efbResized || outputResized || sceneResized) {
     std::erase_if(m_physicals, [&](const std::unique_ptr<Physical>& physical) {
       if (physical->claimed || !stale(size_class_of(*physical))) {
         return false;
@@ -630,6 +643,7 @@ void TransientPool::clear() {
   m_graph.reset();
   m_efbSize = {};
   m_outputSize = {};
+  m_sceneSize = {};
   reset_poison_state();
   publish();
   notify(released);

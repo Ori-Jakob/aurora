@@ -11,6 +11,10 @@
 
 struct SDL_Window;
 
+namespace aurora::render {
+enum class Stage : uint8_t;
+} // namespace aurora::render
+
 namespace aurora::webgpu {
 inline constexpr wgpu::TextureFormat NormalBufferFormat = wgpu::TextureFormat::RGB10A2Unorm;
 inline constexpr wgpu::TextureFormat DebugIdBufferFormat = wgpu::TextureFormat::R32Uint;
@@ -87,6 +91,9 @@ bool set_debug_id_buffer(bool enabled);
 bool set_gbuffer(bool enabled);
 inline bool normal_present() noexcept { return g_graphicsConfig.normalBuffer || g_graphicsConfig.gbuffer; }
 const TextureWithSampler& present_source() noexcept;
+wgpu::Extent3D scene_extent() noexcept;
+const TextureWithSampler& scene_color_for(render::Stage stage) noexcept;
+const TextureWithSampler& scene_depth_for(render::Stage stage) noexcept;
 wgpu::BindGroup create_copy_bind_group(const TextureWithSampler& source);
 void set_resampler(AuroraSampler sampler) noexcept;
 AuroraSampler get_resampler() noexcept;

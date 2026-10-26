@@ -154,6 +154,7 @@ private:
   std::vector<HistoryPair> m_idleHistories;
   GraphExtent m_efbSize;
   GraphExtent m_outputSize;
+  GraphExtent m_sceneSize;
   std::atomic<ReleaseListener> m_listener{nullptr};
   uint64_t m_created = 0;
   uint64_t m_released = 0;

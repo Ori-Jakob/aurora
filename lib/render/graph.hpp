@@ -186,10 +186,13 @@ struct GraphExtent {
   bool operator==(const GraphExtent&) const = default;
 };
 
+constexpr bool scene_sized(Stage stage) noexcept { return stage <= Stage::PrePost; }
+
 struct GraphEnvironment {
   GraphLimits limits;
   GraphExtent efbSize;
   GraphExtent outputSize;
+  GraphExtent sceneSize;
   std::array<wgpu::TextureFormat, GxResourceCount> gxFormats{};
   std::array<wgpu::TextureUsage, GxResourceCount> gxUsage{};
   uint32_t gxSampleCount = 1;
@@ -434,6 +437,7 @@ struct SlotPlan {
   std::vector<std::pair<uint32_t, ResourceId>> poisonPoints;
   GraphExtent efbSize;
   GraphExtent outputSize;
+  GraphExtent sceneSize;
   uint64_t logicalBytes = 0;
   uint64_t slotBytes = 0;
 };
@@ -488,6 +492,7 @@ struct CompiledGraph {
   uint64_t graphHash = 0;
   GraphExtent efbSize;
   GraphExtent outputSize;
+  GraphExtent sceneSize;
   bool hasNativePasses = false;
   std::vector<CompiledNode> nodes;
   std::vector<CompiledUse> uses;
@@ -507,6 +512,7 @@ struct CompiledGraph {
   [[nodiscard]] bool stage_empty(Stage stage) const noexcept {
     return stages[static_cast<size_t>(stage)].passes.empty();
   }
+  [[nodiscard]] GraphExtent efb_extent(Stage stage) const noexcept { return scene_sized(stage) ? sceneSize : efbSize; }
   [[nodiscard]] NodeId find_node(std::string_view name) const noexcept {
     for (size_t i = 0; i < nodes.size(); ++i) {
       if (nodes[i].name == name) {

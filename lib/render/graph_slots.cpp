@@ -256,6 +256,7 @@ SlotPlan plan_slots(const CompiledGraph& graph, const GraphLimits& limits) {
   SlotPlan plan;
   plan.efbSize = graph.efbSize;
   plan.outputSize = graph.outputSize;
+  plan.sceneSize = graph.sceneSize;
   plan.positions.assign(graph.nodes.size(), UINT32_MAX);
   uint32_t position = 0;
   for (const StageProgram& program : graph.stages) {

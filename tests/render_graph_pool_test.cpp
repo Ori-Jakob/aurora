@@ -337,6 +337,27 @@ TEST_F(GraphPoolTest, OutputResizeOnlyTouchesOutputClass) {
   EXPECT_EQ(g_released, (std::vector<uint64_t>{serials.at("o")}));
 }
 
+TEST_F(GraphPoolTest, PoolInvalidatesOnSceneResize) {
+  auto passes = both_chains();
+  append_chain(passes, "e", {.format = TextureFormat::RGBA8Unorm, .sizeClass = SizeClass::OutputEfb});
+  GraphInputs scaled = test_inputs();
+  scaled.env.sceneSize = {853, 480};
+  const auto full = compile(passes);
+  const auto split = compile(passes, scaled);
+  EXPECT_EQ(full->slots.sceneSize, (GraphExtent{1280, 720}));
+  EXPECT_EQ(split->slots.sceneSize, (GraphExtent{853, 480}));
+  TransientPool& pool = transient_pool();
+  pool.materialize(full, t0);
+  const auto serials = serials_by_name(*full);
+  pool.materialize(split, t0 + 16ms);
+  EXPECT_EQ(g_released, (std::vector<uint64_t>{serials.at("x")}));
+  EXPECT_EQ(pool.texture(slot_of(*split, "x")).key.width, 853u);
+  EXPECT_EQ(pool.texture(slot_of(*split, "e")).key.width, 1280u);
+  EXPECT_EQ(serial_of(*split, "y"), serials.at("y"));
+  EXPECT_EQ(serial_of(*split, "e"), serials.at("e"));
+  EXPECT_EQ(pool.stats().idle, 0u);
+}
+
 TEST_F(GraphPoolTest, SameGraphIsNoOp) {
   const auto passes = both_chains();
   const auto graph = compile(passes);

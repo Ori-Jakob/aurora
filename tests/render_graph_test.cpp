@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "logging.hpp"
+#include "render/debug/graph_inspection.hpp"
 #include "render/geometry/hzb.hpp"
 #include "render/graph.hpp"
 #include "render_graph_planned.hpp"
@@ -2889,6 +2890,210 @@ TEST_F(RenderGraph, HzbDescMatchesPlannedRow) {
   EXPECT_EQ(pyramid.extent.width, width);
   EXPECT_EQ(pyramid.extent.height, height);
   EXPECT_EQ(pyramid.mipLevels, static_cast<uint32_t>(std::bit_width(std::max(width, height))));
+}
+
+GraphInputs split_inputs() {
+  GraphInputs inputs = test_inputs();
+  inputs.env.sceneSize = {640, 360};
+  return inputs;
+}
+
+std::pair<uint32_t, uint32_t> extent_of(const CompiledGraph& graph, std::string_view name) {
+  const CompiledResource& found = resource(graph, name);
+  return {found.extent.width, found.extent.height};
+}
+
+TEST_F(RenderGraph, SceneExtentEqualsEfbWithoutSplit) {
+  const std::vector<TestPass> passes{
+      {.name = "scene",
+       .body =
+           [](InternalPassBuilder& b) {
+             b.create("scene.tex", efb_tex(wgpu::TextureFormat::RGBA8Unorm), Access::StorageWrite);
+           }},
+      {.name = "hud",
+       .stage = Stage::BeforeHud,
+       .body =
+           [](InternalPassBuilder& b) {
+             b.create("hud.tex", efb_tex(wgpu::TextureFormat::RGBA8Unorm), Access::StorageWrite);
+           }},
+  };
+  GraphInputs equalInputs = test_inputs();
+  equalInputs.env.sceneSize = equalInputs.env.efbSize;
+  const auto unset = compile(passes);
+  const auto equal = compile(passes, equalInputs);
+  for (const auto& graph : {unset, equal}) {
+    EXPECT_EQ(graph->sceneSize, (GraphExtent{1280, 720}));
+    EXPECT_EQ(graph->sceneSize, graph->efbSize);
+    for (size_t s = 0; s < StageCount; ++s) {
+      EXPECT_EQ(graph->efb_extent(static_cast<Stage>(s)), graph->efbSize) << s;
+    }
+    EXPECT_EQ(extent_of(*graph, "scene.tex"), std::pair(1280u, 720u));
+    EXPECT_EQ(extent_of(*graph, "hud.tex"), std::pair(1280u, 720u));
+    for (size_t g = 0; g < GxResourceCount; ++g) {
+      const std::string_view name = gx_resource_name(static_cast<GxResource>(g));
+      EXPECT_EQ(extent_of(*graph, name), std::pair(1280u, 720u)) << name;
+    }
+  }
+}
+
+TEST_F(RenderGraph, HashUnchangedWithoutSplit) {
+  const auto passes = planned::planned_passes();
+  const auto reads = planned::planned_gx_reads();
+  GraphInputs inputs = planned::planned_inputs(full_limits(), passes, reads);
+  const auto unset = compile_graph(inputs);
+  inputs.env.sceneSize = inputs.env.efbSize;
+  const auto equal = compile_graph(inputs);
+  EXPECT_EQ(equal->graphHash, unset->graphHash);
+  EXPECT_EQ(equal->slots.slotBytes, unset->slots.slotBytes);
+  ASSERT_EQ(equal->slots.slots.size(), unset->slots.slots.size());
+  for (size_t i = 0; i < equal->slots.slots.size(); ++i) {
+    EXPECT_EQ(equal->slots.slots[i].tex, unset->slots.slots[i].tex) << i;
+    EXPECT_EQ(equal->slots.slots[i].buf, unset->slots.slots[i].buf) << i;
+  }
+  ASSERT_EQ(equal->slots.histories.size(), unset->slots.histories.size());
+  for (size_t i = 0; i < equal->slots.histories.size(); ++i) {
+    EXPECT_EQ(equal->slots.histories[i].key, unset->slots.histories[i].key) << i;
+  }
+
+  inputs.env.sceneSize = {inputs.env.efbSize.width / 2, inputs.env.efbSize.height / 2};
+  EXPECT_NE(compile_graph(inputs)->graphHash, unset->graphHash);
+}
+
+TEST_F(RenderGraph, EfbFollowsFirstWriterStage) {
+  const auto graph = compile(
+      {
+          {.name = "opaque",
+           .body =
+               [](InternalPassBuilder& b) {
+                 b.create("s.tex", efb_tex(wgpu::TextureFormat::RGBA8Unorm, 2), Access::StorageWrite);
+                 b.create_buffer("s.buf", {.sizeClass = SizeClass::Efb, .bytesPerTexel = 4}, Access::StorageWrite);
+               }},
+          {.name = "resolve",
+           .stage = Stage::PrePost,
+           .body =
+               [](InternalPassBuilder& b) {
+                 b.history("r.hist", efb_tex(wgpu::TextureFormat::RGBA16Float), Access::StorageWrite);
+                 b.create("r.tex", efb_tex(wgpu::TextureFormat::RGBA8Unorm), Access::StorageWrite);
+               }},
+          {.name = "hud",
+           .stage = Stage::BeforeHud,
+           .body =
+               [](InternalPassBuilder& b) {
+                 b.use("s.tex", Access::Sampled);
+                 b.use_prev("r.hist");
+                 b.create("h.tex", efb_tex(wgpu::TextureFormat::RGBA8Unorm), Access::StorageWrite);
+               }},
+          {.name = "scene.draw",
+           .kind = PassKind::Render,
+           .body =
+               [](InternalPassBuilder& b) {
+                 b.use("gx.color", Access::ColorRMW);
+                 b.use("gx.normal", Access::ColorRMW);
+                 b.create("s.target", efb_tex(wgpu::TextureFormat::RGBA8Unorm), Access::ColorWrite);
+               }},
+          {.name = "hud.draw",
+           .stage = Stage::BeforeHud,
+           .kind = PassKind::Render,
+           .body =
+               [](InternalPassBuilder& b) {
+                 b.use("gx.color", Access::ColorRMW);
+                 b.use("gx.depth", Access::DepthWrite);
+                 b.create("h.target", efb_tex(wgpu::TextureFormat::RGBA8Unorm), Access::ColorWrite);
+               }},
+          {.name = "hud.mixed",
+           .stage = Stage::BeforeHud,
+           .kind = PassKind::Render,
+           .order = 1,
+           .body =
+               [](InternalPassBuilder& b) {
+                 b.use("gx.color", Access::ColorRMW);
+                 b.use("gx.normal", Access::ColorRMW);
+               }},
+      },
+      split_inputs());
+  EXPECT_EQ(graph->sceneSize, (GraphExtent{640, 360}));
+  EXPECT_EQ(graph->efb_extent(Stage::OpaqueDone), (GraphExtent{640, 360}));
+  EXPECT_EQ(graph->efb_extent(Stage::PrePost), (GraphExtent{640, 360}));
+  EXPECT_EQ(graph->efb_extent(Stage::SceneEnd), (GraphExtent{1280, 720}));
+  EXPECT_EQ(graph->efb_extent(Stage::BeforeHud), (GraphExtent{1280, 720}));
+  EXPECT_EQ(extent_of(*graph, "s.tex"), std::pair(320u, 180u));
+  EXPECT_EQ(resource(*graph, "s.buf").bufferSize, 640u * 360u * 4u);
+  EXPECT_EQ(extent_of(*graph, "r.hist"), std::pair(640u, 360u));
+  EXPECT_EQ(extent_of(*graph, "r.tex"), std::pair(640u, 360u));
+  EXPECT_EQ(extent_of(*graph, "h.tex"), std::pair(1280u, 720u));
+  EXPECT_EQ(extent_of(*graph, "s.target"), std::pair(640u, 360u));
+  EXPECT_EQ(extent_of(*graph, "h.target"), std::pair(1280u, 720u));
+  EXPECT_EQ(extent_of(*graph, "gx.normal"), std::pair(640u, 360u));
+  EXPECT_EQ(extent_of(*graph, "gbuf.motion"), std::pair(640u, 360u));
+  EXPECT_EQ(extent_of(*graph, "gx.color"), std::pair(1280u, 720u));
+  EXPECT_TRUE(active(*graph, "opaque"));
+  EXPECT_TRUE(active(*graph, "resolve"));
+  EXPECT_TRUE(active(*graph, "hud"));
+  EXPECT_TRUE(active(*graph, "scene.draw"));
+  EXPECT_TRUE(active(*graph, "hud.draw"));
+  EXPECT_EQ(node(*graph, "hud.mixed").status, CullReason::InvalidDeclaration);
+  EXPECT_NE(first_message(*graph).find("attachments of different sizes"), std::string::npos) << first_message(*graph);
+}
+
+TEST_F(RenderGraph, OutputEfbIsOutputEveryStage) {
+  constexpr TexDesc Desc{.format = wgpu::TextureFormat::RGBA8Unorm, .sizeClass = SizeClass::OutputEfb};
+  GraphInputs inputs = split_inputs();
+  inputs.env.outputSize = {1920, 1080};
+  const auto graph = compile(
+      {
+          {.name = "opaque",
+           .body =
+               [=](InternalPassBuilder& b) {
+                 b.create("o.opaque", Desc, Access::StorageWrite);
+                 b.create_buffer("o.buf", {.sizeClass = SizeClass::OutputEfb, .bytesPerTexel = 4},
+                                 Access::StorageWrite);
+                 b.create("o.surface", {.format = wgpu::TextureFormat::RGBA8Unorm, .sizeClass = SizeClass::Output},
+                          Access::StorageWrite);
+               }},
+          {.name = "resolve",
+           .stage = Stage::PrePost,
+           .body = [=](InternalPassBuilder& b) { b.history("o.hist", Desc, Access::StorageWrite); }},
+          {.name = "hud",
+           .stage = Stage::BeforeHud,
+           .body = [=](InternalPassBuilder& b) { b.create("o.hud", Desc, Access::StorageWrite); }},
+          {.name = "hud.draw",
+           .stage = Stage::BeforeHud,
+           .kind = PassKind::Render,
+           .body =
+               [=](InternalPassBuilder& b) {
+                 b.use("gx.color", Access::ColorRMW);
+                 b.create("o.target", Desc, Access::ColorWrite);
+               }},
+      },
+      inputs);
+  for (const std::string_view name : {"o.opaque", "o.hist", "o.hud", "o.target"}) {
+    EXPECT_EQ(extent_of(*graph, name), std::pair(1280u, 720u)) << name;
+    EXPECT_EQ(resource(*graph, name).tex.sizeClass, SizeClass::OutputEfb) << name;
+  }
+  EXPECT_EQ(resource(*graph, "o.buf").bufferSize, 1280u * 720u * 4u);
+  EXPECT_EQ(extent_of(*graph, "o.surface"), std::pair(1920u, 1080u));
+  EXPECT_TRUE(active(*graph, "hud.draw"));
+
+  const debug::GraphInspection inspection = inspect(*graph);
+  const auto entry = std::ranges::find(inspection.resources, std::string{"o.opaque"}, &debug::InspectResource::name);
+  ASSERT_NE(entry, inspection.resources.end());
+  EXPECT_EQ(entry->size, "OutputEfb");
+}
+
+TEST_F(RenderGraph, HzbPyramidUsesSceneExtent) {
+  const auto passes = planned::planned_passes();
+  const auto reads = planned::planned_gx_reads();
+  GraphInputs inputs = planned::planned_inputs(full_limits(), passes, reads);
+  inputs.env.sceneSize = {1706, 960};
+  const auto graph = compile_graph(inputs);
+  ASSERT_EQ(node(*graph, "hzb.opaque").status, CullReason::None);
+  ASSERT_EQ(node(*graph, "hzb.opaque").stage, Stage::OpaqueDone);
+  const CompiledResource& pyramid = resource(*graph, hzb::Resource);
+  EXPECT_EQ(pyramid.tex.sizeClass, hzb::pyramid_desc().sizeClass);
+  EXPECT_EQ(pyramid.extent.width, 853u);
+  EXPECT_EQ(pyramid.extent.height, 480u);
+  EXPECT_EQ(pyramid.mipLevels, static_cast<uint32_t>(std::bit_width(853u)));
+  EXPECT_EQ(graph->efbSize, (GraphExtent{2560, 1440}));
 }
 } // namespace
 } // namespace aurora::render::detail

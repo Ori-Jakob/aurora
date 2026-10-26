@@ -373,8 +373,8 @@ wgpu::TextureView persistent_attachment_view(PersistentHandle handle, uint32_t g
 
 std::array<std::atomic<GxResolveFn>, GxResourceCount> g_gxResolvers{};
 
-bool resolve_gx_color(const StageData&, Access, GxBinding& out) {
-  const webgpu::TextureWithSampler& efb = webgpu::g_frameBuffer;
+bool resolve_gx_color(const StageData& stage, Access, GxBinding& out) {
+  const webgpu::TextureWithSampler& efb = webgpu::scene_color_for(stage.stage);
   const uint32_t samples = std::max(webgpu::g_graphicsConfig.msaaSamples, 1u);
   const webgpu::TextureWithSampler& resolved = samples > 1 ? webgpu::g_frameBufferResolved : efb;
   if (!efb.texture || !resolved.texture) {
@@ -494,9 +494,10 @@ struct PublishedStats {
 PublishedStats g_stats;
 std::atomic_bool g_recordDetails{false};
 
-// Recording thread only; every stage of a frame binds the same FrameUniforms push
+// Recording thread only; stages of a frame share a FrameUniforms push while their gx.color extent matches
 struct FrameConstantsPush {
   uint64_t frameId = 0;
+  GraphExtent efbSize;
   uint32_t offset = 0;
   bool pushed = false;
 };
@@ -966,12 +967,13 @@ FrameUniforms frame_uniforms(const CompiledGraph& graph, const StageData& stage)
   const auto inverse = [](uint32_t size) { return size != 0 ? 1.0f / static_cast<float>(size) : 0.0f; };
   FrameUniforms uniforms;
   FrameConstants& constants = uniforms.constants;
-  constants.efbSize[0] = graph.efbSize.width;
-  constants.efbSize[1] = graph.efbSize.height;
+  const GraphExtent efb = graph.efb_extent(stage.stage);
+  constants.efbSize[0] = efb.width;
+  constants.efbSize[1] = efb.height;
   constants.outputSize[0] = graph.outputSize.width;
   constants.outputSize[1] = graph.outputSize.height;
-  constants.invEfbSize[0] = inverse(graph.efbSize.width);
-  constants.invEfbSize[1] = inverse(graph.efbSize.height);
+  constants.invEfbSize[0] = inverse(efb.width);
+  constants.invEfbSize[1] = inverse(efb.height);
   constants.invOutputSize[0] = inverse(graph.outputSize.width);
   constants.invOutputSize[1] = inverse(graph.outputSize.height);
   constants.frameIndex = stage.frameIndex;
@@ -1349,10 +1351,11 @@ void build_stage_bindings(StageData& stage, UniformSink sink) {
   if (sink == nullptr) {
     sink = static_cast<gfx::Range (*)(const uint8_t*, size_t)>(&gfx::push_uniform);
   }
-  if (!g_frameConstants.pushed || g_frameConstants.frameId != stage.frameId) {
+  const GraphExtent efbSize = graph->efb_extent(stage.stage);
+  if (!g_frameConstants.pushed || g_frameConstants.frameId != stage.frameId || g_frameConstants.efbSize != efbSize) {
     const FrameUniforms uniforms = frame_uniforms(*graph, stage);
     const gfx::Range range = sink(reinterpret_cast<const uint8_t*>(&uniforms), sizeof(uniforms));
-    g_frameConstants = {.frameId = stage.frameId, .offset = range.offset, .pushed = true};
+    g_frameConstants = {.frameId = stage.frameId, .efbSize = efbSize, .offset = range.offset, .pushed = true};
   }
   StageBindings& bindings = stage.bindings;
   bindings.constantsOffset = g_frameConstants.offset;

@@ -43,6 +43,8 @@ GraphEnvironment gather_graph_environment() {
   env.limits = device_limits();
   env.efbSize = {webgpu::g_frameBuffer.size.width, webgpu::g_frameBuffer.size.height};
   env.outputSize = {config.surfaceConfiguration.width, config.surfaceConfiguration.height};
+  const wgpu::Extent3D scene = webgpu::scene_extent();
+  env.sceneSize = {scene.width, scene.height};
   // The usages gpu.cpp creates the EFB textures with; the graph never widens them
   env.gxFormats[gx_index(GxResource::Color)] = config.surfaceConfiguration.format;
   env.gxUsage[gx_index(GxResource::Color)] = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding |

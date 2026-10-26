@@ -51,6 +51,8 @@ enum class SizeClass : uint8_t {
   Absolute,
   Efb,
   Output,
+  // Output EFB in every stage; Efb follows the scene/HUD split
+  OutputEfb,
 };
 
 struct TexDesc {

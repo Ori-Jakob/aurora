@@ -542,15 +542,30 @@ bool valid_pass_name(std::string_view name) noexcept {
 
 uint32_t scaled(uint32_t size, uint16_t divisor) noexcept { return std::max(1u, (size + divisor - 1) / divisor); }
 
-GraphExtent class_extent(SizeClass sizeClass, const GraphEnvironment& env) noexcept {
-  return sizeClass == SizeClass::Output ? env.outputSize : env.efbSize;
+constexpr bool per_stage_gx(GxResource resource) noexcept {
+  return resource == GxResource::Color || resource == GxResource::Depth;
 }
 
-wgpu::Extent3D texture_extent(const TexDesc& desc, const GraphEnvironment& env) noexcept {
+GraphExtent env_scene_size(const GraphEnvironment& env) noexcept {
+  return env.sceneSize.width != 0 && env.sceneSize.height != 0 ? env.sceneSize : env.efbSize;
+}
+
+GraphExtent class_extent(SizeClass sizeClass, Stage stage, const GraphEnvironment& env) noexcept {
+  switch (sizeClass) {
+  case SizeClass::Output:
+    return env.outputSize;
+  case SizeClass::Efb:
+    return scene_sized(stage) ? env_scene_size(env) : env.efbSize;
+  default:
+    return env.efbSize;
+  }
+}
+
+wgpu::Extent3D texture_extent(const TexDesc& desc, Stage stage, const GraphEnvironment& env) noexcept {
   if (desc.sizeClass == SizeClass::Absolute) {
     return {desc.width, desc.height, desc.depthOrLayers};
   }
-  const GraphExtent size = class_extent(desc.sizeClass, env);
+  const GraphExtent size = class_extent(desc.sizeClass, stage, env);
   return {scaled(size.width, desc.divisor), scaled(size.height, desc.divisor), desc.depthOrLayers};
 }
 
@@ -562,16 +577,17 @@ uint32_t full_mip_chain(const wgpu::Extent3D& extent, wgpu::TextureDimension dim
   return static_cast<uint32_t>(std::bit_width(std::max(largest, 1u)));
 }
 
-uint64_t buffer_size(const BufDesc& desc, const GraphEnvironment& env) noexcept {
+uint64_t buffer_size(const BufDesc& desc, Stage stage, const GraphEnvironment& env) noexcept {
   uint64_t size = desc.size;
   if (desc.sizeClass != SizeClass::Absolute) {
-    const GraphExtent extent = class_extent(desc.sizeClass, env);
+    const GraphExtent extent = class_extent(desc.sizeClass, stage, env);
     size = uint64_t{scaled(extent.width, desc.divisor)} * scaled(extent.height, desc.divisor) * desc.bytesPerTexel;
   }
   return (size + 15) & ~uint64_t{15};
 }
 
-std::optional<std::string> check_texture_desc(std::string_view name, const TexDesc& desc, const GraphEnvironment& env) {
+std::optional<std::string> check_texture_desc(std::string_view name, const TexDesc& desc, Stage stage,
+                                              const GraphEnvironment& env) {
   if (desc.format == wgpu::TextureFormat::Undefined) {
     return fmt::format("declares '{}' without a format", name);
   }
@@ -590,7 +606,7 @@ std::optional<std::string> check_texture_desc(std::string_view name, const TexDe
   } else if (desc.depthOrLayers == 0) {
     return fmt::format("declares '{}' with zero depth or layers", name);
   }
-  const uint32_t fullChain = full_mip_chain(texture_extent(desc, env), desc.dimension);
+  const uint32_t fullChain = full_mip_chain(texture_extent(desc, stage, env), desc.dimension);
   if (desc.mips > fullChain) {
     return fmt::format("declares '{}' with {} mips, more than the full chain of {}", name, desc.mips, fullChain);
   }
@@ -969,6 +985,7 @@ private:
     m_chainBase = m_passCount;
     m_graph.efbSize = env.efbSize;
     m_graph.outputSize = env.outputSize;
+    m_graph.sceneSize = env_scene_size(env);
     m_graph.nodes.resize(accepted + ChainNodeCount);
     for (size_t i = 0; i < accepted; ++i) {
       const PassDesc& desc = m_inputs.passes[i];
@@ -1016,6 +1033,7 @@ private:
     m_nodeUses.resize(m_graph.nodes.size());
     m_nodeAnchors.resize(m_graph.nodes.size());
     const GraphExtent efb{std::max(env.efbSize.width, 1u), std::max(env.efbSize.height, 1u)};
+    const GraphExtent scene{std::max(m_graph.sceneSize.width, 1u), std::max(m_graph.sceneSize.height, 1u)};
     for (size_t g = 0; g < GxResourceCount; ++g) {
       const ResourceId id = intern(GxRows[g].name);
       CompiledResource& resource = m_graph.resources[id];
@@ -1023,7 +1041,8 @@ private:
       resource.gx = static_cast<GxResource>(g);
       resource.tex.format = env.gxFormats[g];
       resource.described = env.gxFormats[g] != wgpu::TextureFormat::Undefined;
-      resource.extent = {efb.width, efb.height, 1};
+      const GraphExtent& size = per_stage_gx(resource.gx) ? efb : scene;
+      resource.extent = {size.width, size.height, 1};
       m_mentioned[id] = true;
     }
     for (size_t k = 0; k < ChainNodes.size(); ++k) {
@@ -1197,6 +1216,7 @@ private:
 
   void describe(NodeId nodeId, ResourceId resourceId, const DeclaredUse& declared) {
     CompiledResource& resource = m_graph.resources[resourceId];
+    const Stage stage = m_graph.nodes[nodeId].stage;
     m_describers[resourceId] = nodeId;
     m_describerRoles[resourceId] = declared.role;
     resource.described = true;
@@ -1219,12 +1239,12 @@ private:
     if (declared.buffer) {
       if (declared.role == UseRole::Create) {
         resource.buf = declared.buf;
-        resource.bufferSize = buffer_size(declared.buf, m_inputs.env);
+        resource.bufferSize = buffer_size(declared.buf, stage, m_inputs.env);
       }
       return;
     }
     resource.tex = declared.tex;
-    resource.extent = texture_extent(declared.tex, m_inputs.env);
+    resource.extent = texture_extent(declared.tex, stage, m_inputs.env);
     resource.mipLevels =
         declared.tex.mips == 0 ? full_mip_chain(resource.extent, declared.tex.dimension) : declared.tex.mips;
   }
@@ -1330,7 +1350,7 @@ private:
     }
     if (use.role == UseRole::Create || use.role == UseRole::History || use.role == UseRole::Import) {
       auto problem = use.buffer ? (use.role == UseRole::Create ? check_buffer_desc(use.name, use.buf) : std::nullopt)
-                                : check_texture_desc(use.name, use.tex, m_inputs.env);
+                                : check_texture_desc(use.name, use.tex, node.stage, m_inputs.env);
       if (problem) {
         return problem;
       }
@@ -1491,6 +1511,15 @@ private:
     return std::nullopt;
   }
 
+  [[nodiscard]] std::pair<uint32_t, uint32_t> attachment_extent(const CompiledResource& resource,
+                                                                Stage stage) const noexcept {
+    if (resource.kind != ResourceKind::Gx || !per_stage_gx(resource.gx)) {
+      return {resource.extent.width, resource.extent.height};
+    }
+    const GraphExtent size = m_graph.efb_extent(stage);
+    return {std::max(size.width, 1u), std::max(size.height, 1u)};
+  }
+
   std::optional<std::string> check_pass_uses(NodeId nodeId) {
     const CompiledNode& node = m_graph.nodes[nodeId];
     uint32_t colors = 0;
@@ -1536,7 +1565,7 @@ private:
       if (!resource.described && resource.kind != ResourceKind::Gx) {
         continue;
       }
-      const std::pair extent{resource.extent.width, resource.extent.height};
+      const std::pair extent = attachment_extent(resource, node.stage);
       if (!size) {
         size = extent;
       } else if (*size != extent) {
@@ -2536,6 +2565,10 @@ private:
     hasher.update(m_graph.efbSize.height);
     hasher.update(m_graph.outputSize.width);
     hasher.update(m_graph.outputSize.height);
+    if (m_graph.sceneSize != m_graph.efbSize) {
+      hasher.update(m_graph.sceneSize.width);
+      hasher.update(m_graph.sceneSize.height);
+    }
     std::vector<bool> referenced(m_graph.resources.size(), false);
     for (const StageProgram& program : m_graph.stages) {
       hasher.update(static_cast<uint32_t>(program.nodes.size()));
@@ -2994,7 +3027,9 @@ std::string size_class_text(SizeClass sizeClass, uint16_t divisor) {
   if (sizeClass == SizeClass::Absolute) {
     return "Absolute";
   }
-  const std::string_view base = sizeClass == SizeClass::Efb ? "Efb" : "Output";
+  const std::string_view base = sizeClass == SizeClass::Efb         ? "Efb"
+                                : sizeClass == SizeClass::OutputEfb ? "OutputEfb"
+                                                                    : "Output";
   return divisor > 1 ? fmt::format("{}/{}", base, divisor) : std::string{base};
 }
 

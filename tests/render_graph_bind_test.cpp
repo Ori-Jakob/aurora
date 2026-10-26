@@ -1627,6 +1627,7 @@ TEST_F(GraphBindTest, FrameConstantsPushedOncePerFrame) {
   };
   GraphInputs inputs = test_inputs();
   inputs.env.efbSize = {640, 480};
+  inputs.env.sceneSize = {640, 480};
   inputs.env.outputSize = {1280, 960};
   const TestFrame frame{compile(passes, inputs)};
   StageData opaque = stage_for(frame, Stage::OpaqueDone, 7);
@@ -1663,6 +1664,91 @@ TEST_F(GraphBindTest, FrameConstantsPushedOncePerFrame) {
   build_stage_bindings(next, &fake_sink);
   EXPECT_EQ(g_pushes.size(), 2u);
   EXPECT_NE(next.bindings.constantsOffset, opaque.bindings.constantsOffset);
+}
+
+TEST_F(GraphBindTest, FrameConstantsFollowStage) {
+  std::vector<TestPass> passes{
+      {.name = "fs.opaque", .stage = Stage::OpaqueDone, .declare = [](InternalPassBuilder& b) { b.side_effect(); }},
+      {.name = "fs.post", .stage = Stage::PrePost, .declare = [](InternalPassBuilder& b) { b.side_effect(); }},
+      {.name = "fs.hud", .stage = Stage::BeforeHud, .declare = [](InternalPassBuilder& b) { b.side_effect(); }},
+  };
+  GraphInputs inputs = test_inputs();
+  inputs.env.efbSize = {640, 480};
+  inputs.env.sceneSize = {320, 240};
+  inputs.env.outputSize = {1280, 960};
+  const TestFrame frame{compile(passes, inputs)};
+  StageData opaque = stage_for(frame, Stage::OpaqueDone, 7);
+  StageData post = stage_for(frame, Stage::PrePost, 7);
+  StageData hud = stage_for(frame, Stage::BeforeHud, 7);
+  build_stage_bindings(opaque, &fake_sink);
+  build_stage_bindings(post, &fake_sink);
+  build_stage_bindings(hud, &fake_sink);
+  ASSERT_EQ(g_pushes, (std::vector<size_t>{FrameUniformsSize, FrameUniformsSize}));
+  EXPECT_EQ(opaque.bindings.constantsOffset, post.bindings.constantsOffset);
+  EXPECT_NE(hud.bindings.constantsOffset, opaque.bindings.constantsOffset);
+
+  const auto constants = [&](const StageData& stage) {
+    FrameConstants value{};
+    std::memcpy(&value, g_uniforms.data() + stage.bindings.constantsOffset, sizeof(value));
+    return value;
+  };
+  const FrameConstants scene = constants(opaque);
+  const FrameConstants output = constants(hud);
+  EXPECT_EQ(scene.efbSize[0], 320u);
+  EXPECT_EQ(scene.efbSize[1], 240u);
+  EXPECT_FLOAT_EQ(scene.invEfbSize[0], 1.0f / 320.0f);
+  EXPECT_FLOAT_EQ(scene.invEfbSize[1], 1.0f / 240.0f);
+  EXPECT_EQ(output.efbSize[0], 640u);
+  EXPECT_EQ(output.efbSize[1], 480u);
+  EXPECT_FLOAT_EQ(output.invEfbSize[0], 1.0f / 640.0f);
+  EXPECT_FLOAT_EQ(output.invEfbSize[1], 1.0f / 480.0f);
+  for (const FrameConstants& value : {scene, output}) {
+    EXPECT_EQ(value.outputSize[0], 1280u);
+    EXPECT_EQ(value.outputSize[1], 960u);
+    EXPECT_EQ(value.frameIndex, 7u);
+  }
+
+  StageData next = stage_for(frame, Stage::OpaqueDone, 8);
+  build_stage_bindings(next, &fake_sink);
+  EXPECT_EQ(g_pushes.size(), 3u);
+}
+
+TEST_F(GraphBindTest, SceneExtentEqualsEfbWithoutSplit) {
+  use_globals({.efbSize = {64, 48, 1}, .createEfb = true});
+  const GraphEnvironment env = gather_graph_environment();
+  EXPECT_EQ(env.efbSize, (GraphExtent{64, 48}));
+  EXPECT_EQ(env.sceneSize, env.efbSize);
+  const wgpu::Extent3D scene = webgpu::scene_extent();
+  EXPECT_EQ(scene.width, 64u);
+  EXPECT_EQ(scene.height, 48u);
+  for (size_t s = 0; s < StageCount; ++s) {
+    const auto stage = static_cast<Stage>(s);
+    EXPECT_EQ(&webgpu::scene_color_for(stage), &webgpu::g_frameBuffer) << s;
+    EXPECT_EQ(&webgpu::scene_depth_for(stage), &webgpu::g_depthBuffer) << s;
+  }
+
+  std::vector<TestPass> passes{
+      {.name = "se.scene",
+       .declare =
+           [](InternalPassBuilder& b) {
+             b.use("gx.color", Access::Sampled);
+             b.side_effect();
+           }},
+      {.name = "se.hud",
+       .stage = Stage::BeforeHud,
+       .declare =
+           [](InternalPassBuilder& b) {
+             b.use("gx.color", Access::Sampled);
+             b.side_effect();
+           }},
+  };
+  const TestFrame frame{compile(passes)};
+  EXPECT_EQ(frame.graph->sceneSize, frame.graph->efbSize);
+  ASSERT_EQ(run_frame(frame, 1), std::nullopt);
+  ASSERT_EQ(run_frame(frame, 2, {}, Stage::BeforeHud), std::nullopt);
+  EXPECT_EQ(passes[0].calls, 1);
+  EXPECT_EQ(passes[1].calls, 1);
+  EXPECT_EQ(testing::last_identities(frame.node("se.scene")), testing::last_identities(frame.node("se.hud")));
 }
 
 TEST_F(GraphBindTest, EmptyProgramPushesNothing) {

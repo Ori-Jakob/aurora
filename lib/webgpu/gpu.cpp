@@ -486,6 +486,12 @@ const TextureWithSampler& present_source() noexcept {
   return g_graphicsConfig.msaaSamples > 1 ? g_frameBufferResolved : g_frameBuffer;
 }
 
+wgpu::Extent3D scene_extent() noexcept { return g_frameBuffer.size; }
+
+const TextureWithSampler& scene_color_for(render::Stage) noexcept { return g_frameBuffer; }
+
+const TextureWithSampler& scene_depth_for(render::Stage) noexcept { return g_depthBuffer; }
+
 void set_resampler(AuroraSampler sampler) noexcept {
   switch (sampler) {
   case SAMPLER_AREA:
