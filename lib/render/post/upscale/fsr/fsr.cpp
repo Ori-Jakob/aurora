@@ -518,14 +518,14 @@ Refs declare(PassBuilder& builder, const Selection& selection) {
   refs.upscaled =
       history("fsr.upscaled", TextureFormat::RGBA16Float, SizeClass::OutputEfb, Sampled, Access::StorageWrite);
   refs.locks = history("fsr.locks", selection.locksR8 ? TextureFormat::R8Unorm : TextureFormat::R32Float,
-                       SizeClass::OutputEfb, wgpu::TextureUsage::None, Access::StorageRW);
+                       SizeClass::OutputEfb, wgpu::TextureUsage::None, Access::StorageWrite);
   refs.recon = builder.create_buffer("fsr.recon",
                                      BufDesc{
                                          .sizeClass = SizeClass::Efb,
                                          .bytesPerTexel = sizeof(uint32_t),
                                          .extraUsage = wgpu::BufferUsage::CopyDst,
                                      },
-                                     Access::StorageRW);
+                                     Access::StorageWrite);
   return refs;
 }
 

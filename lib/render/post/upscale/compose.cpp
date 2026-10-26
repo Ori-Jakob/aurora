@@ -350,6 +350,7 @@ void prepare(SceneComposeData& data) {
   data.mode = split_live() ? ComposeMode::Split : ComposeMode::InPlace;
   data.ratio[0] = scene.width != 0 ? static_cast<float>(output.width) / static_cast<float>(scene.width) : 1.f;
   data.ratio[1] = scene.height != 0 ? static_cast<float>(output.height) / static_cast<float>(scene.height) : 1.f;
+  data.rcasStrength = rcas_strength();
   if (data.mode == ComposeMode::Split) {
     const std::shared_ptr<const SceneHints> frozen = scene_hints_frozen() ? scene_hints() : nullptr;
     const SceneHints& hints = frozen != nullptr ? *frozen : live_scene_hints();

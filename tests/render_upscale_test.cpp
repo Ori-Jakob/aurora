@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "render_fsr_rig.hpp"
 #include "render_test_device.hpp"
 
 #include "gfx/frame_packet.hpp"
@@ -14,6 +15,7 @@
 #include "render/pass_context.hpp"
 #include "render/post/upscale/compose.hpp"
 #include "render/post/upscale/fsr/fsr.hpp"
+#include "render/post/upscale/fsr/fsr_pass.hpp"
 #include "render/post/temporal_resolve.hpp"
 #include "render/post/upscale/upscale.hpp"
 #include "render/settings.hpp"
@@ -33,6 +35,7 @@
 
 namespace aurora::render::detail {
 namespace {
+namespace fsr_pass = upscale::fsr_pass;
 using gfx::detail::FrameOpType;
 
 constexpr uint32_t OutputWidth = 160;
@@ -670,6 +673,223 @@ TEST(FsrHost, ParamsFitPassParams) {
   EXPECT_EQ(params.jitterSequenceLength, 18.f);
   EXPECT_EQ(params.spdMips, 10u);
   EXPECT_EQ(upscale::fsr::spd_tiles({1706, 960}), (GraphExtent{27, 15}));
+}
+TEST(UpscaleRules, EnvOverridesParse) {
+  EXPECT_EQ(parse_upscaler_override("fsr"), (UpscalerOverride{.upscaler = Upscaler::Fsr}));
+  EXPECT_EQ(parse_upscaler_override("fsr:quality"),
+            (UpscalerOverride{.upscaler = Upscaler::Fsr, .quality = UpscalerQuality::Quality}));
+  EXPECT_EQ(parse_upscaler_override("auto:ultra"),
+            (UpscalerOverride{.upscaler = Upscaler::Auto, .quality = UpscalerQuality::UltraPerformance}));
+  EXPECT_EQ(parse_upscaler_override("xess:native"),
+            (UpscalerOverride{.upscaler = Upscaler::Xess, .quality = UpscalerQuality::NativeAa}));
+  EXPECT_EQ(parse_upscaler_override("off"), (UpscalerOverride{.upscaler = Upscaler::Off}));
+  EXPECT_EQ(parse_upscaler_override("fsr:fast"), std::nullopt);
+  EXPECT_EQ(parse_upscaler_override("taa"), std::nullopt);
+  EXPECT_EQ(parse_upscaler_override(""), std::nullopt);
+  EXPECT_EQ(upscale::parse_signs("1,1,1,1"), upscale::Signs{});
+  EXPECT_EQ(upscale::parse_signs("-1,+1,1,-1"), (upscale::Signs{.jitter = {-1.f, 1.f}, .motion = {1.f, -1.f}}));
+  EXPECT_EQ(upscale::parse_signs("1,1,1"), std::nullopt);
+  EXPECT_EQ(upscale::parse_signs("1,1,1,1,1"), std::nullopt);
+  EXPECT_EQ(upscale::parse_signs("1,2,1,1"), std::nullopt);
+  EXPECT_EQ(upscale::parse_color("stored"), ColorEncoding::Stored);
+  EXPECT_EQ(upscale::parse_color("linear"), ColorEncoding::Linear);
+  EXPECT_EQ(upscale::parse_color("gamma"), std::nullopt);
+}
+
+class FsrGraph : public UpscaleTest {
+protected:
+  void SetUp() override {
+    UpscaleTest::SetUp();
+    if (IsSkipped() || !m_started) {
+      return;
+    }
+    m_rig = std::make_unique<fsr_rig::Rig>(*m_device, m_options);
+    if (!m_rig->ok()) {
+      GTEST_SKIP() << "the base G-buffer tier needs a core device";
+    }
+  }
+
+  void TearDown() override {
+    m_rig.reset();
+    UpscaleTest::TearDown();
+  }
+
+  [[nodiscard]] const CompiledNode& node(std::string_view name) const {
+    const NodeId id = m_rig->node(name);
+    EXPECT_NE(id, InvalidNode) << name;
+    return m_rig->m_graph->nodes[id];
+  }
+
+  [[nodiscard]] const CompiledResource* resource(std::string_view name) const {
+    const ResourceId id = m_rig->m_graph->find_resource(name);
+    return id != InvalidResource ? &m_rig->m_graph->resources[id] : nullptr;
+  }
+
+  std::unique_ptr<fsr_rig::Rig> m_rig;
+};
+
+TEST_F(FsrGraph, SkippedWhenNotInstalled) {
+  m_rig->use(m_rig->compile(fsr_rig::fsr_settings(UpscalerQuality::Quality)));
+  EXPECT_EQ(temporal_resolve::installed().pass, taa::Pass);
+  EXPECT_EQ(node(fsr_pass::Pass).status, CullReason::Skipped);
+  EXPECT_EQ(resource("fsr.upscaled"), nullptr);
+  EXPECT_TRUE(m_rig->m_graph->histories.empty());
+  EXPECT_TRUE(m_rig->m_graph->stage_empty(Stage::PrePost));
+  EXPECT_FALSE(fsr_pass::jitter_ready());
+  EXPECT_EQ(upscale::status().active, Upscaler::Off);
+  EXPECT_EQ(m_rig->run(1), std::nullopt);
+  EXPECT_EQ(fsr_pass::testing::counters().encodes, 0u);
+  EXPECT_EQ(upscale::compose::testing::counters().encoded, 0u);
+}
+
+TEST_F(FsrGraph, ReplacesTaaWhenInstalled) {
+  Settings settings = fsr_rig::fsr_settings(UpscalerQuality::Quality);
+  settings.taa = true;
+  m_rig->install(settings);
+  EXPECT_EQ(temporal_resolve::installed().pass, fsr_pass::Pass);
+  EXPECT_EQ(temporal_resolve::jitter_phases(), 18u);
+  EXPECT_EQ(node(taa::Pass).status, CullReason::Skipped);
+  EXPECT_EQ(node(fsr_pass::Pass).status, CullReason::None);
+  EXPECT_EQ(node(fsr_pass::Pass).stage, Stage::PrePost);
+  EXPECT_EQ(resource(taa::History), nullptr);
+  const CompiledResource* upscaled = resource("fsr.upscaled");
+  ASSERT_NE(upscaled, nullptr);
+  EXPECT_EQ(upscaled->kind, ResourceKind::History);
+  EXPECT_EQ(upscaled->extent.width, OutputWidth);
+  EXPECT_EQ(upscaled->extent.height, OutputHeight);
+  const CompiledResource* luma = resource("fsr.luma");
+  ASSERT_NE(luma, nullptr);
+  EXPECT_EQ(luma->extent.width, 106u);
+  EXPECT_EQ(luma->extent.height, 80u);
+  EXPECT_TRUE(upscale::split_live());
+  EXPECT_EQ(upscale::scene_size(), (GraphExtent{106, 80}));
+  EXPECT_TRUE(fsr_pass::jitter_ready());
+  const UpscaleStatus status = upscale::status();
+  EXPECT_EQ(status.active, Upscaler::Fsr);
+  EXPECT_EQ(status.quality, UpscalerQuality::Quality);
+  EXPECT_EQ(status.displayName, "FSR");
+  EXPECT_EQ(status.sceneSize[0], 106u);
+  EXPECT_EQ(status.outputSize[0], OutputWidth);
+  EXPECT_TRUE(status.ready);
+  EXPECT_TRUE(upscale::ready(settings));
+  EXPECT_EQ(m_rig->run(1), std::nullopt);
+  EXPECT_EQ(fsr_pass::testing::counters().encodes, 1u);
+  EXPECT_EQ(taa::testing::counters().resolves, 0u);
+
+  m_rig->install(Settings{.taa = true});
+  EXPECT_EQ(temporal_resolve::installed().pass, taa::Pass);
+  EXPECT_FALSE(upscale::split_live());
+  EXPECT_EQ(node(fsr_pass::Pass).status, CullReason::Skipped);
+  EXPECT_EQ(node(taa::Pass).status, CullReason::None);
+  EXPECT_EQ(upscale::status().active, Upscaler::Off);
+}
+
+TEST_F(FsrGraph, RunsWithTaaOff) {
+  scene::motion::testing::set_jitter_env(scene::motion::testing::JitterEnv::Unset);
+  const Settings settings = fsr_rig::fsr_settings(UpscalerQuality::NativeAa);
+  m_rig->install(settings);
+  EXPECT_FALSE(settings.taa);
+  EXPECT_FALSE(upscale::split_live());
+  EXPECT_EQ(node(fsr_pass::Pass).status, CullReason::None);
+  ASSERT_NE(resource("fsr.upscaled"), nullptr);
+  EXPECT_EQ(resource("fsr.upscaled")->extent.width, OutputWidth);
+  bool jittered = false;
+  for (uint64_t frame = 1; frame <= 3; ++frame) {
+    const StageData post = m_rig->build(frame);
+    EXPECT_TRUE(scene::motion::testing::jitter_active());
+    ASSERT_NE(post.sceneHints, nullptr);
+    jittered = jittered || post.sceneHints->jitterPx[0] != 0.f || post.sceneHints->jitterPx[1] != 0.f;
+    EXPECT_EQ(m_rig->encode(post, true), std::nullopt);
+    const fsr_pass::testing::Frame last = fsr_pass::testing::last_frame();
+    EXPECT_EQ(last.params.jitter[0], post.sceneHints->jitterPx[0]);
+    EXPECT_EQ(last.params.jitter[1], post.sceneHints->jitterPx[1]);
+  }
+  EXPECT_TRUE(jittered);
+  EXPECT_EQ(fsr_pass::testing::counters().encodes, 3u);
+  EXPECT_EQ(fsr_pass::testing::counters().applied, 3u);
+  EXPECT_EQ(fsr_pass::testing::counters().published, 0u);
+  EXPECT_EQ(upscale::compose::testing::counters().encoded, 0u);
+}
+
+TEST_F(FsrGraph, SkippedUnderDebugView) {
+  Settings settings = fsr_rig::fsr_settings(UpscalerQuality::Quality);
+  settings.debugView = 16;
+  m_rig->install(settings);
+  EXPECT_EQ(temporal_resolve::installed().pass, fsr_pass::Pass);
+  EXPECT_TRUE(upscale::split_live());
+  EXPECT_EQ(node(fsr_pass::Pass).status, CullReason::Skipped);
+  EXPECT_FALSE(fsr_pass::jitter_ready());
+  EXPECT_FALSE(upscale::ready(settings));
+  EXPECT_EQ(m_rig->run(1), std::nullopt);
+  EXPECT_EQ(fsr_pass::testing::counters().encodes, 0u);
+  EXPECT_EQ(upscale::compose::testing::counters().encoded, 1u);
+  EXPECT_EQ(upscale::compose::testing::counters().sourced, 0u);
+
+  settings.debugView = 0;
+  m_rig->install(settings);
+  EXPECT_EQ(node(fsr_pass::Pass).status, CullReason::None);
+  EXPECT_EQ(m_rig->run(2), std::nullopt);
+  EXPECT_EQ(upscale::compose::testing::counters().encoded, 2u);
+  EXPECT_EQ(upscale::compose::testing::counters().sourced, 1u);
+}
+
+TEST_F(FsrGraph, PublishesHistoryNotTransient) {
+  m_rig->install(fsr_rig::fsr_settings(UpscalerQuality::Quality));
+  const CompiledResource* upscaled = resource("fsr.upscaled");
+  ASSERT_NE(upscaled, nullptr);
+  ASSERT_EQ(upscaled->kind, ResourceKind::History);
+  std::vector<WGPUTexture> published;
+  for (uint64_t frame = 1; frame <= 3; ++frame) {
+    EXPECT_EQ(m_rig->run(frame), std::nullopt);
+    const wgpu::Texture texture = fsr_pass::testing::last_frame().published;
+    ASSERT_TRUE(texture);
+    EXPECT_EQ(texture.Get(), transient_pool().history_write(upscaled->historySlot).texture.Get());
+    EXPECT_EQ(texture.GetFormat(), wgpu::TextureFormat::RGBA16Float);
+    EXPECT_EQ(texture.GetWidth(), OutputWidth);
+    published.push_back(texture.Get());
+  }
+  EXPECT_NE(published[0], published[1]);
+  EXPECT_EQ(published[0], published[2]);
+  EXPECT_EQ(fsr_pass::testing::counters().published, 3u);
+  EXPECT_EQ(upscale::compose::testing::counters().sourced, 3u);
+}
+
+TEST_F(FsrGraph, ResetNeverSamplesHistory) {
+  m_rig->install(fsr_rig::fsr_settings(UpscalerQuality::Quality));
+  const auto expect_frame = [&](uint64_t frame, const fsr_rig::FrameOptions& options, bool reset, float index) {
+    SCOPED_TRACE(frame);
+    EXPECT_EQ(m_rig->run(frame, options), std::nullopt);
+    const fsr_pass::testing::Frame last = fsr_pass::testing::last_frame();
+    EXPECT_EQ(last.reset, reset);
+    EXPECT_EQ(last.historyBound, !reset);
+    EXPECT_EQ(last.params.frameIndex, index);
+  };
+  expect_frame(1, {}, true, 0.f);
+  expect_frame(2, {}, false, 1.f);
+  expect_frame(3, {}, false, 2.f);
+  expect_frame(4, {.refuseStorage = true}, true, 0.f);
+  expect_frame(5, {}, false, 1.f);
+  expect_frame(6, {.invalidate = true}, true, 0.f);
+  expect_frame(7, {.cutEpoch = 1}, true, 0.f);
+  expect_frame(8, {.cutEpoch = 1}, false, 1.f);
+  EXPECT_EQ(fsr_pass::testing::counters().resets, 4u);
+}
+
+TEST_F(FsrGraph, EncodesValidationClean) {
+  for (const UpscalerQuality quality :
+       {UpscalerQuality::NativeAa, UpscalerQuality::Quality, UpscalerQuality::UltraPerformance}) {
+    SCOPED_TRACE(static_cast<int>(quality));
+    fsr_pass::testing::reset();
+    m_rig->install(fsr_rig::fsr_settings(quality, 0.5f));
+    ASSERT_EQ(node(fsr_pass::Pass).status, CullReason::None);
+    for (uint64_t frame = 1; frame <= 4; ++frame) {
+      EXPECT_EQ(m_rig->run(frame), std::nullopt);
+    }
+    EXPECT_EQ(fsr_pass::testing::counters().encodes, 4u);
+    EXPECT_EQ(fsr_pass::testing::counters().resets, 1u);
+    EXPECT_EQ(fsr_pass::testing::counters().skipped, 0u);
+    EXPECT_EQ(fsr_pass::testing::last_frame().params.reactiveMax, fsr_pass::ReactiveMax);
+  }
 }
 } // namespace
 } // namespace aurora::render::detail

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "render_fsr_rig.hpp"
 #include "render_test_device.hpp"
 
 #include "gfx/pipeline_cache.hpp"
@@ -7,6 +8,7 @@
 #include "render/jobs.hpp"
 #include "render/post/upscale/compose.hpp"
 #include "render/post/upscale/fsr/fsr.hpp"
+#include "render/post/upscale/fsr/fsr_pass.hpp"
 #include "render/shaders.hpp"
 #include "webgpu/gpu.hpp"
 
@@ -16,6 +18,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -25,6 +28,7 @@
 
 namespace aurora::render::detail {
 namespace {
+namespace fsr_pass = upscale::fsr_pass;
 namespace compose = upscale::compose;
 using wgpu::TextureFormat;
 
@@ -1003,6 +1007,340 @@ TEST_F(FsrGpu, StorageTexturesPerStageAtMostFour) {
   if (m_state.locksR8) {
     m_state = {};
     ASSERT_TRUE(run(flat_inputs({64, 64}), 0, fsr::Stage::Accumulate));
+  }
+}
+TEST_F(SceneComposeGpu, RcasZeroIsPassthrough) {
+  constexpr Extent Scene{48, 24};
+  const Split split = split_targets(Scene);
+  std::vector<Rgba> scene(size_t{Scene.width} * Scene.height);
+  for (uint32_t y = 0; y < Scene.height; ++y) {
+    for (uint32_t x = 0; x < Scene.width; ++x) {
+      scene[size_t{y} * Scene.width + x] = {.r = 9, .g = 9, .b = 9, .a = static_cast<uint8_t>((x * 11 + y * 7) & 255)};
+    }
+  }
+  write_color(split.sceneColor, scene);
+  fill_depth(split.sceneDepth, std::vector<float>(scene.size(), 0.5f));
+  const wgpu::Texture source = color_texture({OutputWidth, OutputHeight}, TextureFormat::RGBA8Unorm);
+  std::vector<Rgba> resolved(size_t{OutputWidth} * OutputHeight);
+  for (uint32_t y = 0; y < OutputHeight; ++y) {
+    for (uint32_t x = 0; x < OutputWidth; ++x) {
+      const uint32_t bits = mix_bits(x, y);
+      resolved[size_t{y} * OutputWidth + x] = {.r = static_cast<uint8_t>(bits),
+                                               .g = static_cast<uint8_t>(bits >> 8),
+                                               .b = static_cast<uint8_t>(bits >> 16),
+                                               .a = 255};
+    }
+  }
+  write_color(source, resolved, false);
+  constexpr float Jx = 0.25f;
+  constexpr float Jy = -0.125f;
+  for (const float strength : {0.f, 1.f}) {
+    SCOPED_TRACE(strength);
+    SceneComposeData data = split_data(Scene, Jx, Jy);
+    data.rcasStrength = strength;
+    ASSERT_TRUE(run(data, Scene, {OutputWidth, OutputHeight}, split.targets(),
+                    compose::Source{.view = source.CreateView(), .format = TextureFormat::RGBA8Unorm}));
+    const std::vector<Rgba> out = read_color(split.color);
+    size_t changed = 0;
+    for (uint32_t py = 0; py < OutputHeight; ++py) {
+      for (uint32_t px = 0; px < OutputWidth; ++px) {
+        const size_t i = size_t{py} * OutputWidth + px;
+        changed += out[i].r != resolved[i].r || out[i].g != resolved[i].g || out[i].b != resolved[i].b ? 1 : 0;
+        const uint32_t nx = nearest(px, scale_x(Scene), Jx, Scene.width);
+        const uint32_t ny = nearest(py, scale_y(Scene), Jy, Scene.height);
+        ASSERT_EQ(out[i].a, scene[size_t{ny} * Scene.width + nx].a) << px << "," << py;
+      }
+    }
+    if (strength == 0.f) {
+      EXPECT_EQ(changed, 0u);
+    } else {
+      EXPECT_GT(changed, resolved.size() / 2);
+    }
+  }
+  EXPECT_EQ(compose::testing::counters().sourced, 2u);
+}
+
+class FsrGraphGpu {
+public:
+  using Scene = std::function<Rgba(float x, float y)>;
+
+  FsrGraphGpu(test::TestDevice& device, const test::TestDeviceOptions& options)
+  : m_device(device), rig(device, options) {}
+
+  void clear_targets(float motionX, float motionY, float reactive) const {
+    const wgpu::CommandEncoder encoder = m_device.device.CreateCommandEncoder();
+    const auto clear = [&](const wgpu::TextureView& view, const wgpu::Color& value) {
+      const wgpu::RenderPassColorAttachment attachment{
+          .view = view,
+          .loadOp = wgpu::LoadOp::Clear,
+          .storeOp = wgpu::StoreOp::Store,
+          .clearValue = value,
+      };
+      const wgpu::RenderPassDescriptor descriptor{.colorAttachmentCount = 1, .colorAttachments = &attachment};
+      encoder.BeginRenderPass(&descriptor).End();
+    };
+    clear(webgpu::g_motionBuffer.view, {motionX, motionY, 0.0, 0.0});
+    clear(webgpu::g_reactiveBuffer.view, {reactive, 0.0, 0.0, 0.0});
+    const wgpu::CommandBuffer commands = encoder.Finish();
+    EXPECT_TRUE(test::submit_and_wait(m_device, commands));
+  }
+
+  std::vector<Rgba> frame(const Scene& scene, std::array<float, 2> motion = {}, float reactive = 0.f) {
+    const StageData post = rig.build(++m_frame);
+    jitter = post.sceneHints != nullptr ? std::array{post.sceneHints->jitterPx[0], post.sceneHints->jitterPx[1]}
+                                        : std::array{0.f, 0.f};
+    const wgpu::Texture target = webgpu::scene_color().texture;
+    const uint32_t width = target.GetWidth();
+    const uint32_t height = target.GetHeight();
+    input.assign(size_t{width} * height, Rgba{});
+    std::vector<uint8_t> bgra(input.size() * 4);
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x) {
+        const size_t i = size_t{y} * width + x;
+        input[i] = scene(static_cast<float>(x) + 0.5f - jitter[0], static_cast<float>(y) + 0.5f - jitter[1]);
+        bgra[i * 4 + 0] = input[i].b;
+        bgra[i * 4 + 1] = input[i].g;
+        bgra[i * 4 + 2] = input[i].r;
+        bgra[i * 4 + 3] = input[i].a;
+      }
+    }
+    const wgpu::TexelCopyTextureInfo destination{.texture = target};
+    const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = width * 4, .rowsPerImage = height};
+    const wgpu::Extent3D size{width, height, 1};
+    m_device.queue.WriteTexture(&destination, bgra.data(), bgra.size(), &layout, &size);
+    clear_targets(motion[0], motion[1], reactive);
+    EXPECT_EQ(rig.encode(post, true), std::nullopt);
+    return read_output();
+  }
+
+  [[nodiscard]] std::vector<Rgba> read_output() const {
+    const wgpu::Texture& texture = webgpu::g_frameBuffer.texture;
+    const uint32_t width = texture.GetWidth();
+    const uint32_t height = texture.GetHeight();
+    const uint32_t row = (width * 4 + 255) & ~255u;
+    const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                            .size = uint64_t{row} * height};
+    const wgpu::Buffer buffer = m_device.device.CreateBuffer(&descriptor);
+    const wgpu::CommandEncoder encoder = m_device.device.CreateCommandEncoder();
+    const wgpu::TexelCopyTextureInfo source{.texture = texture};
+    const wgpu::TexelCopyBufferInfo destination{.layout = {.bytesPerRow = row, .rowsPerImage = height},
+                                                .buffer = buffer};
+    const wgpu::Extent3D size{width, height, 1};
+    encoder.CopyTextureToBuffer(&source, &destination, &size);
+    const wgpu::CommandBuffer commands = encoder.Finish();
+    EXPECT_TRUE(test::submit_and_wait(m_device, commands));
+    const auto words = test::read_buffer(m_device, buffer, 0, uint64_t{row} * height);
+    std::vector<Rgba> out(size_t{width} * height);
+    if (!words) {
+      ADD_FAILURE() << "colour readback failed";
+      return out;
+    }
+    const auto* bytes = reinterpret_cast<const uint8_t*>(words->data());
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x) {
+        const uint8_t* p = bytes + size_t{y} * row + size_t{x} * 4;
+        out[size_t{y} * width + x] = {.r = p[2], .g = p[1], .b = p[0], .a = p[3]};
+      }
+    }
+    return out;
+  }
+
+  test::TestDevice& m_device;
+  fsr_rig::Rig rig;
+  uint64_t m_frame = 0;
+  std::array<float, 2> jitter{};
+  std::vector<Rgba> input;
+};
+
+struct Errors {
+  double mean = 0.0;
+  int max = 0;
+};
+
+Errors rgb_errors(const std::vector<Rgba>& got, const std::vector<Rgba>& want, uint32_t width, uint32_t border,
+                  uint32_t limitX = UINT32_MAX) {
+  Errors out;
+  size_t count = 0;
+  const auto height = static_cast<uint32_t>(got.size() / width);
+  for (uint32_t y = border; y + border < height; ++y) {
+    for (uint32_t x = border; x + border < width && x < limitX; ++x) {
+      const Rgba& a = got[size_t{y} * width + x];
+      const Rgba& b = want[size_t{y} * width + x];
+      for (const int d : {std::abs(a.r - b.r), std::abs(a.g - b.g), std::abs(a.b - b.b)}) {
+        out.max = std::max(out.max, d);
+        out.mean += d;
+        ++count;
+      }
+    }
+  }
+  out.mean = count != 0 ? out.mean / static_cast<double>(count) : 0.0;
+  return out;
+}
+
+Rgba noise(uint32_t x, uint32_t y, uint32_t seed) {
+  const uint32_t bits = mix_bits(x + seed * 977u, y + seed * 131u);
+  return {.r = static_cast<uint8_t>(bits),
+          .g = static_cast<uint8_t>(bits >> 8),
+          .b = static_cast<uint8_t>(bits >> 16),
+          .a = static_cast<uint8_t>(bits >> 24)};
+}
+
+std::vector<Rgba> reset_reference(test::TestDevice& device, const test::TestDeviceOptions& options,
+                                  const FsrGraphGpu::Scene& scene) {
+  FsrGraphGpu gpu{device, options};
+  EXPECT_TRUE(gpu.rig.ok());
+  gpu.rig.install(fsr_rig::fsr_settings(UpscalerQuality::NativeAa));
+  std::vector<Rgba> out = gpu.frame(scene);
+  EXPECT_TRUE(fsr_pass::testing::last_frame().reset);
+  return out;
+}
+
+TEST_F(FsrGpu, StaticSceneConvergesToJitterMean) {
+  FsrGraphGpu gpu{*m_device, m_options};
+  ASSERT_TRUE(gpu.rig.ok());
+  scene::motion::testing::set_jitter_env(scene::motion::testing::JitterEnv::On);
+  gpu.rig.install(fsr_rig::fsr_settings(UpscalerQuality::NativeAa));
+  ASSERT_EQ(temporal_resolve::jitter_phases(), 8u);
+  const FsrGraphGpu::Scene scene = [](float x, float y) {
+    const auto value = [&](float phase) {
+      return static_cast<uint8_t>(std::lround(128.0 + 90.0 * std::sin(x * 0.5 + phase) * std::cos(y * 0.2)));
+    };
+    return Rgba{.r = value(0.f), .g = value(1.f), .b = value(2.f), .a = 255};
+  };
+  constexpr uint32_t Size = 64;
+  std::vector<std::array<double, 3>> sum(size_t{Size} * Size);
+  std::vector<Rgba> output;
+  std::vector<std::vector<Rgba>> cycle;
+  bool jittered = false;
+  for (uint32_t frame = 1; frame <= 24; ++frame) {
+    output = gpu.frame(scene);
+    jittered = jittered || gpu.jitter[0] != 0.f || gpu.jitter[1] != 0.f;
+    if (frame > 16) {
+      cycle.push_back(gpu.input);
+      for (size_t i = 0; i < sum.size(); ++i) {
+        sum[i][0] += gpu.input[i].r;
+        sum[i][1] += gpu.input[i].g;
+        sum[i][2] += gpu.input[i].b;
+      }
+    }
+  }
+  ASSERT_TRUE(jittered);
+  std::vector<Rgba> mean(sum.size());
+  for (size_t i = 0; i < sum.size(); ++i) {
+    mean[i] = {.r = static_cast<uint8_t>(std::lround(sum[i][0] / 8.0)),
+               .g = static_cast<uint8_t>(std::lround(sum[i][1] / 8.0)),
+               .b = static_cast<uint8_t>(std::lround(sum[i][2] / 8.0)),
+               .a = 255};
+  }
+  const Errors converged = rgb_errors(output, mean, Size, 4);
+  Errors raw;
+  for (const std::vector<Rgba>& input : cycle) {
+    const Errors errors = rgb_errors(input, mean, Size, 4);
+    raw.max = std::max(raw.max, errors.max);
+    raw.mean += errors.mean / static_cast<double>(cycle.size());
+  }
+  RecordProperty("converged_max", converged.max);
+  RecordProperty("converged_mean_x1000", static_cast<int>(converged.mean * 1000.0));
+  RecordProperty("raw_max", raw.max);
+  RecordProperty("raw_mean_x1000", static_cast<int>(raw.mean * 1000.0));
+  EXPECT_LE(converged.max, 6);
+  EXPECT_LT(converged.mean, 0.5 * raw.mean);
+  EXPECT_EQ(fsr_pass::testing::counters().resets, 1u);
+  EXPECT_EQ(fsr_pass::testing::counters().skipped, 0u);
+}
+
+TEST_F(FsrGpu, ReactiveOneTakesCurrent) {
+  const FsrGraphGpu::Scene first = [](float, float) { return Rgba{.r = 200, .g = 40, .b = 90, .a = 255}; };
+  const FsrGraphGpu::Scene second = [](float x, float y) {
+    return Rgba{.r = static_cast<uint8_t>(20 + 3 * static_cast<int>(x)),
+                .g = static_cast<uint8_t>(230 - 3 * static_cast<int>(y)),
+                .b = 160,
+                .a = 255};
+  };
+  const std::vector<Rgba> reference = reset_reference(*m_device, m_options, second);
+  std::array<Errors, 2> errors{};
+  for (const float reactive : {0.f, 1.f}) {
+    FsrGraphGpu gpu{*m_device, m_options};
+    ASSERT_TRUE(gpu.rig.ok());
+    gpu.rig.install(fsr_rig::fsr_settings(UpscalerQuality::NativeAa));
+    for (int i = 0; i < 8; ++i) {
+      gpu.frame(first);
+    }
+    errors[reactive > 0.f ? 1 : 0] = rgb_errors(gpu.frame(second, {}, reactive), reference, 64, 0);
+    EXPECT_FALSE(fsr_pass::testing::last_frame().reset);
+  }
+  RecordProperty("control_mean_x1000", static_cast<int>(errors[0].mean * 1000.0));
+  RecordProperty("control_max", errors[0].max);
+  RecordProperty("reactive_mean_x1000", static_cast<int>(errors[1].mean * 1000.0));
+  RecordProperty("reactive_max", errors[1].max);
+  EXPECT_LE(errors[1].max, 1);
+  EXPECT_LT(errors[1].mean, errors[0].mean);
+}
+
+TEST_F(FsrGpu, OffscreenMotionRejectsHistory) {
+  const FsrGraphGpu::Scene first = [](float x, float y) {
+    return noise(static_cast<uint32_t>(x), static_cast<uint32_t>(y), 3);
+  };
+  const FsrGraphGpu::Scene second = [](float x, float y) {
+    return noise(static_cast<uint32_t>(x), static_cast<uint32_t>(y), 4);
+  };
+  const std::vector<Rgba> reference = reset_reference(*m_device, m_options, second);
+  FsrGraphGpu gpu{*m_device, m_options};
+  ASSERT_TRUE(gpu.rig.ok());
+  gpu.rig.install(fsr_rig::fsr_settings(UpscalerQuality::NativeAa));
+  for (int i = 0; i < 6; ++i) {
+    gpu.frame(first);
+  }
+  const Errors still = rgb_errors(gpu.frame(second), reference, 64, 0);
+  for (int i = 0; i < 6; ++i) {
+    gpu.frame(first);
+  }
+  const Errors invalid = rgb_errors(gpu.frame(second, {4.f, 4.f}), reference, 64, 0);
+  for (int i = 0; i < 6; ++i) {
+    gpu.frame(first);
+  }
+  const Errors offscreen = rgb_errors(gpu.frame(second, {1.5f, 0.f}), reference, 64, 0, 64 * 3 / 4 - 1);
+  RecordProperty("still_mean_x1000", static_cast<int>(still.mean * 1000.0));
+  RecordProperty("invalid_mean_x1000", static_cast<int>(invalid.mean * 1000.0));
+  RecordProperty("invalid_max", invalid.max);
+  RecordProperty("offscreen_mean_x1000", static_cast<int>(offscreen.mean * 1000.0));
+  RecordProperty("offscreen_max", offscreen.max);
+  EXPECT_LT(invalid.mean, 0.5 * still.mean);
+  EXPECT_LT(offscreen.mean, 0.5 * still.mean);
+  EXPECT_EQ(fsr_pass::testing::counters().resets, 1u);
+  EXPECT_EQ(fsr_pass::testing::counters().skipped, 0u);
+}
+
+TEST_F(FsrGpu, LeavesEfbAlphaUntouched) {
+  for (const UpscalerQuality quality : {UpscalerQuality::NativeAa, UpscalerQuality::Quality}) {
+    for (const float sharpness : {0.f, 1.f}) {
+      SCOPED_TRACE(std::to_string(static_cast<int>(quality)) + " sharpness " + std::to_string(sharpness));
+      FsrGraphGpu gpu{*m_device, m_options};
+      ASSERT_TRUE(gpu.rig.ok());
+      scene::motion::testing::set_jitter_env(scene::motion::testing::JitterEnv::On);
+      gpu.rig.install(fsr_rig::fsr_settings(quality, sharpness));
+      for (uint32_t seed = 10; seed < 14; ++seed) {
+        const std::vector<Rgba> output = gpu.frame([seed](float x, float y) {
+          return noise(static_cast<uint32_t>(std::floor(x)), static_cast<uint32_t>(std::floor(y)), seed);
+        });
+        const wgpu::Texture scene = webgpu::scene_color().texture;
+        const uint32_t sceneWidth = scene.GetWidth();
+        const uint32_t sceneHeight = scene.GetHeight();
+        const float scaleX = static_cast<float>(sceneWidth) / 64.f;
+        const float scaleY = static_cast<float>(sceneHeight) / 64.f;
+        size_t changed = 0;
+        for (uint32_t py = 0; py < 64; ++py) {
+          for (uint32_t px = 0; px < 64; ++px) {
+            const bool split = sceneWidth != 64;
+            const uint32_t sx = split ? nearest(px, scaleX, gpu.jitter[0], sceneWidth) : px;
+            const uint32_t sy = split ? nearest(py, scaleY, gpu.jitter[1], sceneHeight) : py;
+            changed += output[size_t{py} * 64 + px].a != gpu.input[size_t{sy} * sceneWidth + sx].a ? 1 : 0;
+          }
+        }
+        EXPECT_EQ(changed, 0u) << "seed " << seed;
+      }
+      EXPECT_EQ(fsr_pass::testing::counters().skipped, 0u);
+    }
   }
 }
 } // namespace

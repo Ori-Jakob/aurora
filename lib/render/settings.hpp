@@ -5,6 +5,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 
 namespace aurora::render::detail {
@@ -39,6 +40,13 @@ struct UpscalerProbe {
   bool operator==(const UpscalerProbe&) const = default;
 };
 
+struct UpscalerOverride {
+  Upscaler upscaler = Upscaler::Off;
+  std::optional<UpscalerQuality> quality;
+
+  bool operator==(const UpscalerOverride&) const = default;
+};
+
 struct SupportEnv {
   const Caps& caps;
   uint32_t msaaSamples = 1;
@@ -58,6 +66,7 @@ ForceMode forced_gbuffer(ForceMode mode, uint64_t latchIndex) noexcept;
 FeatureSupport evaluate_support(Feature feature, uint8_t option, const Settings& context,
                                 const SupportEnv& env) noexcept;
 Settings sanitize_settings(const Settings& requested) noexcept;
+std::optional<UpscalerOverride> parse_upscaler_override(std::string_view text) noexcept;
 Settings clamp_settings(const Settings& requested, const SupportEnv& env) noexcept;
 
 Settings submit_request(const Settings& requested);

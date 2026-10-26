@@ -16,6 +16,7 @@
 #include "gx_ext/ext_provider.hpp"
 #include "material/gx_lookup.hpp"
 #include "post/taa.hpp"
+#include "post/temporal_resolve.hpp"
 #include "post/upscale/upscale.hpp"
 #include "scene/motion.hpp"
 #include "systems/dispatch.hpp"
@@ -94,6 +95,7 @@ void initialize() {
   compact::initialize();
   hzb::initialize();
   taa::initialize();
+  upscale::initialize();
   systems::initialize();
   debug::initialize();
   debug::initialize_classification();
@@ -186,7 +188,11 @@ bool feature_ready(Feature feature) noexcept {
     return false;
   }
 #if AURORA_ENABLE_RENDER
-  if (feature == Feature::Taa && !detail::taa::ready(effective_settings())) {
+  if (feature == Feature::Taa && detail::temporal_resolve::installed().pass == detail::taa::Pass &&
+      !detail::taa::ready(effective_settings())) {
+    return false;
+  }
+  if (feature == Feature::Upscaler && !detail::upscale::ready(effective_settings())) {
     return false;
   }
 #endif

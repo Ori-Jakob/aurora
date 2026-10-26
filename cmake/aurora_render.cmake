@@ -92,6 +92,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/post/upscale/compose.hpp
         lib/render/post/upscale/fsr/fsr.cpp
         lib/render/post/upscale/fsr/fsr.hpp
+        lib/render/post/upscale/fsr/fsr_pass.cpp
+        lib/render/post/upscale/fsr/fsr_pass.hpp
         lib/render/post/upscale/upscale.cpp
         lib/render/post/upscale/upscale.hpp
         lib/render/scene/classifier.cpp

@@ -27,6 +27,7 @@
 #include <SDL3/SDL_stdinc.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <cmath>
@@ -117,6 +118,8 @@ constexpr BuiltOptions DefaultBuiltOptions = [] {
   // TAA is the first tier-B feature; its support check recurses into GBuffer's built bit
   built[static_cast<size_t>(Feature::GBuffer)] = 1u << 1;
   built[static_cast<size_t>(Feature::Taa)] = 1u << 1;
+  // FSR is portable; Auto resolves to it until a native option is built
+  built[static_cast<size_t>(Feature::Upscaler)] = (1u << 1) | (1u << 4);
   return built;
 }();
 
@@ -462,6 +465,7 @@ ForceMode gbuffer_env() noexcept {
 struct SettingsEnv {
   bool taa = false;
   std::optional<float> sharpness;
+  std::optional<UpscalerOverride> upscaler;
 };
 
 const SettingsEnv& settings_env() noexcept {
@@ -486,6 +490,17 @@ const SettingsEnv& settings_env() noexcept {
         Log.warn("AURORA_RENDER_TAA_SHARPNESS={} is not a number; ignored", text);
       }
     }
+    if (const char* value = SDL_getenv("AURORA_RENDER_UPSCALER")) {
+      out.upscaler = parse_upscaler_override(value);
+      if (out.upscaler) {
+        Log.warn("AURORA_RENDER_UPSCALER={}: overriding the upscaler setting", value);
+      } else {
+        Log.warn(
+            "AURORA_RENDER_UPSCALER={} is not off, auto, fsr, dlss or xess with an optional :native, :quality, "
+            ":balanced, :performance or :ultra; ignored",
+            value);
+      }
+    }
     return out;
   }();
   return env;
@@ -498,6 +513,10 @@ Settings with_env_overrides(Settings settings) noexcept {
   }
   if (env.sharpness) {
     settings.taaSharpness = *env.sharpness;
+  }
+  if (env.upscaler) {
+    settings.upscaler = env.upscaler->upscaler;
+    settings.upscalerQuality = env.upscaler->quality.value_or(settings.upscalerQuality);
   }
   return settings;
 }
@@ -544,6 +563,39 @@ const FeatureInfo& feature_info(Feature feature) noexcept {
 }
 
 const BuiltOptions& default_built_options() noexcept { return DefaultBuiltOptions; }
+
+std::optional<UpscalerOverride> parse_upscaler_override(std::string_view text) noexcept {
+  constexpr std::array<std::pair<std::string_view, Upscaler>, 5> Upscalers{{
+      {"off", Upscaler::Off},
+      {"auto", Upscaler::Auto},
+      {"fsr", Upscaler::Fsr},
+      {"dlss", Upscaler::Dlss},
+      {"xess", Upscaler::Xess},
+  }};
+  constexpr std::array<std::pair<std::string_view, UpscalerQuality>, 5> Qualities{{
+      {"native", UpscalerQuality::NativeAa},
+      {"quality", UpscalerQuality::Quality},
+      {"balanced", UpscalerQuality::Balanced},
+      {"performance", UpscalerQuality::Performance},
+      {"ultra", UpscalerQuality::UltraPerformance},
+  }};
+  const size_t colon = text.find(':');
+  const std::string_view name = text.substr(0, colon);
+  const auto upscaler = std::ranges::find(Upscalers, name, &std::pair<std::string_view, Upscaler>::first);
+  if (upscaler == Upscalers.end()) {
+    return std::nullopt;
+  }
+  UpscalerOverride out{.upscaler = upscaler->second};
+  if (colon != std::string_view::npos) {
+    const std::string_view mode = text.substr(colon + 1);
+    const auto quality = std::ranges::find(Qualities, mode, &std::pair<std::string_view, UpscalerQuality>::first);
+    if (quality == Qualities.end()) {
+      return std::nullopt;
+    }
+    out.quality = quality->second;
+  }
+  return out;
+}
 
 uint8_t requested_option(const Settings& settings, Feature feature) noexcept {
   switch (feature) {
@@ -1020,7 +1072,7 @@ std::shared_ptr<const FrameState> latch_frame() {
     graph = compile_latched(gather_graph_environment());
     taa::on_latch(latched_settings(), graph.get());
   }
-  upscale::check_graph(graph.get());
+  upscale::latch_graph(latched_settings(), graph.get());
   latch_pass_params();
   inspectorOpen = g_graphEnvironment.inspectorOpen;
 #endif

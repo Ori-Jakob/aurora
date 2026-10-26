@@ -656,23 +656,67 @@ TEST_F(RenderApiTest, UpscalerOptionsNotImplementedUntilBuilt) {
   EXPECT_EQ(feature_info(Feature::Upscaler).tier, detail::Tier::Base);
   EXPECT_EQ(feature_info(Feature::Upscaler).optionCount, 4);
   const BuiltOptions& built = detail::default_built_options();
-  EXPECT_EQ(built[static_cast<size_t>(Feature::Upscaler)], 0u);
+  EXPECT_EQ(built[static_cast<size_t>(Feature::Upscaler)],
+            (1u << level(Upscaler::Fsr)) | (1u << level(Upscaler::Auto)));
   const Caps caps = full_caps();
   const UpscalerProbe probe = stub_probe(Available, Available, true);
+  for (const Upscaler upscaler : {Upscaler::Dlss, Upscaler::Xess}) {
+    EXPECT_EQ(evaluate_support(Feature::Upscaler, level(upscaler), Settings{}, upscale_env(caps, built, probe)),
+              unsupported(Reason::NotImplemented))
+        << int{level(upscaler)};
+    EXPECT_EQ(clamped_upscaler(upscaler, upscale_env(caps, built, probe)), Upscaler::Fsr) << int{level(upscaler)};
+  }
+  EXPECT_EQ(clamped_upscaler(Upscaler::Auto, upscale_env(caps, built, probe)), Upscaler::Fsr);
+  const BuiltOptions none = built_none();
   for (uint8_t option = 0; option <= feature_info(Feature::Upscaler).optionCount; ++option) {
-    EXPECT_EQ(evaluate_support(Feature::Upscaler, option, Settings{}, upscale_env(caps, built, probe)),
+    EXPECT_EQ(evaluate_support(Feature::Upscaler, option, Settings{}, upscale_env(caps, none, probe)),
               unsupported(Reason::NotImplemented))
         << int{option};
   }
   for (const Upscaler upscaler : AllUpscalers) {
-    EXPECT_EQ(clamped_upscaler(upscaler, upscale_env(caps, built, probe)), Upscaler::Off) << int{level(upscaler)};
+    EXPECT_EQ(clamped_upscaler(upscaler, upscale_env(caps, none, probe)), Upscaler::Off) << int{level(upscaler)};
   }
 #if AURORA_ENABLE_RENDER
   detail::testing::set_caps(full_caps());
   detail::set_upscaler_probe(probe);
-  for (uint8_t option = 0; option <= feature_info(Feature::Upscaler).optionCount; ++option) {
-    EXPECT_EQ(feature_support(Feature::Upscaler, option), unsupported(Reason::NotImplemented)) << int{option};
+  for (const Upscaler upscaler : {Upscaler::Dlss, Upscaler::Xess}) {
+    EXPECT_EQ(feature_support(Feature::Upscaler, level(upscaler)), unsupported(Reason::NotImplemented))
+        << int{level(upscaler)};
   }
+#endif
+}
+
+TEST_F(RenderApiTest, UpscalerFsrSupport) {
+  const BuiltOptions& built = detail::default_built_options();
+  const UpscalerProbe compiledOut{};
+  const Caps full = full_caps();
+  for (const Upscaler upscaler : {Upscaler::Off, Upscaler::Fsr, Upscaler::Auto}) {
+    EXPECT_EQ(upscaler_support(upscaler, upscale_env(full, built, compiledOut)), Supported) << int{level(upscaler)};
+  }
+  EXPECT_EQ(upscaler_support(Upscaler::Fsr, upscale_env(vulkan_caps(), built, compiledOut)), Supported);
+  EXPECT_EQ(clamped_upscaler(Upscaler::Fsr, upscale_env(full, built, compiledOut)), Upscaler::Fsr);
+  EXPECT_EQ(clamped_upscaler(Upscaler::Auto, upscale_env(full, built, compiledOut)), Upscaler::Fsr);
+  EXPECT_EQ(clamped_upscaler(Upscaler::Dlss, upscale_env(vulkan_caps(), built, compiledOut)), Upscaler::Fsr);
+  const Settings clamped = clamp_settings(upscale_request(Upscaler::Fsr), upscale_env(full, built, compiledOut));
+  EXPECT_EQ(clamped.upscaler, Upscaler::Fsr);
+  EXPECT_FALSE(clamped.taa);
+  EXPECT_TRUE(feature_enabled(clamped, Feature::Upscaler));
+  EXPECT_TRUE(feature_enabled(clamped, Feature::GBuffer));
+
+  EXPECT_EQ(upscaler_support(Upscaler::Fsr, upscale_env(compat_caps(), built, compiledOut)),
+            unsupported(Reason::NeedsCore));
+  EXPECT_EQ(upscaler_support(Upscaler::Fsr, upscale_env(full, built, compiledOut, 4)), unsupported(Reason::MsaaActive));
+  EXPECT_EQ(upscaler_support(Upscaler::Fsr, upscale_env(no_tier1_caps(), built, compiledOut)),
+            unsupported(Reason::NeedsTextureFormats));
+  EXPECT_EQ(upscaler_support(Upscaler::Auto, upscale_env(no_tier1_caps(), built, compiledOut)),
+            unsupported(Reason::NeedsTextureFormats));
+  EXPECT_EQ(clamped_upscaler(Upscaler::Fsr, upscale_env(compat_caps(), built, compiledOut)), Upscaler::Off);
+  EXPECT_EQ(clamped_upscaler(Upscaler::Auto, upscale_env(no_tier1_caps(), built, compiledOut)), Upscaler::Off);
+#if AURORA_ENABLE_RENDER
+  detail::testing::set_caps(full_caps());
+  EXPECT_EQ(feature_support(Feature::Upscaler, level(Upscaler::Fsr)), Supported);
+  EXPECT_EQ(feature_support(Feature::Upscaler, level(Upscaler::Auto)), Supported);
+  EXPECT_EQ(g_probeRequests, 0);
 #endif
 }
 

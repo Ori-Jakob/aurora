@@ -1,3 +1,5 @@
+//#import aurora/rcas
+
 struct ComposeParams {
   scale: vec2f,
   jitter: vec2f,
@@ -31,8 +33,7 @@ fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
 }
 
 fn source_rgb(position: vec2f) -> vec3f {
-  let size = vec2i(textureDimensions(source_color));
-  return textureLoad(source_color, clamp(vec2i(position), vec2i(0), size - 1), 0).rgb;
+  return rcas_sharpen(source_color, vec2i(floor(position)), params.rcas_strength);
 }
 
 //#if COMPOSE_INPLACE

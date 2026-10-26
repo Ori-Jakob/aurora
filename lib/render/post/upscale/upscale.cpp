@@ -1,6 +1,9 @@
 #include "upscale.hpp"
 
 #include "compose.hpp"
+#include "fsr/fsr.hpp"
+#include "fsr/fsr_pass.hpp"
+#include "../taa.hpp"
 #include "../temporal_resolve.hpp"
 #include "../../module.hpp"
 
@@ -12,6 +15,7 @@
 #include <SDL3/SDL_stdinc.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <cmath>
@@ -23,18 +27,59 @@ namespace aurora::render::detail::upscale {
 namespace {
 constexpr Module Log{"aurora::render::upscale"};
 
+template <typename T>
 struct EnvOverride {
   bool set = false;
-  std::optional<float> value;
+  std::optional<T> value;
 };
 
+template <UpscalerQuality Quality>
+GraphExtent fsr_scene_size(GraphExtent output) noexcept {
+  const GraphExtent size = fsr::render_size(output, Quality);
+  return {std::min(size.width, output.width), std::min(size.height, output.height)};
+}
+
+bool fsr_wanted(const Settings& settings) noexcept { return settings.upscaler == Upscaler::Fsr; }
+
+template <UpscalerQuality Quality>
+const temporal_resolve::Resolver FsrResolver{
+    .pass = fsr_pass::Pass,
+    .jitterPhases = fsr::jitter_phases(fsr::mode_ratio(Quality)),
+    .wanted = &fsr_wanted,
+    .jitter_ready = &fsr_pass::jitter_ready,
+    .scene_size = &fsr_scene_size<Quality>,
+};
+
+const temporal_resolve::Resolver* fsr_resolver(UpscalerQuality quality) noexcept {
+  switch (quality) {
+  case UpscalerQuality::NativeAa:
+    return &FsrResolver<UpscalerQuality::NativeAa>;
+  case UpscalerQuality::Quality:
+    return &FsrResolver<UpscalerQuality::Quality>;
+  case UpscalerQuality::Balanced:
+    return &FsrResolver<UpscalerQuality::Balanced>;
+  case UpscalerQuality::Performance:
+    return &FsrResolver<UpscalerQuality::Performance>;
+  case UpscalerQuality::UltraPerformance:
+    return &FsrResolver<UpscalerQuality::UltraPerformance>;
+  }
+  return nullptr;
+}
+
 // Game thread
-EnvOverride g_envOverride;
-EnvOverride g_mipBiasOverride;
+EnvOverride<float> g_envOverride;
+EnvOverride<float> g_mipBiasOverride;
+EnvOverride<Signs> g_signsOverride;
+EnvOverride<ColorEncoding> g_colorOverride;
+const temporal_resolve::Resolver* g_installed = nullptr;
 const CompiledGraph* g_checkedGraph = nullptr;
 bool g_warnedLateWriter = false;
+bool g_warnedLinearFsr = false;
 
 std::atomic_bool g_splitLive{false};
+std::atomic<Upscaler> g_active{Upscaler::Off};
+std::atomic<UpscalerQuality> g_quality{UpscalerQuality::Quality};
+std::atomic<float> g_rcasStrength{0.f};
 std::atomic_uint32_t g_sceneWidth{0};
 std::atomic_uint32_t g_sceneHeight{0};
 std::atomic_uint32_t g_outputWidth{0};
@@ -81,6 +126,46 @@ float mip_bias_env() {
   return env;
 }
 
+Signs signs_env() {
+  if (g_signsOverride.set) {
+    return g_signsOverride.value.value_or(Signs{});
+  }
+  static const Signs env = []() -> Signs {
+    const char* value = SDL_getenv("AURORA_RENDER_UPSCALER_SIGNS");
+    if (value == nullptr) {
+      return {};
+    }
+    const std::optional<Signs> signs = parse_signs(value);
+    if (signs) {
+      Log.warn("AURORA_RENDER_UPSCALER_SIGNS={}: flipping the upscaler's jitter and motion inputs", value);
+    } else {
+      Log.warn("AURORA_RENDER_UPSCALER_SIGNS={} is not four comma-separated 1 or -1 values; ignored", value);
+    }
+    return signs.value_or(Signs{});
+  }();
+  return env;
+}
+
+std::optional<ColorEncoding> color_env() {
+  if (g_colorOverride.set) {
+    return g_colorOverride.value;
+  }
+  static const std::optional<ColorEncoding> env = []() -> std::optional<ColorEncoding> {
+    const char* value = SDL_getenv("AURORA_RENDER_UPSCALER_COLOR");
+    if (value == nullptr) {
+      return std::nullopt;
+    }
+    const std::optional<ColorEncoding> color = parse_color(value);
+    if (color) {
+      Log.warn("AURORA_RENDER_UPSCALER_COLOR={}: overriding the upscaler's colour input", value);
+    } else {
+      Log.warn("AURORA_RENDER_UPSCALER_COLOR={} is not stored or linear; ignored", value);
+    }
+    return color;
+  }();
+  return env;
+}
+
 void publish_sampling() {
   if (!compose_wanted()) {
     gx::g_upscaleSampling = {};
@@ -101,6 +186,8 @@ void publish() noexcept {
   g_outputWidth.store(output.width, std::memory_order_relaxed);
   g_outputHeight.store(output.height, std::memory_order_relaxed);
   g_splitLive.store(webgpu::scene_split_active(), std::memory_order_release);
+  const bool fsr = temporal_resolve::installed().pass == fsr_pass::Pass;
+  g_active.store(fsr ? Upscaler::Fsr : Upscaler::Off, std::memory_order_relaxed);
   publish_sampling();
 }
 
@@ -132,6 +219,36 @@ std::optional<float> parse_split_ratio(std::string_view text) noexcept {
   return value;
 }
 
+std::optional<Signs> parse_signs(std::string_view text) noexcept {
+  std::array<float, 4> values{};
+  for (size_t i = 0; i < values.size(); ++i) {
+    const size_t comma = text.find(',');
+    const std::string_view item = text.substr(0, comma);
+    if (item == "1" || item == "+1") {
+      values[i] = 1.f;
+    } else if (item == "-1") {
+      values[i] = -1.f;
+    } else {
+      return std::nullopt;
+    }
+    if ((comma == std::string_view::npos) != (i + 1 == values.size())) {
+      return std::nullopt;
+    }
+    text.remove_prefix(comma == std::string_view::npos ? text.size() : comma + 1);
+  }
+  return Signs{.jitter = {values[0], values[1]}, .motion = {values[2], values[3]}};
+}
+
+std::optional<ColorEncoding> parse_color(std::string_view text) noexcept {
+  if (text == "stored") {
+    return ColorEncoding::Stored;
+  }
+  if (text == "linear") {
+    return ColorEncoding::Linear;
+  }
+  return std::nullopt;
+}
+
 GraphExtent split_size(GraphExtent output, float ratio) noexcept {
   if (!(ratio > 0.f)) {
     return output;
@@ -151,37 +268,64 @@ GraphExtent wanted_scene_size(const SplitInputs& inputs) noexcept {
   return size == inputs.output ? GraphExtent{} : size;
 }
 
-bool on_latch(const Settings&) {
+void initialize() { fsr_pass::initialize(); }
+
+bool on_latch(const Settings& settings) {
   const wgpu::Extent3D efb = webgpu::g_frameBuffer.size;
-  const SplitInputs inputs{
-      .output = {efb.width, efb.height},
-      .ratio = split_env().value_or(0.f),
-      .sceneTargets = webgpu::scene_targets_supported(),
-      .moduleEnabled = module_enabled(),
-  };
-  const GraphExtent wanted = wanted_scene_size(inputs);
+  const GraphExtent output{efb.width, efb.height};
+  const bool sceneTargets = webgpu::scene_targets_supported();
+  const bool fsr =
+      settings.upscaler == Upscaler::Fsr && module_enabled() && sceneTargets && output.width != 0 && output.height != 0;
+  const temporal_resolve::Resolver* resolver = fsr ? fsr_resolver(settings.upscalerQuality) : nullptr;
+  GraphExtent wanted;
+  if (resolver != nullptr) {
+    const GraphExtent size = resolver->scene_size(output);
+    wanted = size == output ? GraphExtent{} : size;
+  } else {
+    wanted = wanted_scene_size({
+        .output = output,
+        .ratio = split_env().value_or(0.f),
+        .sceneTargets = sceneTargets,
+        .moduleEnabled = module_enabled(),
+    });
+  }
   const wgpu::Extent3D scene = webgpu::scene_extent();
   const GraphExtent current = webgpu::scene_split_active() ? GraphExtent{scene.width, scene.height} : GraphExtent{};
+  const bool resolverChanged = resolver != g_installed;
+  if (fsr && color_env() == ColorEncoding::Linear && !std::exchange(g_warnedLinearFsr, true)) {
+    Log.warn("AURORA_RENDER_UPSCALER_COLOR=linear: FSR keeps stored colour");
+  }
   bool switched = false;
-  if (wanted != current) {
-    const bool warm = wanted.width == 0 || compose::prepare_pipelines(ComposeMode::Split, webgpu::g_frameBuffer.format,
-                                                                      webgpu::g_graphicsConfig.depthFormat);
+  if (wanted != current || resolverChanged) {
+    bool warm = wanted.width == 0 || compose::prepare_pipelines(ComposeMode::Split, webgpu::g_frameBuffer.format,
+                                                                webgpu::g_graphicsConfig.depthFormat);
+    if (resolver != nullptr) {
+      warm = fsr_pass::prepare(wanted.width == 0, webgpu::g_frameBuffer.format) && warm;
+    }
     if (warm) {
       gfx::gpu_synchronize();
-      webgpu::set_scene_render_size(wanted.width, wanted.height);
+      if (wanted != current) {
+        webgpu::set_scene_render_size(wanted.width, wanted.height);
+      }
+      temporal_resolve::install(resolver);
+      g_installed = resolver;
       switched = true;
       if (webgpu::scene_split_active()) {
-        Log.info("Scene split: {}x{} scene, {}x{} output", wanted.width, wanted.height, efb.width, efb.height);
+        Log.info("Scene split: {}x{} scene, {}x{} output{}", wanted.width, wanted.height, efb.width, efb.height,
+                 resolver != nullptr ? ", FSR" : "");
       } else {
-        Log.info("Scene split: off");
+        Log.info("Scene split: off{}", resolver != nullptr ? ", FSR in place" : "");
       }
     }
   }
+  g_quality.store(settings.upscalerQuality, std::memory_order_relaxed);
+  g_rcasStrength.store(taa::rcas_strength(settings.taaSharpness), std::memory_order_relaxed);
   publish();
   return switched;
 }
 
-void check_graph(const CompiledGraph* graph) {
+void latch_graph(const Settings& settings, const CompiledGraph* graph) {
+  fsr_pass::on_latch(settings, graph, signs_env());
   if (graph == g_checkedGraph) {
     return;
   }
@@ -206,10 +350,14 @@ void check_graph(const CompiledGraph* graph) {
 }
 
 void shutdown() noexcept {
+  fsr_pass::shutdown();
   compose::shutdown();
+  temporal_resolve::install(nullptr);
+  g_installed = nullptr;
   gx::g_upscaleSampling = {};
   g_checkedGraph = nullptr;
   g_splitLive.store(false, std::memory_order_release);
+  g_active.store(Upscaler::Off, std::memory_order_relaxed);
   g_sceneWidth.store(0, std::memory_order_relaxed);
   g_sceneHeight.store(0, std::memory_order_relaxed);
   g_outputWidth.store(0, std::memory_order_relaxed);
@@ -234,13 +382,27 @@ float ratio() noexcept {
   return scene.width != 0 ? static_cast<float>(output.width) / static_cast<float>(scene.width) : 1.f;
 }
 
+float rcas_strength() noexcept { return g_rcasStrength.load(std::memory_order_relaxed); }
+
+bool ready(const Settings& settings) noexcept {
+  if (settings.upscaler != Upscaler::Fsr) {
+    return true;
+  }
+  return temporal_resolve::installed().pass == fsr_pass::Pass && fsr_pass::ready();
+}
+
 UpscaleStatus status() noexcept {
   const GraphExtent scene = scene_size();
   const GraphExtent output = output_size();
+  const Upscaler active = g_active.load(std::memory_order_relaxed);
+  const bool fsr = active == Upscaler::Fsr;
   return {
-      .active = Upscaler::Off,
+      .active = active,
+      .quality = g_quality.load(std::memory_order_relaxed),
       .sceneSize = {scene.width, scene.height},
       .outputSize = {output.width, output.height},
+      .displayName = fsr ? std::string_view{"FSR"} : std::string_view{},
+      .ready = fsr && fsr_pass::ready(),
   };
 }
 
@@ -249,12 +411,21 @@ void set_split_env(std::optional<float> ratio) noexcept { g_envOverride = {.set 
 
 void set_mip_bias_env(std::optional<float> extra) noexcept { g_mipBiasOverride = {.set = true, .value = extra}; }
 
+void set_signs_env(std::optional<Signs> signs) noexcept { g_signsOverride = {.set = true, .value = signs}; }
+
+void set_color_env(std::optional<ColorEncoding> color) noexcept { g_colorOverride = {.set = true, .value = color}; }
+
 void reset() noexcept {
   g_envOverride = {};
   g_mipBiasOverride = {};
+  g_signsOverride = {};
+  g_colorOverride = {};
   g_warnedLateWriter = false;
+  g_warnedLinearFsr = false;
   g_checkedGraph = nullptr;
+  g_rcasStrength.store(0.f, std::memory_order_relaxed);
   compose::testing::reset();
+  fsr_pass::testing::reset();
   publish();
 }
 } // namespace testing
