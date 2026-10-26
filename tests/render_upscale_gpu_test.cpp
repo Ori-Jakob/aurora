@@ -6,6 +6,7 @@
 #include "gfx/resources.hpp"
 #include "render/jobs.hpp"
 #include "render/post/upscale/compose.hpp"
+#include "render/post/upscale/fsr/fsr.hpp"
 #include "render/shaders.hpp"
 #include "webgpu/gpu.hpp"
 
@@ -14,8 +15,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -515,6 +519,490 @@ TEST_F(SceneComposeGpu, InplaceWritesRgbOnly) {
     ASSERT_EQ(out[i].g, resolved[i].g) << i;
     ASSERT_EQ(out[i].b, resolved[i].b) << i;
     ASSERT_EQ(out[i].a, base[i].a) << i;
+  }
+}
+
+namespace fsr = upscale::fsr;
+
+float half_to_float(uint16_t half) {
+  const uint32_t sign = (half >> 15) & 1u;
+  const uint32_t exponent = (half >> 10) & 31u;
+  const uint32_t mantissa = half & 1023u;
+  float value = 0.f;
+  if (exponent == 0) {
+    value = std::ldexp(static_cast<float>(mantissa), -24);
+  } else if (exponent == 31) {
+    value = mantissa != 0 ? std::numeric_limits<float>::quiet_NaN() : std::numeric_limits<float>::infinity();
+  } else {
+    value = std::ldexp(static_cast<float>(mantissa | 1024u), static_cast<int>(exponent) - 25);
+  }
+  return sign != 0 ? -value : value;
+}
+
+uint16_t float_to_half(float value) {
+  if (value == 0.f) {
+    return 0;
+  }
+  int exponent = 0;
+  const float fraction = std::frexp(std::fabs(value), &exponent);
+  const uint16_t sign = value < 0.f ? 0x8000u : 0u;
+  if (exponent < -13) {
+    return static_cast<uint16_t>(sign | static_cast<uint16_t>(std::lrint(std::fabs(value) * 16777216.f)));
+  }
+  const auto mantissa = static_cast<uint32_t>(std::lrint(fraction * 2048.f));
+  const uint32_t bits = (static_cast<uint32_t>(exponent + 14) << 10) + (mantissa - 1024u);
+  return static_cast<uint16_t>(sign | bits);
+}
+
+float round_half(float value) { return half_to_float(float_to_half(value)); }
+
+std::array<float, 3> rgb_to_ycocg(const std::array<float, 3>& c) {
+  return {0.25f * c[0] + 0.5f * c[1] + 0.25f * c[2], 0.5f * c[0] - 0.5f * c[2],
+          -0.25f * c[0] + 0.5f * c[1] - 0.25f * c[2]};
+}
+
+std::array<float, 3> ycocg_to_rgb(const std::array<float, 3>& c) {
+  return {c[0] + c[1] - c[2], c[0] + c[2], c[0] - c[1] - c[2]};
+}
+
+uint32_t mix_bits(uint32_t x, uint32_t y) {
+  uint32_t h = x * 374761393u + y * 668265263u;
+  h = (h ^ (h >> 13)) * 1274126177u;
+  return h ^ (h >> 16);
+}
+
+class FsrGpu : public ::testing::Test {
+protected:
+  struct Inputs {
+    Extent size;
+    std::vector<Rgba> color;
+    std::vector<float> depth;
+    std::vector<std::array<float, 2>> motion;
+    std::vector<uint8_t> reactive;
+  };
+
+  void SetUp() override {
+    const wgpu::BackendType backend =
+        test::parse_test_backend(std::getenv("AURORA_TEST_BACKEND")).value_or(wgpu::BackendType::Undefined);
+    m_options = {.backend = backend, .efbSize = {64, 64, 1}, .createEfb = true};
+    m_device = test::create_test_device(m_options, m_error);
+    if (!m_device) {
+      GTEST_SKIP() << "no adapter: " << m_error;
+    }
+    if (m_device->adapterInfo.backendType == wgpu::BackendType::Null) {
+      m_device.reset();
+      GTEST_SKIP() << "the null backend runs no shaders";
+    }
+    if (!m_device->device.HasFeature(wgpu::FeatureName::TextureFormatsTier1)) {
+      m_device.reset();
+      GTEST_SKIP() << "FSR needs texture-formats-tier1";
+    }
+    m_globals = std::make_unique<test::ScopedGlobalDevice>(*m_device, m_options);
+    jobs::initialize(1);
+    shaders::initialize();
+    gfx::set_blocking_pipelines(true);
+    m_state.locksR8 = m_device->device.HasFeature(wgpu::FeatureName::TextureFormatsTier2);
+    RecordProperty("locks_r8", m_state.locksR8 ? 1 : 0);
+    m_started = true;
+  }
+
+  void TearDown() override {
+    if (m_started) {
+      m_state = {};
+      fsr::shutdown();
+      shaders::shutdown();
+      jobs::shutdown();
+      gfx::set_blocking_pipelines(false);
+    }
+    if (m_device) {
+      EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
+    }
+    m_depthFill = {};
+    m_depthFillLayout = {};
+    m_globals.reset();
+    m_device.reset();
+  }
+
+  [[nodiscard]] wgpu::Texture texture(Extent size, TextureFormat format) const {
+    const wgpu::TextureDescriptor descriptor{
+        .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::CopySrc |
+                 (format == DepthFormat ? wgpu::TextureUsage::RenderAttachment : wgpu::TextureUsage::None),
+        .size = {size.width, size.height, 1},
+        .format = format,
+    };
+    return m_device->device.CreateTexture(&descriptor);
+  }
+
+  void write(const wgpu::Texture& target, const void* data, uint32_t bytesPerTexel) const {
+    const wgpu::TexelCopyTextureInfo destination{.texture = target};
+    const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = target.GetWidth() * bytesPerTexel,
+                                             .rowsPerImage = target.GetHeight()};
+    const wgpu::Extent3D size{target.GetWidth(), target.GetHeight(), 1};
+    m_device->queue.WriteTexture(&destination, data, size_t{target.GetWidth()} * target.GetHeight() * bytesPerTexel,
+                                 &layout, &size);
+  }
+
+  [[nodiscard]] std::vector<uint8_t> read_raw(const wgpu::Texture& source, uint32_t bytesPerTexel) const {
+    const uint32_t width = source.GetWidth();
+    const uint32_t height = source.GetHeight();
+    const uint32_t row = (width * bytesPerTexel + 255) & ~255u;
+    const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                            .size = uint64_t{row} * height};
+    const wgpu::Buffer buffer = m_device->device.CreateBuffer(&descriptor);
+    const wgpu::CommandEncoder encoder = m_device->device.CreateCommandEncoder();
+    const wgpu::TexelCopyTextureInfo from{.texture = source};
+    const wgpu::TexelCopyBufferInfo to{.layout = {.bytesPerRow = row, .rowsPerImage = height}, .buffer = buffer};
+    const wgpu::Extent3D size{width, height, 1};
+    encoder.CopyTextureToBuffer(&from, &to, &size);
+    const wgpu::CommandBuffer commands = encoder.Finish();
+    EXPECT_TRUE(test::submit_and_wait(*m_device, commands));
+    const auto words = test::read_buffer(*m_device, buffer, 0, uint64_t{row} * height);
+    std::vector<uint8_t> out(size_t{width} * height * bytesPerTexel);
+    if (!words) {
+      ADD_FAILURE() << "texture readback failed";
+      return out;
+    }
+    const auto* bytes = reinterpret_cast<const uint8_t*>(words->data());
+    for (uint32_t y = 0; y < height; ++y) {
+      std::memcpy(out.data() + size_t{y} * width * bytesPerTexel, bytes + size_t{y} * row, width * bytesPerTexel);
+    }
+    return out;
+  }
+
+  [[nodiscard]] std::vector<float> read_halves(const wgpu::Texture& source, uint32_t channels) const {
+    const std::vector<uint8_t> bytes = read_raw(source, channels * 2);
+    std::vector<float> out(bytes.size() / 2);
+    for (size_t i = 0; i < out.size(); ++i) {
+      uint16_t half = 0;
+      std::memcpy(&half, bytes.data() + i * 2, 2);
+      out[i] = half_to_float(half);
+    }
+    return out;
+  }
+
+  [[nodiscard]] std::vector<float> read_floats(const wgpu::Texture& source, uint32_t channels) const {
+    const std::vector<uint8_t> bytes = read_raw(source, channels * 4);
+    std::vector<float> out(bytes.size() / 4);
+    std::memcpy(out.data(), bytes.data(), bytes.size());
+    return out;
+  }
+
+  [[nodiscard]] std::vector<float> read_reconstruction() const {
+    const uint64_t size = m_state.recon.GetSize();
+    const auto words = test::read_buffer(*m_device, m_state.recon, 0, size);
+    std::vector<float> out(size / 4);
+    if (words) {
+      std::memcpy(out.data(), words->data(), size);
+    }
+    return out;
+  }
+
+  void fill_depth(const wgpu::Texture& target, const std::vector<float>& values) {
+    const wgpu::Device& device = m_device->device;
+    if (!m_depthFill) {
+      const wgpu::BindGroupLayoutEntry entry{
+          .binding = 0,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .texture = {.sampleType = wgpu::TextureSampleType::UnfilterableFloat,
+                      .viewDimension = wgpu::TextureViewDimension::e2D},
+      };
+      const wgpu::BindGroupLayoutDescriptor layoutDescriptor{.entryCount = 1, .entries = &entry};
+      m_depthFillLayout = device.CreateBindGroupLayout(&layoutDescriptor);
+      const wgpu::PipelineLayoutDescriptor pipelineLayout{.bindGroupLayoutCount = 1,
+                                                          .bindGroupLayouts = &m_depthFillLayout};
+      const wgpu::ShaderSourceWGSL wgsl{wgpu::ShaderSourceWGSL::Init{.code = DepthFillWgsl}};
+      const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl};
+      const wgpu::ShaderModule module = device.CreateShaderModule(&moduleDescriptor);
+      const wgpu::DepthStencilState depth{
+          .format = DepthFormat,
+          .depthWriteEnabled = wgpu::OptionalBool::True,
+          .depthCompare = wgpu::CompareFunction::Always,
+      };
+      const wgpu::FragmentState fragment{.module = module, .entryPoint = "fs_main"};
+      const wgpu::RenderPipelineDescriptor descriptor{
+          .layout = device.CreatePipelineLayout(&pipelineLayout),
+          .vertex = {.module = module, .entryPoint = "vs_main"},
+          .depthStencil = &depth,
+          .fragment = &fragment,
+      };
+      m_depthFill = device.CreateRenderPipeline(&descriptor);
+    }
+    const wgpu::Texture source = texture({target.GetWidth(), target.GetHeight()}, TextureFormat::R32Float);
+    write(source, values.data(), 4);
+    const wgpu::BindGroupEntry groupEntry{.binding = 0, .textureView = source.CreateView()};
+    const wgpu::BindGroupDescriptor groupDescriptor{
+        .layout = m_depthFillLayout, .entryCount = 1, .entries = &groupEntry};
+    const wgpu::BindGroup group = device.CreateBindGroup(&groupDescriptor);
+    const wgpu::RenderPassDepthStencilAttachment attachment{
+        .view = target.CreateView(),
+        .depthLoadOp = wgpu::LoadOp::Clear,
+        .depthStoreOp = wgpu::StoreOp::Store,
+        .depthClearValue = 0.f,
+    };
+    const wgpu::RenderPassDescriptor passDescriptor{.depthStencilAttachment = &attachment};
+    const wgpu::CommandEncoder encoder = device.CreateCommandEncoder();
+    const wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&passDescriptor);
+    pass.SetPipeline(m_depthFill);
+    pass.SetBindGroup(0, group);
+    pass.Draw(3);
+    pass.End();
+    const wgpu::CommandBuffer commands = encoder.Finish();
+    EXPECT_TRUE(test::submit_and_wait(*m_device, commands));
+  }
+
+  [[nodiscard]] static Inputs flat_inputs(Extent size) {
+    const size_t count = size_t{size.width} * size.height;
+    return {
+        .size = size,
+        .color = std::vector<Rgba>(count, Rgba{.r = 128, .g = 128, .b = 128, .a = 255}),
+        .depth = std::vector<float>(count, 0.5f),
+        .motion = std::vector<std::array<float, 2>>(count, {0.f, 0.f}),
+        .reactive = std::vector<uint8_t>(count, 0),
+    };
+  }
+
+  bool run(const Inputs& inputs, uint32_t framesSinceReset, fsr::Stage last, std::array<float, 2> jitter = {}) {
+    fsr::testing::Inputs gpu{
+        .color = texture(inputs.size, ColorFormat),
+        .depth = texture(inputs.size, DepthFormat),
+        .motion = texture(inputs.size, TextureFormat::RG16Float),
+        .reactive = texture(inputs.size, TextureFormat::R8Unorm),
+        .frame =
+            {
+                .jitter = {jitter[0], jitter[1]},
+                .prevJitter = {jitter[0], jitter[1]},
+                .camera = {.nearZ = 1.f, .farZ = 1000.f, .fovY = 1.f, .viewToMeters = 0.01f},
+                .framesSinceReset = framesSinceReset,
+            },
+    };
+    std::vector<uint8_t> bgra(inputs.color.size() * 4);
+    for (size_t i = 0; i < inputs.color.size(); ++i) {
+      bgra[i * 4 + 0] = inputs.color[i].b;
+      bgra[i * 4 + 1] = inputs.color[i].g;
+      bgra[i * 4 + 2] = inputs.color[i].r;
+      bgra[i * 4 + 3] = inputs.color[i].a;
+    }
+    write(gpu.color, bgra.data(), 4);
+    std::vector<uint16_t> motion(inputs.motion.size() * 2);
+    for (size_t i = 0; i < inputs.motion.size(); ++i) {
+      motion[i * 2 + 0] = float_to_half(inputs.motion[i][0]);
+      motion[i * 2 + 1] = float_to_half(inputs.motion[i][1]);
+    }
+    write(gpu.motion, motion.data(), 4);
+    write(gpu.reactive, inputs.reactive.data(), 1);
+    fill_depth(gpu.depth, inputs.depth);
+    m_device->device.PushErrorScope(wgpu::ErrorFilter::Validation);
+    const bool ran = fsr::testing::run(m_state, gpu, last);
+    const std::optional<std::string> error = test::pop_validation_error(*m_device);
+    EXPECT_EQ(error, std::nullopt);
+    return ran && !error;
+  }
+
+  test::TestDeviceOptions m_options;
+  std::unique_ptr<test::TestDevice> m_device;
+  std::unique_ptr<test::ScopedGlobalDevice> m_globals;
+  std::string m_error;
+  bool m_started = false;
+  fsr::testing::State m_state;
+  wgpu::BindGroupLayout m_depthFillLayout;
+  wgpu::RenderPipeline m_depthFill;
+};
+
+TEST_F(FsrGpu, PrepareInputsTakesClosestReversedDepth) {
+  constexpr Extent Size{40, 24};
+  Inputs inputs = flat_inputs(Size);
+  for (uint32_t y = 0; y < Size.height; ++y) {
+    for (uint32_t x = 0; x < Size.width; ++x) {
+      const size_t i = size_t{y} * Size.width + x;
+      inputs.depth[i] = 0.05f + 0.9f * static_cast<float>(mix_bits(x, y) % 4096) / 4096.f;
+      inputs.motion[i] = {static_cast<float>(static_cast<int>(x) - 20) / 256.f,
+                          static_cast<float>(static_cast<int>(y) - 12) / 256.f};
+    }
+  }
+  ASSERT_TRUE(run(inputs, 0, fsr::Stage::PrepareInputs));
+  const std::vector<float> dilated = read_floats(m_state.dilatedDepth, 1);
+  const std::vector<float> motion = read_halves(m_state.dilatedMotion, 2);
+  constexpr std::array<std::array<int, 2>, 8> Offsets{
+      {{1, 0}, {0, 1}, {0, -1}, {-1, 0}, {-1, 1}, {1, 1}, {-1, -1}, {1, -1}}};
+  for (int y = 0; y < static_cast<int>(Size.height); ++y) {
+    for (int x = 0; x < static_cast<int>(Size.width); ++x) {
+      const size_t i = static_cast<size_t>(y) * Size.width + static_cast<size_t>(x);
+      float nearest = inputs.depth[i];
+      size_t from = i;
+      for (const auto& [dx, dy] : Offsets) {
+        const int qx = x + dx;
+        const int qy = y + dy;
+        if (qx < 0 || qy < 0 || qx >= static_cast<int>(Size.width) || qy >= static_cast<int>(Size.height)) {
+          continue;
+        }
+        const size_t q = static_cast<size_t>(qy) * Size.width + static_cast<size_t>(qx);
+        if (inputs.depth[q] > nearest) {
+          nearest = inputs.depth[q];
+          from = q;
+        }
+      }
+      ASSERT_EQ(dilated[i], nearest) << x << "," << y;
+      EXPECT_NEAR(motion[i * 2 + 0], -0.5f * round_half(inputs.motion[from][0]), 1e-4f) << x << "," << y;
+      EXPECT_NEAR(motion[i * 2 + 1], 0.5f * round_half(inputs.motion[from][1]), 1e-4f) << x << "," << y;
+    }
+  }
+}
+
+TEST_F(FsrGpu, ReconstructionBufferClearedEachFrame) {
+  constexpr Extent Size{32, 32};
+  Inputs inputs = flat_inputs(Size);
+  std::ranges::fill(inputs.depth, 0.9f);
+  ASSERT_TRUE(run(inputs, 0, fsr::Stage::PrepareInputs));
+  for (const float value : read_reconstruction()) {
+    ASSERT_EQ(value, 0.9f);
+  }
+  for (uint32_t y = 0; y < Size.height; ++y) {
+    for (uint32_t x = 0; x < Size.width; ++x) {
+      inputs.depth[size_t{y} * Size.width + x] = 0.2f + 0.1f * static_cast<float>(mix_bits(x, y) % 256) / 256.f;
+    }
+  }
+  ASSERT_TRUE(run(inputs, 1, fsr::Stage::PrepareInputs));
+  const std::vector<float> reconstructed = read_reconstruction();
+  const std::vector<float> dilated = read_floats(m_state.dilatedDepth, 1);
+  ASSERT_EQ(reconstructed.size(), dilated.size());
+  for (size_t i = 0; i < dilated.size(); ++i) {
+    ASSERT_EQ(reconstructed[i], dilated[i]) << i;
+    ASSERT_LT(reconstructed[i], 0.9f) << i;
+  }
+}
+
+TEST_F(FsrGpu, InvalidMotionBecomesReactive) {
+  constexpr Extent Size{32, 32};
+  Inputs inputs = flat_inputs(Size);
+  for (uint32_t y = 8; y < 16; ++y) {
+    for (uint32_t x = 8; x < 16; ++x) {
+      inputs.motion[size_t{y} * Size.width + x] = {4.f, 4.f};
+    }
+  }
+  ASSERT_TRUE(run(inputs, 0, fsr::Stage::PrepareReactivity));
+  ASSERT_TRUE(run(inputs, 1, fsr::Stage::PrepareReactivity));
+  const std::vector<uint8_t> masks = read_raw(m_state.dilatedReactive, 4);
+  const std::vector<float> motion = read_halves(m_state.dilatedMotion, 2);
+  for (uint32_t y = 0; y < Size.height; ++y) {
+    for (uint32_t x = 0; x < Size.width; ++x) {
+      const size_t i = size_t{y} * Size.width + x;
+      const uint8_t change = masks[i * 4 + 2];
+      if (x >= 8 && x < 16 && y >= 8 && y < 16) {
+        EXPECT_EQ(motion[i * 2], 2.f) << x << "," << y;
+        EXPECT_GE(change, 229) << x << "," << y;
+      } else if (x + 2 < 8 || x >= 18 || y + 2 < 8 || y >= 18) {
+        EXPECT_LE(change, 3) << x << "," << y;
+      }
+    }
+  }
+}
+
+TEST_F(FsrGpu, LumaPyramidFrameInfoMatchesCpu) {
+  constexpr Extent Size{256, 256};
+  Inputs inputs = flat_inputs(Size);
+  double lumaSum = 0.0;
+  for (uint32_t y = 0; y < Size.height; ++y) {
+    for (uint32_t x = 0; x < Size.width; ++x) {
+      const Rgba color{
+          .r = static_cast<uint8_t>(x), .g = static_cast<uint8_t>(y), .b = static_cast<uint8_t>(x ^ y), .a = 255};
+      inputs.color[size_t{y} * Size.width + x] = color;
+      const float luma = 0.2126f * color.r / 255.f + 0.7152f * color.g / 255.f + 0.0722f * color.b / 255.f;
+      lumaSum += round_half(luma);
+    }
+  }
+  ASSERT_TRUE(run(inputs, 0, fsr::Stage::LumaPyramidB));
+  const std::vector<float> info = read_floats(m_state.frameInfo[m_state.current()], 4);
+  ASSERT_EQ(info.size(), 4u);
+  const double averageLuma = lumaSum / (double{Size.width} * Size.height);
+  const float deltaTime = fsr::NominalFrameMs / 1000.f;
+  const float logLuma = std::max(0.f, 1.f + (6.10e-05f - 1.f) * (1.f - std::exp(-deltaTime)));
+  const float exposure = 1.f / ((78.f / (0.65f * 100.f)) * std::pow(2.f, std::log2(std::exp(logLuma) * 100.f / 12.5f)));
+  EXPECT_NEAR(info[2], averageLuma, 2e-3);
+  EXPECT_NEAR(info[1], logLuma, 1e-4f);
+  EXPECT_NEAR(info[0], exposure, exposure * 1e-3f);
+}
+
+TEST_F(FsrGpu, ResetEqualsLanczosUpsample) {
+  constexpr Extent Render{32, 24};
+  constexpr Extent Output{64, 48};
+  constexpr std::array<float, 2> Jitter{0.25f, -0.125f};
+  Inputs inputs = flat_inputs(Render);
+  for (uint32_t y = 0; y < Render.height; ++y) {
+    for (uint32_t x = 0; x < Render.width; ++x) {
+      inputs.color[size_t{y} * Render.width + x] = {
+          .r = static_cast<uint8_t>(x * 8),
+          .g = static_cast<uint8_t>(y * 10),
+          .b = static_cast<uint8_t>(mix_bits(x, y) & 255),
+          .a = 255,
+      };
+    }
+  }
+  m_state.output = {Output.width, Output.height};
+  ASSERT_TRUE(run(inputs, 0, fsr::Stage::Accumulate, Jitter));
+  const std::vector<float> upscaled = read_halves(m_state.upscaled[m_state.current()], 4);
+  const auto load = [&](int x, int y) {
+    x = std::clamp(x, 0, static_cast<int>(Render.width) - 1);
+    y = std::clamp(y, 0, static_cast<int>(Render.height) - 1);
+    const Rgba c = inputs.color[static_cast<size_t>(y) * Render.width + static_cast<size_t>(x)];
+    return rgb_to_ycocg({c.r / 255.f, c.g / 255.f, c.b / 255.f});
+  };
+  for (uint32_t py = 0; py < Output.height; ++py) {
+    for (uint32_t px = 0; px < Output.width; ++px) {
+      const float outX = (static_cast<float>(px) + 0.5f) * 0.5f;
+      const float outY = (static_cast<float>(py) + 0.5f) * 0.5f;
+      const int inX = static_cast<int>(std::floor(outX));
+      const int inY = static_cast<int>(std::floor(outY));
+      const float unjitteredX = static_cast<float>(inX) + 0.5f - Jitter[0];
+      const float unjitteredY = static_cast<float>(inY) + 0.5f - Jitter[1];
+      const bool flipCol = unjitteredX > outX;
+      const bool flipRow = unjitteredY > outY;
+      const int left = flipCol ? -2 : -1;
+      const int top = flipRow ? -2 : -1;
+      std::array<float, 3> sum{};
+      float weightSum = 0.f;
+      for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+          const int cx = left + (flipCol ? 3 - col : col);
+          const int cy = top + (flipRow ? 3 - row : row);
+          const float dx = unjitteredX - outX + static_cast<float>(cx);
+          const float dy = unjitteredY - outY + static_cast<float>(cy);
+          const int sx = inX + cx;
+          const int sy = inY + cy;
+          const bool onScreen =
+              sx >= 0 && sy >= 0 && sx < static_cast<int>(Render.width) && sy < static_cast<int>(Render.height);
+          const float weight = onScreen ? std::exp(-2.3f * (dx * dx + dy * dy)) : 0.f;
+          const std::array<float, 3> sample = load(sx, sy);
+          for (size_t c = 0; c < 3; ++c) {
+            sum[c] += sample[c] * weight;
+          }
+          weightSum += weight;
+        }
+      }
+      const std::array<float, 3> rgb = ycocg_to_rgb({sum[0] / weightSum, sum[1] / weightSum, sum[2] / weightSum});
+      const size_t i = (size_t{py} * Output.width + px) * 4;
+      for (size_t c = 0; c < 3; ++c) {
+        ASSERT_NEAR(upscaled[i + c], std::max(0.f, rgb[c]), 2e-3f) << px << "," << py << " " << c;
+      }
+    }
+  }
+}
+
+TEST_F(FsrGpu, StorageTexturesPerStageAtMostFour) {
+  for (const bool locksR8 : {false, true}) {
+    for (size_t i = 0; i < fsr::StageCount; ++i) {
+      const auto stage = static_cast<fsr::Stage>(i);
+      const std::span<const fsr::testing::Binding> bindings = fsr::testing::layout(stage, locksR8);
+      const auto storage = std::ranges::count_if(bindings, [](const fsr::testing::Binding& binding) {
+        return binding.kind == fsr::testing::Kind::StorageWrite || binding.kind == fsr::testing::Kind::StorageReadWrite;
+      });
+      EXPECT_LE(storage, fsr::MaxStorageTextures) << fsr::shader_id(stage);
+      EXPECT_FALSE(bindings.empty()) << fsr::shader_id(stage);
+    }
+  }
+  ASSERT_TRUE(run(flat_inputs({64, 64}), 0, fsr::Stage::Accumulate));
+  if (m_state.locksR8) {
+    m_state = {};
+    ASSERT_TRUE(run(flat_inputs({64, 64}), 0, fsr::Stage::Accumulate));
   }
 }
 } // namespace

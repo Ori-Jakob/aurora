@@ -13,6 +13,7 @@
 #include "render/jobs.hpp"
 #include "render/pass_context.hpp"
 #include "render/post/upscale/compose.hpp"
+#include "render/post/upscale/fsr/fsr.hpp"
 #include "render/post/temporal_resolve.hpp"
 #include "render/post/upscale/upscale.hpp"
 #include "render/settings.hpp"
@@ -22,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -620,6 +622,54 @@ TEST(UpscaleRules, SplitRatioParses) {
   EXPECT_EQ(upscale::parse_split_ratio("1.5x"), std::nullopt);
   EXPECT_EQ(upscale::split_size({2560, 1440}, 1.5f), (GraphExtent{1706, 960}));
   EXPECT_EQ(upscale::split_size({1, 1}, 3.f), (GraphExtent{1, 1}));
+}
+
+TEST(FsrHost, RenderSizesMatchAmd) {
+  const GraphExtent output{2560, 1440};
+  EXPECT_EQ(upscale::fsr::render_size(output, UpscalerQuality::NativeAa), output);
+  EXPECT_EQ(upscale::fsr::render_size(output, UpscalerQuality::Quality), (GraphExtent{1706, 960}));
+  EXPECT_EQ(upscale::fsr::render_size(output, UpscalerQuality::Balanced), (GraphExtent{1505, 847}));
+  EXPECT_EQ(upscale::fsr::render_size(output, UpscalerQuality::Performance), (GraphExtent{1280, 720}));
+  EXPECT_EQ(upscale::fsr::render_size(output, UpscalerQuality::UltraPerformance), (GraphExtent{853, 480}));
+  EXPECT_EQ(upscale::fsr::render_size({4779, 2688}, UpscalerQuality::Quality), (GraphExtent{3186, 1792}));
+  EXPECT_EQ(upscale::fsr::render_size({64, 40}, UpscalerQuality::UltraPerformance), (GraphExtent{32, 32}));
+}
+
+TEST(FsrHost, JitterPhasesMatchAmd) {
+  constexpr std::array Qualities{UpscalerQuality::NativeAa, UpscalerQuality::Quality, UpscalerQuality::Balanced,
+                                 UpscalerQuality::Performance, UpscalerQuality::UltraPerformance};
+  for (const uint32_t width : {1920u, 2560u, 4779u}) {
+    for (const UpscalerQuality quality : Qualities) {
+      const GraphExtent render = upscale::fsr::render_size({width, width / 2}, quality);
+      const float ratio = static_cast<float>(width) / static_cast<float>(render.width);
+      const auto amd = static_cast<uint32_t>(8.f * std::pow(ratio, 2.f));
+      EXPECT_EQ(upscale::fsr::jitter_phases(upscale::fsr::mode_ratio(quality)), std::max(8u, amd))
+          << width << " " << static_cast<int>(quality);
+    }
+  }
+  EXPECT_EQ(upscale::fsr::jitter_phases(1.5f), 18u);
+  EXPECT_EQ(upscale::fsr::jitter_phases(1.7f), 23u);
+  EXPECT_EQ(upscale::fsr::jitter_phases(3.f), 72u);
+}
+
+TEST(FsrHost, ParamsFitPassParams) {
+  static_assert(sizeof(upscale::fsr::Params) <= MaxPassParamsSize);
+  EXPECT_EQ(sizeof(upscale::fsr::Params) % 16, 0u);
+  const upscale::fsr::Params params = upscale::fsr::make_params({
+      .camera = {.nearZ = 10.f, .farZ = 10000.f, .fovY = 1.f, .viewToMeters = 0.01f},
+      .frameTimeMs = 2000.f,
+      .framesSinceReset = 3,
+      .jitterPhases = 18,
+      .render = {1706, 960},
+  });
+  const auto view_depth = [&](float depth) { return params.deviceToView[1] / (depth - params.deviceToView[0]); };
+  EXPECT_NEAR(view_depth(1.f), 10.f, 1e-3f);
+  EXPECT_NEAR(view_depth(0.f), 10000.f, 1.f);
+  EXPECT_EQ(params.deltaTime, 1.f);
+  EXPECT_EQ(params.frameIndex, 3.f);
+  EXPECT_EQ(params.jitterSequenceLength, 18.f);
+  EXPECT_EQ(params.spdMips, 10u);
+  EXPECT_EQ(upscale::fsr::spd_tiles({1706, 960}), (GraphExtent{27, 15}));
 }
 } // namespace
 } // namespace aurora::render::detail
