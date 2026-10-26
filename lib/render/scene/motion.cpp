@@ -2,6 +2,7 @@
 
 #include "classifier.hpp"
 #include "../gx_ext/records.hpp"
+#include "../post/temporal_resolve.hpp"
 #include "../../gfx/frame.hpp"
 #include "../../gfx/recording.hpp"
 #include "../../gx/gx.hpp"
@@ -23,6 +24,7 @@ namespace aurora::render::scene::motion {
 namespace {
 constexpr Module Log{"aurora::render::motion"};
 namespace rx = gx::render_ext;
+namespace temporal_resolve = render::detail::temporal_resolve;
 
 constexpr uint32_t TableSlots = 16384;
 constexpr uint32_t TableMask = TableSlots - 1;
@@ -32,7 +34,6 @@ constexpr uint32_t OrdinalFallbacks = 3;
 constexpr uint32_t PositionSlots = gx::MaxPnMtx + gx::MaxTexMtx;
 constexpr uint32_t ImmobileSamplesPerFrame = 64;
 constexpr float ImmobileMaxPx = 0.05f;
-constexpr uint32_t JitterPhases = 8;
 constexpr uint32_t StatsLogFrames = 60;
 constexpr uint32_t DefaultCheckFirst = 30;
 constexpr uint32_t DefaultCheckLast = 300;
@@ -536,8 +537,11 @@ void latch(const Settings& settings, bool motionLayoutLive) noexcept {
   allocate();
   const bool first = !g_active;
   g_active = true;
-  g_jitterActive = g_jitterEnv == testing::JitterEnv::On || (g_jitterEnv != testing::JitterEnv::Off && settings.taa);
-  g_jitter = g_jitterActive ? detail::halton_jitter(gfx::current_frame() % JitterPhases + 1) : std::array<float, 2>{};
+  const temporal_resolve::Resolver& resolver = temporal_resolve::installed();
+  g_jitterActive = g_jitterEnv == testing::JitterEnv::On ||
+                   (g_jitterEnv != testing::JitterEnv::Off && resolver.wanted != nullptr && resolver.wanted(settings));
+  g_jitter = g_jitterActive ? detail::halton_jitter(gfx::current_frame() % temporal_resolve::jitter_phases() + 1)
+                            : std::array<float, 2>{};
   if (first) {
     clear_history();
   } else if (g_frame.usable) {
@@ -630,7 +634,8 @@ Validity on_main_camera(const gx::hints::Camera& camera, bool usable) noexcept {
     frame.prevProj[2] = prevProj.m3;
     frame.reproject = detail::reproject_matrix(g_previous.camera.view, camera.view);
   }
-  bool jitter = g_jitterActive && reason == MotionReason::Valid;
+  bool jitter = g_jitterActive && reason == MotionReason::Valid &&
+                (g_jitterEnv == testing::JitterEnv::On || temporal_resolve::jitter_enabled());
   if (jitter) {
     frame.jitterPx[0] = g_jitter[0];
     frame.jitterPx[1] = g_jitter[1];

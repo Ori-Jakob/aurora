@@ -9,6 +9,7 @@
 #if AURORA_ENABLE_RENDER
 #include "debug/debug.hpp"
 #include "hints.hpp"
+#include "history_reset.hpp"
 #include "shaders.hpp"
 #include "../webgpu/gpu_prof.hpp"
 #endif
@@ -68,6 +69,9 @@ bool build_stage_data(StageData& stage) {
   // Runs before the empty-program return so every frame resets the cull state
   if (stage.stage == Stage::SceneBegin) {
     begin_frame_cull(*graph, g_frameCull);
+    if (history_reset::begin_frame(*graph, stage.frameId) != history_reset::Reason::None) {
+      invalidate_histories(g_frameCull);
+    }
   }
 #endif
   const StageProgram& program = graph->stages[static_cast<size_t>(stage.stage)];
@@ -187,7 +191,12 @@ bool pass_pipelines_ready(const CompiledNode& node) noexcept {
 #endif
 }
 
-void reset_frame_cull() noexcept { g_frameCull = {}; }
+void reset_frame_cull() noexcept {
+  g_frameCull = {};
+#if AURORA_ENABLE_RENDER
+  history_reset::reset();
+#endif
+}
 
 namespace testing {
 void reset_missing_marker_warnings() noexcept { g_warnedMissingMarker = {}; }

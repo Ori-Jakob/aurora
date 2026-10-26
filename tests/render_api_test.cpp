@@ -233,6 +233,42 @@ TEST_F(RenderApiTest, MaterialFeaturesBuiltByDefault) {
   }
 }
 
+TEST_F(RenderApiTest, TaaAndGBufferBuiltByDefault) {
+  const BuiltOptions& built = detail::default_built_options();
+  Caps budget24 = full_caps();
+  budget24.limits.maxColorAttachmentBytesPerSample = 24;
+  for (const Feature feature : {Feature::GBuffer, Feature::Taa}) {
+    EXPECT_EQ(evaluate_support(feature, 1, Settings{}, env(full_caps(), built)), Supported) << feature_name(feature);
+    EXPECT_EQ(evaluate_support(feature, 1, Settings{}, env(metal32_caps(), built)), Supported) << feature_name(feature);
+    EXPECT_EQ(evaluate_support(feature, 1, Settings{}, env(compat_caps(), built)), unsupported(Reason::NeedsCore))
+        << feature_name(feature);
+    EXPECT_EQ(evaluate_support(feature, 1, Settings{}, env(full_caps(), built, 4)), unsupported(Reason::MsaaActive))
+        << feature_name(feature);
+    EXPECT_EQ(evaluate_support(feature, 1, Settings{}, env(budget24, built)), unsupported(Reason::ColorBudget))
+        << feature_name(feature);
+  }
+  EXPECT_EQ(evaluate_support(Feature::DeferredFog, 1, Settings{}, env(full_caps(), built)),
+            unsupported(Reason::NotImplemented));
+
+  const Settings full = clamp_settings({.taa = true}, env(full_caps(), built));
+  EXPECT_TRUE(full.taa);
+  EXPECT_TRUE(feature_enabled(full, Feature::GBuffer));
+  const Settings compat = clamp_settings({.taa = true}, env(compat_caps(), built));
+  EXPECT_FALSE(compat.taa);
+  EXPECT_FALSE(feature_enabled(compat, Feature::GBuffer));
+
+#if AURORA_ENABLE_RENDER
+  detail::testing::set_caps(full_caps());
+  apply_settings({.taa = true});
+  detail::latch_frame();
+  EXPECT_TRUE(feature_enabled(effective_settings(), Feature::Taa));
+  EXPECT_TRUE(feature_enabled(effective_settings(), Feature::DeferredFog));
+  EXPECT_FALSE(feature_ready(Feature::DeferredFog));
+  EXPECT_FALSE(feature_active(Feature::DeferredFog));
+  gfx::shutdown_pipeline_cache();
+#endif
+}
+
 TEST_F(RenderApiTest, GenerateMissingMipsIsNeverClamped) {
   const BuiltOptions all = built_all();
   const Settings request{.generateMissingMips = true};
@@ -604,24 +640,24 @@ TEST_F(RenderApiTest, CompactInitializeWithoutDeviceIsInert) {
 TEST_F(RenderApiTest, FeatureReadyFollowsSceneLayout) {
   detail::testing::set_caps(full_caps());
   enable_all_built();
-  apply_settings({.taa = true});
+  apply_settings({.ao = Quality::High});
   detail::latch_frame();
-  ASSERT_TRUE(feature_enabled(effective_settings(), Feature::Taa));
-  ASSERT_NE(feature_info(Feature::Taa).tier, detail::Tier::None);
-  EXPECT_TRUE(feature_ready(Feature::Taa));
+  ASSERT_TRUE(feature_enabled(effective_settings(), Feature::Ao));
+  ASSERT_NE(feature_info(Feature::Ao).tier, detail::Tier::None);
+  EXPECT_TRUE(feature_ready(Feature::Ao));
 
   // Leaving the tier warms the legacy layout, which needs no device
   webgpu::g_graphicsConfig.gbuffer = true;
   gfx::detail::latch_scene_layout(false);
   ASSERT_TRUE(gfx::scene_layout_transitioning());
-  EXPECT_FALSE(feature_ready(Feature::Taa));
-  EXPECT_FALSE(feature_active(Feature::Taa));
+  EXPECT_FALSE(feature_ready(Feature::Ao));
+  EXPECT_FALSE(feature_active(Feature::Ao));
   EXPECT_TRUE(feature_ready(Feature::TextureMaterials));
-  EXPECT_TRUE(feature_ready(Feature::Ao));
+  EXPECT_TRUE(feature_ready(Feature::Ssil));
 
   gfx::detail::latch_scene_layout(true);
   EXPECT_FALSE(gfx::scene_layout_transitioning());
-  EXPECT_TRUE(feature_ready(Feature::Taa));
+  EXPECT_TRUE(feature_ready(Feature::Ao));
   webgpu::g_graphicsConfig.gbuffer = false;
   gfx::shutdown_pipeline_cache();
 }

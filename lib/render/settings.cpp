@@ -18,6 +18,7 @@
 #include "debug/debug.hpp"
 #include "gx_ext/ext_provider.hpp"
 #include "hints.hpp"
+#include "post/taa.hpp"
 #include "scene/classify.hpp"
 #include "scene/motion.hpp"
 #endif
@@ -25,6 +26,7 @@
 #include <SDL3/SDL_stdinc.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <mutex>
 #include <optional>
@@ -108,6 +110,9 @@ constexpr BuiltOptions DefaultBuiltOptions = [] {
   BuiltOptions built{};
   built[static_cast<size_t>(Feature::TextureMaterials)] = 1u << 1;
   built[static_cast<size_t>(Feature::StochasticTiling)] = 1u << 1;
+  // TAA is the first tier-B feature; its support check recurses into GBuffer's built bit
+  built[static_cast<size_t>(Feature::GBuffer)] = 1u << 1;
+  built[static_cast<size_t>(Feature::Taa)] = 1u << 1;
   return built;
 }();
 
@@ -332,6 +337,49 @@ ForceMode gbuffer_env() noexcept {
     return ForceMode::Unset;
   }();
   return forced;
+}
+
+struct SettingsEnv {
+  bool taa = false;
+  std::optional<float> sharpness;
+};
+
+const SettingsEnv& settings_env() noexcept {
+  static const SettingsEnv env = [] {
+    SettingsEnv out;
+    if (const char* value = SDL_getenv("AURORA_RENDER_TAA")) {
+      if (std::string_view{value} == "on") {
+        Log.warn("AURORA_RENDER_TAA=on: requesting TAA regardless of settings");
+        out.taa = true;
+      } else {
+        Log.warn("AURORA_RENDER_TAA={} is not on; ignored", value);
+      }
+    }
+    if (const char* value = SDL_getenv("AURORA_RENDER_TAA_SHARPNESS")) {
+      const std::string_view text{value};
+      float sharpness = 0.f;
+      const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), sharpness);
+      if (error == std::errc{} && end == text.data() + text.size()) {
+        Log.warn("AURORA_RENDER_TAA_SHARPNESS={}: overriding the TAA sharpness setting", text);
+        out.sharpness = sharpness;
+      } else {
+        Log.warn("AURORA_RENDER_TAA_SHARPNESS={} is not a number; ignored", text);
+      }
+    }
+    return out;
+  }();
+  return env;
+}
+
+Settings with_env_overrides(Settings settings) noexcept {
+  const SettingsEnv& env = settings_env();
+  if (env.taa) {
+    settings.taa = true;
+  }
+  if (env.sharpness) {
+    settings.taaSharpness = *env.sharpness;
+  }
+  return settings;
 }
 
 bool latch_gbuffer_want(uint32_t msaaSamples) {
@@ -664,7 +712,7 @@ Settings clamp_settings(const Settings& requested, const SupportEnv& env) noexce
 
 Settings submit_request(const Settings& requested) {
   std::lock_guard lock{g_requestMutex};
-  Settings preview = clamp_settings(requested, {caps(), g_msaaSamples, g_built, module_enabled()});
+  Settings preview = clamp_settings(with_env_overrides(requested), {caps(), g_msaaSamples, g_built, module_enabled()});
   g_lastRequest = requested;
   g_pending = requested;
   g_supportContext = preview;
@@ -696,7 +744,7 @@ void reset_settings_state(uint32_t msaaSamples) noexcept {
   {
     std::lock_guard lock{g_requestMutex};
     g_msaaSamples = msaaSamples;
-    result = clamp_settings(g_lastRequest, {caps(), msaaSamples, g_built, module_enabled()});
+    result = clamp_settings(with_env_overrides(g_lastRequest), {caps(), msaaSamples, g_built, module_enabled()});
     g_supportContext = result;
     g_pending.reset();
     g_reclamp = false;
@@ -734,7 +782,7 @@ std::shared_ptr<const FrameState> latch_frame() {
   bool settingsChanged = false;
   if (request) {
     const SupportEnv env{.caps = caps(), .msaaSamples = msaaSamples, .built = built, .moduleEnabled = module_enabled()};
-    Settings next = clamp_settings(*request, env);
+    Settings next = clamp_settings(with_env_overrides(*request), env);
     if (next != latched_settings()) {
       const FeatureMask previous = enabled_features(latched_settings());
       g_latched = std::move(next);
@@ -785,6 +833,7 @@ std::shared_ptr<const FrameState> latch_frame() {
     graph = compiled ? std::move(compiled) : empty_graph();
   }
   scene::motion::latch(latched_settings(), gfx::layout_has_gbuffer(gfx::scene_render_target_layout()));
+  taa::on_latch(latched_settings(), graph.get());
   latch_pass_params();
   inspectorOpen = g_graphEnvironment.inspectorOpen;
 #endif

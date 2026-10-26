@@ -147,6 +147,9 @@ TEST_F(RenderLatchTest, OnlyMaterialFeaturesKeepLegacyStorageSize) {
     detail::testing::reset();
     detail::testing::set_caps(full_caps());
     gfx::detail::testing::reset_streaming_request();
+    for (size_t j = 0; j < FeatureCount; ++j) {
+      detail::testing::set_built_options(static_cast<Feature>(j), 0);
+    }
     if (is_material(feature)) {
       for (const Feature material : MaterialFeatures) {
         detail::testing::set_built_options(material, ~0u);

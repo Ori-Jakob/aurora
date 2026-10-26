@@ -15,6 +15,7 @@
 #include "geometry/hzb.hpp"
 #include "gx_ext/ext_provider.hpp"
 #include "material/gx_lookup.hpp"
+#include "post/taa.hpp"
 #include "scene/motion.hpp"
 #include "systems/dispatch.hpp"
 #include "systems/systems.hpp"
@@ -85,6 +86,7 @@ void initialize() {
   shaders::initialize();
   compact::initialize();
   hzb::initialize();
+  taa::initialize();
   systems::initialize();
   debug::initialize();
   debug::initialize_classification();
@@ -117,6 +119,7 @@ void shutdown() noexcept {
   shaders::shutdown();
   jobs::shutdown();
   hzb::shutdown();
+  taa::shutdown();
   // Unhooks the release listener before the pool clears, so its last releases have no cache left to evict from
   shutdown_bindings();
   transient_pool().clear();
@@ -134,6 +137,7 @@ void on_worker_frame_begin([[maybe_unused]] uint64_t frameId, [[maybe_unused]] c
   bind_cache_tick(frameId);
   compact::worker_frame_begin(frameId);
   hzb::worker_tick(frameId);
+  taa::worker_tick(frameId);
   systems::tick_worker(frameId);
 #endif
 }
@@ -167,8 +171,19 @@ FeatureSupport feature_support(Feature feature, uint8_t option, const Settings& 
 
 bool feature_ready(Feature feature) noexcept {
   // feature_active calls this, and inactive features stay ready
-  return detail::feature_info(feature).tier == detail::Tier::None || !feature_enabled(effective_settings(), feature) ||
-         !gfx::scene_layout_transitioning();
+  if (detail::feature_info(feature).tier == detail::Tier::None || !feature_enabled(effective_settings(), feature)) {
+    return true;
+  }
+  if (gfx::scene_layout_transitioning()) {
+    return false;
+  }
+#if AURORA_ENABLE_RENDER
+  if (feature == Feature::Taa && !detail::taa::ready(effective_settings())) {
+    return false;
+  }
+#endif
+  // DeferredFog mirrors the gbuffer request but has no composite until its built bit is set
+  return feature != Feature::DeferredFog || feature_support(Feature::DeferredFog, 1).supported;
 }
 
 std::string_view feature_name(Feature feature) noexcept { return detail::feature_info(feature).name; }

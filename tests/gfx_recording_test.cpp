@@ -21,6 +21,7 @@
 #include "render/graph_bind.hpp"
 #include "render/graph_layout.hpp"
 #include "render/hints.hpp"
+#include "render/history_reset.hpp"
 #include "render/scene/classify.hpp"
 #include "render/scene_depth.hpp"
 #include "render/settings.hpp"
@@ -1634,6 +1635,16 @@ TEST_F(GfxRenderStageTest, StagesPushUniformsOnlyForPasses) {
 
 class GfxHistoryStageTest : public GfxRenderStageTest {
 protected:
+  void TearDown() override {
+    GfxRenderStageTest::TearDown();
+    render::detail::testing::reset_hints();
+  }
+
+  static void use_hints() {
+    render::detail::testing::set_hints_override(1);
+    render::detail::install_hints();
+  }
+
   void add_history_passes() {
     add_declared("h", 0, true, [](auto& b) { b.history("hist", StageTexture, render::detail::Access::StorageWrite); });
     add_declared("p", 1, true, [](auto& b) {
@@ -1762,6 +1773,36 @@ TEST_F(GfxHistoryStageTest, SameHashRecompileKeepsCullState) {
   EXPECT_NE(frame.renderState->graph, before);
   EXPECT_EQ(frame.renderState->graph->graphHash, before->graphHash);
   EXPECT_TRUE(prev_valid_at_marker());
+}
+
+TEST_F(GfxHistoryStageTest, NoHistoriesSkipsCameraCheck) {
+  use_hints();
+  add_declared("p", 0, true, [](auto& b) { b.side_effect(); });
+  for (uint32_t cutEpoch = 0; cutEpoch < 3; ++cutEpoch) {
+    ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+    aurora::test::process_hints(aurora::test::camera_hint(AURORA_CAMERA_MAIN, true, cutEpoch));
+    record_stage(Stage::OpaqueDone);
+    ASSERT_EQ(frame.stages.size(), 1u);
+    EXPECT_TRUE(frame.stages[0].sceneHints->has(render::detail::SceneHasMainCamera));
+  }
+  EXPECT_EQ(render::detail::history_reset::stats().frames, 0u);
+}
+
+TEST_F(GfxHistoryStageTest, CutEpochInvalidatesAtSceneBegin) {
+  use_hints();
+  add_history_passes();
+  const std::array<std::pair<uint32_t, bool>, 5> frames{{{0, false}, {0, true}, {1, false}, {1, true}, {1, true}}};
+  for (const auto& [cutEpoch, valid] : frames) {
+    ASSERT_NO_FATAL_FAILURE(latch_new_frame(2));
+    aurora::test::process_hints(aurora::test::camera_hint(AURORA_CAMERA_MAIN, true, cutEpoch));
+    EXPECT_EQ(prev_valid_at_marker(), valid) << "cut epoch " << cutEpoch;
+  }
+  using render::detail::history_reset::Reason;
+  const auto stats = render::detail::history_reset::stats();
+  EXPECT_EQ(stats.frames, frames.size());
+  EXPECT_EQ(stats.reasons[static_cast<size_t>(Reason::CameraReacquired)], 1u);
+  EXPECT_EQ(stats.reasons[static_cast<size_t>(Reason::CutEpoch)], 1u);
+  EXPECT_EQ(stats.reasons[static_cast<size_t>(Reason::None)], 3u);
 }
 
 using render::DepthSource;

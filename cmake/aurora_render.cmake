@@ -67,6 +67,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/gx_ext/records.hpp
         lib/render/hints.cpp
         lib/render/hints.hpp
+        lib/render/history_reset.cpp
+        lib/render/history_reset.hpp
         lib/render/jobs.cpp
         lib/render/jobs.hpp
         lib/render/json.hpp
@@ -82,6 +84,10 @@ if (AURORA_ENABLE_RENDER)
         lib/render/material/schema_text.cpp
         lib/render/material/user_layer.cpp
         lib/render/material/user_layer.hpp
+        lib/render/post/taa.cpp
+        lib/render/post/taa.hpp
+        lib/render/post/temporal_resolve.cpp
+        lib/render/post/temporal_resolve.hpp
         lib/render/scene/classifier.cpp
         lib/render/scene/classifier.hpp
         lib/render/scene/classify.cpp
