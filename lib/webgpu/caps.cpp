@@ -30,7 +30,9 @@ constexpr std::array RequestedFeatureTable{
     RequestedFeature{wgpu::FeatureName::AdapterPropertiesD3D, "AdapterPropertiesD3D"},
     RequestedFeature{wgpu::FeatureName::SharedBufferMemoryD3D12Resource, "SharedBufferMemoryD3D12Resource"},
     RequestedFeature{wgpu::FeatureName::SharedFenceDXGISharedHandle, "SharedFenceDXGISharedHandle"},
+    RequestedFeature{wgpu::FeatureName::SharedTextureMemoryD3D12Resource, "SharedTextureMemoryD3D12Resource"},
 };
+constexpr size_t NativeInteropFeatureCount = 1;
 
 // Written on the main thread inside initialize, before any other thread reads it
 render::Caps g_caps;
@@ -88,7 +90,10 @@ render::DeviceLimits device_limits(const wgpu::Limits& limits, const wgpu::Compa
 }
 } // namespace
 
-std::span<const RequestedFeature> requested_features() noexcept { return RequestedFeatureTable; }
+std::span<const RequestedFeature> requested_features(bool nativeInterop) noexcept {
+  const std::span<const RequestedFeature> table{RequestedFeatureTable};
+  return nativeInterop ? table : table.first(table.size() - NativeInteropFeatureCount);
+}
 
 std::string_view requested_feature_name(wgpu::FeatureName feature) noexcept {
   for (const auto& entry : RequestedFeatureTable) {
@@ -105,9 +110,9 @@ bool requests_core_features(std::span<const wgpu::FeatureName> adapterFeatures, 
 }
 
 std::vector<wgpu::FeatureName> select_device_features(std::span<const wgpu::FeatureName> adapterFeatures,
-                                                      AuroraFeatureProfile profile) {
+                                                      AuroraFeatureProfile profile, bool nativeInterop) {
   std::vector<wgpu::FeatureName> features;
-  for (const auto& entry : RequestedFeatureTable) {
+  for (const auto& entry : requested_features(nativeInterop)) {
     if (contains(adapterFeatures, entry.feature) && feature_profile_allows(profile, entry.feature)) {
       features.push_back(entry.feature);
     }
@@ -117,10 +122,11 @@ std::vector<wgpu::FeatureName> select_device_features(std::span<const wgpu::Feat
 
 std::vector<FeatureRequestResult> describe_feature_requests(std::span<const wgpu::FeatureName> adapterFeatures,
                                                             std::span<const wgpu::FeatureName> deviceFeatures,
-                                                            AuroraFeatureProfile profile) {
+                                                            AuroraFeatureProfile profile, bool nativeInterop) {
+  const auto table = requested_features(nativeInterop);
   std::vector<FeatureRequestResult> results;
-  results.reserve(RequestedFeatureTable.size());
-  for (const auto& entry : RequestedFeatureTable) {
+  results.reserve(table.size());
+  for (const auto& entry : table) {
     auto state = FeatureRequestState::Unsupported;
     if (contains(deviceFeatures, entry.feature)) {
       state = FeatureRequestState::Enabled;
@@ -264,6 +270,7 @@ render::Caps build_caps(const CapsSource& source) {
       .rg11b10Renderable = has(wgpu::FeatureName::RG11B10UfloatRenderable),
       .d3d12SharedBuffer = sharedBuffer,
       .d3d12SharedFence = sharedFence,
+      .d3d12SharedTexture = has(wgpu::FeatureName::SharedTextureMemoryD3D12Resource),
       // The Null backend reports every feature, so interop also needs a real D3D12 device
       .d3d12Interop = backend == BACKEND_D3D12 && sharedBuffer && sharedFence,
       .nativeD3D12 = backend == BACKEND_D3D12 && source.nativeD3D12,

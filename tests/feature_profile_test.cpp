@@ -20,6 +20,7 @@ constexpr std::array MetalMasked{
     FeatureName::AtomicVec2uMinMax,
     FeatureName::SharedBufferMemoryD3D12Resource,
     FeatureName::SharedFenceDXGISharedHandle,
+    FeatureName::SharedTextureMemoryD3D12Resource,
 };
 
 constexpr std::array CommonFeatures{
@@ -147,13 +148,14 @@ TEST(FeatureProfileTest, MaskedFeatureNames) {
   EXPECT_EQ(compat[0].name, "CoreFeaturesAndLimits");
 
   const auto metal = feature_profile_masked_features(FEATURE_PROFILE_METAL);
-  ASSERT_EQ(metal.size(), 6u);
+  ASSERT_EQ(metal.size(), 7u);
   EXPECT_EQ(metal[0].name, "MultiDrawIndirect");
   EXPECT_EQ(metal[1].name, "ChromiumExperimentalSamplingResourceTable");
   EXPECT_EQ(metal[2].name, "PrimitiveIndex");
   EXPECT_EQ(metal[3].name, "AtomicVec2uMinMax");
   EXPECT_EQ(metal[4].name, "SharedBufferMemoryD3D12Resource");
   EXPECT_EQ(metal[5].name, "SharedFenceDXGISharedHandle");
+  EXPECT_EQ(metal[6].name, "SharedTextureMemoryD3D12Resource");
   for (size_t i = 0; i < metal.size(); ++i) {
     EXPECT_FALSE(metal[i].name.empty());
     EXPECT_EQ(metal[i].feature, MetalMasked[i]);

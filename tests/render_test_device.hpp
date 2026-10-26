@@ -23,6 +23,8 @@ struct TestDeviceOptions {
   bool productionToggles = false;
   std::optional<AuroraFeatureProfile> profile;
   bool preciseTimestamps = false;
+  bool backendValidation = false;
+  bool nativeInterop = false;
 };
 
 struct TestDevice {

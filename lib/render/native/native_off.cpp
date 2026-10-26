@@ -7,6 +7,8 @@ void shutdown_native() noexcept {}
 } // namespace aurora::render::detail
 
 namespace aurora::render::detail::native {
+bool interop_enabled() noexcept { return false; }
+
 bool initialize_device(const wgpu::Device&, const wgpu::Adapter&) noexcept { return false; }
 
 void initialize() noexcept {}

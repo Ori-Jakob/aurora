@@ -59,14 +59,14 @@ struct CapsSource {
   bool nativeD3D12 = false;
 };
 
-std::span<const RequestedFeature> requested_features() noexcept;
+std::span<const RequestedFeature> requested_features(bool nativeInterop = false) noexcept;
 std::string_view requested_feature_name(wgpu::FeatureName feature) noexcept;
 bool requests_core_features(std::span<const wgpu::FeatureName> adapterFeatures, AuroraFeatureProfile profile) noexcept;
 std::vector<wgpu::FeatureName> select_device_features(std::span<const wgpu::FeatureName> adapterFeatures,
-                                                      AuroraFeatureProfile profile);
+                                                      AuroraFeatureProfile profile, bool nativeInterop = false);
 std::vector<FeatureRequestResult> describe_feature_requests(std::span<const wgpu::FeatureName> adapterFeatures,
                                                             std::span<const wgpu::FeatureName> deviceFeatures,
-                                                            AuroraFeatureProfile profile);
+                                                            AuroraFeatureProfile profile, bool nativeInterop = false);
 wgpu::Limits build_required_limits(const wgpu::Limits& adapter, bool core, AuroraFeatureProfile profile,
                                    uint32_t immediateSize) noexcept;
 VramInfo vram_from_heaps(std::span<const wgpu::MemoryHeapInfo> heaps, wgpu::AdapterType adapterType) noexcept;

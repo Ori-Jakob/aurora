@@ -5,6 +5,10 @@
 #include "webgpu/feature_profile.hpp"
 #include "webgpu/gpu.hpp"
 
+#ifdef WEBGPU_DAWN
+#include <dawn/native/DawnNative.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -42,8 +46,18 @@ std::unique_ptr<TestDevice> create_test_device(const TestDeviceOptions& options,
       .enabledToggleCount = instanceToggles.size(),
       .enabledToggles = instanceToggles.data(),
   }};
+#ifdef WEBGPU_DAWN
+  dawn::native::DawnInstanceDescriptor validationDescriptor{};
+  validationDescriptor.nextInChain = &instanceTogglesDescriptor;
+  validationDescriptor.backendValidationLevel = dawn::native::BackendValidationLevel::Partial;
+  const wgpu::ChainedStruct* instanceChain = options.backendValidation
+                                                 ? static_cast<const wgpu::ChainedStruct*>(&validationDescriptor)
+                                                 : &instanceTogglesDescriptor;
+#else
+  const wgpu::ChainedStruct* instanceChain = &instanceTogglesDescriptor;
+#endif
   const wgpu::InstanceDescriptor instanceDescriptor{
-      .nextInChain = &instanceTogglesDescriptor,
+      .nextInChain = instanceChain,
       .requiredFeatureCount = instanceFeatures.size(),
       .requiredFeatures = instanceFeatures.data(),
   };
@@ -96,7 +110,7 @@ std::unique_ptr<TestDevice> create_test_device(const TestDeviceOptions& options,
   std::vector<const char*> disabledToggles;
   if (profileMode) {
     const AuroraFeatureProfile profile = *options.profile;
-    features = webgpu::select_device_features(adapterFeatures, profile);
+    features = webgpu::select_device_features(adapterFeatures, profile, options.nativeInterop);
     requiredLimits = webgpu::build_required_limits(
         adapterLimits, webgpu::requests_core_features(adapterFeatures, profile), profile, GxDrawImmediateSize);
     requiredLimits.nextInChain = &compatLimits;
@@ -117,6 +131,14 @@ std::unique_ptr<TestDevice> create_test_device(const TestDeviceOptions& options,
     }
     if (options.optionalFeatures) {
       for (const auto feature : OptionalFeatures) {
+        if (result->adapter.HasFeature(feature)) {
+          features.push_back(feature);
+        }
+      }
+    }
+    if (options.nativeInterop) {
+      for (const auto feature :
+           {wgpu::FeatureName::SharedTextureMemoryD3D12Resource, wgpu::FeatureName::SharedFenceDXGISharedHandle}) {
         if (result->adapter.HasFeature(feature)) {
           features.push_back(feature);
         }
@@ -150,8 +172,16 @@ std::unique_ptr<TestDevice> create_test_device(const TestDeviceOptions& options,
                                            to_string(text));
       },
       result.get());
-  deviceDescriptor.SetDeviceLostCallback(wgpu::CallbackMode::AllowSpontaneous,
-                                         [](const wgpu::Device&, wgpu::DeviceLostReason, wgpu::StringView) {});
+  deviceDescriptor.SetDeviceLostCallback(
+      wgpu::CallbackMode::AllowSpontaneous,
+      [](const wgpu::Device&, wgpu::DeviceLostReason reason, wgpu::StringView text, TestDevice* device) {
+        if (reason == wgpu::DeviceLostReason::Destroyed || reason == wgpu::DeviceLostReason::CallbackCancelled) {
+          return;
+        }
+        std::lock_guard lock{device->errorMutex};
+        device->uncapturedErrors.push_back("device lost: " + to_string(text));
+      },
+      result.get());
   const wgpu::Future deviceFuture =
       result->adapter.RequestDevice(&deviceDescriptor, wgpu::CallbackMode::WaitAnyOnly,
                                     [&](wgpu::RequestDeviceStatus status, wgpu::Device device, wgpu::StringView text) {

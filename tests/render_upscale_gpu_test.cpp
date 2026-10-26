@@ -28,8 +28,15 @@
 
 #if AURORA_ENABLE_NATIVE_D3D12
 #include "render/native/d3d12/device.hpp"
+#include "render/native/d3d12/shared_texture.hpp"
+#include "render/native/d3d12/teardown.hpp"
 
 #include <wrl/client.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <thread>
 #endif
 
 namespace aurora::render::detail {
@@ -1390,6 +1397,475 @@ TEST(NativeD3D12Gpu, DeviceAndQueueComeFromDawn) {
   EXPECT_FALSE(d3d12::available());
   EXPECT_EQ(d3d12::device(), nullptr);
   EXPECT_EQ(d3d12::queue(), nullptr);
+}
+
+constexpr uint32_t SharedWidth = 64;
+constexpr uint32_t SharedHeight = 32;
+constexpr uint32_t SharedRowBytes = SharedWidth * 4;
+
+std::vector<uint32_t> texel_pattern(uint32_t seed) {
+  std::vector<uint32_t> out(size_t{SharedWidth} * SharedHeight);
+  for (uint32_t y = 0; y < SharedHeight; ++y) {
+    for (uint32_t x = 0; x < SharedWidth; ++x) {
+      out[size_t{y} * SharedWidth + x] = mix_bits(x + seed * 977u, y + seed * 131u);
+    }
+  }
+  return out;
+}
+
+class NativeInteropGpu : public ::testing::Test {
+protected:
+  using SharedTexture = native::d3d12::SharedTexture;
+
+  struct Commands {
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+  };
+
+  struct GateRelease {
+    ID3D12Fence* gate = nullptr;
+    ~GateRelease() {
+      if (gate != nullptr) {
+        gate->Signal(1);
+      }
+    }
+  };
+
+  void SetUp() override {
+    m_options = {
+        .backend = test::parse_test_backend(std::getenv("AURORA_TEST_BACKEND")).value_or(wgpu::BackendType::Undefined),
+        .efbSize = {SharedWidth, SharedHeight, 1},
+        .createEfb = true,
+        .backendValidation = true,
+        .nativeInterop = true,
+    };
+    m_device = test::create_test_device(m_options, m_error);
+    if (!m_device) {
+      GTEST_SKIP() << "no adapter: " << m_error;
+    }
+    if (m_device->adapterInfo.backendType != wgpu::BackendType::D3D12) {
+      m_device.reset();
+      GTEST_SKIP() << "needs the D3D12 backend";
+    }
+    if (!m_device->device.HasFeature(wgpu::FeatureName::SharedTextureMemoryD3D12Resource) ||
+        !m_device->device.HasFeature(wgpu::FeatureName::SharedFenceDXGISharedHandle)) {
+      m_device.reset();
+      GTEST_SKIP() << "needs D3D12 shared textures and fences";
+    }
+    m_globals = std::make_unique<test::ScopedGlobalDevice>(*m_device, m_options);
+    ASSERT_TRUE(native::d3d12::initialize(m_device->device, m_device->adapter));
+    Microsoft::WRL::ComPtr<ID3D12DebugDevice> debugDevice;
+    if (FAILED(native_device()->QueryInterface(IID_PPV_ARGS(&debugDevice)))) {
+      std::fprintf(stderr, "note: the D3D12 debug layer is not available\n");
+    }
+    m_started = true;
+  }
+
+  void TearDown() override {
+    if (m_started) {
+      drain(native::d3d12::queue());
+      for (const auto& queue : m_queues) {
+        drain(queue.Get());
+      }
+      m_commands.clear();
+      m_queues.clear();
+      native::d3d12::run_teardowns();
+      EXPECT_EQ(native::d3d12::shared_bytes(), 0u);
+      EXPECT_EQ(debug_layer_errors(), std::vector<std::string>{});
+      native::d3d12::shutdown();
+    }
+    if (m_device) {
+      EXPECT_EQ(test::take_uncaptured_errors(*m_device), std::vector<std::string>{});
+    }
+    m_globals.reset();
+    m_device.reset();
+  }
+
+  static ID3D12Device* native_device() { return native::d3d12::device(); }
+
+  static std::vector<std::string> debug_layer_errors() {
+    std::vector<std::string> out;
+    Microsoft::WRL::ComPtr<ID3D12InfoQueue> info;
+    if (native_device() == nullptr || FAILED(native_device()->QueryInterface(IID_PPV_ARGS(&info)))) {
+      return out;
+    }
+    const UINT64 count = info->GetNumStoredMessages();
+    for (UINT64 i = 0; i < count; ++i) {
+      SIZE_T length = 0;
+      info->GetMessage(i, nullptr, &length);
+      std::vector<std::byte> storage(length);
+      auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+      if (SUCCEEDED(info->GetMessage(i, message, &length)) && message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR) {
+        out.emplace_back(message->pDescription);
+      }
+    }
+    return out;
+  }
+
+  static void drain(ID3D12CommandQueue* queue) {
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    ASSERT_TRUE(SUCCEEDED(native_device()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))));
+    ASSERT_TRUE(SUCCEEDED(queue->Signal(fence.Get(), 1)));
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    ASSERT_NE(event, nullptr);
+    ASSERT_TRUE(SUCCEEDED(fence->SetEventOnCompletion(1, event)));
+    EXPECT_EQ(WaitForSingleObject(event, 10000), WAIT_OBJECT_0);
+    CloseHandle(event);
+  }
+
+  Commands open_commands() {
+    Commands out;
+    EXPECT_TRUE(SUCCEEDED(
+        native_device()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&out.allocator))));
+    EXPECT_TRUE(SUCCEEDED(native_device()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, out.allocator.Get(),
+                                                             nullptr, IID_PPV_ARGS(&out.list))));
+    return out;
+  }
+
+  void execute(ID3D12CommandQueue* queue, const Commands& commands) {
+    ASSERT_TRUE(SUCCEEDED(commands.list->Close()));
+    ID3D12CommandList* lists[] = {commands.list.Get()};
+    queue->ExecuteCommandLists(1, lists);
+    m_commands.push_back(commands);
+  }
+
+  ID3D12CommandQueue* side_queue() {
+    const D3D12_COMMAND_QUEUE_DESC desc{.Type = D3D12_COMMAND_LIST_TYPE_DIRECT};
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+    EXPECT_TRUE(SUCCEEDED(native_device()->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue))));
+    m_queues.push_back(queue);
+    return queue.Get();
+  }
+
+  static Microsoft::WRL::ComPtr<ID3D12Fence> gate_fence() {
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    EXPECT_TRUE(SUCCEEDED(native_device()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))));
+    return fence;
+  }
+
+  static Microsoft::WRL::ComPtr<ID3D12Resource> native_buffer(D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES state) {
+    const D3D12_HEAP_PROPERTIES heap{.Type = type};
+    const D3D12_RESOURCE_DESC desc{
+        .Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
+        .Width = uint64_t{SharedRowBytes} * SharedHeight,
+        .Height = 1,
+        .DepthOrArraySize = 1,
+        .MipLevels = 1,
+        .Format = DXGI_FORMAT_UNKNOWN,
+        .SampleDesc = {.Count = 1},
+        .Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+    };
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    EXPECT_TRUE(SUCCEEDED(native_device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+                                                                   IID_PPV_ARGS(&buffer))));
+    return buffer;
+  }
+
+  static D3D12_TEXTURE_COPY_LOCATION buffer_location(ID3D12Resource* buffer, DXGI_FORMAT format) {
+    D3D12_TEXTURE_COPY_LOCATION location{};
+    location.pResource = buffer;
+    location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    location.PlacedFootprint.Footprint = {
+        .Format = format, .Width = SharedWidth, .Height = SharedHeight, .Depth = 1, .RowPitch = SharedRowBytes};
+    return location;
+  }
+
+  static D3D12_TEXTURE_COPY_LOCATION texture_location(ID3D12Resource* texture) {
+    D3D12_TEXTURE_COPY_LOCATION location{};
+    location.pResource = texture;
+    location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    location.SubresourceIndex = 0;
+    return location;
+  }
+
+  static void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
+                         D3D12_RESOURCE_STATES after) {
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = resource;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = before;
+    barrier.Transition.StateAfter = after;
+    list->ResourceBarrier(1, &barrier);
+  }
+
+  static std::vector<uint32_t> map_words(ID3D12Resource* buffer) {
+    std::vector<uint32_t> out(size_t{SharedWidth} * SharedHeight);
+    void* data = nullptr;
+    const D3D12_RANGE range{0, out.size() * sizeof(uint32_t)};
+    if (FAILED(buffer->Map(0, &range, &data))) {
+      return {};
+    }
+    std::memcpy(out.data(), data, out.size() * sizeof(uint32_t));
+    const D3D12_RANGE written{0, 0};
+    buffer->Unmap(0, &written);
+    return out;
+  }
+
+  [[nodiscard]] static std::unique_ptr<SharedTexture> shared(TextureFormat format, std::string_view label,
+                                                             bool renderTarget = false) {
+    return SharedTexture::create(
+        {.format = format, .width = SharedWidth, .height = SharedHeight, .renderTarget = renderTarget, .label = label});
+  }
+
+  void write_dawn(const wgpu::Texture& texture, const std::vector<uint32_t>& words) const {
+    const wgpu::TexelCopyTextureInfo destination{.texture = texture};
+    const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = SharedRowBytes, .rowsPerImage = SharedHeight};
+    const wgpu::Extent3D extent{SharedWidth, SharedHeight, 1};
+    m_device->queue.WriteTexture(&destination, words.data(), words.size() * sizeof(uint32_t), &layout, &extent);
+  }
+
+  [[nodiscard]] wgpu::Buffer copy_dawn(const wgpu::Texture& texture) const {
+    const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead,
+                                            .size = uint64_t{SharedRowBytes} * SharedHeight};
+    const wgpu::Buffer buffer = m_device->device.CreateBuffer(&descriptor);
+    const wgpu::TexelCopyTextureInfo source{.texture = texture};
+    const wgpu::TexelCopyBufferInfo destination{.layout = {.bytesPerRow = SharedRowBytes, .rowsPerImage = SharedHeight},
+                                                .buffer = buffer};
+    const wgpu::Extent3D extent{SharedWidth, SharedHeight, 1};
+    const wgpu::CommandEncoder encoder = m_device->device.CreateCommandEncoder();
+    encoder.CopyTextureToBuffer(&source, &destination, &extent);
+    const wgpu::CommandBuffer commands = encoder.Finish();
+    m_device->queue.Submit(1, &commands);
+    return buffer;
+  }
+
+  [[nodiscard]] std::vector<uint32_t> map_dawn(const wgpu::Buffer& buffer) const {
+    bool mapped = false;
+    const wgpu::Future future = buffer.MapAsync(
+        wgpu::MapMode::Read, 0, buffer.GetSize(), wgpu::CallbackMode::WaitAnyOnly,
+        [&](wgpu::MapAsyncStatus status, wgpu::StringView) { mapped = status == wgpu::MapAsyncStatus::Success; });
+    if (m_device->instance.WaitAny(future, 5'000'000'000) != wgpu::WaitStatus::Success || !mapped) {
+      return {};
+    }
+    return mapped_words(buffer);
+  }
+
+  static std::vector<uint32_t> mapped_words(const wgpu::Buffer& buffer) {
+    std::vector<uint32_t> words(buffer.GetSize() / sizeof(uint32_t));
+    std::memcpy(words.data(), buffer.GetConstMappedRange(0, buffer.GetSize()), words.size() * sizeof(uint32_t));
+    buffer.Unmap();
+    return words;
+  }
+
+  test::TestDeviceOptions m_options;
+  std::unique_ptr<test::TestDevice> m_device;
+  std::unique_ptr<test::ScopedGlobalDevice> m_globals;
+  std::string m_error;
+  bool m_started = false;
+  std::vector<Commands> m_commands;
+  std::vector<Microsoft::WRL::ComPtr<ID3D12CommandQueue>> m_queues;
+};
+
+class D3D12SharedTextureGpu : public NativeInteropGpu {};
+class NativeFence : public NativeInteropGpu {};
+
+TEST_F(D3D12SharedTextureGpu, DawnWriteNativeCopyDawnRead) {
+  const auto fence = native::d3d12::NativeFence::create("test.fence");
+  const auto source = shared(TextureFormat::RGBA8Unorm, "test.source");
+  const auto target = shared(TextureFormat::RGBA8Unorm, "test.target");
+  ASSERT_TRUE(fence && source && target);
+  EXPECT_GT(source->bytes(), 0u);
+  EXPECT_EQ(native::d3d12::shared_bytes(), source->bytes() + target->bytes());
+  const auto pattern = texel_pattern(1);
+
+  ASSERT_TRUE(source->begin(false));
+  write_dawn(source->texture(), pattern);
+  const auto written = source->end();
+  ASSERT_TRUE(written.has_value());
+  ASSERT_FALSE(written->fences.empty());
+
+  ID3D12CommandQueue* queue = native::d3d12::queue();
+  ASSERT_TRUE(native::d3d12::queue_wait(queue, *written));
+  const Commands commands = open_commands();
+  commands.list->CopyResource(target->resource(), source->resource());
+  execute(queue, commands);
+  const uint64_t copied = fence->signal(queue);
+  source->mark_used(*fence, copied);
+  target->mark_used(*fence, copied);
+
+  const std::array fences{fence->dawn()};
+  const std::array values{copied};
+  ASSERT_TRUE(target->begin(true, fences, values));
+  const wgpu::Buffer buffer = copy_dawn(target->texture());
+  EXPECT_TRUE(target->end().has_value());
+  EXPECT_EQ(map_dawn(buffer), pattern);
+}
+
+TEST_F(D3D12SharedTextureGpu, Bgra8CopyFromEfb) {
+  const auto fence = native::d3d12::NativeFence::create("test.fence");
+  const auto copy = shared(TextureFormat::BGRA8Unorm, "test.efb_copy");
+  ASSERT_TRUE(fence && copy);
+  const wgpu::Texture& efb = webgpu::g_frameBuffer.texture;
+  ASSERT_EQ(efb.GetFormat(), TextureFormat::BGRA8Unorm);
+  const auto pattern = texel_pattern(2);
+  write_dawn(efb, pattern);
+
+  ASSERT_TRUE(copy->begin(false));
+  const wgpu::TexelCopyTextureInfo from{.texture = efb};
+  const wgpu::TexelCopyTextureInfo to{.texture = copy->texture()};
+  const wgpu::Extent3D extent{SharedWidth, SharedHeight, 1};
+  const wgpu::CommandEncoder encoder = m_device->device.CreateCommandEncoder();
+  encoder.CopyTextureToTexture(&from, &to, &extent);
+  const wgpu::CommandBuffer dawnCommands = encoder.Finish();
+  m_device->queue.Submit(1, &dawnCommands);
+  const auto copied = copy->end();
+  ASSERT_TRUE(copied.has_value());
+
+  ID3D12CommandQueue* queue = native::d3d12::queue();
+  const auto readback = native_buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(readback);
+  ASSERT_TRUE(native::d3d12::queue_wait(queue, *copied));
+  const Commands commands = open_commands();
+  const auto destination = buffer_location(readback.Get(), DXGI_FORMAT_B8G8R8A8_UNORM);
+  const auto sourceLocation = texture_location(copy->resource());
+  commands.list->CopyTextureRegion(&destination, 0, 0, 0, &sourceLocation, nullptr);
+  execute(queue, commands);
+  const uint64_t read = fence->signal(queue);
+  copy->mark_used(*fence, read);
+  ASSERT_TRUE(fence->wait_cpu(read));
+  EXPECT_EQ(map_words(readback.Get()), pattern);
+}
+
+TEST_F(D3D12SharedTextureGpu, BeginAccessResetsToCommon) {
+  const auto fence = native::d3d12::NativeFence::create("test.fence");
+  const auto target = shared(TextureFormat::RGBA8Unorm, "test.target", true);
+  ASSERT_TRUE(fence && target);
+  ID3D12CommandQueue* queue = native::d3d12::queue();
+
+  ASSERT_TRUE(target->begin(false));
+  wgpu::RenderPassColorAttachment attachment{};
+  attachment.view = target->view();
+  attachment.loadOp = wgpu::LoadOp::Clear;
+  attachment.storeOp = wgpu::StoreOp::Store;
+  attachment.clearValue = {0.2, 0.4, 0.6, 1.0};
+  const wgpu::RenderPassDescriptor pass{.colorAttachmentCount = 1, .colorAttachments = &attachment};
+  const wgpu::CommandEncoder encoder = m_device->device.CreateCommandEncoder();
+  encoder.BeginRenderPass(&pass).End();
+  const wgpu::CommandBuffer dawnCommands = encoder.Finish();
+  m_device->queue.Submit(1, &dawnCommands);
+  const auto cleared = target->end();
+  ASSERT_TRUE(cleared.has_value());
+
+  const auto readback = native_buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+  ASSERT_TRUE(readback);
+  ASSERT_TRUE(native::d3d12::queue_wait(queue, *cleared));
+  const Commands copyCommands = open_commands();
+  transition(copyCommands.list.Get(), target->resource(), D3D12_RESOURCE_STATE_COMMON,
+             D3D12_RESOURCE_STATE_COPY_SOURCE);
+  const auto destination = buffer_location(readback.Get(), DXGI_FORMAT_R8G8B8A8_UNORM);
+  const auto sourceLocation = texture_location(target->resource());
+  copyCommands.list->CopyTextureRegion(&destination, 0, 0, 0, &sourceLocation, nullptr);
+  transition(copyCommands.list.Get(), target->resource(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+             D3D12_RESOURCE_STATE_COMMON);
+  execute(queue, copyCommands);
+  const uint64_t read = fence->signal(queue);
+  target->mark_used(*fence, read);
+  ASSERT_TRUE(fence->wait_cpu(read));
+  EXPECT_EQ(map_words(readback.Get()), std::vector<uint32_t>(size_t{SharedWidth} * SharedHeight, 0xFF996633u));
+
+  const D3D12_DESCRIPTOR_HEAP_DESC heapDesc{.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV, .NumDescriptors = 1};
+  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;
+  ASSERT_TRUE(SUCCEEDED(native_device()->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&heap))));
+  const D3D12_CPU_DESCRIPTOR_HANDLE rtv = heap->GetCPUDescriptorHandleForHeapStart();
+  native_device()->CreateRenderTargetView(target->resource(), nullptr, rtv);
+  const Commands clearCommands = open_commands();
+  transition(clearCommands.list.Get(), target->resource(), D3D12_RESOURCE_STATE_COMMON,
+             D3D12_RESOURCE_STATE_RENDER_TARGET);
+  constexpr std::array<float, 4> NativeClear{0.8f, 0.6f, 0.4f, 0.2f};
+  clearCommands.list->ClearRenderTargetView(rtv, NativeClear.data(), 0, nullptr);
+  transition(clearCommands.list.Get(), target->resource(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+             D3D12_RESOURCE_STATE_COMMON);
+  execute(queue, clearCommands);
+  const uint64_t nativeCleared = fence->signal(queue);
+  target->mark_used(*fence, nativeCleared);
+
+  const std::array fences{fence->dawn()};
+  const std::array values{nativeCleared};
+  ASSERT_TRUE(target->begin(true, fences, values));
+  const wgpu::Buffer buffer = copy_dawn(target->texture());
+  EXPECT_TRUE(target->end().has_value());
+  EXPECT_EQ(map_dawn(buffer), std::vector<uint32_t>(size_t{SharedWidth} * SharedHeight, 0x336699CCu));
+}
+
+TEST_F(D3D12SharedTextureGpu, FenceOrdersNativeBeforeDawnRead) {
+  const auto fence = native::d3d12::NativeFence::create("test.fence");
+  const auto target = shared(TextureFormat::RGBA8Unorm, "test.target");
+  ASSERT_TRUE(fence && target);
+  const auto stale = texel_pattern(3);
+  const auto fresh = texel_pattern(4);
+  ASSERT_TRUE(target->begin(false));
+  write_dawn(target->texture(), stale);
+  const auto written = target->end();
+  ASSERT_TRUE(written.has_value());
+
+  const auto upload = native_buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+  ASSERT_TRUE(upload);
+  void* mapped = nullptr;
+  ASSERT_TRUE(SUCCEEDED(upload->Map(0, nullptr, &mapped)));
+  std::memcpy(mapped, fresh.data(), fresh.size() * sizeof(uint32_t));
+  upload->Unmap(0, nullptr);
+
+  ID3D12CommandQueue* side = side_queue();
+  const auto gate = gate_fence();
+  ASSERT_TRUE(side && gate);
+  const GateRelease release{gate.Get()};
+  ASSERT_TRUE(SUCCEEDED(side->Wait(gate.Get(), 1)));
+  ASSERT_TRUE(native::d3d12::queue_wait(side, *written));
+  const Commands commands = open_commands();
+  const auto destination = texture_location(target->resource());
+  const auto sourceLocation = buffer_location(upload.Get(), DXGI_FORMAT_R8G8B8A8_UNORM);
+  commands.list->CopyTextureRegion(&destination, 0, 0, 0, &sourceLocation, nullptr);
+  execute(side, commands);
+  const uint64_t uploaded = fence->signal(side);
+  target->mark_used(*fence, uploaded);
+
+  const std::array fences{fence->dawn()};
+  const std::array values{uploaded};
+  ASSERT_TRUE(target->begin(true, fences, values));
+  const wgpu::Buffer buffer = copy_dawn(target->texture());
+  EXPECT_TRUE(target->end().has_value());
+  bool done = false;
+  const wgpu::Future future = buffer.MapAsync(
+      wgpu::MapMode::Read, 0, buffer.GetSize(), wgpu::CallbackMode::WaitAnyOnly,
+      [&](wgpu::MapAsyncStatus status, wgpu::StringView) { done = status == wgpu::MapAsyncStatus::Success; });
+  EXPECT_EQ(m_device->instance.WaitAny(future, 200'000'000), wgpu::WaitStatus::TimedOut);
+  EXPECT_LT(fence->completed(), uploaded);
+  ASSERT_TRUE(SUCCEEDED(gate->Signal(1)));
+  ASSERT_EQ(m_device->instance.WaitAny(future, 5'000'000'000), wgpu::WaitStatus::Success);
+  ASSERT_TRUE(done);
+  EXPECT_EQ(mapped_words(buffer), fresh);
+  EXPECT_TRUE(fence->wait_cpu(uploaded));
+}
+
+TEST_F(NativeFence, WaitCpuBlocksUntilSignal) {
+  const auto fence = native::d3d12::NativeFence::create("test.fence");
+  ASSERT_TRUE(fence);
+  ASSERT_TRUE(fence->dawn());
+  EXPECT_EQ(fence->last_signalled(), 0u);
+  EXPECT_TRUE(fence->wait_cpu(0));
+  ID3D12CommandQueue* side = side_queue();
+  const auto gate = gate_fence();
+  ASSERT_TRUE(side && gate);
+  const GateRelease release{gate.Get()};
+  ASSERT_TRUE(SUCCEEDED(side->Wait(gate.Get(), 1)));
+  const uint64_t value = fence->signal(side);
+  EXPECT_EQ(value, 1u);
+  EXPECT_EQ(fence->last_signalled(), value);
+  std::atomic<bool> done{false};
+  std::atomic<bool> ok{false};
+  std::thread waiter{[&] {
+    ok = fence->wait_cpu(value);
+    done = true;
+  }};
+  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  EXPECT_FALSE(done);
+  EXPECT_LT(fence->completed(), value);
+  EXPECT_TRUE(SUCCEEDED(gate->Signal(1)));
+  waiter.join();
+  EXPECT_TRUE(done);
+  EXPECT_TRUE(ok);
+  EXPECT_GE(fence->completed(), value);
 }
 #endif
 } // namespace

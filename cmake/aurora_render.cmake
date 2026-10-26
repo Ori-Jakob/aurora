@@ -91,6 +91,8 @@ if (AURORA_ENABLE_RENDER)
             lib/render/native/d3d12/device.hpp
             lib/render/native/d3d12/sentinel.cpp
             lib/render/native/d3d12/sentinel.hpp
+            lib/render/native/d3d12/shared_texture.cpp
+            lib/render/native/d3d12/shared_texture.hpp
             lib/render/native/d3d12/teardown.cpp
             lib/render/native/d3d12/teardown.hpp
             lib/render/native/native.cpp

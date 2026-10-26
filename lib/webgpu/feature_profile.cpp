@@ -11,13 +11,14 @@ constexpr std::array<MaskedFeature, 1> CompatMaskedFeatures{{
 }};
 
 // Worst-case Apple GPU: no MDI, resource table or D3D12 interop; PrimitiveIndex needs Apple7, atomic64 Apple8+
-constexpr std::array<MaskedFeature, 6> MetalMaskedFeatures{{
+constexpr std::array<MaskedFeature, 7> MetalMaskedFeatures{{
     {wgpu::FeatureName::MultiDrawIndirect, "MultiDrawIndirect"},
     {wgpu::FeatureName::ChromiumExperimentalSamplingResourceTable, "ChromiumExperimentalSamplingResourceTable"},
     {wgpu::FeatureName::PrimitiveIndex, "PrimitiveIndex"},
     {wgpu::FeatureName::AtomicVec2uMinMax, "AtomicVec2uMinMax"},
     {wgpu::FeatureName::SharedBufferMemoryD3D12Resource, "SharedBufferMemoryD3D12Resource"},
     {wgpu::FeatureName::SharedFenceDXGISharedHandle, "SharedFenceDXGISharedHandle"},
+    {wgpu::FeatureName::SharedTextureMemoryD3D12Resource, "SharedTextureMemoryD3D12Resource"},
 }};
 
 constexpr std::array<std::pair<std::string_view, AuroraFeatureProfile>, 5> ProfileNames{{

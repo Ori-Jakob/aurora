@@ -218,7 +218,7 @@ void log_caps(const render::Caps& caps, const std::vector<FeatureRequestResult>&
       caps.d3d12Interop ? "yes" : "no", shader_model_text(caps.d3dShaderModel));
 }
 
-render::Caps query_device_caps(std::span<const wgpu::FeatureName> adapterFeatures) {
+render::Caps query_device_caps(std::span<const wgpu::FeatureName> adapterFeatures, bool nativeInterop) {
   wgpu::SupportedFeatures deviceFeatures;
   g_device.GetFeatures(&deviceFeatures);
   wgpu::CompatibilityModeLimits compatLimits{};
@@ -269,7 +269,7 @@ render::Caps query_device_caps(std::span<const wgpu::FeatureName> adapterFeature
       .d3dShaderModel = infoValid && hasD3D ? d3dProperties.shaderModel : 0,
       .nativeD3D12 = nativeD3D12,
   });
-  log_caps(deviceCaps, describe_feature_requests(adapterFeatures, features, g_featureProfile));
+  log_caps(deviceCaps, describe_feature_requests(adapterFeatures, features, g_featureProfile, nativeInterop));
   return deviceCaps;
 }
 
@@ -1216,7 +1216,12 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         build_required_limits(supportedLimits, requestCore, g_featureProfile, sizeof(gx::DrawImmediateData));
     requiredLimits.nextInChain = &compatibilityModeLimits;
     log_required_limits(requiredLimits, requestCore);
-    const auto requiredFeatures = select_device_features(adapterFeatures, g_featureProfile);
+#if AURORA_ENABLE_NATIVE_D3D12
+    const bool nativeInterop = g_backendType == wgpu::BackendType::D3D12 && render::detail::native::interop_enabled();
+#else
+    constexpr bool nativeInterop = false;
+#endif
+    const auto requiredFeatures = select_device_features(adapterFeatures, g_featureProfile, nativeInterop);
     const auto requested = [&](wgpu::FeatureName feature) {
       return std::ranges::find(requiredFeatures, feature) != requiredFeatures.end();
     };
@@ -1327,7 +1332,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     }
     g_device.SetLoggingCallback(wgpu_log);
     log_feature_profile(resolvedProfile, supportedFeatures, supportedLimits);
-    deviceCaps = query_device_caps(adapterFeatures);
+    deviceCaps = query_device_caps(adapterFeatures, nativeInterop);
   }
   g_queue = g_device.GetQueue();
 

@@ -86,6 +86,7 @@ struct Caps {
   bool rg11b10Renderable = false;
   bool d3d12SharedBuffer = false;
   bool d3d12SharedFence = false;
+  bool d3d12SharedTexture = false;
   bool d3d12Interop = false;
   bool nativeD3D12 = false;
   uint32_t d3dShaderModel = 0;

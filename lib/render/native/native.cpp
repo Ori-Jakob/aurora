@@ -24,6 +24,8 @@ void shutdown_native() noexcept {
 }
 
 namespace native {
+bool interop_enabled() noexcept { return !d3d12::killed(); }
+
 bool initialize_device(const wgpu::Device& device, const wgpu::Adapter& adapter) noexcept {
   return d3d12::initialize(device, adapter);
 }

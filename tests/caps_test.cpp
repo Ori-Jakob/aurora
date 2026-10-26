@@ -47,11 +47,12 @@ constexpr std::array FeatureFlags{
     FeatureFlag{FeatureName::RG11B10UfloatRenderable, &Caps::rg11b10Renderable},
     FeatureFlag{FeatureName::SharedBufferMemoryD3D12Resource, &Caps::d3d12SharedBuffer},
     FeatureFlag{FeatureName::SharedFenceDXGISharedHandle, &Caps::d3d12SharedFence},
+    FeatureFlag{FeatureName::SharedTextureMemoryD3D12Resource, &Caps::d3d12SharedTexture},
 };
 
-std::vector<FeatureName> table_features() {
+std::vector<FeatureName> table_features(bool nativeInterop = false) {
   std::vector<FeatureName> features;
-  for (const auto& entry : requested_features()) {
+  for (const auto& entry : requested_features(nativeInterop)) {
     features.push_back(entry.feature);
   }
   return features;
@@ -196,6 +197,12 @@ TEST(CapsTest, FeatureTableNamesAndOrder) {
   }
   EXPECT_FALSE(features.contains(FeatureName::SharedTextureMemoryD3D12Resource));
   EXPECT_FALSE(features.contains(FeatureName::SubgroupSizeControl));
+  const auto native = requested_features(true);
+  ASSERT_EQ(native.size(), table.size() + 1);
+  EXPECT_TRUE(std::equal(table.begin(), table.end(), native.begin(),
+                         [](const auto& a, const auto& b) { return a.feature == b.feature && a.name == b.name; }));
+  EXPECT_EQ(native.back().feature, FeatureName::SharedTextureMemoryD3D12Resource);
+  EXPECT_EQ(native.back().name, "SharedTextureMemoryD3D12Resource");
 }
 
 TEST(CapsTest, FeatureNameLookup) {
@@ -422,7 +429,7 @@ TEST(CapsTest, BuildCapsMapsFeatures) {
   for (const auto& flag : FeatureFlags) {
     EXPECT_FALSE(requested_feature_name(flag.feature).empty());
   }
-  for (const auto& entry : requested_features()) {
+  for (const auto& entry : requested_features(true)) {
     SCOPED_TRACE(std::string{entry.name});
     const std::array features{entry.feature};
     const auto caps = caps_with(features);
@@ -566,6 +573,58 @@ TEST(CapsTest, NativeD3D12FalseOnNullBackend) {
   EXPECT_FALSE(build_caps(source).nativeD3D12);
   source.backend = wgpu::BackendType::D3D12;
   EXPECT_TRUE(build_caps(source).nativeD3D12);
+}
+
+TEST(CapsTest, SharedTextureRequestedOnlyWithNativeBuild) {
+  const auto adapter = table_features(true);
+  const auto legacy = select_device_features(adapter, FEATURE_PROFILE_FULL);
+  EXPECT_FALSE(contains(legacy, FeatureName::SharedTextureMemoryD3D12Resource));
+  EXPECT_EQ(legacy, table_features());
+  const auto native = select_device_features(adapter, FEATURE_PROFILE_FULL, true);
+  ASSERT_EQ(native.size(), legacy.size() + 1);
+  EXPECT_EQ(native.back(), FeatureName::SharedTextureMemoryD3D12Resource);
+  EXPECT_TRUE(std::equal(legacy.begin(), legacy.end(), native.begin()));
+  EXPECT_TRUE(caps_with(native).d3d12SharedTexture);
+  EXPECT_FALSE(caps_with(legacy).d3d12SharedTexture);
+  const auto noAdapterSupport = without(adapter, {FeatureName::SharedTextureMemoryD3D12Resource});
+  EXPECT_EQ(select_device_features(noAdapterSupport, FEATURE_PROFILE_FULL, true), legacy);
+  EXPECT_EQ(requested_feature_name(FeatureName::SharedTextureMemoryD3D12Resource), "SharedTextureMemoryD3D12Resource");
+}
+
+TEST(CapsTest, KillSwitchMatchesLegacyCaps) {
+  const auto legacyAdapter = table_features();
+  const auto nativeAdapter = table_features(true);
+  for (const auto profile : {FEATURE_PROFILE_FULL, FEATURE_PROFILE_COMPAT, FEATURE_PROFILE_METAL}) {
+    SCOPED_TRACE(static_cast<int>(profile));
+    const auto legacy = select_device_features(legacyAdapter, profile);
+    const auto killed = select_device_features(nativeAdapter, profile, false);
+    EXPECT_EQ(killed, legacy);
+    for (const auto backend : {wgpu::BackendType::D3D12, wgpu::BackendType::Vulkan, wgpu::BackendType::Null}) {
+      EXPECT_EQ(caps_with(killed, backend), caps_with(legacy, backend));
+    }
+    const auto legacyRequests = describe_feature_requests(legacyAdapter, legacy, profile);
+    const auto killedRequests = describe_feature_requests(nativeAdapter, killed, profile, false);
+    ASSERT_EQ(killedRequests.size(), legacyRequests.size());
+    for (size_t i = 0; i < legacyRequests.size(); ++i) {
+      EXPECT_EQ(killedRequests[i].feature, legacyRequests[i].feature);
+      EXPECT_EQ(killedRequests[i].state, legacyRequests[i].state);
+    }
+  }
+}
+
+TEST(CapsTest, MetalProfileMasksSharedTexture) {
+  const auto adapter = table_features(true);
+  for (const auto profile : {FEATURE_PROFILE_METAL, FEATURE_PROFILE_METAL32}) {
+    EXPECT_FALSE(feature_profile_allows(profile, FeatureName::SharedTextureMemoryD3D12Resource));
+    const auto selected = select_device_features(adapter, profile, true);
+    EXPECT_FALSE(contains(selected, FeatureName::SharedTextureMemoryD3D12Resource));
+    const auto requests = describe_feature_requests(adapter, selected, profile, true);
+    ASSERT_EQ(requests.size(), requested_features(true).size());
+    EXPECT_EQ(requests.back().feature, FeatureName::SharedTextureMemoryD3D12Resource);
+    EXPECT_EQ(requests.back().state, FeatureRequestState::MaskedByProfile);
+  }
+  EXPECT_TRUE(contains(select_device_features(adapter, FEATURE_PROFILE_COMPAT, true),
+                       FeatureName::SharedTextureMemoryD3D12Resource));
 }
 
 TEST(CapsTest, BuildCapsIdentity) {
