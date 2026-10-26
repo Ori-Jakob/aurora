@@ -98,7 +98,10 @@ void draw_clear(const wgpu::RenderPassEncoder& pass, bool clearColor, bool clear
 
 size_t load_from_cache(void const* key, size_t keySize, void* value, size_t valueSize, void* userdata);
 void store_to_cache(void const* key, size_t keySize, void const* value, size_t valueSize, void* userdata);
-void cache_prune(std::span<const uint64_t> keepLayouts);
+// Unused blobs of an idle layout lapse after this many sessions, so sets from old drivers or shaders cannot pile up
+inline constexpr int64_t CacheLayoutIdleSessions = 32;
+
+void cache_prune(std::span<const uint64_t> knownLayouts, std::span<const uint64_t> liveLayouts);
 void cache_shutdown();
 
 // Dawn loads and stores blobs on the thread that creates the pipeline, so a thread-local tag names their layout

@@ -102,6 +102,7 @@ static std::atomic_bool g_blockingPipelines = false;
 static std::atomic_uint64_t g_pipelineEpoch = 0;
 static std::atomic_uint64_t g_skippedDraws = 0;
 static std::vector<uint64_t> g_sceneLayoutKeys;
+static std::vector<uint64_t> g_liveLayoutKeys;
 
 static sqlite3* g_pipelineCacheDb = nullptr;
 static sqlite3_stmt* g_pipelineCacheLoadStmt = nullptr;
@@ -492,12 +493,14 @@ static void notify_pipeline_ready(bool queued, uint32_t pipelineCount) {
   createdPipelines += pipelineCount;
   if (queued && --queuedPipelines == 0 && g_gpuCachePrunePending.exchange(false, std::memory_order_acq_rel)) {
     // Prune GPU cache entries after fully loading the pipeline cache.
-    std::vector<uint64_t> layouts;
+    std::vector<uint64_t> known;
+    std::vector<uint64_t> live;
     {
       std::lock_guard lock{g_pipelineMutex};
-      layouts = g_sceneLayoutKeys;
+      known = g_sceneLayoutKeys;
+      live = g_liveLayoutKeys;
     }
-    webgpu::cache_prune(layouts);
+    webgpu::cache_prune(known, live);
   }
   g_pipelineReadyCv.notify_all();
 }
@@ -1399,6 +1402,14 @@ void rebuild_pipeline_cache() {
         },
         pipeline.config);
   }
+
+  // Marked only after its resolves are queued, so a prune racing this rebuild still keeps the layout's blobs
+  std::lock_guard lock{g_pipelineMutex};
+  for (const uint64_t key : {scene.key, offscreen.key}) {
+    if (std::ranges::find(g_liveLayoutKeys, key) == g_liveLayoutKeys.end()) {
+      g_liveLayoutKeys.push_back(key);
+    }
+  }
 }
 
 void initialize_pipeline_cache() {
@@ -1443,6 +1454,7 @@ void shutdown_pipeline_cache() {
   g_knownPipelines.clear();
   g_pipelineLayoutKey.reset();
   g_sceneLayoutKeys.clear();
+  g_liveLayoutKeys.clear();
   g_pipelineQueue.clear();
   g_warmPipelineQueue.clear();
   g_backgroundPipelineQueue.clear();

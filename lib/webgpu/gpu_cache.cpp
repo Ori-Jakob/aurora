@@ -38,6 +38,7 @@ struct LayoutTag {
 };
 static std::vector<LayoutTag> pending_layout_tags;
 static thread_local uint64_t t_cacheLayout = 0;
+static int64_t cache_session;
 #if defined(AURORA_CACHE_USE_ZSTD)
 static std::vector<uint8_t> compress_buffer;
 #endif
@@ -91,7 +92,7 @@ static bool ensure_schema_up_to_date() {
 
   cmd = fmt::format(
       R"(DROP TABLE IF EXISTS cache;
-DROP TABLE IF EXISTS cache_layouts;
+DROP TABLE IF EXISTS cache_layout_tags;
 CREATE TABLE cache (
   key BLOB PRIMARY KEY NOT NULL,
   value BLOB NOT NULL,
@@ -109,6 +110,26 @@ INSERT INTO aurora_schema VALUES ({});)",
 
   tx.commit();
   return true;
+}
+
+static std::optional<uint64_t> select_uint64(const char* sql) {
+  sqlite3_stmt* stmt = nullptr;
+  auto ret = sqlite3_prepare_v3(db, sql, -1, 0, &stmt, nullptr);
+  if (ret != SQLITE_OK) {
+    Log.error("Failed to prepare statement '{}': {}", sql, sqlite3_errmsg(db));
+    return std::nullopt;
+  }
+
+  std::optional<uint64_t> result;
+  ret = sqlite3_step(stmt);
+  if (ret == SQLITE_ROW) {
+    result = static_cast<uint64_t>(sqlite3_column_int64(stmt, 0));
+  } else if (ret != SQLITE_DONE) {
+    Log.error("Failed to execute statement '{}': {}", sql, sqlite3_errmsg(db));
+  }
+
+  sqlite3_finalize(stmt);
+  return result;
 }
 
 static bool cache_init_core() {
@@ -136,15 +157,23 @@ static bool cache_init_core() {
 
   // Kept apart from the cache table so adding it leaves existing blobs valid
   ret = sqlite::exec(db,
-                     "CREATE TABLE IF NOT EXISTS cache_layouts ("
+                     "CREATE TABLE IF NOT EXISTS cache_layout_tags ("
                      "key BLOB NOT NULL,"
                      "layout INTEGER NOT NULL,"
+                     "session INTEGER NOT NULL,"
                      "PRIMARY KEY (key, layout)"
                      ") WITHOUT ROWID;");
   if (ret != SQLITE_OK) {
     Log.error("Failed to create layout table: {}", sqlite3_errmsg(db));
     return false;
   }
+
+  // Sessions count only runs that tagged a blob, so a layout's age is the runs it sat idle through
+  const auto lastSession = select_uint64("SELECT COALESCE(MAX(session), 0) FROM cache_layout_tags");
+  if (!lastSession) {
+    return false;
+  }
+  cache_session = static_cast<int64_t>(*lastSession) + 1;
 
   ret = sqlite3_prepare_v3(db, "SELECT value, size, compressed FROM cache WHERE key = ?", -1, SQLITE_PREPARE_PERSISTENT,
                            &load_stmt, nullptr);
@@ -160,7 +189,7 @@ static bool cache_init_core() {
     return false;
   }
 
-  ret = sqlite3_prepare_v3(db, "INSERT OR IGNORE INTO cache_layouts (key, layout) VALUES (?, ?)", -1,
+  ret = sqlite3_prepare_v3(db, "REPLACE INTO cache_layout_tags (key, layout, session) VALUES (?, ?, ?)", -1,
                            SQLITE_PREPARE_PERSISTENT, &tag_stmt, nullptr);
   if (ret != SQLITE_OK) {
     Log.error("Failed to prepare statement: {}", sqlite3_errmsg(db));
@@ -168,26 +197,6 @@ static bool cache_init_core() {
   }
 
   return true;
-}
-
-static std::optional<uint64_t> select_uint64(const char* sql) {
-  sqlite3_stmt* stmt = nullptr;
-  auto ret = sqlite3_prepare_v3(db, sql, -1, 0, &stmt, nullptr);
-  if (ret != SQLITE_OK) {
-    Log.error("Failed to prepare statement '{}': {}", sql, sqlite3_errmsg(db));
-    return std::nullopt;
-  }
-
-  std::optional<uint64_t> result;
-  ret = sqlite3_step(stmt);
-  if (ret == SQLITE_ROW) {
-    result = static_cast<uint64_t>(sqlite3_column_int64(stmt, 0));
-  } else if (ret != SQLITE_DONE) {
-    Log.error("Failed to execute statement '{}': {}", sql, sqlite3_errmsg(db));
-  }
-
-  sqlite3_finalize(stmt);
-  return result;
 }
 
 static bool fill_used_key_table(const std::vector<XXH128_hash_t>& usedKeys) {
@@ -242,6 +251,7 @@ static bool flush_layout_tags() {
   for (const auto& tag : pending_layout_tags) {
     check(sqlite3_bind_blob(tag_stmt, 1, &tag.key, sizeof(tag.key), SQLITE_TRANSIENT));
     check(sqlite3_bind_int64(tag_stmt, 2, static_cast<sqlite3_int64>(tag.layout)));
+    check(sqlite3_bind_int64(tag_stmt, 3, cache_session));
     const auto ret = sqlite3_step(tag_stmt);
     sqlite3_reset(tag_stmt);
     if (ret != SQLITE_DONE) {
@@ -253,32 +263,38 @@ static bool flush_layout_tags() {
   return true;
 }
 
-static bool fill_kept_layout_table(std::span<const uint64_t> keepLayouts) {
+static bool fill_known_layout_table(std::span<const uint64_t> knownLayouts, std::span<const uint64_t> liveLayouts) {
   auto ret = sqlite::exec(db,
-                          "CREATE TEMP TABLE IF NOT EXISTS cache_layouts_kept ("
-                          "layout INTEGER PRIMARY KEY NOT NULL"
+                          "CREATE TEMP TABLE IF NOT EXISTS cache_layouts_known ("
+                          "layout INTEGER PRIMARY KEY NOT NULL,"
+                          "live INTEGER NOT NULL"
                           ");"
-                          "DELETE FROM cache_layouts_kept;");
+                          "DELETE FROM cache_layouts_known;");
   if (ret != SQLITE_OK) {
-    Log.error("Failed to prepare dawn cache kept layout table: {}", sqlite3_errmsg(db));
+    Log.error("Failed to prepare dawn cache known layout table: {}", sqlite3_errmsg(db));
     return false;
   }
 
   sqlite3_stmt* stmt = nullptr;
-  ret = sqlite3_prepare_v3(db, "INSERT OR IGNORE INTO cache_layouts_kept (layout) VALUES (?)", -1, 0, &stmt, nullptr);
+  ret = sqlite3_prepare_v3(db, "INSERT OR IGNORE INTO cache_layouts_known (layout, live) VALUES (?, ?)", -1, 0, &stmt,
+                           nullptr);
   if (ret != SQLITE_OK) {
-    Log.error("Failed to prepare dawn cache kept layout insert: {}", sqlite3_errmsg(db));
+    Log.error("Failed to prepare dawn cache known layout insert: {}", sqlite3_errmsg(db));
     return false;
   }
 
-  for (const uint64_t layout : keepLayouts) {
-    check(sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(layout)));
-    ret = sqlite3_step(stmt);
-    sqlite3_reset(stmt);
-    if (ret != SQLITE_DONE) {
-      Log.error("Failed to insert dawn cache kept layout: {}", sqlite3_errmsg(db));
-      sqlite3_finalize(stmt);
-      return false;
+  // Live rows go first so a layout in both lists stays live
+  for (const auto& [layouts, live] : {std::pair{liveLayouts, 1}, std::pair{knownLayouts, 0}}) {
+    for (const uint64_t layout : layouts) {
+      check(sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(layout)));
+      check(sqlite3_bind_int(stmt, 2, live));
+      ret = sqlite3_step(stmt);
+      sqlite3_reset(stmt);
+      if (ret != SQLITE_DONE) {
+        Log.error("Failed to insert dawn cache known layout: {}", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return false;
+      }
     }
   }
 
@@ -444,7 +460,7 @@ void store_to_cache(void const* key, size_t keySize, void const* value, size_t v
   cache_keys_used.push_back(keyHash);
 }
 
-void cache_prune(std::span<const uint64_t> keepLayouts) {
+void cache_prune(std::span<const uint64_t> knownLayouts, std::span<const uint64_t> liveLayouts) {
   std::lock_guard lock(cache_mutex);
   if (!cache_init()) {
     return;
@@ -463,7 +479,8 @@ void cache_prune(std::span<const uint64_t> keepLayouts) {
       return;
     }
 
-    if (!flush_layout_tags() || !fill_used_key_table(cache_keys_used) || !fill_kept_layout_table(keepLayouts)) {
+    if (!flush_layout_tags() || !fill_used_key_table(cache_keys_used) ||
+        !fill_known_layout_table(knownLayouts, liveLayouts)) {
       return;
     }
 
@@ -473,26 +490,31 @@ void cache_prune(std::span<const uint64_t> keepLayouts) {
     }
     totalRows = *totalRowsResult;
 
-    // A scene layout that is not live this session can still come back, and its blobs with it
-    auto ret = sqlite::exec(db,
-                            "DELETE FROM cache "
-                            "WHERE NOT EXISTS ("
-                            "  SELECT 1 FROM cache_keys_used WHERE cache_keys_used.key = cache.key"
-                            ") AND NOT EXISTS ("
-                            "  SELECT 1 FROM cache_layouts JOIN cache_layouts_kept USING (layout)"
-                            "  WHERE cache_layouts.key = cache.key"
-                            ")");
+    // A live layout loads every reachable blob before the prune, so only an idle known layout keeps unused ones
+    const int64_t lapsedSession = cache_session - CacheLayoutIdleSessions;
+    auto sql = fmt::format(
+        "DELETE FROM cache "
+        "WHERE NOT EXISTS ("
+        "  SELECT 1 FROM cache_keys_used WHERE cache_keys_used.key = cache.key"
+        ") AND NOT EXISTS ("
+        "  SELECT 1 FROM cache_layout_tags JOIN cache_layouts_known USING (layout)"
+        "  WHERE cache_layout_tags.key = cache.key AND live = 0 AND session > {}"
+        ")",
+        lapsedSession);
+    auto ret = sqlite::exec(db, sql.c_str());
     if (ret != SQLITE_OK) {
       Log.error("Failed to prune dawn cache rows: {}", sqlite3_errmsg(db));
       return;
     }
     deletedRows = sqlite3_changes64(db);
 
-    ret = sqlite::exec(db,
-                       "DELETE FROM cache_layouts "
-                       "WHERE layout NOT IN (SELECT layout FROM cache_layouts_kept) OR NOT EXISTS ("
-                       "  SELECT 1 FROM cache WHERE cache.key = cache_layouts.key"
-                       ")");
+    sql = fmt::format(
+        "DELETE FROM cache_layout_tags "
+        "WHERE session <= {} OR layout NOT IN (SELECT layout FROM cache_layouts_known) OR NOT EXISTS ("
+        "  SELECT 1 FROM cache WHERE cache.key = cache_layout_tags.key"
+        ")",
+        lapsedSession);
+    ret = sqlite::exec(db, sql.c_str());
     if (ret != SQLITE_OK) {
       Log.error("Failed to prune dawn cache layouts: {}", sqlite3_errmsg(db));
       return;

@@ -20,6 +20,8 @@ using detail::PipelinePriority;
 constexpr uint64_t LegacyLayout = 0x1111;
 constexpr uint64_t GBufferLayout = 0x2222;
 constexpr uint64_t StaleLayout = 0x3333;
+constexpr std::array KnownLayouts{LegacyLayout, GBufferLayout};
+constexpr std::array LegacyLive{LegacyLayout};
 constexpr size_t BlobSize = 64;
 
 void store_blob(std::string_view key, uint64_t layout) {
@@ -71,8 +73,7 @@ TEST_F(DawnCachePruneTest, PruneKeepsBlobsOfKnownSceneLayouts) {
 
   // The next session draws only the legacy layout
   ASSERT_TRUE(load_blob("legacy", LegacyLayout));
-  const std::array keep{LegacyLayout, GBufferLayout};
-  webgpu::cache_prune(keep);
+  webgpu::cache_prune(KnownLayouts, LegacyLive);
   EXPECT_TRUE(blob_present("legacy"));
   EXPECT_TRUE(blob_present("gbuffer"));
   EXPECT_FALSE(blob_present("stale"));
@@ -86,17 +87,48 @@ TEST_F(DawnCachePruneTest, LoadsTagBlobsStoredWithoutLayout) {
   webgpu::cache_shutdown();
 
   store_blob("legacy", LegacyLayout);
-  const std::array keep{LegacyLayout, GBufferLayout};
-  webgpu::cache_prune(keep);
+  webgpu::cache_prune(KnownLayouts, LegacyLive);
   EXPECT_TRUE(blob_present("gbuffer"));
   webgpu::cache_shutdown();
 
   // Once its layout is no longer known, an unused blob goes as before
   ASSERT_TRUE(load_blob("legacy", LegacyLayout));
-  const std::array legacyOnly{LegacyLayout};
-  webgpu::cache_prune(legacyOnly);
+  webgpu::cache_prune(LegacyLive, LegacyLive);
   EXPECT_TRUE(blob_present("legacy"));
   EXPECT_FALSE(blob_present("gbuffer"));
+}
+
+TEST_F(DawnCachePruneTest, PruneDropsUnusedBlobsOfLiveLayouts) {
+  store_blob("old", LegacyLayout);
+  webgpu::cache_shutdown();
+
+  // A session that starts on the G-buffer layout keeps the idle legacy blob
+  store_blob("gbuffer", GBufferLayout);
+  const std::array gbufferLive{GBufferLayout};
+  webgpu::cache_prune(KnownLayouts, gbufferLive);
+  EXPECT_TRUE(blob_present("old"));
+  EXPECT_TRUE(blob_present("gbuffer"));
+  webgpu::cache_shutdown();
+
+  // A live layout loads every blob it can still reach, so the one it skipped is stale
+  store_blob("legacy", LegacyLayout);
+  webgpu::cache_prune(KnownLayouts, LegacyLive);
+  EXPECT_FALSE(blob_present("old"));
+  EXPECT_TRUE(blob_present("legacy"));
+  EXPECT_TRUE(blob_present("gbuffer"));
+}
+
+TEST_F(DawnCachePruneTest, PruneDropsBlobsOfLayoutsIdleTooLong) {
+  store_blob("gbuffer", GBufferLayout);
+  store_blob("legacy", LegacyLayout);
+  webgpu::cache_shutdown();
+
+  for (int64_t session = 2; session <= webgpu::CacheLayoutIdleSessions + 1; ++session) {
+    ASSERT_TRUE(load_blob("legacy", LegacyLayout));
+    webgpu::cache_prune(KnownLayouts, LegacyLive);
+    EXPECT_EQ(blob_present("gbuffer"), session <= webgpu::CacheLayoutIdleSessions) << "session " << session;
+    webgpu::cache_shutdown();
+  }
 }
 
 SceneLayoutBase test_base() {
