@@ -42,7 +42,8 @@ struct Targets {
 };
 
 [[nodiscard]] Params make_params(const SceneComposeData& data, GraphExtent scene, GraphExtent output) noexcept;
-bool prepare_pipelines(ComposeMode mode, wgpu::TextureFormat colorFormat, wgpu::TextureFormat depthFormat);
+bool prepare_pipelines(ComposeMode mode, wgpu::TextureFormat colorFormat, wgpu::TextureFormat depthFormat,
+                       ColorEncoding encoding = ColorEncoding::Stored);
 void prepare(SceneComposeData& data);
 void encode(wgpu::CommandEncoder& cmd, const SceneComposeData& data);
 void publish_source(const Source& source) noexcept;
@@ -65,7 +66,8 @@ Counters counters() noexcept;
 void reset() noexcept;
 void hold_pipelines(bool hold) noexcept;
 shaders::RenderPipelineDesc pipeline_desc(ComposeMode mode, wgpu::TextureFormat colorFormat,
-                                          wgpu::TextureFormat depthFormat);
+                                          wgpu::TextureFormat depthFormat,
+                                          ColorEncoding encoding = ColorEncoding::Stored);
 bool encode(wgpu::CommandEncoder& cmd, const SceneComposeData& data, const Targets& targets,
             const std::optional<Source>& source);
 } // namespace testing

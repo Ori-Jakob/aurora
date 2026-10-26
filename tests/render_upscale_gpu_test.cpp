@@ -30,10 +30,14 @@
 #if AURORA_ENABLE_NATIVE_D3D12
 #include "gfx/encoding.hpp"
 #include "gfx/frame_packet.hpp"
+#include "gfx/tex_copy_conv.hpp"
 #include "render/native/d3d12/device.hpp"
 #include "render/native/d3d12/native_step.hpp"
 #include "render/native/d3d12/shared_texture.hpp"
 #include "render/native/d3d12/teardown.hpp"
+#include "render/native/d3d12/upscale_bridge.hpp"
+#include "render/native/native.hpp"
+#include "render/post/upscale/native_upscale.hpp"
 #include "render/stage.hpp"
 #include "webgpu/gpu_prof.hpp"
 
@@ -2077,6 +2081,345 @@ TEST_F(NativeStepGpu, TimestampsReported) {
   ASSERT_NE(native, times.passes.end());
   EXPECT_GT(native->ms, 0.f);
   EXPECT_LT(native->ms, 100.f);
+}
+
+namespace native_upscale = upscale::native_upscale;
+
+class NativeUpscaleGpu : public NativeInteropGpu {
+protected:
+  using Passthrough = native::d3d12::upscale_bridge::PassthroughUpscaler;
+  static constexpr float DepthValue = 0.375f;
+
+  void SetUp() override {
+    NativeInteropGpu::SetUp();
+    if (!m_started) {
+      return;
+    }
+    jobs::initialize(1);
+    shaders::initialize();
+    gfx::set_blocking_pipelines(true);
+    gfx::tex_copy_conv::initialize();
+    compose::testing::reset();
+    upscale::native_upscale::testing::reset();
+    m_ready = true;
+    m_rig = std::make_unique<fsr_rig::Rig>(*m_device, m_options);
+    if (!m_rig->ok()) {
+      GTEST_SKIP() << "the base G-buffer tier needs a core device";
+    }
+  }
+
+  void TearDown() override {
+    if (m_ready) {
+      m_rig.reset();
+      native::d3d12::upscale_bridge::testing::reset();
+      gfx::tex_copy_conv::shutdown();
+      shaders::shutdown();
+      jobs::shutdown();
+      gfx::set_blocking_pipelines(false);
+    }
+    NativeInteropGpu::TearDown();
+  }
+
+  static Settings settings(UpscalerQuality quality = UpscalerQuality::Quality, uint32_t debugView = 0) {
+    Settings out;
+    out.upscalerQuality = quality;
+    out.taaSharpness = 0.f;
+    out.debugView = debugView;
+    return out;
+  }
+
+  void install(const Settings& wanted) {
+    native_upscale::testing::set_stand_in(&m_copy);
+    for (int i = 0; i < 3; ++i) {
+      upscale::on_latch(wanted);
+      native_worker_frame_begin();
+    }
+    ASSERT_TRUE(native_upscale::is_native(temporal_resolve::installed()));
+    m_rig->use(m_rig->compile(wanted));
+  }
+
+  [[nodiscard]] const CompiledNode& node() const {
+    const NodeId id = m_rig->node(native_upscale::Pass);
+    EXPECT_NE(id, InvalidNode);
+    return m_rig->m_graph->nodes[id];
+  }
+
+  void clear_targets() const {
+    const wgpu::CommandEncoder encoder = m_device->device.CreateCommandEncoder();
+    const auto clear = [&](const wgpu::TextureView& view, const wgpu::Color& value) {
+      const wgpu::RenderPassColorAttachment attachment{
+          .view = view,
+          .loadOp = wgpu::LoadOp::Clear,
+          .storeOp = wgpu::StoreOp::Store,
+          .clearValue = value,
+      };
+      const wgpu::RenderPassDescriptor descriptor{.colorAttachmentCount = 1, .colorAttachments = &attachment};
+      encoder.BeginRenderPass(&descriptor).End();
+    };
+    clear(webgpu::g_motionBuffer.view, {0.25, -0.5, 0.0, 0.0});
+    clear(webgpu::g_reactiveBuffer.view, {0.6, 0.0, 0.0, 0.0});
+    const wgpu::RenderPassDepthStencilAttachment depth{
+        .view = webgpu::scene_depth().view,
+        .depthLoadOp = wgpu::LoadOp::Clear,
+        .depthStoreOp = wgpu::StoreOp::Store,
+        .depthClearValue = DepthValue,
+    };
+    const wgpu::RenderPassDescriptor depthPass{.depthStencilAttachment = &depth};
+    encoder.BeginRenderPass(&depthPass).End();
+    const wgpu::CommandBuffer commands = encoder.Finish();
+    EXPECT_TRUE(test::submit_and_wait(*m_device, commands));
+  }
+
+  void write_scene(uint32_t seed) {
+    const wgpu::Texture target = webgpu::scene_color().texture;
+    const uint32_t width = target.GetWidth();
+    const uint32_t height = target.GetHeight();
+    m_scene.assign(size_t{width} * height, Rgba{});
+    std::vector<uint8_t> bgra(m_scene.size() * 4);
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x) {
+        const size_t i = size_t{y} * width + x;
+        m_scene[i] = noise(x, y, seed);
+        bgra[i * 4 + 0] = m_scene[i].b;
+        bgra[i * 4 + 1] = m_scene[i].g;
+        bgra[i * 4 + 2] = m_scene[i].r;
+        bgra[i * 4 + 3] = m_scene[i].a;
+      }
+    }
+    const wgpu::TexelCopyTextureInfo destination{.texture = target};
+    const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = width * 4, .rowsPerImage = height};
+    const wgpu::Extent3D size{width, height, 1};
+    m_device->queue.WriteTexture(&destination, bgra.data(), bgra.size(), &layout, &size);
+  }
+
+  std::vector<Rgba> run_frame(uint32_t seed, fsr_rig::FrameOptions options = {}) {
+    const webgpu::TextureWithSampler& depth = webgpu::scene_depth();
+    options.sceneDepth = std::make_shared<const SceneDepth>(SceneDepth{
+        .source = DepthSource::Direct,
+        .sampledTexture = depth.texture,
+        .sampled = depth.view,
+        .sampledFormat = DepthFormat,
+        .attachmentTexture = depth.texture,
+        .attachment = depth.view,
+        .attachmentFormat = DepthFormat,
+        .size = depth.size,
+    });
+    const StageData post = m_rig->build(++m_frame, options);
+    write_scene(seed);
+    clear_targets();
+    SceneComposeData data{
+        .mode = upscale::split_live() ? ComposeMode::Split : ComposeMode::InPlace,
+        .ratio = {upscale::ratio(), upscale::ratio()},
+        .rcasStrength = upscale::rcas_strength(),
+        .frameId = post.frameId,
+    };
+    if (post.sceneHints != nullptr && data.mode == ComposeMode::Split) {
+      data.jitterPx[0] = post.sceneHints->jitterPx[0];
+      data.jitterPx[1] = post.sceneHints->jitterPx[1];
+    }
+    const compose::Params params = compose::make_params(data, upscale::scene_size(), upscale::output_size());
+    m_device->queue.WriteBuffer(gfx::detail::resources().uniformBuffer, 0, &params, sizeof(params));
+    wgpu::CommandEncoder cmd = m_device->device.CreateCommandEncoder();
+    if (post.any_enabled()) {
+      run_stage(cmd, post);
+    }
+    gfx::detail::FramePacket packet;
+    const gfx::detail::FrameOp op{.type = gfx::detail::FrameOpType::SceneCompose, .sceneCompose = &data};
+    gfx::detail::encode_op(cmd, packet, op);
+    m_segments = packet.segments.size();
+    const wgpu::CommandBuffer last = cmd.Finish();
+    submit_segments(packet.segments);
+    m_device->queue.Submit(1, &last);
+    end_segments(packet.segments);
+    const std::vector<uint8_t> bytes = read_texture(webgpu::g_frameBuffer.texture, 4);
+    std::vector<Rgba> out(bytes.size() / 4);
+    for (size_t i = 0; i < out.size(); ++i) {
+      out[i] = {.r = bytes[i * 4 + 2], .g = bytes[i * 4 + 1], .b = bytes[i * 4 + 0], .a = bytes[i * 4 + 3]};
+    }
+    return out;
+  }
+
+  [[nodiscard]] std::vector<uint8_t> read_texture(const wgpu::Texture& source, uint32_t bytesPerTexel) const {
+    const uint32_t width = source.GetWidth();
+    const uint32_t height = source.GetHeight();
+    const uint32_t row = (width * bytesPerTexel + 255) & ~255u;
+    const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                            .size = uint64_t{row} * height};
+    const wgpu::Buffer buffer = m_device->device.CreateBuffer(&descriptor);
+    const wgpu::CommandEncoder encoder = m_device->device.CreateCommandEncoder();
+    const wgpu::TexelCopyTextureInfo from{.texture = source};
+    const wgpu::TexelCopyBufferInfo to{.layout = {.bytesPerRow = row, .rowsPerImage = height}, .buffer = buffer};
+    const wgpu::Extent3D size{width, height, 1};
+    encoder.CopyTextureToBuffer(&from, &to, &size);
+    const wgpu::CommandBuffer commands = encoder.Finish();
+    EXPECT_TRUE(test::submit_and_wait(*m_device, commands));
+    const auto words = test::read_buffer(*m_device, buffer, 0, uint64_t{row} * height);
+    std::vector<uint8_t> out(size_t{width} * height * bytesPerTexel);
+    if (!words) {
+      ADD_FAILURE() << "texture readback failed";
+      return out;
+    }
+    const auto* bytes = reinterpret_cast<const uint8_t*>(words->data());
+    for (uint32_t y = 0; y < height; ++y) {
+      std::memcpy(out.data() + size_t{y} * width * bytesPerTexel, bytes + size_t{y} * row, width * bytesPerTexel);
+    }
+    return out;
+  }
+
+  [[nodiscard]] std::vector<uint8_t> read_shared(SharedTexture* texture, uint32_t bytesPerTexel) const {
+    if (texture == nullptr) {
+      ADD_FAILURE() << "shared texture missing";
+      return {};
+    }
+    EXPECT_TRUE(texture->begin(true));
+    std::vector<uint8_t> out = read_texture(texture->texture(), bytesPerTexel);
+    EXPECT_TRUE(texture->end().has_value());
+    return out;
+  }
+
+  static int max_rgb_error(const std::vector<Rgba>& got, const std::vector<Rgba>& want) {
+    int out = got.size() == want.size() ? 0 : 255;
+    for (size_t i = 0; i < std::min(got.size(), want.size()); ++i) {
+      for (const int d :
+           {std::abs(got[i].r - want[i].r), std::abs(got[i].g - want[i].g), std::abs(got[i].b - want[i].b)}) {
+        out = std::max(out, d);
+      }
+    }
+    return out;
+  }
+
+  bool m_ready = false;
+  Passthrough m_copy;
+  std::unique_ptr<fsr_rig::Rig> m_rig;
+  std::vector<Rgba> m_scene;
+  uint64_t m_frame = 0;
+  size_t m_segments = 0;
+};
+
+TEST_F(NativeUpscaleGpu, InputsMatchSceneTargets) {
+  m_copy = Passthrough{2.f, ColorEncoding::Stored, true};
+  install(settings());
+  ASSERT_TRUE(upscale::split_live());
+  ASSERT_EQ(node().status, CullReason::None);
+  run_frame(3);
+  EXPECT_EQ(m_segments, 1u);
+  EXPECT_EQ(m_copy.evaluations(), 1u);
+  const auto shared = native::d3d12::upscale_bridge::testing::shared();
+  EXPECT_EQ(read_shared(shared.color, 4), read_texture(webgpu::scene_color().texture, 4));
+  EXPECT_EQ(read_shared(shared.motion, 4), read_texture(webgpu::g_motionBuffer.texture, 4));
+  EXPECT_EQ(read_shared(shared.reactive, 1), read_texture(webgpu::g_reactiveBuffer.texture, 1));
+  const std::vector<uint8_t> depth = read_shared(shared.depth, 4);
+  ASSERT_EQ(depth.size(), size_t{SharedWidth / 2} * (SharedHeight / 2) * 4);
+  for (size_t i = 0; i < depth.size(); i += 4) {
+    float value = 0.f;
+    std::memcpy(&value, depth.data() + i, sizeof(value));
+    ASSERT_EQ(value, DepthValue) << i / 4;
+  }
+  EXPECT_EQ(compose::testing::counters().native, 1u);
+}
+
+TEST_F(NativeUpscaleGpu, LinearInputRoundTrips) {
+  m_copy = Passthrough{1.f, ColorEncoding::Linear};
+  install(settings(UpscalerQuality::NativeAa));
+  ASSERT_FALSE(upscale::split_live());
+  for (uint32_t seed = 0; seed < 3; ++seed) {
+    const std::vector<Rgba> output = run_frame(seed + 20);
+    EXPECT_EQ(m_segments, 1u);
+    EXPECT_LE(max_rgb_error(output, m_scene), 1) << "seed " << seed;
+  }
+  const auto shared = native::d3d12::upscale_bridge::testing::shared();
+  ASSERT_NE(shared.color, nullptr);
+  EXPECT_EQ(shared.color->format(), TextureFormat::RGBA16Float);
+  EXPECT_EQ(shared.out->format(), TextureFormat::RGBA16Float);
+  EXPECT_EQ(compose::testing::counters().lastStatus, 1u);
+}
+
+TEST_F(NativeUpscaleGpu, ComposeIsRgbOnly) {
+  m_copy = Passthrough{2.f};
+  install(settings());
+  ASSERT_TRUE(upscale::split_live());
+  const std::vector<Rgba> bilinear = run_frame(41, {.camera = false});
+  EXPECT_EQ(m_segments, 0u);
+  const std::vector<Rgba> output = run_frame(41);
+  EXPECT_EQ(m_segments, 1u);
+  EXPECT_EQ(max_rgb_error(output, bilinear), 0);
+  const uint32_t sceneWidth = webgpu::scene_color().size.width;
+  const uint32_t sceneHeight = webgpu::scene_color().size.height;
+  size_t changed = 0;
+  for (uint32_t py = 0; py < SharedHeight; ++py) {
+    for (uint32_t px = 0; px < SharedWidth; ++px) {
+      const uint32_t sx = nearest(px, 0.5f, 0.f, sceneWidth);
+      const uint32_t sy = nearest(py, 0.5f, 0.f, sceneHeight);
+      changed += output[size_t{py} * SharedWidth + px].a != m_scene[size_t{sy} * sceneWidth + sx].a ? 1 : 0;
+    }
+  }
+  EXPECT_EQ(changed, 0u);
+  EXPECT_EQ(compose::testing::counters().native, 1u);
+}
+
+TEST_F(NativeUpscaleGpu, ResizeRecreatesShared) {
+  m_copy = Passthrough{2.f};
+  install(settings());
+  run_frame(5);
+  auto shared = native::d3d12::upscale_bridge::testing::shared();
+  ASSERT_NE(shared.color, nullptr);
+  EXPECT_EQ(shared.color->texture().GetWidth(), SharedWidth / 2);
+  EXPECT_EQ(shared.out->texture().GetHeight(), SharedHeight / 2);
+  m_copy.set_ratio(1.5f);
+  install(settings(UpscalerQuality::Performance));
+  EXPECT_EQ(upscale::scene_size(), (GraphExtent{42, 21}));
+  const std::vector<Rgba> output = run_frame(6);
+  EXPECT_EQ(m_segments, 1u);
+  shared = native::d3d12::upscale_bridge::testing::shared();
+  ASSERT_NE(shared.color, nullptr);
+  EXPECT_EQ(shared.color->texture().GetWidth(), 42u);
+  EXPECT_EQ(shared.color->texture().GetHeight(), 21u);
+  EXPECT_EQ(shared.out->texture().GetWidth(), 42u);
+  const uint64_t bytes = shared.color->bytes() + shared.depth->bytes() + shared.motion->bytes() + shared.out->bytes();
+  EXPECT_EQ(native::d3d12::shared_bytes(), bytes);
+  EXPECT_EQ(m_copy.prepares(), 2u);
+  EXPECT_EQ(m_copy.evaluations(), 2u);
+  EXPECT_EQ(compose::testing::counters().lastStatus, 1u);
+  EXPECT_EQ(output.size(), size_t{SharedWidth} * SharedHeight);
+}
+
+TEST_F(NativeUpscaleGpu, NativeAaInplace) {
+  m_copy = Passthrough{1.f};
+  install(settings(UpscalerQuality::NativeAa));
+  ASSERT_FALSE(upscale::split_live());
+  ASSERT_TRUE(upscale::compose_wanted());
+  for (uint32_t seed = 0; seed < 2; ++seed) {
+    const std::vector<Rgba> output = run_frame(seed + 60);
+    EXPECT_EQ(m_segments, 1u);
+    ASSERT_EQ(output.size(), m_scene.size());
+    EXPECT_EQ(max_rgb_error(output, m_scene), 0);
+    size_t changed = 0;
+    for (size_t i = 0; i < output.size(); ++i) {
+      changed += output[i].a != m_scene[i].a ? 1 : 0;
+    }
+    EXPECT_EQ(changed, 0u);
+  }
+  EXPECT_EQ(compose::testing::counters().native, 2u);
+  EXPECT_EQ(compose::testing::counters().skipped, 0u);
+}
+
+TEST_F(NativeUpscaleGpu, SkippedNodeFrameSubmitsClean) {
+  m_copy = Passthrough{2.f};
+  install(settings(UpscalerQuality::Quality, 16));
+  EXPECT_EQ(node().status, CullReason::Skipped);
+  run_frame(7);
+  EXPECT_EQ(m_segments, 0u);
+
+  install(settings());
+  EXPECT_EQ(node().status, CullReason::None);
+  run_frame(8, {.camera = false});
+  EXPECT_EQ(m_segments, 0u);
+  EXPECT_GE(native_upscale::testing::counters().skippedNoScene, 1u);
+  const auto counters = compose::testing::counters();
+  EXPECT_EQ(counters.encoded, 2u);
+  EXPECT_EQ(counters.native, 0u);
+  EXPECT_EQ(counters.skipped, 0u);
+  EXPECT_EQ(m_copy.evaluations(), 0u);
 }
 #endif
 } // namespace

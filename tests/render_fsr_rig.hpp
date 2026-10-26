@@ -19,6 +19,7 @@
 #include "render/post/upscale/fsr/fsr_pass.hpp"
 #include "render/post/upscale/upscale.hpp"
 #include "render/scene/motion.hpp"
+#include "render/scene_depth.hpp"
 #include "render/settings.hpp"
 #include "render/stage.hpp"
 #include "render/stage_data.hpp"
@@ -92,6 +93,7 @@ struct FrameOptions {
   bool invalidate = false;
   bool refuseStorage = false;
   bool compose = true;
+  std::shared_ptr<const SceneDepth> sceneDepth;
 };
 
 class Rig {
@@ -214,6 +216,7 @@ public:
         .frameIndex = static_cast<uint32_t>(frameId),
         .markerSeen = true,
         .frame = m_state.get(),
+        .sceneDepth = options.sceneDepth,
     };
     build_stage_data(post);
     Storage::refuse = false;

@@ -18,11 +18,24 @@
 #include "render/post/upscale/fsr/fsr.hpp"
 #include "render/post/upscale/fsr/fsr_pass.hpp"
 #include "render/post/temporal_resolve.hpp"
+#include "render/post/upscale/native_upscale.hpp"
 #include "render/post/upscale/upscale.hpp"
+#include "render/native/native.hpp"
 #include "render/settings.hpp"
 #include "render/shaders.hpp"
 #include "render/stage.hpp"
+#include "webgpu/caps.hpp"
 #include "webgpu/gpu.hpp"
+
+#if AURORA_ENABLE_NATIVE_D3D12
+#include "io.hpp"
+#include "render/native/d3d12/probe.hpp"
+#include "render/native/d3d12/sentinel.hpp"
+#include "render/native/d3d12/upscale_bridge.hpp"
+
+#include <filesystem>
+#include <system_error>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -1090,5 +1103,266 @@ TEST_F(FrameSegments, NoStepBindsNoSharedTexture) {
   EXPECT_EQ(counters.native, 0u);
   EXPECT_EQ(counters.statusWrites, 0u);
 }
+
+#if AURORA_ENABLE_NATIVE_D3D12
+namespace native_upscale = upscale::native_upscale;
+namespace probe = native::d3d12::probe;
+namespace bridge = native::d3d12::upscale_bridge;
+namespace sentinel = native::d3d12::sentinel;
+
+class StubUpscaler final : public native_upscale::NativeUpscaler {
+public:
+  [[nodiscard]] Upscaler option() const noexcept override { return Upscaler::Xess; }
+  [[nodiscard]] std::string_view name() const noexcept override { return "stub"; }
+  [[nodiscard]] std::string_view runtime_file() const noexcept override { return runtime; }
+  native_upscale::ProbeResult probe(const native_upscale::Adapter&) noexcept override {
+    ++probes;
+    return {.support = support, .path = "stub path", .autoPick = true};
+  }
+  [[nodiscard]] std::string_view display_name(UpscalerQuality) const noexcept override { return "Stub"; }
+  [[nodiscard]] ColorEncoding color_encoding() const noexcept override { return ColorEncoding::Stored; }
+  [[nodiscard]] bool wants_reactive() const noexcept override { return false; }
+  std::optional<GraphExtent> prepare(const native_upscale::Adapter&, GraphExtent output,
+                                     UpscalerQuality) noexcept override {
+    ++prepares;
+    return prepareFails ? std::nullopt : std::optional{upscale::split_size(output, 2.f)};
+  }
+  bool evaluate(const native_upscale::Inputs&) noexcept override { return true; }
+  void destroy() noexcept override { ++destroys; }
+  [[nodiscard]] uint64_t vram_bytes() const noexcept override { return 0; }
+  [[nodiscard]] uint32_t jitter_phases(float) const noexcept override { return 8; }
+  [[nodiscard]] float mip_bias(float ratio) const noexcept override { return std::log2(1.f / ratio); }
+
+  FeatureSupport support{true, Reason::None};
+  std::string_view runtime;
+  bool prepareFails = false;
+  uint32_t probes = 0;
+  uint32_t prepares = 0;
+  uint32_t destroys = 0;
+};
+
+class NativeUpscale : public UpscaleTest {
+protected:
+  void SetUp() override {
+    UpscaleTest::SetUp();
+    if (IsSkipped() || !m_started) {
+      return;
+    }
+    const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+    m_dir = std::filesystem::temp_directory_path() /
+            ("aurora_native_probe_" + std::string{info->test_suite_name()} + "_" + info->name());
+    std::error_code ec;
+    std::filesystem::remove_all(m_dir, ec);
+    ASSERT_TRUE(std::filesystem::create_directories(m_dir, ec)) << ec.message();
+    sentinel::open(m_dir);
+    set_native_caps(true);
+    testing::set_built_options(Feature::Upscaler, 0b11111);
+    probe::testing::set_identity(TestIdentity);
+    probe::testing::set_runtime_directory(m_dir);
+    m_native = true;
+  }
+
+  void TearDown() override {
+    if (m_native) {
+      upscale::shutdown();
+      bridge::testing::reset();
+      probe::testing::reset();
+      sentinel::open({});
+      std::error_code ec;
+      std::filesystem::remove_all(m_dir, ec);
+    }
+    UpscaleTest::TearDown();
+  }
+
+  static void set_native_caps(bool shared) {
+    Caps deviceCaps = caps();
+    deviceCaps.backend = BACKEND_D3D12;
+    deviceCaps.d3d12SharedTexture = shared;
+    deviceCaps.d3d12SharedFence = shared;
+    testing::set_caps(deviceCaps);
+  }
+
+  static FeatureSupport support(Upscaler option) {
+    return current_support(Feature::Upscaler, static_cast<uint8_t>(option), nullptr);
+  }
+
+  void start_probe() const { probe::initialize(m_dir); }
+
+  void probe_now() {
+    probe::request();
+    native_worker_frame_begin();
+  }
+
+  void frame() {
+    start_frame();
+    end_frame();
+    native_worker_frame_begin();
+  }
+
+  static Settings with_upscaler(Upscaler upscaler) {
+    Settings settings;
+    settings.upscaler = upscaler;
+    return settings;
+  }
+
+  [[nodiscard]] bool cache_has_xess() const {
+    const auto bytes = io::read_file(m_dir / probe::CacheFile);
+    return bytes && std::string_view{reinterpret_cast<const char*>(bytes->data()), bytes->size()}.find("\"xess\"") !=
+                        std::string_view::npos;
+  }
+
+  static constexpr probe::Identity TestIdentity{
+      .vendorId = 0x8086, .deviceId = 0x56A0, .subSysId = 0x10208086, .revision = 8, .driverVersion = 0x1F'0000'65A4};
+
+  std::filesystem::path m_dir;
+  StubUpscaler m_stub;
+  bool m_native = false;
+};
+
+using NativeProbe = NativeUpscale;
+
+TEST_F(NativeUpscale, StubReportsBuildDisabled) {
+  start_probe();
+  probe_now();
+  EXPECT_EQ(support(Upscaler::Dlss), (FeatureSupport{false, Reason::BuildDisabled}));
+  EXPECT_EQ(support(Upscaler::Xess), (FeatureSupport{false, Reason::BuildDisabled}));
+  EXPECT_EQ(native::upscaler(Upscaler::Xess), nullptr);
+  EXPECT_EQ(native::testing::sdk_calls(), 0u);
+}
+
+TEST_F(NativeUpscale, ProbeReasonsReachSupport) {
+  m_stub.support = {false, Reason::DriverTooOld};
+  bridge::testing::set_upscaler(Upscaler::Xess, &m_stub);
+  start_probe();
+  EXPECT_EQ(support(Upscaler::Xess).reason, Reason::Probing);
+  native_worker_frame_begin();
+  EXPECT_EQ(m_stub.probes, 1u);
+  EXPECT_EQ(support(Upscaler::Xess), (FeatureSupport{false, Reason::DriverTooOld}));
+  EXPECT_EQ(support(Upscaler::Dlss).reason, Reason::BuildDisabled);
+  EXPECT_EQ(native::upscaler_path(Upscaler::Xess), "stub path");
+
+  m_stub.runtime = "stub_runtime.dll";
+  start_probe();
+  EXPECT_EQ(support(Upscaler::Xess), (FeatureSupport{false, Reason::RuntimeMissing}));
+
+  m_stub.runtime = {};
+  set_native_caps(false);
+  start_probe();
+  EXPECT_EQ(support(Upscaler::Xess), (FeatureSupport{false, Reason::NativeUnavailable}));
+  probe_now();
+  EXPECT_EQ(m_stub.probes, 1u);
+}
+
+TEST_F(NativeUpscale, FailureClampsToFsr) {
+  m_stub.prepareFails = true;
+  bridge::testing::set_upscaler(Upscaler::Xess, &m_stub);
+  start_probe();
+  probe_now();
+  ASSERT_TRUE(support(Upscaler::Xess).supported);
+  ASSERT_TRUE(cache_has_xess());
+  submit_request(with_upscaler(Upscaler::Xess));
+  frame();
+  EXPECT_EQ(m_stub.prepares, 1u);
+  EXPECT_EQ(support(Upscaler::Xess), (FeatureSupport{false, Reason::NativeUnavailable}));
+  EXPECT_FALSE(cache_has_xess());
+  frame();
+  EXPECT_EQ(latched_settings().upscaler, Upscaler::Fsr);
+  EXPECT_EQ(m_stub.prepares, 1u);
+  EXPECT_NE(temporal_resolve::installed().pass, native_upscale::Pass);
+}
+
+TEST_F(NativeUpscale, NoSelectionAllocatesNothing) {
+  bridge::testing::set_upscaler(Upscaler::Xess, &m_stub);
+  start_probe();
+  probe_now();
+  const uint32_t calls = native::testing::sdk_calls();
+  submit_request(with_upscaler(Upscaler::Off));
+  for (int i = 0; i < 10; ++i) {
+    frame();
+    static_cast<void>(support(Upscaler::Fsr));
+  }
+  EXPECT_EQ(m_stub.prepares, 0u);
+  EXPECT_EQ(native::testing::sdk_calls(), calls);
+  const bridge::testing::Shared shared = bridge::testing::shared();
+  EXPECT_EQ(shared.color, nullptr);
+  EXPECT_EQ(shared.out, nullptr);
+  EXPECT_NE(temporal_resolve::installed().pass, native_upscale::Pass);
+}
+
+TEST_F(NativeProbe, NoSdkCallWithUpscalerOff) {
+  bridge::testing::set_upscaler(Upscaler::Xess, &m_stub);
+  start_probe();
+  submit_request(with_upscaler(Upscaler::Off));
+  for (int i = 0; i < 100; ++i) {
+    frame();
+    static_cast<void>(support(Upscaler::Off));
+    static_cast<void>(support(Upscaler::Fsr));
+  }
+  EXPECT_EQ(native::testing::sdk_calls(), 0u);
+  EXPECT_EQ(m_stub.probes, 0u);
+  EXPECT_FALSE(std::filesystem::exists(m_dir / probe::CacheFile));
+}
+
+TEST_F(NativeProbe, CacheHitSkipsSdk) {
+  bridge::testing::set_upscaler(Upscaler::Xess, &m_stub);
+  start_probe();
+  probe_now();
+  ASSERT_EQ(native::testing::sdk_calls(), 1u);
+  ASSERT_TRUE(std::filesystem::exists(m_dir / probe::CacheFile));
+  start_probe();
+  EXPECT_EQ(support(Upscaler::Xess), (FeatureSupport{true, Reason::None}));
+  native_worker_frame_begin();
+  EXPECT_EQ(native::testing::sdk_calls(), 1u);
+  EXPECT_EQ(m_stub.probes, 1u);
+  EXPECT_EQ(native::upscaler_path(Upscaler::Xess), "stub path");
+}
+
+TEST_F(NativeProbe, CacheMissOnDriverChange) {
+  bridge::testing::set_upscaler(Upscaler::Xess, &m_stub);
+  start_probe();
+  probe_now();
+  ASSERT_EQ(m_stub.probes, 1u);
+  probe::Identity updated = TestIdentity;
+  updated.driverVersion += 1;
+  probe::testing::set_identity(updated);
+  start_probe();
+  EXPECT_EQ(support(Upscaler::Xess).reason, Reason::Probing);
+  native_worker_frame_begin();
+  EXPECT_EQ(m_stub.probes, 2u);
+  EXPECT_TRUE(support(Upscaler::Xess).supported);
+}
+
+TEST_F(NativeProbe, StaleSentinelSkipsProbe) {
+  bridge::testing::set_upscaler(Upscaler::Xess, &m_stub);
+  sentinel::arm(sentinel::Probe);
+  sentinel::open(m_dir);
+  ASSERT_EQ(sentinel::stale_at_startup(), sentinel::Probe);
+  start_probe();
+  EXPECT_EQ(support(Upscaler::Xess), (FeatureSupport{false, Reason::NativeDisabledAfterCrash}));
+  probe_now();
+  EXPECT_EQ(m_stub.probes, 0u);
+  native::reenable_upscalers();
+  EXPECT_EQ(support(Upscaler::Xess).reason, Reason::Probing);
+  native_worker_frame_begin();
+  EXPECT_EQ(m_stub.probes, 1u);
+  EXPECT_TRUE(support(Upscaler::Xess).supported);
+}
+
+TEST_F(NativeProbe, RequestHeldUntilPublished) {
+  bridge::testing::set_upscaler(Upscaler::Xess, &m_stub);
+  start_probe();
+  submit_request(with_upscaler(Upscaler::Xess));
+  start_frame();
+  end_frame();
+  EXPECT_EQ(latched_settings().upscaler, Upscaler::Off);
+  EXPECT_EQ(m_stub.probes, 0u);
+  native_worker_frame_begin();
+  EXPECT_EQ(m_stub.probes, 1u);
+  start_frame();
+  end_frame();
+  EXPECT_EQ(latched_settings().upscaler, Upscaler::Xess);
+  EXPECT_EQ(m_stub.probes, 1u);
+}
+#endif
 } // namespace
 } // namespace aurora::render::detail

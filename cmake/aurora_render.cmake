@@ -91,18 +91,22 @@ if (AURORA_ENABLE_RENDER)
             lib/render/native/d3d12/device.hpp
             lib/render/native/d3d12/native_step.cpp
             lib/render/native/d3d12/native_step.hpp
+            lib/render/native/d3d12/probe.cpp
+            lib/render/native/d3d12/probe.hpp
             lib/render/native/d3d12/sentinel.cpp
             lib/render/native/d3d12/sentinel.hpp
             lib/render/native/d3d12/shared_texture.cpp
             lib/render/native/d3d12/shared_texture.hpp
             lib/render/native/d3d12/teardown.cpp
             lib/render/native/d3d12/teardown.hpp
+            lib/render/native/d3d12/upscale_bridge.cpp
+            lib/render/native/d3d12/upscale_bridge.hpp
             lib/render/native/native.cpp
             lib/render/native/native.hpp
         )
         target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_NATIVE_D3D12=1)
         target_compile_definitions(aurora_core PRIVATE AURORA_ENABLE_NATIVE_D3D12=1)
-        target_link_libraries(aurora_gx PRIVATE d3d12 dxgi)
+        target_link_libraries(aurora_gx PRIVATE d3d12 dxgi version)
     else ()
         target_sources(aurora_gx PRIVATE lib/render/native/native.hpp lib/render/native/native_off.cpp)
         target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_NATIVE_D3D12=0)
@@ -118,6 +122,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/post/upscale/fsr/fsr.hpp
         lib/render/post/upscale/fsr/fsr_pass.cpp
         lib/render/post/upscale/fsr/fsr_pass.hpp
+        lib/render/post/upscale/native_upscale.cpp
+        lib/render/post/upscale/native_upscale.hpp
         lib/render/post/upscale/upscale.cpp
         lib/render/post/upscale/upscale.hpp
         lib/render/scene/classifier.cpp

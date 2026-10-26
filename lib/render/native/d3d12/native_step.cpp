@@ -2,17 +2,12 @@
 
 #include "device.hpp"
 #include "sentinel.hpp"
-#include "teardown.hpp"
 
-#include "../../post/upscale/compose.hpp"
 #include "../../../internal.hpp"
 #include "../../../webgpu/gpu.hpp"
 #include "../../../webgpu/gpu_prof.hpp"
 
-#include <aurora/render_caps.hpp>
-
 #include <algorithm>
-#include <cstdlib>
 #include <cstring>
 #include <utility>
 
@@ -275,100 +270,4 @@ void StepRunner::end_output(void* user) noexcept {
     self.m_lastOut = self.m_output->end();
   }
 }
-
-namespace test_step {
-namespace {
-struct State {
-  int mode = -1;
-  bool failed = false;
-  std::unique_ptr<StepRunner> runner;
-  std::unique_ptr<SharedTexture> in;
-  std::unique_ptr<SharedTexture> out;
-};
-
-State g_state;
-
-[[maybe_unused]] bool record_copy(void* user, ID3D12GraphicsCommandList* list) noexcept {
-  const auto& state = *static_cast<const State*>(user);
-  D3D12_TEXTURE_COPY_LOCATION destination{};
-  destination.pResource = state.out->resource();
-  destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  D3D12_TEXTURE_COPY_LOCATION source{};
-  source.pResource = state.in->resource();
-  source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
-  return true;
-}
-
-[[maybe_unused]] void copy_failed(void* user) noexcept { static_cast<State*>(user)->failed = true; }
-
-[[maybe_unused]] void teardown() noexcept {
-  g_state.runner.reset();
-  g_state.out.reset();
-  g_state.in.reset();
-  g_state.failed = true;
-}
-
-[[maybe_unused]] bool ensure_targets(const webgpu::TextureWithSampler& scene) noexcept {
-  if (g_state.in && g_state.in->texture().GetWidth() == scene.size.width &&
-      g_state.in->texture().GetHeight() == scene.size.height && g_state.in->format() == scene.format) {
-    return true;
-  }
-  if (g_state.runner) {
-    g_state.runner->wait_idle();
-  }
-  g_state.out.reset();
-  g_state.in.reset();
-  g_state.in = SharedTexture::create(
-      {.format = scene.format, .width = scene.size.width, .height = scene.size.height, .label = "native.copy.in"});
-  g_state.out = SharedTexture::create(
-      {.format = scene.format, .width = scene.size.width, .height = scene.size.height, .label = "native.copy.out"});
-  if (!g_state.runner) {
-    g_state.runner = StepRunner::create({
-        .name = "copy",
-        .inputState = D3D12_RESOURCE_STATE_COPY_SOURCE,
-        .outputState = D3D12_RESOURCE_STATE_COPY_DEST,
-        .record = &record_copy,
-        .failed = &copy_failed,
-        .user = &g_state,
-    });
-  }
-  register_teardown(&teardown);
-  return g_state.in && g_state.out && g_state.runner;
-}
-} // namespace
-
-void encode([[maybe_unused]] wgpu::CommandEncoder& cmd) noexcept {
-#ifndef NDEBUG
-  if (g_state.mode < 0) {
-    const char* value = std::getenv("AURORA_NATIVE_TEST_STEP");
-    g_state.mode = value != nullptr && std::string_view{value} == "copy" ? 1 : 0;
-    if (g_state.mode == 1) {
-      Log.warn("AURORA_NATIVE_TEST_STEP=copy: a native copy stands in for the resolver over the split");
-    }
-  }
-  const Caps& deviceCaps = caps();
-  if (g_state.mode != 1 || g_state.failed || !available() || !deviceCaps.d3d12SharedTexture ||
-      !deviceCaps.d3d12SharedFence) {
-    return;
-  }
-  const webgpu::TextureWithSampler& scene = webgpu::scene_color();
-  if (!scene.texture) {
-    return;
-  }
-  if (!ensure_targets(scene)) {
-    Log.warn("AURORA_NATIVE_TEST_STEP=copy: its shared textures or native step could not be created");
-    g_state.failed = true;
-    return;
-  }
-  const std::array inputs{g_state.in.get()};
-  upscale::compose::request_native_step(g_state.runner->step(inputs, g_state.out.get()),
-                                        {.view = g_state.out->view(), .format = g_state.out->format()});
-  const wgpu::TexelCopyTextureInfo source{.texture = scene.texture};
-  const wgpu::TexelCopyTextureInfo destination{.texture = g_state.in->texture()};
-  const wgpu::Extent3D extent{scene.size.width, scene.size.height, 1};
-  cmd.CopyTextureToTexture(&source, &destination, &extent);
-#endif
-}
-} // namespace test_step
 } // namespace aurora::render::detail::native::d3d12

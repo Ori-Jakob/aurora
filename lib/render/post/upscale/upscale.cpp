@@ -1,11 +1,13 @@
 #include "upscale.hpp"
 
 #include "compose.hpp"
+#include "native_upscale.hpp"
 #include "fsr/fsr.hpp"
 #include "fsr/fsr_pass.hpp"
 #include "../taa.hpp"
 #include "../temporal_resolve.hpp"
 #include "../../module.hpp"
+#include "../../native/native.hpp"
 
 #include "../../../gfx/frame.hpp"
 #include "../../../gx/gx.hpp"
@@ -77,6 +79,7 @@ bool g_warnedLateWriter = false;
 bool g_warnedLinearFsr = false;
 
 std::atomic_bool g_splitLive{false};
+std::atomic_bool g_nativeInPlace{false};
 std::atomic<Upscaler> g_active{Upscaler::Off};
 std::atomic<UpscalerQuality> g_quality{UpscalerQuality::Quality};
 std::atomic<float> g_rcasStrength{0.f};
@@ -185,9 +188,12 @@ void publish() noexcept {
   g_sceneHeight.store(scene.height, std::memory_order_relaxed);
   g_outputWidth.store(output.width, std::memory_order_relaxed);
   g_outputHeight.store(output.height, std::memory_order_relaxed);
+  const temporal_resolve::Resolver& installed = temporal_resolve::installed();
+  const bool fsr = installed.pass == fsr_pass::Pass;
+  const bool native = native_upscale::is_native(installed);
   g_splitLive.store(webgpu::scene_split_active(), std::memory_order_release);
-  const bool fsr = temporal_resolve::installed().pass == fsr_pass::Pass;
-  g_active.store(fsr ? Upscaler::Fsr : Upscaler::Off, std::memory_order_relaxed);
+  g_nativeInPlace.store(native && !webgpu::scene_split_active(), std::memory_order_release);
+  g_active.store(fsr ? Upscaler::Fsr : (native ? native_upscale::active() : Upscaler::Off), std::memory_order_relaxed);
   publish_sampling();
 }
 
@@ -268,19 +274,41 @@ GraphExtent wanted_scene_size(const SplitInputs& inputs) noexcept {
   return size == inputs.output ? GraphExtent{} : size;
 }
 
-void initialize() { fsr_pass::initialize(); }
+void initialize() {
+  fsr_pass::initialize();
+  native_upscale::initialize();
+}
 
 bool on_latch(const Settings& settings) {
   const wgpu::Extent3D efb = webgpu::g_frameBuffer.size;
   const GraphExtent output{efb.width, efb.height};
   const bool sceneTargets = webgpu::scene_targets_supported();
-  const bool fsr =
-      settings.upscaler == Upscaler::Fsr && module_enabled() && sceneTargets && output.width != 0 && output.height != 0;
+  const bool usable = module_enabled() && sceneTargets && output.width != 0 && output.height != 0;
+  const bool fsr = settings.upscaler == Upscaler::Fsr && usable;
+  native_upscale::NativeUpscaler* vendor = nullptr;
+  if (usable && (settings.upscaler == Upscaler::Dlss || settings.upscaler == Upscaler::Xess)) {
+    vendor = native::upscaler(settings.upscaler);
+  } else if (usable && settings.upscaler == Upscaler::Off) {
+    vendor = native_upscale::stand_in(split_env().value_or(1.f));
+  }
   const temporal_resolve::Resolver* resolver = fsr ? fsr_resolver(settings.upscalerQuality) : nullptr;
+  ColorEncoding encoding = ColorEncoding::Stored;
   GraphExtent wanted;
   if (resolver != nullptr) {
     const GraphExtent size = resolver->scene_size(output);
     wanted = size == output ? GraphExtent{} : size;
+  } else if (vendor != nullptr) {
+    const std::optional<native_upscale::Selection> selection =
+        native_upscale::select(*vendor, settings.upscalerQuality, output);
+    if (!selection) {
+      g_quality.store(settings.upscalerQuality, std::memory_order_relaxed);
+      g_rcasStrength.store(taa::rcas_strength(settings.taaSharpness), std::memory_order_relaxed);
+      publish();
+      return false;
+    }
+    resolver = selection->resolver;
+    wanted = selection->scene == output ? GraphExtent{} : selection->scene;
+    encoding = selection->encoding;
   } else {
     wanted = wanted_scene_size({
         .output = output,
@@ -297,10 +325,16 @@ bool on_latch(const Settings& settings) {
   }
   bool switched = false;
   if (wanted != current || resolverChanged) {
-    bool warm = wanted.width == 0 || compose::prepare_pipelines(ComposeMode::Split, webgpu::g_frameBuffer.format,
-                                                                webgpu::g_graphicsConfig.depthFormat);
-    if (resolver != nullptr) {
-      warm = fsr_pass::prepare(wanted.width == 0, webgpu::g_frameBuffer.format) && warm;
+    const wgpu::TextureFormat colorFormat = webgpu::g_frameBuffer.format;
+    const wgpu::TextureFormat depthFormat = webgpu::g_graphicsConfig.depthFormat;
+    bool warm = wanted.width == 0 || compose::prepare_pipelines(ComposeMode::Split, colorFormat, depthFormat);
+    if (fsr) {
+      warm = fsr_pass::prepare(wanted.width == 0, colorFormat) && warm;
+    } else if (vendor != nullptr) {
+      const ComposeMode mode = wanted.width == 0 ? ComposeMode::InPlace : ComposeMode::Split;
+      warm = compose::prepare_pipelines(mode, colorFormat, depthFormat) &&
+             compose::prepare_pipelines(mode, colorFormat, depthFormat, encoding) &&
+             native_upscale::prepare_pipelines(encoding) && warm;
     }
     if (warm) {
       gfx::gpu_synchronize();
@@ -309,14 +343,25 @@ bool on_latch(const Settings& settings) {
       }
       temporal_resolve::install(resolver);
       g_installed = resolver;
+      native_upscale::installed(resolver);
       switched = true;
+      std::string_view name;
+      if (fsr) {
+        name = "FSR";
+      } else if (vendor != nullptr) {
+        name = vendor->name();
+      }
+      const std::string_view separator = name.empty() ? "" : ", ";
       if (webgpu::scene_split_active()) {
-        Log.info("Scene split: {}x{} scene, {}x{} output{}", wanted.width, wanted.height, efb.width, efb.height,
-                 resolver != nullptr ? ", FSR" : "");
+        Log.info("Scene split: {}x{} scene, {}x{} output{}{}", wanted.width, wanted.height, efb.width, efb.height,
+                 separator, name);
       } else {
-        Log.info("Scene split: off{}", resolver != nullptr ? ", FSR in place" : "");
+        Log.info("Scene split: off{}{}{}", separator, name, name.empty() ? "" : " in place");
       }
     }
+  }
+  if (vendor == nullptr && !native_upscale::is_native(temporal_resolve::installed())) {
+    native_upscale::release();
   }
   g_quality.store(settings.upscalerQuality, std::memory_order_relaxed);
   g_rcasStrength.store(taa::rcas_strength(settings.taaSharpness), std::memory_order_relaxed);
@@ -326,12 +371,14 @@ bool on_latch(const Settings& settings) {
 
 void latch_graph(const Settings& settings, const CompiledGraph* graph) {
   fsr_pass::on_latch(settings, graph, signs_env());
+  native_upscale::on_latch(settings, graph, signs_env());
   if (graph == g_checkedGraph) {
     return;
   }
   g_checkedGraph = graph;
   const temporal_resolve::Resolver& resolver = temporal_resolve::installed();
-  if (graph == nullptr || !split_live() || resolver.scene_size == nullptr || g_warnedLateWriter) {
+  const bool composes = native_upscale::is_native(resolver) || (split_live() && resolver.scene_size != nullptr);
+  if (graph == nullptr || !composes || g_warnedLateWriter) {
     return;
   }
   const std::span<const NodeId> passes = graph->stages[static_cast<size_t>(Stage::PrePost)].passes;
@@ -351,12 +398,14 @@ void latch_graph(const Settings& settings, const CompiledGraph* graph) {
 
 void shutdown() noexcept {
   fsr_pass::shutdown();
+  native_upscale::shutdown();
   compose::shutdown();
   temporal_resolve::install(nullptr);
   g_installed = nullptr;
   gx::g_upscaleSampling = {};
   g_checkedGraph = nullptr;
   g_splitLive.store(false, std::memory_order_release);
+  g_nativeInPlace.store(false, std::memory_order_release);
   g_active.store(Upscaler::Off, std::memory_order_relaxed);
   g_sceneWidth.store(0, std::memory_order_relaxed);
   g_sceneHeight.store(0, std::memory_order_relaxed);
@@ -366,7 +415,7 @@ void shutdown() noexcept {
 
 bool split_live() noexcept { return g_splitLive.load(std::memory_order_acquire); }
 
-bool compose_wanted() noexcept { return split_live(); }
+bool compose_wanted() noexcept { return split_live() || g_nativeInPlace.load(std::memory_order_acquire); }
 
 GraphExtent scene_size() noexcept {
   return {g_sceneWidth.load(std::memory_order_relaxed), g_sceneHeight.load(std::memory_order_relaxed)};
@@ -385,24 +434,42 @@ float ratio() noexcept {
 float rcas_strength() noexcept { return g_rcasStrength.load(std::memory_order_relaxed); }
 
 bool ready(const Settings& settings) noexcept {
-  if (settings.upscaler != Upscaler::Fsr) {
-    return true;
+  const temporal_resolve::Resolver& installed = temporal_resolve::installed();
+  switch (settings.upscaler) {
+  case Upscaler::Fsr:
+    return installed.pass == fsr_pass::Pass && fsr_pass::ready();
+  case Upscaler::Dlss:
+  case Upscaler::Xess:
+    return native_upscale::is_native(installed) && native_upscale::active() == settings.upscaler &&
+           native_upscale::ready();
+  case Upscaler::Off:
+  case Upscaler::Auto:
+    break;
   }
-  return temporal_resolve::installed().pass == fsr_pass::Pass && fsr_pass::ready();
+  return true;
 }
 
 UpscaleStatus status() noexcept {
   const GraphExtent scene = scene_size();
   const GraphExtent output = output_size();
   const Upscaler active = g_active.load(std::memory_order_relaxed);
+  const UpscalerQuality quality = g_quality.load(std::memory_order_relaxed);
   const bool fsr = active == Upscaler::Fsr;
+  const bool native = active == Upscaler::Dlss || active == Upscaler::Xess;
+  std::string_view displayName;
+  if (fsr) {
+    displayName = "FSR";
+  } else if (native) {
+    displayName = native_upscale::display_name(quality);
+  }
   return {
       .active = active,
-      .quality = g_quality.load(std::memory_order_relaxed),
+      .quality = quality,
       .sceneSize = {scene.width, scene.height},
       .outputSize = {output.width, output.height},
-      .displayName = fsr ? std::string_view{"FSR"} : std::string_view{},
-      .ready = fsr && fsr_pass::ready(),
+      .displayName = displayName,
+      .path = native ? native_upscale::path() : std::string_view{},
+      .ready = fsr ? fsr_pass::ready() : native && native_upscale::ready(),
   };
 }
 
@@ -426,6 +493,7 @@ void reset() noexcept {
   g_rcasStrength.store(0.f, std::memory_order_relaxed);
   compose::testing::reset();
   fsr_pass::testing::reset();
+  native_upscale::testing::reset();
   publish();
 }
 } // namespace testing

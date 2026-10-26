@@ -27,6 +27,8 @@ namespace aurora::render::detail::upscale::compose {
 namespace {
 constexpr Module Log{"aurora::render::upscale"};
 constexpr std::array<std::string_view, 1> InplaceDefines{"COMPOSE_INPLACE"};
+constexpr std::array<std::string_view, 1> LinearDefines{"COMPOSE_LINEAR"};
+constexpr std::array<std::string_view, 2> InplaceLinearDefines{"COMPOSE_INPLACE", "COMPOSE_LINEAR"};
 constexpr uint64_t SplitLayoutKey = 0x55505343'53504C54ull;
 constexpr uint64_t InplaceLayoutKey = 0x55505343'494E504Cull;
 constexpr size_t GroupCacheCapacity = 4;
@@ -340,7 +342,8 @@ Params make_params(const SceneComposeData& data, GraphExtent scene, GraphExtent 
   };
 }
 
-bool prepare_pipelines(ComposeMode mode, wgpu::TextureFormat colorFormat, wgpu::TextureFormat depthFormat) {
+bool prepare_pipelines(ComposeMode mode, wgpu::TextureFormat colorFormat, wgpu::TextureFormat depthFormat,
+                       ColorEncoding encoding) {
   const wgpu::TextureFormat depth = mode == ComposeMode::Split ? depthFormat : wgpu::TextureFormat::Undefined;
   shaders::PipelineId id;
   {
@@ -349,19 +352,18 @@ bool prepare_pipelines(ComposeMode mode, wgpu::TextureFormat colorFormat, wgpu::
       return false;
     }
     for (const PipelineEntry& entry : g_pipelines) {
-      if (entry.mode == mode && entry.encoding == ColorEncoding::Stored && entry.color == colorFormat &&
-          entry.depth == depth) {
+      if (entry.mode == mode && entry.encoding == encoding && entry.color == colorFormat && entry.depth == depth) {
         id = entry.id;
         break;
       }
     }
     if (!id) {
-      shaders::RenderPipelineDesc desc = testing::pipeline_desc(mode, colorFormat, depth);
+      shaders::RenderPipelineDesc desc = testing::pipeline_desc(mode, colorFormat, depth, encoding);
       const bool split = mode == ComposeMode::Split;
       desc.layout = split ? g_shared.splitPipelineLayout : g_shared.inplacePipelineLayout;
       desc.layoutKey = split ? SplitLayoutKey : InplaceLayoutKey;
       id = shaders::request_render(desc);
-      g_pipelines.push_back({.mode = mode, .color = colorFormat, .depth = depth, .id = id});
+      g_pipelines.push_back({.mode = mode, .encoding = encoding, .color = colorFormat, .depth = depth, .id = id});
     }
   }
   return !g_hold.load(std::memory_order_relaxed) && shaders::ready(id);
@@ -488,14 +490,22 @@ void reset() noexcept {
 void hold_pipelines(bool hold) noexcept { g_hold.store(hold, std::memory_order_relaxed); }
 
 shaders::RenderPipelineDesc pipeline_desc(ComposeMode mode, wgpu::TextureFormat colorFormat,
-                                          wgpu::TextureFormat depthFormat) {
+                                          wgpu::TextureFormat depthFormat, ColorEncoding encoding) {
   const bool split = mode == ComposeMode::Split;
+  const bool linear = encoding == ColorEncoding::Linear;
+  std::span<const std::string_view> defines;
+  if (split) {
+    defines = linear ? std::span<const std::string_view>{LinearDefines} : std::span<const std::string_view>{};
+  } else {
+    defines = linear ? std::span<const std::string_view>{InplaceLinearDefines}
+                     : std::span<const std::string_view>{InplaceDefines};
+  }
   shaders::RenderPipelineDesc desc{
       .label = split ? "upscale.compose split" : "upscale.compose in place",
       .shader = Shader,
       .vertexEntry = "vs_main",
       .fragmentEntry = split ? "fs_split" : "fs_inplace",
-      .defines = split ? std::span<const std::string_view>{} : std::span<const std::string_view>{InplaceDefines},
+      .defines = defines,
       .colorCount = 1,
       .depthFormat = split ? depthFormat : wgpu::TextureFormat::Undefined,
       .depthWrite = split,

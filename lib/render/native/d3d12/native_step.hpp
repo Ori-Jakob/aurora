@@ -73,8 +73,4 @@ private:
   bool m_armed = false;
   bool m_failed = false;
 };
-
-namespace test_step {
-void encode(wgpu::CommandEncoder& cmd) noexcept;
-} // namespace test_step
 } // namespace aurora::render::detail::native::d3d12

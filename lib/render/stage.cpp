@@ -13,7 +13,6 @@
 #include "debug/debug.hpp"
 #include "hints.hpp"
 #include "history_reset.hpp"
-#include "native/native.hpp"
 #include "shaders.hpp"
 #include "post/upscale/compose.hpp"
 #include "post/upscale/upscale.hpp"
@@ -215,9 +214,6 @@ void scene_compose([[maybe_unused]] wgpu::CommandEncoder& cmd, [[maybe_unused]] 
 bool take_native_step([[maybe_unused]] wgpu::CommandEncoder& cmd, [[maybe_unused]] const SceneComposeData& data,
                       [[maybe_unused]] gfx::detail::NativeStep& step) noexcept {
 #if AURORA_ENABLE_RENDER
-  if (data.mode == ComposeMode::Split) {
-    native::encode_test_step(cmd);
-  }
   return upscale::compose::take_native_step(step);
 #else
   return false;

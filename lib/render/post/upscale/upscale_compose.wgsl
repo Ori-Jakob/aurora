@@ -32,8 +32,17 @@ fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
   return vec4f(uv * 2.0 - 1.0, 0.0, 1.0);
 }
 
+fn stored_rgb(rgb: vec3f) -> vec3f {
+//#if COMPOSE_LINEAR
+  let linear = saturate(rgb);
+  return select(1.055 * pow(linear, vec3f(1.0 / 2.4)) - 0.055, linear * 12.92, linear <= vec3f(0.0031308));
+//#else
+  return rgb;
+//#endif
+}
+
 fn source_rgb(position: vec2f) -> vec3f {
-  return rcas_sharpen(source_color, vec2i(floor(position)), params.rcas_strength);
+  return stored_rgb(rcas_sharpen(source_color, vec2i(floor(position)), params.rcas_strength));
 }
 
 //#if COMPOSE_INPLACE
@@ -61,7 +70,7 @@ fn fs_split(@builtin(position) position: vec4f) -> ComposeOut {
   var rgb = textureSampleLevel(scene_color, linear_clamp, scene / params.scene_size, 0.0).rgb;
   // Only the native copy test hands over a source at render size, so it is resampled like the scene colour
   if (status.value == 1u && all(textureDimensions(source_color) == textureDimensions(scene_color))) {
-    rgb = textureSampleLevel(source_color, linear_clamp, scene / params.scene_size, 0.0).rgb;
+    rgb = stored_rgb(textureSampleLevel(source_color, linear_clamp, scene / params.scene_size, 0.0).rgb);
   } else if (status.value == 1u) {
     rgb = source_rgb(position.xy);
   }

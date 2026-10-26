@@ -132,6 +132,7 @@ void shutdown() noexcept {
   hzb::shutdown();
   taa::shutdown();
   upscale::shutdown();
+  native::shutdown();
   // Unhooks the release listener before the pool clears, so its last releases have no cache left to evict from
   shutdown_bindings();
   transient_pool().clear();
