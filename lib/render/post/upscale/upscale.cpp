@@ -5,6 +5,7 @@
 #include "../../module.hpp"
 
 #include "../../../gfx/frame.hpp"
+#include "../../../gx/gx.hpp"
 #include "../../../logging.hpp"
 #include "../../../webgpu/gpu.hpp"
 
@@ -24,11 +25,12 @@ constexpr Module Log{"aurora::render::upscale"};
 
 struct EnvOverride {
   bool set = false;
-  std::optional<float> ratio;
+  std::optional<float> value;
 };
 
 // Game thread
 EnvOverride g_envOverride;
+EnvOverride g_mipBiasOverride;
 const CompiledGraph* g_checkedGraph = nullptr;
 bool g_warnedLateWriter = false;
 
@@ -40,7 +42,7 @@ std::atomic_uint32_t g_outputHeight{0};
 
 std::optional<float> split_env() {
   if (g_envOverride.set) {
-    return g_envOverride.ratio;
+    return g_envOverride.value;
   }
   static const std::optional<float> env = []() -> std::optional<float> {
     const char* value = SDL_getenv("AURORA_RENDER_SPLIT");
@@ -58,6 +60,39 @@ std::optional<float> split_env() {
   return env;
 }
 
+float mip_bias_env() {
+  if (g_mipBiasOverride.set) {
+    return g_mipBiasOverride.value.value_or(0.f);
+  }
+  static const float env = []() -> float {
+    const char* value = SDL_getenv("AURORA_RENDER_UPSCALER_MIP_BIAS");
+    if (value == nullptr) {
+      return 0.f;
+    }
+    const std::optional<float> extra = parse_mip_bias(value);
+    if (extra) {
+      Log.warn("AURORA_RENDER_UPSCALER_MIP_BIAS={}: adding {} to the scene mip bias while upscaling", value, *extra);
+    } else {
+      Log.warn("AURORA_RENDER_UPSCALER_MIP_BIAS={} is not a bias between -{} and {}; ignored", value, MaxExtraMipBias,
+               MaxExtraMipBias);
+    }
+    return extra.value_or(0.f);
+  }();
+  return env;
+}
+
+void publish_sampling() {
+  if (!compose_wanted()) {
+    gx::g_upscaleSampling = {};
+    return;
+  }
+  const float outputPerRender = ratio();
+  const temporal_resolve::Resolver& resolver = temporal_resolve::installed();
+  const float bias =
+      resolver.mip_bias != nullptr ? resolver.mip_bias(outputPerRender) : std::log2(1.f / outputPerRender);
+  gx::g_upscaleSampling = {.active = true, .outputPerRender = outputPerRender, .mipBias = bias + mip_bias_env()};
+}
+
 void publish() noexcept {
   const wgpu::Extent3D scene = webgpu::scene_extent();
   const wgpu::Extent3D output = webgpu::g_frameBuffer.size;
@@ -66,6 +101,7 @@ void publish() noexcept {
   g_outputWidth.store(output.width, std::memory_order_relaxed);
   g_outputHeight.store(output.height, std::memory_order_relaxed);
   g_splitLive.store(webgpu::scene_split_active(), std::memory_order_release);
+  publish_sampling();
 }
 
 bool writes_color(const CompiledGraph& graph, NodeId node) noexcept {
@@ -75,6 +111,16 @@ bool writes_color(const CompiledGraph& graph, NodeId node) noexcept {
   });
 }
 } // namespace
+
+std::optional<float> parse_mip_bias(std::string_view text) noexcept {
+  float value = 0.f;
+  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+  if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
+      std::abs(value) > MaxExtraMipBias) {
+    return std::nullopt;
+  }
+  return value;
+}
 
 std::optional<float> parse_split_ratio(std::string_view text) noexcept {
   float value = 0.f;
@@ -161,6 +207,7 @@ void check_graph(const CompiledGraph* graph) {
 
 void shutdown() noexcept {
   compose::shutdown();
+  gx::g_upscaleSampling = {};
   g_checkedGraph = nullptr;
   g_splitLive.store(false, std::memory_order_release);
   g_sceneWidth.store(0, std::memory_order_relaxed);
@@ -198,10 +245,13 @@ UpscaleStatus status() noexcept {
 }
 
 namespace testing {
-void set_split_env(std::optional<float> ratio) noexcept { g_envOverride = {.set = true, .ratio = ratio}; }
+void set_split_env(std::optional<float> ratio) noexcept { g_envOverride = {.set = true, .value = ratio}; }
+
+void set_mip_bias_env(std::optional<float> extra) noexcept { g_mipBiasOverride = {.set = true, .value = extra}; }
 
 void reset() noexcept {
   g_envOverride = {};
+  g_mipBiasOverride = {};
   g_warnedLateWriter = false;
   g_checkedGraph = nullptr;
   compose::testing::reset();

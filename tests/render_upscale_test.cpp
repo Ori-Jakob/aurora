@@ -5,12 +5,15 @@
 #include "gfx/frame_packet.hpp"
 #include "gfx/pipeline_cache.hpp"
 #include "gfx/recording.hpp"
+#include "gfx/texture.hpp"
 #include "gx/gx.hpp"
+#include "gx/shader_info.hpp"
 #include "render/frame_state.hpp"
 #include "render/graph.hpp"
 #include "render/jobs.hpp"
 #include "render/pass_context.hpp"
 #include "render/post/upscale/compose.hpp"
+#include "render/post/temporal_resolve.hpp"
 #include "render/post/upscale/upscale.hpp"
 #include "render/settings.hpp"
 #include "render/shaders.hpp"
@@ -20,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
@@ -435,6 +439,176 @@ TEST_F(Upscale, SwitchWaitsForWarm) {
   EXPECT_EQ(status.active, Upscaler::Off);
   EXPECT_EQ(status.sceneSize[0], SceneAtTwo.width);
   EXPECT_EQ(status.outputSize[0], OutputWidth);
+}
+
+constexpr gfx::Viewport FullViewport{0.f, 0.f, 640.f, 480.f, 0.f, 1.f};
+gfx::TextureBind bias_texture(bool arbitraryMips) {
+  auto ref = std::make_shared<gfx::TextureRef>(wgpu::Texture{}, wgpu::TextureView{}, wgpu::TextureView{},
+                                               wgpu::Extent3D{128, 128, 1}, wgpu::TextureFormat::RGBA8Unorm, 8u,
+                                               static_cast<uint32_t>(GX_TF_RGBA8));
+  ref->hasArbitraryMips = arbitraryMips;
+  ref->isReplacement = arbitraryMips;
+  GXTexObj_ obj{};
+  obj.mWidth = 64;
+  obj.mHeight = 64;
+  obj.mode0 = 16u << 9;
+  return {obj, std::move(ref)};
+}
+
+class GxTextureBias : public UpscaleTest {
+protected:
+  void TearDown() override {
+    gx::g_gxState.textures[0] = {};
+    temporal_resolve::install(nullptr);
+    UpscaleTest::TearDown();
+  }
+
+  static std::vector<uint8_t> uniform_bytes() {
+    gx::ShaderInfo info{};
+    info.sampledTextures.set(0);
+    return gx::testing::uniform_bytes(info);
+  }
+
+  static float sampled_bias() {
+    const std::vector<uint8_t> bytes = uniform_bytes();
+    std::array<float, 4> sizeBias{};
+    EXPECT_GE(bytes.size(), sizeof(sizeBias));
+    std::memcpy(sizeBias.data(), bytes.data() + bytes.size() - sizeof(sizeBias), sizeof(sizeBias));
+    EXPECT_EQ(sizeBias[0], 64.f);
+    return sizeBias[2];
+  }
+
+  static bool uniform_dirty() { return (gx::g_gxState.dirty & gx::DirtyUniform) != 0; }
+};
+
+TEST_F(GxTextureBias, UniformBytesUnchangedWithoutUpscale) {
+  gx::g_gxState.textures[0] = bias_texture(true);
+  start_frame();
+  EXPECT_FALSE(gx::g_upscaleSampling.active);
+  gx::set_logical_viewport(FullViewport);
+  const std::vector<uint8_t> before = uniform_bytes();
+  gx::g_upscaleSampling = {.active = false, .outputPerRender = 2.f, .mipBias = -1.f};
+  EXPECT_EQ(uniform_bytes(), before);
+  end_frame();
+
+  upscale::testing::set_split_env(2.f);
+  upscale::testing::set_mip_bias_env(-1.f);
+  start_frame();
+  EXPECT_TRUE(gx::g_upscaleSampling.active);
+  gx::set_logical_viewport(FullViewport);
+  EXPECT_NE(uniform_bytes(), before);
+  end_frame();
+
+  upscale::testing::set_split_env(std::nullopt);
+  start_frame();
+  EXPECT_FALSE(upscale::split_live());
+  EXPECT_FALSE(gx::g_upscaleSampling.active);
+  gx::set_logical_viewport(FullViewport);
+  EXPECT_EQ(uniform_bytes(), before);
+  gx::g_gxState.dirty = 0;
+  gfx::begin_offscreen(32, 16);
+  EXPECT_FALSE(uniform_dirty());
+  gfx::end_offscreen();
+  EXPECT_FALSE(uniform_dirty());
+}
+
+TEST_F(GxTextureBias, SceneDrawsGetUpscaleBias) {
+  gx::g_gxState.textures[0] = bias_texture(false);
+  start_frame();
+  gx::set_logical_viewport(FullViewport);
+  const float base = sampled_bias();
+  EXPECT_EQ(base, 0.5f);
+  end_frame();
+
+  upscale::testing::set_split_env(2.f);
+  start_frame();
+  ASSERT_TRUE(upscale::split_live());
+  EXPECT_TRUE(gfx::in_scene_pass());
+  EXPECT_TRUE(gx::g_upscaleSampling.active);
+  EXPECT_EQ(gx::g_upscaleSampling.outputPerRender, 2.f);
+  EXPECT_EQ(gx::g_upscaleSampling.mipBias, -1.f);
+  gx::set_logical_viewport(FullViewport);
+  EXPECT_EQ(sampled_bias(), base - 1.f);
+  end_frame();
+
+  upscale::testing::set_mip_bias_env(-1.f);
+  start_frame();
+  EXPECT_EQ(gx::g_upscaleSampling.mipBias, -2.f);
+  gx::set_logical_viewport(FullViewport);
+  EXPECT_EQ(sampled_bias(), base - 2.f);
+  end_frame();
+
+  static constexpr temporal_resolve::Resolver Biased{
+      .pass = "test.biased",
+      .mip_bias = [](float ratio) noexcept { return -0.25f * ratio; },
+  };
+  temporal_resolve::install(&Biased);
+  upscale::testing::set_mip_bias_env(std::nullopt);
+  start_frame();
+  EXPECT_EQ(gx::g_upscaleSampling.mipBias, -0.5f);
+  gx::set_logical_viewport(FullViewport);
+  EXPECT_EQ(sampled_bias(), base - 0.5f);
+}
+
+TEST_F(GxTextureBias, OffscreenAndPostSplitUnbiased) {
+  gx::g_gxState.textures[0] = bias_texture(false);
+  upscale::testing::set_split_env(2.f);
+  start_frame();
+  gx::set_logical_viewport(FullViewport);
+  const float base = gx::g_gxState.textures[0].sample_lod_bias();
+  EXPECT_EQ(sampled_bias(), base - 1.f);
+
+  gx::g_gxState.dirty = 0;
+  gfx::begin_offscreen(32, 16);
+  EXPECT_FALSE(gfx::in_scene_pass());
+  EXPECT_TRUE(uniform_dirty());
+  EXPECT_EQ(sampled_bias(), base);
+
+  gx::g_gxState.dirty = 0;
+  gfx::end_offscreen();
+  EXPECT_TRUE(gfx::in_scene_pass());
+  EXPECT_TRUE(uniform_dirty());
+  EXPECT_EQ(sampled_bias(), base - 1.f);
+
+  gx::g_gxState.dirty = 0;
+  gfx::record_stage(Stage::PrePost);
+  EXPECT_EQ(gfx::current_efb_mode(), gfx::EfbMode::Output);
+  EXPECT_FALSE(gfx::in_scene_pass());
+  EXPECT_TRUE(uniform_dirty());
+  EXPECT_EQ(sampled_bias(), base);
+
+  gfx::begin_offscreen(32, 16);
+  EXPECT_EQ(sampled_bias(), base);
+  gfx::end_offscreen();
+  EXPECT_FALSE(gfx::in_scene_pass());
+  EXPECT_EQ(sampled_bias(), base);
+}
+
+TEST_F(GxTextureBias, ArbitraryMipReplacementKeepsOutputScale) {
+  gx::g_gxState.textures[0] = bias_texture(true);
+  start_frame();
+  gx::set_logical_viewport(FullViewport);
+  ASSERT_EQ(gx::g_gxState.renderViewport.width, static_cast<float>(OutputWidth));
+  const float output = sampled_bias();
+  EXPECT_EQ(output, 0.5f - 3.f);
+  end_frame();
+
+  upscale::testing::set_split_env(2.f);
+  start_frame();
+  gx::set_logical_viewport(FullViewport);
+  ASSERT_EQ(gx::g_gxState.renderViewport.width, static_cast<float>(SceneAtTwo.width));
+  EXPECT_EQ(sampled_bias(), output + gx::g_upscaleSampling.mipBias);
+  gfx::record_stage(Stage::PrePost);
+  EXPECT_EQ(gx::g_gxState.renderViewport.width, static_cast<float>(OutputWidth));
+  EXPECT_EQ(sampled_bias(), output);
+}
+
+TEST(UpscaleRules, MipBiasParses) {
+  EXPECT_EQ(upscale::parse_mip_bias("-1"), -1.f);
+  EXPECT_EQ(upscale::parse_mip_bias("0.5"), 0.5f);
+  EXPECT_EQ(upscale::parse_mip_bias("-4.5"), std::nullopt);
+  EXPECT_EQ(upscale::parse_mip_bias("bias"), std::nullopt);
+  EXPECT_EQ(upscale::parse_mip_bias("-1x"), std::nullopt);
 }
 
 TEST(UpscaleRules, SplitRatioParses) {

@@ -14,6 +14,7 @@ struct Resolver {
   bool (*wanted)(const Settings& settings) noexcept = nullptr;
   bool (*jitter_ready)() noexcept = nullptr;
   GraphExtent (*scene_size)(GraphExtent output) noexcept = nullptr;
+  float (*mip_bias)(float ratio) noexcept = nullptr;
 };
 
 void install(const Resolver* resolver) noexcept;

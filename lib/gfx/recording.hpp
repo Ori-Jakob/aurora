@@ -231,5 +231,6 @@ void push_debug_group(std::string label);
 void insert_debug_marker(std::string label);
 void record_stage(render::Stage stage);
 EfbMode current_efb_mode() noexcept;
+bool in_scene_pass() noexcept;
 render::DepthSource current_scene_depth_source() noexcept;
 } // namespace aurora::gfx

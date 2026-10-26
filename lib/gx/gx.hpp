@@ -441,6 +441,12 @@ struct GXState {
   void clearVtxSizeCache() { lastVtxFmt = GX_MAX_VTXFMT; }
 };
 extern GXState g_gxState;
+struct UpscaleSampling {
+  bool active = false;
+  float outputPerRender = 1.f;
+  float mipBias = 0.f;
+};
+inline UpscaleSampling g_upscaleSampling{};
 struct ShaderInfo;
 
 void initialize() noexcept;

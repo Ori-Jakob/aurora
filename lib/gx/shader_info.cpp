@@ -20,6 +20,19 @@ bool is_alpha_bump_channel(GXChannelID id) { return id == GX_ALPHA_BUMP || id ==
 Vec4<float> texture_size_bias(const gfx::TextureBind& tex) {
   auto width = static_cast<float>(tex.texObj.width());
   auto height = static_cast<float>(tex.texObj.height());
+  // Upscalers resolve to output size, so scene textures pick mips as if drawn there
+  if (g_upscaleSampling.active && gfx::in_scene_pass()) {
+    float sceneBias = g_upscaleSampling.mipBias;
+    if (tex.ref && tex.ref->hasArbitraryMips) {
+      const float viewportScale =
+          std::min(g_gxState.renderViewport.width / std::max(g_gxState.logicalViewport.width, 1.f),
+                   g_gxState.renderViewport.height / std::max(g_gxState.logicalViewport.height, 1.f)) *
+          g_upscaleSampling.outputPerRender;
+      const float replacementScale = static_cast<float>(tex.ref->size.width) / std::max(width, 1.f);
+      sceneBias += std::log2(viewportScale / std::max(replacementScale, 0.001f));
+    }
+    return {width, height, tex.sample_lod_bias() + sceneBias, 0.0f};
+  }
   float vpBias = 0.f;
   if (tex.ref && tex.ref->hasArbitraryMips) {
     const float viewportScale =

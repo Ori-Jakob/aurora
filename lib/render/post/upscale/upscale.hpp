@@ -9,6 +9,7 @@
 
 namespace aurora::render::detail::upscale {
 inline constexpr float MaxSplitRatio = 3.f;
+inline constexpr float MaxExtraMipBias = 4.f;
 
 struct SplitInputs {
   GraphExtent output;
@@ -18,6 +19,7 @@ struct SplitInputs {
 };
 
 [[nodiscard]] std::optional<float> parse_split_ratio(std::string_view text) noexcept;
+[[nodiscard]] std::optional<float> parse_mip_bias(std::string_view text) noexcept;
 [[nodiscard]] GraphExtent split_size(GraphExtent output, float ratio) noexcept;
 [[nodiscard]] GraphExtent wanted_scene_size(const SplitInputs& inputs) noexcept;
 
@@ -33,6 +35,7 @@ void shutdown() noexcept;
 
 namespace testing {
 void set_split_env(std::optional<float> ratio) noexcept;
+void set_mip_bias_env(std::optional<float> extra) noexcept;
 void reset() noexcept;
 } // namespace testing
 } // namespace aurora::render::detail::upscale

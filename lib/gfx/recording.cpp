@@ -106,6 +106,13 @@ const webgpu::TextureWithSampler& efb_depth(EfbMode mode) noexcept {
   return mode == EfbMode::Scene ? webgpu::scene_depth() : webgpu::g_depthBuffer;
 }
 
+// The scene bias differs between scene, offscreen and output passes, so a pass change rebuilds the uniform
+void note_scene_pass_change() noexcept {
+  if (gx::g_upscaleSampling.active) {
+    gx::g_gxState.dirty |= gx::DirtyUniform;
+  }
+}
+
 void set_single_color_target(RenderPass& pass, wgpu::TextureFormat format, const wgpu::Extent3D size,
                              wgpu::TextureView view, wgpu::TextureView resolveView = {});
 
@@ -574,6 +581,7 @@ void suspend_efb() {
   }
   g_recorder.suspendedEfbViewport = g_recorder.cachedViewport;
   g_recorder.suspendedEfbScissor = g_recorder.cachedScissor;
+  note_scene_pass_change();
 }
 
 void finish_current_offscreen() {
@@ -645,6 +653,7 @@ void restore_efb() {
   g_recorder.cachedScissor = g_recorder.suspendedEfbScissor;
   push_command(CommandType::SetViewport, Command::Data{.setViewport = g_recorder.cachedViewport});
   push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
+  note_scene_pass_change();
 
   if (g_recorder.pendingStageEnd > g_recorder.nextStage) {
     run_stages_until(std::exchange(g_recorder.pendingStageEnd, 0), NoLiveMarker);
@@ -894,6 +903,7 @@ void switch_to_output(bool reopen) {
   if (data.mode == render::detail::ComposeMode::Split) {
     g_recorder.efbMode = EfbMode::Output;
   }
+  note_scene_pass_change();
   g_recorder.currentRenderPass = UINT32_MAX;
   if (reopen) {
     open_efb_pass_loading();
@@ -955,6 +965,7 @@ void begin_recording(FramePacket& packet, size_t frameSlot) {
   g_recorder.efbMode = EfbMode::Scene;
   g_recorder.composeWanted = render::detail::scene_compose_wanted();
   g_recorder.composed = false;
+  note_scene_pass_change();
   g_channelStorageBytes = 0;
 
   current_render_passes().emplace_back();
@@ -1659,6 +1670,10 @@ void finish() {
 }
 
 EfbMode current_efb_mode() noexcept { return g_recorder.efbMode; }
+
+bool in_scene_pass() noexcept {
+  return g_recorder.active() && !g_recorder.inOffscreen && g_recorder.efbMode == EfbMode::Scene && !g_recorder.composed;
+}
 
 render::DepthSource current_scene_depth_source() noexcept {
   if (g_sceneDepthOverride) {
