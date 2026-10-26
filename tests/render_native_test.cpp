@@ -8,21 +8,25 @@
 #include "render/settings.hpp"
 
 #if AURORA_ENABLE_NATIVE_D3D12
+#include "io.hpp"
+#include "render/frame_state.hpp"
+#include "render/native/d3d12/dlss.hpp"
+#include "render/native/d3d12/probe.hpp"
 #include "render/native/d3d12/sentinel.hpp"
 #include "render/native/d3d12/teardown.hpp"
-#endif
-
-#if AURORA_ENABLE_NATIVE_D3D12 && AURORA_ENABLE_XESS
-#include "render/frame_state.hpp"
-#include "render/native/d3d12/probe.hpp"
 #include "render/native/d3d12/upscale_bridge.hpp"
-#include "render/native/d3d12/xess.hpp"
-#include "render/post/upscale/upscale.hpp"
 
 #include <array>
 #include <cmath>
 #include <optional>
+#include <span>
+#include <string_view>
 #include <utility>
+#endif
+
+#if AURORA_ENABLE_NATIVE_D3D12 && AURORA_ENABLE_XESS
+#include "render/native/d3d12/xess.hpp"
+#include "render/post/upscale/upscale.hpp"
 #endif
 
 #include <atomic>
@@ -306,6 +310,395 @@ TEST_F(Xess, ColorFollowsEnvOverride) {
   EXPECT_EQ(xess::upscaler().color_encoding(), ColorEncoding::Linear);
   upscale::testing::reset();
   EXPECT_EQ(xess::upscaler().color_encoding(), ColorEncoding::Linear);
+}
+#endif
+
+#if AURORA_ENABLE_NATIVE_D3D12
+namespace dlss = native::d3d12::dlss;
+namespace ngx_probe = native::d3d12::probe;
+namespace ngx_bridge = native::d3d12::upscale_bridge;
+
+constexpr std::string_view TestProjectId = "3f6c2a91-58d4-4e0b-9a7e-2c41d8b5f063";
+constexpr GraphExtent TestOutput{2560, 1440};
+constexpr std::array<float, dlss::ModeCount> FakeRatios{1.f, 1.5f, 1.72f, 2.f, 3.f};
+
+struct FakeNgx {
+  uint32_t requirements = 0;
+  uint32_t inits = 0;
+  uint32_t capabilities = 0;
+  uint32_t optimals = 0;
+  uint32_t shutdowns = 0;
+  uint32_t waits = 0;
+  std::optional<dlss::Requirements> requirement = dlss::Requirements{};
+  bool initOk = true;
+  std::optional<dlss::Capability> capability = dlss::Capability{.available = true};
+  native::Identity identity;
+  std::filesystem::path data;
+
+  [[nodiscard]] uint32_t calls() const noexcept { return requirements + inits + capabilities + optimals + shutdowns; }
+};
+
+FakeNgx g_ngx;
+
+dlss::Api fake_ngx_api() {
+  dlss::Api api;
+  api.requirements = [](IDXGIAdapter*, const native::Identity&,
+                        const std::filesystem::path&) noexcept -> std::optional<dlss::Requirements> {
+    ++g_ngx.requirements;
+    return g_ngx.requirement;
+  };
+  api.init = [](ID3D12Device*, const native::Identity& identity, const std::filesystem::path& data) noexcept {
+    ++g_ngx.inits;
+    g_ngx.identity = identity;
+    g_ngx.data = data;
+    return g_ngx.initOk;
+  };
+  api.capability = []() noexcept {
+    ++g_ngx.capabilities;
+    return g_ngx.capability;
+  };
+  api.optimal = [](GraphExtent output, UpscalerQuality quality) noexcept -> std::optional<dlss::ModeSize> {
+    ++g_ngx.optimals;
+    const float ratio = FakeRatios[static_cast<size_t>(quality)];
+    const GraphExtent optimal{static_cast<uint32_t>(std::lround(static_cast<float>(output.width) / ratio)),
+                              static_cast<uint32_t>(std::lround(static_cast<float>(output.height) / ratio))};
+    return dlss::ModeSize{.optimal = optimal, .minimum = optimal, .maximum = output};
+  };
+  api.shutdown = [](ID3D12Device*) noexcept { ++g_ngx.shutdowns; };
+  return api;
+}
+
+void count_wait() noexcept { ++g_ngx.waits; }
+
+class Dlss : public ::testing::Test {
+protected:
+  void SetUp() override {
+    const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+    m_dir = std::filesystem::temp_directory_path() / ("aurora_dlss_" + std::string{info->name()});
+    std::error_code ec;
+    std::filesystem::remove_all(m_dir, ec);
+    ASSERT_TRUE(std::filesystem::create_directories(m_dir, ec)) << ec.message();
+    constexpr std::string_view Runtime = "stand-in runtime";
+    ASSERT_TRUE(io::write_file(m_dir / std::string{dlss::RuntimeFile},
+                               std::span{reinterpret_cast<const uint8_t*>(Runtime.data()), Runtime.size()}));
+    testing::reset();
+    ngx_probe::testing::reset();
+    sentinel::open(m_dir);
+    Caps deviceCaps = test::full_caps();
+    deviceCaps.d3d12SharedTexture = true;
+    deviceCaps.d3d12SharedFence = true;
+    testing::set_caps(deviceCaps);
+    ngx_probe::testing::set_identity(
+        ngx_probe::Identity{.vendorId = 0x10DE, .deviceId = 0x2860, .subSysId = 0x3CBC17AA, .driverVersion = 1});
+    ngx_probe::testing::set_runtime_directory(m_dir);
+    g_ngx = {};
+    m_api = fake_ngx_api();
+    dlss::set_api(&m_api);
+    dlss::testing::set_project_env(std::nullopt);
+    dlss::testing::set_data_directory(m_dir / std::string{dlss::DataFolder});
+    dlss::testing::set_fence_wait(&count_wait);
+    native::testing::clear_app_identity();
+    ngx_bridge::testing::set_upscaler(Upscaler::Dlss, &dlss::upscaler());
+    ngx_bridge::testing::set_adapter(adapter());
+    gfx::render_worker::initialize();
+    m_worker = true;
+  }
+
+  void TearDown() override {
+    if (m_worker) {
+      on_worker([] {
+        ngx_bridge::testing::reset();
+        native::d3d12::run_teardowns();
+        dlss::upscaler().destroy();
+      });
+      gfx::render_worker::shutdown();
+    }
+    EXPECT_FALSE(dlss::upscaler().session());
+    ngx_probe::testing::reset();
+    dlss::set_api(nullptr);
+    dlss::testing::reset();
+    native::testing::clear_app_identity();
+    sentinel::open({});
+    testing::reset();
+    std::error_code ec;
+    std::filesystem::remove_all(m_dir, ec);
+  }
+
+  template <typename Work>
+  static void on_worker(Work&& work) {
+    gfx::render_worker::enqueue_work([&] { work(); });
+    gfx::render_worker::synchronize();
+  }
+
+  static FeatureSupport support(Upscaler option) {
+    return current_support(Feature::Upscaler, static_cast<uint8_t>(option), nullptr);
+  }
+
+  static upscale::native_upscale::Adapter adapter(uint32_t vendorId = dlss::NvidiaVendorId) {
+    return {.device = &g_ngx, .vendorId = vendorId};
+  }
+
+  static upscale::native_upscale::ProbeResult probe(uint32_t vendorId = dlss::NvidiaVendorId) {
+    upscale::native_upscale::ProbeResult result;
+    on_worker([&] { result = dlss::upscaler().probe(adapter(vendorId)); });
+    return result;
+  }
+
+  static std::optional<GraphExtent> prepare(GraphExtent output, UpscalerQuality quality = UpscalerQuality::Quality) {
+    std::optional<GraphExtent> render;
+    on_worker([&] { render = dlss::upscaler().prepare(adapter(), output, quality); });
+    return render;
+  }
+
+  static void request(Upscaler upscaler) {
+    Settings settings;
+    settings.upscaler = upscaler;
+    static_cast<void>(submit_request(settings));
+  }
+
+  static void use_test_identity() { set_app_identity({.projectId = TestProjectId, .engineVersion = "1.2.3"}); }
+
+  [[nodiscard]] bool cache_has_dlss() const {
+    const auto bytes = io::read_file(m_dir / ngx_probe::CacheFile);
+    return bytes && std::string_view{reinterpret_cast<const char*>(bytes->data()), bytes->size()}.find("\"dlss\"") !=
+                        std::string_view::npos;
+  }
+
+  std::filesystem::path m_dir;
+  dlss::Api m_api;
+  bool m_worker = false;
+};
+
+TEST_F(Dlss, CapabilityMappingTable) {
+  using dlss::Capability;
+  using dlss::InitResult;
+  const std::vector<std::pair<Capability, FeatureSupport>> capabilities{
+      {{.available = true}, {true, Reason::None}},
+      {{.available = false}, {false, Reason::UnsupportedGpu}},
+      {{.available = true, .needsUpdatedDriver = true}, {false, Reason::DriverTooOld}},
+      {{.available = false, .needsUpdatedDriver = true}, {false, Reason::DriverTooOld}},
+      {{.available = false, .initResult = InitResult::Denied}, {false, Reason::NativeUnavailable}},
+      {{.needsUpdatedDriver = true, .initResult = InitResult::Denied}, {false, Reason::NativeUnavailable}},
+      {{.available = false, .initResult = InitResult::OutOfDate}, {false, Reason::DriverTooOld}},
+      {{.available = false, .initResult = InitResult::Failed}, {false, Reason::UnsupportedGpu}},
+  };
+  for (size_t i = 0; i < capabilities.size(); ++i) {
+    EXPECT_EQ(dlss::support_from_capability(capabilities[i].first), capabilities[i].second) << i;
+  }
+  EXPECT_EQ(dlss::refusal_from_requirements({}), std::nullopt);
+  EXPECT_EQ(dlss::refusal_from_requirements({.driverTooOld = true}), (FeatureSupport{false, Reason::DriverTooOld}));
+  EXPECT_EQ(dlss::refusal_from_requirements({.adapterUnsupported = true}),
+            (FeatureSupport{false, Reason::UnsupportedGpu}));
+  EXPECT_EQ(dlss::refusal_from_requirements({.osTooOld = true}), (FeatureSupport{false, Reason::NativeUnavailable}));
+  EXPECT_EQ(dlss::refusal_from_requirements({.driverTooOld = true, .adapterUnsupported = true}),
+            (FeatureSupport{false, Reason::DriverTooOld}));
+
+  use_test_identity();
+  for (const uint32_t vendor : {0x8086u, 0x1002u, 0u}) {
+    EXPECT_EQ(probe(vendor).support, (FeatureSupport{false, Reason::UnsupportedGpu})) << vendor;
+  }
+  EXPECT_EQ(g_ngx.calls(), 0u);
+
+  g_ngx.requirement = dlss::Requirements{.adapterUnsupported = true};
+  EXPECT_EQ(probe().support, (FeatureSupport{false, Reason::UnsupportedGpu}));
+  EXPECT_EQ(g_ngx.inits, 0u);
+
+  g_ngx.requirement = std::nullopt;
+  g_ngx.capability = Capability{.needsUpdatedDriver = true, .minDriverMajor = 580, .minDriverMinor = 88};
+  request(Upscaler::Dlss);
+  EXPECT_EQ(probe().support, (FeatureSupport{false, Reason::DriverTooOld}));
+  EXPECT_EQ(g_ngx.inits, 1u);
+  EXPECT_EQ(g_ngx.shutdowns, 1u);
+  EXPECT_FALSE(dlss::upscaler().session());
+
+  g_ngx.capability = std::nullopt;
+  EXPECT_EQ(probe().support, (FeatureSupport{false, Reason::NativeUnavailable}));
+  g_ngx.capability = Capability{.available = true};
+  g_ngx.initOk = false;
+  EXPECT_EQ(probe().support, (FeatureSupport{false, Reason::NativeUnavailable}));
+  EXPECT_FALSE(dlss::upscaler().session());
+}
+
+TEST_F(Dlss, OutputLimits) {
+  using dlss::OutputFit;
+  const std::vector<std::pair<GraphExtent, OutputFit>> fits{
+      {{64, 32}, OutputFit::Fits},          {{63, 32}, OutputFit::TooSmall},     {{64, 31}, OutputFit::TooSmall},
+      {{0, 0}, OutputFit::TooSmall},        {{2560, 1440}, OutputFit::Fits},     {{4779, 2688}, OutputFit::Fits},
+      {{7680, 4320}, OutputFit::Fits},      {{7681, 4320}, OutputFit::TooLarge}, {{7680, 4321}, OutputFit::TooLarge},
+      {{10240, 1440}, OutputFit::TooLarge},
+  };
+  for (const auto& [output, fit] : fits) {
+    EXPECT_EQ(dlss::output_fit(output), fit) << output.width << "x" << output.height;
+  }
+
+  use_test_identity();
+  EXPECT_EQ(prepare({7681, 4320}), std::nullopt);
+  EXPECT_EQ(dlss::upscaler().prepare_failure(), Reason::OutputTooLarge);
+  EXPECT_EQ(prepare({32, 16}), (GraphExtent{32, 16}));
+  on_worker([] { EXPECT_EQ(dlss::upscaler().warmup(), upscale::native_upscale::Warmup::Pending); });
+  EXPECT_EQ(g_ngx.calls(), 0u);
+  EXPECT_EQ(prepare(TestOutput), (GraphExtent{1707, 960}));
+  EXPECT_EQ(dlss::upscaler().prepare_failure(), Reason::NativeUnavailable);
+  on_worker([] { EXPECT_EQ(dlss::upscaler().warmup(), upscale::native_upscale::Warmup::Ready); });
+  EXPECT_EQ(prepare({7680, 4320}, UpscalerQuality::Performance), (GraphExtent{3840, 2160}));
+
+  ngx_probe::initialize(m_dir);
+  ngx_probe::request();
+  on_worker([] { native_worker_frame_begin(); });
+  ASSERT_TRUE(support(Upscaler::Dlss).supported);
+  ASSERT_TRUE(cache_has_dlss());
+  ngx_probe::fail(Upscaler::Dlss, Reason::OutputTooLarge);
+  EXPECT_EQ(support(Upscaler::Dlss), (FeatureSupport{false, Reason::OutputTooLarge}));
+  EXPECT_TRUE(cache_has_dlss());
+  ngx_probe::fail(Upscaler::Dlss);
+  EXPECT_EQ(support(Upscaler::Dlss), (FeatureSupport{false, Reason::NativeUnavailable}));
+  EXPECT_FALSE(cache_has_dlss());
+}
+
+TEST_F(Dlss, MissingIdentityRefuses) {
+  const std::string engine = std::to_string(ApiVersion);
+  const native::Identity configured{.projectId = std::string{TestProjectId}, .engineVersion = "2.0"};
+  const std::optional<std::string> env = std::string{"0d6f1c5e-3b7a-4f29-8e61-9a2b4c7d1e08"};
+  EXPECT_EQ(dlss::resolve_identity(std::nullopt, std::nullopt), std::nullopt);
+  EXPECT_EQ(dlss::resolve_identity(std::nullopt, std::string{}), std::nullopt);
+  EXPECT_EQ(dlss::resolve_identity(std::nullopt, env), (native::Identity{.projectId = *env, .engineVersion = engine}));
+  EXPECT_EQ(dlss::resolve_identity(configured, env), configured);
+  EXPECT_EQ(dlss::resolve_identity(native::Identity{}, env), std::nullopt);
+  EXPECT_EQ(dlss::resolve_identity(native::Identity{.projectId = *env}, std::nullopt),
+            (native::Identity{.projectId = *env, .engineVersion = engine}));
+  EXPECT_TRUE(dlss::valid_project_id(TestProjectId));
+  EXPECT_TRUE(dlss::valid_project_id("A0F57B54-1DAF-4934-90AE-C4035C19DF04"));
+  for (const std::string_view id :
+       {"", "dusklight", "{3f6c2a91-58d4-4e0b-9a7e-2c41d8b5f063}", "3f6c2a9158d44e0b9a7e2c41d8b5f063",
+        "3f6c2a91-58d4-4e0b-9a7e-2c41d8b5f06g", "3f6c2a91-58d4-4e0b-9a7e_2c41d8b5f063"}) {
+    EXPECT_FALSE(dlss::valid_project_id(id)) << id;
+  }
+
+  ngx_probe::initialize(m_dir);
+  EXPECT_EQ(support(Upscaler::Dlss), (FeatureSupport{false, Reason::NativeUnavailable}));
+  request(Upscaler::Dlss);
+  for (int i = 0; i < 10; ++i) {
+    static_cast<void>(latch_frame());
+    on_worker([] { native_worker_frame_begin(); });
+  }
+  EXPECT_EQ(probe().support, (FeatureSupport{false, Reason::NativeUnavailable}));
+  EXPECT_EQ(g_ngx.calls(), 0u);
+  EXPECT_FALSE(std::filesystem::exists(m_dir / std::string{dlss::DataFolder}));
+
+  dlss::testing::set_project_env(*env);
+  ngx_probe::initialize(m_dir);
+  EXPECT_EQ(support(Upscaler::Dlss).reason, Reason::Probing);
+  set_app_identity({.projectId = {}, .engineVersion = "2.0"});
+  ngx_probe::initialize(m_dir);
+  EXPECT_EQ(support(Upscaler::Dlss), (FeatureSupport{false, Reason::NativeUnavailable}));
+  set_app_identity({.projectId = "dusklight"});
+  ngx_probe::initialize(m_dir);
+  EXPECT_EQ(support(Upscaler::Dlss), (FeatureSupport{false, Reason::NativeUnavailable}));
+  EXPECT_EQ(g_ngx.calls(), 0u);
+
+  use_test_identity();
+  ngx_probe::initialize(m_dir);
+  EXPECT_EQ(support(Upscaler::Dlss).reason, Reason::Probing);
+  ngx_probe::request();
+  on_worker([] { native_worker_frame_begin(); });
+  EXPECT_TRUE(support(Upscaler::Dlss).supported);
+  EXPECT_EQ(g_ngx.inits, 1u);
+  EXPECT_EQ(g_ngx.identity, (native::Identity{.projectId = std::string{TestProjectId}, .engineVersion = "1.2.3"}));
+  EXPECT_EQ(g_ngx.data, m_dir / std::string{dlss::DataFolder});
+}
+
+TEST_F(Dlss, ModesFromOptimalSettings) {
+  use_test_identity();
+  EXPECT_EQ(prepare(TestOutput), (GraphExtent{1707, 960}));
+  EXPECT_EQ(g_ngx.optimals, dlss::ModeCount);
+  const dlss::Modes& modes = dlss::upscaler().modes();
+  const std::array<GraphExtent, dlss::ModeCount> expected{GraphExtent{2560, 1440}, GraphExtent{1707, 960},
+                                                          GraphExtent{1488, 837}, GraphExtent{1280, 720},
+                                                          GraphExtent{853, 480}};
+  for (size_t i = 0; i < dlss::ModeCount; ++i) {
+    const auto quality = static_cast<UpscalerQuality>(i);
+    ASSERT_TRUE(modes[i].has_value()) << i;
+    EXPECT_EQ(modes[i]->optimal, expected[i]) << i;
+    EXPECT_EQ(dlss::render_size(modes, quality, TestOutput), expected[i]) << i;
+    EXPECT_EQ(prepare(TestOutput, quality), expected[i]) << i;
+  }
+  EXPECT_EQ(g_ngx.optimals, dlss::ModeCount);
+  EXPECT_EQ(g_ngx.inits, 1u);
+  EXPECT_EQ(prepare({1920, 1080}, UpscalerQuality::Performance), (GraphExtent{960, 540}));
+  EXPECT_EQ(g_ngx.optimals, 2 * dlss::ModeCount);
+
+  dlss::Modes partial{};
+  partial[1] = dlss::ModeSize{.optimal = {3000, 2000}};
+  partial[3] = dlss::ModeSize{.optimal = {0, 0}};
+  EXPECT_EQ(dlss::render_size(partial, UpscalerQuality::NativeAa, TestOutput), TestOutput);
+  EXPECT_EQ(dlss::render_size(partial, UpscalerQuality::Quality, TestOutput), TestOutput);
+  EXPECT_EQ(dlss::render_size(partial, UpscalerQuality::Balanced, TestOutput), std::nullopt);
+  EXPECT_EQ(dlss::render_size(partial, UpscalerQuality::Performance, TestOutput), std::nullopt);
+  EXPECT_EQ(dlss::upscaler().display_name(UpscalerQuality::NativeAa), "DLAA");
+  EXPECT_EQ(dlss::upscaler().display_name(UpscalerQuality::Quality), "DLSS");
+  EXPECT_EQ(dlss::upscaler().color_encoding(), ColorEncoding::Stored);
+  EXPECT_FALSE(dlss::upscaler().wants_reactive());
+}
+
+TEST_F(Dlss, ProbeOnlySessionShutsDown) {
+  use_test_identity();
+  for (const Upscaler requested : {Upscaler::Off, Upscaler::Fsr, Upscaler::Xess}) {
+    request(requested);
+    EXPECT_TRUE(probe().support.supported) << int{static_cast<uint8_t>(requested)};
+    EXPECT_FALSE(dlss::upscaler().session());
+  }
+  EXPECT_EQ(g_ngx.requirements, 3u);
+  EXPECT_EQ(g_ngx.inits, 0u);
+  EXPECT_EQ(g_ngx.shutdowns, 0u);
+
+  g_ngx.requirement = std::nullopt;
+  request(Upscaler::Off);
+  EXPECT_TRUE(probe().support.supported);
+  EXPECT_FALSE(dlss::upscaler().session());
+  EXPECT_EQ(g_ngx.inits, 1u);
+  EXPECT_EQ(g_ngx.shutdowns, 1u);
+  EXPECT_EQ(g_ngx.waits, 1u);
+
+  for (const Upscaler requested : {Upscaler::Dlss, Upscaler::Auto}) {
+    request(requested);
+    const uint32_t requirements = g_ngx.requirements;
+    const uint32_t inits = g_ngx.inits;
+    const uint32_t shutdowns = g_ngx.shutdowns;
+    EXPECT_TRUE(probe().support.supported);
+    EXPECT_TRUE(dlss::upscaler().session());
+    EXPECT_EQ(prepare(TestOutput), (GraphExtent{1707, 960}));
+    EXPECT_EQ(g_ngx.requirements, requirements);
+    EXPECT_EQ(g_ngx.inits, inits + 1);
+    EXPECT_EQ(g_ngx.shutdowns, shutdowns);
+    on_worker([] { dlss::upscaler().destroy(); });
+    EXPECT_FALSE(dlss::upscaler().session());
+    EXPECT_EQ(g_ngx.shutdowns, shutdowns + 1);
+  }
+  EXPECT_EQ(g_ngx.waits, g_ngx.shutdowns);
+
+  g_ngx.capability = dlss::Capability{.available = false};
+  request(Upscaler::Dlss);
+  EXPECT_EQ(probe().support, (FeatureSupport{false, Reason::UnsupportedGpu}));
+  EXPECT_FALSE(dlss::upscaler().session());
+
+  g_ngx.capability = dlss::Capability{.available = true};
+  g_ngx.requirement = dlss::Requirements{};
+  const uint32_t inits = g_ngx.inits;
+  ngx_probe::initialize(m_dir);
+  request(Upscaler::Off);
+  ngx_probe::request();
+  on_worker([] { native_worker_frame_begin(); });
+  EXPECT_TRUE(support(Upscaler::Dlss).supported);
+  EXPECT_FALSE(dlss::upscaler().session());
+  EXPECT_EQ(g_ngx.inits, inits);
+
+  request(Upscaler::Dlss);
+  static_cast<void>(probe());
+  ASSERT_TRUE(dlss::upscaler().session());
+  const uint32_t shutdowns = g_ngx.shutdowns;
+  on_worker([] { native::d3d12::run_teardowns(); });
+  EXPECT_FALSE(dlss::upscaler().session());
+  EXPECT_EQ(g_ngx.shutdowns, shutdowns + 1);
 }
 #endif
 } // namespace

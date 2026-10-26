@@ -68,6 +68,7 @@ struct Shared {
 
 Shared shared() noexcept;
 void set_upscaler(Upscaler option, NativeUpscaler* upscaler) noexcept;
+void set_adapter(std::optional<upscale::native_upscale::Adapter> adapter) noexcept;
 void reset() noexcept;
 } // namespace testing
 } // namespace aurora::render::detail::native::d3d12::upscale_bridge

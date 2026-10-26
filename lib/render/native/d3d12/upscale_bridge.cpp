@@ -58,6 +58,7 @@ struct Live {
 };
 
 std::array<NativeUpscaler*, 2> g_upscalers{};
+std::optional<Adapter> g_adapterOverride;
 std::mutex g_mutex;
 Exchange g_exchange;
 
@@ -141,10 +142,11 @@ void finish_prepare(const Plan& plan, bool ok) noexcept {
     set_vendor_bytes(g_live.vendorBytes);
     return;
   }
+  const Reason reason = upscaler.prepare_failure();
   Log.warn("Native upscaler {} could not be prepared for {}x{}", upscaler.name(), plan.output.width,
            plan.output.height);
   release_live();
-  probe::fail(upscaler.option());
+  probe::fail(upscaler.option(), reason);
 }
 
 void teardown() noexcept {
@@ -210,9 +212,17 @@ NativeUpscaler* upscaler(Upscaler option) noexcept {
 }
 
 Adapter adapter() noexcept {
-  Adapter out{.backend = upscale::native_upscale::Backend::D3D12, .device = device(), .queue = queue()};
+  if (g_adapterOverride) {
+    return *g_adapterOverride;
+  }
+  Adapter out{.backend = upscale::native_upscale::Backend::D3D12,
+              .device = device(),
+              .queue = queue(),
+              .physical = dxgi_adapter()};
   if (available()) {
     const DXGI_ADAPTER_DESC1& desc = adapter_desc();
+    out.luid =
+        (static_cast<uint64_t>(static_cast<uint32_t>(desc.AdapterLuid.HighPart)) << 32) | desc.AdapterLuid.LowPart;
     out.vendorId = desc.VendorId;
     out.deviceId = desc.DeviceId;
     out.subSysId = desc.SubSysId;
@@ -386,9 +396,12 @@ void set_upscaler(Upscaler option, NativeUpscaler* upscaler) noexcept {
   }
 }
 
+void set_adapter(std::optional<Adapter> adapter) noexcept { g_adapterOverride = adapter; }
+
 void reset() noexcept {
   release_live();
   g_upscalers = {};
+  g_adapterOverride.reset();
   std::lock_guard lock{g_mutex};
   g_exchange = {};
 }

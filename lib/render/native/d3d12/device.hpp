@@ -19,6 +19,7 @@ void shutdown() noexcept;
 bool available() noexcept;
 ID3D12Device* device() noexcept;
 ID3D12CommandQueue* queue() noexcept;
+IDXGIAdapter* dxgi_adapter() noexcept;
 const DXGI_ADAPTER_DESC1& adapter_desc() noexcept;
 uint64_t driver_version() noexcept;
 uint64_t reserve_external_memory(uint64_t bytes) noexcept;

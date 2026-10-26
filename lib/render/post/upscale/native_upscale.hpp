@@ -31,6 +31,8 @@ struct Adapter {
   Backend backend = Backend::D3D12;
   void* device = nullptr;
   void* queue = nullptr;
+  void* physical = nullptr;
+  uint64_t luid = 0;
   uint32_t vendorId = 0;
   uint32_t deviceId = 0;
   uint32_t subSysId = 0;
@@ -79,6 +81,7 @@ public:
   [[nodiscard]] virtual Upscaler option() const noexcept = 0;
   [[nodiscard]] virtual std::string_view name() const noexcept = 0;
   [[nodiscard]] virtual std::string_view runtime_file() const noexcept { return {}; }
+  [[nodiscard]] virtual bool configured() const noexcept { return true; }
   virtual ProbeResult probe(const Adapter& adapter) noexcept = 0;
   [[nodiscard]] virtual std::string_view display_name(UpscalerQuality quality) const noexcept = 0;
   [[nodiscard]] virtual ColorEncoding color_encoding() const noexcept = 0;
@@ -87,6 +90,7 @@ public:
   [[nodiscard]] virtual bool passthrough() const noexcept { return false; }
   virtual std::optional<GraphExtent> prepare(const Adapter& adapter, GraphExtent output,
                                              UpscalerQuality quality) noexcept = 0;
+  [[nodiscard]] virtual Reason prepare_failure() const noexcept { return Reason::NativeUnavailable; }
   virtual Warmup warmup() noexcept { return Warmup::Ready; }
   virtual bool evaluate(const Inputs& inputs) noexcept = 0;
   virtual void destroy() noexcept = 0;

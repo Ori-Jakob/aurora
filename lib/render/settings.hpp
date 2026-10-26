@@ -76,6 +76,7 @@ void reset_settings_state(uint32_t msaaSamples) noexcept;
 void shutdown_settings_state() noexcept;
 void set_upscaler_probe(const UpscalerProbe& probe) noexcept;
 void set_probe_requester(void (*requester)() noexcept) noexcept;
+Upscaler requested_upscaler() noexcept;
 
 namespace testing {
 using Clock = std::chrono::steady_clock;

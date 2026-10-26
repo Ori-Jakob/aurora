@@ -53,6 +53,13 @@
 #include "gfx/render_worker.hpp"
 #include "render/native/d3d12/xess.hpp"
 #endif
+#if AURORA_ENABLE_DLSS
+#include "gfx/render_worker.hpp"
+#include "render/native/d3d12/dlss.hpp"
+
+#include <filesystem>
+#include <system_error>
+#endif
 #endif
 
 namespace aurora::render::detail {
@@ -2756,6 +2763,98 @@ TEST_F(XessGraph, WaitsForPipelineBuild) {
   on_worker([] { bridge::testing::reset(); });
   EXPECT_EQ(g_fakeXess.destroys, 1u);
   EXPECT_EQ(native::d3d12::vendor_bytes(), 0u);
+}
+#endif
+
+#if AURORA_ENABLE_DLSS
+namespace dlss = native::d3d12::dlss;
+
+class DlssGpu : public NativeInteropGpu {
+protected:
+  void SetUp() override {
+    NativeInteropGpu::SetUp();
+    if (!m_started || IsSkipped()) {
+      return;
+    }
+    m_data = std::filesystem::temp_directory_path() / "aurora_dlss_gpu" / std::string{dlss::DataFolder};
+    std::error_code ec;
+    std::filesystem::remove_all(m_data.parent_path(), ec);
+    dlss::set_api(&dlss::ngx_api());
+    dlss::testing::set_project_env(std::string{"3f6c2a91-58d4-4e0b-9a7e-2c41d8b5f063"});
+    dlss::testing::set_data_directory(m_data);
+    gfx::render_worker::initialize();
+    m_worker = true;
+  }
+
+  void TearDown() override {
+    if (m_worker) {
+      on_worker([] { dlss::upscaler().destroy(); });
+      gfx::render_worker::shutdown();
+      dlss::set_api(nullptr);
+      dlss::testing::reset();
+      std::error_code ec;
+      std::filesystem::remove_all(m_data.parent_path(), ec);
+    }
+    NativeInteropGpu::TearDown();
+  }
+
+  template <typename Work>
+  void on_worker(Work&& work) {
+    gfx::render_worker::enqueue_work([&] { work(); });
+    gfx::render_worker::synchronize();
+  }
+
+  std::filesystem::path m_data;
+  bool m_worker = false;
+};
+
+TEST_F(DlssGpu, ProbeReportsSupport) {
+  if (native::d3d12::adapter_desc().VendorId != dlss::NvidiaVendorId) {
+    GTEST_SKIP() << "needs an NVIDIA GPU";
+  }
+  upscale::native_upscale::ProbeResult result;
+  double probeMs = 0.0;
+  on_worker([&] {
+    const auto start = std::chrono::steady_clock::now();
+    result = dlss::upscaler().probe(native::d3d12::upscale_bridge::adapter());
+    probeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  });
+  std::fprintf(stderr, "note: DLSS probe: %s in %.1f ms\n",
+               result.support.supported ? "supported" : std::string{reason_name(result.support.reason)}.c_str(),
+               probeMs);
+  ASSERT_TRUE(result.support.supported) << reason_name(result.support.reason);
+  EXPECT_FALSE(dlss::upscaler().session());
+
+  constexpr GraphExtent Output{2560, 1440};
+  std::optional<GraphExtent> render;
+  double prepareMs = 0.0;
+  on_worker([&] {
+    const auto start = std::chrono::steady_clock::now();
+    render = dlss::upscaler().prepare(native::d3d12::upscale_bridge::adapter(), Output, UpscalerQuality::Quality);
+    prepareMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  });
+  std::fprintf(stderr, "note: DLSS prepare with NGX init: %.1f ms\n", prepareMs);
+  ASSERT_TRUE(render.has_value());
+  EXPECT_TRUE(dlss::upscaler().session());
+  EXPECT_NEAR(static_cast<double>(render->width), Output.width / 1.5, 2.0);
+  EXPECT_NEAR(static_cast<double>(render->height), Output.height / 1.5, 2.0);
+  const dlss::Modes& modes = dlss::upscaler().modes();
+  ASSERT_TRUE(modes[static_cast<size_t>(UpscalerQuality::Performance)].has_value());
+  EXPECT_EQ(dlss::render_size(modes, UpscalerQuality::NativeAa, Output), Output);
+  const std::optional<GraphExtent> ultra = dlss::render_size(modes, UpscalerQuality::UltraPerformance, Output);
+  ASSERT_TRUE(ultra.has_value());
+  EXPECT_LT(ultra->width, render->width);
+  on_worker([] { dlss::upscaler().destroy(); });
+  EXPECT_FALSE(dlss::upscaler().session());
+
+  size_t logs = 0;
+  std::error_code ec;
+  for (std::filesystem::recursive_directory_iterator it{m_data, ec}, end; !ec && it != end; it.increment(ec)) {
+    if (it->path().extension() == ".log") {
+      ++logs;
+    }
+  }
+  EXPECT_EQ(logs, 0u) << "NGX wrote its own log files";
 }
 #endif
 #endif

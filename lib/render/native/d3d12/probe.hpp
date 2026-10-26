@@ -25,7 +25,7 @@ void initialize(const std::filesystem::path& directory) noexcept;
 void shutdown() noexcept;
 void request() noexcept;
 void run_pending() noexcept;
-void fail(Upscaler option) noexcept;
+void fail(Upscaler option, Reason reason = Reason::NativeUnavailable) noexcept;
 void clear() noexcept;
 [[nodiscard]] std::string_view path(Upscaler option) noexcept;
 void count_sdk_call() noexcept;

@@ -18,6 +18,7 @@ struct DeviceState {
   wgpu::Device dawnDevice;
   ComPtr<ID3D12Device> device;
   ComPtr<ID3D12CommandQueue> queue;
+  ComPtr<IDXGIAdapter> adapter;
   DXGI_ADAPTER_DESC1 adapterDesc{};
   uint64_t driverVersion = 0;
 };
@@ -63,6 +64,7 @@ bool initialize(const wgpu::Device& device, const wgpu::Adapter& adapter) noexce
   if (SUCCEEDED(dxgiAdapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd))) {
     state.driverVersion = static_cast<uint64_t>(umd.QuadPart);
   }
+  state.adapter = dxgiAdapter;
   const DXGI_ADAPTER_DESC1& desc = state.adapterDesc;
   const uint64_t v = state.driverVersion;
   Log.info(
@@ -81,6 +83,8 @@ bool available() noexcept { return g_state.device != nullptr; }
 ID3D12Device* device() noexcept { return g_state.device.Get(); }
 
 ID3D12CommandQueue* queue() noexcept { return g_state.queue.Get(); }
+
+IDXGIAdapter* dxgi_adapter() noexcept { return g_state.adapter.Get(); }
 
 const DXGI_ADAPTER_DESC1& adapter_desc() noexcept { return g_state.adapterDesc; }
 

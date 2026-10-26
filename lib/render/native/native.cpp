@@ -6,6 +6,9 @@
 #include "d3d12/teardown.hpp"
 #include "d3d12/upscale_bridge.hpp"
 
+#if AURORA_ENABLE_DLSS
+#include "d3d12/dlss.hpp"
+#endif
 #if AURORA_ENABLE_XESS
 #include "d3d12/xess.hpp"
 #endif
@@ -15,12 +18,16 @@
 #include "../../io.hpp"
 
 #include <filesystem>
+#include <mutex>
 
 namespace aurora::render::detail {
 namespace {
 [[maybe_unused]] constexpr Module Log{"aurora::render::native"};
 
 native::d3d12::upscale_bridge::PassthroughUpscaler g_testUpscaler;
+
+std::mutex g_identityMutex;
+std::optional<native::Identity> g_identity;
 } // namespace
 
 void native_worker_frame_begin() noexcept {
@@ -45,6 +52,10 @@ void initialize() noexcept {
   const std::filesystem::path directory =
       g_config.cachePath != nullptr ? io::fs_path_from_string(g_config.cachePath) : std::filesystem::path{};
   d3d12::sentinel::open(directory);
+#if AURORA_ENABLE_DLSS
+  d3d12::dlss::set_api(&d3d12::dlss::ngx_api());
+  d3d12::upscale_bridge::register_upscaler(d3d12::dlss::upscaler());
+#endif
 #if AURORA_ENABLE_XESS
   d3d12::upscale_bridge::register_upscaler(d3d12::xess::upscaler());
 #endif
@@ -83,8 +94,24 @@ bool begin_upscale(const upscale::native_upscale::Frame& frame, upscale::native_
 
 std::string_view upscaler_path(Upscaler option) noexcept { return d3d12::probe::path(option); }
 
+void set_app_identity(const AppIdentity& identity) noexcept {
+  std::lock_guard lock{g_identityMutex};
+  g_identity =
+      Identity{.projectId = std::string{identity.projectId}, .engineVersion = std::string{identity.engineVersion}};
+}
+
+std::optional<Identity> app_identity() noexcept {
+  std::lock_guard lock{g_identityMutex};
+  return g_identity;
+}
+
 namespace testing {
 uint32_t sdk_calls() noexcept { return d3d12::probe::sdk_calls(); }
+
+void clear_app_identity() noexcept {
+  std::lock_guard lock{g_identityMutex};
+  g_identity.reset();
+}
 } // namespace testing
 } // namespace native
 } // namespace aurora::render::detail

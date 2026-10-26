@@ -220,6 +220,10 @@ ProbeEntry entry_locked(size_t index, uint8_t stale) noexcept {
   if (!g_state.usable) {
     return {.known = true, .support = {false, Reason::NativeUnavailable}};
   }
+  if (!upscaler->configured()) {
+    Log.info("Native upscaler {} is not configured for this app, so it stays off", upscaler->name());
+    return {.known = true, .support = {false, Reason::NativeUnavailable}};
+  }
   if (stale != 0) {
     return {.known = true, .support = {false, Reason::NativeDisabledAfterCrash}};
   }
@@ -320,15 +324,21 @@ void run_pending() noexcept {
   }
 }
 
-void fail(Upscaler option) noexcept {
+void fail(Upscaler option, Reason reason) noexcept {
   if (option != Upscaler::Dlss && option != Upscaler::Xess) {
     return;
   }
   std::lock_guard lock{g_mutex};
   const size_t index = index_of(option);
-  g_state.probe.native[index] = {.known = true, .support = {false, Reason::NativeUnavailable}};
+  g_state.probe.native[index] = {.known = true, .support = {false, reason}};
   if (option == Upscaler::Xess) {
     g_state.probe.xessXeFx = false;
+  }
+  // An output-size refusal says nothing about the GPU, so the cached probe stays valid
+  if (reason == Reason::OutputTooLarge) {
+    set_upscaler_probe(g_state.probe);
+    Log.warn("Native upscaler {} refused the output size; it stays off for this session", Keys[index]);
+    return;
   }
   g_state.cache[index].valid = false;
   write_cache_locked();

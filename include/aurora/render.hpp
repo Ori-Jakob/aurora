@@ -209,6 +209,13 @@ struct UpscaleStatus {
 UpscaleStatus upscale_status() noexcept;
 void reenable_native_upscalers() noexcept;
 
+struct AppIdentity {
+  std::string_view projectId;
+  std::string_view engineVersion;
+};
+
+void set_app_identity(const AppIdentity& identity) noexcept;
+
 enum class Stage : uint8_t {
   SceneBegin,
   OpaqueDone,

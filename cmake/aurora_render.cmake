@@ -89,6 +89,8 @@ if (AURORA_ENABLE_RENDER)
         target_sources(aurora_gx PRIVATE
             lib/render/native/d3d12/device.cpp
             lib/render/native/d3d12/device.hpp
+            lib/render/native/d3d12/dlss.cpp
+            lib/render/native/d3d12/dlss.hpp
             lib/render/native/d3d12/native_step.cpp
             lib/render/native/d3d12/native_step.hpp
             lib/render/native/d3d12/probe.cpp
@@ -107,6 +109,13 @@ if (AURORA_ENABLE_RENDER)
         target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_NATIVE_D3D12=1)
         target_compile_definitions(aurora_core PRIVATE AURORA_ENABLE_NATIVE_D3D12=1)
         target_link_libraries(aurora_gx PRIVATE d3d12 dxgi version)
+        if (AURORA_ENABLE_DLSS)
+            target_sources(aurora_gx PRIVATE lib/render/native/d3d12/dlss_ngx.cpp)
+            target_link_libraries(aurora_gx PRIVATE aurora::ngx)
+            target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_DLSS=1)
+        else ()
+            target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_DLSS=0)
+        endif ()
         if (AURORA_ENABLE_XESS)
             target_sources(aurora_gx PRIVATE lib/render/native/d3d12/xess.cpp lib/render/native/d3d12/xess.hpp
                 lib/render/native/d3d12/xess_upscaler.cpp)

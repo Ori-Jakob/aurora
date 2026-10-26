@@ -4,6 +4,8 @@
 #include <webgpu/webgpu_cpp.h>
 
 #include <cstdint>
+#include <optional>
+#include <string>
 #include <string_view>
 
 namespace aurora::render::detail {
@@ -23,6 +25,13 @@ void shutdown_native() noexcept;
 } // namespace aurora::render::detail
 
 namespace aurora::render::detail::native {
+struct Identity {
+  std::string projectId;
+  std::string engineVersion;
+
+  bool operator==(const Identity&) const = default;
+};
+
 bool interop_enabled() noexcept;
 bool initialize_device(const wgpu::Device& device, const wgpu::Adapter& adapter) noexcept;
 void initialize() noexcept;
@@ -36,8 +45,11 @@ bool prepare_upscaler(const upscale::native_upscale::Plan& plan, GraphExtent& re
 void release_upscaler() noexcept;
 bool begin_upscale(const upscale::native_upscale::Frame& frame, upscale::native_upscale::Targets& targets) noexcept;
 std::string_view upscaler_path(Upscaler option) noexcept;
+void set_app_identity(const AppIdentity& identity) noexcept;
+[[nodiscard]] std::optional<Identity> app_identity() noexcept;
 
 namespace testing {
 uint32_t sdk_calls() noexcept;
+void clear_app_identity() noexcept;
 } // namespace testing
 } // namespace aurora::render::detail::native

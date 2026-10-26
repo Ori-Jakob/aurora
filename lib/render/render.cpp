@@ -221,6 +221,8 @@ UpscaleStatus upscale_status() noexcept {
 
 void reenable_native_upscalers() noexcept { detail::native::reenable_upscalers(); }
 
+void set_app_identity(const AppIdentity& identity) noexcept { detail::native::set_app_identity(identity); }
+
 bool hints_enabled() noexcept {
 #if AURORA_ENABLE_RENDER
   return detail::hints_enabled();

@@ -121,6 +121,7 @@ constexpr BuiltOptions DefaultBuiltOptions = [] {
   // FSR is portable; Auto resolves to it until a native option is built
   built[static_cast<size_t>(Feature::Upscaler)] = (1u << 1) | (1u << 4);
   built[static_cast<size_t>(Feature::Upscaler)] |= 1u << 3;
+  built[static_cast<size_t>(Feature::Upscaler)] |= 1u << 2;
   return built;
 }();
 
@@ -970,6 +971,11 @@ void set_upscaler_probe(const UpscalerProbe& probe) noexcept {
 }
 
 void set_probe_requester(void (*requester)() noexcept) noexcept { g_probeRequester.store(requester); }
+
+Upscaler requested_upscaler() noexcept {
+  std::lock_guard lock{g_requestMutex};
+  return sanitize_settings(with_env_overrides(g_lastRequest)).upscaler;
+}
 
 std::shared_ptr<const FrameState> latch_frame() {
   std::optional<Settings> request;
