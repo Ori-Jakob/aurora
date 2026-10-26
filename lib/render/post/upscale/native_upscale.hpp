@@ -108,6 +108,7 @@ struct Plan {
 };
 
 struct Frame {
+  Plan plan;
   GraphExtent render;
   GraphExtent output;
   wgpu::TextureFormat colorFormat = wgpu::TextureFormat::Undefined;

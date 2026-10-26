@@ -2311,6 +2311,7 @@ protected:
 
   bool m_ready = false;
   Passthrough m_copy;
+  Passthrough m_other;
   std::unique_ptr<fsr_rig::Rig> m_rig;
   std::vector<Rgba> m_scene;
   uint64_t m_frame = 0;
@@ -2422,6 +2423,49 @@ TEST_F(NativeUpscaleGpu, NativeAaInplace) {
   }
   EXPECT_EQ(compose::testing::counters().native, 2u);
   EXPECT_EQ(compose::testing::counters().skipped, 0u);
+}
+
+TEST_F(NativeUpscaleGpu, SwitchKeepsInstalledContext) {
+  m_copy = Passthrough{1.f};
+  install(settings(UpscalerQuality::NativeAa));
+  run_frame(70);
+  ASSERT_EQ(m_segments, 1u);
+
+  m_other = Passthrough{1.f, ColorEncoding::Linear};
+  m_other.set_warmup(native_upscale::Warmup::Pending);
+  native_upscale::testing::set_stand_in(&m_other);
+  const auto latch = [&] {
+    for (int i = 0; i < 3; ++i) {
+      upscale::on_latch(settings(UpscalerQuality::NativeAa));
+      native_worker_frame_begin();
+    }
+  };
+  latch();
+  EXPECT_EQ(m_other.prepares(), 1u);
+  const std::vector<Rgba> warming = run_frame(71);
+  EXPECT_EQ(m_segments, 1u);
+  EXPECT_EQ(max_rgb_error(warming, m_scene), 0);
+  EXPECT_EQ(m_copy.evaluations(), 2u);
+  EXPECT_EQ(m_copy.destroys(), 0u);
+  EXPECT_EQ(m_other.evaluations(), 0u);
+  auto shared = native::d3d12::upscale_bridge::testing::shared();
+  ASSERT_NE(shared.color, nullptr);
+  EXPECT_EQ(shared.color->format(), TextureFormat::BGRA8Unorm);
+
+  m_other.set_warmup(native_upscale::Warmup::Ready);
+  latch();
+  m_rig->use(m_rig->compile(settings(UpscalerQuality::NativeAa)));
+  const std::vector<Rgba> switched = run_frame(72);
+  EXPECT_EQ(m_segments, 1u);
+  EXPECT_LE(max_rgb_error(switched, m_scene), 1);
+  EXPECT_EQ(m_copy.evaluations(), 2u);
+  EXPECT_EQ(m_copy.destroys(), 1u);
+  EXPECT_EQ(m_other.prepares(), 1u);
+  EXPECT_EQ(m_other.evaluations(), 1u);
+  shared = native::d3d12::upscale_bridge::testing::shared();
+  ASSERT_NE(shared.color, nullptr);
+  EXPECT_EQ(shared.color->format(), TextureFormat::RGBA16Float);
+  EXPECT_EQ(compose::testing::counters().lastStatus, 1u);
 }
 
 TEST_F(NativeUpscaleGpu, SkippedNodeFrameSubmitsClean) {

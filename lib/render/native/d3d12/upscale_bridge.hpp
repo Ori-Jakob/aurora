@@ -19,6 +19,7 @@ public:
 
   void set_ratio(float ratio) noexcept { m_ratio = ratio; }
   void set_failing(bool failing) noexcept { m_failing = failing; }
+  void set_warmup(upscale::native_upscale::Warmup warmup) noexcept { m_warmup = warmup; }
   [[nodiscard]] uint32_t prepares() const noexcept { return m_prepares; }
   [[nodiscard]] uint32_t evaluations() const noexcept { return m_evaluations; }
   [[nodiscard]] uint32_t destroys() const noexcept { return m_destroys; }
@@ -32,6 +33,7 @@ public:
   [[nodiscard]] bool passthrough() const noexcept override { return true; }
   std::optional<GraphExtent> prepare(const upscale::native_upscale::Adapter& adapter, GraphExtent output,
                                      UpscalerQuality quality) noexcept override;
+  upscale::native_upscale::Warmup warmup() noexcept override { return m_warmup; }
   bool evaluate(const upscale::native_upscale::Inputs& inputs) noexcept override;
   void destroy() noexcept override { ++m_destroys; }
   [[nodiscard]] uint64_t vram_bytes() const noexcept override { return 0; }
@@ -43,6 +45,7 @@ private:
   ColorEncoding m_encoding = ColorEncoding::Stored;
   bool m_reactive = false;
   bool m_failing = false;
+  upscale::native_upscale::Warmup m_warmup = upscale::native_upscale::Warmup::Ready;
   uint32_t m_prepares = 0;
   uint32_t m_evaluations = 0;
   uint32_t m_destroys = 0;

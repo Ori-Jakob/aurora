@@ -41,6 +41,7 @@ struct Local {
   uint16_t token = 0;
   uint8_t linear = 0;
   uint8_t reactiveUsed = 0;
+  Plan plan;
 };
 static_assert(sizeof(Local) <= PassLocalSize);
 
@@ -188,7 +189,8 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
   const bool reactive = upscaler.wants_reactive();
   builder.after(phase::Taa);
   builder.manual_bindings();
-  Local local{.linear = static_cast<uint8_t>(linear), .reactiveUsed = static_cast<uint8_t>(reactive)};
+  Local local{
+      .linear = static_cast<uint8_t>(linear), .reactiveUsed = static_cast<uint8_t>(reactive), .plan = slot->plan};
   local.color = builder.use(resource::GxColor, linear ? Access::Sampled : Access::CopySrc, UseOptions{}).index;
   local.depth = builder.use(resource::GxDepth, Access::Sampled, UseOptions{}).index;
   local.motion = builder.use(resource::Motion, Access::CopySrc, UseOptions{.missing = Missing::DisablePass}).index;
@@ -281,6 +283,7 @@ void encode(PassContext& ctx, const void*) {
       fsr::camera_from_projection(hints->mainCamera.gxProj, units_per_meter(*hints))
           .value_or(fsr::Camera{.nearZ = 1.f, .farZ = 100000.f, .fovY = 1.f, .viewToMeters = 0.01f});
   const Frame frame{
+      .plan = l.plan,
       .render = render,
       .output = output,
       .colorFormat = ctx.format(TexRef{l.color}),
