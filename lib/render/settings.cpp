@@ -26,6 +26,7 @@
 #include <SDL3/SDL_stdinc.h>
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <cmath>
 #include <mutex>
@@ -68,6 +69,7 @@ constexpr std::array<FeatureInfo, FeatureCount> FeatureTable{{
     {"TextureMaterials", Tier::None, 1},
     {"StochasticTiling", Tier::None, 1},
     {"LegacyMatMaps", Tier::None, 1},
+    {"Upscaler", Tier::Base, 4},
 }};
 static_assert(FeatureTable.size() == FeatureCount);
 
@@ -80,6 +82,7 @@ constexpr std::array ClampOrder{
     Feature::LegacyMatMaps,
     Feature::Pbr,
     Feature::Taa,
+    Feature::Upscaler,
     Feature::Ao,
     Feature::Ssil,
     Feature::Shadows,
@@ -122,15 +125,22 @@ constexpr float MaxExposureBias = 8.f;
 constexpr uint64_t ModuleStorageBufferSize = 32 * 1024 * 1024;
 
 constexpr Settings Defaults{};
+constexpr UpscalerProbe NoUpscalerProbe{};
+constexpr auto ProbeHoldTimeout = std::chrono::seconds{2};
 
 std::mutex g_requestMutex;
 Settings g_lastRequest;
 std::optional<Settings> g_pending;
 Settings g_supportContext;
 BuiltOptions g_built = DefaultBuiltOptions;
+UpscalerProbe g_upscalerProbe;
+std::optional<Settings> g_heldRequest;
+testing::Clock::time_point g_heldSince;
 uint32_t g_msaaSamples = 1;
 bool g_reclamp = false;
 std::optional<Settings> g_latched;
+std::atomic<void (*)() noexcept> g_probeRequester{nullptr};
+std::atomic<testing::Clock::time_point (*)() noexcept> g_clock{&testing::Clock::now};
 
 uint64_t g_generation = 0;
 std::shared_ptr<const FrameState> g_frameState;
@@ -170,6 +180,112 @@ template <typename E>
 void sanitize_enum(E& value, E last, E fallback) noexcept {
   if (static_cast<uint8_t>(value) > static_cast<uint8_t>(last)) {
     value = fallback;
+  }
+}
+
+bool option_built(const SupportEnv& env, Feature feature, uint8_t level) noexcept {
+  return (env.built[feature_index(feature)] & (1u << level)) != 0;
+}
+
+const ProbeEntry& probe_entry(const SupportEnv& env, Upscaler option) noexcept {
+  const UpscalerProbe& probe = env.upscalers != nullptr ? *env.upscalers : NoUpscalerProbe;
+  return probe.native[option == Upscaler::Dlss ? 0 : 1];
+}
+
+bool compiled_out(const ProbeEntry& entry) noexcept {
+  return entry.known && !entry.support.supported && entry.support.reason == Reason::BuildDisabled;
+}
+
+bool upscaler_supported(Upscaler option, const Settings& context, const SupportEnv& env) noexcept {
+  return evaluate_support(Feature::Upscaler, enum_level(option), context, env).supported;
+}
+
+Upscaler resolve_auto(const Settings& context, const SupportEnv& env) noexcept {
+  const bool xessXeFx = env.upscalers != nullptr && env.upscalers->xessXeFx;
+  if (upscaler_supported(Upscaler::Dlss, context, env)) {
+    return Upscaler::Dlss;
+  }
+  if (xessXeFx && upscaler_supported(Upscaler::Xess, context, env)) {
+    return Upscaler::Xess;
+  }
+  return upscaler_supported(Upscaler::Fsr, context, env) ? Upscaler::Fsr : Upscaler::Off;
+}
+
+Upscaler resolve_upscaler(Upscaler wanted, const Settings& context, const SupportEnv& env) noexcept {
+  switch (wanted) {
+  case Upscaler::Off:
+    return Upscaler::Off;
+  case Upscaler::Auto:
+    return upscaler_supported(Upscaler::Auto, context, env) ? resolve_auto(context, env) : Upscaler::Off;
+  case Upscaler::Dlss:
+  case Upscaler::Xess:
+    if (upscaler_supported(wanted, context, env)) {
+      return wanted;
+    }
+    break;
+  case Upscaler::Fsr:
+    break;
+  }
+  return upscaler_supported(Upscaler::Fsr, context, env) ? Upscaler::Fsr : Upscaler::Off;
+}
+
+FeatureSupport upscaler_support(Upscaler option, const Settings& context, const SupportEnv& env) noexcept {
+  switch (option) {
+  case Upscaler::Fsr:
+    if (!env.caps.textureFormatsTier1) {
+      return {false, Reason::NeedsTextureFormats};
+    }
+    return {true, Reason::None};
+  case Upscaler::Dlss:
+  case Upscaler::Xess: {
+    const ProbeEntry& entry = probe_entry(env, option);
+    // BuildDisabled first, so platforms without the native module never see a backend hint they cannot act on
+    if (compiled_out(entry)) {
+      return {false, Reason::BuildDisabled};
+    }
+    if (env.caps.backend != BACKEND_D3D12) {
+      return {false, Reason::NeedsD3D12};
+    }
+    if (!entry.known) {
+      return {false, Reason::Probing};
+    }
+    return entry.support;
+  }
+  case Upscaler::Auto:
+    if (resolve_auto(context, env) != Upscaler::Off) {
+      return {true, Reason::None};
+    }
+    return evaluate_support(Feature::Upscaler, enum_level(Upscaler::Fsr), context, env);
+  case Upscaler::Off:
+    break;
+  }
+  return {false, Reason::NotImplemented};
+}
+
+bool upscaler_waits_for_probe(const Settings& request, const SupportEnv& env) noexcept {
+  const Settings s = sanitize_settings(request);
+  const auto probing = [&](Upscaler option) {
+    return evaluate_support(Feature::Upscaler, enum_level(option), s, env).reason == Reason::Probing;
+  };
+  switch (s.upscaler) {
+  case Upscaler::Dlss:
+  case Upscaler::Xess:
+    return probing(s.upscaler);
+  case Upscaler::Auto:
+    if (!option_built(env, Feature::Upscaler, enum_level(Upscaler::Auto))) {
+      return false;
+    }
+    return probing(Upscaler::Dlss) || (!upscaler_supported(Upscaler::Dlss, s, env) && probing(Upscaler::Xess));
+  case Upscaler::Off:
+  case Upscaler::Fsr:
+    break;
+  }
+  return false;
+}
+
+void request_probe() noexcept {
+  if (void (*requester)() noexcept = g_probeRequester.load()) {
+    requester();
   }
 }
 
@@ -267,6 +383,9 @@ void write_level(Settings& settings, Feature feature, uint8_t value) noexcept {
     break;
   case Feature::LegacyMatMaps:
     settings.legacyMatMaps = false;
+    break;
+  case Feature::Upscaler:
+    settings.upscaler = static_cast<Upscaler>(value);
     break;
   case Feature::GBuffer:
   case Feature::DeferredFog:
@@ -490,6 +609,8 @@ uint8_t requested_option(const Settings& settings, Feature feature) noexcept {
     return flag(settings.stochasticTiling);
   case Feature::LegacyMatMaps:
     return flag(settings.textureMaterials && settings.legacyMatMaps);
+  case Feature::Upscaler:
+    return enum_level(settings.upscaler);
   }
   return 0;
 }
@@ -531,7 +652,7 @@ FeatureSupport evaluate_support(Feature feature, uint8_t option, const Settings&
   }
   const FeatureInfo& info = FeatureTable[index];
   const uint8_t level = option == 0 ? 1 : option;
-  if (level > info.optionCount || (env.built[index] & (1u << level)) == 0) {
+  if (level > info.optionCount || !option_built(env, feature, level)) {
     return {false, Reason::NotImplemented};
   }
 
@@ -590,6 +711,8 @@ FeatureSupport evaluate_support(Feature feature, uint8_t option, const Settings&
       return {false, Reason::NativeUnavailable};
     }
     break;
+  case Feature::Upscaler:
+    return upscaler_support(static_cast<Upscaler>(level), context, env);
   default:
     break;
   }
@@ -638,6 +761,8 @@ Settings sanitize_settings(const Settings& requested) noexcept {
   sanitize_enum(s.preset, Preset::Ultra, Defaults.preset);
   sanitize_enum(s.exposure, Exposure::Manual, Defaults.exposure);
   sanitize_enum(s.tonemap, Tonemap::AgX, Defaults.tonemap);
+  sanitize_enum(s.upscaler, Upscaler::Auto, Defaults.upscaler);
+  sanitize_enum(s.upscalerQuality, UpscalerQuality::UltraPerformance, Defaults.upscalerQuality);
   sanitize_enum(s.ao, Quality::Ultra, Defaults.ao);
   sanitize_enum(s.shadows.quality, Quality::Ultra, Defaults.shadows.quality);
   sanitize_enum(s.shadows.game, GameShadows::Remove, Defaults.shadows.game);
@@ -692,6 +817,11 @@ Settings sanitize_settings(const Settings& requested) noexcept {
 Settings clamp_settings(const Settings& requested, const SupportEnv& env) noexcept {
   Settings s = sanitize_settings(requested);
   for (const Feature feature : ClampOrder) {
+    if (feature == Feature::Upscaler) {
+      // A vendor upscaler that cannot run falls back to the portable one, never to another vendor's
+      write_level(s, feature, enum_level(resolve_upscaler(s.upscaler, s, env)));
+      continue;
+    }
     const uint8_t wanted = requested_option(s, feature);
     if (wanted != 0) {
       uint8_t granted = wanted;
@@ -712,7 +842,8 @@ Settings clamp_settings(const Settings& requested, const SupportEnv& env) noexce
 
 Settings submit_request(const Settings& requested) {
   std::lock_guard lock{g_requestMutex};
-  Settings preview = clamp_settings(with_env_overrides(requested), {caps(), g_msaaSamples, g_built, module_enabled()});
+  Settings preview = clamp_settings(with_env_overrides(requested),
+                                    {caps(), g_msaaSamples, g_built, module_enabled(), &g_upscalerProbe});
   g_lastRequest = requested;
   g_pending = requested;
   g_supportContext = preview;
@@ -721,11 +852,13 @@ Settings submit_request(const Settings& requested) {
 
 FeatureSupport current_support(Feature feature, uint8_t option, const Settings* context) noexcept {
   BuiltOptions built;
+  UpscalerProbe upscalers;
   uint32_t msaaSamples = 1;
   Settings supportContext;
   {
     std::lock_guard lock{g_requestMutex};
     built = g_built;
+    upscalers = g_upscalerProbe;
     msaaSamples = g_msaaSamples;
     if (context == nullptr) {
       supportContext = g_supportContext;
@@ -734,7 +867,15 @@ FeatureSupport current_support(Feature feature, uint8_t option, const Settings* 
   if (context != nullptr) {
     supportContext = sanitize_settings(*context);
   }
-  return evaluate_support(feature, option, supportContext, {caps(), msaaSamples, built, module_enabled()});
+  const SupportEnv env{caps(), msaaSamples, built, module_enabled(), &upscalers};
+  if (feature == Feature::Upscaler) {
+    Settings query = supportContext;
+    query.upscaler = static_cast<Upscaler>(option);
+    if (upscaler_waits_for_probe(query, env)) {
+      request_probe();
+    }
+  }
+  return evaluate_support(feature, option, supportContext, env);
 }
 
 const Settings& latched_settings() noexcept { return g_latched ? *g_latched : initial_settings(); }
@@ -744,9 +885,11 @@ void reset_settings_state(uint32_t msaaSamples) noexcept {
   {
     std::lock_guard lock{g_requestMutex};
     g_msaaSamples = msaaSamples;
-    result = clamp_settings(with_env_overrides(g_lastRequest), {caps(), msaaSamples, g_built, module_enabled()});
+    result = clamp_settings(with_env_overrides(g_lastRequest),
+                            {caps(), msaaSamples, g_built, module_enabled(), &g_upscalerProbe});
     g_supportContext = result;
     g_pending.reset();
+    g_heldRequest.reset();
     g_reclamp = false;
   }
   g_latched = result;
@@ -766,10 +909,20 @@ void shutdown_settings_state() noexcept {
   g_msaaSamples = 1;
 }
 
+void set_upscaler_probe(const UpscalerProbe& probe) noexcept {
+  std::lock_guard lock{g_requestMutex};
+  g_upscalerProbe = probe;
+  g_reclamp = true;
+}
+
+void set_probe_requester(void (*requester)() noexcept) noexcept { g_probeRequester.store(requester); }
+
 std::shared_ptr<const FrameState> latch_frame() {
   std::optional<Settings> request;
   BuiltOptions built;
+  UpscalerProbe upscalers;
   uint32_t msaaSamples = 1;
+  bool askForProbe = false;
   {
     std::lock_guard lock{g_requestMutex};
     request.swap(g_pending);
@@ -777,11 +930,36 @@ std::shared_ptr<const FrameState> latch_frame() {
       request = g_lastRequest;
     }
     built = g_built;
+    upscalers = g_upscalerProbe;
     msaaSamples = g_msaaSamples;
+    const SupportEnv env{caps(), msaaSamples, built, module_enabled(), &upscalers};
+    const std::optional<Settings> wanted =
+        request ? std::optional{sanitize_settings(with_env_overrides(*request))} : std::nullopt;
+    if (wanted && upscaler_waits_for_probe(*wanted, env)) {
+      const testing::Clock::time_point now = g_clock.load()();
+      if (g_heldRequest != wanted) {
+        g_heldRequest = wanted;
+        g_heldSince = now;
+        askForProbe = true;
+      }
+      // A saved vendor upscaler waits for its probe instead of starting as FSR and switching later
+      if (now - g_heldSince < ProbeHoldTimeout) {
+        g_pending = std::exchange(request, std::nullopt);
+      }
+    } else if (wanted) {
+      g_heldRequest.reset();
+    }
+  }
+  if (askForProbe) {
+    request_probe();
   }
   bool settingsChanged = false;
   if (request) {
-    const SupportEnv env{.caps = caps(), .msaaSamples = msaaSamples, .built = built, .moduleEnabled = module_enabled()};
+    const SupportEnv env{.caps = caps(),
+                         .msaaSamples = msaaSamples,
+                         .built = built,
+                         .moduleEnabled = module_enabled(),
+                         .upscalers = &upscalers};
     Settings next = clamp_settings(with_env_overrides(*request), env);
     if (next != latched_settings()) {
       const FeatureMask previous = enabled_features(latched_settings());
@@ -859,12 +1037,16 @@ void reset() noexcept {
   {
     std::lock_guard lock{g_requestMutex};
     g_built = DefaultBuiltOptions;
+    g_upscalerProbe = {};
+    g_heldRequest.reset();
     g_msaaSamples = 1;
     g_lastRequest = {};
     g_supportContext = {};
     g_pending.reset();
     g_reclamp = false;
   }
+  g_probeRequester.store(nullptr);
+  g_clock.store(&Clock::now);
   g_latched.reset();
   g_generation = 0;
   g_frameState.reset();
@@ -897,5 +1079,7 @@ void set_built_options(Feature feature, uint32_t optionMask) noexcept {
   g_built[index] = optionMask;
   g_reclamp = true;
 }
+
+void set_clock(Clock::time_point (*now)() noexcept) noexcept { g_clock.store(now != nullptr ? now : &Clock::now); }
 } // namespace testing
 } // namespace aurora::render::detail

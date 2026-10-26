@@ -38,7 +38,7 @@ namespace aurora::render {
 namespace {
 constexpr Module Log{"aurora::render"};
 
-constexpr std::array<std::string_view, 22> ReasonNames{
+constexpr std::array<std::string_view, 28> ReasonNames{
     "None",
     "NeedsCore",
     "ColorBudget",
@@ -61,8 +61,14 @@ constexpr std::array<std::string_view, 22> ReasonNames{
     "RequiredByShadows",
     "NeedsAo",
     "NeedsRt",
+    "NeedsTextureFormats",
+    "RuntimeMissing",
+    "DriverTooOld",
+    "UnsupportedGpu",
+    "OutputTooLarge",
+    "Probing",
 };
-static_assert(ReasonNames.size() == static_cast<size_t>(Reason::NeedsRt) + 1);
+static_assert(ReasonNames.size() == static_cast<size_t>(Reason::Probing) + 1);
 
 std::string_view yes_no(bool value) noexcept { return value ? "yes" : "no"; }
 } // namespace
@@ -192,6 +198,8 @@ std::string_view reason_name(Reason reason) noexcept {
   const auto index = static_cast<size_t>(reason);
   return index < ReasonNames.size() ? ReasonNames[index] : "Unknown";
 }
+
+UpscaleStatus upscale_status() noexcept { return {.active = Upscaler::Off}; }
 
 bool hints_enabled() noexcept {
 #if AURORA_ENABLE_RENDER

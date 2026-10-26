@@ -3,6 +3,7 @@
 #include <aurora/render.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <string_view>
 
@@ -23,11 +24,27 @@ struct FeatureInfo {
 
 using BuiltOptions = std::array<uint32_t, FeatureCount>;
 
+struct ProbeEntry {
+  bool known = true;
+  FeatureSupport support{false, Reason::BuildDisabled};
+
+  bool operator==(const ProbeEntry&) const = default;
+};
+
+struct UpscalerProbe {
+  std::array<ProbeEntry, 2> native;
+  uint32_t vendorId = 0;
+  bool xessXeFx = false;
+
+  bool operator==(const UpscalerProbe&) const = default;
+};
+
 struct SupportEnv {
   const Caps& caps;
   uint32_t msaaSamples = 1;
   const BuiltOptions& built;
   bool moduleEnabled = false;
+  const UpscalerProbe* upscalers = nullptr;
 };
 
 const FeatureInfo& feature_info(Feature feature) noexcept;
@@ -48,10 +65,15 @@ FeatureSupport current_support(Feature feature, uint8_t option, const Settings* 
 const Settings& latched_settings() noexcept;
 void reset_settings_state(uint32_t msaaSamples) noexcept;
 void shutdown_settings_state() noexcept;
+void set_upscaler_probe(const UpscalerProbe& probe) noexcept;
+void set_probe_requester(void (*requester)() noexcept) noexcept;
 
 namespace testing {
+using Clock = std::chrono::steady_clock;
+
 void reset() noexcept;
 void set_caps(const Caps& caps, uint32_t msaaSamples = 1) noexcept;
 void set_built_options(Feature feature, uint32_t optionMask) noexcept;
+void set_clock(Clock::time_point (*now)() noexcept) noexcept;
 } // namespace testing
 } // namespace aurora::render::detail

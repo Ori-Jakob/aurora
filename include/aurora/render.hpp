@@ -24,6 +24,8 @@ enum class GodRays : uint8_t { Off, Auto, ScreenSpace, Volumetric };
 enum class TerrainDetail : uint8_t { Off, Parallax, Tessellated };
 enum class GrassShadows : uint8_t { Off, Contact, Shell, Full };
 enum class StaticWorld : uint8_t { Off, Validate, On };
+enum class Upscaler : uint8_t { Off, Fsr, Dlss, Xess, Auto };
+enum class UpscalerQuality : uint8_t { NativeAa, Quality, Balanced, Performance, UltraPerformance };
 
 struct ShadowSettings {
   Quality quality = Quality::Off;
@@ -92,6 +94,8 @@ struct Settings {
   Tonemap tonemap = Tonemap::PbrNeutral;
   bool taa = false;
   float taaSharpness = 0.35f;
+  Upscaler upscaler = Upscaler::Off;
+  UpscalerQuality upscalerQuality = UpscalerQuality::Quality;
   Quality ao = Quality::Off;
   bool ssil = false;
   ShadowSettings shadows;
@@ -140,8 +144,9 @@ enum class Feature : uint8_t {
   TextureMaterials,
   StochasticTiling,
   LegacyMatMaps,
+  Upscaler,
 };
-inline constexpr size_t FeatureCount = static_cast<size_t>(Feature::LegacyMatMaps) + 1;
+inline constexpr size_t FeatureCount = static_cast<size_t>(Feature::Upscaler) + 1;
 
 enum class Reason : uint8_t {
   None,
@@ -166,6 +171,12 @@ enum class Reason : uint8_t {
   RequiredByShadows,
   NeedsAo,
   NeedsRt,
+  NeedsTextureFormats,
+  RuntimeMissing,
+  DriverTooOld,
+  UnsupportedGpu,
+  OutputTooLarge,
+  Probing,
 };
 
 struct FeatureSupport {
@@ -184,6 +195,18 @@ FeatureSupport feature_support(Feature feature, uint8_t option, const Settings& 
 bool feature_ready(Feature feature) noexcept;
 std::string_view feature_name(Feature feature) noexcept;
 std::string_view reason_name(Reason reason) noexcept;
+
+struct UpscaleStatus {
+  Upscaler active = Upscaler::Off;
+  UpscalerQuality quality = UpscalerQuality::Quality;
+  uint32_t sceneSize[2]{};
+  uint32_t outputSize[2]{};
+  std::string_view displayName;
+  std::string_view path;
+  bool ready = false;
+};
+
+UpscaleStatus upscale_status() noexcept;
 
 enum class Stage : uint8_t {
   SceneBegin,
