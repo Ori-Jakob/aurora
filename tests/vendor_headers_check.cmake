@@ -10,7 +10,12 @@ set(_patterns
     "typedef.*xess_"
     "XESS_[A-Z0-9_]+[[:space:]]*=[[:space:]]*-?[0-9]"
     "NVSDK_NGX_API"
-    "Intel copyrighted materials")
+    "NVSDK_NGX_Result[[:space:]]+(NVSDK_CONV[[:space:]]+)?(NVSDK_)?NGX_[A-Za-z0-9_]+[[:space:]]*[(]"
+    "typedef.*NVSDK_NGX_"
+    "NVSDK_NGX_[A-Za-z0-9_]+[[:space:]]*=[[:space:]]*-?[0-9]"
+    "#define[[:space:]]+NVSDK_NGX_"
+    "Intel copyrighted materials"
+    "LicenseRef-NvidiaProprietary")
 set(_args "")
 foreach (_pattern IN LISTS _patterns)
   list(APPEND _args -e "${_pattern}")

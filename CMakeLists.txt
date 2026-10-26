@@ -60,6 +60,7 @@ set_property(CACHE AURORA_NOD_LINKAGE PROPERTY STRINGS shared static)
 
 add_subdirectory(extern)
 include(cmake/AuroraXessProvider.cmake)
+include(cmake/AuroraDlssProvider.cmake)
 
 include(cmake/aurora_core.cmake)
 include(cmake/aurora_os.cmake)

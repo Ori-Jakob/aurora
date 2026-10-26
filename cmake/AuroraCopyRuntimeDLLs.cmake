@@ -66,8 +66,10 @@ function(aurora_install_runtime_dlls target install_destination)
     return()
   endif ()
 
+  # DLSS ships only through its own gated rule, never because a copy sits in a reused build tree
   install(CODE
     "file(GLOB _aurora_runtime_dlls \"$<TARGET_FILE_DIR:${target}>/*.dll\")\n\
+list(FILTER _aurora_runtime_dlls EXCLUDE REGEX \"/[Nn][Vv][Nn][Gg][Xx]_[^/]*[.][Dd][Ll][Ll]$\")\n\
 if(_aurora_runtime_dlls)\n\
   file(INSTALL DESTINATION \"${install_destination}\" TYPE FILE FILES \${_aurora_runtime_dlls})\n\
 endif()"
