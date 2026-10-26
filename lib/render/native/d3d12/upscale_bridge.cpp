@@ -44,8 +44,10 @@ struct Live {
   NativeUpscaler* upscaler = nullptr;
   Plan plan;
   GraphExtent render;
+  uint64_t vendorBytes = 0;
   bool armed = false;
   bool failed = false;
+  bool warming = false;
   std::unique_ptr<StepRunner> runner;
   std::unique_ptr<SharedTexture> color;
   std::unique_ptr<SharedTexture> depth;
@@ -112,10 +114,37 @@ void release_live() noexcept {
     g_live.upscaler->destroy();
   }
   const bool armed = g_live.armed;
+  const bool vendorBytes = g_live.vendorBytes != 0;
   g_live = {};
+  if (vendorBytes) {
+    set_vendor_bytes(0);
+  }
   if (armed) {
     sentinel::disarm(sentinel::Session);
   }
+}
+
+void finish_prepare(const Plan& plan, bool ok) noexcept {
+  NativeUpscaler& upscaler = *plan.upscaler;
+  g_live.warming = false;
+  {
+    std::lock_guard lock{g_mutex};
+    if (ok) {
+      g_exchange.prepared = plan;
+      g_exchange.render = g_live.render;
+    } else {
+      g_exchange.failed = plan;
+    }
+  }
+  if (ok) {
+    g_live.vendorBytes = upscaler.vram_bytes();
+    set_vendor_bytes(g_live.vendorBytes);
+    return;
+  }
+  Log.warn("Native upscaler {} could not be prepared for {}x{}", upscaler.name(), plan.output.width,
+           plan.output.height);
+  release_live();
+  probe::fail(upscaler.option());
 }
 
 void teardown() noexcept {
@@ -230,41 +259,38 @@ void worker_frame_begin() noexcept {
     return;
   }
   NativeUpscaler& upscaler = *wanted->upscaler;
-  if (g_live.upscaler != nullptr && g_live.upscaler != &upscaler) {
-    release_live();
-  }
-  if (g_live.runner) {
-    g_live.runner->wait_idle();
-  }
-  if (!std::exchange(g_live.armed, true)) {
-    sentinel::arm(sentinel::Session);
-  }
-  register_teardown(&teardown);
-  probe::count_sdk_call();
-  std::optional<GraphExtent> render = upscaler.prepare(adapter(), wanted->output, wanted->quality);
-  const bool ok = render.has_value() && render->width != 0 && render->height != 0;
-  if (ok) {
-    render->width = std::min(render->width, wanted->output.width);
-    render->height = std::min(render->height, wanted->output.height);
+  if (!g_live.warming || g_live.upscaler != &upscaler || g_live.plan != *wanted) {
+    if (g_live.upscaler != nullptr && g_live.upscaler != &upscaler) {
+      release_live();
+    }
+    if (g_live.runner) {
+      g_live.runner->wait_idle();
+    }
+    if (!std::exchange(g_live.armed, true)) {
+      sentinel::arm(sentinel::Session);
+    }
+    register_teardown(&teardown);
+    probe::count_sdk_call();
+    const std::optional<GraphExtent> render = upscaler.prepare(adapter(), wanted->output, wanted->quality);
+    if (!render || render->width == 0 || render->height == 0) {
+      finish_prepare(*wanted, false);
+      return;
+    }
     g_live.upscaler = &upscaler;
     g_live.plan = *wanted;
-    g_live.render = *render;
+    g_live.render = {std::min(render->width, wanted->output.width), std::min(render->height, wanted->output.height)};
     g_live.failed = false;
   }
-  {
-    std::lock_guard lock{g_mutex};
-    if (ok) {
-      g_exchange.prepared = wanted;
-      g_exchange.render = *render;
-    } else {
-      g_exchange.failed = wanted;
-    }
+  const upscale::native_upscale::Warmup state = upscaler.warmup();
+  g_live.warming = state == upscale::native_upscale::Warmup::Pending;
+  if (!g_live.warming) {
+    finish_prepare(*wanted, state == upscale::native_upscale::Warmup::Ready);
   }
-  if (!ok) {
-    Log.warn("Native upscaler {} could not be prepared for {}x{}", upscaler.name(), wanted->output.width,
-             wanted->output.height);
-    release_live();
-    probe::fail(upscaler.option());
+}
+
+void wait_idle() noexcept {
+  if (g_live.runner) {
+    g_live.runner->wait_idle();
   }
 }
 

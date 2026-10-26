@@ -25,6 +25,7 @@ inline constexpr std::string_view Pass = "aurora.native_upscale";
 inline constexpr std::string_view InputShader = "post/upscale/native_inputs";
 
 enum class Backend : uint8_t { D3D12 };
+enum class Warmup : uint8_t { Ready, Pending, Failed };
 
 struct Adapter {
   Backend backend = Backend::D3D12;
@@ -86,6 +87,7 @@ public:
   [[nodiscard]] virtual bool passthrough() const noexcept { return false; }
   virtual std::optional<GraphExtent> prepare(const Adapter& adapter, GraphExtent output,
                                              UpscalerQuality quality) noexcept = 0;
+  virtual Warmup warmup() noexcept { return Warmup::Ready; }
   virtual bool evaluate(const Inputs& inputs) noexcept = 0;
   virtual void destroy() noexcept = 0;
   [[nodiscard]] virtual uint64_t vram_bytes() const noexcept = 0;

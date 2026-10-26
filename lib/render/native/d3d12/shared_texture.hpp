@@ -86,4 +86,6 @@ private:
 
 bool queue_wait(ID3D12CommandQueue* queue, const AccessFences& fences) noexcept;
 uint64_t shared_bytes() noexcept;
+void set_vendor_bytes(uint64_t bytes) noexcept;
+uint64_t vendor_bytes() noexcept;
 } // namespace aurora::render::detail::native::d3d12

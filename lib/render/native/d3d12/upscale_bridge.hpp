@@ -54,6 +54,7 @@ void register_upscaler(NativeUpscaler& upscaler) noexcept;
 bool prepare(const upscale::native_upscale::Plan& plan, GraphExtent& render) noexcept;
 void release() noexcept;
 void worker_frame_begin() noexcept;
+void wait_idle() noexcept;
 bool begin(const upscale::native_upscale::Frame& frame, upscale::native_upscale::Targets& targets) noexcept;
 
 namespace testing {

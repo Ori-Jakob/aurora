@@ -32,6 +32,7 @@ struct Signs {
 [[nodiscard]] std::optional<ColorEncoding> parse_color(std::string_view text) noexcept;
 [[nodiscard]] GraphExtent split_size(GraphExtent output, float ratio) noexcept;
 [[nodiscard]] GraphExtent wanted_scene_size(const SplitInputs& inputs) noexcept;
+[[nodiscard]] std::optional<ColorEncoding> color_env();
 
 void initialize();
 bool on_latch(const Settings& settings);

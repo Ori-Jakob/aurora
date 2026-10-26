@@ -25,6 +25,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #if AURORA_ENABLE_NATIVE_D3D12
@@ -2198,6 +2199,10 @@ protected:
   }
 
   std::vector<Rgba> run_frame(uint32_t seed, fsr_rig::FrameOptions options = {}) {
+    return encode_frame(build_frame(seed, std::move(options)));
+  }
+
+  StageData build_frame(uint32_t seed, fsr_rig::FrameOptions options) {
     const webgpu::TextureWithSampler& depth = webgpu::scene_depth();
     options.sceneDepth = std::make_shared<const SceneDepth>(SceneDepth{
         .source = DepthSource::Direct,
@@ -2209,9 +2214,13 @@ protected:
         .attachmentFormat = DepthFormat,
         .size = depth.size,
     });
-    const StageData post = m_rig->build(++m_frame, options);
+    StageData post = m_rig->build(++m_frame, options);
     write_scene(seed);
     clear_targets();
+    return post;
+  }
+
+  std::vector<Rgba> encode_frame(const StageData& post) {
     SceneComposeData data{
         .mode = upscale::split_live() ? ComposeMode::Split : ComposeMode::InPlace,
         .ratio = {upscale::ratio(), upscale::ratio()},
@@ -2428,16 +2437,155 @@ TEST_F(NativeUpscaleGpu, SkippedNodeFrameSubmitsClean) {
 }
 
 #if AURORA_ENABLE_XESS
-class XessGpu : public NativeInteropGpu {};
+namespace xess = native::d3d12::xess;
+namespace bridge = native::d3d12::upscale_bridge;
+
+std::atomic_uint32_t g_xessFenceWaits{0};
+
+struct FakeXess {
+  xess_result_t buildStatus = XESS_RESULT_ERROR_OPERATION_IN_PROGRESS;
+  uint32_t builds = 0;
+  uint32_t polls = 0;
+  uint32_t inits = 0;
+  uint32_t destroys = 0;
+  uint32_t buildFlags = 0;
+  uint32_t initFlags = 0;
+  bool blocking = false;
+  std::array<float, 2> velocity{};
+  int context = 0;
+};
+
+FakeXess g_fakeXess;
+
+xess::Api fake_xess_api() {
+  xess::Api api;
+  api.getVersion = [](xess_version_t* version) {
+    *version = {};
+    return XESS_RESULT_SUCCESS;
+  };
+  api.getIntelXeFxVersion = [](xess_context_handle_t, xess_version_t* version) {
+    *version = {};
+    return XESS_RESULT_SUCCESS;
+  };
+  api.getProperties = [](xess_context_handle_t, const xess_2d_t*, xess_properties_t* properties) {
+    *properties = {};
+    properties->tempBufferHeapSize = 1u << 20;
+    properties->tempTextureHeapSize = 2u << 20;
+    return XESS_RESULT_SUCCESS;
+  };
+  api.getOptimalInputResolution = [](xess_context_handle_t, const xess_2d_t* output, xess_quality_settings_t,
+                                     xess_2d_t* optimal, xess_2d_t* minimum, xess_2d_t* maximum) {
+    *optimal = {output->x * 10 / 17, output->y * 10 / 17};
+    *minimum = *optimal;
+    *maximum = *output;
+    return XESS_RESULT_SUCCESS;
+  };
+  api.getPipelineBuildStatus = [](xess_context_handle_t) {
+    ++g_fakeXess.polls;
+    return g_fakeXess.buildStatus;
+  };
+  api.setVelocityScale = [](xess_context_handle_t, float x, float y) {
+    g_fakeXess.velocity = {x, y};
+    return XESS_RESULT_SUCCESS;
+  };
+  api.setLoggingCallback = [](xess_context_handle_t, xess_logging_level_t, xess_app_log_callback_t) {
+    return XESS_RESULT_SUCCESS;
+  };
+  api.isOptimalDriver = [](xess_context_handle_t) { return XESS_RESULT_SUCCESS; };
+  api.destroyContext = [](xess_context_handle_t) {
+    ++g_fakeXess.destroys;
+    return XESS_RESULT_SUCCESS;
+  };
+  api.d3d12CreateContext = [](ID3D12Device*, xess_context_handle_t* context) {
+    *context = reinterpret_cast<xess_context_handle_t>(&g_fakeXess.context);
+    return XESS_RESULT_SUCCESS;
+  };
+  api.d3d12BuildPipelines = [](xess_context_handle_t, ID3D12PipelineLibrary*, bool blocking, uint32_t flags) {
+    ++g_fakeXess.builds;
+    g_fakeXess.blocking = blocking;
+    g_fakeXess.buildFlags = flags;
+    return XESS_RESULT_SUCCESS;
+  };
+  api.d3d12Init = [](xess_context_handle_t, const xess_d3d12_init_params_t* params) {
+    ++g_fakeXess.inits;
+    g_fakeXess.initFlags = params->initFlags;
+    return XESS_RESULT_SUCCESS;
+  };
+  api.d3d12Execute = [](xess_context_handle_t, ID3D12GraphicsCommandList*, const xess_d3d12_execute_params_t*) {
+    return XESS_RESULT_SUCCESS;
+  };
+  return api;
+}
+
+class XessGpu : public NativeUpscaleGpu {
+protected:
+  void SetUp() override {
+    NativeUpscaleGpu::SetUp();
+    if (!m_ready || IsSkipped()) {
+      return;
+    }
+    gfx::render_worker::initialize();
+    m_worker = true;
+    bridge::testing::set_upscaler(Upscaler::Xess, &xess::upscaler());
+  }
+
+  void TearDown() override {
+    if (m_worker) {
+      on_worker([] {
+        bridge::testing::reset();
+        xess::upscaler().destroy();
+      });
+      gfx::render_worker::shutdown();
+    }
+    xess::testing::set_api(nullptr);
+    xess::testing::set_fence_wait(nullptr);
+    NativeUpscaleGpu::TearDown();
+  }
+
+  template <typename Work>
+  void on_worker(Work&& work) {
+    gfx::render_worker::enqueue_work([&] { work(); });
+    gfx::render_worker::synchronize();
+  }
+
+  static Settings xess_settings(UpscalerQuality quality = UpscalerQuality::Quality) {
+    Settings out = settings(quality);
+    out.upscaler = Upscaler::Xess;
+    return out;
+  }
+
+  [[nodiscard]] bool supported() {
+    upscale::native_upscale::ProbeResult result;
+    on_worker([&] { result = xess::upscaler().probe(bridge::adapter()); });
+    return result.support.supported;
+  }
+
+  bool install_xess(const Settings& wanted) {
+    for (int i = 0; i < 4; ++i) {
+      upscale::on_latch(wanted);
+      on_worker([] { native_worker_frame_begin(); });
+    }
+    if (!native_upscale::is_native(temporal_resolve::installed())) {
+      return false;
+    }
+    m_rig->use(m_rig->compile(wanted));
+    return true;
+  }
+
+  std::vector<Rgba> frame_on_worker(uint32_t seed, fsr_rig::FrameOptions options = {}) {
+    const StageData post = build_frame(seed, std::move(options));
+    std::vector<Rgba> out;
+    on_worker([&] { out = encode_frame(post); });
+    return out;
+  }
+
+  bool m_worker = false;
+};
 
 TEST_F(XessGpu, ProbeOnD3D12) {
-  namespace xess = native::d3d12::xess;
   const uint32_t loads = xess::testing::loads();
   upscale::native_upscale::ProbeResult result;
-  gfx::render_worker::initialize();
-  gfx::render_worker::enqueue_work([&] { result = xess::upscaler().probe(native::d3d12::upscale_bridge::adapter()); });
-  gfx::render_worker::synchronize();
-  gfx::render_worker::shutdown();
+  on_worker([&] { result = xess::upscaler().probe(bridge::adapter()); });
   std::fprintf(stderr, "note: XeSS-SR probe: %s, path '%s'\n",
                result.support.supported ? "supported" : std::string{reason_name(result.support.reason)}.c_str(),
                result.path.c_str());
@@ -2458,6 +2606,156 @@ TEST_F(XessGpu, ProbeOnD3D12) {
   }
   native::d3d12::run_teardowns();
   EXPECT_FALSE(xess::loaded());
+}
+
+TEST_F(XessGpu, ReinitWaitsForFence) {
+  if (!supported()) {
+    GTEST_SKIP() << "XeSS-SR is not supported on this adapter";
+  }
+  g_xessFenceWaits = 0;
+  xess::testing::set_fence_wait([]() noexcept { g_xessFenceWaits.fetch_add(1); });
+  xess::XessUpscaler& upscaler = xess::upscaler();
+  const GraphExtent output{SharedWidth, SharedHeight};
+  std::optional<GraphExtent> quality;
+  std::optional<GraphExtent> performance;
+  auto first = native_upscale::Warmup::Failed;
+  auto second = native_upscale::Warmup::Failed;
+  bool reinitPending = false;
+  on_worker([&] {
+    quality = upscaler.prepare(bridge::adapter(), output, UpscalerQuality::Quality);
+    first = upscaler.warmup();
+  });
+  ASSERT_TRUE(quality.has_value());
+  ASSERT_EQ(first, native_upscale::Warmup::Ready);
+  EXPECT_TRUE(upscaler.initialized());
+  EXPECT_EQ(g_xessFenceWaits.load(), 1u);
+  EXPECT_GT(upscaler.vram_bytes(), 0u);
+  on_worker([&] {
+    performance = upscaler.prepare(bridge::adapter(), output, UpscalerQuality::Performance);
+    reinitPending = !upscaler.initialized();
+    second = upscaler.warmup();
+  });
+  ASSERT_TRUE(performance.has_value());
+  EXPECT_TRUE(reinitPending);
+  EXPECT_EQ(second, native_upscale::Warmup::Ready);
+  EXPECT_EQ(g_xessFenceWaits.load(), 2u);
+  EXPECT_LT(performance->width, quality->width);
+  on_worker([&] { upscaler.destroy(); });
+  EXPECT_EQ(g_xessFenceWaits.load(), 3u);
+  EXPECT_FALSE(upscaler.initialized());
+  EXPECT_EQ(upscaler.vram_bytes(), 0u);
+  on_worker([&] { upscaler.destroy(); });
+  EXPECT_EQ(g_xessFenceWaits.load(), 3u);
+}
+
+TEST_F(XessGpu, EvaluatesValidationClean) {
+  if (!supported()) {
+    GTEST_SKIP() << "XeSS-SR is not supported on this adapter";
+  }
+  const Settings wanted = xess_settings();
+  ASSERT_TRUE(install_xess(wanted));
+  ASSERT_TRUE(upscale::split_live());
+  ASSERT_EQ(node().status, CullReason::None);
+  EXPECT_GT(native::d3d12::vendor_bytes(), 0u);
+  std::vector<Rgba> output;
+  for (uint32_t seed = 0; seed < 4; ++seed) {
+    output = frame_on_worker(seed + 80);
+    EXPECT_EQ(m_segments, 1u) << seed;
+  }
+  const auto counters = compose::testing::counters();
+  EXPECT_EQ(counters.native, 4u);
+  EXPECT_EQ(counters.lastStatus, 1u);
+  EXPECT_EQ(native_upscale::testing::counters().encodes, 4u);
+  EXPECT_GE(native_upscale::testing::counters().resets, 1u);
+  const auto shared = bridge::testing::shared();
+  ASSERT_NE(shared.out, nullptr);
+  EXPECT_EQ(shared.color->format(), TextureFormat::RGBA16Float);
+  EXPECT_EQ(shared.out->format(), TextureFormat::RGBA16Float);
+  EXPECT_EQ(shared.out->texture().GetWidth(), SharedWidth);
+  EXPECT_EQ(shared.out->texture().GetHeight(), SharedHeight);
+  ASSERT_EQ(output.size(), size_t{SharedWidth} * SharedHeight);
+  double sum = 0.0;
+  double sceneSum = 0.0;
+  for (const Rgba& texel : output) {
+    sum += (texel.r + texel.g + texel.b) / 3.0;
+  }
+  for (const Rgba& texel : m_scene) {
+    sceneSum += (texel.r + texel.g + texel.b) / 3.0;
+  }
+  EXPECT_NEAR(sum / static_cast<double>(output.size()), sceneSum / static_cast<double>(m_scene.size()), 24.0);
+  on_worker([] { bridge::testing::reset(); });
+  EXPECT_EQ(native::d3d12::vendor_bytes(), 0u);
+}
+
+TEST_F(XessGpu, LeavesEfbAlphaUntouched) {
+  if (!supported()) {
+    GTEST_SKIP() << "XeSS-SR is not supported on this adapter";
+  }
+  ASSERT_TRUE(install_xess(xess_settings()));
+  ASSERT_TRUE(upscale::split_live());
+  const std::vector<Rgba> bilinear = frame_on_worker(91, {.camera = false});
+  EXPECT_EQ(m_segments, 0u);
+  const std::vector<Rgba> upscaled = frame_on_worker(91);
+  EXPECT_EQ(m_segments, 1u);
+  ASSERT_EQ(upscaled.size(), bilinear.size());
+  size_t changed = 0;
+  size_t opaque = 0;
+  for (size_t i = 0; i < upscaled.size(); ++i) {
+    changed += upscaled[i].a != bilinear[i].a ? 1 : 0;
+    opaque += upscaled[i].a == 255 ? 1 : 0;
+  }
+  EXPECT_EQ(changed, 0u);
+  EXPECT_LT(opaque, upscaled.size() / 8);
+  EXPECT_EQ(compose::testing::counters().lastStatus, 1u);
+
+  ASSERT_TRUE(install_xess(xess_settings(UpscalerQuality::NativeAa)));
+  ASSERT_FALSE(upscale::split_live());
+  const std::vector<Rgba> inPlace = frame_on_worker(92);
+  EXPECT_EQ(m_segments, 1u);
+  ASSERT_EQ(inPlace.size(), m_scene.size());
+  changed = 0;
+  for (size_t i = 0; i < inPlace.size(); ++i) {
+    changed += inPlace[i].a != m_scene[i].a ? 1 : 0;
+  }
+  EXPECT_EQ(changed, 0u);
+  EXPECT_EQ(compose::testing::counters().native, 2u);
+  EXPECT_EQ(compose::testing::counters().lastStatus, 1u);
+}
+
+class XessGraph : public XessGpu {};
+
+TEST_F(XessGraph, WaitsForPipelineBuild) {
+  g_fakeXess = {};
+  static const xess::Api api = fake_xess_api();
+  xess::testing::set_api(&api);
+  const Settings wanted = xess_settings();
+  gfx::set_blocking_pipelines(false);
+  for (int i = 0; i < 4; ++i) {
+    upscale::on_latch(wanted);
+    on_worker([] { native_worker_frame_begin(); });
+  }
+  gfx::set_blocking_pipelines(true);
+  EXPECT_FALSE(native_upscale::is_native(temporal_resolve::installed()));
+  EXPECT_FALSE(upscale::ready(wanted));
+  EXPECT_EQ(g_fakeXess.builds, 1u);
+  EXPECT_FALSE(g_fakeXess.blocking);
+  EXPECT_GE(g_fakeXess.polls, 3u);
+  EXPECT_EQ(g_fakeXess.inits, 0u);
+
+  g_fakeXess.buildStatus = XESS_RESULT_SUCCESS;
+  ASSERT_TRUE(install_xess(wanted));
+  EXPECT_EQ(g_fakeXess.builds, 1u);
+  EXPECT_EQ(g_fakeXess.inits, 1u);
+  EXPECT_EQ(g_fakeXess.initFlags, xess::init_flags(false));
+  EXPECT_EQ(g_fakeXess.buildFlags, g_fakeXess.initFlags);
+  const GraphExtent scene = upscale::scene_size();
+  EXPECT_EQ(scene, (GraphExtent{SharedWidth * 10 / 17, SharedHeight * 10 / 17}));
+  EXPECT_EQ(g_fakeXess.velocity, xess::velocity_scale(scene));
+  EXPECT_EQ(native::d3d12::vendor_bytes(), uint64_t{3} << 20);
+  EXPECT_EQ(node().status, CullReason::None);
+  on_worker([] { bridge::testing::reset(); });
+  EXPECT_EQ(g_fakeXess.destroys, 1u);
+  EXPECT_EQ(native::d3d12::vendor_bytes(), 0u);
 }
 #endif
 #endif

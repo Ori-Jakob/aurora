@@ -17,8 +17,12 @@
 #include "render/native/d3d12/probe.hpp"
 #include "render/native/d3d12/upscale_bridge.hpp"
 #include "render/native/d3d12/xess.hpp"
+#include "render/post/upscale/upscale.hpp"
 
+#include <array>
+#include <cmath>
 #include <optional>
+#include <utility>
 #endif
 
 #include <atomic>
@@ -253,6 +257,55 @@ TEST_F(Xess, NotLoadedWithUpscalerOff) {
   EXPECT_FALSE(std::filesystem::exists(m_dir / probe::CacheFile));
   EXPECT_EQ(support(Upscaler::Xess).reason, Reason::Probing);
   EXPECT_FALSE(xess::loaded());
+}
+
+TEST_F(Xess, QualityMapsToXessEnum) {
+  EXPECT_EQ(xess::quality_setting(UpscalerQuality::NativeAa), XESS_QUALITY_SETTING_AA);
+  EXPECT_EQ(xess::quality_setting(UpscalerQuality::Quality), XESS_QUALITY_SETTING_QUALITY);
+  EXPECT_EQ(xess::quality_setting(UpscalerQuality::Balanced), XESS_QUALITY_SETTING_BALANCED);
+  EXPECT_EQ(xess::quality_setting(UpscalerQuality::Performance), XESS_QUALITY_SETTING_PERFORMANCE);
+  EXPECT_EQ(xess::quality_setting(UpscalerQuality::UltraPerformance), XESS_QUALITY_SETTING_ULTRA_PERFORMANCE);
+  const std::vector<int> spec{106, 103, 102, 101, 100};
+  for (uint8_t i = 0; i < spec.size(); ++i) {
+    EXPECT_EQ(static_cast<int>(xess::quality_setting(static_cast<UpscalerQuality>(i))), spec[i]) << int{i};
+  }
+}
+
+TEST_F(Xess, JitterPhasesAtLeastEightRatioSquared) {
+  const xess::XessUpscaler& upscaler = xess::upscaler();
+  for (const auto& [ratio, phases] : std::vector<std::pair<float, uint32_t>>{
+           {1.f, 8}, {1.3f, 14}, {1.5f, 18}, {1.7f, 24}, {2.f, 32}, {2.3f, 43}, {3.f, 72}}) {
+    EXPECT_EQ(upscaler.jitter_phases(ratio), phases) << ratio;
+    EXPECT_GE(upscaler.jitter_phases(ratio), 8u) << ratio;
+    EXPECT_GE(static_cast<float>(upscaler.jitter_phases(ratio)), 8.f * ratio * ratio) << ratio;
+    EXPECT_FLOAT_EQ(upscaler.mip_bias(ratio), std::log2(1.f / ratio)) << ratio;
+  }
+}
+
+TEST_F(Xess, VelocityScaleFollowsRenderSize) {
+  EXPECT_EQ(xess::velocity_scale({1706, 960}), (std::array{-853.f, 480.f}));
+  EXPECT_EQ(xess::velocity_scale({2811, 1581}), (std::array{-1405.5f, 790.5f}));
+  EXPECT_EQ(xess::velocity_scale({64, 32}), (std::array{-32.f, 16.f}));
+  EXPECT_EQ(xess::velocity_scale({}), (std::array{-0.f, 0.f}));
+}
+
+TEST_F(Xess, InitFlagsNoResponsiveByDefault) {
+  const uint32_t flags = xess::init_flags(false);
+  EXPECT_EQ(flags, static_cast<uint32_t>(XESS_INIT_FLAG_INVERTED_DEPTH | XESS_INIT_FLAG_LDR_INPUT_COLOR));
+  EXPECT_EQ(flags & XESS_INIT_FLAG_RESPONSIVE_PIXEL_MASK, 0u);
+  EXPECT_EQ(flags & (XESS_INIT_FLAG_HIGH_RES_MV | XESS_INIT_FLAG_USE_NDC_VELOCITY | XESS_INIT_FLAG_JITTERED_MV), 0u);
+  EXPECT_EQ(xess::init_flags(true), flags | XESS_INIT_FLAG_RESPONSIVE_PIXEL_MASK);
+  EXPECT_FALSE(xess::upscaler().wants_reactive());
+}
+
+TEST_F(Xess, ColorFollowsEnvOverride) {
+  EXPECT_EQ(xess::upscaler().color_encoding(), ColorEncoding::Linear);
+  upscale::testing::set_color_env(ColorEncoding::Stored);
+  EXPECT_EQ(xess::upscaler().color_encoding(), ColorEncoding::Stored);
+  upscale::testing::set_color_env(ColorEncoding::Linear);
+  EXPECT_EQ(xess::upscaler().color_encoding(), ColorEncoding::Linear);
+  upscale::testing::reset();
+  EXPECT_EQ(xess::upscaler().color_encoding(), ColorEncoding::Linear);
 }
 #endif
 } // namespace

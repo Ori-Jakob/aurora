@@ -149,26 +149,6 @@ Signs signs_env() {
   return env;
 }
 
-std::optional<ColorEncoding> color_env() {
-  if (g_colorOverride.set) {
-    return g_colorOverride.value;
-  }
-  static const std::optional<ColorEncoding> env = []() -> std::optional<ColorEncoding> {
-    const char* value = SDL_getenv("AURORA_RENDER_UPSCALER_COLOR");
-    if (value == nullptr) {
-      return std::nullopt;
-    }
-    const std::optional<ColorEncoding> color = parse_color(value);
-    if (color) {
-      Log.warn("AURORA_RENDER_UPSCALER_COLOR={}: overriding the upscaler's colour input", value);
-    } else {
-      Log.warn("AURORA_RENDER_UPSCALER_COLOR={} is not stored or linear; ignored", value);
-    }
-    return color;
-  }();
-  return env;
-}
-
 void publish_sampling() {
   if (!compose_wanted()) {
     gx::g_upscaleSampling = {};
@@ -204,6 +184,26 @@ bool writes_color(const CompiledGraph& graph, NodeId node) noexcept {
   });
 }
 } // namespace
+
+std::optional<ColorEncoding> color_env() {
+  if (g_colorOverride.set) {
+    return g_colorOverride.value;
+  }
+  static const std::optional<ColorEncoding> env = []() -> std::optional<ColorEncoding> {
+    const char* value = SDL_getenv("AURORA_RENDER_UPSCALER_COLOR");
+    if (value == nullptr) {
+      return std::nullopt;
+    }
+    const std::optional<ColorEncoding> color = parse_color(value);
+    if (color) {
+      Log.warn("AURORA_RENDER_UPSCALER_COLOR={}: overriding the upscaler's colour input", value);
+    } else {
+      Log.warn("AURORA_RENDER_UPSCALER_COLOR={} is not stored or linear; ignored", value);
+    }
+    return color;
+  }();
+  return env;
+}
 
 std::optional<float> parse_mip_bias(std::string_view text) noexcept {
   float value = 0.f;

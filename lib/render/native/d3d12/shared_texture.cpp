@@ -29,6 +29,7 @@ std::vector<SharedTexture*> g_textures;
 std::vector<NativeFence*> g_fences;
 std::vector<DawnFence> g_dawnFences;
 uint64_t g_sharedBytes = 0;
+uint64_t g_vendorBytes = 0;
 
 DXGI_FORMAT dxgi_format(wgpu::TextureFormat format) noexcept {
   switch (format) {
@@ -71,7 +72,7 @@ void adjust_reservation(uint64_t add, uint64_t remove) noexcept {
   {
     std::lock_guard lock{g_mutex};
     g_sharedBytes = g_sharedBytes + add - std::min(remove, g_sharedBytes + add);
-    total = g_sharedBytes;
+    total = g_sharedBytes + g_vendorBytes;
   }
   const uint64_t reserved = reserve_external_memory(total);
   if (reserved < total) {
@@ -353,5 +354,18 @@ bool queue_wait(ID3D12CommandQueue* queue, const AccessFences& fences) noexcept 
 uint64_t shared_bytes() noexcept {
   std::lock_guard lock{g_mutex};
   return g_sharedBytes;
+}
+
+void set_vendor_bytes(uint64_t bytes) noexcept {
+  {
+    std::lock_guard lock{g_mutex};
+    g_vendorBytes = bytes;
+  }
+  adjust_reservation(0, 0);
+}
+
+uint64_t vendor_bytes() noexcept {
+  std::lock_guard lock{g_mutex};
+  return g_vendorBytes;
 }
 } // namespace aurora::render::detail::native::d3d12

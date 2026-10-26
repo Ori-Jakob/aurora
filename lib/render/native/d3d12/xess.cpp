@@ -17,7 +17,6 @@ constexpr Module Log{"aurora::render::native"};
 
 using upscale::native_upscale::Adapter;
 using upscale::native_upscale::Backend;
-using upscale::native_upscale::Inputs;
 using upscale::native_upscale::ProbeResult;
 
 constexpr uint32_t MinJitterPhases = 8;
@@ -28,6 +27,7 @@ Api g_api;
 std::atomic_bool g_loaded{false};
 std::atomic_uint32_t g_loads{0};
 std::optional<std::filesystem::path> g_library;
+const Api* g_apiOverride = nullptr;
 XessUpscaler g_upscaler;
 
 template <typename T>
@@ -63,6 +63,7 @@ HMODULE open_library() noexcept {
 }
 
 void unload() noexcept {
+  g_upscaler.destroy();
   if (g_module == nullptr) {
     return;
   }
@@ -116,8 +117,20 @@ Path path_for(uint32_t vendorId, const xess_version_t& xefx) noexcept {
   return {.name = CrossVendorPath, .xefx = false};
 }
 
+xess_result_t create_context(const Api& api, ID3D12Device* device, xess_context_handle_t& context) noexcept {
+  context = nullptr;
+  const xess_result_t created = api.d3d12CreateContext(device, &context);
+  if (created >= XESS_RESULT_SUCCESS && context != nullptr) {
+    api.setLoggingCallback(context, XESS_LOGGING_LEVEL_WARNING, &forward_log);
+  }
+  return created;
+}
+
 const Api* load() noexcept {
   native::assert_worker();
+  if (g_apiOverride != nullptr) {
+    return g_apiOverride;
+  }
   if (g_module != nullptr) {
     return &g_api;
   }
@@ -158,7 +171,7 @@ ProbeResult XessUpscaler::probe(const Adapter& adapter) noexcept {
     return {.support = {false, Reason::NativeUnavailable}, .autoPick = false};
   }
   xess_context_handle_t context = nullptr;
-  const xess_result_t created = api->d3d12CreateContext(device, &context);
+  const xess_result_t created = create_context(*api, device, context);
   FeatureSupport support = support_from_result(created);
   if (support.supported && context == nullptr) {
     support = {false, Reason::NativeUnavailable};
@@ -171,7 +184,6 @@ ProbeResult XessUpscaler::probe(const Adapter& adapter) noexcept {
              reason_name(support.reason));
     return {.support = support, .autoPick = false};
   }
-  api->setLoggingCallback(context, XESS_LOGGING_LEVEL_WARNING, &forward_log);
   if (api->isOptimalDriver(context) == XESS_RESULT_WARNING_OLD_DRIVER) {
     Log.warn("{}: the installed GPU driver may give degraded performance or quality", DisplayName);
   }
@@ -189,13 +201,6 @@ ProbeResult XessUpscaler::probe(const Adapter& adapter) noexcept {
   return {.support = {true, Reason::None}, .path = std::string{path.name}, .autoPick = path.xefx};
 }
 
-std::optional<GraphExtent> XessUpscaler::prepare(const Adapter&, GraphExtent, UpscalerQuality) noexcept {
-  native::assert_worker();
-  return std::nullopt;
-}
-
-bool XessUpscaler::evaluate(const Inputs&) noexcept { return false; }
-
 uint32_t XessUpscaler::jitter_phases(float ratio) const noexcept {
   return std::max(MinJitterPhases, static_cast<uint32_t>(std::ceil(8.f * ratio * ratio)));
 }
@@ -206,5 +211,7 @@ namespace testing {
 void set_library(std::optional<std::filesystem::path> path) noexcept { g_library = std::move(path); }
 
 uint32_t loads() noexcept { return g_loads.load(std::memory_order_relaxed); }
+
+void set_api(const Api* api) noexcept { g_apiOverride = api; }
 } // namespace testing
 } // namespace aurora::render::detail::native::d3d12::xess
