@@ -3,12 +3,101 @@
 #include "gfx/pipeline_cache.hpp"
 #include "gfx/scene_targets.hpp"
 #include "gx/pipeline.hpp"
+#include "internal.hpp"
+#include "webgpu/gpu.hpp"
 
+#include <array>
+#include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <string>
+#include <string_view>
 
 namespace aurora::gfx {
 namespace {
 using detail::PipelinePriority;
+
+constexpr uint64_t LegacyLayout = 0x1111;
+constexpr uint64_t GBufferLayout = 0x2222;
+constexpr uint64_t StaleLayout = 0x3333;
+constexpr size_t BlobSize = 64;
+
+void store_blob(std::string_view key, uint64_t layout) {
+  const webgpu::CacheLayoutScope scope{layout};
+  const std::string value(BlobSize, key.front());
+  webgpu::store_to_cache(key.data(), key.size(), value.data(), value.size(), nullptr);
+}
+
+bool load_blob(std::string_view key, uint64_t layout) {
+  const webgpu::CacheLayoutScope scope{layout};
+  std::array<char, BlobSize> value{};
+  return webgpu::load_from_cache(key.data(), key.size(), value.data(), value.size(), nullptr) == BlobSize;
+}
+
+// A size-only lookup never marks the key as used, so it leaves the prune alone
+bool blob_present(std::string_view key) {
+  return webgpu::load_from_cache(key.data(), key.size(), nullptr, 0, nullptr) == BlobSize;
+}
+
+class DawnCachePruneTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    m_cachePath = (std::filesystem::temp_directory_path() /
+                   ("aurora-dawn-cache-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())))
+                      .string();
+    std::filesystem::create_directories(m_cachePath);
+    m_savedCachePath = g_config.cachePath;
+    g_config.cachePath = m_cachePath.c_str();
+    webgpu::cache_shutdown();
+  }
+
+  void TearDown() override {
+    webgpu::cache_shutdown();
+    g_config.cachePath = m_savedCachePath;
+    std::error_code ec;
+    std::filesystem::remove_all(m_cachePath, ec);
+  }
+
+  std::string m_cachePath;
+  const char* m_savedCachePath = nullptr;
+};
+
+TEST_F(DawnCachePruneTest, PruneKeepsBlobsOfKnownSceneLayouts) {
+  store_blob("legacy", LegacyLayout);
+  store_blob("gbuffer", GBufferLayout);
+  store_blob("stale", StaleLayout);
+  store_blob("untagged", 0);
+  webgpu::cache_shutdown();
+
+  // The next session draws only the legacy layout
+  ASSERT_TRUE(load_blob("legacy", LegacyLayout));
+  const std::array keep{LegacyLayout, GBufferLayout};
+  webgpu::cache_prune(keep);
+  EXPECT_TRUE(blob_present("legacy"));
+  EXPECT_TRUE(blob_present("gbuffer"));
+  EXPECT_FALSE(blob_present("stale"));
+  EXPECT_FALSE(blob_present("untagged"));
+}
+
+TEST_F(DawnCachePruneTest, LoadsTagBlobsStoredWithoutLayout) {
+  store_blob("gbuffer", 0);
+  webgpu::cache_shutdown();
+  ASSERT_TRUE(load_blob("gbuffer", GBufferLayout));
+  webgpu::cache_shutdown();
+
+  store_blob("legacy", LegacyLayout);
+  const std::array keep{LegacyLayout, GBufferLayout};
+  webgpu::cache_prune(keep);
+  EXPECT_TRUE(blob_present("gbuffer"));
+  webgpu::cache_shutdown();
+
+  // Once its layout is no longer known, an unused blob goes as before
+  ASSERT_TRUE(load_blob("legacy", LegacyLayout));
+  const std::array legacyOnly{LegacyLayout};
+  webgpu::cache_prune(legacyOnly);
+  EXPECT_TRUE(blob_present("legacy"));
+  EXPECT_FALSE(blob_present("gbuffer"));
+}
 
 SceneLayoutBase test_base() {
   return {.color = wgpu::TextureFormat::BGRA8Unorm, .depth = wgpu::TextureFormat::Depth32Float, .size = {64, 64, 1}};

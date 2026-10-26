@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+#include <span>
 
 struct SDL_Window;
 
@@ -97,7 +98,19 @@ void draw_clear(const wgpu::RenderPassEncoder& pass, bool clearColor, bool clear
 
 size_t load_from_cache(void const* key, size_t keySize, void* value, size_t valueSize, void* userdata);
 void store_to_cache(void const* key, size_t keySize, void const* value, size_t valueSize, void* userdata);
-void cache_prune();
+void cache_prune(std::span<const uint64_t> keepLayouts);
 void cache_shutdown();
+
+// Dawn loads and stores blobs on the thread that creates the pipeline, so a thread-local tag names their layout
+class CacheLayoutScope {
+public:
+  explicit CacheLayoutScope(uint64_t layoutKey) noexcept;
+  ~CacheLayoutScope();
+  CacheLayoutScope(const CacheLayoutScope&) = delete;
+  CacheLayoutScope& operator=(const CacheLayoutScope&) = delete;
+
+private:
+  uint64_t m_previous;
+};
 
 } // namespace aurora::webgpu

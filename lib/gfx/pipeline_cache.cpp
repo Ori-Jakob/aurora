@@ -4,6 +4,7 @@
 #include "frame_packet.hpp"
 #include "resources.hpp"
 #include "hash.hpp"
+#include "scene_targets.hpp"
 #include "../gx/pipeline.hpp"
 #include "../gx/render_ext.hpp"
 #include "../gx/shader_info.hpp"
@@ -15,6 +16,7 @@
 #include "../webgpu/gpu.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -99,6 +101,7 @@ static std::atomic_bool g_gpuCachePrunePending = false;
 static std::atomic_bool g_blockingPipelines = false;
 static std::atomic_uint64_t g_pipelineEpoch = 0;
 static std::atomic_uint64_t g_skippedDraws = 0;
+static std::vector<uint64_t> g_sceneLayoutKeys;
 
 static sqlite3* g_pipelineCacheDb = nullptr;
 static sqlite3_stmt* g_pipelineCacheLoadStmt = nullptr;
@@ -489,7 +492,12 @@ static void notify_pipeline_ready(bool queued, uint32_t pipelineCount) {
   createdPipelines += pipelineCount;
   if (queued && --queuedPipelines == 0 && g_gpuCachePrunePending.exchange(false, std::memory_order_acq_rel)) {
     // Prune GPU cache entries after fully loading the pipeline cache.
-    webgpu::cache_prune();
+    std::vector<uint64_t> layouts;
+    {
+      std::lock_guard lock{g_pipelineMutex};
+      layouts = g_sceneLayoutKeys;
+    }
+    webgpu::cache_prune(layouts);
   }
   g_pipelineReadyCv.notify_all();
 }
@@ -592,14 +600,25 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
 static PipelineRef resolve_pipeline(ShaderType type, const gx::PipelineConfig& config, const RenderTargetLayout& layout,
                                     PipelinePriority priority) {
   const auto runtimeKey = xxh3_hash(layout.key, xxh3_hash(config, static_cast<HashType>(type)));
-  return find_pipeline_impl(runtimeKey, [config, layout] { return create_pipeline(config, layout); }, priority);
+  return find_pipeline_impl(
+      runtimeKey,
+      [config, layout] {
+        const webgpu::CacheLayoutScope scope{layout.key};
+        return create_pipeline(config, layout);
+      },
+      priority);
 }
 
 static PipelineRef resolve_pipeline(ShaderType type, const clear::PipelineConfig& config,
                                     const RenderTargetLayout& layout, PipelinePriority priority) {
   const auto runtimeKey = xxh3_hash(layout.key, xxh3_hash(config, static_cast<HashType>(type)));
   return find_pipeline_impl(
-      runtimeKey, [config, layout] { return CompiledPipeline{.main = create_pipeline(config, layout)}; }, priority);
+      runtimeKey,
+      [config, layout] {
+        const webgpu::CacheLayoutScope scope{layout.key};
+        return CompiledPipeline{.main = create_pipeline(config, layout)};
+      },
+      priority);
 }
 
 #ifdef AURORA_ENABLE_RMLUI
@@ -1331,6 +1350,19 @@ void note_skipped_draw() noexcept { g_skippedDraws.fetch_add(1, std::memory_orde
 
 uint64_t skipped_draws() noexcept { return g_skippedDraws.load(std::memory_order_relaxed); }
 
+// Dawn's startup prune keeps the blobs of every scene layout a switch can bring back, not just the live one
+static void remember_scene_layouts(uint64_t offscreenKey) {
+  const SceneLayoutBase base = live_layout_base();
+  const std::array keys{pending_scene_layout(false, false, base).key, pending_scene_layout(true, false, base).key,
+                        pending_scene_layout(false, true, base).key, offscreenKey};
+  std::lock_guard lock{g_pipelineMutex};
+  for (const uint64_t key : keys) {
+    if (std::ranges::find(g_sceneLayoutKeys, key) == g_sceneLayoutKeys.end()) {
+      g_sceneLayoutKeys.push_back(key);
+    }
+  }
+}
+
 void rebuild_pipeline_cache() {
   ZoneScoped;
   const auto scene = pipeline_base_layout(scene_render_target_layout());
@@ -1339,6 +1371,7 @@ void rebuild_pipeline_cache() {
   offscreen.sampleCount = 1;
   detail::finalize_render_target_layout(offscreen);
   g_pipelineLayoutKey = scene.key;
+  remember_scene_layouts(offscreen.key);
 
   std::vector<KnownPipeline> known;
   {
@@ -1409,6 +1442,7 @@ void shutdown_pipeline_cache() {
   g_pipelines.clear();
   g_knownPipelines.clear();
   g_pipelineLayoutKey.reset();
+  g_sceneLayoutKeys.clear();
   g_pipelineQueue.clear();
   g_warmPipelineQueue.clear();
   g_backgroundPipelineQueue.clear();
