@@ -2768,12 +2768,13 @@ TEST_F(XessGraph, WaitsForPipelineBuild) {
 
 #if AURORA_ENABLE_DLSS
 namespace dlss = native::d3d12::dlss;
+namespace bridge = native::d3d12::upscale_bridge;
 
-class DlssGpu : public NativeInteropGpu {
+class DlssGpu : public NativeUpscaleGpu {
 protected:
   void SetUp() override {
-    NativeInteropGpu::SetUp();
-    if (!m_started || IsSkipped()) {
+    NativeUpscaleGpu::SetUp();
+    if (!m_ready || IsSkipped()) {
       return;
     }
     m_data = std::filesystem::temp_directory_path() / "aurora_dlss_gpu" / std::string{dlss::DataFolder};
@@ -2784,18 +2785,22 @@ protected:
     dlss::testing::set_data_directory(m_data);
     gfx::render_worker::initialize();
     m_worker = true;
+    bridge::testing::set_upscaler(Upscaler::Dlss, &dlss::upscaler());
   }
 
   void TearDown() override {
     if (m_worker) {
-      on_worker([] { dlss::upscaler().destroy(); });
+      on_worker([] {
+        bridge::testing::reset();
+        dlss::upscaler().destroy();
+      });
       gfx::render_worker::shutdown();
       dlss::set_api(nullptr);
       dlss::testing::reset();
       std::error_code ec;
       std::filesystem::remove_all(m_data.parent_path(), ec);
     }
-    NativeInteropGpu::TearDown();
+    NativeUpscaleGpu::TearDown();
   }
 
   template <typename Work>
@@ -2804,12 +2809,39 @@ protected:
     gfx::render_worker::synchronize();
   }
 
+  [[nodiscard]] static bool nvidia() { return native::d3d12::adapter_desc().VendorId == dlss::NvidiaVendorId; }
+
+  static Settings dlss_settings(UpscalerQuality quality = UpscalerQuality::Quality) {
+    Settings out = settings(quality);
+    out.upscaler = Upscaler::Dlss;
+    return out;
+  }
+
+  bool install_dlss(const Settings& wanted) {
+    for (int i = 0; i < 4; ++i) {
+      upscale::on_latch(wanted);
+      on_worker([] { native_worker_frame_begin(); });
+    }
+    if (!native_upscale::is_native(temporal_resolve::installed())) {
+      return false;
+    }
+    m_rig->use(m_rig->compile(wanted));
+    return true;
+  }
+
+  std::vector<Rgba> frame_on_worker(uint32_t seed, fsr_rig::FrameOptions options = {}) {
+    const StageData post = build_frame(seed, std::move(options));
+    std::vector<Rgba> out;
+    on_worker([&] { out = encode_frame(post); });
+    return out;
+  }
+
   std::filesystem::path m_data;
   bool m_worker = false;
 };
 
 TEST_F(DlssGpu, ProbeReportsSupport) {
-  if (native::d3d12::adapter_desc().VendorId != dlss::NvidiaVendorId) {
+  if (!nvidia()) {
     GTEST_SKIP() << "needs an NVIDIA GPU";
   }
   upscale::native_upscale::ProbeResult result;
@@ -2855,6 +2887,88 @@ TEST_F(DlssGpu, ProbeReportsSupport) {
     }
   }
   EXPECT_EQ(logs, 0u) << "NGX wrote its own log files";
+}
+
+TEST_F(DlssGpu, EvaluatesValidationClean) {
+  if (!nvidia()) {
+    GTEST_SKIP() << "needs an NVIDIA GPU";
+  }
+  ASSERT_TRUE(install_dlss(dlss_settings()));
+  ASSERT_TRUE(upscale::split_live());
+  ASSERT_EQ(node().status, CullReason::None);
+  EXPECT_FALSE(dlss::upscaler().has_feature());
+  std::vector<Rgba> output;
+  for (uint32_t seed = 0; seed < 4; ++seed) {
+    output = frame_on_worker(seed + 80);
+    EXPECT_EQ(m_segments, 1u) << seed;
+    EXPECT_EQ(compose::testing::counters().lastStatus, 1u) << seed;
+  }
+  EXPECT_TRUE(dlss::upscaler().has_feature());
+  const auto counters = compose::testing::counters();
+  EXPECT_EQ(counters.native, 4u);
+  EXPECT_EQ(native_upscale::testing::counters().encodes, 4u);
+  EXPECT_GE(native_upscale::testing::counters().resets, 1u);
+  const auto shared = bridge::testing::shared();
+  ASSERT_NE(shared.out, nullptr);
+  EXPECT_EQ(shared.color->format(), webgpu::scene_color().texture.GetFormat());
+  EXPECT_EQ(shared.out->format(), TextureFormat::RGBA8Unorm);
+  EXPECT_EQ(shared.out->texture().GetWidth(), SharedWidth);
+  EXPECT_EQ(shared.out->texture().GetHeight(), SharedHeight);
+  on_worker([] { native_worker_frame_begin(); });
+  EXPECT_GT(dlss::upscaler().vram_bytes(), 0u);
+  EXPECT_EQ(native::d3d12::vendor_bytes(), dlss::upscaler().vram_bytes());
+  std::fprintf(stderr, "note: DLSS %ux%u to %ux%u, %.1f MiB\n", upscale::scene_size().width,
+               upscale::scene_size().height, SharedWidth, SharedHeight,
+               static_cast<double>(dlss::upscaler().vram_bytes()) / (1024.0 * 1024.0));
+  ASSERT_EQ(output.size(), size_t{SharedWidth} * SharedHeight);
+  double sum = 0.0;
+  double sceneSum = 0.0;
+  for (const Rgba& texel : output) {
+    sum += (texel.r + texel.g + texel.b) / 3.0;
+  }
+  for (const Rgba& texel : m_scene) {
+    sceneSum += (texel.r + texel.g + texel.b) / 3.0;
+  }
+  EXPECT_NEAR(sum / static_cast<double>(output.size()), sceneSum / static_cast<double>(m_scene.size()), 24.0);
+  on_worker([] { bridge::testing::reset(); });
+  EXPECT_FALSE(dlss::upscaler().has_feature());
+  EXPECT_EQ(native::d3d12::vendor_bytes(), 0u);
+}
+
+TEST_F(DlssGpu, LeavesEfbAlphaUntouched) {
+  if (!nvidia()) {
+    GTEST_SKIP() << "needs an NVIDIA GPU";
+  }
+  ASSERT_TRUE(install_dlss(dlss_settings()));
+  ASSERT_TRUE(upscale::split_live());
+  const std::vector<Rgba> bilinear = frame_on_worker(91, {.camera = false});
+  EXPECT_EQ(m_segments, 0u);
+  const std::vector<Rgba> upscaled = frame_on_worker(91);
+  EXPECT_EQ(m_segments, 1u);
+  ASSERT_EQ(upscaled.size(), bilinear.size());
+  size_t changed = 0;
+  size_t opaque = 0;
+  for (size_t i = 0; i < upscaled.size(); ++i) {
+    changed += upscaled[i].a != bilinear[i].a ? 1 : 0;
+    opaque += upscaled[i].a == 255 ? 1 : 0;
+  }
+  EXPECT_EQ(changed, 0u);
+  EXPECT_LT(opaque, upscaled.size() / 8);
+  EXPECT_EQ(compose::testing::counters().lastStatus, 1u);
+
+  ASSERT_TRUE(install_dlss(dlss_settings(UpscalerQuality::NativeAa)));
+  ASSERT_FALSE(upscale::split_live());
+  EXPECT_EQ(native_upscale::display_name(UpscalerQuality::NativeAa), "DLAA");
+  const std::vector<Rgba> inPlace = frame_on_worker(92);
+  EXPECT_EQ(m_segments, 1u);
+  ASSERT_EQ(inPlace.size(), m_scene.size());
+  changed = 0;
+  for (size_t i = 0; i < inPlace.size(); ++i) {
+    changed += inPlace[i].a != m_scene[i].a ? 1 : 0;
+  }
+  EXPECT_EQ(changed, 0u);
+  EXPECT_EQ(compose::testing::counters().native, 2u);
+  EXPECT_EQ(compose::testing::counters().lastStatus, 1u);
 }
 #endif
 #endif

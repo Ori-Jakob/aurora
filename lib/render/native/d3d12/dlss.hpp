@@ -50,6 +50,37 @@ struct ModeSize {
 
 using Modes = std::array<std::optional<ModeSize>, ModeCount>;
 
+struct FeatureFlags {
+  bool hdr = false;
+  bool mvLowRes = false;
+  bool mvJittered = false;
+  bool depthInverted = false;
+  bool autoExposure = false;
+
+  bool operator==(const FeatureFlags&) const = default;
+};
+
+struct FeatureDesc {
+  GraphExtent render;
+  GraphExtent output;
+  UpscalerQuality quality = UpscalerQuality::Quality;
+  FeatureFlags flags;
+
+  bool operator==(const FeatureDesc&) const = default;
+};
+
+struct Evaluation {
+  ID3D12Resource* color = nullptr;
+  ID3D12Resource* depth = nullptr;
+  ID3D12Resource* motion = nullptr;
+  ID3D12Resource* output = nullptr;
+  std::array<float, 2> jitter{};
+  std::array<float, 2> motionScale{};
+  GraphExtent render;
+  float frameTimeMs = 0.f;
+  bool reset = true;
+};
+
 // NGX calls in aurora types, so this file and its tests build without NVIDIA's headers; dlss_ngx.cpp binds the SDK
 struct Api {
   std::optional<Requirements> (*requirements)(IDXGIAdapter* adapter, const Identity& identity,
@@ -58,6 +89,10 @@ struct Api {
   std::optional<Capability> (*capability)() noexcept = nullptr;
   std::optional<ModeSize> (*optimal)(GraphExtent output, UpscalerQuality quality) noexcept = nullptr;
   void (*shutdown)(ID3D12Device* device) noexcept = nullptr;
+  void* (*create)(ID3D12GraphicsCommandList* list, const FeatureDesc& desc) noexcept = nullptr;
+  bool (*evaluate)(ID3D12GraphicsCommandList* list, void* feature, const Evaluation& evaluation) noexcept = nullptr;
+  void (*release)(void* feature) noexcept = nullptr;
+  std::optional<uint64_t> (*vram)() noexcept = nullptr;
 };
 
 class DlssUpscaler final : public upscale::native_upscale::NativeUpscaler {
@@ -76,22 +111,30 @@ public:
   upscale::native_upscale::Warmup warmup() noexcept override;
   bool evaluate(const upscale::native_upscale::Inputs& inputs) noexcept override;
   void destroy() noexcept override;
-  [[nodiscard]] uint64_t vram_bytes() const noexcept override { return 0; }
+  [[nodiscard]] uint64_t vram_bytes() const noexcept override { return m_vramBytes; }
   [[nodiscard]] uint32_t jitter_phases(float ratio) const noexcept override;
   [[nodiscard]] float mip_bias(float ratio) const noexcept override;
   [[nodiscard]] bool session() const noexcept { return m_session; }
   [[nodiscard]] const Modes& modes() const noexcept { return m_modes; }
+  [[nodiscard]] bool has_feature() const noexcept { return m_feature != nullptr; }
 
 private:
   upscale::native_upscale::ProbeResult probe_steps(const upscale::native_upscale::Adapter& adapter) noexcept;
   FeatureSupport check_capability() noexcept;
   bool begin_session(ID3D12Device* device, const Identity& identity) noexcept;
   void end_session() noexcept;
+  void want_feature(const FeatureDesc& desc) noexcept;
+  void release_feature() noexcept;
+  void drop_feature() noexcept;
 
   const Api* m_api = nullptr;
   ID3D12Device* m_device = nullptr;
   Modes m_modes{};
   GraphExtent m_modesOutput;
+  FeatureDesc m_wanted;
+  FeatureDesc m_featureDesc;
+  void* m_feature = nullptr;
+  uint64_t m_vramBytes = 0;
   Reason m_failure = Reason::NativeUnavailable;
   bool m_session = false;
   bool m_waiting = false;
@@ -102,6 +145,7 @@ using FenceWait = void (*)() noexcept;
 [[nodiscard]] std::optional<FeatureSupport> refusal_from_requirements(const Requirements& requirements) noexcept;
 [[nodiscard]] FeatureSupport support_from_capability(const Capability& capability) noexcept;
 [[nodiscard]] OutputFit output_fit(GraphExtent output) noexcept;
+[[nodiscard]] FeatureFlags feature_flags() noexcept;
 [[nodiscard]] bool valid_project_id(std::string_view id) noexcept;
 [[nodiscard]] std::optional<Identity> resolve_identity(const std::optional<Identity>& configured,
                                                        const std::optional<std::string>& env);

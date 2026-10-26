@@ -265,6 +265,11 @@ void worker_frame_begin() noexcept {
   if (releasing) {
     release_live();
   }
+  if (g_live.upscaler != nullptr && !g_live.warming && g_live.upscaler->vram_bytes() != g_live.vendorBytes) {
+    // DLSS allocates its feature inside the first native step, after the plan was published
+    g_live.vendorBytes = g_live.upscaler->vram_bytes();
+    set_vendor_bytes(g_live.vendorBytes);
+  }
   if (!wanted || wanted->upscaler == nullptr) {
     return;
   }

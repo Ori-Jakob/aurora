@@ -15,6 +15,7 @@
 #include "render/native/d3d12/sentinel.hpp"
 #include "render/native/d3d12/teardown.hpp"
 #include "render/native/d3d12/upscale_bridge.hpp"
+#include "render/post/upscale/fsr/fsr.hpp"
 
 #include <array>
 #include <cmath>
@@ -329,13 +330,26 @@ struct FakeNgx {
   uint32_t optimals = 0;
   uint32_t shutdowns = 0;
   uint32_t waits = 0;
+  uint32_t creates = 0;
+  uint32_t evaluates = 0;
+  uint32_t releases = 0;
   std::optional<dlss::Requirements> requirement = dlss::Requirements{};
   bool initOk = true;
+  bool createOk = true;
   std::optional<dlss::Capability> capability = dlss::Capability{.available = true};
+  uint64_t vram = uint64_t{150} << 20;
   native::Identity identity;
   std::filesystem::path data;
+  std::optional<dlss::FeatureDesc> created;
+  void* createList = nullptr;
+  void* released = nullptr;
+  dlss::Evaluation evaluation;
+  std::string events;
+  int feature = 0;
 
-  [[nodiscard]] uint32_t calls() const noexcept { return requirements + inits + capabilities + optimals + shutdowns; }
+  [[nodiscard]] uint32_t calls() const noexcept {
+    return requirements + inits + capabilities + optimals + shutdowns + creates + evaluates + releases;
+  }
 };
 
 FakeNgx g_ngx;
@@ -364,11 +378,51 @@ dlss::Api fake_ngx_api() {
                               static_cast<uint32_t>(std::lround(static_cast<float>(output.height) / ratio))};
     return dlss::ModeSize{.optimal = optimal, .minimum = optimal, .maximum = output};
   };
-  api.shutdown = [](ID3D12Device*) noexcept { ++g_ngx.shutdowns; };
+  api.shutdown = [](ID3D12Device*) noexcept {
+    ++g_ngx.shutdowns;
+    g_ngx.events += 's';
+  };
+  api.create = [](ID3D12GraphicsCommandList* list, const dlss::FeatureDesc& desc) noexcept -> void* {
+    ++g_ngx.creates;
+    g_ngx.events += 'c';
+    g_ngx.created = desc;
+    g_ngx.createList = list;
+    return g_ngx.createOk ? &g_ngx.feature : nullptr;
+  };
+  api.evaluate = [](ID3D12GraphicsCommandList*, void* feature, const dlss::Evaluation& evaluation) noexcept {
+    ++g_ngx.evaluates;
+    g_ngx.evaluation = evaluation;
+    return feature == &g_ngx.feature;
+  };
+  api.release = [](void* feature) noexcept {
+    ++g_ngx.releases;
+    g_ngx.events += 'r';
+    g_ngx.released = feature;
+  };
+  api.vram = []() noexcept -> std::optional<uint64_t> { return g_ngx.vram; };
   return api;
 }
 
-void count_wait() noexcept { ++g_ngx.waits; }
+void count_wait() noexcept {
+  ++g_ngx.waits;
+  g_ngx.events += 'w';
+}
+
+std::array<int, 5> g_fakeResources{};
+
+void* fake_resource(size_t index) noexcept { return &g_fakeResources[index]; }
+
+upscale::native_upscale::Inputs fake_inputs(GraphExtent render, GraphExtent output = TestOutput) {
+  return {
+      .commandList = fake_resource(0),
+      .color = {.resource = fake_resource(1), .format = wgpu::TextureFormat::BGRA8Unorm, .size = render},
+      .depth = {.resource = fake_resource(2), .format = wgpu::TextureFormat::R32Float, .size = render},
+      .motion = {.resource = fake_resource(3), .format = wgpu::TextureFormat::RG16Float, .size = render},
+      .output = {.resource = fake_resource(4), .format = wgpu::TextureFormat::RGBA8Unorm, .size = output},
+      .motionScale = {upscale::fsr::MotionScale[0] * static_cast<float>(render.width),
+                      upscale::fsr::MotionScale[1] * static_cast<float>(render.height)},
+  };
+}
 
 class Dlss : public ::testing::Test {
 protected:
@@ -448,6 +502,12 @@ protected:
     std::optional<GraphExtent> render;
     on_worker([&] { render = dlss::upscaler().prepare(adapter(), output, quality); });
     return render;
+  }
+
+  static bool evaluate(const upscale::native_upscale::Inputs& inputs) {
+    bool ok = false;
+    on_worker([&] { ok = dlss::upscaler().evaluate(inputs); });
+    return ok;
   }
 
   static void request(Upscaler upscaler) {
@@ -699,6 +759,160 @@ TEST_F(Dlss, ProbeOnlySessionShutsDown) {
   on_worker([] { native::d3d12::run_teardowns(); });
   EXPECT_FALSE(dlss::upscaler().session());
   EXPECT_EQ(g_ngx.shutdowns, shutdowns + 1);
+}
+
+TEST_F(Dlss, ModeRatiosAndPhases) {
+  const dlss::DlssUpscaler& upscaler = dlss::upscaler();
+  const std::vector<std::pair<float, uint32_t>> phases{{1.f, 16},  {1.3f, 16}, {1.5f, 18},
+                                                       {1.7f, 23}, {2.f, 32},  {3.f, 72}};
+  for (const auto& [ratio, expected] : phases) {
+    EXPECT_EQ(upscaler.jitter_phases(ratio), expected) << ratio;
+    EXPECT_FLOAT_EQ(upscaler.mip_bias(ratio), std::log2(1.f / ratio)) << ratio;
+  }
+  EXPECT_FLOAT_EQ(upscaler.mip_bias(1.f), 0.f);
+
+  use_test_identity();
+  for (size_t i = 0; i < dlss::ModeCount; ++i) {
+    const auto quality = static_cast<UpscalerQuality>(i);
+    const std::optional<GraphExtent> render = prepare(TestOutput, quality);
+    ASSERT_TRUE(render.has_value()) << i;
+    EXPECT_NEAR(static_cast<float>(TestOutput.width) / static_cast<float>(render->width), FakeRatios[i], 0.01f) << i;
+    EXPECT_NEAR(static_cast<float>(TestOutput.height) / static_cast<float>(render->height), FakeRatios[i], 0.01f) << i;
+    ASSERT_TRUE(evaluate(fake_inputs(*render)));
+    ASSERT_TRUE(g_ngx.created.has_value());
+    EXPECT_EQ(g_ngx.created->quality, quality);
+    EXPECT_EQ(g_ngx.created->render, *render);
+    EXPECT_EQ(g_ngx.created->output, TestOutput);
+  }
+  EXPECT_EQ(g_ngx.creates, dlss::ModeCount);
+  EXPECT_EQ(g_ngx.releases, dlss::ModeCount - 1);
+}
+
+TEST_F(Dlss, MvScaleSigns) {
+  // aurora's motion is NDC(cur) - NDC(prev) with y up; NGX wants previous minus current in render pixels, y down
+  EXPECT_EQ(upscale::fsr::MotionScale[0], -0.5f);
+  EXPECT_EQ(upscale::fsr::MotionScale[1], 0.5f);
+  use_test_identity();
+  const std::optional<GraphExtent> render = prepare(TestOutput);
+  ASSERT_EQ(render, (GraphExtent{1707, 960}));
+  upscale::native_upscale::Inputs inputs = fake_inputs(*render);
+  inputs.jitter[0] = 0.25f;
+  inputs.jitter[1] = -0.375f;
+  inputs.frameTimeMs = 1000.f / 60.f;
+  ASSERT_TRUE(evaluate(inputs));
+  EXPECT_EQ(g_ngx.createList, fake_resource(0));
+  EXPECT_EQ(g_ngx.evaluation.motionScale, (std::array{-853.5f, 480.f}));
+  EXPECT_EQ(g_ngx.evaluation.jitter, (std::array{0.25f, -0.375f}));
+  EXPECT_EQ(g_ngx.evaluation.render, *render);
+  EXPECT_FLOAT_EQ(g_ngx.evaluation.frameTimeMs, 1000.f / 60.f);
+  EXPECT_TRUE(g_ngx.evaluation.reset);
+  EXPECT_EQ(static_cast<void*>(g_ngx.evaluation.color), fake_resource(1));
+  EXPECT_EQ(static_cast<void*>(g_ngx.evaluation.depth), fake_resource(2));
+  EXPECT_EQ(static_cast<void*>(g_ngx.evaluation.motion), fake_resource(3));
+  EXPECT_EQ(static_cast<void*>(g_ngx.evaluation.output), fake_resource(4));
+
+  inputs.reset = false;
+  inputs.motionScale[1] = -inputs.motionScale[1];
+  ASSERT_TRUE(evaluate(inputs));
+  EXPECT_FALSE(g_ngx.evaluation.reset);
+  EXPECT_EQ(g_ngx.evaluation.motionScale, (std::array{-853.5f, -480.f}));
+  EXPECT_EQ(g_ngx.creates, 1u);
+  EXPECT_EQ(g_ngx.evaluates, 2u);
+
+  EXPECT_FALSE(evaluate(fake_inputs({1280, 720})));
+  EXPECT_FALSE(evaluate(fake_inputs(*render, {1920, 1080})));
+  upscale::native_upscale::Inputs noList = fake_inputs(*render);
+  noList.commandList = nullptr;
+  EXPECT_FALSE(evaluate(noList));
+  EXPECT_EQ(g_ngx.evaluates, 2u);
+}
+
+TEST_F(Dlss, FlagsLdrInverted) {
+  const dlss::FeatureFlags flags = dlss::feature_flags();
+  EXPECT_TRUE(flags.mvLowRes);
+  EXPECT_TRUE(flags.depthInverted);
+  EXPECT_FALSE(flags.hdr);
+  EXPECT_FALSE(flags.mvJittered);
+  EXPECT_FALSE(flags.autoExposure);
+  EXPECT_EQ(dlss::upscaler().color_encoding(), ColorEncoding::Stored);
+
+  use_test_identity();
+  const std::optional<GraphExtent> render = prepare(TestOutput, UpscalerQuality::Performance);
+  ASSERT_EQ(render, (GraphExtent{1280, 720}));
+  EXPECT_EQ(g_ngx.creates, 0u);
+  EXPECT_EQ(dlss::upscaler().vram_bytes(), 0u);
+  ASSERT_TRUE(evaluate(fake_inputs(*render)));
+  EXPECT_EQ(g_ngx.created,
+            (dlss::FeatureDesc{
+                .render = {1280, 720}, .output = TestOutput, .quality = UpscalerQuality::Performance, .flags = flags}));
+  EXPECT_EQ(dlss::upscaler().vram_bytes(), g_ngx.vram);
+
+  on_worker([] { dlss::upscaler().destroy(); });
+  g_ngx.createOk = false;
+  ASSERT_EQ(prepare(TestOutput), (GraphExtent{1707, 960}));
+  EXPECT_FALSE(evaluate(fake_inputs({1707, 960})));
+  EXPECT_FALSE(dlss::upscaler().has_feature());
+  EXPECT_EQ(g_ngx.evaluates, 1u);
+  EXPECT_EQ(dlss::upscaler().vram_bytes(), 0u);
+}
+
+TEST_F(Dlss, DisplayNameDlaaAtNative) {
+  const dlss::DlssUpscaler& upscaler = dlss::upscaler();
+  EXPECT_EQ(upscaler.display_name(UpscalerQuality::NativeAa), "DLAA");
+  for (const UpscalerQuality quality : {UpscalerQuality::Quality, UpscalerQuality::Balanced,
+                                        UpscalerQuality::Performance, UpscalerQuality::UltraPerformance}) {
+    EXPECT_EQ(upscaler.display_name(quality), "DLSS") << int{static_cast<uint8_t>(quality)};
+  }
+  EXPECT_EQ(dlss::mode_name(UpscalerQuality::NativeAa), "DLAA");
+  use_test_identity();
+  ASSERT_EQ(prepare(TestOutput, UpscalerQuality::NativeAa), TestOutput);
+  ASSERT_TRUE(evaluate(fake_inputs(TestOutput)));
+  ASSERT_TRUE(g_ngx.created.has_value());
+  EXPECT_EQ(g_ngx.created->quality, UpscalerQuality::NativeAa);
+  EXPECT_EQ(g_ngx.created->render, TestOutput);
+}
+
+TEST_F(Dlss, RecreateWaitsForFence) {
+  use_test_identity();
+  const std::optional<GraphExtent> quality = prepare(TestOutput);
+  ASSERT_TRUE(quality.has_value());
+  ASSERT_TRUE(evaluate(fake_inputs(*quality)));
+  ASSERT_TRUE(evaluate(fake_inputs(*quality)));
+  EXPECT_EQ(g_ngx.events, "c");
+
+  g_ngx.events.clear();
+  EXPECT_EQ(prepare(TestOutput), quality);
+  EXPECT_EQ(g_ngx.events, "");
+  EXPECT_TRUE(dlss::upscaler().has_feature());
+
+  const std::optional<GraphExtent> performance = prepare(TestOutput, UpscalerQuality::Performance);
+  ASSERT_TRUE(performance.has_value());
+  EXPECT_EQ(g_ngx.events, "wr");
+  EXPECT_EQ(g_ngx.released, &g_ngx.feature);
+  EXPECT_FALSE(dlss::upscaler().has_feature());
+  EXPECT_EQ(dlss::upscaler().vram_bytes(), 0u);
+  EXPECT_FALSE(evaluate(fake_inputs(*quality)));
+  ASSERT_TRUE(evaluate(fake_inputs(*performance)));
+  EXPECT_EQ(g_ngx.events, "wrc");
+
+  const GraphExtent resized{1920, 1080};
+  const std::optional<GraphExtent> smaller = prepare(resized, UpscalerQuality::Performance);
+  ASSERT_EQ(smaller, (GraphExtent{960, 540}));
+  ASSERT_TRUE(evaluate(fake_inputs(*smaller, resized)));
+  EXPECT_EQ(g_ngx.events, "wrcwrc");
+  EXPECT_EQ(g_ngx.created->output, resized);
+
+  on_worker([] { dlss::upscaler().destroy(); });
+  EXPECT_EQ(g_ngx.events, "wrcwrcwrs");
+  EXPECT_EQ(g_ngx.releases, g_ngx.creates);
+  EXPECT_FALSE(dlss::upscaler().session());
+
+  ASSERT_EQ(prepare(TestOutput), quality);
+  ASSERT_TRUE(evaluate(fake_inputs(*quality)));
+  g_ngx.events.clear();
+  on_worker([] { native::d3d12::run_teardowns(); });
+  EXPECT_EQ(g_ngx.events, "wrs");
+  EXPECT_EQ(g_ngx.releases, g_ngx.creates);
 }
 #endif
 } // namespace

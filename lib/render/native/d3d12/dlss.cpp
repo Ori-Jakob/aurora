@@ -14,7 +14,6 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cmath>
 #include <iterator>
 #include <system_error>
 #include <utility>
@@ -22,12 +21,10 @@
 namespace aurora::render::detail::native::d3d12::dlss {
 namespace {
 constexpr Module Log{"aurora::render::native"};
-constexpr uint32_t MinJitterPhases = 16;
 constexpr std::string_view ProjectIdEnv = "AURORA_RENDER_NGX_PROJECT_ID";
 
 using upscale::native_upscale::Adapter;
 using upscale::native_upscale::Backend;
-using upscale::native_upscale::Inputs;
 using upscale::native_upscale::ProbeResult;
 using upscale::native_upscale::Warmup;
 
@@ -273,10 +270,6 @@ FeatureSupport DlssUpscaler::check_capability() noexcept {
   return support;
 }
 
-std::string_view DlssUpscaler::display_name(UpscalerQuality quality) const noexcept {
-  return quality == UpscalerQuality::NativeAa ? NativeAaName : DisplayName;
-}
-
 std::optional<GraphExtent> DlssUpscaler::prepare(const Adapter& adapter, GraphExtent output,
                                                  UpscalerQuality quality) noexcept {
   native::assert_worker();
@@ -326,29 +319,13 @@ std::optional<GraphExtent> DlssUpscaler::prepare(const Adapter& adapter, GraphEx
   const std::optional<GraphExtent> render = render_size(m_modes, quality, output);
   if (!render) {
     Log.warn("{}: NGX gave no {} render size for {}x{}", DisplayName, mode_name(quality), output.width, output.height);
+    return std::nullopt;
   }
+  want_feature({.render = *render, .output = output, .quality = quality, .flags = feature_flags()});
   return render;
 }
 
 Warmup DlssUpscaler::warmup() noexcept { return m_waiting ? Warmup::Pending : Warmup::Ready; }
-
-bool DlssUpscaler::evaluate(const Inputs&) noexcept {
-  native::assert_worker();
-  return false;
-}
-
-void DlssUpscaler::destroy() noexcept {
-  end_session();
-  m_modes = {};
-  m_modesOutput = {};
-  m_waiting = false;
-}
-
-uint32_t DlssUpscaler::jitter_phases(float ratio) const noexcept {
-  return std::max(MinJitterPhases, static_cast<uint32_t>(std::lround(8.f * ratio * ratio)));
-}
-
-float DlssUpscaler::mip_bias(float ratio) const noexcept { return std::log2(1.f / ratio); }
 
 bool DlssUpscaler::begin_session(ID3D12Device* device, const Identity& identity) noexcept {
   if (m_session) {
@@ -379,6 +356,7 @@ void DlssUpscaler::end_session() noexcept {
   }
   native::assert_worker();
   wait_last_use();
+  drop_feature();
   m_api->shutdown(m_device);
   m_api = nullptr;
   m_device = nullptr;

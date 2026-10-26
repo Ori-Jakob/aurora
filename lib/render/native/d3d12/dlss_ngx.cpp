@@ -12,6 +12,7 @@
 namespace aurora::render::detail::native::d3d12::dlss {
 namespace {
 constexpr Module Log{"aurora::render::native"};
+constexpr unsigned int NodeMask = 1;
 
 NVSDK_NGX_Parameter* g_parameters = nullptr;
 NVSDK_NGX_FeatureCommonInfo g_info{};
@@ -54,6 +55,16 @@ NVSDK_NGX_PerfQuality_Value perf_quality(UpscalerQuality quality) noexcept {
     return NVSDK_NGX_PerfQuality_Value_UltraPerformance;
   }
   return NVSDK_NGX_PerfQuality_Value_MaxQuality;
+}
+
+int feature_bits(const FeatureFlags& flags) noexcept {
+  int bits = NVSDK_NGX_DLSS_Feature_Flags_None;
+  bits |= flags.hdr ? NVSDK_NGX_DLSS_Feature_Flags_IsHDR : 0;
+  bits |= flags.mvLowRes ? NVSDK_NGX_DLSS_Feature_Flags_MVLowRes : 0;
+  bits |= flags.mvJittered ? NVSDK_NGX_DLSS_Feature_Flags_MVJittered : 0;
+  bits |= flags.depthInverted ? NVSDK_NGX_DLSS_Feature_Flags_DepthInverted : 0;
+  bits |= flags.autoExposure ? NVSDK_NGX_DLSS_Feature_Flags_AutoExposure : 0;
+  return bits;
 }
 
 InitResult init_result(int value) noexcept {
@@ -168,6 +179,73 @@ std::optional<ModeSize> ngx_optimal(GraphExtent output, UpscalerQuality quality)
   return size;
 }
 
+void* ngx_create(ID3D12GraphicsCommandList* list, const FeatureDesc& desc) noexcept {
+  native::assert_worker();
+  if (list == nullptr || parameters() == nullptr) {
+    return nullptr;
+  }
+  NVSDK_NGX_DLSS_Create_Params create{};
+  create.Feature.InWidth = desc.render.width;
+  create.Feature.InHeight = desc.render.height;
+  create.Feature.InTargetWidth = desc.output.width;
+  create.Feature.InTargetHeight = desc.output.height;
+  create.Feature.InPerfQualityValue = perf_quality(desc.quality);
+  create.InFeatureCreateFlags = feature_bits(desc.flags);
+  NVSDK_NGX_Handle* handle = nullptr;
+  const NVSDK_NGX_Result result = NGX_D3D12_CREATE_DLSS_EXT(list, NodeMask, NodeMask, &handle, g_parameters, &create);
+  if (NVSDK_NGX_FAILED(result) || handle == nullptr) {
+    Log.warn("DLSS: NGX feature creation failed (result {:#010x})", result_code(result));
+    return nullptr;
+  }
+  return handle;
+}
+
+bool ngx_evaluate(ID3D12GraphicsCommandList* list, void* feature, const Evaluation& evaluation) noexcept {
+  native::assert_worker();
+  if (list == nullptr || feature == nullptr || g_parameters == nullptr) {
+    return false;
+  }
+  NVSDK_NGX_D3D12_DLSS_Eval_Params params{};
+  params.Feature.pInColor = evaluation.color;
+  params.Feature.pInOutput = evaluation.output;
+  params.pInDepth = evaluation.depth;
+  params.pInMotionVectors = evaluation.motion;
+  params.InJitterOffsetX = evaluation.jitter[0];
+  params.InJitterOffsetY = evaluation.jitter[1];
+  params.InRenderSubrectDimensions = {evaluation.render.width, evaluation.render.height};
+  params.InReset = evaluation.reset ? 1 : 0;
+  params.InMVScaleX = evaluation.motionScale[0];
+  params.InMVScaleY = evaluation.motionScale[1];
+  params.InFrameTimeDeltaInMsec = evaluation.frameTimeMs;
+  const NVSDK_NGX_Result result =
+      NGX_D3D12_EVALUATE_DLSS_EXT(list, static_cast<NVSDK_NGX_Handle*>(feature), g_parameters, &params);
+  if (NVSDK_NGX_FAILED(result)) {
+    Log.warn("DLSS: NGX evaluation failed (result {:#010x})", result_code(result));
+    return false;
+  }
+  return true;
+}
+
+void ngx_release(void* feature) noexcept {
+  native::assert_worker();
+  const NVSDK_NGX_Result result = NVSDK_NGX_D3D12_ReleaseFeature(static_cast<NVSDK_NGX_Handle*>(feature));
+  if (NVSDK_NGX_FAILED(result)) {
+    Log.warn("DLSS: NGX feature release failed (result {:#010x})", result_code(result));
+  }
+}
+
+std::optional<uint64_t> ngx_vram() noexcept {
+  native::assert_worker();
+  if (parameters() == nullptr) {
+    return std::nullopt;
+  }
+  unsigned long long bytes = 0;
+  if (NVSDK_NGX_FAILED(NGX_DLSS_GET_STATS(g_parameters, &bytes))) {
+    return std::nullopt;
+  }
+  return bytes;
+}
+
 void ngx_shutdown(ID3D12Device* device) noexcept {
   native::assert_worker();
   if (g_parameters != nullptr) {
@@ -190,6 +268,10 @@ const Api& ngx_api() noexcept {
       .capability = &ngx_capability,
       .optimal = &ngx_optimal,
       .shutdown = &ngx_shutdown,
+      .create = &ngx_create,
+      .evaluate = &ngx_evaluate,
+      .release = &ngx_release,
+      .vram = &ngx_vram,
   };
   return api;
 }

@@ -91,6 +91,7 @@ if (AURORA_ENABLE_RENDER)
             lib/render/native/d3d12/device.hpp
             lib/render/native/d3d12/dlss.cpp
             lib/render/native/d3d12/dlss.hpp
+            lib/render/native/d3d12/dlss_upscaler.cpp
             lib/render/native/d3d12/native_step.cpp
             lib/render/native/d3d12/native_step.hpp
             lib/render/native/d3d12/probe.cpp
