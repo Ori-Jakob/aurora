@@ -64,8 +64,11 @@ uint32_t receiver_code(const scene::DrawClass& cls) noexcept {
 
 // Sky and pre-scene translucents lie under the whole scene, so only in-window translucents ask TAA for the frame
 bool raises_reactive(const gx::PipelineConfig& config, const scene::DrawClass& cls) noexcept {
+  // Terrain layers and decals blend over the depth they lie on, so the motion below them is their own
+  constexpr uint32_t Layers = scene::category::Terrain | scene::category::Decal;
   const bool window = cls.key.window == scene::Window::Opaque || cls.key.window == scene::Window::Translucent;
-  return window && cls.key.role != scene::Role::Sky && gx::reactive_write(config) == gx::ReactiveWrite::Raise;
+  return window && cls.key.role != scene::Role::Sky && (cls.key.categories & Layers) == 0 &&
+         gx::reactive_write(config) == gx::ReactiveWrite::Raise;
 }
 
 bool has_debug_id(const gfx::RenderTargetLayout& layout) noexcept {

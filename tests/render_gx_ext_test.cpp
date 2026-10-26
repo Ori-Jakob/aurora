@@ -518,9 +518,11 @@ gx::PipelineConfig translucent(bool depthUpdate) {
   return config;
 }
 
-bool stamped_reactive(scene::Window window, scene::Role role, const gx::PipelineConfig& config) {
+bool stamped_reactive(scene::Window window, scene::Role role, const gx::PipelineConfig& config,
+                      uint32_t categories = 0) {
   scene::DrawClass cls = draw_class(window, 1);
   cls.key.role = role;
+  cls.key.categories = categories;
   cls.kind = role == scene::Role::Sky ? scene::Kind::Sky : scene::Kind::MainBlended;
   gx::DrawData draw{};
   draw.instanceCount = 1;
@@ -548,6 +550,20 @@ TEST_F(RenderGxExt, ReactiveFlagMarksInWindowTranslucentsOnly) {
   gx::PipelineConfig depthOnly = translucent(true);
   depthOnly.colorUpdate = false;
   EXPECT_FALSE(stamped_reactive(Window::Opaque, Role::Main, depthOnly));
+}
+
+TEST_F(RenderGxExt, ReactiveFlagSkipsTerrainLayersAndDecals) {
+  namespace cat = scene::category;
+  using scene::Role;
+  using scene::Window;
+  records::testing::set_push(&FakeStorage::push);
+  records::testing::set_active(true, true, false);
+  EXPECT_FALSE(stamped_reactive(Window::Opaque, Role::Main, translucent(false), cat::Static | cat::Terrain));
+  EXPECT_FALSE(stamped_reactive(Window::Opaque, Role::Main, translucent(false), cat::Decal | cat::FakeShadow));
+  EXPECT_FALSE(
+      stamped_reactive(Window::Translucent, Role::Main, translucent(false), cat::Terrain | cat::CloudReceiver));
+  EXPECT_TRUE(stamped_reactive(Window::Translucent, Role::Main, translucent(false), cat::Static | cat::Water));
+  EXPECT_TRUE(stamped_reactive(Window::Translucent, Role::Main, translucent(false), cat::Dynamic | cat::Foliage));
 }
 
 // C_MTXPerspective(60, 4:3, 1, 1000), as GXSetProjection receives it
