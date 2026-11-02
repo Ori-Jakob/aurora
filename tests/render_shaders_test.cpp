@@ -423,6 +423,14 @@ TEST_F(RenderShaders, GbufViewUintVariantCompiles) {
   EXPECT_TRUE(validate_module("aurora/gbuffer", {}, error)) << error;
 }
 
+TEST_F(RenderShaders, AoGtaoSsilHookCompiles) {
+  const std::array<std::string_view, 1> defines{"AO_SSIL"};
+  std::string error;
+  EXPECT_TRUE(validate_module("ao/gtao", defines, error)) << error;
+  EXPECT_TRUE(validate_module("ao/gtao", {}, error)) << error;
+  EXPECT_TRUE(validate_module("ao/upsample", {}, error)) << error;
+}
+
 TEST_F(RenderShaders, NeverReadyIsNeverReady) {
   EXPECT_TRUE(NeverReady);
   EXPECT_EQ(status(NeverReady), PipelineStatus::Failed);

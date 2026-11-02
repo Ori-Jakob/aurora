@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace render_demo {
@@ -47,6 +48,8 @@ constexpr u64 TentacleObject = 0x200;
 constexpr u64 FirstMarkerObject = 0x210;
 constexpr u64 CaptureOnlyObject = 0x300;
 constexpr u64 WaterObject = 0x400;
+constexpr u64 AoWallObject = 0x500;
+constexpr u64 AoPoleObject = 0x501;
 constexpr u32 GroundMaterial = 1;
 constexpr u32 SceneEpoch = 1;
 constexpr u32 GroundTextureSize = 64;
@@ -54,6 +57,15 @@ constexpr u32 GroundMipCount = 7;
 constexpr u32 GroundCells = 16;
 constexpr f32 GroundCellSize = 5.f;
 constexpr f32 GroundExtent = GroundCells * GroundCellSize / 2.f;
+constexpr u32 AoCheckClock = 0;
+constexpr size_t AoCreaseBox = 2;
+
+struct Slab {
+  Vec centre;
+  Vec size;
+};
+constexpr Slab AoWall{{14.f, 1.5f, -4.f}, {0.2f, 3.f, 6.f}};
+constexpr Slab AoPole{{14.65f, 1.3f, -4.f}, {0.1f, 2.6f, 0.1f}};
 
 struct BoxPlacement {
   f32 x;
@@ -499,6 +511,27 @@ void draw_hud_panel() {
   pop_scope();
 }
 
+void draw_ao_slabs(const Mtx view) {
+  set_lit_channel(GX_SRC_VTX);
+  set_pass_color_tev();
+  GXSetCurrentMtx(GX_PNMTX0);
+  GXSetCullMode(GX_CULL_BACK);
+  for (const auto& [slab, id] : {std::pair{AoWall, AoWallObject}, std::pair{AoPole, AoPoleObject}}) {
+    Mtx model;
+    Mtx scale;
+    Mtx modelView;
+    C_MTXTrans(model, slab.centre.x, slab.centre.y, slab.centre.z);
+    C_MTXScale(scale, slab.size.x, slab.size.y, slab.size.z);
+    C_MTXConcat(model, scale, model);
+    C_MTXConcat(view, model, modelView);
+    begin_object(id, AURORA_CAT_STATIC, AURORA_OBJ_IMMOBILE);
+    load_matrices(modelView, GX_PNMTX0);
+    set_box_format();
+    GXCallDisplayList(sBoxDisplayList, sBoxDisplayListSize);
+    end_object();
+  }
+}
+
 void emit_frame_hints(u32 frame, const Mtx view, const Mtx44 projection, const Lights& lights) {
   if (!hint_emission()) {
     return;
@@ -688,14 +721,63 @@ std::optional<std::array<f32, 2>> motion_probe_expected(MotionProbe probe, u32 f
 
 const std::array<FogParams, 2>& fog_bands() noexcept { return FogBands; }
 
+std::vector<AoProbe> ao_check_probes() {
+  const SceneCamera camera = scene_camera(AoCheckClock);
+  std::vector<AoProbe> probes;
+  const auto add = [&](AoProbeClass cls, const Vec& world, f32 offsetPx = 0.f) {
+    const std::array<f32, 2> ndc = project(camera, world);
+    probes.push_back({.ndc = {ndc[0], ndc[1]}, .offsetPx = offsetPx, .cls = cls});
+  };
+  const BoxPlacement& box = BoxPlacements[AoCreaseBox];
+  const f32 face = box.x + box.scale / 2.f;
+  for (u32 i = 0; i <= 18; ++i) {
+    const f32 z = box.z - box.scale / 2.f + 0.35f + 0.1f * static_cast<f32>(i);
+    for (const f32 gap : {0.02f, 0.05f}) {
+      add(AoProbeClass::Crease, {face + gap, 0.f, z});
+      add(AoProbeClass::Crease, {face, gap, z});
+    }
+  }
+  for (u32 i = 0; i < 8; ++i) {
+    for (u32 j = 0; j < 8; ++j) {
+      add(AoProbeClass::Open, {10.f + 0.4f * static_cast<f32>(i), 0.f, 6.f + 0.8f * static_cast<f32>(j)});
+    }
+  }
+  const f32 wallFace = AoWall.centre.x + AoWall.size.x / 2.f;
+  for (const f32 y : {1.3f, 1.6f, 1.9f, 2.2f}) {
+    for (const f32 z : {-6.2f, -5.6f, -2.4f, -1.8f}) {
+      add(AoProbeClass::Interior, {wallFace, y, z});
+    }
+  }
+  for (const f32 y : {1.3f, 1.5f, 1.7f, 1.9f, 2.1f}) {
+    f32 left = 1e9f;
+    f32 right = -1e9f;
+    f32 row = 0.f;
+    for (const f32 dx : {-0.5f, 0.5f}) {
+      for (const f32 dz : {-0.5f, 0.5f}) {
+        const std::array<f32, 2> ndc =
+            project(camera, {AoPole.centre.x + dx * AoPole.size.x, y, AoPole.centre.z + dz * AoPole.size.z});
+        left = std::min(left, ndc[0]);
+        right = std::max(right, ndc[0]);
+        row += ndc[1] / 4.f;
+      }
+    }
+    for (u32 k = 2; k <= 6; ++k) {
+      probes.push_back({.ndc = {right, row}, .offsetPx = static_cast<f32>(k), .cls = AoProbeClass::Strip});
+      probes.push_back({.ndc = {left, row}, .offsetPx = -static_cast<f32>(k), .cls = AoProbeClass::Strip});
+    }
+  }
+  return probes;
+}
+
 FogResolveCounts fog_resolve_counts() noexcept { return sFogResolves; }
 
 void draw_scene(u32 frame, const SceneOptions& options) {
   // Not gated on hints_enabled() so the off capture proves emitters add only hint bytes; real producers do gate on it
   set_hint_emission(options.hints);
   upload_gpu_arrays(options);
-  const f32 t = static_cast<f32>(frame) / 60.f;
-  const SceneCamera camera = scene_camera(frame);
+  const u32 clock = options.aoCheck ? AoCheckClock : frame;
+  const f32 t = static_cast<f32>(clock) / 60.f;
+  const SceneCamera camera = scene_camera(clock);
   GXSetCopyClear(ClearColor, GX_MAX_Z24);
   GXSetViewport(0.f, 0.f, 640.f, 480.f, 0.f, 1.f);
   GXSetScissor(0, 0, 640, 480);
@@ -709,7 +791,7 @@ void draw_scene(u32 frame, const SceneOptions& options) {
   set_fog(Fog);
   const Lights lights = setup_lights(view, t);
   // Every frame-level hint goes out before SCENE_BEGIN, where aurora freezes the frame's values
-  emit_frame_hints(frame, view, projection, lights);
+  emit_frame_hints(clock, view, projection, lights);
   hint_stage(AURORA_STAGE_SCENE_BEGIN);
 
   if (options.fogBands) {
@@ -726,6 +808,9 @@ void draw_scene(u32 frame, const SceneOptions& options) {
     aurora::gfx::push_custom_draw(options.customDrawProbe, nullptr, 0);
   }
   draw_boxes(view, t);
+  if (options.aoCheck) {
+    draw_ao_slabs(view);
+  }
 
   Mtx bones[TentacleBones];
   tentacle_bones(t, bones);

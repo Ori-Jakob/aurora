@@ -31,6 +31,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <vector>
 
 // Last because it redefines main
 #include <aurora/main.h>
@@ -50,6 +51,7 @@ enum ExitCode : int {
   ExitBench = 10,
   ExitMotionCheck = 11,
   ExitFogCheck = 12,
+  ExitAoCheck = 13,
 };
 
 std::atomic_uint32_t g_errorCount = 0;
@@ -213,6 +215,35 @@ std::optional<std::string> fog_check_failure(const render_demo::GraphPassReport&
     return std::string{text};
   }
   return std::nullopt;
+}
+
+struct AoCheckOutcome {
+  render_demo::AoCheckSummary summary;
+  std::optional<std::string> failure;
+};
+
+AoCheckOutcome ao_check_outcome(const render_demo::AoCheckReport& report, bool nullBackend) {
+  using namespace render_demo;
+  std::vector<AoProbeStat> probes;
+  probes.reserve(report.probes.size());
+  for (size_t i = 0; i < report.probes.size() && i < report.sums.size(); ++i) {
+    const bool receiver = report.frames != 0 && report.receiverFrames[i] == report.frames;
+    const double visibility = report.frames != 0 ? report.sums[i] / report.frames : 0.0;
+    probes.push_back({.cls = report.probes[i].cls, .visibility = visibility, .receiver = receiver});
+  }
+  const double coverage = report.pixels != 0 ? static_cast<double>(report.receivers) / report.pixels : 0.0;
+  AoCheckOutcome outcome{.summary = summarize_ao_check(probes, coverage)};
+  if (nullBackend) {
+    return outcome;
+  }
+  if (report.encodes == 0) {
+    outcome.failure = "ao.final or gx.normal unavailable";
+  } else if (report.frames == 0) {
+    outcome.failure = "no frame was read back";
+  } else {
+    outcome.failure = check_ao(outcome.summary);
+  }
+  return outcome;
 }
 
 struct HintCounterSnapshot {
@@ -571,6 +602,11 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  if (options.aoCheck) {
+    // apply_settings alone cannot reach AO before its built bits ship, so the check builds it through the env
+    SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_AO", "high", false);
+  }
+
   AuroraConfig config{};
   config.appName = "render_demo";
   config.userPath = options.dataDir.empty() ? nullptr : options.dataDir.c_str();
@@ -613,7 +649,8 @@ int main(int argc, char* argv[]) {
                                          .customDrawProbe = g_customDrawProbe.type,
                                          .gpuArrays = options.gpuArrays,
                                          .gpuPadMiB = options.gpuPadMiB,
-                                         .fogBands = options.fogCheck};
+                                         .fogBands = options.fogCheck,
+                                         .aoCheck = options.aoCheck};
   bool decodingChanged = false;
 
   GXInit(nullptr, 0);
@@ -631,7 +668,8 @@ int main(int argc, char* argv[]) {
                                                                    .cullTimings = options.cullTimings,
                                                                    .motionCheck = options.motionCheck,
                                                                    .motionView = options.motionView,
-                                                                   .fogCheck = options.fogCheck},
+                                                                   .fogCheck = options.fogCheck,
+                                                                   .aoCheck = options.aoCheck},
                                                                   graphError)) {
     std::fprintf(stderr, "render_demo: render graph setup failed: %s\n", graphError.c_str());
     render_demo::shutdown_scene();
@@ -775,6 +813,20 @@ int main(int argc, char* argv[]) {
         std::bit_cast<float>(f[render_demo::FogMaxErrorBits]) * 127.f, fogResolves.checked, fogResolves.live,
         fogResolves.mismatches);
   }
+  const AoCheckOutcome aoOutcome =
+      options.aoCheck ? ao_check_outcome(graphReport.ao, info.backend == BACKEND_NULL) : AoCheckOutcome{};
+  if (options.aoCheck) {
+    const std::string status = aoOutcome.failure              ? "FAILED: " + *aoOutcome.failure
+                               : info.backend == BACKEND_NULL ? std::string{"skipped (null backend)"}
+                                                              : std::string{"passed"};
+    const auto& a = aoOutcome.summary;
+    std::printf(
+        "render_demo: ao check %s: frames %u, coverage %.3f, crease %.3f (%u/%u), open %.3f at %.1f%% "
+        "(%u/%u), strip %.3f (%u/%u), interior %.3f (%u/%u)\n",
+        status.c_str(), graphReport.ao.frames, a.coverage, a.mean[0], a.receivers[0], a.probes[0], a.mean[1],
+        a.openShare * 100.0, a.receivers[1], a.probes[1], a.mean[2], a.receivers[2], a.probes[2], a.mean[3],
+        a.receivers[3], a.probes[3]);
+  }
   if (options.gpuCull != 0) {
     print_cull_report(graphReport.cull, frame, options.cullTimings);
   }
@@ -826,6 +878,9 @@ int main(int argc, char* argv[]) {
   }
   if (fogFailure) {
     return ExitFogCheck;
+  }
+  if (aoOutcome.failure) {
+    return ExitAoCheck;
   }
   if (cullFailure) {
     return ExitCullCheck;

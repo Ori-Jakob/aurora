@@ -63,3 +63,64 @@ fn ao_is_sky(z: f32) -> bool {
 fn ao_linear_factor(a: f32) -> f32 {
   return pow(a, 2.2);
 }
+
+const AO_SECTOR_COUNT: u32 = 32u;
+const AO_RAW_SCALE: f32 = 1.5;
+const AO_HILBERT_WIDTH: u32 = 64u;
+const AO_NOISE_PERIOD: u32 = 64u;
+const AO_NOISE_STRIDE: u32 = 288u;
+const AO_R2_STEPS: vec2u = vec2u(3242174889u, 2447445414u);
+
+// Round activates a sector only when half of it is covered, so near-horizon slivers do not darken open ground
+fn ao_sector_bits(t0: f32, t1: f32, ceil_mode: bool) -> u32 {
+  let lo = clamp(t0, 0.0, 1.0);
+  let hi = clamp(t1, 0.0, 1.0);
+  var start: u32;
+  var end: u32;
+  if (ceil_mode) {
+    start = min(u32(lo * 32.0), 31u);
+    end = min(start + u32(max(ceil((hi - lo) * 32.0), 0.0)), 32u);
+  } else {
+    start = u32(round(lo * 32.0));
+    end = u32(round(hi * 32.0));
+  }
+  if (end <= start) {
+    return 0u;
+  }
+  return (0xFFFFFFFFu >> (32u - (end - start))) << start;
+}
+
+fn ao_hilbert_index(px: u32, py: u32) -> u32 {
+  var x = px;
+  var y = py;
+  var index = 0u;
+  for (var level = AO_HILBERT_WIDTH / 2u; level > 0u; level = level / 2u) {
+    let rx = select(0u, 1u, (x & level) != 0u);
+    let ry = select(0u, 1u, (y & level) != 0u);
+    index += level * level * ((3u * rx) ^ ry);
+    if (ry == 0u) {
+      if (rx == 1u) {
+        x = AO_HILBERT_WIDTH - 1u - x;
+        y = AO_HILBERT_WIDTH - 1u - y;
+      }
+      let swap = x;
+      x = y;
+      y = swap;
+    }
+  }
+  return index;
+}
+
+fn ao_noise(p: vec2u, noise_index: u32) -> vec2f {
+  let index = ao_hilbert_index(p.x, p.y) + AO_NOISE_STRIDE * (noise_index % AO_NOISE_PERIOD);
+  return fract(vec2f(0.5) + vec2f(index * AO_R2_STEPS) * (1.0 / 4294967296.0));
+}
+
+fn ao_raw_visibility(t: vec4f) -> f32 {
+  return saturate(t.r * AO_RAW_SCALE);
+}
+
+// Strength scales the darkening; above 1 it deepens mid-tones but stops at the floor
+fn ao_apply_strength(v: f32, k: f32, floor_value: f32) -> f32 {
+  return max(1.0 - k * (1.0 - v), 1.0 - min(k, 1.0) * (1.0 - floor_value));
+}

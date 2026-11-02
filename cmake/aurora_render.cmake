@@ -19,8 +19,12 @@ if (AURORA_ENABLE_RENDER)
     target_sources(aurora_gx PRIVATE
         lib/render/ao/ao.cpp
         lib/render/ao/ao.hpp
+        lib/render/ao/gtao.cpp
+        lib/render/ao/gtao.hpp
         lib/render/ao/hiz.cpp
         lib/render/ao/hiz.hpp
+        lib/render/ao/upsample.cpp
+        lib/render/ao/upsample.hpp
         lib/render/debug/capture.cpp
         lib/render/debug/capture.hpp
         lib/render/debug/class_view.cpp

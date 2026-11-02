@@ -97,6 +97,8 @@ struct Settings {
   Upscaler upscaler = Upscaler::Off;
   UpscalerQuality upscalerQuality = UpscalerQuality::Quality;
   Quality ao = Quality::Off;
+  // Radius in metres, so the reach does not depend on the game's units
+  float aoRadius = 0.73f, aoStrength = 1.f;
   bool ssil = false;
   ShadowSettings shadows;
   GiMode gi = GiMode::Off;

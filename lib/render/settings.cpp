@@ -129,6 +129,8 @@ constexpr BuiltOptions DefaultBuiltOptions = [] {
 constexpr uint32_t CompanionSampledTextures = 16;
 constexpr uint32_t TessellationVertexStorageBuffers = 4;
 constexpr float MaxExposureBias = 8.f;
+// The AO tests cover this range; wider radii halo at depth edges
+constexpr float MinAoRadius = 0.25f, MaxAoRadius = 1.5f, MaxAoStrength = 1.5f;
 constexpr uint64_t ModuleStorageBufferSize = 32 * 1024 * 1024;
 
 constexpr Settings Defaults{};
@@ -851,6 +853,8 @@ Settings sanitize_settings(const Settings& requested) noexcept {
 
   sanitize_range(s.legacyBlend, Defaults.legacyBlend, 0.f, 1.f);
   sanitize_range(s.taaSharpness, Defaults.taaSharpness, 0.f, 1.f);
+  sanitize_range(s.aoRadius, Defaults.aoRadius, MinAoRadius, MaxAoRadius);
+  sanitize_range(s.aoStrength, Defaults.aoStrength, 0.f, MaxAoStrength);
   sanitize_range(s.exposureBias, Defaults.exposureBias, -MaxExposureBias, MaxExposureBias);
   if (!std::isfinite(s.sky.cloudStyle) || s.sky.cloudStyle < 0.f) {
     // Negative means the stage profile picks the style

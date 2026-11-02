@@ -7,6 +7,7 @@
 #include <aurora/gfx.hpp>
 #include <aurora/render_graph.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -20,6 +21,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace render_demo {
 namespace {
@@ -844,6 +846,278 @@ bool register_fog_check(std::string& error) {
   }
   return true;
 }
+
+struct AoCheckParams {
+  u32 probeCount;
+  u32 pad[3];
+};
+static_assert(sizeof(AoCheckParams) == 16);
+
+constexpr u32 AoCheckHeaderWords = 8;
+constexpr u32 AoCheckProbeWords = 3;
+constexpr uint64_t AoCheckBytes = (AoCheckHeaderWords + AoCheckMaxProbes * AoCheckProbeWords) * sizeof(u32);
+constexpr size_t AoCheckRing = 4;
+constexpr auto AoCompileWait = std::chrono::milliseconds{50};
+
+enum AoCheckWord : u32 { AoReceivers, AoPixels, AoWidth, AoHeight, AoWritten };
+enum class AoSlotState : u32 { Free, Copied, Mapping };
+
+constexpr std::string_view AoCheckWgsl = R"(
+struct AoCheckParams {
+  probe_count: u32,
+  pad0: u32,
+  pad1: u32,
+  pad2: u32,
+};
+struct AoProbe {
+  ndc: vec2f,
+  offset_px: f32,
+  cls: u32,
+};
+@group(0) @binding(1) var<uniform> params: AoCheckParams;
+@group(1) @binding(0) var ao_final: texture_2d<f32>;
+@group(1) @binding(1) var scene_normal: texture_2d<f32>;
+@group(2) @binding(0) var<storage, read_write> results: array<atomic<u32>>;
+@group(2) @binding(1) var<storage, read> probes: array<AoProbe>;
+
+fn receiver_code(p: vec2i) -> u32 {
+  return u32(round(saturate(textureLoad(scene_normal, p, 0).a) * 3.0));
+}
+
+@compute @workgroup_size(8, 8)
+fn cs_main(@builtin(global_invocation_id) id: vec3u, @builtin(num_workgroups) groups: vec3u) {
+  let size = textureDimensions(ao_final);
+  if (all(id.xy == vec2u(0u))) {
+    atomicStore(&results[2], size.x);
+    atomicStore(&results[3], size.y);
+    atomicStore(&results[4], 1u);
+  }
+  let index = id.y * groups.x * 8u + id.x;
+  if (index < params.probe_count) {
+    let probe = probes[index];
+    let centre = (probe.ndc * vec2f(0.5, -0.5) + 0.5) * vec2f(size);
+    let p = clamp(vec2i(floor(centre + vec2f(probe.offset_px, 0.0))), vec2i(0), vec2i(size) - 1);
+    let ao = textureLoad(ao_final, p, 0);
+    let base = 8u + index * 3u;
+    atomicStore(&results[base], bitcast<u32>(ao.r));
+    atomicStore(&results[base + 1u], receiver_code(p));
+    atomicStore(&results[base + 2u], u32(round(ao.g * 255.0)) | (u32(round(ao.b * 255.0)) << 8u));
+  }
+  if (any(id.xy >= size)) {
+    return;
+  }
+  atomicAdd(&results[1], 1u);
+  if (receiver_code(vec2i(id.xy)) >= 1u) {
+    atomicAdd(&results[0], 1u);
+  }
+}
+)";
+
+struct AoCheckSlot {
+  wgpu::Buffer readback;
+  std::atomic<AoSlotState> state = AoSlotState::Free;
+  u32 frame = 0;
+};
+
+struct AoCheckPass {
+  PassId id = aurora::render::InvalidPass;
+  std::atomic_uint32_t encodes = 0;
+  std::atomic_uint32_t armedFrame = UINT32_MAX;
+  bool waitedForPipelines = false;
+  std::chrono::steady_clock::time_point deadline;
+  AoCheckParams params{};
+  wgpu::Buffer output;
+  wgpu::Buffer probeBuffer;
+  wgpu::BindGroupLayout layout;
+  wgpu::BindGroup group;
+  std::array<AoCheckSlot, AoCheckRing> slots;
+  wgpu::ComputePipeline pipeline;
+  wgpu::BindGroupLayout passLayout;
+  std::mutex mutex;
+  std::vector<AoProbe> probes;
+  u32 frames = 0;
+  u32 failedMaps = 0;
+  u32 receivers = 0;
+  u32 pixels = 0;
+  std::vector<double> sums;
+  std::vector<u32> receiverFrames;
+};
+
+AoCheckPass sAo;
+
+wgpu::ComputePipeline create_ao_check_pipeline(const PassContext& ctx, const wgpu::BindGroupLayout& own) {
+  const std::string code{AoCheckWgsl};
+  const wgpu::ShaderSourceWGSL wgsl{wgpu::ShaderSourceWGSL::Init{.code = code.c_str()}};
+  const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl, .label = "demo.ao_check"};
+  const wgpu::ShaderModule module = ctx.device().CreateShaderModule(&moduleDescriptor);
+  const std::array<wgpu::BindGroupLayout, 3> layouts{ctx.frame_layout(), ctx.pass_layout(), own};
+  const wgpu::PipelineLayoutDescriptor layoutDescriptor{
+      .label = "demo.ao_check",
+      .bindGroupLayoutCount = layouts.size(),
+      .bindGroupLayouts = layouts.data(),
+  };
+  const wgpu::ComputePipelineDescriptor descriptor{
+      .label = "demo.ao_check",
+      .layout = ctx.device().CreatePipelineLayout(&layoutDescriptor),
+      .compute = {.module = module, .entryPoint = "cs_main"},
+  };
+  return ctx.device().CreateComputePipeline(&descriptor);
+}
+
+void declare_ao_check(PassBuilder& builder, void*) {
+  builder.after(aurora::render::phase::Ao);
+  builder.use(aurora::render::resource::AoFinal, Access::Sampled, aurora::render::Missing::DisablePass);
+  builder.use(aurora::render::resource::GxNormal, Access::Sampled, aurora::render::Missing::DisablePass);
+  builder.side_effect();
+}
+
+void encode_ao_check(PassContext& ctx, void* userdata) {
+  auto& check = *static_cast<AoCheckPass*>(userdata);
+  check.encodes.fetch_add(1, std::memory_order_relaxed);
+  if (!check.pipeline || check.passLayout.Get() != ctx.pass_layout().Get()) {
+    check.pipeline = create_ao_check_pipeline(ctx, check.layout);
+    check.passLayout = ctx.pass_layout();
+  }
+  constexpr aurora::render::TexRef AoFinal{0};
+  const wgpu::Extent3D size = ctx.extent(AoFinal);
+  ctx.encoder().ClearBuffer(check.output, 0, AoCheckBytes);
+  const wgpu::ComputePassEncoder compute = ctx.begin_compute();
+  if (!compute) {
+    return;
+  }
+  compute.SetPipeline(check.pipeline);
+  compute.SetBindGroup(2, check.group);
+  compute.DispatchWorkgroups((size.width + 7) / 8, (size.height + 7) / 8);
+  compute.End();
+  if (ctx.frame() < check.armedFrame.load(std::memory_order_acquire)) {
+    return;
+  }
+  for (AoCheckSlot& slot : check.slots) {
+    if (slot.state.load(std::memory_order_acquire) == AoSlotState::Free) {
+      ctx.encoder().CopyBufferToBuffer(check.output, 0, slot.readback, 0, AoCheckBytes);
+      slot.frame = ctx.frame();
+      slot.state.store(AoSlotState::Copied, std::memory_order_release);
+      break;
+    }
+  }
+}
+
+void ao_check_mapped(AoCheckPass& check, AoCheckSlot& slot, wgpu::MapAsyncStatus status) {
+  const auto* mapped = status == wgpu::MapAsyncStatus::Success
+                           ? static_cast<const u32*>(slot.readback.GetConstMappedRange(0, AoCheckBytes))
+                           : nullptr;
+  {
+    std::lock_guard lock{check.mutex};
+    if (mapped == nullptr || mapped[AoWritten] != 1) {
+      ++check.failedMaps;
+    } else {
+      ++check.frames;
+      check.receivers = mapped[AoReceivers];
+      check.pixels = mapped[AoPixels];
+      for (size_t i = 0; i < check.probes.size(); ++i) {
+        const u32* probe = mapped + AoCheckHeaderWords + i * AoCheckProbeWords;
+        check.sums[i] += std::bit_cast<f32>(probe[0]);
+        check.receiverFrames[i] += probe[1] >= 1 ? 1 : 0;
+      }
+    }
+  }
+  if (status == wgpu::MapAsyncStatus::Success) {
+    slot.readback.Unmap();
+  }
+  slot.state.store(AoSlotState::Free, std::memory_order_release);
+}
+
+void ao_check_submitted(u32 frame, void* userdata) {
+  auto& check = *static_cast<AoCheckPass*>(userdata);
+  for (AoCheckSlot& slot : check.slots) {
+    if (slot.state.load(std::memory_order_acquire) != AoSlotState::Copied || slot.frame != frame) {
+      continue;
+    }
+    slot.state.store(AoSlotState::Mapping, std::memory_order_release);
+    slot.readback.MapAsync(
+        wgpu::MapMode::Read, 0, AoCheckBytes, wgpu::CallbackMode::AllowSpontaneous,
+        [&check, &slot](wgpu::MapAsyncStatus status, wgpu::StringView) { ao_check_mapped(check, slot, status); });
+  }
+}
+
+bool register_ao_check(std::string& error) {
+  sAo.probes = ao_check_probes();
+  if (sAo.probes.empty() || sAo.probes.size() > AoCheckMaxProbes) {
+    error = "demo.ao_check has no room for its probes";
+    return false;
+  }
+  sAo.params = {.probeCount = static_cast<u32>(sAo.probes.size())};
+  sAo.sums.assign(sAo.probes.size(), 0.0);
+  sAo.receiverFrames.assign(sAo.probes.size(), 0);
+  const wgpu::Device device = aurora::gfx::device();
+  const wgpu::BufferDescriptor outputDescriptor{
+      .label = "demo.ao_check output",
+      .usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+      .size = AoCheckBytes,
+  };
+  sAo.output = device.CreateBuffer(&outputDescriptor);
+  const uint64_t probeBytes = sAo.probes.size() * sizeof(AoProbe);
+  const wgpu::BufferDescriptor probeDescriptor{
+      .label = "demo.ao_check probes",
+      .usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+      .size = probeBytes,
+  };
+  sAo.probeBuffer = device.CreateBuffer(&probeDescriptor);
+  device.GetQueue().WriteBuffer(sAo.probeBuffer, 0, sAo.probes.data(), probeBytes);
+  for (AoCheckSlot& slot : sAo.slots) {
+    const wgpu::BufferDescriptor readbackDescriptor{
+        .label = "demo.ao_check readback",
+        .usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+        .size = AoCheckBytes,
+    };
+    slot.readback = device.CreateBuffer(&readbackDescriptor);
+    slot.state.store(AoSlotState::Free, std::memory_order_relaxed);
+  }
+  const std::array layoutEntries{
+      wgpu::BindGroupLayoutEntry{
+          .binding = 0,
+          .visibility = wgpu::ShaderStage::Compute,
+          .buffer = {.type = wgpu::BufferBindingType::Storage},
+      },
+      wgpu::BindGroupLayoutEntry{
+          .binding = 1,
+          .visibility = wgpu::ShaderStage::Compute,
+          .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage},
+      },
+  };
+  const wgpu::BindGroupLayoutDescriptor layoutDescriptor{
+      .label = "demo.ao_check",
+      .entryCount = layoutEntries.size(),
+      .entries = layoutEntries.data(),
+  };
+  sAo.layout = device.CreateBindGroupLayout(&layoutDescriptor);
+  const std::array groupEntries{
+      wgpu::BindGroupEntry{.binding = 0, .buffer = sAo.output, .size = AoCheckBytes},
+      wgpu::BindGroupEntry{.binding = 1, .buffer = sAo.probeBuffer, .size = probeBytes},
+  };
+  const wgpu::BindGroupDescriptor groupDescriptor{
+      .label = "demo.ao_check",
+      .layout = sAo.layout,
+      .entryCount = groupEntries.size(),
+      .entries = groupEntries.data(),
+  };
+  sAo.group = device.CreateBindGroup(&groupDescriptor);
+  sAo.id = aurora::render::register_pass({
+      .name = "demo.ao_check",
+      .stage = aurora::render::Stage::OpaqueDone,
+      .kind = aurora::render::PassKind::Compute,
+      .paramsSize = sizeof(AoCheckParams),
+      .declare = declare_ao_check,
+      .encode = encode_ao_check,
+      .afterSubmit = ao_check_submitted,
+      .userdata = &sAo,
+  });
+  if (sAo.id == aurora::render::InvalidPass) {
+    error = "register_pass refused demo.ao_check";
+    return false;
+  }
+  return true;
+}
 } // namespace
 
 // Aurora's pipeline threads update the counter through atomic_ref, so it is read the same way
@@ -883,6 +1157,9 @@ bool register_graph_passes(const GraphPassOptions& options, std::string& error) 
     return false;
   }
   if (options.fogCheck && !register_fog_check(error)) {
+    return false;
+  }
+  if (options.aoCheck && !register_ao_check(error)) {
     return false;
   }
   return options.gpuCull == 0 ||
@@ -930,6 +1207,20 @@ void update_graph_passes(u32 frame) {
       }
     }
   }
+  if (sAo.id != aurora::render::InvalidPass) {
+    aurora::render::set_pass_params(sAo.id, &sAo.params, sizeof(sAo.params));
+    if (frame >= AoCheckFrame && sAo.armedFrame.load(std::memory_order_relaxed) == UINT32_MAX) {
+      if (!std::exchange(sAo.waitedForPipelines, true)) {
+        wait_for_pipelines();
+        sAo.deadline = std::chrono::steady_clock::now() + PipelineWait;
+      }
+      if (!pipelines_compiling() && sAo.encodes.load(std::memory_order_relaxed) != 0) {
+        sAo.armedFrame.store(aurora::gfx::current_frame(), std::memory_order_release);
+      } else if (std::chrono::steady_clock::now() < sAo.deadline) {
+        std::this_thread::sleep_for(AoCompileWait);
+      }
+    }
+  }
   if (sVignette.id == aurora::render::InvalidPass) {
     return;
   }
@@ -947,10 +1238,16 @@ void finish_graph_passes() {
   const bool depth = waiting(sProbe.id, sProbe.encodes, sProbe.armedFrame);
   const bool motion = waiting(sMotion.id, sMotion.encodes, sMotion.armedFrame);
   const bool fog = waiting(sFog.id, sFog.encodes, sFog.armedFrame);
+  const auto aoPending = [] {
+    return std::ranges::any_of(sAo.slots, [](const AoCheckSlot& slot) {
+      return slot.state.load(std::memory_order_acquire) != AoSlotState::Free;
+    });
+  };
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
   while (((depth && sProbe.result.load(std::memory_order_acquire) == ProbeResult::Pending) ||
           (motion && sMotion.result.load(std::memory_order_acquire) == ProbeResult::Pending) ||
-          (fog && sFog.result.load(std::memory_order_acquire) == ProbeResult::Pending)) &&
+          (fog && sFog.result.load(std::memory_order_acquire) == ProbeResult::Pending) ||
+          (sAo.id != aurora::render::InvalidPass && aoPending())) &&
          std::chrono::steady_clock::now() < deadline) {
     aurora::gfx::synchronize();
     aurora::gfx::device().Tick();
@@ -982,6 +1279,19 @@ GraphPassReport graph_pass_report() {
     std::lock_guard lock{sFog.mutex};
     report.fog = sFog.values;
   }
+  if (sAo.id != aurora::render::InvalidPass) {
+    std::lock_guard lock{sAo.mutex};
+    report.ao = {
+        .encodes = sAo.encodes.load(std::memory_order_relaxed),
+        .frames = sAo.frames,
+        .failedMaps = sAo.failedMaps,
+        .receivers = sAo.receivers,
+        .pixels = sAo.pixels,
+        .probes = sAo.probes,
+        .sums = sAo.sums,
+        .receiverFrames = sAo.receiverFrames,
+    };
+  }
   return report;
 }
 
@@ -989,10 +1299,10 @@ void unregister_graph_passes() {
   const bool cull = unregister_cull_passes();
   if (!cull && sVignette.id == aurora::render::InvalidPass && sProbe.id == aurora::render::InvalidPass &&
       sMotion.id == aurora::render::InvalidPass && sMotionView.id == aurora::render::InvalidPass &&
-      sFog.id == aurora::render::InvalidPass) {
+      sFog.id == aurora::render::InvalidPass && sAo.id == aurora::render::InvalidPass) {
     return;
   }
-  for (PassId* id : {&sVignette.id, &sProbe.id, &sMotion.id, &sMotionView.id, &sFog.id}) {
+  for (PassId* id : {&sVignette.id, &sProbe.id, &sMotion.id, &sMotionView.id, &sFog.id, &sAo.id}) {
     if (*id != aurora::render::InvalidPass) {
       aurora::render::unregister_pass(*id);
       *id = aurora::render::InvalidPass;
@@ -1026,5 +1336,15 @@ void unregister_graph_passes() {
   sFog.readback = {};
   sFog.output = {};
   sFog.waitedForPipelines = false;
+  sAo.pipeline = {};
+  sAo.passLayout = {};
+  sAo.group = {};
+  sAo.layout = {};
+  sAo.probeBuffer = {};
+  sAo.output = {};
+  for (AoCheckSlot& slot : sAo.slots) {
+    slot.readback = {};
+  }
+  sAo.waitedForPipelines = false;
 }
 } // namespace render_demo

@@ -7,7 +7,9 @@
 #include "gfx/resources.hpp"
 #include "gx/hints.hpp"
 #include "render/ao/ao.hpp"
+#include "render/ao/gtao.hpp"
 #include "render/ao/hiz.hpp"
+#include "render/ao/upsample.hpp"
 #include "render/debug/views.hpp"
 #include "render/frame_state.hpp"
 #include "render/gpu_heap.hpp"
@@ -40,8 +42,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <numbers>
 #include <optional>
 #include <random>
 #include <span>
@@ -1023,6 +1027,1252 @@ TEST_F(AoGpu, Bench) {
     std::printf("ao hiz bench %ux%u backend %d adapter %s: gpu median %.4f ms\n", width, height,
                 static_cast<int>(m_device->adapterInfo.backendType),
                 std::string{std::string_view{m_device->adapterInfo.device}}.c_str(), median(gpuMs));
+  }
+}
+
+TEST(AoRules, SectorBitsRoundEdgeCases) {
+  EXPECT_EQ(ao::sector_bits(0.f, 0.49f / 32.f, false), 0u);
+  EXPECT_EQ(ao::sector_bits(0.f, 0.51f / 32.f, false), 1u);
+  EXPECT_EQ(ao::sector_bits(0.f, 1.f, false), 0xFFFFFFFFu);
+  EXPECT_EQ(ao::sector_bits(-3.f, 7.f, false), 0xFFFFFFFFu);
+  EXPECT_EQ(ao::sector_bits(31.f / 32.f, 1.f, false), 0x80000000u);
+  EXPECT_EQ(ao::sector_bits(0.7f, 0.3f, false), 0u);
+  EXPECT_EQ(ao::sector_bits(1.f, 1.f, false), 0u);
+  EXPECT_EQ(ao::sector_bits(2.f / 32.f, 5.f / 32.f, false), 0b11100u);
+  EXPECT_EQ(ao::sector_bits(1.49f / 32.f, 2.51f / 32.f, false), 0b110u);
+}
+
+TEST(AoRules, SectorBitsCeilVariant) {
+  EXPECT_EQ(ao::sector_bits(0.f, 0.49f / 32.f, true), 1u);
+  EXPECT_EQ(ao::sector_bits(0.f, 1.f, true), 0xFFFFFFFFu);
+  EXPECT_EQ(ao::sector_bits(31.5f / 32.f, 1.f, true), 0x80000000u);
+  EXPECT_EQ(ao::sector_bits(0.7f, 0.3f, true), 0u);
+  EXPECT_EQ(ao::sector_bits(1.f, 1.f, true), 0u);
+  EXPECT_EQ(ao::sector_bits(1.2f / 32.f, 2.1f / 32.f, true), 0b10u);
+  EXPECT_EQ(ao::sector_bits(0.1f / 32.f, 0.2f / 32.f, true), 1u);
+  EXPECT_EQ(ao::sector_bits(0.1f / 32.f, 0.2f / 32.f, false), 0u);
+  EXPECT_EQ(ao::sector_bits(5.9f / 32.f, 6.1f / 32.f, true), 0b100000u);
+}
+
+TEST(AoRules, HilbertMatchesXeGtao) {
+  constexpr uint32_t Width = ao::HilbertWidth;
+  std::vector<std::array<uint32_t, 2>> cells(Width * Width, {UINT32_MAX, UINT32_MAX});
+  for (uint32_t y = 0; y < Width; ++y) {
+    for (uint32_t x = 0; x < Width; ++x) {
+      const uint32_t index = ao::hilbert_index(x, y);
+      ASSERT_LT(index, Width * Width);
+      EXPECT_EQ(cells[index][0], UINT32_MAX) << "index " << index << " repeats";
+      cells[index] = {x, y};
+      EXPECT_EQ(ao::hilbert_index(x + Width, y + 3 * Width), index);
+    }
+  }
+  EXPECT_EQ(ao::hilbert_index(0, 0), 0u);
+  for (size_t i = 1; i < cells.size(); ++i) {
+    const uint32_t dx = cells[i][0] > cells[i - 1][0] ? cells[i][0] - cells[i - 1][0] : cells[i - 1][0] - cells[i][0];
+    const uint32_t dy = cells[i][1] > cells[i - 1][1] ? cells[i][1] - cells[i - 1][1] : cells[i - 1][1] - cells[i][1];
+    EXPECT_EQ(dx + dy, 1u) << "curve breaks at " << i;
+  }
+}
+
+TEST(AoRules, FalloffMovesBoundsToLowEdge) {
+  for (const bool positive : {true, false}) {
+    const auto same = ao::falloff_bounds(0.3f, 0.6f, 1.f, positive);
+    EXPECT_EQ(same[0], 0.3f);
+    EXPECT_EQ(same[1], 0.6f);
+    const auto none = ao::falloff_bounds(0.3f, 0.6f, 0.f, positive);
+    EXPECT_EQ(none[0], positive ? 1.f : 0.f);
+    EXPECT_EQ(none[1], positive ? 1.f : 0.f);
+    EXPECT_EQ(ao::sector_bits(none[0], none[1], false), 0u);
+    const auto half = ao::falloff_bounds(0.3f, 0.6f, 0.5f, positive);
+    EXPECT_FLOAT_EQ(half[0], positive ? 0.65f : 0.15f);
+    EXPECT_FLOAT_EQ(half[1], positive ? 0.8f : 0.3f);
+    EXPECT_FLOAT_EQ(half[1] - half[0], 0.15f);
+  }
+}
+
+TEST(AoRules, NoiseRotatesEveryFrame) {
+  for (const auto [x, y] : {std::pair{0u, 0u}, std::pair{17u, 40u}, std::pair{1279u, 719u}}) {
+    std::array<float, 2> previous = ao::noise(x, y, 0);
+    for (uint32_t frame = 1; frame < ao::NoisePeriod; ++frame) {
+      const std::array<float, 2> noise = ao::noise(x, y, frame);
+      EXPECT_NE(noise, previous) << frame;
+      EXPECT_GE(noise[0], 0.f);
+      EXPECT_LT(noise[0], 1.f);
+      EXPECT_GE(noise[1], 0.f);
+      EXPECT_LT(noise[1], 1.f);
+      previous = noise;
+    }
+    EXPECT_EQ(ao::noise(x, y, ao::NoisePeriod), ao::noise(x, y, 0));
+  }
+}
+
+TEST(AoRules, StrengthCurve) {
+  const float floor = ao::MinVisibility;
+  for (float v = floor; v <= 1.f; v += 0.01f) {
+    EXPECT_EQ(ao::apply_strength(v, 0.f, floor), 1.f) << v;
+    EXPECT_FLOAT_EQ(ao::apply_strength(v, 1.f, floor), v) << v;
+    EXPECT_NEAR(1.f - ao::apply_strength(v, 0.5f, floor), 0.5f * (1.f - v), 1e-6f) << v;
+    EXPECT_GE(ao::apply_strength(v, 1.5f, floor), floor - 1e-6f) << v;
+    EXPECT_LE(ao::apply_strength(v, 1.5f, floor), v + 1e-6f) << v;
+  }
+  for (float k = 0.f; k <= 1.5f; k += 0.05f) {
+    EXPECT_EQ(ao::apply_strength(1.f, k, floor), 1.f) << k;
+  }
+}
+
+TEST(AoRules, TuningDefaultsMatchConstants) {
+  EXPECT_EQ(Settings{}.aoRadius, ao::RadiusMetres);
+  EXPECT_EQ(Settings{}.aoStrength, 1.f);
+  const ao::Params params = ao::latched_params(Settings{}, {});
+  EXPECT_EQ(params.radiusMetres, ao::RadiusMetres);
+  EXPECT_EQ(params.strength, 1.f);
+  EXPECT_EQ(params.thicknessMetres, ao::ThicknessMetres);
+  EXPECT_EQ(params.minVisibility, ao::MinVisibility);
+}
+
+struct Reader {
+  std::string_view resource;
+  wgpu::Texture texture;
+  int calls = 0;
+};
+
+void declare_reader(InternalPassBuilder& builder, const PassSetup&, const void* state) {
+  builder.after(phase::Ao);
+  builder.use(static_cast<const Reader*>(state)->resource, Access::CopySrc);
+  builder.side_effect();
+}
+
+void encode_reader(PassContext& ctx, const void* state) {
+  auto& reader = *static_cast<Reader*>(const_cast<void*>(state));
+  ++reader.calls;
+  reader.texture = ctx.texture(TexRef{0});
+}
+
+PassDesc reader_desc(Reader& reader) {
+  return {
+      .name = "t.read." + std::string{reader.resource},
+      .stage = Stage::OpaqueDone,
+      .kind = PassKind::Copy,
+      .order = 3,
+      .declare = declare_reader,
+      .encode = encode_reader,
+      .state = &reader,
+  };
+}
+
+constexpr std::array<std::string_view, 3> ChainPasses{ao::hiz::Pass, ao::gtao::Pass, ao::upsample::Pass};
+
+std::span<const CompiledUse> node_uses(const CompiledGraph& graph, NodeId node) {
+  return std::span{graph.uses}.subspan(graph.nodes[node].firstUse, graph.nodes[node].useCount);
+}
+
+class AoChainGraph : public AoGraph {
+protected:
+  void latch_chain(const CompiledGraph& graph) {
+    latch(&graph);
+    for (const std::string_view name : ChainPasses) {
+      const NodeId node = graph.find_node(name);
+      if (node == InvalidNode || graph.nodes[node].status != CullReason::None) {
+        continue;
+      }
+      for (const uint32_t id : graph.nodes[node].pipelineIds) {
+        if (id != 0) {
+          ASSERT_EQ(shaders::wait({id}, PipelineWaitNs), shaders::PipelineStatus::Ready) << name;
+        }
+      }
+    }
+  }
+};
+
+TEST_F(AoChainGraph, GtaoBindsHizThenNormal) {
+  Reader reader{.resource = ao::gtao::Resource};
+  register_pass(reader_desc(reader));
+  const auto graph = compile(ao_settings(Quality::High));
+  const NodeId node = graph->find_node(ao::gtao::Pass);
+  ASSERT_NE(node, InvalidNode);
+  EXPECT_EQ(graph->nodes[node].status, CullReason::None);
+  EXPECT_EQ(graph->nodes[node].order, 0u);
+  const auto uses = node_uses(*graph, node);
+  ASSERT_GE(uses.size(), 3u);
+  EXPECT_EQ(graph->resources[uses[0].resource].name, ao::hiz::Resource);
+  EXPECT_EQ(uses[0].access, Access::Sampled);
+  EXPECT_EQ(uses[0].options.sampleType, wgpu::TextureSampleType::UnfilterableFloat);
+  EXPECT_EQ(graph->resources[uses[1].resource].name, resource::GxNormal);
+  EXPECT_EQ(uses[1].access, Access::Sampled);
+  EXPECT_EQ(graph->resources[uses[2].resource].name, ao::gtao::Resource);
+  EXPECT_EQ(uses[2].access, Access::StorageWrite);
+  const CompiledResource& raw = graph->resources[graph->find_resource(ao::gtao::Resource)];
+  EXPECT_EQ(raw.tex.format, wgpu::TextureFormat::RGBA8Unorm);
+  EXPECT_EQ(raw.tex.divisor, 2u);
+}
+
+TEST_F(AoChainGraph, UpsampleCreatesRenderSizeRgba8) {
+  for (const auto [width, height] : {std::pair{2560u, 1440u}, std::pair{4779u, 2688u}, std::pair{61u, 37u}}) {
+    use_globals({width, height, 1});
+    ao::testing::set_camera_override(camera_hints(perspective(Near, Far)));
+    Reader reader{.resource = resource::AoFinal};
+    register_pass(reader_desc(reader));
+    for (const Quality quality : {Quality::Low, Quality::High, Quality::Ultra}) {
+      const auto graph = compile(ao_settings(quality));
+      const NodeId node = graph->find_node(ao::upsample::Pass);
+      ASSERT_NE(node, InvalidNode);
+      EXPECT_EQ(graph->nodes[node].status, CullReason::None);
+      EXPECT_EQ(graph->nodes[node].passKind, PassKind::Render);
+      EXPECT_EQ(graph->nodes[node].order, 2u);
+      const CompiledResource& final = graph->resources[graph->find_resource(resource::AoFinal)];
+      EXPECT_EQ(final.tex.format, wgpu::TextureFormat::RGBA8Unorm);
+      EXPECT_EQ(final.tex.divisor, 1u);
+      EXPECT_EQ(final.extent.width, width);
+      EXPECT_EQ(final.extent.height, height);
+      EXPECT_TRUE(final.textureUsage & wgpu::TextureUsage::RenderAttachment);
+      EXPECT_TRUE(final.textureUsage & wgpu::TextureUsage::TextureBinding);
+    }
+  }
+}
+
+TEST_F(AoChainGraph, UpsampleReadsNormal) {
+  Reader reader{.resource = resource::AoFinal};
+  register_pass(reader_desc(reader));
+  const auto graph = compile(ao_settings(Quality::High));
+  const NodeId node = graph->find_node(ao::upsample::Pass);
+  ASSERT_NE(node, InvalidNode);
+  const auto uses = node_uses(*graph, node);
+  ASSERT_EQ(uses.size(), 5u);
+  const std::array<std::string_view, 5> names{ao::gtao::Resource, ao::hiz::Resource, resource::GxDepth,
+                                              resource::GxNormal, resource::AoFinal};
+  for (size_t i = 0; i < names.size(); ++i) {
+    EXPECT_EQ(graph->resources[uses[i].resource].name, names[i]) << i;
+    EXPECT_EQ(uses[i].missing, Missing::DisablePass) << i;
+  }
+  EXPECT_EQ(uses[1].options.sampleType, wgpu::TextureSampleType::UnfilterableFloat);
+  EXPECT_EQ(uses[2].options.sampleType, wgpu::TextureSampleType::UnfilterableFloat);
+  EXPECT_EQ(uses[4].access, Access::ColorWrite);
+}
+
+TEST_F(AoChainGraph, FinalIsTransientNotHistory) {
+  Reader reader{.resource = resource::AoFinal};
+  register_pass(reader_desc(reader));
+  const auto graph = compile(ao_settings(Quality::High));
+  for (const std::string_view name : {resource::AoFinal, ao::gtao::Resource, ao::hiz::Resource}) {
+    const ResourceId id = graph->find_resource(name);
+    ASSERT_NE(id, InvalidResource) << name;
+    EXPECT_EQ(graph->resources[id].kind, ResourceKind::Transient) << name;
+  }
+  EXPECT_TRUE(graph->histories.empty());
+}
+
+TEST_F(AoChainGraph, SinkEnvKeepsChainAlive) {
+  const auto culled = compile(ao_settings(Quality::High));
+  for (const std::string_view name : ChainPasses) {
+    EXPECT_EQ(culled->nodes[culled->find_node(name)].status, CullReason::NoConsumer) << name;
+  }
+  ao::testing::set_sink_override(true);
+  const auto sunk = compile(ao_settings(Quality::High));
+  for (const std::string_view name : ChainPasses) {
+    EXPECT_EQ(sunk->nodes[sunk->find_node(name)].status, CullReason::None) << name;
+  }
+  EXPECT_TRUE(sunk->nodes[sunk->find_node(ao::upsample::Pass)].sideEffect);
+  EXPECT_NE(sunk->graphHash, culled->graphHash);
+  latch_chain(*sunk);
+  EXPECT_TRUE(ao::pipelines_live());
+  const FrameState state{.graph = sunk};
+  EXPECT_EQ(run(state, 1, scene_depth(test::make_depth(*m_device, 64, 64))), std::nullopt);
+  EXPECT_EQ(ao::gtao::testing::counters().dispatches, 1u);
+  EXPECT_EQ(ao::upsample::testing::counters().draws, 1u);
+}
+
+TEST_F(AoChainGraph, ChainDisabledWhenPyramidDisabled) {
+  Reader reader{.resource = resource::AoFinal};
+  register_pass(reader_desc(reader));
+  const auto graph = compile(ao_settings(Quality::High));
+  latch_chain(*graph);
+  const FrameState state{.graph = graph};
+  const auto encoded = [] {
+    return std::array{ao::hiz::testing::counters().dispatches, ao::gtao::testing::counters().dispatches,
+                      ao::upsample::testing::counters().draws};
+  };
+  EXPECT_EQ(run(state, 1, depth64()), std::nullopt);
+  const auto live = encoded();
+  EXPECT_GT(live[0], 0u);
+  EXPECT_EQ(live[1], 1u);
+  EXPECT_EQ(live[2], 1u);
+  EXPECT_EQ(reader.calls, 1);
+  ao::testing::set_camera_override(std::make_shared<const SceneHints>());
+  EXPECT_EQ(run(state, 2, depth64()), std::nullopt);
+  EXPECT_EQ(encoded(), live);
+  ao::testing::set_camera_override(camera_hints(perspective(Near, Far)));
+  debug::set_view_override(debug::ClassViews.front().id);
+  latch(graph.get());
+  EXPECT_EQ(run(state, 3, depth64()), std::nullopt);
+  EXPECT_EQ(encoded(), live);
+  EXPECT_EQ(reader.calls, 1);
+  debug::set_view_override(0);
+  latch(graph.get());
+  EXPECT_EQ(run(state, 4, depth64()), std::nullopt);
+  EXPECT_EQ(encoded()[2], 2u);
+}
+
+TEST_F(AoChainGraph, TuningReachesParams) {
+  Reader reader{.resource = resource::AoFinal};
+  register_pass(reader_desc(reader));
+  Settings settings = ao_settings(Quality::High);
+  settings.aoRadius = 1.f;
+  settings.aoStrength = 0.5f;
+  const auto graph = compile(settings);
+  latch_chain(*graph);
+  ao::testing::set_camera_override(camera_hints(perspective(Near, Far), {}, 50.f));
+  const FrameState state{.graph = graph};
+  const StageData opaque = build(state, 9, depth64());
+  for (const std::string_view name : ChainPasses) {
+    const NodeId node = graph->find_node(name);
+    const ao::Params latched = params_from(latched_pass_params(graph->nodes[node].id));
+    EXPECT_EQ(latched.radiusMetres, 1.f) << name;
+    EXPECT_EQ(latched.strength, 0.5f) << name;
+    const auto it = std::ranges::find(opaque.bindings.params, node, &StageBindings::Params::node);
+    ASSERT_NE(it, opaque.bindings.params.end()) << name;
+    const ao::Params filled = params_from(std::span{it->bytes}.first(it->size));
+    EXPECT_EQ(filled.effectRadius, 50.f) << name;
+    EXPECT_EQ(filled.strength, 0.5f) << name;
+  }
+  EXPECT_EQ(ao::effective_strength(), 0.5f);
+  const ao::Params env =
+      ao::latched_params(settings, {.radius = 0.6f, .thickness = 2.f, .strength = 1.2f, .floor = 0.03f});
+  EXPECT_EQ(env.radiusMetres, 0.6f);
+  EXPECT_EQ(env.strength, 1.2f);
+  EXPECT_EQ(env.thicknessMetres, 2.f);
+  EXPECT_EQ(env.minVisibility, 0.03f);
+  const ao::Params clamped = ao::latched_params(settings, {.radius = 9.f, .strength = 9.f});
+  EXPECT_EQ(clamped.radiusMetres, 1.5f);
+  EXPECT_EQ(clamped.strength, 1.5f);
+}
+
+TEST_F(AoChainGraph, TuningKeepsGraphHash) {
+  Reader reader{.resource = resource::AoFinal};
+  register_pass(reader_desc(reader));
+  Settings settings = ao_settings(Quality::High);
+  const auto base = compile(settings);
+  latch_chain(*base);
+  const shaders::PipelineStats before = shaders::stats();
+  for (const auto [radius, strength] : {std::pair{0.25f, 0.f}, std::pair{1.5f, 1.5f}, std::pair{1.f, 0.5f}}) {
+    settings.aoRadius = radius;
+    settings.aoStrength = strength;
+    const auto tuned = compile(settings);
+    EXPECT_EQ(tuned->graphHash, base->graphHash);
+    for (const std::string_view name : ChainPasses) {
+      EXPECT_EQ(tuned->nodes[tuned->find_node(name)].pipelineIds, base->nodes[base->find_node(name)].pipelineIds)
+          << name;
+    }
+    for (size_t feature = 0; feature < FeatureCount; ++feature) {
+      EXPECT_EQ(feature_enabled(settings, static_cast<Feature>(feature)),
+                feature_enabled(ao_settings(Quality::High), static_cast<Feature>(feature)));
+    }
+  }
+  const shaders::PipelineStats after = shaders::stats();
+  EXPECT_EQ(after.ready + after.pending + after.failed, before.ready + before.pending + before.failed);
+}
+
+TEST_F(AoChainGraph, EncodesValidationClean) {
+  for (const auto [width, height] :
+       {std::pair{1u, 1u}, std::pair{3u, 5u}, std::pair{61u, 37u}, std::pair{1280u, 720u}}) {
+    for (const Quality quality : {Quality::Low, Quality::High, Quality::Ultra}) {
+      SCOPED_TRACE(std::to_string(width) + "x" + std::to_string(height) + " q" +
+                   std::to_string(static_cast<int>(quality)));
+      use_globals({width, height, 1});
+      ao::testing::set_camera_override(camera_hints(perspective(Near, Far)));
+      Reader reader{.resource = resource::AoFinal};
+      register_pass(reader_desc(reader));
+      const auto graph = compile(ao_settings(quality));
+      latch_chain(*graph);
+      const FrameState state{.graph = graph};
+      EXPECT_EQ(run(state, 1, scene_depth(test::make_depth(*m_device, width, height))), std::nullopt);
+      EXPECT_EQ(ao::gtao::testing::counters().dispatches, 1u);
+      EXPECT_EQ(ao::upsample::testing::counters().draws, 1u);
+      EXPECT_EQ(reader.calls, 1);
+    }
+  }
+}
+
+using Vec3d = std::array<double, 3>;
+
+struct Box {
+  Vec3d min;
+  Vec3d max;
+  uint32_t tag;
+};
+
+struct CustomHit {
+  double t = 0.0;
+  Vec3d normal{};
+  uint32_t tag = 0;
+};
+
+struct Rig {
+  uint32_t width = 64;
+  uint32_t height = 48;
+  double eyeHeight = 300.0;
+  double pitch = 0.0;
+  bool ground = true;
+  std::vector<Box> boxes;
+  std::function<std::optional<CustomHit>(const Vec3d& eye, const Vec3d& dir)> custom;
+  std::function<uint32_t(const Vec3d& point, uint32_t tag)> classify;
+  std::function<uint32_t(uint32_t tag)> code;
+  std::function<Vec3d(const Vec3d& normal, uint32_t tag)> shade;
+};
+
+struct Frame {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  std::vector<float> depth;
+  std::vector<uint32_t> normals;
+  std::vector<uint32_t> tags;
+};
+
+constexpr uint32_t TagGround = 1;
+constexpr uint32_t TagWall = 2;
+constexpr uint32_t TagPole = 3;
+constexpr uint32_t TagBand = 10;
+constexpr uint32_t TagOpen = 11;
+
+double dot3(const Vec3d& a, const Vec3d& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+
+std::optional<CustomHit> hit_box(const Box& box, const Vec3d& eye, const Vec3d& dir) {
+  double t0 = -1e300;
+  double t1 = 1e300;
+  int axis = -1;
+  double axisSign = 0.0;
+  for (int i = 0; i < 3; ++i) {
+    if (std::abs(dir[i]) < 1e-12) {
+      if (eye[i] < box.min[i] || eye[i] > box.max[i]) {
+        return std::nullopt;
+      }
+      continue;
+    }
+    double a = (box.min[i] - eye[i]) / dir[i];
+    double b = (box.max[i] - eye[i]) / dir[i];
+    double s = -1.0;
+    if (a > b) {
+      std::swap(a, b);
+      s = 1.0;
+    }
+    if (a > t0) {
+      t0 = a;
+      axis = i;
+      axisSign = s;
+    }
+    t1 = std::min(t1, b);
+  }
+  if (axis < 0 || t0 > t1 || t0 <= 0.0) {
+    return std::nullopt;
+  }
+  CustomHit hit{.t = t0, .tag = box.tag};
+  hit.normal[axis] = axisSign;
+  return hit;
+}
+
+Frame render_rig(const Rig& rig, const Mat4x4<float>& proj) {
+  Frame frame{.width = rig.width, .height = rig.height};
+  const size_t count = size_t{rig.width} * rig.height;
+  frame.depth.assign(count, 0.f);
+  frame.normals.assign(count, ref::pack_normal({0.0, 0.0, 1.0}, 0));
+  frame.tags.assign(count, 0);
+  const Vec3d fwd{0.0, -std::sin(rig.pitch), std::cos(rig.pitch)};
+  const Vec3d up{0.0, std::cos(rig.pitch), std::sin(rig.pitch)};
+  const Vec3d right{1.0, 0.0, 0.0};
+  const Vec3d eye{0.0, rig.eyeHeight, 0.0};
+  for (uint32_t y = 0; y < rig.height; ++y) {
+    for (uint32_t x = 0; x < rig.width; ++x) {
+      const double vx = ((x + 0.5) / rig.width * 2.0 - 1.0) / proj.m0[0];
+      const double vy = (1.0 - (y + 0.5) / rig.height * 2.0) / proj.m1[1];
+      const Vec3d dir{right[0] * vx + up[0] * vy + fwd[0], right[1] * vx + up[1] * vy + fwd[1],
+                      right[2] * vx + up[2] * vy + fwd[2]};
+      std::optional<CustomHit> best;
+      const auto consider = [&](const std::optional<CustomHit>& hit) {
+        if (hit && hit->t > 0.0 && (!best || hit->t < best->t)) {
+          best = hit;
+        }
+      };
+      if (rig.ground && dir[1] < 0.0) {
+        consider(CustomHit{.t = -eye[1] / dir[1], .normal = {0.0, 1.0, 0.0}, .tag = TagGround});
+      }
+      for (const Box& box : rig.boxes) {
+        consider(hit_box(box, eye, dir));
+      }
+      if (rig.custom) {
+        consider(rig.custom(eye, dir));
+      }
+      if (!best || best->t > 0.99 * Far) {
+        continue;
+      }
+      const Vec3d point{eye[0] + best->t * dir[0], eye[1] + best->t * dir[1], eye[2] + best->t * dir[2]};
+      const uint32_t tag = rig.classify ? rig.classify(point, best->tag) : best->tag;
+      const Vec3d shaded = rig.shade ? rig.shade(best->normal, tag) : best->normal;
+      const Vec3d n{dot3(shaded, right), dot3(shaded, up), dot3(shaded, fwd)};
+      const size_t i = size_t{y} * rig.width + x;
+      frame.depth[i] = static_cast<float>(double{proj.m2[2]} - double{proj.m2[3]} / best->t);
+      frame.normals[i] = ref::pack_normal({n[0], n[1], -n[2]}, rig.code ? rig.code(tag) : 3u);
+      frame.tags[i] = tag;
+    }
+  }
+  return frame;
+}
+
+float half_to_float(uint32_t bits) {
+  const uint32_t exponent = (bits >> 10) & 0x1Fu;
+  const uint32_t mantissa = bits & 0x3FFu;
+  const float sign = (bits & 0x8000u) != 0 ? -1.f : 1.f;
+  if (exponent == 0) {
+    return sign * std::ldexp(static_cast<float>(mantissa), -24);
+  }
+  return sign * std::ldexp(static_cast<float>(mantissa | 0x400u), static_cast<int>(exponent) - 25);
+}
+
+struct TestPass {
+  std::string name;
+  PassKind kind = PassKind::Copy;
+  uint16_t order = 0;
+  std::function<void(InternalPassBuilder&)> declare;
+  std::function<void(PassContext&)> encode;
+  mutable int calls = 0;
+};
+
+void declare_test_pass(InternalPassBuilder& builder, const PassSetup&, const void* state) {
+  static_cast<const TestPass*>(state)->declare(builder);
+}
+
+void encode_test_pass(PassContext& ctx, const void* state) {
+  const auto& pass = *static_cast<const TestPass*>(state);
+  ++pass.calls;
+  pass.encode(ctx);
+}
+
+PassDesc desc_of(const TestPass& pass) {
+  return {
+      .name = pass.name,
+      .stage = Stage::OpaqueDone,
+      .kind = pass.kind,
+      .order = pass.order,
+      .declare = declare_test_pass,
+      .encode = encode_test_pass,
+      .state = &pass,
+  };
+}
+
+struct ChainResult {
+  Frame frame;
+  std::vector<uint32_t> raw;
+  std::vector<uint32_t> final;
+  uint32_t gridWidth = 0;
+  uint32_t gridHeight = 0;
+  uint32_t divisor = 2;
+  StageCamera camera;
+  ao::Params params;
+  ref::CpuPyramid pyramid;
+};
+
+class AoChainGpu : public AoHizGpu {
+protected:
+  using Result = ChainResult;
+
+  using RawFn = std::function<uint32_t(uint32_t x, uint32_t y, double z, uint8_t edges)>;
+
+  void upload_normals(const Frame& frame) {
+    const wgpu::TextureDescriptor descriptor{
+        .label = "test normals",
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding |
+                 wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst,
+        .size = {frame.width, frame.height, 1},
+        .format = wgpu::TextureFormat::RGB10A2Unorm,
+    };
+    const wgpu::Texture texture = m_device->device.CreateTexture(&descriptor);
+    const wgpu::TexelCopyTextureInfo destination{.texture = texture};
+    const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = frame.width * 4, .rowsPerImage = frame.height};
+    const wgpu::Extent3D size{frame.width, frame.height, 1};
+    m_device->queue.WriteTexture(&destination, frame.normals.data(), frame.normals.size() * 4, &layout, &size);
+    webgpu::g_normalBuffer.texture = texture;
+    webgpu::g_normalBuffer.view = texture.CreateView();
+    webgpu::g_normalBuffer.size = size;
+    webgpu::g_normalBuffer.format = wgpu::TextureFormat::RGB10A2Unorm;
+  }
+
+  std::shared_ptr<CompiledGraph> chain(const Settings& settings) {
+    std::shared_ptr<CompiledGraph> graph = compile(settings);
+    for (const std::string_view name : ChainPasses) {
+      const NodeId node = graph->find_node(name);
+      if (node == InvalidNode || graph->nodes[node].status != CullReason::None) {
+        continue;
+      }
+      for (const uint32_t id : graph->nodes[node].pipelineIds) {
+        if (id != 0) {
+          EXPECT_EQ(shaders::wait({id}, PipelineWaitNs), shaders::PipelineStatus::Ready) << name;
+        }
+      }
+    }
+    latch(graph.get());
+    return graph;
+  }
+
+  static void edit_params(const CompiledGraph& graph, const std::function<void(ao::Params&)>& edit) {
+    for (const std::string_view name : ChainPasses) {
+      const NodeId node = graph.find_node(name);
+      if (node == InvalidNode) {
+        continue;
+      }
+      ao::Params params = params_from(latched_pass_params(graph.nodes[node].id));
+      edit(params);
+      set_pass_params(graph.nodes[node].id, std::as_bytes(std::span{&params, 1}));
+    }
+    latch_pass_params();
+  }
+
+  std::vector<uint32_t> texels(const wgpu::Texture& texture) const {
+    std::vector<uint32_t> out;
+    for (const float value : test::read_texture_mip(*m_device, texture, 0)) {
+      out.push_back(std::bit_cast<uint32_t>(value));
+    }
+    return out;
+  }
+
+  static ao::Params cpu_params(const CompiledGraph& graph, uint64_t frameId) {
+    const NodeId node = graph.find_node(ao::hiz::Pass);
+    ao::Params params = params_from(latched_pass_params(graph.nodes[node].id));
+    params.effectRadius = params.radiusMetres * DefaultUnitsPerMetre;
+    params.thickness = params.thicknessMetres * DefaultUnitsPerMetre;
+    params.noiseIndex = static_cast<uint32_t>(frameId % ao::NoisePeriod);
+    return params;
+  }
+
+  Result run_rig(const Rig& rig, Quality quality, const std::function<void(ao::Params&)>& edit = {},
+                 const RawFn& stubRaw = {}, uint64_t frameId = 5) {
+    use_globals({rig.width, rig.height, 1});
+    const Mat4x4<float> proj = perspective(Near, Far);
+    const auto hints = camera_hints(proj);
+    ao::testing::set_camera_override(hints);
+    Result result;
+    result.divisor = ao::working_divisor(quality);
+    result.gridWidth = ao::grid_size(rig.width, result.divisor);
+    result.gridHeight = ao::grid_size(rig.height, result.divisor);
+    result.frame = render_rig(rig, proj);
+    EXPECT_TRUE(fill_stage_camera(hints.get(), result.camera));
+    const double effectRadius = double{ao::RadiusMetres} * DefaultUnitsPerMetre;
+    result.pyramid =
+        ref::build_pyramid(result.frame.depth, rig.width, rig.height, result.divisor, result.camera, effectRadius,
+                           ao::hiz::written_levels(chain_levels(result.gridWidth, result.gridHeight)));
+    Reader rawReader{.resource = ao::gtao::Resource};
+    Reader finalReader{.resource = resource::AoFinal};
+    std::vector<uint32_t> staged;
+    const uint32_t rowWords = ((result.gridWidth * 4 + 255) & ~255u) / 4;
+    wgpu::Buffer staging;
+    TestPass stub{.name = "t.raw"};
+    if (stubRaw) {
+      ao::testing::unregister(ao::gtao::Pass);
+      staged.assign(size_t{rowWords} * result.gridHeight, 0);
+      result.raw.assign(size_t{result.gridWidth} * result.gridHeight, 0);
+      const std::vector<double>& hiz = result.pyramid.levels[0];
+      for (uint32_t y = 0; y < result.gridHeight; ++y) {
+        for (uint32_t x = 0; x < result.gridWidth; ++x) {
+          const auto at = [&](int64_t px, int64_t py) {
+            px = std::clamp<int64_t>(px, 0, result.gridWidth - 1);
+            py = std::clamp<int64_t>(py, 0, result.gridHeight - 1);
+            return hiz[static_cast<size_t>(py) * result.gridWidth + static_cast<size_t>(px)];
+          };
+          const double z = at(x, y);
+          const uint8_t edges = ref::pack_edges(ref::calculate_edges(z, at(int64_t{x} - 1, y), at(int64_t{x} + 1, y),
+                                                                     at(x, int64_t{y} - 1), at(x, int64_t{y} + 1)));
+          const uint32_t value = stubRaw(x, y, z, edges);
+          result.raw[size_t{y} * result.gridWidth + x] = value;
+          staged[size_t{y} * rowWords + x] = value;
+        }
+      }
+      const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                              .size = staged.size() * 4};
+      staging = m_device->device.CreateBuffer(&descriptor);
+      m_device->queue.WriteBuffer(staging, 0, staged.data(), staged.size() * 4);
+      const TexDesc desc = ao::gtao::raw_desc(result.divisor);
+      stub.declare = [desc](InternalPassBuilder& b) {
+        b.after(phase::Ao);
+        b.create(ao::gtao::Resource, desc, Access::CopyDst);
+      };
+      stub.encode = [&](PassContext& ctx) {
+        const wgpu::TexelCopyBufferInfo from{.layout = {.bytesPerRow = rowWords * 4, .rowsPerImage = result.gridHeight},
+                                             .buffer = staging};
+        const wgpu::TexelCopyTextureInfo to{.texture = ctx.texture(TexRef{0})};
+        const wgpu::Extent3D extent{result.gridWidth, result.gridHeight, 1};
+        ctx.encoder().CopyBufferToTexture(&from, &to, &extent);
+      };
+      register_pass(desc_of(stub));
+    } else {
+      register_pass(reader_desc(rawReader));
+    }
+    register_pass(reader_desc(finalReader));
+    upload_normals(result.frame);
+    const auto graph = chain(ao_settings(quality));
+    if (edit) {
+      edit_params(*graph, edit);
+    }
+    result.params = cpu_params(*graph, frameId);
+    const wgpu::Texture depth = test::make_depth(*m_device, rig.width, rig.height);
+    test::fill_depth(*m_device, depth, result.frame.depth);
+    const FrameState state{.graph = graph};
+    EXPECT_EQ(run(state, frameId, scene_depth(depth)), std::nullopt);
+    EXPECT_EQ(finalReader.calls, 1);
+    if (!finalReader.texture || (!stubRaw && !rawReader.texture)) {
+      ADD_FAILURE() << "the AO chain did not run";
+      return result;
+    }
+    if (!stubRaw) {
+      result.raw = texels(rawReader.texture);
+    }
+    result.final = texels(finalReader.texture);
+    return result;
+  }
+
+  static double raw_visibility(uint32_t texel) { return std::min((texel & 0xFFu) / 255.0 * ao::RawScale, 1.0); }
+  static uint32_t red(uint32_t texel) { return texel & 0xFFu; }
+
+  static std::vector<size_t> grid_tagged(const Result& r, uint32_t tag) {
+    std::vector<size_t> out;
+    for (uint32_t y = 0; y < r.gridHeight; ++y) {
+      for (uint32_t x = 0; x < r.gridWidth; ++x) {
+        const uint32_t qx = ao::rep_texel(x, r.divisor, r.frame.width);
+        const uint32_t qy = ao::rep_texel(y, r.divisor, r.frame.height);
+        if (r.frame.tags[size_t{qy} * r.frame.width + qx] == tag) {
+          out.push_back(size_t{y} * r.gridWidth + x);
+        }
+      }
+    }
+    return out;
+  }
+
+  static double mean_raw(const Result& r, std::span<const size_t> texels) {
+    double sum = 0.0;
+    for (const size_t i : texels) {
+      sum += raw_visibility(r.raw[i]);
+    }
+    return texels.empty() ? 0.0 : sum / static_cast<double>(texels.size());
+  }
+
+  std::vector<ref::GtaoTexel> cpu_gtao(const Result& r) const {
+    return ref::estimate_gtao({.depth = r.frame.depth,
+                               .normals = r.frame.normals,
+                               .width = r.frame.width,
+                               .height = r.frame.height,
+                               .divisor = r.divisor,
+                               .camera = r.camera,
+                               .params = r.params},
+                              r.pyramid);
+  }
+
+  std::vector<double> cpu_upsample(const Result& r) const {
+    return ref::upsample({.depth = r.frame.depth,
+                          .normals = r.frame.normals,
+                          .raw = r.raw,
+                          .hiz = r.pyramid.levels[0],
+                          .width = r.frame.width,
+                          .height = r.frame.height,
+                          .gridWidth = r.gridWidth,
+                          .gridHeight = r.gridHeight,
+                          .camera = r.camera,
+                          .params = r.params});
+  }
+};
+
+using AoGtaoGpu = AoChainGpu;
+using AoUpsampleGpu = AoChainGpu;
+
+constexpr double Deg = std::numbers::pi / 180.0;
+
+Rig ground_rig(uint32_t width, uint32_t height, double pitch) {
+  return {.width = width, .height = height, .eyeHeight = 300.0, .pitch = pitch * Deg};
+}
+
+Rig frontal_rig(uint32_t width, uint32_t height, double distance) {
+  return {.width = width,
+          .height = height,
+          .eyeHeight = 0.0,
+          .ground = false,
+          .boxes = {{{-1e5, -1e5, distance}, {1e5, 1e5, distance + 100.0}, TagWall}}};
+}
+
+TEST_F(AoGtaoGpu, FlatPlaneIsOpen) {
+  for (const Quality quality : {Quality::High, Quality::Ultra}) {
+    const Result r = run_rig(ground_rig(320, 240, 30.0), quality);
+    const std::vector<size_t> ground = grid_tagged(r, TagGround);
+    ASSERT_GT(ground.size(), r.raw.size() / 3);
+    size_t open = 0;
+    size_t exact = 0;
+    for (const size_t i : ground) {
+      open += raw_visibility(r.raw[i]) >= 0.97 ? 1 : 0;
+      exact += red(r.raw[i]) >= 170 ? 1 : 0;
+    }
+    EXPECT_GE(open, ground.size() * 99 / 100) << static_cast<int>(quality);
+    EXPECT_GE(exact, ground.size() * 95 / 100) << static_cast<int>(quality);
+  }
+}
+
+TEST_F(AoGtaoGpu, BoxCreaseIsDark) {
+  Rig rig{.width = 320, .height = 240, .eyeHeight = 250.0, .pitch = 15.0 * Deg};
+  rig.boxes = {{{-300.0, 0.0, 700.0}, {300.0, 400.0, 760.0}, TagWall}};
+  rig.classify = [](const Vec3d& p, uint32_t tag) {
+    if (std::abs(p[0]) < 200.0 && ((tag == TagGround && p[2] > 688.0) || (tag == TagWall && p[1] < 12.0))) {
+      return TagBand;
+    }
+    return tag == TagGround && p[2] < 500.0 && std::abs(p[0]) < 200.0 ? TagOpen : tag;
+  };
+  const Result r = run_rig(rig, Quality::High);
+  const std::vector<size_t> crease = grid_tagged(r, TagBand);
+  const std::vector<size_t> open = grid_tagged(r, TagOpen);
+  ASSERT_GT(crease.size(), 20u);
+  ASSERT_GT(open.size(), 100u);
+  const double creaseMean = mean_raw(r, crease);
+  std::printf("box crease mean %.4f over %zu texels, open %.4f\n", creaseMean, crease.size(), mean_raw(r, open));
+  EXPECT_LE(creaseMean, 0.75);
+  EXPECT_GE(mean_raw(r, open), 0.97);
+}
+
+TEST_F(AoGtaoGpu, ThinPoleHaloBounded) {
+  Rig rig{.width = 320, .height = 240, .eyeHeight = 200.0};
+  rig.boxes = {{{-300.0, 0.0, 300.0}, {300.0, 400.0, 340.0}, TagWall},
+               {{-10.0, 0.0, 260.0}, {10.0, 300.0, 280.0}, TagPole}};
+  rig.classify = [](const Vec3d& p, uint32_t tag) {
+    return tag == TagWall && p[1] > 120.0 && p[1] < 260.0 ? (std::abs(p[0]) > 150.0 ? TagOpen : TagBand) : tag;
+  };
+  std::array<double, 2> strips{};
+  std::array<double, 2> interiors{};
+  for (size_t run = 0; run < 2; ++run) {
+    const float thickness = run == 0 ? ao::ThicknessMetres : 1e6f;
+    const Result r = run_rig(rig, Quality::High, [thickness](ao::Params& p) { p.thicknessMetres = thickness; });
+    double strip = 0.0;
+    double interior = 0.0;
+    size_t stripCount = 0;
+    size_t interiorCount = 0;
+    for (uint32_t y = 0; y < r.frame.height; ++y) {
+      int64_t left = -1;
+      int64_t right = -1;
+      for (uint32_t x = 0; x < r.frame.width; ++x) {
+        if (r.frame.tags[size_t{y} * r.frame.width + x] == TagPole) {
+          left = left < 0 ? x : left;
+          right = x;
+        }
+      }
+      for (uint32_t x = 0; x < r.frame.width; ++x) {
+        const size_t i = size_t{y} * r.frame.width + x;
+        const double value = red(r.final[i]) / 255.0;
+        const int64_t gap = std::min(std::abs(int64_t{x} - left), std::abs(int64_t{x} - right));
+        if (r.frame.tags[i] == TagBand && left >= 0 && gap >= 2 && gap <= 6) {
+          strip += value;
+          ++stripCount;
+        } else if (r.frame.tags[i] == TagOpen) {
+          interior += value;
+          ++interiorCount;
+        }
+      }
+    }
+    ASSERT_GT(stripCount, 50u);
+    ASSERT_GT(interiorCount, 100u);
+    strips[run] = strip / stripCount;
+    interiors[run] = interior / interiorCount;
+  }
+  std::printf("pole strip %.4f (interior %.4f) at 0.25 m, %.4f at 1e6 m\n", strips[0], interiors[0], strips[1]);
+  EXPECT_GE(strips[0], 0.9);
+  EXPECT_LE(strips[1], 0.8);
+}
+
+TEST_F(AoGtaoGpu, TiltedNormalsMatchContinuousCoverage) {
+  Rig rig = frontal_rig(256, 192, 500.0);
+  const double tilt = 15.0 * Deg;
+  rig.shade = [tilt](const Vec3d& n, uint32_t) { return Vec3d{n[0], std::sin(tilt), n[2] * std::cos(tilt)}; };
+  std::array<double, 2> means{};
+  double continuous = 0.0;
+  for (size_t run = 0; run < 2; ++run) {
+    const Result r =
+        run_rig(rig, Quality::High, [run](ao::Params& p) { p.flags |= run == 1 ? uint32_t{ao::FlagSectorCeil} : 0u; });
+    const std::vector<ref::GtaoTexel> cpu = cpu_gtao(r);
+    double gpu = 0.0;
+    double cont = 0.0;
+    size_t count = 0;
+    for (uint32_t y = 4; y + 4 < r.gridHeight; ++y) {
+      for (uint32_t x = 4; x + 4 < r.gridWidth; ++x) {
+        const size_t i = size_t{y} * r.gridWidth + x;
+        gpu += raw_visibility(r.raw[i]);
+        cont += cpu[i].continuous;
+        ++count;
+      }
+    }
+    means[run] = gpu / count;
+    continuous = cont / count;
+  }
+  std::printf("tilted interior: round %.4f, ceil %.4f, continuous %.4f\n", means[0], means[1], continuous);
+  EXPECT_NEAR(means[0], continuous, 0.006);
+}
+
+TEST_F(AoGtaoGpu, FacetedSmoothNormalsStayOpen) {
+  Rig rig{.width = 256, .height = 192, .eyeHeight = 300.0, .ground = false};
+  constexpr double Radius = 400.0;
+  constexpr double Facet = 10.0 * Deg;
+  const Vec3d centre{0.0, 300.0, 900.0};
+  rig.custom = [centre](const Vec3d& eye, const Vec3d& dir) -> std::optional<CustomHit> {
+    const double apothem = Radius * std::cos(Facet / 2.0);
+    double enter = -1e300;
+    double exit = 1e300;
+    for (int k = 0; k < 36; ++k) {
+      const double a = (k + 0.5) * Facet;
+      const Vec3d n{0.0, std::sin(a), -std::cos(a)};
+      const double denom = dot3(n, dir);
+      const double dist = apothem - dot3(n, {eye[0] - centre[0], eye[1] - centre[1], eye[2] - centre[2]});
+      if (std::abs(denom) < 1e-12) {
+        if (dist < 0.0) {
+          return std::nullopt;
+        }
+        continue;
+      }
+      const double t = dist / denom;
+      if (denom < 0.0 && t > enter) {
+        enter = t;
+      } else if (denom > 0.0) {
+        exit = std::min(exit, t);
+      }
+    }
+    if (enter > exit || enter <= 0.0) {
+      return std::nullopt;
+    }
+    const Vec3d p{eye[0] + enter * dir[0], eye[1] + enter * dir[1], eye[2] + enter * dir[2]};
+    const double smooth = std::atan2(p[1] - centre[1], centre[2] - p[2]);
+    return CustomHit{.t = enter, .normal = {0.0, std::sin(smooth), -std::cos(smooth)}, .tag = TagWall};
+  };
+  rig.classify = [centre](const Vec3d& p, uint32_t tag) {
+    return std::abs(p[1] - centre[1]) < 0.6 * Radius && std::abs(p[0]) < 300.0 ? TagBand : tag;
+  };
+  const Result r = run_rig(rig, Quality::High);
+  const std::vector<size_t> surface = grid_tagged(r, TagBand);
+  ASSERT_GT(surface.size(), 500u);
+  size_t exact = 0;
+  for (const size_t i : surface) {
+    exact += red(r.raw[i]) >= 170 ? 1 : 0;
+  }
+  const double mean = mean_raw(r, surface);
+  std::printf("faceted surface mean %.4f, exactly open %.4f\n", mean, static_cast<double>(exact) / surface.size());
+  EXPECT_GE(mean, 0.97);
+  EXPECT_GE(exact, surface.size() * 3 / 4);
+}
+
+TEST_F(AoGtaoGpu, FloorHoldsInDeepSlot) {
+  Rig slot{.width = 320, .height = 240, .eyeHeight = 700.0, .pitch = 60.0 * Deg};
+  slot.boxes = {{{-600.0, 0.0, 200.0}, {-15.0, 400.0, 900.0}, TagWall},
+                {{15.0, 0.0, 200.0}, {600.0, 400.0, 900.0}, TagWall}};
+  const Result deep = run_rig(slot, Quality::High, [](ao::Params& p) { p.thicknessMetres = 1e6f; });
+  for (size_t i = 0; i < deep.raw.size(); ++i) {
+    if (((deep.raw[i] >> 16) & 0xFFu) != 0) {
+      EXPECT_GE(red(deep.raw[i]), 34u) << i;
+    }
+  }
+  for (const uint32_t texel : deep.final) {
+    EXPECT_GE(red(texel), 51u);
+  }
+  Rig crease{.width = 320, .height = 240, .eyeHeight = 250.0, .pitch = 15.0 * Deg};
+  crease.boxes = {{{-300.0, 0.0, 700.0}, {300.0, 400.0, 760.0}, TagWall}};
+  constexpr float Floor = 0.75f;
+  const Result floored = run_rig(crease, Quality::High, [](ao::Params& p) { p.minVisibility = Floor; });
+  size_t atFloor = 0;
+  for (const uint32_t texel : floored.raw) {
+    if (((texel >> 16) & 0xFFu) != 0) {
+      EXPECT_GE(red(texel), 127u);
+      atFloor += red(texel) <= 128u ? 1 : 0;
+    }
+  }
+  EXPECT_GT(atFloor, 10u);
+  for (size_t i = 0; i < floored.final.size(); ++i) {
+    if (floored.frame.depth[i] != 0.f) {
+      EXPECT_GE(red(floored.final[i]), 190u) << i;
+    }
+  }
+}
+
+TEST_F(AoGtaoGpu, CodeZeroAndSkyWriteOne) {
+  Rig rig = ground_rig(128, 96, 10.0);
+  rig.boxes = {{{-100.0, 0.0, 600.0}, {100.0, 150.0, 650.0}, TagWall}};
+  rig.code = [](uint32_t tag) { return tag == TagWall ? 0u : 3u; };
+  const Result r = run_rig(rig, Quality::High);
+  size_t sky = 0;
+  size_t zero = 0;
+  for (uint32_t y = 0; y < r.gridHeight; ++y) {
+    for (uint32_t x = 0; x < r.gridWidth; ++x) {
+      const size_t i = size_t{y} * r.gridWidth + x;
+      const uint32_t tag =
+          r.frame
+              .tags[size_t{ao::rep_texel(y, 2, r.frame.height)} * r.frame.width + ao::rep_texel(x, 2, r.frame.width)];
+      if (tag == 0 || tag == TagWall) {
+        EXPECT_EQ(red(r.raw[i]), 170u) << x << "," << y;
+        EXPECT_EQ((r.raw[i] >> 16) & 0xFFu, 0u) << x << "," << y;
+        (tag == 0 ? sky : zero) += 1;
+      }
+    }
+  }
+  EXPECT_GT(sky, 10u);
+  EXPECT_GT(zero, 10u);
+  for (size_t i = 0; i < r.final.size(); ++i) {
+    if (r.frame.tags[i] == 0 || r.frame.tags[i] == TagWall) {
+      EXPECT_EQ(red(r.final[i]), 255u) << i;
+    }
+    if (r.frame.tags[i] == 0) {
+      EXPECT_EQ(r.final[i] & 0xFFFF00u, 0u) << i;
+    }
+  }
+}
+
+TEST_F(AoGtaoGpu, DistantSurfaceWritesOne) {
+  const Result r = run_rig(frontal_rig(128, 96, 40000.0), Quality::High);
+  for (const uint32_t texel : r.raw) {
+    EXPECT_EQ(red(texel), 170u);
+    EXPECT_EQ((texel >> 16) & 0xFFu, 255u);
+  }
+  for (const uint32_t texel : r.final) {
+    EXPECT_EQ(red(texel), 255u);
+  }
+}
+
+TEST_F(AoGtaoGpu, DepthNormalsMatchOnPlane) {
+  Rig rig = ground_rig(256, 192, 35.0);
+  rig.boxes = {{{-150.0, 0.0, 600.0}, {150.0, 200.0, 700.0}, TagWall}};
+  const Result gbuffer = run_rig(rig, Quality::High);
+  const Result depth = run_rig(rig, Quality::High, [](ao::Params& p) { p.flags |= ao::FlagNormalFromDepth; });
+  const std::vector<size_t> ground = grid_tagged(gbuffer, TagGround);
+  ASSERT_GT(ground.size(), 1000u);
+  double delta = 0.0;
+  for (const size_t i : ground) {
+    delta += std::abs(raw_visibility(gbuffer.raw[i]) - raw_visibility(depth.raw[i]));
+  }
+  EXPECT_LE(delta / ground.size(), 0.02);
+}
+
+TEST_F(AoGtaoGpu, MatchesCpuReference) {
+  Rig rig{.width = 256, .height = 192, .eyeHeight = 260.0, .pitch = 20.0 * Deg};
+  rig.boxes = {{{-250.0, 0.0, 650.0}, {50.0, 300.0, 720.0}, TagWall},
+               {{90.0, 0.0, 560.0}, {130.0, 90.0, 600.0}, TagWall},
+               {{-5.0, 0.0, 600.0}, {5.0, 220.0, 610.0}, TagPole}};
+  for (const Quality quality : {Quality::Medium, Quality::High, Quality::Ultra}) {
+    const Result r = run_rig(rig, quality);
+    const std::vector<ref::GtaoTexel> cpu = cpu_gtao(r);
+    double delta = 0.0;
+    size_t count = 0;
+    size_t edgeMismatches = 0;
+    for (size_t i = 0; i < cpu.size(); ++i) {
+      EXPECT_EQ(((r.raw[i] >> 16) & 0xFFu) != 0, cpu[i].receiver) << i;
+      edgeMismatches += ((r.raw[i] >> 8) & 0xFFu) != cpu[i].edges ? 1 : 0;
+      if (cpu[i].receiver) {
+        delta += std::abs(raw_visibility(r.raw[i]) - cpu[i].visibility);
+        ++count;
+      }
+    }
+    ASSERT_GT(count, 1000u);
+    EXPECT_LE(edgeMismatches, cpu.size() / 100);
+    std::printf("quality %d: mean |gpu - cpu| %.5f over %zu texels\n", static_cast<int>(quality), delta / count, count);
+    EXPECT_LE(delta / count, 0.02);
+  }
+}
+
+TEST_F(AoGtaoGpu, OddSizesValidationClean) {
+  for (const auto [width, height] : {std::pair{1u, 1u}, std::pair{3u, 5u}, std::pair{61u, 37u}}) {
+    for (const Quality quality : {Quality::Low, Quality::Ultra}) {
+      SCOPED_TRACE(std::to_string(width) + "x" + std::to_string(height));
+      const Result r = run_rig(ground_rig(width, height, 25.0), quality);
+      EXPECT_EQ(r.raw.size(), size_t{r.gridWidth} * r.gridHeight);
+      EXPECT_EQ(r.final.size(), size_t{width} * height);
+    }
+  }
+}
+
+uint32_t raw_texel(uint32_t r, uint8_t edges, bool receiver) {
+  return r | (uint32_t{edges} << 8) | (receiver ? 0xFF0000u : 0u);
+}
+
+void expect_matches_mirror(const ChainResult& r, const std::vector<double>& want, std::string_view what) {
+  size_t bad = 0;
+  size_t first = 0;
+  for (size_t i = 0; i < want.size(); ++i) {
+    const auto expected = static_cast<int>(std::lround(want[i] * 255.0));
+    if (std::abs(static_cast<int>(r.final[i] & 0xFFu) - expected) > 1) {
+      first = bad == 0 ? i : first;
+      ++bad;
+    }
+  }
+  EXPECT_EQ(bad, 0u) << what << ": first mismatch at " << first << " got " << (r.final[first] & 0xFFu) << " want "
+                     << want[first] * 255.0;
+}
+
+TEST_F(AoUpsampleGpu, AllOnesStaysExact) {
+  for (const Quality quality : {Quality::High, Quality::Ultra}) {
+    const Result r = run_rig(ground_rig(64, 48, 25.0), quality, {},
+                             [](uint32_t, uint32_t, double, uint8_t e) { return raw_texel(170, e, true); });
+    for (const uint32_t texel : r.final) {
+      EXPECT_EQ(texel & 0xFFu, 255u);
+    }
+  }
+}
+
+TEST_F(AoUpsampleGpu, IdentityWritesWhite) {
+  const Result r = run_rig(
+      frontal_rig(64, 48, 500.0), Quality::High, [](ao::Params& p) { p.flags |= ao::FlagIdentityForced; },
+      [](uint32_t, uint32_t, double, uint8_t e) { return raw_texel(40, e, true); });
+  for (const uint32_t texel : r.final) {
+    EXPECT_EQ(texel & 0xFFu, 255u);
+  }
+}
+
+TEST_F(AoUpsampleGpu, SkyWritesOne) {
+  const Result r = run_rig(ground_rig(64, 48, 10.0), Quality::High, {},
+                           [](uint32_t, uint32_t, double, uint8_t e) { return raw_texel(40, e, true); });
+  size_t sky = 0;
+  size_t dark = 0;
+  for (size_t i = 0; i < r.final.size(); ++i) {
+    if (r.frame.depth[i] == 0.f) {
+      EXPECT_EQ(r.final[i] & 0xFFFFFFu, 0xFFu) << i;
+      ++sky;
+    } else {
+      dark += (r.final[i] & 0xFFu) < 255u ? 1 : 0;
+    }
+  }
+  EXPECT_GT(sky, 100u);
+  EXPECT_GE(dark, (r.final.size() - sky) * 3 / 4);
+}
+
+TEST_F(AoUpsampleGpu, CodeZeroPixelWritesOne) {
+  Rig rig = frontal_rig(64, 48, 500.0);
+  rig.classify = [](const Vec3d& p, uint32_t tag) {
+    return std::abs(p[0]) < 20.0 && std::abs(p[1]) < 20.0 ? TagBand : tag;
+  };
+  rig.code = [](uint32_t tag) { return tag == TagBand ? 0u : 3u; };
+  const Result r =
+      run_rig(rig, Quality::High, {}, [](uint32_t, uint32_t, double, uint8_t e) { return raw_texel(60, e, true); });
+  size_t zero = 0;
+  for (size_t i = 0; i < r.final.size(); ++i) {
+    if (r.frame.tags[i] == TagBand) {
+      EXPECT_EQ(r.final[i] & 0xFFu, 255u) << i;
+      ++zero;
+    } else {
+      EXPECT_LT(r.final[i] & 0xFFu, 255u) << i;
+    }
+  }
+  EXPECT_GT(zero, 4u);
+  expect_matches_mirror(r, cpu_upsample(r), "code zero");
+}
+
+TEST_F(AoUpsampleGpu, DepthStepLeakBounded) {
+  for (const double step : {0.05, 0.15}) {
+    for (const Quality quality : {Quality::High, Quality::Ultra}) {
+      SCOPED_TRACE(std::to_string(step) + " q" + std::to_string(static_cast<int>(quality)));
+      Rig rig{.width = 64, .height = 48, .eyeHeight = 0.0, .ground = false};
+      rig.boxes = {{{-1e5, -1e5, 500.0}, {0.0, 1e5, 600.0}, TagWall},
+                   {{0.0, -1e5, 500.0 * (1.0 + step)}, {1e5, 1e5, 700.0}, TagOpen}};
+      const Result r = run_rig(rig, quality, {}, [&](uint32_t x, uint32_t, double, uint8_t e) {
+        return raw_texel(ao::rep_texel(x, ao::working_divisor(quality), 64) < 32 ? 60u : 170u, e, true);
+      });
+      const uint32_t d = ao::working_divisor(quality);
+      for (uint32_t y = 0; y < r.frame.height; ++y) {
+        for (uint32_t x = 32 + d; x < r.frame.width; ++x) {
+          EXPECT_GE(r.final[size_t{y} * r.frame.width + x] & 0xFFu, 254u) << x << "," << y;
+        }
+      }
+      expect_matches_mirror(r, cpu_upsample(r), "depth step");
+    }
+  }
+}
+
+TEST_F(AoUpsampleGpu, UnrepresentedSurfaceWritesOne) {
+  Rig rig = frontal_rig(64, 48, 500.0);
+  const double column = 20.0;
+  rig.custom = [column](const Vec3d&, const Vec3d& dir) -> std::optional<CustomHit> {
+    if (std::floor((dir[0] * 1.2990381 + 1.0) * 32.0) != column) {
+      return std::nullopt;
+    }
+    return CustomHit{.t = 250.0, .normal = {0.0, 0.0, -1.0}, .tag = TagPole};
+  };
+
+  const Result r =
+      run_rig(rig, Quality::High, {}, [](uint32_t, uint32_t, double, uint8_t e) { return raw_texel(60, e, true); });
+  size_t strip = 0;
+  for (size_t i = 0; i < r.final.size(); ++i) {
+    if (r.frame.tags[i] == TagPole) {
+      EXPECT_EQ(i % r.frame.width % 2, 0u);
+      EXPECT_EQ(r.final[i] & 0xFFu, 255u) << i;
+      ++strip;
+    } else {
+      EXPECT_LT(r.final[i] & 0xFFu, 255u) << i;
+    }
+  }
+  EXPECT_EQ(strip, size_t{r.frame.height});
+}
+
+TEST_F(AoUpsampleGpu, NonReceiverTapsExcluded) {
+  const Result r =
+      run_rig(frontal_rig(64, 48, 500.0), Quality::High, {}, [](uint32_t x, uint32_t y, double, uint8_t e) {
+        const bool receiver = (x + y) % 2 == 0;
+        return raw_texel(receiver ? 170u : 10u, e, receiver);
+      });
+  for (const uint32_t texel : r.final) {
+    EXPECT_EQ(texel & 0xFFu, 255u);
+  }
+}
+
+TEST_F(AoUpsampleGpu, DepthKeyRoundTrips) {
+  const Result r = run_rig(ground_rig(64, 48, 20.0), Quality::High, {},
+                           [](uint32_t, uint32_t, double, uint8_t e) { return raw_texel(100, e, true); });
+  size_t checked = 0;
+  for (size_t i = 0; i < r.final.size(); ++i) {
+    const uint32_t key = (r.final[i] >> 8) & 0xFFFFu;
+    const float depth = r.frame.depth[i];
+    if (depth == 0.f) {
+      EXPECT_EQ(key, 0u) << i;
+      continue;
+    }
+    EXPECT_NEAR(half_to_float(key), depth, depth * 0x1p-10f + 6e-8f) << i;
+    EXPECT_EQ(r.final[i] >> 24, 0u) << i;
+    ++checked;
+  }
+  EXPECT_GT(checked, 1000u);
+}
+
+TEST_F(AoUpsampleGpu, StrengthZeroWritesOne) {
+  const Result r = run_rig(
+      frontal_rig(64, 48, 500.0), Quality::High, [](ao::Params& p) { p.strength = 0.f; },
+      [](uint32_t, uint32_t, double, uint8_t e) { return raw_texel(34, e, true); });
+  for (const uint32_t texel : r.final) {
+    EXPECT_EQ(texel & 0xFFu, 255u);
+  }
+}
+
+TEST_F(AoUpsampleGpu, StrengthMatchesMirror) {
+  for (const float strength : {0.5f, 1.5f}) {
+    std::mt19937 rng{0x5A17u};
+    std::uniform_int_distribution<uint32_t> dist(34, 170);
+    std::vector<uint32_t> values(64 * 48);
+    for (uint32_t& value : values) {
+      value = dist(rng);
+    }
+    Rig rig = ground_rig(64, 48, 30.0);
+    rig.boxes = {{{-60.0, 0.0, 700.0}, {60.0, 120.0, 760.0}, TagWall}};
+    const Result r = run_rig(
+        rig, Quality::High, [strength](ao::Params& p) { p.strength = strength; },
+        [&](uint32_t x, uint32_t y, double, uint8_t e) { return raw_texel(values[size_t{y} * 64 + x], e, true); });
+    expect_matches_mirror(r, cpu_upsample(r), strength < 1.f ? "strength 0.5" : "strength 1.5");
+    for (const uint32_t texel : r.final) {
+      EXPECT_GE(texel & 0xFFu, 51u);
+    }
+  }
+}
+
+TEST_F(AoUpsampleGpu, OddSizesCovered) {
+  for (const auto [width, height] : {std::pair{3u, 5u}, std::pair{61u, 37u}}) {
+    SCOPED_TRACE(std::to_string(width) + "x" + std::to_string(height));
+    const Result r =
+        run_rig(ground_rig(width, height, 15.0), Quality::High, {}, [](uint32_t x, uint32_t y, double, uint8_t e) {
+          return raw_texel(40 + (x * 7 + y * 13) % 130, e, true);
+        });
+    ASSERT_EQ(r.final.size(), size_t{width} * height);
+    for (size_t i = 0; i < r.final.size(); ++i) {
+      const uint32_t key = (r.final[i] >> 8) & 0xFFFFu;
+      EXPECT_EQ(key != 0, r.frame.depth[i] != 0.f) << i;
+    }
+    expect_matches_mirror(r, cpu_upsample(r), "odd size");
   }
 }
 } // namespace

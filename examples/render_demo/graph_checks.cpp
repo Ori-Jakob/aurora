@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <numbers>
+#include <string_view>
 
 namespace render_demo {
 namespace {
@@ -46,6 +47,59 @@ std::optional<std::string> check_depth_probe(std::span<const f32, 4> values, boo
   const bool closer = reversedZ ? values[2] > values[1] : values[2] < values[1];
   if (!closer) {
     std::snprintf(text, sizeof(text), "near probe %.6g is not closer than mid probe %.6g", values[2], values[1]);
+    return std::string{text};
+  }
+  return std::nullopt;
+}
+
+AoCheckSummary summarize_ao_check(std::span<const AoProbeStat> probes, double coverage) {
+  AoCheckSummary summary{.coverage = coverage};
+  u32 open = 0;
+  for (const AoProbeStat& probe : probes) {
+    const auto cls = static_cast<size_t>(probe.cls);
+    ++summary.probes[cls];
+    if (!probe.receiver) {
+      continue;
+    }
+    ++summary.receivers[cls];
+    summary.mean[cls] += probe.visibility;
+    open += probe.cls == AoProbeClass::Open && probe.visibility >= AoOpenMin ? 1 : 0;
+  }
+  for (size_t cls = 0; cls < AoProbeClassCount; ++cls) {
+    summary.mean[cls] = summary.receivers[cls] != 0 ? summary.mean[cls] / summary.receivers[cls] : 0.0;
+  }
+  const u32 openReceivers = summary.receivers[static_cast<size_t>(AoProbeClass::Open)];
+  summary.openShare = openReceivers != 0 ? static_cast<double>(open) / openReceivers : 0.0;
+  return summary;
+}
+
+std::optional<std::string> check_ao(const AoCheckSummary& summary) {
+  constexpr std::array<std::string_view, AoProbeClassCount> Names{"crease", "open-ground", "strip", "interior"};
+  char text[160];
+  if (summary.coverage < AoCoverageMin) {
+    std::snprintf(text, sizeof(text), "receiver coverage %.3f is below %.2f", summary.coverage, AoCoverageMin);
+    return std::string{text};
+  }
+  for (size_t cls = 0; cls < AoProbeClassCount; ++cls) {
+    if (summary.receivers[cls] * 2 < summary.probes[cls] || summary.receivers[cls] == 0) {
+      std::snprintf(text, sizeof(text), "only %u of %u %.*s probes landed on receivers", summary.receivers[cls],
+                    summary.probes[cls], static_cast<int>(Names[cls].size()), Names[cls].data());
+      return std::string{text};
+    }
+  }
+  const auto mean = [&](AoProbeClass cls) { return summary.mean[static_cast<size_t>(cls)]; };
+  if (mean(AoProbeClass::Crease) > AoCreaseMax) {
+    std::snprintf(text, sizeof(text), "crease mean %.3f is above %.2f", mean(AoProbeClass::Crease), AoCreaseMax);
+    return std::string{text};
+  }
+  if (summary.openShare < AoOpenShare) {
+    std::snprintf(text, sizeof(text), "%.1f%% of open-ground probes reach %.2f", summary.openShare * 100.0, AoOpenMin);
+    return std::string{text};
+  }
+  const double strip = mean(AoProbeClass::Strip);
+  const double interior = mean(AoProbeClass::Interior);
+  if (strip < AoStripMin || std::abs(strip - interior) > AoStripInteriorGap) {
+    std::snprintf(text, sizeof(text), "strip mean %.3f against interior %.3f", strip, interior);
     return std::string{text};
   }
   return std::nullopt;

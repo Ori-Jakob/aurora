@@ -33,7 +33,33 @@ struct MotionProbeParams {
 };
 static_assert(sizeof(MotionProbeParams) == 48);
 
+enum class AoProbeClass : u32 { Crease, Open, Strip, Interior };
+inline constexpr u32 AoProbeClassCount = 4;
+
+inline constexpr double AoCreaseMax = 0.75;
+inline constexpr double AoOpenMin = 0.97;
+inline constexpr double AoOpenShare = 0.99;
+inline constexpr double AoStripMin = 0.9;
+inline constexpr double AoStripInteriorGap = 0.05;
+inline constexpr double AoCoverageMin = 0.1;
+
+struct AoProbeStat {
+  AoProbeClass cls;
+  double visibility;
+  bool receiver;
+};
+
+struct AoCheckSummary {
+  std::array<double, AoProbeClassCount> mean{};
+  std::array<u32, AoProbeClassCount> receivers{};
+  std::array<u32, AoProbeClassCount> probes{};
+  double openShare = 0.0;
+  double coverage = 0.0;
+};
+
 VignetteParams vignette_params(u32 frame) noexcept;
 bool is_unknown_anchor_warning(AuroraLogLevel level, std::string_view module, std::string_view message) noexcept;
 std::optional<std::string> check_depth_probe(std::span<const f32, 4> values, bool reversedZ);
+AoCheckSummary summarize_ao_check(std::span<const AoProbeStat> probes, double coverage);
+std::optional<std::string> check_ao(const AoCheckSummary& summary);
 } // namespace render_demo

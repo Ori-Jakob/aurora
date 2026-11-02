@@ -2,12 +2,14 @@
 
 #include "cull_pass.hpp"
 #include "graph_checks.hpp"
+#include "scene.hpp"
 
 #include <aurora/render_graph.hpp>
 #include <dolphin/types.h>
 
 #include <array>
 #include <string>
+#include <vector>
 
 namespace render_demo {
 inline constexpr u32 FogCheckFrame = 30;
@@ -30,6 +32,20 @@ enum FogCheckWord : u32 {
   FogCheckWords = 16,
 };
 
+inline constexpr u32 AoCheckFrame = 30;
+inline constexpr u32 AoCheckMaxProbes = 256;
+
+struct AoCheckReport {
+  u32 encodes = 0;
+  u32 frames = 0;
+  u32 failedMaps = 0;
+  u32 receivers = 0;
+  u32 pixels = 0;
+  std::vector<AoProbe> probes;
+  std::vector<double> sums;
+  std::vector<u32> receiverFrames;
+};
+
 struct GraphPassOptions {
   bool vignette = false;
   std::string vignetteAnchor;
@@ -40,6 +56,7 @@ struct GraphPassOptions {
   bool motionCheck = false;
   bool motionView = false;
   bool fogCheck = false;
+  bool aoCheck = false;
 };
 
 struct GraphPassReport {
@@ -55,6 +72,7 @@ struct GraphPassReport {
   u32 fogEncodes = 0;
   bool fogReady = false;
   std::array<u32, FogCheckWords> fog{};
+  AoCheckReport ao;
 };
 
 bool pipelines_compiling() noexcept;

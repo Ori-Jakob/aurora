@@ -17,6 +17,7 @@
 #endif
 
 #include <array>
+#include <bit>
 #include <chrono>
 #include <limits>
 #include <random>
@@ -88,6 +89,8 @@ Settings random_settings(std::mt19937& rng) {
   s.upscaler = random_enum(rng, Upscaler::Auto);
   s.upscalerQuality = random_enum(rng, UpscalerQuality::UltraPerformance);
   s.ao = random_enum(rng, Quality::Ultra);
+  s.aoRadius = random_float(rng);
+  s.aoStrength = random_float(rng);
   s.ssil = random_bool(rng);
   s.shadows.quality = random_enum(rng, Quality::Ultra);
   s.shadows.pages = random_count(rng);
@@ -478,6 +481,53 @@ TEST_F(RenderApiTest, AoNotBuiltBeforeComposite) {
   EXPECT_EQ(evaluate_support(Feature::Ao, static_cast<uint8_t>(Quality::High), Settings{}, env(caps, built)),
             unsupported(Reason::NotImplemented));
   EXPECT_EQ(clamp_settings({.ao = Quality::High}, env(caps, built)).ao, Quality::Off);
+}
+
+TEST_F(RenderApiTest, AoTuningSanitized) {
+  for (const float bad : {NaN, Infinity, -Infinity}) {
+    Settings request;
+    request.aoRadius = bad;
+    request.aoStrength = bad;
+    const Settings sanitized = sanitize_settings(request);
+    EXPECT_EQ(sanitized.aoRadius, 0.73f);
+    EXPECT_EQ(sanitized.aoStrength, 1.f);
+  }
+  Settings request;
+  request.aoRadius = 0.1f;
+  request.aoStrength = -1.f;
+  EXPECT_EQ(sanitize_settings(request).aoRadius, 0.25f);
+  EXPECT_EQ(sanitize_settings(request).aoStrength, 0.f);
+  request.aoRadius = 9.f;
+  request.aoStrength = 9.f;
+  EXPECT_EQ(sanitize_settings(request).aoRadius, 1.5f);
+  EXPECT_EQ(sanitize_settings(request).aoStrength, 1.5f);
+  for (const float value : {0.25f, 0.5f, 0.73f, 1.f, 1.234567f, 1.5f}) {
+    request.aoRadius = value;
+    request.aoStrength = value;
+    EXPECT_EQ(std::bit_cast<uint32_t>(sanitize_settings(request).aoRadius), std::bit_cast<uint32_t>(value));
+    EXPECT_EQ(std::bit_cast<uint32_t>(sanitize_settings(request).aoStrength), std::bit_cast<uint32_t>(value));
+  }
+  request.aoStrength = 0.f;
+  EXPECT_EQ(sanitize_settings(request).aoStrength, 0.f);
+  const Caps caps = full_caps();
+  for (const BuiltOptions& built : {built_none(), built_all()}) {
+    Settings base;
+    base.ao = Quality::High;
+    base.taa = true;
+    Settings tuned = base;
+    tuned.aoRadius = 1.4f;
+    tuned.aoStrength = 0.f;
+    const Settings a = clamp_settings(base, env(caps, built));
+    const Settings b = clamp_settings(tuned, env(caps, built));
+    for (size_t feature = 0; feature < FeatureCount; ++feature) {
+      const auto f = static_cast<Feature>(feature);
+      EXPECT_EQ(feature_enabled(a, f), feature_enabled(b, f)) << feature_name(f);
+      EXPECT_EQ(evaluate_support(f, 1, base, env(caps, built)), evaluate_support(f, 1, tuned, env(caps, built)))
+          << feature_name(f);
+    }
+    EXPECT_EQ(b.aoRadius, 1.4f);
+    EXPECT_EQ(b.aoStrength, 0.f);
+  }
 }
 
 TEST_F(RenderApiTest, DependencyReasons) {

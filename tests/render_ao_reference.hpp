@@ -1,5 +1,6 @@
 #pragma once
 
+#include "render/ao/ao.hpp"
 #include "render/stage_camera.hpp"
 
 #include <array>
@@ -22,4 +23,45 @@ std::array<double, 3> view_position_fwd(const render::detail::StageCamera& camer
                                         double width, double height);
 CpuPyramid build_pyramid(std::span<const float> depth, uint32_t width, uint32_t height, uint32_t divisor,
                          const render::detail::StageCamera& camera, double effectRadius, uint32_t levels);
+
+uint32_t pack_normal(const std::array<double, 3>& gxNormal, uint32_t code);
+uint32_t normal_code(uint32_t packed);
+std::array<double, 4> calculate_edges(double z, double left, double right, double top, double bottom);
+uint8_t pack_edges(const std::array<double, 4>& edges);
+std::array<double, 4> unpack_edges(uint8_t packed);
+double interval_union(std::vector<std::array<double, 2>> intervals);
+
+struct GtaoTexel {
+  double visibility = 1.0;
+  double continuous = 1.0;
+  bool receiver = false;
+  uint8_t edges = 0;
+};
+
+struct GtaoSetup {
+  std::span<const float> depth;
+  std::span<const uint32_t> normals;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t divisor = 2;
+  render::detail::StageCamera camera;
+  render::detail::ao::Params params;
+};
+
+std::vector<GtaoTexel> estimate_gtao(const GtaoSetup& setup, const CpuPyramid& pyramid);
+
+struct UpsampleSetup {
+  std::span<const float> depth;
+  std::span<const uint32_t> normals;
+  std::span<const uint32_t> raw;
+  std::span<const double> hiz;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t gridWidth = 0;
+  uint32_t gridHeight = 0;
+  render::detail::StageCamera camera;
+  render::detail::ao::Params params;
+};
+
+std::vector<double> upsample(const UpsampleSetup& setup);
 } // namespace aurora::test::ao
