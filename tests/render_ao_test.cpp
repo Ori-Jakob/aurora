@@ -224,10 +224,28 @@ TEST(AoRules, EnvironmentUnitsScaleRadius) {
     EXPECT_EQ(filled.camera.unitsPerMeter, expected);
     EXPECT_EQ(filled.effectRadius, ao::RadiusMetres * expected);
     EXPECT_EQ(filled.thickness, ao::ThicknessMetres * expected);
-    EXPECT_EQ(filled.noiseIndex, 70u % ao::NoisePeriod);
+    EXPECT_EQ(filled.noiseIndex, stage.sceneHints->hintFrame % ao::NoisePeriod);
     EXPECT_EQ(filled.sliceCount, latched.sliceCount);
     EXPECT_EQ(filled.radiusMetres, ao::RadiusMetres);
   }
+  ao::testing::reset();
+}
+
+TEST(AoRules, NoiseFollowsHintFrame) {
+  ao::testing::reset();
+  const ao::Params latched;
+  const auto noise_index = [&](uint32_t frameIndex, uint64_t hintFrame) {
+    auto hints = std::make_shared<SceneHints>(*camera_hints(perspective(Near, Far)));
+    hints->hintFrame = hintFrame;
+    std::array<std::byte, sizeof(ao::Params)> bytes{};
+    std::memcpy(bytes.data(), &latched, sizeof(latched));
+    ao::fill_camera({.frameIndex = frameIndex, .sceneHints = std::move(hints)}, nullptr, bytes);
+    return params_from(bytes).noiseIndex;
+  };
+  EXPECT_EQ(noise_index(70, 135), 135u % ao::NoisePeriod);
+  // A replay repeat restarts the hint frame but not the gfx frame index
+  EXPECT_EQ(noise_index(70 + 300, 135), noise_index(70, 135));
+  EXPECT_NE(noise_index(70, 136), noise_index(70, 135));
   ao::testing::reset();
 }
 
@@ -773,7 +791,8 @@ TEST_F(AoGraph, CameraFilledAtStageBuild) {
   EXPECT_EQ(params.camera.flags, CameraValid);
   EXPECT_EQ(params.effectRadius, ao::RadiusMetres * 50.f);
   EXPECT_EQ(params.thickness, ao::ThicknessMetres * 50.f);
-  EXPECT_EQ(params.noiseIndex, 70u % ao::NoisePeriod);
+  ASSERT_NE(opaque.sceneHints, nullptr);
+  EXPECT_EQ(params.noiseIndex, opaque.sceneHints->hintFrame % ao::NoisePeriod);
   EXPECT_EQ(params.sliceCount, 3u);
   const ao::Params latched = params_from(latched_pass_params(graph->nodes[node].id));
   EXPECT_EQ(latched.camera.flags, 0u);
@@ -1561,7 +1580,9 @@ TEST_F(AoDenoiseGraph, TemporalOffAlwaysResets) {
     StageData opaque = build(state, frame, depth64());
     const auto it = std::ranges::find(opaque.bindings.params, gtao, &StageBindings::Params::node);
     ASSERT_NE(it, opaque.bindings.params.end());
-    EXPECT_EQ(params_from(std::span{it->bytes}.first(it->size)).noiseIndex, frame % ao::NoisePeriod);
+    ASSERT_NE(opaque.sceneHints, nullptr);
+    EXPECT_EQ(params_from(std::span{it->bytes}.first(it->size)).noiseIndex,
+              opaque.sceneHints->hintFrame % ao::NoisePeriod);
     EXPECT_EQ(encode(opaque), std::nullopt);
   }
   EXPECT_EQ(denoise_counters().temporalResets, 4u);

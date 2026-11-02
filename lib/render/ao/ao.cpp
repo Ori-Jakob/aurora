@@ -264,7 +264,9 @@ void fill_camera(const StageData& stage, const void*, std::span<std::byte> bytes
       std::isfinite(params.thicknessMetres) && params.thicknessMetres > 0.f ? params.thicknessMetres : ThicknessMetres;
   params.effectRadius = radius * upm;
   params.thickness = thickness * upm;
-  params.noiseIndex = stage.frameIndex % NoisePeriod;
+  // The hint frame restarts with every replayed run, while the gfx frame index keeps counting
+  const uint64_t noiseFrame = stage.sceneHints != nullptr ? stage.sceneHints->hintFrame : stage.frameIndex;
+  params.noiseIndex = static_cast<uint32_t>(noiseFrame % NoisePeriod);
   std::memcpy(bytes.data(), &params, sizeof(Params));
   bump(g_cameraFills);
 }
