@@ -258,10 +258,13 @@ fn fs_apply(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   let hit_min = min(mn4, e) / max(4.0 * mx4, vec3f(0.00001));
   let hit_max = (1.0 - max(mx4, e)) / min(4.0 * mn4 - 4.0, vec3f(-0.00001));
   let limit = max(-RCAS_LIMIT, min(max3(max(-hit_min, hit_max)), 0.0));
-  let base_lobe = limit * base_strength;
   let lobe = limit * strength;
-  let base = (base_lobe * (b + d + f + h) + e) / (4.0 * base_lobe + 1.0);
   let color = (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
+  if (!(boost > 1.0)) {
+    return vec4f(saturate(color), 0.0);
+  }
+  let base_lobe = limit * base_strength;
+  let base = (base_lobe * (b + d + f + h) + e) / (4.0 * base_lobe + 1.0);
   // The motion share may restore lost detail but not ring past the local range by more than a few codes
   let lo = min(mn4, e);
   let hi = max(mx4, e);
