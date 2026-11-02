@@ -194,7 +194,7 @@ fn fs_resolve(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   let shift = select(vec2f(0.0), motion, motion_known);
   let prev_position = frag.xy - shift * vec2f(0.5, -0.5) * size;
   let off_screen = !motion_known || any(prev_position < vec2f(0.0)) || any(prev_position >= size);
-  let samples = load_clamped(history_tex, vec2i(floor(prev_position))).a;
+  let samples = abs(load_clamped(history_tex, vec2i(floor(prev_position))).a);
   var history = history_catmull_rom(prev_position, 1.0 / size);
 
   var moment1 = vec3f(0.0);
@@ -227,7 +227,9 @@ fn fs_resolve(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   let reactive = saturate(load_clamped(scene_reactive, pixel).r);
   let blend = max(max(1.0 / next, MIN_BLEND), reactive);
   let resolved = select(mix(history, current, blend), current, blend >= 1.0);
-  return vec4f(resolved, 1.0 / blend);
+  // A negative count marks a moving history held at this frame's cap, so apply can read the blur back without motion
+  let at_cap = !still && next >= cap && blend * next <= 1.0001;
+  return vec4f(resolved, select(1.0, -1.0, at_cap) / blend);
 //#endif
 }
 
@@ -236,14 +238,12 @@ fn fs_apply(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   let pixel = vec2i(floor(frag.xy));
   let centre = load_clamped(history_tex, pixel);
   let e = centre.rgb;
+  let samples = abs(centre.a);
   // Young pixels are still close to one raw frame, which full-strength RCAS pushes past the scene's own range
-  let confidence = saturate((centre.a - 1.0) / (SHARPEN_SAMPLES - 1.0));
-  let motion = load_clamped(scene_motion, pixel).xy;
-  let known = finite2(motion) && all(abs(motion) < vec2f(2.0));
-  let shift = select(vec2f(0.0), motion * vec2f(0.5, -0.5) * vec2f(textureDimensions(history_tex)), known);
+  let confidence = saturate((samples - 1.0) / (SHARPEN_SAMPLES - 1.0));
   // RCAS gives back what this frame's history resample took, so moving detail keeps its still sharpness
-  let still = all(abs(shift) < vec2f(0.01));
-  let boost = 1.0 + MOTION_SHARPEN * select(resample_blur(frag.xy - shift), 0.0, still);
+  let blur = saturate((MOVING_SAMPLES - samples) / (MOVING_SAMPLES - BLURRED_SAMPLES));
+  let boost = 1.0 + MOTION_SHARPEN * select(0.0, blur, centre.a < 0.0);
   let base_strength = min(taa_params.sharpness, 1.0) * confidence;
   let strength = min(taa_params.sharpness * boost, 1.0) * confidence;
   if (!(strength > 0.0)) {

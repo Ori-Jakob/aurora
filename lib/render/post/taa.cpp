@@ -34,8 +34,10 @@ constexpr std::array<shaders::Constant, 5> ResolveConstants{{
     {"FALLBACK_BLUR", FallbackBlur},
     {"BLURRED_SAMPLES", BlurredSamples},
 }};
-constexpr std::array<shaders::Constant, 4> ApplyConstants{{
+constexpr std::array<shaders::Constant, 6> ApplyConstants{{
     {"SHARPEN_SAMPLES", SharpenSamples},
+    {"MOVING_SAMPLES", MovingSamples},
+    {"BLURRED_SAMPLES", BlurredSamples},
     {"MOTION_SHARPEN", MotionSharpen},
     {"OVERSHOOT_SPAN", OvershootSpan},
     {"OVERSHOOT_LIMIT", OvershootLimit},

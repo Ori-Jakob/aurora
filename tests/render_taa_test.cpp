@@ -193,17 +193,21 @@ TEST(TaaRules, ResolveConstantsComeFromHeader) {
   EXPECT_EQ(desc.constants[4].value, double{taa::BlurredSamples});
   EXPECT_LT(taa::MovingSamples, 1.f / taa::MinBlend);
   EXPECT_GE(taa::BlurredSamples, 1.f);
-  EXPECT_LE(taa::BlurredSamples, taa::MovingSamples);
+  EXPECT_LT(taa::BlurredSamples, taa::MovingSamples);
   const shaders::RenderPipelineDesc apply = taa::testing::apply_desc(TextureFormat::BGRA8Unorm);
-  ASSERT_EQ(apply.constants.size(), 4u);
+  ASSERT_EQ(apply.constants.size(), 6u);
   EXPECT_EQ(apply.constants[0].name, "SHARPEN_SAMPLES");
   EXPECT_EQ(apply.constants[0].value, double{taa::SharpenSamples});
-  EXPECT_EQ(apply.constants[1].name, "MOTION_SHARPEN");
-  EXPECT_EQ(apply.constants[1].value, double{taa::MotionSharpen});
-  EXPECT_EQ(apply.constants[2].name, "OVERSHOOT_SPAN");
-  EXPECT_EQ(apply.constants[2].value, double{taa::OvershootSpan});
-  EXPECT_EQ(apply.constants[3].name, "OVERSHOOT_LIMIT");
-  EXPECT_EQ(apply.constants[3].value, double{taa::OvershootLimit});
+  EXPECT_EQ(apply.constants[1].name, "MOVING_SAMPLES");
+  EXPECT_EQ(apply.constants[1].value, double{taa::MovingSamples});
+  EXPECT_EQ(apply.constants[2].name, "BLURRED_SAMPLES");
+  EXPECT_EQ(apply.constants[2].value, double{taa::BlurredSamples});
+  EXPECT_EQ(apply.constants[3].name, "MOTION_SHARPEN");
+  EXPECT_EQ(apply.constants[3].value, double{taa::MotionSharpen});
+  EXPECT_EQ(apply.constants[4].name, "OVERSHOOT_SPAN");
+  EXPECT_EQ(apply.constants[4].value, double{taa::OvershootSpan});
+  EXPECT_EQ(apply.constants[5].name, "OVERSHOOT_LIMIT");
+  EXPECT_EQ(apply.constants[5].value, double{taa::OvershootLimit});
   EXPECT_GT(taa::SharpenSamples, 1.f);
   EXPECT_LE(taa::SharpenSamples, taa::MovingSamples);
 }
@@ -1146,24 +1150,27 @@ TEST_F(TaaGpu, MotionCapsSampleCount) {
   const auto most_samples = [this] {
     float most = 0.f;
     for (const auto& texel : read_history()) {
-      most = std::max(most, texel[3]);
+      most = std::max(most, std::abs(texel[3]));
     }
     return most;
   };
+  const auto interior_count = [this] { return read_history()[size_t{24} * Width + 32][3]; };
   // Whole-texel motion resamples nothing, half-texel motion lands every tap halfway between texels
   const float texel = 2.f / static_cast<float>(Width);
   for (int i = 0; i < 20; ++i) {
     frame(input, texel, 0.f);
   }
   EXPECT_EQ(most_samples(), taa::MovingSamples);
+  EXPECT_EQ(interior_count(), -taa::MovingSamples);
   for (int i = 0; i < 20; ++i) {
     frame(input, 0.5f * texel, 0.f);
   }
   EXPECT_EQ(most_samples(), taa::BlurredSamples);
+  EXPECT_EQ(interior_count(), -taa::BlurredSamples);
   for (int i = 0; i < 20; ++i) {
     frame(input);
   }
-  EXPECT_GT(read_history()[size_t{24} * Width + 32][3], taa::MovingSamples);
+  EXPECT_GT(interior_count(), taa::MovingSamples);
 }
 
 TEST_F(TaaGpu, MovingDetailKeepsStillSharpness) {
