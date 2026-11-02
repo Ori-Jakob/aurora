@@ -336,12 +336,16 @@ if (AURORA_ENABLE_GX)
   target_link_libraries(gx_shader_corpus PRIVATE gx_shader_corpus_lib)
   aurora_copy_runtime_dlls(gx_shader_corpus)
 
-  add_executable(gx_shader_golden_tests gx_shader_golden_test.cpp gx_shader_ext_test.cpp)
+  add_executable(gx_shader_golden_tests gx_shader_golden_test.cpp gx_shader_ext_test.cpp gx_unlit_plan_test.cpp)
   target_compile_definitions(gx_shader_golden_tests PRIVATE
     AURORA_GX_SHADER_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/shaders/gx_shader_golden.txt"
     AURORA_GX_SHADER_GOLDEN_OUT="${CMAKE_CURRENT_BINARY_DIR}/gx_shader_golden_out"
+    AURORA_ENABLE_RENDER=$<BOOL:${AURORA_ENABLE_RENDER}>
   )
   target_link_libraries(gx_shader_golden_tests PRIVATE gx_shader_corpus_lib gtest gtest_main)
+  if (AURORA_ENABLE_RENDER)
+    target_link_libraries(gx_shader_golden_tests PRIVATE yyjson::yyjson)
+  endif ()
   aurora_copy_runtime_dlls(gx_shader_golden_tests)
   gtest_discover_tests(gx_shader_golden_tests)
 
