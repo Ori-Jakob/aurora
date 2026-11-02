@@ -1385,6 +1385,9 @@ void build_stage_bindings(StageData& stage, UniformSink sink) {
       latched = latched_pass_params(node.id);
     }
     std::copy_n(latched.begin(), std::min<size_t>(latched.size(), size), params.bytes.begin());
+    if (node.stageParams != nullptr) {
+      node.stageParams(stage, node.state, std::span{params.bytes}.first(size));
+    }
     params.uniformOffset = sink(reinterpret_cast<const uint8_t*>(params.bytes.data()), params.bytes.size()).offset;
   }
 }

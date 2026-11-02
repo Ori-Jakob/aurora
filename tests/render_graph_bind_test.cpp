@@ -11,9 +11,11 @@
 #include "render/geometry/indirect.hpp"
 #include "render/gpu_heap.hpp"
 #include "render/graph.hpp"
+#include "render/graph_api.hpp"
 #include "render/graph_bind.hpp"
 #include "render/graph_layout.hpp"
 #include "render/graph_pool.hpp"
+#include "render/hints.hpp"
 #include "render/jobs.hpp"
 #include "render/module.hpp"
 #include "render/settings.hpp"
@@ -84,6 +86,7 @@ struct TestPass {
   std::function<void(InternalPassBuilder&)> declare;
   std::function<void(PassContext&)> encode;
   std::function<void(const PipelineSetup&, std::span<uint32_t, MaxPassPipelines>)> pipelines;
+  std::function<void(const StageData&, std::span<std::byte>)> stageParams;
   bool encodes = true;
   mutable int calls = 0;
 };
@@ -107,6 +110,10 @@ void pipelines_test_pass(const PipelineSetup& setup, const void* state, std::spa
   static_cast<const TestPass*>(state)->pipelines(setup, ids);
 }
 
+void stage_params_test_pass(const StageData& stage, const void* state, std::span<std::byte> params) {
+  static_cast<const TestPass*>(state)->stageParams(stage, params);
+}
+
 PassDesc desc_of(const TestPass& pass) {
   return {
       .name = pass.name,
@@ -117,6 +124,7 @@ PassDesc desc_of(const TestPass& pass) {
       .declare = declare_test_pass,
       .encode = pass.encodes ? encode_test_pass : nullptr,
       .pipelines = pass.pipelines ? pipelines_test_pass : nullptr,
+      .stageParams = pass.stageParams ? stage_params_test_pass : nullptr,
       .state = &pass,
   };
 }
@@ -1499,6 +1507,11 @@ std::vector<std::byte> params_bytes(const StageData& stage) {
 
 class GraphBindParamsTest : public GraphBindTest {
 protected:
+  void TearDown() override {
+    testing::reset_external_passes();
+    GraphBindTest::TearDown();
+  }
+
   void register_params_pass(uint32_t paramsSize) {
     m_passes = {params_pass(paramsSize)};
     m_id = register_pass(desc_of(m_passes[0]));
@@ -1618,6 +1631,133 @@ TEST_F(GraphBindParamsTest, UnregisterDropsParams) {
   EXPECT_NE(again, m_id);
   latch_pass_params();
   EXPECT_TRUE(latched_pass_params(again).empty());
+}
+
+TEST_F(GraphBindParamsTest, StageHookOverwritesLatchedBytes) {
+  register_params_pass(16);
+  m_passes[0].stageParams = [](const StageData&, std::span<std::byte> params) {
+    std::fill_n(params.begin() + 4, 4, std::byte{0xC5});
+  };
+  std::vector<std::byte> seen;
+  uint32_t offset = UINT32_MAX;
+  m_passes[0].encode = [&](PassContext& ctx) {
+    seen.assign(ctx.params().begin(), ctx.params().end());
+    offset = ctx.params_offset();
+    const wgpu::ComputePassEncoder pass = ctx.begin_compute();
+    pass.End();
+  };
+  const auto payload = pattern(16, 1);
+  ASSERT_TRUE(set_pass_params(m_id, payload));
+  latch_pass_params();
+  const TestFrame frame = compile_params();
+  ASSERT_EQ(run_frame(frame, 1), std::nullopt);
+
+  auto expected = payload;
+  std::fill_n(expected.begin() + 4, 4, std::byte{0xC5});
+  EXPECT_EQ(seen, expected);
+  EXPECT_TRUE(std::ranges::equal(latched_pass_params(m_id), payload));
+  EXPECT_EQ(std::ranges::count(g_pushes, MaxPassParamsSize), 1);
+  ASSERT_NE(offset, UINT32_MAX);
+  ASSERT_GE(g_uniforms.size(), offset + expected.size());
+  EXPECT_EQ(std::memcmp(g_uniforms.data() + offset, expected.data(), expected.size()), 0);
+}
+
+TEST_F(GraphBindParamsTest, StageHookSeesStageData) {
+  register_params_pass(24);
+  std::vector<size_t> sizes;
+  m_passes[0].stageParams = [&sizes](const StageData& stage, std::span<std::byte> params) {
+    sizes.push_back(params.size());
+    std::memcpy(params.data(), &stage.frameId, sizeof(stage.frameId));
+    if (stage.sceneHints != nullptr) {
+      std::memcpy(params.data() + 8, stage.sceneHints->jitterPx, sizeof(stage.sceneHints->jitterPx));
+    }
+  };
+  const auto payload = pattern(24, 100);
+  ASSERT_TRUE(set_pass_params(m_id, payload));
+  latch_pass_params();
+  const TestFrame frame = compile_params();
+  const auto hints = std::make_shared<SceneHints>();
+  hints->jitterPx[0] = 0.25f;
+  hints->jitterPx[1] = -0.375f;
+
+  StageData hinted = stage_for(frame, Stage::OpaqueDone, 9);
+  hinted.sceneHints = hints;
+  build_stage_bindings(hinted, &fake_sink);
+  StageData plain = stage_for(frame, Stage::OpaqueDone, 10);
+  build_stage_bindings(plain, &fake_sink);
+
+  EXPECT_EQ(sizes, (std::vector<size_t>{24, 24}));
+  auto expected = payload;
+  const uint64_t hintedId = 9;
+  std::memcpy(expected.data(), &hintedId, sizeof(hintedId));
+  std::memcpy(expected.data() + 8, hints->jitterPx, sizeof(hints->jitterPx));
+  EXPECT_EQ(params_bytes(hinted), expected);
+  expected = payload;
+  const uint64_t plainId = 10;
+  std::memcpy(expected.data(), &plainId, sizeof(plainId));
+  EXPECT_EQ(params_bytes(plain), expected);
+}
+
+TEST_F(GraphBindParamsTest, StageHookSkippedWhenDisabled) {
+  int calls = 0;
+  const auto count = [&calls](const StageData&, std::span<std::byte>) { ++calls; };
+  m_passes = {params_pass(16),
+              TestPass{.name = "par.none", .declare = [](InternalPassBuilder& b) { b.side_effect(); }}};
+  m_passes[0].stageParams = count;
+  m_passes[1].stageParams = count;
+  m_id = register_pass(desc_of(m_passes[0]));
+  ASSERT_NE(m_id, InvalidPassId);
+  latch_pass_params();
+  const TestFrame frame = compile_params();
+
+  StageData enabled = stage_for(frame, Stage::OpaqueDone, 1);
+  build_stage_bindings(enabled, &fake_sink);
+  EXPECT_EQ(calls, 1);
+  ASSERT_EQ(enabled.bindings.params.size(), 1u);
+  EXPECT_EQ(enabled.bindings.params[0].node, frame.node("par.pass"));
+
+  StageData disabled = stage_for(frame, Stage::OpaqueDone, 2);
+  set_bit(disabled.enabled, frame.program_index("par.pass"), false);
+  build_stage_bindings(disabled, &fake_sink);
+  EXPECT_EQ(calls, 1);
+  EXPECT_TRUE(disabled.bindings.params.empty());
+  EXPECT_EQ(std::ranges::count(g_pushes, MaxPassParamsSize), 1);
+}
+
+TEST_F(GraphBindParamsTest, ExternalPassIgnoresHook) {
+  const render::PassId id = render::register_pass(render::ExternalPassDesc{
+      .name = "mod.params",
+      .stage = Stage::OpaqueDone,
+      .kind = PassKind::Compute,
+      .paramsSize = 16,
+      .declare = [](PassBuilder& b, void*) { b.side_effect(); },
+      .encode = [](render::PassContext&, void*) {},
+  });
+  ASSERT_NE(id, render::InvalidPass);
+  const auto payload = pattern(16, 40);
+  ASSERT_TRUE(render::set_pass_params(id, payload.data(), payload.size()));
+  latch_external_passes();
+  const std::shared_ptr<const ExternalPassSet> set = snapshot_external_passes();
+  std::vector<PassDesc> descs;
+  append_external_passes(*set, nullptr, descs);
+  ASSERT_EQ(descs.size(), 1u);
+  descs[0].stageParams = [](const StageData&, const void*, std::span<std::byte> params) {
+    std::ranges::fill(params, std::byte{0xEE});
+  };
+  GraphInputs inputs = test_inputs();
+  inputs.passes = descs;
+  inputs.externals = set;
+  const std::shared_ptr<CompiledGraph> graph = compile_graph(inputs);
+  prepare_graph_bindings(*graph);
+  const TestFrame frame{graph};
+  const NodeId node = frame.node("mod.params");
+  ASSERT_NE(node, InvalidNode);
+  EXPECT_TRUE(graph->nodes[node].external);
+  EXPECT_EQ(graph->nodes[node].stageParams, nullptr);
+
+  StageData stage = stage_for(frame, Stage::OpaqueDone, 1);
+  build_stage_bindings(stage, &fake_sink);
+  EXPECT_EQ(params_bytes(stage), payload);
 }
 
 TEST_F(GraphBindTest, FrameConstantsPushedOncePerFrame) {

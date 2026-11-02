@@ -247,6 +247,8 @@ struct PipelineSetup {
 
 using PassPipelinesFn = void (*)(const PipelineSetup& setup, const void* state,
                                  std::span<uint32_t, MaxPassPipelines> pipelines);
+// Runs on the FIFO at stage build after the latched copy, so a pass can add values frozen with the frame's scene hints
+using PassStageParamsFn = void (*)(const StageData& stage, const void* state, std::span<std::byte> params);
 
 struct PassDesc {
   std::string name;
@@ -262,6 +264,7 @@ struct PassDesc {
   PassEncodeFn encode = nullptr;
   PassEncodeNativeFn encodeNative = nullptr;
   PassPipelinesFn pipelines = nullptr;
+  PassStageParamsFn stageParams = nullptr;
   const void* state = nullptr;
 };
 
@@ -370,6 +373,7 @@ struct CompiledNode {
   PassEncodeFn encode = nullptr;
   PassEncodeNativeFn encodeNative = nullptr;
   PassPipelinesFn pipelines = nullptr;
+  PassStageParamsFn stageParams = nullptr;
   std::array<uint32_t, MaxPassPipelines> pipelineIds{};
   const void* state = nullptr;
   std::array<std::byte, PassLocalSize> local{};
