@@ -198,6 +198,8 @@ struct GraphEnvironment {
   uint32_t gxSampleCount = 1;
   AuroraFeatureProfile profile = FEATURE_PROFILE_FULL;
   bool inspectorOpen = false;
+  // Kept here so picking a view in the inspector recompiles the graph the way a settings change does
+  uint16_t viewOverride = 0;
   bool operator==(const GraphEnvironment&) const = default;
 };
 
@@ -208,6 +210,13 @@ struct PassSetup {
   DepthSource sceneDepth = DepthSource::Unavailable;
   bool gx_available(GxResource resource) const noexcept {
     return env != nullptr && env->gxFormats[static_cast<size_t>(resource)] != wgpu::TextureFormat::Undefined;
+  }
+  // The inspector's override wins, as in debug::selected_view_id
+  uint16_t debug_view() const noexcept {
+    if (env != nullptr && env->viewOverride != 0) {
+      return env->viewOverride;
+    }
+    return settings != nullptr ? settings->debugView : 0;
   }
 };
 

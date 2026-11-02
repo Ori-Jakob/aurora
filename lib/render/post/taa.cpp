@@ -89,7 +89,7 @@ inline void bump(std::atomic_uint32_t& counter) noexcept {
 
 void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) {
   const Settings* settings = setup.settings;
-  if (settings == nullptr || !settings->taa || settings->debugView != 0 || !setup.gx_available(GxResource::Motion) ||
+  if (settings == nullptr || !settings->taa || setup.debug_view() != 0 || !setup.gx_available(GxResource::Motion) ||
       temporal_resolve::installed().pass != Pass) {
     builder.skip();
     return;

@@ -5,6 +5,7 @@
 #include "gfx/frame.hpp"
 #include "gfx/resources.hpp"
 #include "gx/hints.hpp"
+#include "render/debug/views.hpp"
 #include "render/frame_state.hpp"
 #include "render/gpu_heap.hpp"
 #include "render/graph.hpp"
@@ -451,29 +452,17 @@ TEST_F(TemporalResolve, JitterPhasesFollowResolver) {
   const uint32_t frame = static_cast<uint32_t>(live_scene_hints().hintFrame);
   motion::latch(Settings{}, true);
   EXPECT_EQ(motion::frame_jitter(), motion::detail::halton_jitter(frame % 8 + 1));
-  for (uint32_t f = 0; f < 64; ++f) {
-    const uint32_t phase = f % temporal_resolve::jitter_phases() + 1;
-    EXPECT_GE(phase, 1u);
-    EXPECT_LE(phase, 8u);
-  }
 
   temporal_resolve::install(&StubResolver);
   EXPECT_EQ(temporal_resolve::jitter_phases(), 16u);
-  begin_hint_frame();
+  // Only phases 9-16 tell a 16-phase cycle from an 8-phase one
+  do {
+    begin_hint_frame();
+  } while (live_scene_hints().hintFrame % 16 < 8);
   const uint32_t next = static_cast<uint32_t>(live_scene_hints().hintFrame);
   motion::latch(Settings{}, true);
   EXPECT_EQ(motion::frame_jitter(), motion::detail::halton_jitter(next % 16 + 1));
-  bool sawPastEight = false;
-  for (uint32_t f = 0; f < 64; ++f) {
-    const uint32_t phase = f % temporal_resolve::jitter_phases() + 1;
-    EXPECT_GE(phase, 1u);
-    EXPECT_LE(phase, 16u);
-    sawPastEight = sawPastEight || phase > 8;
-  }
-  EXPECT_TRUE(sawPastEight);
-  if (next % 16 >= 8) {
-    EXPECT_NE(motion::detail::halton_jitter(next % 16 + 1), motion::detail::halton_jitter(next % 8 + 1));
-  }
+  EXPECT_NE(motion::frame_jitter(), motion::detail::halton_jitter(next % 8 + 1));
 }
 
 TEST_F(TemporalResolve, WantedDrivesJitterLatch) {
@@ -559,6 +548,24 @@ TEST_F(TaaGraph, SkippedUnderDebugView) {
   Settings settings = taa_settings();
   settings.debugView = 16;
   expect_skipped(settings);
+}
+
+TEST_F(TaaGraph, SkippedUnderInspectorViewOverride) {
+  struct ScopedOverride {
+    explicit ScopedOverride(uint16_t id) noexcept { debug::set_view_override(id); }
+    ~ScopedOverride() { debug::set_view_override(0); }
+  };
+  const GraphEnvironment before = gather_graph_environment();
+  for (const uint16_t id : {uint16_t{1}, uint16_t{16}}) {
+    SCOPED_TRACE(id);
+    const ScopedOverride view{id};
+    // The latch recompiles when the environment changes, and that recompile is what turns TAA and its jitter off
+    EXPECT_NE(gather_graph_environment(), before);
+    expect_skipped(taa_settings());
+  }
+  EXPECT_EQ(gather_graph_environment(), before);
+  const auto graph = live_graph(taa_settings());
+  EXPECT_TRUE(taa::jitter_enabled());
 }
 
 TEST_F(TaaGraph, DisabledWithoutMarkerCameraOrAtFinish) {
