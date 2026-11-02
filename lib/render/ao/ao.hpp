@@ -65,12 +65,13 @@ struct QualityRow {
   uint32_t divisor = 2;
 };
 
+// High drops a slice, not a step: slices average linearly, while fewer steps shrink each slice's union and lighten AO
 inline constexpr std::array<QualityRow, 5> QualityTable{{
     {0, 0, 2},
     {1, 2, 2},
     {2, 2, 2},
-    {3, 3, 2},
-    {3, 3, 1},
+    {2, 3, 2},
+    {2, 3, 1},
 }};
 
 struct Params {

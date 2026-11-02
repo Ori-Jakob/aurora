@@ -249,13 +249,13 @@ TEST(AoRules, NoiseFollowsHintFrame) {
   ao::testing::reset();
 }
 
-TEST(AoRules, QualityTableMatchesXeGtao) {
+TEST(AoRules, QualityTableRows) {
   const auto row = [](Quality quality) { return ao::quality_row(quality); };
   EXPECT_EQ(row(Quality::Low).slices, 1u);
   EXPECT_EQ(row(Quality::Low).steps, 2u);
   EXPECT_EQ(row(Quality::Medium).slices, 2u);
   EXPECT_EQ(row(Quality::Medium).steps, 2u);
-  EXPECT_EQ(row(Quality::High).slices, 3u);
+  EXPECT_EQ(row(Quality::High).slices, 2u);
   EXPECT_EQ(row(Quality::High).steps, 3u);
   EXPECT_EQ(row(Quality::Ultra).slices, row(Quality::High).slices);
   EXPECT_EQ(row(Quality::Ultra).steps, row(Quality::High).steps);
@@ -734,14 +734,14 @@ TEST_F(AoGraph, ParamsLatchedEveryFrameAndAfterReinit) {
   m_settings = ao_settings(Quality::High);
   latch(medium.get());
   params = params_from(latched_pass_params(first));
-  EXPECT_EQ(params.sliceCount, 3u);
-  EXPECT_EQ(params.stepsPerSlice, 3u);
+  EXPECT_EQ(params.sliceCount, ao::quality_row(Quality::High).slices);
+  EXPECT_EQ(params.stepsPerSlice, ao::quality_row(Quality::High).steps);
 
   clear_pass_params(first);
   latch_pass_params();
   EXPECT_TRUE(latched_pass_params(first).empty());
   latch(medium.get());
-  EXPECT_EQ(params_from(latched_pass_params(first)).sliceCount, 3u);
+  EXPECT_EQ(params_from(latched_pass_params(first)).stepsPerSlice, ao::quality_row(Quality::High).steps);
 
   ao::shutdown();
   EXPECT_FALSE(ao::pipelines_live());
@@ -793,7 +793,7 @@ TEST_F(AoGraph, CameraFilledAtStageBuild) {
   EXPECT_EQ(params.thickness, ao::ThicknessMetres * 50.f);
   ASSERT_NE(opaque.sceneHints, nullptr);
   EXPECT_EQ(params.noiseIndex, opaque.sceneHints->hintFrame % ao::NoisePeriod);
-  EXPECT_EQ(params.sliceCount, 3u);
+  EXPECT_EQ(params.sliceCount, ao::quality_row(Quality::High).slices);
   const ao::Params latched = params_from(latched_pass_params(graph->nodes[node].id));
   EXPECT_EQ(latched.camera.flags, 0u);
   EXPECT_EQ(latched.effectRadius, 0.f);
