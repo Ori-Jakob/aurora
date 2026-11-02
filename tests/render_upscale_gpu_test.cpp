@@ -1,3 +1,29 @@
+// The FSR CPU references (the YCoCg transform, the luma pyramid's auto exposure and the reset upsample) are ported from
+// AMD FidelityFX Super Resolution 3.1.5 (GPUOpen-LibrariesAndSDKs/FidelityFX-SDK v2.3.0, ffx_fsr3upscaler_common.h,
+// ffx_fsr3upscaler_luma_pyramid.h and ffx_fsr3upscaler_upsample.h), which carry this notice:
+//
+// This file is part of the FidelityFX SDK.
+//
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files(the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and /or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions :
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+
 #include <gtest/gtest.h>
 
 #include "render_fsr_rig.hpp"
@@ -597,6 +623,10 @@ uint16_t float_to_half(float value) {
 
 float round_half(float value) { return half_to_float(float_to_half(value)); }
 
+float srgb_to_linear(float stored) {
+  return stored <= 0.04045f ? stored / 12.92f : std::pow((stored + 0.055f) / 1.055f, 2.4f);
+}
+
 std::array<float, 3> rgb_to_ycocg(const std::array<float, 3>& c) {
   return {0.25f * c[0] + 0.5f * c[1] + 0.25f * c[2], 0.5f * c[0] - 0.5f * c[2],
           -0.25f * c[0] + 0.5f * c[1] - 0.25f * c[2]};
@@ -979,50 +1009,56 @@ TEST_F(FsrGpu, ResetEqualsLanczosUpsample) {
     }
   }
   m_state.output = {Output.width, Output.height};
-  ASSERT_TRUE(run(inputs, 0, fsr::Stage::Accumulate, Jitter));
-  const std::vector<float> upscaled = read_halves(m_state.upscaled[m_state.current()], 4);
-  const auto load = [&](int x, int y) {
-    x = std::clamp(x, 0, static_cast<int>(Render.width) - 1);
-    y = std::clamp(y, 0, static_cast<int>(Render.height) - 1);
-    const Rgba c = inputs.color[static_cast<size_t>(y) * Render.width + static_cast<size_t>(x)];
-    return rgb_to_ycocg({c.r / 255.f, c.g / 255.f, c.b / 255.f});
-  };
-  for (uint32_t py = 0; py < Output.height; ++py) {
-    for (uint32_t px = 0; px < Output.width; ++px) {
-      const float outX = (static_cast<float>(px) + 0.5f) * 0.5f;
-      const float outY = (static_cast<float>(py) + 0.5f) * 0.5f;
-      const int inX = static_cast<int>(std::floor(outX));
-      const int inY = static_cast<int>(std::floor(outY));
-      const float unjitteredX = static_cast<float>(inX) + 0.5f - Jitter[0];
-      const float unjitteredY = static_cast<float>(inY) + 0.5f - Jitter[1];
-      const bool flipCol = unjitteredX > outX;
-      const bool flipRow = unjitteredY > outY;
-      const int left = flipCol ? -2 : -1;
-      const int top = flipRow ? -2 : -1;
-      std::array<float, 3> sum{};
-      float weightSum = 0.f;
-      for (int row = 0; row < 3; ++row) {
-        for (int col = 0; col < 3; ++col) {
-          const int cx = left + (flipCol ? 3 - col : col);
-          const int cy = top + (flipRow ? 3 - row : row);
-          const float dx = unjitteredX - outX + static_cast<float>(cx);
-          const float dy = unjitteredY - outY + static_cast<float>(cy);
-          const int sx = inX + cx;
-          const int sy = inY + cy;
-          const bool onScreen =
-              sx >= 0 && sy >= 0 && sx < static_cast<int>(Render.width) && sy < static_cast<int>(Render.height);
-          const float weight = onScreen ? std::exp(-2.3f * (dx * dx + dy * dy)) : 0.f;
-          const std::array<float, 3> sample = load(sx, sy);
-          for (size_t c = 0; c < 3; ++c) {
-            sum[c] += sample[c] * weight;
+  for (const bool linear : {false, true}) {
+    SCOPED_TRACE(linear ? "linear input" : "stored input");
+    m_state.linear = linear;
+    ASSERT_TRUE(run(inputs, 0, fsr::Stage::Accumulate, Jitter));
+    const std::vector<float> upscaled = read_halves(m_state.upscaled[m_state.current()], 4);
+    const auto load = [&](int x, int y) {
+      x = std::clamp(x, 0, static_cast<int>(Render.width) - 1);
+      y = std::clamp(y, 0, static_cast<int>(Render.height) - 1);
+      const Rgba c = inputs.color[static_cast<size_t>(y) * Render.width + static_cast<size_t>(x)];
+      const std::array<float, 3> rgb{c.r / 255.f, c.g / 255.f, c.b / 255.f};
+      return rgb_to_ycocg(linear ? std::array{srgb_to_linear(rgb[0]), srgb_to_linear(rgb[1]), srgb_to_linear(rgb[2])}
+                                 : rgb);
+    };
+    for (uint32_t py = 0; py < Output.height; ++py) {
+      for (uint32_t px = 0; px < Output.width; ++px) {
+        const float outX = (static_cast<float>(px) + 0.5f) * 0.5f;
+        const float outY = (static_cast<float>(py) + 0.5f) * 0.5f;
+        const int inX = static_cast<int>(std::floor(outX));
+        const int inY = static_cast<int>(std::floor(outY));
+        const float unjitteredX = static_cast<float>(inX) + 0.5f - Jitter[0];
+        const float unjitteredY = static_cast<float>(inY) + 0.5f - Jitter[1];
+        const bool flipCol = unjitteredX > outX;
+        const bool flipRow = unjitteredY > outY;
+        const int left = flipCol ? -2 : -1;
+        const int top = flipRow ? -2 : -1;
+        std::array<float, 3> sum{};
+        float weightSum = 0.f;
+        for (int row = 0; row < 3; ++row) {
+          for (int col = 0; col < 3; ++col) {
+            const int cx = left + (flipCol ? 3 - col : col);
+            const int cy = top + (flipRow ? 3 - row : row);
+            const float dx = unjitteredX - outX + static_cast<float>(cx);
+            const float dy = unjitteredY - outY + static_cast<float>(cy);
+            const int sx = inX + cx;
+            const int sy = inY + cy;
+            const bool onScreen =
+                sx >= 0 && sy >= 0 && sx < static_cast<int>(Render.width) && sy < static_cast<int>(Render.height);
+            const float weight = onScreen ? std::exp(-2.3f * (dx * dx + dy * dy)) : 0.f;
+            const std::array<float, 3> sample = load(sx, sy);
+            for (size_t c = 0; c < 3; ++c) {
+              sum[c] += sample[c] * weight;
+            }
+            weightSum += weight;
           }
-          weightSum += weight;
         }
-      }
-      const std::array<float, 3> rgb = ycocg_to_rgb({sum[0] / weightSum, sum[1] / weightSum, sum[2] / weightSum});
-      const size_t i = (size_t{py} * Output.width + px) * 4;
-      for (size_t c = 0; c < 3; ++c) {
-        ASSERT_NEAR(upscaled[i + c], std::max(0.f, rgb[c]), 2e-3f) << px << "," << py << " " << c;
+        const std::array<float, 3> rgb = ycocg_to_rgb({sum[0] / weightSum, sum[1] / weightSum, sum[2] / weightSum});
+        const size_t i = (size_t{py} * Output.width + px) * 4;
+        for (size_t c = 0; c < 3; ++c) {
+          ASSERT_NEAR(upscaled[i + c], std::max(0.f, rgb[c]), 2e-3f) << px << "," << py << " " << c;
+        }
       }
     }
   }
@@ -1095,6 +1131,71 @@ TEST_F(SceneComposeGpu, RcasZeroIsPassthrough) {
     }
   }
   EXPECT_EQ(compose::testing::counters().sourced, 2u);
+}
+
+TEST_F(SceneComposeGpu, LinearSourceSharpensLikeStored) {
+  ASSERT_TRUE(compose::prepare_pipelines(ComposeMode::InPlace, ColorFormat, DepthFormat, ColorEncoding::Linear));
+  constexpr Extent Size{OutputWidth, OutputHeight};
+  const wgpu::Texture stored = color_texture(Size, TextureFormat::RGBA8Unorm);
+  const wgpu::Texture linear = color_texture(Size, TextureFormat::RGBA16Float);
+  std::vector<Rgba> pattern(size_t{Size.width} * Size.height);
+  std::vector<uint16_t> halves(pattern.size() * 4);
+  for (uint32_t y = 0; y < Size.height; ++y) {
+    for (uint32_t x = 0; x < Size.width; ++x) {
+      const size_t i = size_t{y} * Size.width + x;
+      const uint32_t bits = mix_bits(x, y);
+      pattern[i] = {.r = static_cast<uint8_t>(bits),
+                    .g = static_cast<uint8_t>(bits >> 8),
+                    .b = static_cast<uint8_t>(bits >> 16),
+                    .a = 255};
+      halves[i * 4 + 0] = float_to_half(srgb_to_linear(pattern[i].r / 255.f));
+      halves[i * 4 + 1] = float_to_half(srgb_to_linear(pattern[i].g / 255.f));
+      halves[i * 4 + 2] = float_to_half(srgb_to_linear(pattern[i].b / 255.f));
+      halves[i * 4 + 3] = float_to_half(1.f);
+    }
+  }
+  write_color(stored, pattern, false);
+  const wgpu::TexelCopyTextureInfo destination{.texture = linear};
+  const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = Size.width * 8, .rowsPerImage = Size.height};
+  const wgpu::Extent3D extent{Size.width, Size.height, 1};
+  m_device->queue.WriteTexture(&destination, halves.data(), halves.size() * sizeof(uint16_t), &layout, &extent);
+  const wgpu::Texture target = color_texture(Size);
+  const compose::Targets targets{.colorTexture = target, .color = target.CreateView(), .colorFormat = ColorFormat};
+  SceneComposeData data{.mode = ComposeMode::InPlace};
+  data.rcasStrength = 1.f;
+  ASSERT_TRUE(run(data, Size, Size, targets,
+                  compose::Source{.view = stored.CreateView(), .format = TextureFormat::RGBA8Unorm}));
+  const std::vector<Rgba> fromStored = read_color(target);
+  ASSERT_TRUE(run(data, Size, Size, targets,
+                  compose::Source{.view = linear.CreateView(),
+                                  .format = TextureFormat::RGBA16Float,
+                                  .encoding = ColorEncoding::Linear}));
+  const std::vector<Rgba> fromLinear = read_color(target);
+  int worst = 0;
+  size_t sharpened = 0;
+  for (size_t i = 0; i < pattern.size(); ++i) {
+    worst = std::max({worst, std::abs(fromStored[i].r - fromLinear[i].r), std::abs(fromStored[i].g - fromLinear[i].g),
+                      std::abs(fromStored[i].b - fromLinear[i].b)});
+    sharpened += fromStored[i].r != pattern[i].r || fromStored[i].g != pattern[i].g ? 1 : 0;
+  }
+  RecordProperty("worst", worst);
+  EXPECT_LE(worst, 1);
+  EXPECT_GT(sharpened, pattern.size() / 2);
+}
+
+TEST_F(SceneComposeGpu, ForgottenSourceLeavesGroupCache) {
+  constexpr Extent Size{OutputWidth, OutputHeight};
+  const wgpu::Texture target = color_texture(Size);
+  const wgpu::Texture source = color_texture(Size, TextureFormat::RGBA8Unorm);
+  const wgpu::TextureView view = source.CreateView();
+  const compose::Targets targets{.colorTexture = target, .color = target.CreateView(), .colorFormat = ColorFormat};
+  const SceneComposeData data{.mode = ComposeMode::InPlace};
+  ASSERT_TRUE(run(data, Size, Size, targets, compose::Source{.view = view, .format = TextureFormat::RGBA8Unorm}));
+  EXPECT_TRUE(compose::testing::caches_source(view));
+  compose::forget_source(view);
+  EXPECT_FALSE(compose::testing::caches_source(view));
+  ASSERT_TRUE(run(data, Size, Size, targets, compose::Source{.view = view, .format = TextureFormat::RGBA8Unorm}));
+  EXPECT_TRUE(compose::testing::caches_source(view));
 }
 
 class FsrGraphGpu {
@@ -1378,6 +1479,25 @@ TEST_F(FsrGpu, LeavesEfbAlphaUntouched) {
       }
       EXPECT_EQ(fsr_pass::testing::counters().skipped, 0u);
     }
+  }
+}
+
+TEST_F(FsrGpu, LinearColourRoundTripsFlatScene) {
+  constexpr Rgba Flat{.r = 40, .g = 128, .b = 220, .a = 255};
+  for (const UpscalerQuality quality : {UpscalerQuality::NativeAa, UpscalerQuality::Quality}) {
+    SCOPED_TRACE(static_cast<int>(quality));
+    FsrGraphGpu gpu{*m_device, m_options};
+    ASSERT_TRUE(gpu.rig.ok());
+    upscale::testing::set_color_env(ColorEncoding::Linear);
+    gpu.rig.install(fsr_rig::fsr_settings(quality, 1.f));
+    std::vector<Rgba> output;
+    for (int frame = 0; frame < 4; ++frame) {
+      output = gpu.frame([](float, float) { return Flat; });
+    }
+    const Errors errors = rgb_errors(output, std::vector<Rgba>(output.size(), Flat), 64, 0);
+    RecordProperty(quality == UpscalerQuality::NativeAa ? "native_max" : "quality_max", errors.max);
+    EXPECT_LE(errors.max, 2);
+    EXPECT_EQ(fsr_pass::testing::counters().skipped, 0u);
   }
 }
 

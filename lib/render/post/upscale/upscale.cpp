@@ -76,7 +76,6 @@ EnvOverride<ColorEncoding> g_colorOverride;
 const temporal_resolve::Resolver* g_installed = nullptr;
 const CompiledGraph* g_checkedGraph = nullptr;
 bool g_warnedLateWriter = false;
-bool g_warnedLinearFsr = false;
 
 std::atomic_bool g_splitLive{false};
 std::atomic_bool g_nativeInPlace{false};
@@ -297,6 +296,7 @@ bool on_latch(const Settings& settings) {
   if (resolver != nullptr) {
     const GraphExtent size = resolver->scene_size(output);
     wanted = size == output ? GraphExtent{} : size;
+    encoding = color_env().value_or(ColorEncoding::Stored);
   } else if (vendor != nullptr) {
     const std::optional<native_upscale::Selection> selection =
         native_upscale::select(*vendor, settings.upscalerQuality, output);
@@ -320,16 +320,16 @@ bool on_latch(const Settings& settings) {
   const wgpu::Extent3D scene = webgpu::scene_extent();
   const GraphExtent current = webgpu::scene_split_active() ? GraphExtent{scene.width, scene.height} : GraphExtent{};
   const bool resolverChanged = resolver != g_installed;
-  if (fsr && color_env() == ColorEncoding::Linear && !std::exchange(g_warnedLinearFsr, true)) {
-    Log.warn("AURORA_RENDER_UPSCALER_COLOR=linear: FSR keeps stored colour");
-  }
   bool switched = false;
   if (wanted != current || resolverChanged) {
     const wgpu::TextureFormat colorFormat = webgpu::g_frameBuffer.format;
     const wgpu::TextureFormat depthFormat = webgpu::g_graphicsConfig.depthFormat;
     bool warm = wanted.width == 0 || compose::prepare_pipelines(ComposeMode::Split, colorFormat, depthFormat);
     if (fsr) {
-      warm = fsr_pass::prepare(wanted.width == 0, colorFormat) && warm;
+      warm =
+          fsr_pass::prepare(wanted.width == 0, colorFormat) &&
+          (wanted.width == 0 || compose::prepare_pipelines(ComposeMode::Split, colorFormat, depthFormat, encoding)) &&
+          warm;
     } else if (vendor != nullptr) {
       const ComposeMode mode = wanted.width == 0 ? ComposeMode::InPlace : ComposeMode::Split;
       warm = compose::prepare_pipelines(mode, colorFormat, depthFormat) &&
@@ -488,7 +488,6 @@ void reset() noexcept {
   g_signsOverride = {};
   g_colorOverride = {};
   g_warnedLateWriter = false;
-  g_warnedLinearFsr = false;
   g_checkedGraph = nullptr;
   g_rcasStrength.store(0.f, std::memory_order_relaxed);
   compose::testing::reset();

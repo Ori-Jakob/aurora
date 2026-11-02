@@ -53,6 +53,6 @@ struct Frame {
 Counters counters() noexcept;
 Frame last_frame() noexcept;
 void reset() noexcept;
-shaders::RenderPipelineDesc apply_desc(wgpu::TextureFormat format);
+shaders::RenderPipelineDesc apply_desc(wgpu::TextureFormat format, bool linear = false);
 } // namespace testing
 } // namespace aurora::render::detail::upscale::fsr_pass

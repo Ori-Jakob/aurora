@@ -48,6 +48,8 @@ using wgpu::TextureFormat;
 constexpr float DefaultUnitsPerMeter = 100.f;
 constexpr uint64_t LayoutSalt = 0x4653'5233'5550'5343ull;
 constexpr std::array<std::string_view, 1> LocksR8Defines{"FSR_LOCKS_R8"};
+constexpr std::array<std::string_view, 1> LinearDefines{"FSR_LINEAR_INPUT"};
+constexpr std::array<std::string_view, 2> LocksR8LinearDefines{"FSR_LINEAR_INPUT", "FSR_LOCKS_R8"};
 
 constexpr std::array<std::string_view, StageCount> ShaderIds{
     "post/upscale/fsr/fsr_prepare_inputs",   "post/upscale/fsr/fsr_luma_pyramid_a",
@@ -143,8 +145,8 @@ struct Shared {
 
 struct TestShared {
   wgpu::BindGroupLayout frameLayout;
-  std::array<Pipelines, 2> pipelines;
-  std::array<bool, 2> requested{};
+  std::array<Pipelines, 4> pipelines;
+  std::array<bool, 4> requested{};
   wgpu::Buffer constants;
   wgpu::Buffer params;
   std::array<wgpu::Sampler, 4> samplers;
@@ -160,6 +162,18 @@ constexpr uint32_t groups(uint32_t size, uint32_t group) noexcept { return (size
 
 constexpr bool uses_locks(Stage stage) noexcept {
   return stage == Stage::PrepareReactivity || stage == Stage::Accumulate;
+}
+
+constexpr bool reads_input_color(Stage stage) noexcept {
+  return stage == Stage::PrepareInputs || stage == Stage::Accumulate;
+}
+
+std::span<const std::string_view> stage_defines(bool r8, bool linear) noexcept {
+  if (linear) {
+    return r8 ? std::span<const std::string_view>{LocksR8LinearDefines}
+              : std::span<const std::string_view>{LinearDefines};
+  }
+  return r8 ? std::span<const std::string_view>{LocksR8Defines} : std::span<const std::string_view>{};
 }
 
 wgpu::BindGroupLayoutEntry layout_entry(uint32_t binding, const Binding& info) {
@@ -529,7 +543,8 @@ Refs declare(PassBuilder& builder, const Selection& selection) {
   return refs;
 }
 
-bool request_pipelines(const wgpu::BindGroupLayout& frameLayout, uint64_t layoutKey, bool locksR8, Pipelines& out) {
+bool request_pipelines(const wgpu::BindGroupLayout& frameLayout, uint64_t layoutKey, bool locksR8, bool linear,
+                       Pipelines& out) {
   if (!webgpu::g_device || !frameLayout) {
     return false;
   }
@@ -539,6 +554,7 @@ bool request_pipelines(const wgpu::BindGroupLayout& frameLayout, uint64_t layout
     layouts = pipeline_layouts_locked(frameLayout, locksR8).layouts;
   }
   out.locksR8 = locksR8;
+  out.linear = linear;
   for (size_t i = 0; i < StageCount; ++i) {
     const auto stage = static_cast<Stage>(i);
     const bool r8 = locksR8 && uses_locks(stage);
@@ -546,7 +562,7 @@ bool request_pipelines(const wgpu::BindGroupLayout& frameLayout, uint64_t layout
         .label = "aurora.fsr",
         .shader = shader_id(stage),
         .entryPoint = "main",
-        .defines = r8 ? std::span<const std::string_view>{LocksR8Defines} : std::span<const std::string_view>{},
+        .defines = stage_defines(r8, linear && reads_input_color(stage)),
         .layout = layouts[i],
         .layoutKey = layoutKey ^ (LayoutSalt + (i << 1) + (r8 ? 1 : 0)),
     });
@@ -649,9 +665,9 @@ bool run(State& state, const Inputs& inputs, Stage last) {
     std::lock_guard lock{g_mutex};
     ensure_test_shared_locked(device);
   }
-  const size_t variant = locksR8 ? 1 : 0;
+  const size_t variant = (locksR8 ? 1 : 0) + (state.linear ? 2 : 0);
   if (!g_test.requested[variant]) {
-    if (!request_pipelines(g_test.frameLayout, 0x7465'7374ull, locksR8, g_test.pipelines[variant])) {
+    if (!request_pipelines(g_test.frameLayout, 0x7465'7374ull, locksR8, state.linear, g_test.pipelines[variant])) {
       return false;
     }
     g_test.requested[variant] = true;

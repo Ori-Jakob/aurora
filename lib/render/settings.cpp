@@ -118,7 +118,7 @@ constexpr BuiltOptions DefaultBuiltOptions = [] {
   // TAA is the first tier-B feature; its support check recurses into GBuffer's built bit
   built[static_cast<size_t>(Feature::GBuffer)] = 1u << 1;
   built[static_cast<size_t>(Feature::Taa)] = 1u << 1;
-  // FSR is portable; Auto resolves to it until a native option is built
+  // FSR is portable, so Auto falls back to it whenever no native option is supported
   built[static_cast<size_t>(Feature::Upscaler)] = (1u << 1) | (1u << 4);
   built[static_cast<size_t>(Feature::Upscaler)] |= 1u << 3;
   built[static_cast<size_t>(Feature::Upscaler)] |= 1u << 2;

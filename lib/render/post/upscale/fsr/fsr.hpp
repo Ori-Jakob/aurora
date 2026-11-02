@@ -104,6 +104,7 @@ struct Refs {
 struct Pipelines {
   std::array<shaders::PipelineId, StageCount> ids{};
   bool locksR8 = false;
+  bool linear = false;
 };
 
 struct FrameGroup {
@@ -153,7 +154,8 @@ struct Bindings {
 [[nodiscard]] std::string_view shader_id(Stage stage) noexcept;
 
 Refs declare(PassBuilder& builder, const Selection& selection);
-bool request_pipelines(const wgpu::BindGroupLayout& frameLayout, uint64_t layoutKey, bool locksR8, Pipelines& out);
+bool request_pipelines(const wgpu::BindGroupLayout& frameLayout, uint64_t layoutKey, bool locksR8, bool linear,
+                       Pipelines& out);
 [[nodiscard]] bool pipelines_ready(const Pipelines& pipelines) noexcept;
 bool encode(const wgpu::CommandEncoder& cmd, const Pipelines& pipelines, const FrameGroup& frame,
             const Bindings& bindings, GraphExtent render, GraphExtent output, Stage last = Stage::Accumulate);
@@ -179,6 +181,7 @@ struct State {
   GraphExtent render;
   GraphExtent output;
   bool locksR8 = false;
+  bool linear = false;
   uint32_t frames = 0;
   wgpu::Texture dilatedDepth;
   wgpu::Texture dilatedMotion;

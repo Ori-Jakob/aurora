@@ -24,6 +24,7 @@
 // THE SOFTWARE.
 
 //#import aurora/frame
+//#import aurora/srgb
 
 struct FsrParams {
   jitter: vec2f,
@@ -46,6 +47,16 @@ struct FsrParams {
 
 @group(0) @binding(1) var<uniform> fsr: FsrParams;
 @group(0) @binding(2) var linear_clamp: sampler;
+
+// Not in AMD's FSR: the EFB colour is gamma encoded, and AURORA_RENDER_UPSCALER_COLOR=linear decodes it for an A/B
+fn load_input_rgb(input: texture_2d<f32>, p: vec2i) -> vec3f {
+  let stored = textureLoad(input, p, 0).rgb;
+//#if FSR_LINEAR_INPUT
+  return srgb_to_linear(stored);
+//#else
+  return stored;
+//#endif
+}
 
 const FP16_MIN: f32 = 6.10e-05;
 const FP16_MAX: f32 = 65504.0;

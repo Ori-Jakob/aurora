@@ -37,6 +37,7 @@ constexpr uint32_t ApplyOffset = 512;
 constexpr float DefaultUnitsPerMeter = 100.f;
 constexpr wgpu::ColorWriteMask RgbMask =
     wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue;
+constexpr std::array<std::string_view, 1> ApplyLinearDefines{"FSR_APPLY_LINEAR"};
 
 struct Local {
   uint16_t color = 0;
@@ -82,10 +83,12 @@ struct Prepared {
   wgpu::BindGroupLayout frameLayout;
   bool requested = false;
   bool locksR8 = false;
+  bool linear = false;
   fsr::Pipelines compute;
   wgpu::BindGroupLayout applyLayout;
   wgpu::PipelineLayout applyPipelineLayout;
   TextureFormat applyFormat = TextureFormat::Undefined;
+  bool applyLinear = false;
   shaders::PipelineId apply;
 };
 
@@ -164,27 +167,33 @@ void ensure_apply_layout_locked() {
   g_prepared.applyPipelineLayout = webgpu::g_device.CreatePipelineLayout(&pipelineDescriptor);
 }
 
-bool request_locked(const wgpu::BindGroupLayout& frameLayout, bool locksR8, bool inPlace, TextureFormat colorFormat) {
+bool linear_input() { return color_env() == ColorEncoding::Linear; }
+
+bool request_locked(const wgpu::BindGroupLayout& frameLayout, bool locksR8, bool linear, bool inPlace,
+                    TextureFormat colorFormat) {
   if (!webgpu::g_device || !frameLayout) {
     return false;
   }
-  if (!g_prepared.requested || g_prepared.frameLayout.Get() != frameLayout.Get() || g_prepared.locksR8 != locksR8) {
+  if (!g_prepared.requested || g_prepared.frameLayout.Get() != frameLayout.Get() || g_prepared.locksR8 != locksR8 ||
+      g_prepared.linear != linear) {
     fsr::Pipelines compute;
-    if (!fsr::request_pipelines(frameLayout, LayoutKey, locksR8, compute)) {
+    if (!fsr::request_pipelines(frameLayout, LayoutKey, locksR8, linear, compute)) {
       return false;
     }
     g_prepared.frameLayout = frameLayout;
     g_prepared.locksR8 = locksR8;
+    g_prepared.linear = linear;
     g_prepared.compute = compute;
     g_prepared.requested = true;
   }
-  if (inPlace && g_prepared.applyFormat != colorFormat) {
+  if (inPlace && (g_prepared.applyFormat != colorFormat || g_prepared.applyLinear != linear)) {
     ensure_apply_layout_locked();
-    shaders::RenderPipelineDesc desc = testing::apply_desc(colorFormat);
+    shaders::RenderPipelineDesc desc = testing::apply_desc(colorFormat, linear);
     desc.layout = g_prepared.applyPipelineLayout;
     desc.layoutKey = ApplyLayoutKey;
     g_prepared.apply = shaders::request_render(desc);
     g_prepared.applyFormat = colorFormat;
+    g_prepared.applyLinear = linear;
   }
   return true;
 }
@@ -464,7 +473,9 @@ void encode(PassContext& ctx, const void*) {
     }
   } else {
     // A history outlives the graph's last use, so compose can still read it after PrePost
-    compose::publish_source({.view = bindings.upscaled, .format = TextureFormat::RGBA16Float});
+    compose::publish_source({.view = bindings.upscaled,
+                             .format = TextureFormat::RGBA16Float,
+                             .encoding = prepared.linear ? ColorEncoding::Linear : ColorEncoding::Stored});
     published = ctx.texture(upscaledRef);
     bump(g_published);
   }
@@ -519,8 +530,9 @@ void shutdown() noexcept {
 bool prepare(bool inPlace, wgpu::TextureFormat colorFormat) {
   const wgpu::BindGroupLayout frameLayout = frame_layout();
   const bool locksR8 = caps().textureFormatsTier2;
+  const bool linear = linear_input();
   std::lock_guard lock{g_mutex};
-  return request_locked(frameLayout, locksR8, inPlace, colorFormat) && ready_locked();
+  return request_locked(frameLayout, locksR8, linear, inPlace, colorFormat) && ready_locked();
 }
 
 void on_latch(const Settings& settings, const CompiledGraph* graph, const Signs& signs) {
@@ -548,8 +560,9 @@ void on_latch(const Settings& settings, const CompiledGraph* graph, const Signs&
   if (live) {
     const wgpu::BindGroupLayout frameLayout = frame_layout();
     const bool locksR8 = caps().textureFormatsTier2;
+    const bool linear = linear_input();
     std::lock_guard lock{g_mutex};
-    request_locked(frameLayout, locksR8, inPlace, webgpu::g_frameBuffer.format);
+    request_locked(frameLayout, locksR8, linear, inPlace, webgpu::g_frameBuffer.format);
   }
   g_live.store(live, std::memory_order_relaxed);
 }
@@ -583,12 +596,13 @@ void reset() noexcept {
   g_skippedNoScene.store(0, std::memory_order_relaxed);
 }
 
-shaders::RenderPipelineDesc apply_desc(wgpu::TextureFormat format) {
+shaders::RenderPipelineDesc apply_desc(wgpu::TextureFormat format, bool linear) {
   shaders::RenderPipelineDesc desc{
       .label = "aurora.fsr apply",
       .shader = ApplyShader,
       .vertexEntry = "vs_main",
       .fragmentEntry = "fs_main",
+      .defines = linear ? std::span<const std::string_view>{ApplyLinearDefines} : std::span<const std::string_view>{},
       .colorCount = 1,
   };
   desc.colors[0] = {.format = format, .writeMask = RgbMask};

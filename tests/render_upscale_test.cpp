@@ -413,6 +413,39 @@ TEST_F(SceneSplit, CopyAfterSplitUsesOutputScale) {
   EXPECT_EQ(copy.height, static_cast<int32_t>(OutputHeight / 2));
 }
 
+TEST_F(SceneSplit, OutputPixelRectsScaleToSceneTarget) {
+  struct PolicyGuard {
+    AuroraViewportPolicy saved = gx::g_gxState.viewportPolicy;
+    ~PolicyGuard() { gx::g_gxState.viewportPolicy = saved; }
+  } guard;
+  gx::g_gxState.viewportPolicy = AURORA_VIEWPORT_NATIVE;
+  upscale::testing::set_split_env(2.f);
+  start_frame();
+  ASSERT_EQ(gfx::get_render_target_size(), (Vec2<uint32_t>{SceneAtTwo.width, SceneAtTwo.height}));
+  const gfx::Viewport full{0.f, 0.f, static_cast<float>(OutputWidth), static_cast<float>(OutputHeight), 0.f, 1.f};
+  const gfx::ClipRect fullScissor{0, 0, static_cast<int32_t>(OutputWidth), static_cast<int32_t>(OutputHeight)};
+  for (const gfx::Viewport& viewport : {gx::map_logical_viewport(full), gx::map_render_viewport(full)}) {
+    EXPECT_EQ(viewport.width, static_cast<float>(SceneAtTwo.width));
+    EXPECT_EQ(viewport.height, static_cast<float>(SceneAtTwo.height));
+  }
+  for (const gfx::ClipRect& scissor : {gx::map_logical_scissor(fullScissor), gx::map_render_scissor(fullScissor)}) {
+    EXPECT_EQ(scissor.width, static_cast<int32_t>(SceneAtTwo.width));
+    EXPECT_EQ(scissor.height, static_cast<int32_t>(SceneAtTwo.height));
+  }
+  gfx::record_stage(Stage::PrePost);
+  // Past the compose the pass is output-sized, so output pixels pass through untouched
+  EXPECT_EQ(gx::map_render_viewport(full).width, static_cast<float>(OutputWidth));
+  EXPECT_EQ(gx::map_logical_scissor(fullScissor).width, static_cast<int32_t>(OutputWidth));
+}
+
+TEST(UpscaleRules, OutputPixelScale) {
+  EXPECT_EQ(gx::output_pixel_scale({80, 60}, {160, 120}), (Vec2<float>{0.5f, 0.5f}));
+  EXPECT_EQ(gx::output_pixel_scale({1706, 960}, {2560, 1440}), (Vec2<float>{1706.f / 2560.f, 960.f / 1440.f}));
+  EXPECT_EQ(gx::output_pixel_scale({160, 120}, {160, 120}), (Vec2<float>{1.f, 1.f}));
+  EXPECT_EQ(gx::output_pixel_scale({0, 0}, {160, 120}), (Vec2<float>{1.f, 1.f}));
+  EXPECT_EQ(gx::output_pixel_scale({80, 60}, {0, 0}), (Vec2<float>{1.f, 1.f}));
+}
+
 TEST_F(SceneSplit, OffWhenMsaaOrCompat) {
   constexpr GraphExtent Output{OutputWidth, OutputHeight};
   EXPECT_EQ(upscale::wanted_scene_size({.output = Output, .ratio = 2.f, .sceneTargets = true}), SceneAtTwo);

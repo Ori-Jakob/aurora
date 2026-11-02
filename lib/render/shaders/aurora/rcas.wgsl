@@ -41,6 +41,11 @@ fn rcas_sharpen(t: texture_2d<f32>, pixel: vec2i, sharpness: f32) -> vec3f {
   let d = rcas_tap(t, pixel + vec2i(-1, 0));
   let f = rcas_tap(t, pixel + vec2i(1, 0));
   let h = rcas_tap(t, pixel + vec2i(0, 1));
+  return rcas_filter(e, b, d, f, h, sharpness);
+}
+
+// Callers that hold linear colour pass stored-space taps, so one strength sharpens every resolver alike
+fn rcas_filter(e: vec3f, b: vec3f, d: vec3f, f: vec3f, h: vec3f, sharpness: f32) -> vec3f {
   let mn4 = min(min(b, d), min(f, h));
   let mx4 = max(max(b, d), max(f, h));
   let hit_min = min(mn4, e) / max(4.0 * mx4, vec3f(0.00001));

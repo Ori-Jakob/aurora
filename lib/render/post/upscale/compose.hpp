@@ -51,6 +51,8 @@ void request_native_step(const gfx::detail::NativeStep& step, const Source& out)
 bool take_native_step(gfx::detail::NativeStep& step) noexcept;
 void write_native_status(bool ok) noexcept;
 void drop_native_step() noexcept;
+// Render worker only; a cached bind group would otherwise keep a freed native output's memory alive
+void forget_source(const wgpu::TextureView& view) noexcept;
 void shutdown() noexcept;
 
 namespace testing {
@@ -70,5 +72,6 @@ shaders::RenderPipelineDesc pipeline_desc(ComposeMode mode, wgpu::TextureFormat 
                                           ColorEncoding encoding = ColorEncoding::Stored);
 bool encode(wgpu::CommandEncoder& cmd, const SceneComposeData& data, const Targets& targets,
             const std::optional<Source>& source);
+[[nodiscard]] bool caches_source(const wgpu::TextureView& view) noexcept;
 } // namespace testing
 } // namespace aurora::render::detail::upscale::compose

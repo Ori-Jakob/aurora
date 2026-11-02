@@ -1191,20 +1191,20 @@ void handle_aurora(ByteReader& reader) noexcept {
     const f32 height = reader.read<f32>();
     const f32 nearZ = reader.read<f32>();
     const f32 farZ = reader.read<f32>();
-    set_render_viewport({
+    set_render_viewport(map_render_viewport({
         .left = left,
         .top = top,
         .width = width,
         .height = height,
         .znear = nearZ,
         .zfar = farZ,
-    });
+    }));
   } else if (subCmd == GX_AURORA_LOAD_SCISSOR_RENDER) {
     const s32 left = reader.read<s32>();
     const s32 top = reader.read<s32>();
     const s32 width = reader.read<s32>();
     const s32 height = reader.read<s32>();
-    set_render_scissor({left, top, width, height});
+    set_render_scissor(map_render_scissor({left, top, width, height}));
   } else if (subCmd == GX_AURORA_LOAD_PROJECTION_FULL) {
     auto& proj = g_gxState.proj;
     for (int r = 0; r < 4; ++r) {

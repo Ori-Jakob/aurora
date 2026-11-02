@@ -1,17 +1,21 @@
 #include <gtest/gtest.h>
 
+#include "gfx/clear.hpp"
+#include "gfx/frame_packet.hpp"
 #include "gfx/pipeline_cache.hpp"
 #include "gfx/scene_targets.hpp"
 #include "gx/pipeline.hpp"
 #include "internal.hpp"
 #include "webgpu/gpu.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace aurora::gfx {
 namespace {
@@ -327,6 +331,56 @@ TEST(SceneLayout, WarmPromotionRules) {
   EXPECT_EQ(detail::promoted(Warm, Blocking), Blocking);
   EXPECT_EQ(detail::promoted(Normal, Warm), Normal);
   EXPECT_EQ(detail::promoted(Normal, Blocking), Normal);
+}
+
+TEST(PipelineCacheLayouts, RebuildRemembersEverySwitchableLayout) {
+  shutdown_pipeline_cache();
+  rebuild_pipeline_cache();
+  const SceneLayoutBase base = live_layout_base();
+  RenderTargetLayout offscreen = pipeline_base_layout(scene_render_target_layout());
+  offscreen.colorAttachmentCount = 1;
+  offscreen.sampleCount = 1;
+  detail::finalize_render_target_layout(offscreen);
+  std::vector<uint64_t> expected;
+  for (const uint64_t key : {compose_scene_layout({}, base).key, compose_scene_layout({.normal = true}, base).key,
+                             compose_scene_layout({.gbuffer = true}, base).key, offscreen.key}) {
+    if (std::ranges::find(expected, key) == expected.end()) {
+      expected.push_back(key);
+    }
+  }
+  EXPECT_EQ(testing::remembered_layout_keys(), expected);
+  shutdown_pipeline_cache();
+  EXPECT_TRUE(testing::remembered_layout_keys().empty());
+}
+
+std::vector<uint64_t> g_createLayouts;
+
+CompiledPipeline record_gx_create(const gx::PipelineConfig&, const RenderTargetLayout&) {
+  g_createLayouts.push_back(webgpu::current_cache_layout());
+  return {};
+}
+
+wgpu::RenderPipeline record_clear_create(const clear::PipelineConfig&, const RenderTargetLayout&) {
+  g_createLayouts.push_back(webgpu::current_cache_layout());
+  return {};
+}
+
+TEST(PipelineCacheLayouts, CreatesRunInTheirLayoutScope) {
+  g_createLayouts.clear();
+  shutdown_pipeline_cache();
+  const testing::CreateHooks saved =
+      testing::set_create_hooks({.gx = &record_gx_create, .clear = &record_clear_create});
+  // No pipeline thread runs here, so blocking lookups build inline on this thread
+  set_blocking_pipelines(true);
+  const RenderTargetLayout gbuffer = compose_scene_layout({.gbuffer = true}, test_base());
+  const RenderTargetLayout legacy = compose_scene_layout({}, test_base());
+  find_pipeline(gx::PipelineConfig{}, gbuffer);
+  find_pipeline(clear::PipelineConfig{}, legacy);
+  set_blocking_pipelines(false);
+  testing::set_create_hooks(saved);
+  shutdown_pipeline_cache();
+  EXPECT_EQ(g_createLayouts, (std::vector{gbuffer.key, legacy.key}));
+  EXPECT_EQ(webgpu::current_cache_layout(), 0u);
 }
 } // namespace
 } // namespace aurora::gfx

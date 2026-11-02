@@ -1,4 +1,5 @@
 //#import aurora/rcas
+//#import aurora/srgb
 
 struct ComposeParams {
   scale: vec2f,
@@ -34,15 +35,25 @@ fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
 
 fn stored_rgb(rgb: vec3f) -> vec3f {
 //#if COMPOSE_LINEAR
-  let linear = saturate(rgb);
-  return select(1.055 * pow(linear, vec3f(1.0 / 2.4)) - 0.055, linear * 12.92, linear <= vec3f(0.0031308));
+  return linear_to_srgb(rgb);
 //#else
   return rgb;
 //#endif
 }
 
+fn stored_tap(p: vec2i) -> vec3f {
+  return stored_rgb(rcas_tap(source_color, p));
+}
+
 fn source_rgb(position: vec2f) -> vec3f {
-  return stored_rgb(rcas_sharpen(source_color, vec2i(floor(position)), params.rcas_strength));
+  let p = vec2i(floor(position));
+  let e = stored_tap(p);
+  if (!(params.rcas_strength > 0.0)) {
+    return e;
+  }
+  // TAA, FSR and DLSS sharpen stored colour, so a linear source is sharpened on its re-encoded taps too
+  return rcas_filter(e, stored_tap(p + vec2i(0, -1)), stored_tap(p + vec2i(-1, 0)), stored_tap(p + vec2i(1, 0)),
+                     stored_tap(p + vec2i(0, 1)), params.rcas_strength);
 }
 
 //#if COMPOSE_INPLACE

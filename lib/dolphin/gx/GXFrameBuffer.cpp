@@ -12,9 +12,19 @@
 #include <cmath>
 
 namespace {
+aurora::Vec2<uint32_t> scaled_size(u32 width, u32 height, float scaleX, float scaleY) {
+  const auto scaledWidth = std::max<u32>(static_cast<u32>(std::lround(static_cast<float>(width) * scaleX)), 1);
+  const auto scaledHeight = std::max<u32>(static_cast<u32>(std::lround(static_cast<float>(height) * scaleY)), 1);
+  return {scaledWidth, scaledHeight};
+}
+
 aurora::Vec2<uint32_t> scale_copy_dst(u32 logicalWidth, u32 logicalHeight) {
   if (g_gxState.viewportPolicy == AURORA_VIEWPORT_NATIVE) {
-    return {logicalWidth, logicalHeight};
+    const auto [scaleX, scaleY] = aurora::gx::output_pixel_scale();
+    if (scaleX == 1.f && scaleY == 1.f) {
+      return {logicalWidth, logicalHeight};
+    }
+    return scaled_size(logicalWidth, logicalHeight, scaleX, scaleY);
   }
 
   const auto [logicalFbWidth, logicalFbHeight] = aurora::gx::logical_fb_size();
@@ -25,9 +35,7 @@ aurora::Vec2<uint32_t> scale_copy_dst(u32 logicalWidth, u32 logicalHeight) {
 
   const float scaleX = static_cast<float>(targetWidth) / static_cast<float>(logicalFbWidth);
   const float scaleY = static_cast<float>(targetHeight) / static_cast<float>(logicalFbHeight);
-  const auto scaledWidth = std::max<u32>(static_cast<u32>(std::lround(static_cast<float>(logicalWidth) * scaleX)), 1);
-  const auto scaledHeight = std::max<u32>(static_cast<u32>(std::lround(static_cast<float>(logicalHeight) * scaleY)), 1);
-  return {scaledWidth, scaledHeight};
+  return scaled_size(logicalWidth, logicalHeight, scaleX, scaleY);
 }
 } // namespace
 

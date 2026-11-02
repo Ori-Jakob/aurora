@@ -29,6 +29,7 @@
 #include <variant>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <SDL3/SDL_iostream.h>
@@ -103,6 +104,7 @@ static std::atomic_uint64_t g_pipelineEpoch = 0;
 static std::atomic_uint64_t g_skippedDraws = 0;
 static std::vector<uint64_t> g_sceneLayoutKeys;
 static std::vector<uint64_t> g_liveLayoutKeys;
+static testing::CreateHooks g_createHooks;
 
 static sqlite3* g_pipelineCacheDb = nullptr;
 static sqlite3_stmt* g_pipelineCacheLoadStmt = nullptr;
@@ -607,7 +609,7 @@ static PipelineRef resolve_pipeline(ShaderType type, const gx::PipelineConfig& c
       runtimeKey,
       [config, layout] {
         const webgpu::CacheLayoutScope scope{layout.key};
-        return create_pipeline(config, layout);
+        return g_createHooks.gx != nullptr ? g_createHooks.gx(config, layout) : gx::create_pipeline(config, layout);
       },
       priority);
 }
@@ -619,7 +621,8 @@ static PipelineRef resolve_pipeline(ShaderType type, const clear::PipelineConfig
       runtimeKey,
       [config, layout] {
         const webgpu::CacheLayoutScope scope{layout.key};
-        return CompiledPipeline{.main = create_pipeline(config, layout)};
+        return CompiledPipeline{.main = g_createHooks.clear != nullptr ? g_createHooks.clear(config, layout)
+                                                                       : clear::create_pipeline(config, layout)};
       },
       priority);
 }
@@ -1506,5 +1509,14 @@ PipelineRef ready_pipeline(const gx::PipelineConfig& config, const RenderTargetL
   const auto it = g_pipelines.find(runtimeKey);
   return it != g_pipelines.end() && it->second.main ? runtimeKey : 0;
 }
+
+namespace testing {
+CreateHooks set_create_hooks(const CreateHooks& hooks) noexcept { return std::exchange(g_createHooks, hooks); }
+
+std::vector<uint64_t> remembered_layout_keys() {
+  std::lock_guard lock{g_pipelineMutex};
+  return g_sceneLayoutKeys;
+}
+} // namespace testing
 
 } // namespace aurora::gfx

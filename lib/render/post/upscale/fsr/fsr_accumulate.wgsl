@@ -174,7 +174,7 @@ fn compute_base_accumulation_weight(c: AccumParams, d: ptr<function, AccumData>)
 }
 
 fn load_prepared_color(p: vec2i) -> vec3f {
-  return rgb_to_ycocg(max(vec3f(0.0), textureLoad(input_color, p, 0).rgb));
+  return rgb_to_ycocg(max(vec3f(0.0), load_input_rgb(input_color, p)));
 }
 
 fn add_box_sample(d: ptr<function, AccumData>, first: bool, color: vec3f, weight: f32) {

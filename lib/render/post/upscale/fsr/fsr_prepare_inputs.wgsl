@@ -102,6 +102,6 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   textureStore(dilated_depth, p, vec4f(extents.nearest, 0.0, 0.0, 0.0));
   let farthest_m = min(get_view_space_depth_in_meters(extents.farthest), FP16_MAX);
   textureStore(farthest_depth, p, vec4f(farthest_m, 0.0, 0.0, 0.0));
-  let color = max(vec3f(0.0), textureLoad(input_color, p, 0).rgb);
+  let color = max(vec3f(0.0), load_input_rgb(input_color, p));
   textureStore(current_luma, p, vec4f(rgb_to_luma(color), 0.0, 0.0, 0.0));
 }

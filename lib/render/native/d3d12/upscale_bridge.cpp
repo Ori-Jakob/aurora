@@ -118,6 +118,9 @@ void release_context(Live& live) noexcept {
   if (live.upscaler != nullptr) {
     live.upscaler->destroy();
   }
+  if (live.out) {
+    upscale::compose::forget_source(live.out->view());
+  }
   const bool vendorBytes = live.vendorBytes != 0;
   live = {};
   if (vendorBytes) {
@@ -195,6 +198,9 @@ bool ensure(std::unique_ptr<SharedTexture>& texture, const SharedTexture::Desc& 
   }
   if (g_live.runner) {
     g_live.runner->wait_idle();
+  }
+  if (texture) {
+    upscale::compose::forget_source(texture->view());
   }
   texture.reset();
   texture = SharedTexture::create(desc);

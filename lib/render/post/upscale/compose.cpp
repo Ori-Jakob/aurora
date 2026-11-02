@@ -443,6 +443,10 @@ void write_native_status(bool ok) noexcept {
   g_lastStatus.store(words[0], std::memory_order_relaxed);
 }
 
+void forget_source(const wgpu::TextureView& view) noexcept {
+  std::erase_if(g_groups, [&view](const GroupEntry& entry) { return entry.source.Get() == view.Get(); });
+}
+
 void drop_native_step() noexcept {
   g_nativeOut.reset();
   if (g_requested && !std::exchange(g_warnedStaleStep, true)) {
@@ -485,6 +489,10 @@ void reset() noexcept {
   g_statusWrites.store(0, std::memory_order_relaxed);
   g_lastStatus.store(0, std::memory_order_relaxed);
   g_hold.store(false, std::memory_order_relaxed);
+}
+
+bool caches_source(const wgpu::TextureView& view) noexcept {
+  return std::ranges::any_of(g_groups, [&view](const GroupEntry& entry) { return entry.source.Get() == view.Get(); });
 }
 
 void hold_pipelines(bool hold) noexcept { g_hold.store(hold, std::memory_order_relaxed); }

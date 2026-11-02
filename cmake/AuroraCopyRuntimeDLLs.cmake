@@ -57,6 +57,17 @@ function(aurora_copy_runtime_dlls target)
   endif ()
 endfunction()
 
+# aurora_runtime_dlls_to_install(<out_var> <directory>)
+#
+# The DLLs in <directory> that an install may copy. The install rule and the
+# RuntimeDlls test both call it, so the test checks the rule the install runs.
+function(aurora_runtime_dlls_to_install out_var directory)
+  file(GLOB _dlls "${directory}/*.dll")
+  # DLSS ships only through its own gated rule, never because a copy sits in a reused build tree
+  list(FILTER _dlls EXCLUDE REGEX "/[Nn][Vv][Nn][Gg][Xx]_[^/]*[.][Dd][Ll][Ll]$")
+  set(${out_var} "${_dlls}" PARENT_SCOPE)
+endfunction()
+
 # aurora_install_runtime_dlls(<executable_target> <install_destination>)
 #
 # INSTALL rule that copies all DLLs already placed next to the built target
@@ -66,10 +77,9 @@ function(aurora_install_runtime_dlls target install_destination)
     return()
   endif ()
 
-  # DLSS ships only through its own gated rule, never because a copy sits in a reused build tree
   install(CODE
-    "file(GLOB _aurora_runtime_dlls \"$<TARGET_FILE_DIR:${target}>/*.dll\")\n\
-list(FILTER _aurora_runtime_dlls EXCLUDE REGEX \"/[Nn][Vv][Nn][Gg][Xx]_[^/]*[.][Dd][Ll][Ll]$\")\n\
+    "include(\"${CMAKE_CURRENT_FUNCTION_LIST_FILE}\")\n\
+aurora_runtime_dlls_to_install(_aurora_runtime_dlls \"$<TARGET_FILE_DIR:${target}>\")\n\
 if(_aurora_runtime_dlls)\n\
   file(INSTALL DESTINATION \"${install_destination}\" TYPE FILE FILES \${_aurora_runtime_dlls})\n\
 endif()"

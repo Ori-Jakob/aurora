@@ -114,6 +114,9 @@ void evict_copy_texture(const void* dest) noexcept {
 }
 void shutdown() noexcept {}
 Vec2<uint32_t> logical_fb_size() noexcept { return {640, 480}; }
+Vec2<float> output_pixel_scale() noexcept { return {1.f, 1.f}; }
+gfx::Viewport map_render_viewport(const gfx::Viewport& viewport) noexcept { return viewport; }
+gfx::ClipRect map_render_scissor(const gfx::ClipRect& scissor) noexcept { return scissor; }
 gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcept { return logicalViewport; }
 gfx::ClipRect map_logical_scissor(const gfx::ClipRect& logicalScissor) noexcept { return logicalScissor; }
 void set_logical_viewport(const gfx::Viewport& viewport) noexcept {

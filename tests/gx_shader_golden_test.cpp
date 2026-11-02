@@ -17,6 +17,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -585,6 +586,47 @@ std::map<uint64_t, std::string> allow_class(const std::vector<Entry>& entries) {
   return keys;
 }
 
+bool same_text(const GoldenLine& a, const GoldenLine& b) {
+  return a.wgslHash == b.wgslHash && a.wgslSize == b.wgslSize;
+}
+
+// A class record needs a listing only while its text differs from the fixture, so an upstream fix leaves no keys
+std::map<uint64_t, std::string> differing_class_keys(std::span<const GoldenLine> actual,
+                                                     std::span<const GoldenLine> fixture,
+                                                     const std::map<uint64_t, std::string>& classKeys) {
+  std::map<uint64_t, const GoldenLine*> expected;
+  for (const auto& line : fixture) {
+    expected.emplace(line.key, &line);
+  }
+  std::map<uint64_t, std::string> keys;
+  for (const auto& line : actual) {
+    const auto it = expected.find(line.key);
+    if (classKeys.contains(line.key) && it != expected.end() && !same_text(*it->second, line)) {
+      keys.emplace(line.key, line.label);
+    }
+  }
+  return keys;
+}
+
+std::vector<std::string> allow_problems(const AllowList& allow, const std::map<uint64_t, std::string>& classKeys,
+                                        std::map<uint64_t, std::string> differing) {
+  std::vector<std::string> problems;
+  for (const auto& line : allow.lines) {
+    if (line.label != AllowEntry) {
+      problems.push_back(fmt::format("allow-listed key {:016x} names entry {}", line.key, line.label));
+    }
+    if (!classKeys.contains(line.key)) {
+      problems.push_back(fmt::format("allow-listed key {:016x} is outside the synthetic allow class", line.key));
+    }
+    differing.erase(line.key);
+  }
+  for (const auto& [key, label] : differing) {
+    problems.push_back(
+        fmt::format("allow class key {:016x} ({}) differs from the fixture and is not listed", key, label));
+  }
+  return problems;
+}
+
 TEST(GxShaderCorpusTest, ShaderConfigLayoutIsKnown) {
   // A new legacy field must bump the record format, so this has to fail before the fixture silently drifts.
   // ext is a fork field the records never carry, so RecordSize stays 868
@@ -896,17 +938,38 @@ TEST(GxShaderGoldenTest, AllowListIsWellFormed) {
   ASSERT_TRUE(allow.has_value()) << allow_path().string() << ": " << error;
   ASSERT_EQ(allow->entries.size(), 1u);
   EXPECT_EQ(allow->entries.front(), AllowEntry);
-  auto classKeys = allow_class(synthetic());
+  const auto fixture = parse_golden(read_text(AURORA_GX_SHADER_GOLDEN), &error);
+  ASSERT_TRUE(fixture.has_value()) << error;
+  auto entries = synthetic();
+  sort_and_dedupe(entries);
+  const auto classKeys = allow_class(entries);
   EXPECT_FALSE(classKeys.empty());
-  for (const auto& line : allow->lines) {
-    EXPECT_EQ(line.label, AllowEntry);
-    if (classKeys.erase(line.key) == 0) {
-      ADD_FAILURE() << fmt::format("allow-listed key {:016x} is outside the synthetic allow class", line.key);
-    }
+  for (const std::string& problem :
+       allow_problems(*allow, classKeys, differing_class_keys(golden_lines(entries), *fixture, classKeys))) {
+    ADD_FAILURE() << problem;
   }
-  for (const auto& [key, label] : classKeys) {
-    ADD_FAILURE() << fmt::format("allow class key {:016x} ({}) is not listed", key, label);
-  }
+}
+
+TEST(GxShaderGoldenTest, AllowListEmptiesWhenUpstreamMatches) {
+  std::string error;
+  const auto empty = parse_allow(fmt::format("{}\n{} 6c8e4c5 fixed upstream\n", AllowHeader, AllowEntry), error);
+  ASSERT_TRUE(empty.has_value()) << error;
+  EXPECT_TRUE(empty->lines.empty());
+  const std::map<uint64_t, std::string> classKeys{{0x10, "lit"}, {0x20, "lit"}};
+  EXPECT_TRUE(allow_problems(*empty, classKeys, {}).empty());
+  EXPECT_EQ(allow_problems(*empty, classKeys, {{0x20, "lit"}}).size(), 1u);
+
+  const auto listed = parse_allow(fmt::format("{}\n{} 6c8e4c5 still differs\n0000000000000020 00000000000000aa 64 {}\n",
+                                              AllowHeader, AllowEntry, AllowEntry),
+                                  error);
+  ASSERT_TRUE(listed.has_value()) << error;
+  EXPECT_TRUE(allow_problems(*listed, classKeys, {{0x20, "lit"}}).empty());
+  EXPECT_TRUE(allow_problems(*listed, classKeys, {}).empty());
+  EXPECT_EQ(allow_problems(*listed, {{0x10, "lit"}}, {}).size(), 1u);
+
+  const std::vector<GoldenLine> fixture{{0x10, 1, 8, "lit"}, {0x20, 2, 8, "lit"}, {0x30, 3, 8, "unlit"}};
+  const std::vector<GoldenLine> actual{{0x10, 1, 8, "lit"}, {0x20, 9, 8, "lit"}, {0x30, 7, 8, "unlit"}};
+  EXPECT_EQ(differing_class_keys(actual, fixture, classKeys), (std::map<uint64_t, std::string>{{0x20, "lit"}}));
 }
 
 TEST(GxShaderGoldenTest, MatchesFixture) {
@@ -945,11 +1008,11 @@ TEST(GxShaderGoldenTest, MatchesFixture) {
       }
       want = listed->second;
       allowed.erase(listed);
-    } else if (inClass) {
+    } else if (inClass && !same_text(*want, line)) {
       ADD_FAILURE() << fmt::format("allow class key {:016x} ({}) is not listed: run regen-golden", line.key,
                                    line.label);
     }
-    if (want->wgslHash != line.wgslHash || want->wgslSize != line.wgslSize) {
+    if (!same_text(*want, line)) {
       ADD_FAILURE() << fmt::format(
           "WGSL changed for {:016x} ({}): G2 violation, legacy shader text must match upstream", line.key, line.label);
       offending.push_back(line.key);

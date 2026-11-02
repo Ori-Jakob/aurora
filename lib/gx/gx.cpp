@@ -239,47 +239,24 @@ Vec2<uint32_t> logical_fb_size() noexcept {
   return gfx::is_offscreen() ? gfx::get_render_target_size() : vi::configured_fb_size();
 }
 
-gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcept {
-  if (g_gxState.viewportPolicy == AURORA_VIEWPORT_NATIVE) {
-    return logicalViewport;
-  }
-
-  const auto [logicalFbWidth, logicalFbHeight] = logical_fb_size();
-  const auto [targetWidth, targetHeight] = gfx::get_render_target_size();
-  if (logicalFbWidth == 0 || logicalFbHeight == 0 || targetWidth == 0 || targetHeight == 0) {
-    return logicalViewport;
-  }
-
-  const float scaleX = static_cast<float>(targetWidth) / static_cast<float>(logicalFbWidth);
-  const float scaleY = static_cast<float>(targetHeight) / static_cast<float>(logicalFbHeight);
+namespace {
+gfx::Viewport scale_viewport(const gfx::Viewport& viewport, float scaleX, float scaleY) noexcept {
   return {
-      .left = logicalViewport.left * scaleX,
-      .top = logicalViewport.top * scaleY,
-      .width = logicalViewport.width * scaleX,
-      .height = logicalViewport.height * scaleY,
-      .znear = logicalViewport.znear,
-      .zfar = logicalViewport.zfar,
+      .left = viewport.left * scaleX,
+      .top = viewport.top * scaleY,
+      .width = viewport.width * scaleX,
+      .height = viewport.height * scaleY,
+      .znear = viewport.znear,
+      .zfar = viewport.zfar,
   };
 }
 
-gfx::ClipRect map_logical_scissor(const gfx::ClipRect& logicalScissor) noexcept {
-  if (g_gxState.viewportPolicy == AURORA_VIEWPORT_NATIVE) {
-    return logicalScissor;
-  }
-
-  const auto [logicalFbWidth, logicalFbHeight] = logical_fb_size();
-  const auto [targetWidth, targetHeight] = gfx::get_render_target_size();
-  if (logicalFbWidth == 0 || logicalFbHeight == 0 || targetWidth == 0 || targetHeight == 0) {
-    return logicalScissor;
-  }
-
-  const float scaleX = static_cast<float>(targetWidth) / static_cast<float>(logicalFbWidth);
-  const float scaleY = static_cast<float>(targetHeight) / static_cast<float>(logicalFbHeight);
-
-  const float left = static_cast<float>(logicalScissor.x) * scaleX;
-  const float top = static_cast<float>(logicalScissor.y) * scaleY;
-  const float right = static_cast<float>(logicalScissor.x + logicalScissor.width) * scaleX;
-  const float bottom = static_cast<float>(logicalScissor.y + logicalScissor.height) * scaleY;
+gfx::ClipRect scale_scissor(const gfx::ClipRect& scissor, float scaleX, float scaleY, uint32_t targetWidth,
+                            uint32_t targetHeight) noexcept {
+  const float left = static_cast<float>(scissor.x) * scaleX;
+  const float top = static_cast<float>(scissor.y) * scaleY;
+  const float right = static_cast<float>(scissor.x + scissor.width) * scaleX;
+  const float bottom = static_cast<float>(scissor.y + scissor.height) * scaleY;
 
   const auto mappedLeft = std::clamp(static_cast<int32_t>(std::floor(left)), 0, static_cast<int32_t>(targetWidth));
   const auto mappedTop = std::clamp(static_cast<int32_t>(std::floor(top)), 0, static_cast<int32_t>(targetHeight));
@@ -294,6 +271,69 @@ gfx::ClipRect map_logical_scissor(const gfx::ClipRect& logicalScissor) noexcept 
       .width = mappedRight - mappedLeft,
       .height = mappedBottom - mappedTop,
   };
+}
+} // namespace
+
+Vec2<float> output_pixel_scale(Vec2<uint32_t> target, Vec2<uint32_t> output) noexcept {
+  if (target.x == 0 || target.y == 0 || output.x == 0 || output.y == 0 || target == output) {
+    return {1.f, 1.f};
+  }
+  return {static_cast<float>(target.x) / static_cast<float>(output.x),
+          static_cast<float>(target.y) / static_cast<float>(output.y)};
+}
+
+Vec2<float> output_pixel_scale() noexcept {
+  if (gfx::is_offscreen() || !webgpu::scene_split_active()) {
+    return {1.f, 1.f};
+  }
+  const wgpu::Extent3D output = webgpu::g_frameBuffer.size;
+  return output_pixel_scale(gfx::get_render_target_size(), {output.width, output.height});
+}
+
+gfx::Viewport map_render_viewport(const gfx::Viewport& viewport) noexcept {
+  const auto [scaleX, scaleY] = output_pixel_scale();
+  return scaleX == 1.f && scaleY == 1.f ? viewport : scale_viewport(viewport, scaleX, scaleY);
+}
+
+gfx::ClipRect map_render_scissor(const gfx::ClipRect& scissor) noexcept {
+  const auto [scaleX, scaleY] = output_pixel_scale();
+  if (scaleX == 1.f && scaleY == 1.f) {
+    return scissor;
+  }
+  const auto [targetWidth, targetHeight] = gfx::get_render_target_size();
+  return scale_scissor(scissor, scaleX, scaleY, targetWidth, targetHeight);
+}
+
+gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcept {
+  if (g_gxState.viewportPolicy == AURORA_VIEWPORT_NATIVE) {
+    return map_render_viewport(logicalViewport);
+  }
+
+  const auto [logicalFbWidth, logicalFbHeight] = logical_fb_size();
+  const auto [targetWidth, targetHeight] = gfx::get_render_target_size();
+  if (logicalFbWidth == 0 || logicalFbHeight == 0 || targetWidth == 0 || targetHeight == 0) {
+    return logicalViewport;
+  }
+
+  const float scaleX = static_cast<float>(targetWidth) / static_cast<float>(logicalFbWidth);
+  const float scaleY = static_cast<float>(targetHeight) / static_cast<float>(logicalFbHeight);
+  return scale_viewport(logicalViewport, scaleX, scaleY);
+}
+
+gfx::ClipRect map_logical_scissor(const gfx::ClipRect& logicalScissor) noexcept {
+  if (g_gxState.viewportPolicy == AURORA_VIEWPORT_NATIVE) {
+    return map_render_scissor(logicalScissor);
+  }
+
+  const auto [logicalFbWidth, logicalFbHeight] = logical_fb_size();
+  const auto [targetWidth, targetHeight] = gfx::get_render_target_size();
+  if (logicalFbWidth == 0 || logicalFbHeight == 0 || targetWidth == 0 || targetHeight == 0) {
+    return logicalScissor;
+  }
+
+  const float scaleX = static_cast<float>(targetWidth) / static_cast<float>(logicalFbWidth);
+  const float scaleY = static_cast<float>(targetHeight) / static_cast<float>(logicalFbHeight);
+  return scale_scissor(logicalScissor, scaleX, scaleY, targetWidth, targetHeight);
 }
 
 void set_logical_viewport(const gfx::Viewport& viewport) noexcept {
@@ -326,29 +366,9 @@ void set_render_scissor(const gfx::ClipRect& scissor) noexcept {
 
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept { return g_gxState.textures[static_cast<size_t>(id)]; }
 
-wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout,
-                                    const PipelineOptions& options, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
-                                    wgpu::ShaderModule shader, const char* label) noexcept {
-  ZoneScoped;
-  const float depthBias = (UseReversedZ ? -1.0f : 1.0f) * std::bit_cast<float>(config.polygonOffsetBits);
-  const float depthBiasSlopeScale = (UseReversedZ ? -1.0f : 1.0f) * std::bit_cast<float>(config.polygonOffsetScaleBits);
-  const float depthBiasClamp = webgpu::g_hasCoreFeatures ? std::bit_cast<float>(config.polygonOffsetClampBits) : 0.0f;
-  const bool writesDepth = config.depthCompare && options.depthUpdate;
-  const wgpu::DepthStencilState depthStencil{
-      .format = layout.depthStencilFormat,
-      .depthWriteEnabled = writesDepth,
-      .depthCompare = config.depthCompare ? to_compare_function(config.depthFunc) : wgpu::CompareFunction::Always,
-      .depthBias = round_away_from_zero<int32_t>(depthBias),
-      .depthBiasSlopeScale = depthBiasSlopeScale,
-      .depthBiasClamp = depthBiasClamp,
-  };
-  const auto blendState = to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp,
-                                         config.dstAlpha, options.dstAlphaMode == DstAlphaMode::DualSource);
-  const ShaderTargets targets = shader_targets(layout);
-  const uint32_t normalTarget = normal_target(config.shaderConfig, targets);
-  const bool opaque = effectively_opaque(config);
-  const bool writesFog = writes_fog_record(config, options);
-  const ReactiveWrite reactive = reactive_write(config, options);
+std::array<wgpu::ColorTargetState, gfx::MaxColorAttachments>
+color_target_states(const PipelineConfig& config, const gfx::RenderTargetLayout& layout,
+                    const PipelineOptions& options) noexcept {
   // Coverage only grows, so overlapping translucents keep the strongest
   static const wgpu::BlendState ReactiveBlend{
       .color = {.operation = wgpu::BlendOperation::Max,
@@ -358,6 +378,12 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
                 .srcFactor = wgpu::BlendFactor::One,
                 .dstFactor = wgpu::BlendFactor::One},
   };
+  const bool writesDepth = config.depthCompare && options.depthUpdate;
+  const ShaderTargets targets = shader_targets(layout);
+  const uint32_t normalTarget = normal_target(config.shaderConfig, targets);
+  const bool opaque = effectively_opaque(config);
+  const bool writesFog = writes_fog_record(config, options);
+  const ReactiveWrite reactive = reactive_write(config, options);
   std::array<wgpu::ColorTargetState, gfx::MaxColorAttachments> colorTargets{};
   for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
     bool writes = i == normalTarget && writesDepth;
@@ -376,6 +402,29 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
         .writeMask = writes ? wgpu::ColorWriteMask::All : wgpu::ColorWriteMask::None,
     };
   }
+  return colorTargets;
+}
+
+wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout,
+                                    const PipelineOptions& options, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
+                                    wgpu::ShaderModule shader, const char* label) noexcept {
+  ZoneScoped;
+  const float depthBias = (UseReversedZ ? -1.0f : 1.0f) * std::bit_cast<float>(config.polygonOffsetBits);
+  const float depthBiasSlopeScale = (UseReversedZ ? -1.0f : 1.0f) * std::bit_cast<float>(config.polygonOffsetScaleBits);
+  const float depthBiasClamp = webgpu::g_hasCoreFeatures ? std::bit_cast<float>(config.polygonOffsetClampBits) : 0.0f;
+  const bool writesDepth = config.depthCompare && options.depthUpdate;
+  const wgpu::DepthStencilState depthStencil{
+      .format = layout.depthStencilFormat,
+      .depthWriteEnabled = writesDepth,
+      .depthCompare = config.depthCompare ? to_compare_function(config.depthFunc) : wgpu::CompareFunction::Always,
+      .depthBias = round_away_from_zero<int32_t>(depthBias),
+      .depthBiasSlopeScale = depthBiasSlopeScale,
+      .depthBiasClamp = depthBiasClamp,
+  };
+  const auto blendState = to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp,
+                                         config.dstAlpha, options.dstAlphaMode == DstAlphaMode::DualSource);
+  std::array<wgpu::ColorTargetState, gfx::MaxColorAttachments> colorTargets =
+      color_target_states(config, layout, options);
   // Integer targets such as the fog record can never blend
   colorTargets[gfx::SceneColorAttachmentIndex].blend = &blendState;
   colorTargets[gfx::SceneColorAttachmentIndex].writeMask = to_write_mask(options.colorUpdate, options.alphaUpdate);

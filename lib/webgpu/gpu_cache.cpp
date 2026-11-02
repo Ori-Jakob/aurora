@@ -577,4 +577,6 @@ CacheLayoutScope::CacheLayoutScope(uint64_t layoutKey) noexcept : m_previous(std
 
 CacheLayoutScope::~CacheLayoutScope() { t_cacheLayout = m_previous; }
 
+uint64_t current_cache_layout() noexcept { return t_cacheLayout; }
+
 } // namespace aurora::webgpu

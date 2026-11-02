@@ -461,6 +461,11 @@ void evict_copy_texture(const void* dest) noexcept;
 void evict_texture_object(u32 texObjId) noexcept;
 void evict_tlut_object(u32 tlutObjId) noexcept;
 Vec2<uint32_t> logical_fb_size() noexcept;
+// Native and render-pixel rectangles are output pixels, which a split scene target holds at its own size
+Vec2<float> output_pixel_scale(Vec2<uint32_t> target, Vec2<uint32_t> output) noexcept;
+Vec2<float> output_pixel_scale() noexcept;
+gfx::Viewport map_render_viewport(const gfx::Viewport& viewport) noexcept;
+gfx::ClipRect map_render_scissor(const gfx::ClipRect& scissor) noexcept;
 gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcept;
 gfx::ClipRect map_logical_scissor(const gfx::ClipRect& logicalScissor) noexcept;
 void set_logical_viewport(const gfx::Viewport& viewport) noexcept;

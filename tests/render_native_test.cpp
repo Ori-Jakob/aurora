@@ -270,10 +270,6 @@ TEST_F(Xess, QualityMapsToXessEnum) {
   EXPECT_EQ(xess::quality_setting(UpscalerQuality::Balanced), XESS_QUALITY_SETTING_BALANCED);
   EXPECT_EQ(xess::quality_setting(UpscalerQuality::Performance), XESS_QUALITY_SETTING_PERFORMANCE);
   EXPECT_EQ(xess::quality_setting(UpscalerQuality::UltraPerformance), XESS_QUALITY_SETTING_ULTRA_PERFORMANCE);
-  const std::vector<int> spec{106, 103, 102, 101, 100};
-  for (uint8_t i = 0; i < spec.size(); ++i) {
-    EXPECT_EQ(static_cast<int>(xess::quality_setting(static_cast<UpscalerQuality>(i))), spec[i]) << int{i};
-  }
 }
 
 TEST_F(Xess, JitterPhasesAtLeastEightRatioSquared) {

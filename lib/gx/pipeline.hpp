@@ -3,6 +3,7 @@
 #include "../gfx/pipeline_cache.hpp"
 #include "gx.hpp"
 
+#include <array>
 #include <optional>
 #include <span>
 
@@ -81,6 +82,10 @@ constexpr ReactiveWrite reactive_write(const PipelineConfig& c, const PipelineOp
 constexpr ReactiveWrite reactive_write(const PipelineConfig& c) noexcept {
   return reactive_write(c, {.colorUpdate = c.colorUpdate, .alphaUpdate = c.alphaUpdate, .depthUpdate = c.depthUpdate});
 }
+// The scene colour slot comes back unblended and unwritten; build_pipeline gives it the GX blend and write mask
+std::array<wgpu::ColorTargetState, gfx::MaxColorAttachments>
+color_target_states(const PipelineConfig& config, const gfx::RenderTargetLayout& layout,
+                    const PipelineOptions& options) noexcept;
 
 gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout);
 uint64_t gbuffer_pipeline_failures() noexcept;

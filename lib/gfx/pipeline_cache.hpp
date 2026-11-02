@@ -4,6 +4,7 @@
 
 #include <optional>
 #include <span>
+#include <vector>
 
 namespace aurora::gfx::clear {
 struct PipelineConfig;
@@ -87,5 +88,15 @@ enum class PipelinePriority : uint8_t {
 std::optional<PipelinePriority> next_queue(bool normal, bool warm, bool background) noexcept;
 PipelinePriority promoted(PipelinePriority current, PipelinePriority requested) noexcept;
 } // namespace detail
+
+namespace testing {
+struct CreateHooks {
+  CompiledPipeline (*gx)(const gx::PipelineConfig& config, const RenderTargetLayout& layout) = nullptr;
+  wgpu::RenderPipeline (*clear)(const clear::PipelineConfig& config, const RenderTargetLayout& layout) = nullptr;
+};
+// Stands in for pipeline creation so a test can see the cache layout each create runs under; null restores it
+CreateHooks set_create_hooks(const CreateHooks& hooks) noexcept;
+std::vector<uint64_t> remembered_layout_keys();
+} // namespace testing
 
 } // namespace aurora::gfx

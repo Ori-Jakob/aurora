@@ -1,3 +1,5 @@
+//#import aurora/srgb
+
 //#if NATIVE_DEPTH
 @group(0) @binding(0) var scene_depth: texture_depth_2d;
 //#else
@@ -19,7 +21,6 @@ fn fs_depth(@builtin(position) position: vec4f) -> @location(0) vec4f {
 @fragment
 fn fs_linear(@builtin(position) position: vec4f) -> @location(0) vec4f {
   let stored = textureLoad(scene_color, vec2i(floor(position.xy)), 0);
-  let rgb = select(pow((stored.rgb + 0.055) / 1.055, vec3f(2.4)), stored.rgb / 12.92, stored.rgb <= vec3f(0.04045));
-  return vec4f(rgb, stored.a);
+  return vec4f(srgb_to_linear(stored.rgb), stored.a);
 }
 //#endif

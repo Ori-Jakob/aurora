@@ -126,5 +126,6 @@ public:
 private:
   uint64_t m_previous;
 };
+[[nodiscard]] uint64_t current_cache_layout() noexcept;
 
 } // namespace aurora::webgpu

@@ -599,10 +599,13 @@ TEST_F(GxShaderExtTest, ReactiveNeedsReactiveTarget) {
   EXPECT_NE(fragment_output(text).find("@location(3) reactive: vec4f,"), std::string::npos);
   EXPECT_NE(text.find("let reactive_flags = select(0u, load_word(&abuf, imm._pad + 1u), imm._pad != 0u);"),
             std::string::npos);
-  EXPECT_NE(text.find("out.reactive = vec4f(select(0.0, saturate(prev.a), (reactive_flags & " +
+  EXPECT_NE(text.find("out.reactive = vec4f(select(0.0, saturate(reactive_alpha), (reactive_flags & " +
                       std::to_string(render_ext::RecordFlagReactive) + "u) != 0u));"),
             std::string::npos);
-  EXPECT_EQ(text.find("out.reactive = vec4f(saturate(prev.a));"), std::string::npos);
+  EXPECT_EQ(text.find("saturate(prev.a)"), std::string::npos);
+  // Replace forces prev.a to 1, so coverage has to be read before it
+  EXPECT_EQ(count(text, "let reactive_alpha = prev.a;"), 1u);
+  EXPECT_LT(text.find("let reactive_alpha = prev.a;"), text.find("prev.a = 1.0;"));
   EXPECT_EQ(text.find("mo_cur"), std::string::npos);
   EXPECT_EQ(location_count(text), location_count(wgsl(config)));
   const std::string both = build_shader_source(config, DstAlphaMode::None, ShaderTargets{.motion = 2, .reactive = 3});
@@ -635,6 +638,51 @@ TEST_F(GxShaderExtTest, ReactiveWriteClearsUnderOpaqueAndDepthWriters) {
   EXPECT_EQ(rule(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, true, true, false), ReactiveWrite::None);
   EXPECT_EQ(rule(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, true, false, false), ReactiveWrite::None);
 }
+
+TEST_F(GxShaderExtTest, ReactiveTargetStateFollowsReactiveWrite) {
+  const gfx::SceneLayoutBase base{
+      .color = wgpu::TextureFormat::BGRA8Unorm,
+      .depth = wgpu::TextureFormat::Depth32Float,
+      .size = {64, 64, 1},
+      .samples = 1,
+  };
+  const gfx::RenderTargetLayout layout = gfx::compose_scene_layout({.gbuffer = true}, base);
+  const uint32_t target = shader_targets(layout).reactive;
+  ASSERT_NE(target, UINT32_MAX);
+  PipelineConfig opaque{};
+  opaque.blendMode = GX_BM_NONE;
+  opaque.blendFacSrc = GX_BL_ONE;
+  opaque.blendFacDst = GX_BL_ZERO;
+  opaque.depthCompare = true;
+  PipelineConfig translucent = opaque;
+  translucent.blendMode = GX_BM_BLEND;
+  translucent.blendFacSrc = GX_BL_SRCALPHA;
+  translucent.blendFacDst = GX_BL_INVSRCALPHA;
+  const auto reactive = [&](const PipelineConfig& config, const PipelineOptions& options) {
+    return color_target_states(config, layout, options)[target];
+  };
+
+  const wgpu::ColorTargetState clear = reactive(opaque, {.colorUpdate = true, .depthUpdate = true});
+  EXPECT_EQ(clear.format, layout.colorAttachments[target].format);
+  EXPECT_EQ(clear.writeMask, wgpu::ColorWriteMask::All);
+  EXPECT_EQ(clear.blend, nullptr);
+  const wgpu::ColorTargetState raise = reactive(translucent, {.colorUpdate = true});
+  EXPECT_EQ(raise.writeMask, wgpu::ColorWriteMask::All);
+  ASSERT_NE(raise.blend, nullptr);
+  EXPECT_EQ(raise.blend->color.operation, wgpu::BlendOperation::Max);
+  EXPECT_EQ(raise.blend->alpha.operation, wgpu::BlendOperation::Max);
+  const wgpu::ColorTargetState none = reactive(translucent, {.depthUpdate = true});
+  EXPECT_EQ(none.writeMask, wgpu::ColorWriteMask::None);
+  EXPECT_EQ(none.blend, nullptr);
+  // The alpha prepass runs before the colour pass, so it must leave coverage to it
+  const PipelineOptions prepass{.dstAlphaMode = DstAlphaMode::Replace, .alphaUpdate = true};
+  for (const PipelineConfig& config : {opaque, translucent}) {
+    const wgpu::ColorTargetState state = reactive(config, prepass);
+    EXPECT_EQ(state.writeMask, wgpu::ColorWriteMask::None);
+    EXPECT_EQ(state.blend, nullptr);
+  }
+}
+
 ShaderConfig lit_normal_config() {
   ShaderConfig config = single_site();
   config.attrs[GX_VA_NRM] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32};

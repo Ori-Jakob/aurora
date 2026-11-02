@@ -9,6 +9,9 @@ add_test(NAME VendorHeaders.NoneTracked
   COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/.. -DGIT_EXECUTABLE=${GIT_EXECUTABLE}
     -P ${CMAKE_CURRENT_SOURCE_DIR}/vendor_headers_check.cmake)
 set_tests_properties(VendorHeaders.NoneTracked PROPERTIES SKIP_REGULAR_EXPRESSION "VendorHeaders: skipped")
+add_test(NAME RuntimeDlls.DlssNeverInstalled
+  COMMAND ${CMAKE_COMMAND} -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/runtime_dlls_check
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/runtime_dlls_check.cmake)
 
 if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
   add_compile_options(/Zc:__cplusplus)

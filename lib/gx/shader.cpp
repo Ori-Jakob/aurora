@@ -1638,6 +1638,10 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
   if constexpr (EnableNormalVisualization) {
     fragmentFn += "\n    prev = vec4f(in.mv_nrm, prev.a);";
   }
+  if (targets.reactive != UINT32_MAX) {
+    // Coverage is the TEV alpha that blends, not the destination alpha the Replace override writes
+    fragmentFn += "\n    let reactive_alpha = prev.a;";
+  }
 
   if (dstAlphaMode == DstAlphaMode::Replace) {
     // GX destination alpha is set via the blend constant
@@ -1732,7 +1736,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     members.push_back(
         {targets.reactive, fmt::format("    @location({}) reactive: vec4f,\n", targets.reactive),
          fmt::format("\n    let reactive_flags = select(0u, load_word(&abuf, imm._pad + {}u), imm._pad != 0u);"
-                     "\n    out.reactive = vec4f(select(0.0, saturate(prev.a), (reactive_flags & {}u) != 0u));",
+                     "\n    out.reactive = vec4f(select(0.0, saturate(reactive_alpha), (reactive_flags & {}u) != 0u));",
                      render_ext::DrawRecordFlagsWord, render_ext::RecordFlagReactive)});
   }
   if (targets.fog != UINT32_MAX && config.ext.output != 0) {
