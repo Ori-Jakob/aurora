@@ -178,7 +178,7 @@ bool pipelines_ready() noexcept {
 void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) {
   const Settings* settings = setup.settings;
   const Slot* slot = g_installed;
-  if (settings == nullptr || settings->debugView != 0 || setup.env == nullptr || slot == nullptr ||
+  if (settings == nullptr || setup.debug_view() != 0 || setup.env == nullptr || slot == nullptr ||
       slot->upscaler == nullptr || temporal_resolve::installed().pass != Pass ||
       !setup.gx_available(GxResource::Motion)) {
     builder.skip();

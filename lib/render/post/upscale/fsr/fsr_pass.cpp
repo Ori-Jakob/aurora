@@ -286,7 +286,7 @@ float units_per_meter(const SceneHints& hints) noexcept {
 
 void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) {
   const Settings* settings = setup.settings;
-  if (settings == nullptr || settings->debugView != 0 || setup.env == nullptr || setup.caps == nullptr ||
+  if (settings == nullptr || setup.debug_view() != 0 || setup.env == nullptr || setup.caps == nullptr ||
       !setup.caps->textureFormatsTier1 || !setup.gx_available(GxResource::Motion) ||
       temporal_resolve::installed().pass != Pass) {
     builder.skip();

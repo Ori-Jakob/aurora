@@ -10,6 +10,7 @@
 #include "gfx/texture.hpp"
 #include "gx/gx.hpp"
 #include "gx/shader_info.hpp"
+#include "render/debug/views.hpp"
 #include "render/frame_state.hpp"
 #include "render/graph.hpp"
 #include "render/jobs.hpp"
@@ -845,6 +846,42 @@ TEST_F(FsrGraph, SkippedUnderDebugView) {
   EXPECT_EQ(node(fsr_pass::Pass).status, CullReason::None);
   EXPECT_EQ(m_rig->run(2), std::nullopt);
   EXPECT_EQ(upscale::compose::testing::counters().encoded, 2u);
+  EXPECT_EQ(upscale::compose::testing::counters().sourced, 1u);
+}
+
+TEST_F(FsrGraph, SkippedUnderInspectorViewOverride) {
+  struct ScopedOverride {
+    explicit ScopedOverride(uint16_t id) noexcept { debug::set_view_override(id); }
+    ~ScopedOverride() { debug::set_view_override(0); }
+  };
+  const Settings settings = fsr_rig::fsr_settings(UpscalerQuality::Quality);
+  m_rig->install(settings);
+  ASSERT_EQ(node(fsr_pass::Pass).status, CullReason::None);
+  const GraphEnvironment live = gather_graph_environment();
+  uint64_t frame = 0;
+  for (const uint16_t id : {uint16_t{1}, uint16_t{16}}) {
+    SCOPED_TRACE(id);
+    const ScopedOverride view{id};
+    EXPECT_NE(gather_graph_environment(), live);
+    m_rig->install(settings);
+    EXPECT_EQ(temporal_resolve::installed().pass, fsr_pass::Pass);
+    // The same as under settings.debugView: the scene stays split and compose upsamples it unsourced
+    EXPECT_TRUE(upscale::split_live());
+    EXPECT_EQ(node(fsr_pass::Pass).status, CullReason::Skipped);
+    EXPECT_FALSE(fsr_pass::jitter_ready());
+    EXPECT_FALSE(temporal_resolve::jitter_enabled());
+    EXPECT_FALSE(upscale::ready(settings));
+    EXPECT_EQ(m_rig->run(++frame), std::nullopt);
+    EXPECT_EQ(fsr_pass::testing::counters().encodes, 0u);
+    EXPECT_EQ(upscale::compose::testing::counters().sourced, 0u);
+  }
+  EXPECT_EQ(gather_graph_environment(), live);
+  m_rig->install(settings);
+  EXPECT_EQ(node(fsr_pass::Pass).status, CullReason::None);
+  EXPECT_TRUE(temporal_resolve::jitter_enabled());
+  EXPECT_EQ(m_rig->run(++frame), std::nullopt);
+  EXPECT_EQ(fsr_pass::testing::counters().encodes, 1u);
+  EXPECT_EQ(upscale::compose::testing::counters().encoded, 3u);
   EXPECT_EQ(upscale::compose::testing::counters().sourced, 1u);
 }
 

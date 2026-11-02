@@ -5,6 +5,7 @@
 
 #include "gfx/pipeline_cache.hpp"
 #include "gfx/resources.hpp"
+#include "render/debug/views.hpp"
 #include "render/jobs.hpp"
 #include "render/post/upscale/compose.hpp"
 #include "render/post/upscale/fsr/fsr.hpp"
@@ -2485,6 +2486,40 @@ TEST_F(NativeUpscaleGpu, SkippedNodeFrameSubmitsClean) {
   EXPECT_EQ(counters.native, 0u);
   EXPECT_EQ(counters.skipped, 0u);
   EXPECT_EQ(m_copy.evaluations(), 0u);
+}
+
+TEST_F(NativeUpscaleGpu, SkippedUnderInspectorViewOverride) {
+  struct ScopedOverride {
+    explicit ScopedOverride(uint16_t id) noexcept { debug::set_view_override(id); }
+    ~ScopedOverride() { debug::set_view_override(0); }
+  };
+  m_copy = Passthrough{2.f};
+  install(settings());
+  ASSERT_EQ(node().status, CullReason::None);
+  const GraphEnvironment live = gather_graph_environment();
+  for (const uint16_t id : {uint16_t{1}, uint16_t{16}}) {
+    SCOPED_TRACE(id);
+    const ScopedOverride view{id};
+    EXPECT_NE(gather_graph_environment(), live);
+    install(settings());
+    EXPECT_EQ(node().status, CullReason::Skipped);
+    // The same as under settings.debugView: the scene stays split and compose upsamples it unsourced
+    EXPECT_TRUE(upscale::split_live());
+    EXPECT_FALSE(native_upscale::jitter_ready());
+    EXPECT_FALSE(temporal_resolve::jitter_enabled());
+    run_frame(id);
+    EXPECT_EQ(m_segments, 0u);
+  }
+  EXPECT_EQ(gather_graph_environment(), live);
+  install(settings());
+  EXPECT_EQ(node().status, CullReason::None);
+  EXPECT_TRUE(temporal_resolve::jitter_enabled());
+  run_frame(17);
+  EXPECT_EQ(m_segments, 1u);
+  const auto counters = compose::testing::counters();
+  EXPECT_EQ(counters.encoded, 3u);
+  EXPECT_EQ(counters.native, 1u);
+  EXPECT_EQ(m_copy.evaluations(), 1u);
 }
 
 #if AURORA_ENABLE_XESS
