@@ -90,6 +90,8 @@ struct TaaParams {
 override MIN_BLEND: f32 = 0.1;
 override MOVING_SAMPLES: f32 = 8.0;
 override CLIP_SCALE: f32 = 1.5;
+override FALLBACK_BLUR: f32 = 0.25;
+override SHARPEN_SAMPLES: f32 = 4.0;
 
 const RCAS_LIMIT: f32 = 0.1875;
 
@@ -187,12 +189,19 @@ fn fs_resolve(@builtin(position) frag: vec4f) -> @location(0) vec4f {
 
   var moment1 = vec3f(0.0);
   var moment2 = vec3f(0.0);
+  var tent = vec3f(0.0);
   for (var y = -1; y <= 1; y++) {
     for (var x = -1; x <= 1; x++) {
-      let c = rgb_to_ycocg(load_clamped(source_tex, pixel + vec2i(x, y)).rgb);
+      let rgb = load_clamped(source_tex, pixel + vec2i(x, y)).rgb;
+      let c = rgb_to_ycocg(rgb);
       moment1 += c;
       moment2 += c * c;
+      tent += f32((2 - abs(x)) * (2 - abs(y))) * rgb;
     }
+  }
+  if (off_screen || !(samples >= 1.0)) {
+    // The raw jittered frame would be sharper than its accumulated neighbours and crawl along a turn's leading edge
+    return vec4f(mix(current, tent / 16.0, FALLBACK_BLUR), 1.0);
   }
   let mean = moment1 / 9.0;
   let deviation = CLIP_SCALE * sqrt(max(moment2 / 9.0 - mean * mean, vec3f(0.0)));
@@ -204,10 +213,7 @@ fn fs_resolve(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   let still = all(abs(shift) * 0.5 * size < vec2f(0.01));
   let next = select(min(samples + 1.0, MOVING_SAMPLES), samples + 1.0, still);
   let reactive = saturate(load_clamped(scene_reactive, pixel).r);
-  var blend = max(max(1.0 / next, MIN_BLEND), reactive);
-  if (off_screen || !(samples >= 1.0)) {
-    blend = 1.0;
-  }
+  let blend = max(max(1.0 / next, MIN_BLEND), reactive);
   let resolved = select(mix(history, current, blend), current, blend >= 1.0);
   return vec4f(resolved, 1.0 / blend);
 //#endif
@@ -216,9 +222,11 @@ fn fs_resolve(@builtin(position) frag: vec4f) -> @location(0) vec4f {
 @fragment
 fn fs_apply(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   let pixel = vec2i(floor(frag.xy));
-  let e = load_clamped(history_tex, pixel).rgb;
-  let sharpness = taa_params.sharpness;
-  if (!(sharpness > 0.0)) {
+  let centre = load_clamped(history_tex, pixel);
+  let e = centre.rgb;
+  // Young pixels are still close to one raw frame, which full-strength RCAS pushes past the scene's own range
+  let strength = min(taa_params.sharpness, 1.0) * saturate((centre.a - 1.0) / (SHARPEN_SAMPLES - 1.0));
+  if (!(strength > 0.0)) {
     return vec4f(e, 0.0);
   }
   let b = load_clamped(history_tex, pixel + vec2i(0, -1)).rgb;
@@ -229,7 +237,7 @@ fn fs_apply(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   let mx4 = max(max(b, d), max(f, h));
   let hit_min = min(mn4, e) / max(4.0 * mx4, vec3f(0.00001));
   let hit_max = (1.0 - max(mx4, e)) / min(4.0 * mn4 - 4.0, vec3f(-0.00001));
-  let lobe = max(-RCAS_LIMIT, min(max3(max(-hit_min, hit_max)), 0.0)) * min(sharpness, 1.0);
+  let lobe = max(-RCAS_LIMIT, min(max3(max(-hit_min, hit_max)), 0.0)) * strength;
   let color = (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
   return vec4f(saturate(color), 0.0);
 }

@@ -3,11 +3,13 @@
 #include "render_test_device.hpp"
 
 #include "gfx/frame.hpp"
+#include "gfx/resources.hpp"
 #include "gx/hints.hpp"
 #include "render/frame_state.hpp"
 #include "render/gpu_heap.hpp"
 #include "render/graph.hpp"
 #include "render/graph_bind.hpp"
+#include "render/graph_layout.hpp"
 #include "render/graph_pool.hpp"
 #include "render/gx_ext/records.hpp"
 #include "render/hints.hpp"
@@ -177,14 +179,22 @@ TEST(TaaRules, ResolveTargetIsHistoryFormat) {
 TEST(TaaRules, ResolveConstantsComeFromHeader) {
   EXPECT_TRUE(taa::testing::resolve_desc(true).constants.empty());
   const shaders::RenderPipelineDesc desc = taa::testing::resolve_desc(false);
-  ASSERT_EQ(desc.constants.size(), 3u);
+  ASSERT_EQ(desc.constants.size(), 4u);
   EXPECT_EQ(desc.constants[0].name, "MIN_BLEND");
   EXPECT_EQ(desc.constants[0].value, double{taa::MinBlend});
   EXPECT_EQ(desc.constants[1].name, "MOVING_SAMPLES");
   EXPECT_EQ(desc.constants[1].value, double{taa::MovingSamples});
   EXPECT_EQ(desc.constants[2].name, "CLIP_SCALE");
   EXPECT_EQ(desc.constants[2].value, double{taa::ClipScale});
+  EXPECT_EQ(desc.constants[3].name, "FALLBACK_BLUR");
+  EXPECT_EQ(desc.constants[3].value, double{taa::FallbackBlur});
   EXPECT_LT(taa::MovingSamples, 1.f / taa::MinBlend);
+  const shaders::RenderPipelineDesc apply = taa::testing::apply_desc(TextureFormat::BGRA8Unorm);
+  ASSERT_EQ(apply.constants.size(), 1u);
+  EXPECT_EQ(apply.constants[0].name, "SHARPEN_SAMPLES");
+  EXPECT_EQ(apply.constants[0].value, double{taa::SharpenSamples});
+  EXPECT_GT(taa::SharpenSamples, 1.f);
+  EXPECT_LE(taa::SharpenSamples, taa::MovingSamples);
 }
 
 struct FrameOptions {
@@ -336,8 +346,23 @@ protected:
     return post;
   }
 
+  static gfx::Range uniform_sink(const uint8_t* data, size_t length) {
+    const size_t alignment = std::max<size_t>(gfx::detail::resources().limits.minUniformBufferOffsetAlignment, 1);
+    const size_t offset = (s_uniforms.size() + alignment - 1) / alignment * alignment;
+    s_uniforms.resize(offset + length);
+    std::memcpy(s_uniforms.data() + offset, data, length);
+    return {static_cast<uint32_t>(offset), static_cast<uint32_t>(length)};
+  }
+
   std::optional<std::string> run(const FrameState& state, uint64_t frameId, const FrameOptions& options = {}) {
-    const StageData post = build(state, frameId, options);
+    StageData post = build(state, frameId, options);
+    if (post.any_enabled()) {
+      // gfx::push_uniform needs a recording frame, so without this the shaders read zero pass params
+      s_uniforms.assign(FrameUniformsSize, 0);
+      build_stage_bindings(post, &uniform_sink);
+      s_uniforms.resize((s_uniforms.size() + 3) & ~size_t{3});
+      m_device->queue.WriteBuffer(gfx::detail::resources().uniformBuffer, 0, s_uniforms.data(), s_uniforms.size());
+    }
     m_device->device.PushErrorScope(wgpu::ErrorFilter::Validation);
     const wgpu::CommandEncoder encoder = m_device->device.CreateCommandEncoder();
     if (post.any_enabled()) {
@@ -348,6 +373,7 @@ protected:
     return test::pop_validation_error(*m_device);
   }
 
+  static inline std::vector<uint8_t> s_uniforms;
   test::TestDeviceOptions m_options;
   std::unique_ptr<test::TestDevice> m_device;
   std::unique_ptr<test::ScopedGlobalDevice> m_globals;
@@ -904,6 +930,28 @@ protected:
     return read_color();
   }
 
+  static std::vector<Rgba> fallback(const std::vector<Rgba>& input) {
+    return image([&input](uint32_t x, uint32_t y) {
+      std::array<double, 3> tent{};
+      for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+          const int tx = std::clamp(static_cast<int>(x) + dx, 0, static_cast<int>(Width) - 1);
+          const int ty = std::clamp(static_cast<int>(y) + dy, 0, static_cast<int>(Height) - 1);
+          const Rgba& tap = input[static_cast<size_t>(ty) * Width + static_cast<size_t>(tx)];
+          const double weight = (2 - std::abs(dx)) * (2 - std::abs(dy)) / 16.0;
+          tent[0] += weight * tap.r;
+          tent[1] += weight * tap.g;
+          tent[2] += weight * tap.b;
+        }
+      }
+      const Rgba& own = input[size_t{y} * Width + x];
+      const auto mix = [](uint8_t value, double blurred) {
+        return static_cast<uint8_t>(std::lround(value + (blurred - value) * double{taa::FallbackBlur}));
+      };
+      return Rgba{mix(own.r, tent[0]), mix(own.g, tent[1]), mix(own.b, tent[2]), own.a};
+    });
+  }
+
   static int max_rgb_error(const std::vector<Rgba>& got, const std::vector<Rgba>& want,
                            const std::function<bool(uint32_t, uint32_t)>& include = {}) {
     int worst = 0;
@@ -1019,12 +1067,31 @@ TEST_F(TaaGpu, OffscreenMotionRejectsHistory) {
     frame(first);
   }
   const std::vector<Rgba> second = random_image(4);
-  EXPECT_EQ(max_rgb_error(frame(second, 4.f, 4.f), second), 0);
+  const std::vector<Rgba> softened = fallback(second);
+  EXPECT_LE(max_rgb_error(frame(second, 4.f, 4.f), softened), 1);
   for (int i = 0; i < 4; ++i) {
     frame(first);
   }
   const std::vector<Rgba> output = frame(second, 1.5f, 0.f);
-  EXPECT_EQ(max_rgb_error(output, second, [](uint32_t x, uint32_t) { return x + 1 < Width * 3 / 4; }), 0);
+  EXPECT_LE(max_rgb_error(output, softened, [](uint32_t x, uint32_t) { return x + 1 < Width * 3 / 4; }), 1);
+}
+
+TEST_F(TaaGpu, YoungPixelsSkipSharpening) {
+  start(1.f);
+  const std::vector<Rgba> input = image([](uint32_t x, uint32_t y) {
+    const uint8_t v = (x + y) % 2 == 0 ? 150 : 100;
+    return Rgba{v, v, v, 255};
+  });
+  EXPECT_EQ(max_rgb_error(frame(input), input), 0);
+  EXPECT_EQ(taa::testing::counters().resets, 1u);
+  EXPECT_LE(max_rgb_error(frame(input, 4.f, 4.f), fallback(input)), 1);
+  std::vector<Rgba> output;
+  for (int i = 0; i < 12; ++i) {
+    output = frame(input);
+  }
+  EXPECT_GT(max_rgb_error(output, input,
+                          [](uint32_t x, uint32_t y) { return x > 0 && y > 0 && x + 1 < Width && y + 1 < Height; }),
+            32);
 }
 
 TEST_F(TaaGpu, BorderPixelsStayExact) {

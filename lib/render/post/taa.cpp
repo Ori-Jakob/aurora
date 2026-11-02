@@ -27,11 +27,13 @@ constexpr uint32_t SourceGroupIndex = 2;
 constexpr size_t CacheCapacity = 6;
 constexpr uint64_t LayoutSalt = 0x5441412D53524331ull;
 constexpr std::array<std::string_view, 1> ResetDefines{"TAA_RESET"};
-constexpr std::array<shaders::Constant, 3> ResolveConstants{{
+constexpr std::array<shaders::Constant, 4> ResolveConstants{{
     {"MIN_BLEND", MinBlend},
     {"MOVING_SAMPLES", MovingSamples},
     {"CLIP_SCALE", ClipScale},
+    {"FALLBACK_BLUR", FallbackBlur},
 }};
+constexpr std::array<shaders::Constant, 1> ApplyConstants{{{"SHARPEN_SAMPLES", SharpenSamples}}};
 constexpr wgpu::ColorWriteMask RgbMask =
     wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue;
 
@@ -378,6 +380,7 @@ shaders::RenderPipelineDesc apply_desc(wgpu::TextureFormat format) {
       .shader = Shader,
       .vertexEntry = "vs_main",
       .fragmentEntry = "fs_apply",
+      .constants = ApplyConstants,
       .colorCount = 1,
   };
   desc.colors[0] = {.format = format, .writeMask = RgbMask};
