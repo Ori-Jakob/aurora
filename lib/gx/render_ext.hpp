@@ -71,6 +71,8 @@ inline constexpr u32 MotionSourceCamera = 1;
 inline constexpr u32 MotionSourceObject = 2;
 inline constexpr u32 MotionSourcePalette = 3;
 inline constexpr u32 RecordFlagJitter = 1u << 2;
+// Core-visible copy of records::flag::ScreenAo for the generator
+inline constexpr u32 RecordFlagScreenAo = 1u << 11;
 inline constexpr u32 RecordFlagPrevProjFrame = 1u << 12;
 inline constexpr u32 RecordFlagReactive = 1u << 13;
 inline constexpr u32 FrameMotionWord = 4;
@@ -111,6 +113,7 @@ inline PipelineConfig fallback_config(const PipelineConfig& config) noexcept {
   PipelineConfig fallback = legacy_config(config);
   fallback.shaderConfig.ext.output = 0;
   fallback.shaderConfig.ext.velocity = 0;
+  fallback.shaderConfig.ext.fwdEnv = 0;
   return fallback;
 }
 

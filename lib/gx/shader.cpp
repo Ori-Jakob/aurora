@@ -852,6 +852,10 @@ HashType shader_hash(const ShaderConfig& config, DstAlphaMode dstAlphaMode, cons
       hash = xxh3_hash(target, hash);
     }
   }
+  // Only text that carries the environment differs, so every M7 hash and label stays as it was
+  if (uses_forward_env(config, targets)) {
+    hash = xxh3_hash(targets.fwdEnv, hash);
+  }
   return hash;
 }
 
@@ -1128,6 +1132,11 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
   if (lastStage.alphaOp.outReg != 0) {
     fragmentFn += fmt::format("\n    prev.a = {0}.a;", regName[lastStage.alphaOp.outReg]);
   }
+  const bool fwdEnv = uses_forward_env(config, targets);
+  // Unclamped TEV colour wraps after fog, so AO would land before the wrap
+  const bool fwdAo = fwdEnv && tev_colour_clamped(config);
+  CHECK(tev_colour_clamped(config) == prevColorNormalized, "GX colour clamp disagrees with the last TEV stage");
+  CHECK(!fwdEnv || targets.motion != UINT32_MAX, "forward environment needs the record reader");
 
   if (info.loadsTevReg.test(0)) {
     uniBufAttrs += "\n    tevprev: vec4f,";
@@ -1524,6 +1533,31 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
   if (info.usesPTTexMtx.any()) {
     uniBufAttrs += fmt::format("\n    postmtx: array<mat3x4f, {}>,", MaxPTTexMtx);
   }
+  if (fwdAo) {
+    // About 0.4% and 2% of the view distance; f16 keys stay near 0.05%
+    constexpr float ForwardAoGapStart = 0.004f, ForwardAoGapEnd = 0.02f;
+    uniformPre += fmt::format(
+        "\n// G and B hold the f16 bits of the receiver's depth; reversed Z, so 0 means nothing behind"
+        "\nfn fwd_screen_ao(t: vec4f, z: f32) -> f32 {{"
+        "\n    if (t.r >= 1.0) {{"
+        "\n        return 1.0;"
+        "\n    }}"
+        "\n    let key = u32(round(t.g * 255.0)) | (u32(round(t.b * 255.0)) << 8u);"
+        "\n    let zr = unpack2x16float(key).x;"
+        "\n    // Relative depth gap, so only draws lying on the receiver take its AO"
+        "\n    let gap = abs(z - zr) / max(zr, 1e-7);"
+        "\n    let w = select(0.0, 1.0 - smoothstep({:.3f}, {:.3f}, gap), zr > 0.0);"
+        "\n    return 1.0 - w * (1.0 - t.r);"
+        "\n}}",
+        ForwardAoGapStart, ForwardAoGapEnd);
+    fragmentFn += fmt::format(
+        "\n    // Screen factors darken the surface before fog, so fog keeps its colour"
+        "\n    if ((gx_record_word({}u) & {}u) != 0u) {{"
+        "\n        let fwd_px = min(vec2u(in.pos.xy), textureDimensions(fwd_ao) - vec2u(1u));"
+        "\n        prev = vec4f(prev.rgb * fwd_screen_ao(textureLoad(fwd_ao, fwd_px, 0), in.pos.z), prev.a);"
+        "\n    }}",
+        render_ext::DrawRecordFlagsWord, render_ext::RecordFlagScreenAo);
+  }
   if (info.usesFog) {
     uniformPre +=
         "\n"
@@ -1590,6 +1624,9 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
         "@group(2) @binding({2})\n"
         "var tex{0}_samp: sampler;",
         i, i * 2, i * 2 + 1);
+  }
+  if (fwdEnv) {
+    texBindings += "\n@group(3) @binding(0)\nvar fwd_ao: texture_2d<f32>;";
   }
   if (info.stochasticTextures.any()) {
     for (u32 i = 0; i < MaxTextures; ++i) {
@@ -2170,6 +2207,7 @@ ShaderTargets shader_targets(const gfx::RenderTargetLayout& layout) noexcept {
   if (gfx::layout_has_gbuffer(layout)) {
     targets.gbufferNormal = std::exchange(targets.normal, UINT32_MAX);
   }
+  targets.fwdEnv = gfx::layout_has_gbuffer(layout);
   return targets;
 }
 

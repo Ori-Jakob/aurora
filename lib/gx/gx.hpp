@@ -598,7 +598,17 @@ struct ShaderTargets {
   uint32_t reactive = UINT32_MAX;
   uint32_t gbufferNormal = UINT32_MAX;
   uint32_t fog = UINT32_MAX;
+  // Group-3 forward environment; a layout property, so the 3-argument form never has it
+  bool fwdEnv = false;
 };
+// Text, pipeline layout and the group-3 bind all key on this, so they never disagree
+inline bool uses_forward_env(const ShaderConfig& c, const ShaderTargets& t) noexcept {
+  return c.ext.fwdEnv != 0 && t.fwdEnv;
+}
+// The generator's prevColorNormalized; flag stamping uses it too, so flags never land on draws without the AO block
+inline bool tev_colour_clamped(const ShaderConfig& c) noexcept {
+  return c.tevStageCount != 0 && c.tevStages[c.tevStageCount - 1].colorOp.clamp;
+}
 inline uint32_t normal_target(const ShaderConfig& config, const ShaderTargets& targets) noexcept {
   if (targets.normal != UINT32_MAX) {
     return targets.normal;
@@ -617,8 +627,11 @@ GXBindGroups build_bind_groups(const ShaderInfo& info, bool baseLevel = false) n
 // build_bind_groups with masked slots bound to 1x1 white or clear; the uniform keeps the real sizes
 GXBindGroups build_neutral_bind_groups(const ShaderInfo& info, u8 whiteMask, u8 clearMask,
                                        bool baseLevel = false) noexcept;
+constexpr uint8_t Group3ForwardEnvironment = 1;
+const wgpu::BindGroupLayout& forward_environment_layout() noexcept;
 
 namespace detail {
+const wgpu::BindGroup& neutral_forward_environment_group() noexcept;
 struct TextureFillViews {
   WGPUTextureView empty = nullptr;
   WGPUTextureView white = nullptr;

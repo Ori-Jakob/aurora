@@ -8,9 +8,12 @@
 #include "gx/render_ext.hpp"
 #include "gx/texture.hpp"
 #include "render/frame_state.hpp"
+#include "render/graph.hpp"
 #include "render/gx_ext/ext_provider.hpp"
+#include "render/gx_ext/fwd_env.hpp"
 #include "render/gx_ext/records.hpp"
 #include "render/hints.hpp"
+#include "render/post/composite.hpp"
 #include "render/material/registry.hpp"
 #include "render/scene/classifier.hpp"
 #include "webgpu/gpu.hpp"
@@ -771,6 +774,344 @@ TEST_F(RenderGxExt, HooksInstalledForGbufferWithoutStochastic) {
   apply_frame_state(frame(false, false));
   EXPECT_FALSE(records::gbuffer());
   EXPECT_EQ(gx::render_ext::hooks(), nullptr);
+}
+
+namespace cat = scene::category;
+
+scene::DrawClass forward_class(uint32_t categories = cat::Terrain) {
+  scene::DrawClass cls = draw_class(scene::Window::Translucent, 1);
+  cls.kind = scene::Kind::MainBlended;
+  cls.mainClass = true;
+  cls.key.categories = categories;
+  return cls;
+}
+
+gx::PipelineConfig layer_config(bool clamped = true) {
+  gx::PipelineConfig config = translucent(false);
+  config.shaderConfig.tevStageCount = 1;
+  config.shaderConfig.tevStages[0].colorOp.clamp = clamped;
+  config.shaderConfig.ext.fwdEnv = 1;
+  return config;
+}
+
+detail::FrameState ao_frame(Quality ao, uint16_t view = 0) {
+  detail::FrameState state;
+  state.settings.ao = ao;
+  state.settings.debugView = view;
+  return state;
+}
+
+gx::RenderExtConfig derived_ext(const gx::PipelineConfig& config, const gfx::RenderTargetLayout& layout) {
+  const gx::render_ext::Hooks* hooks = gx::render_ext::hooks();
+  EXPECT_NE(hooks, nullptr);
+  gx::render_ext::StochasticLanes lanes{};
+  return hooks != nullptr ? hooks->derive(hooks->userData, config, gx::ShaderInfo{}, layout, lanes)
+                          : gx::RenderExtConfig{};
+}
+
+TEST_F(RenderGxExt, FwdEnvOnlyForTranslucentMainColourWriters) {
+  const ScopedTargets targets;
+  const ScopedHints hints;
+  webgpu::g_graphicsConfig.gbuffer = true;
+  apply_frame_state(frame(false, false));
+  const gfx::RenderTargetLayout gbuffer = scene_layout(true);
+  const gfx::RenderTargetLayout legacy = scene_layout(false);
+  ASSERT_TRUE(records::in_forward_window(forward_class()));
+  records::on_route(forward_class());
+  EXPECT_EQ(gx::render_ext::g_drawInputs, records::ForwardWindow);
+  EXPECT_EQ(derived_ext(writer(false, true), gbuffer).fwdEnv, 1u);
+  EXPECT_EQ(derived_ext(writer(false, true), gbuffer).output, 0u);
+  EXPECT_EQ(derived_ext(layer_config(false), gbuffer).fwdEnv, 1u);
+  EXPECT_EQ(derived_ext(writer(true, false), gbuffer).fwdEnv, 0u);
+  EXPECT_EQ(derived_ext(writer(false, true), legacy).fwdEnv, 0u);
+
+  scene::DrawClass notMain = forward_class();
+  notMain.mainClass = false;
+  scene::DrawClass offscreen = forward_class();
+  offscreen.offscreen = true;
+  scene::DrawClass noColour = forward_class();
+  noColour.colorWrite = false;
+  std::vector<scene::DrawClass> others{notMain, offscreen, noColour};
+  for (const scene::Window window : {scene::Window::PreScene, scene::Window::Opaque, scene::Window::Post,
+                                     scene::Window::SceneEnd, scene::Window::Hud}) {
+    scene::DrawClass cls = forward_class();
+    cls.key.window = window;
+    others.push_back(cls);
+  }
+  for (const scene::DrawClass& cls : others) {
+    EXPECT_FALSE(records::in_forward_window(cls)) << static_cast<int>(cls.key.window);
+    records::on_route(cls);
+    EXPECT_EQ(gx::render_ext::g_drawInputs & records::ForwardWindow, 0u);
+    EXPECT_EQ(derived_ext(writer(false, true), gbuffer).fwdEnv, 0u) << static_cast<int>(cls.key.window);
+  }
+  EXPECT_EQ(fwd_env_for(writer(false, true), true), 1u);
+  EXPECT_EQ(fwd_env_for(writer(true, false), true), 0u);
+  EXPECT_EQ(fwd_env_for(writer(false, true), false), 0u);
+}
+
+TEST_F(RenderGxExt, AoToggleKeepsPipelineKeys) {
+  const ScopedTargets targets;
+  const ScopedHints hints;
+  webgpu::g_graphicsConfig.gbuffer = true;
+  const gfx::RenderTargetLayout gbuffer = scene_layout(true);
+  scene::DrawClass opaque = draw_class();
+  opaque.mainClass = true;
+  const std::array classes{forward_class(), forward_class(0), opaque};
+  const std::array configs{layer_config(), layer_config(false), writer(true, true), writer(false, true)};
+  const auto keys = [&](const detail::FrameState& state) {
+    apply_frame_state(state);
+    std::vector<gx::RenderExtConfig> out;
+    for (const scene::DrawClass& cls : classes) {
+      records::on_route(cls);
+      for (const gx::PipelineConfig& config : configs) {
+        out.push_back(derived_ext(config, gbuffer));
+      }
+    }
+    return out;
+  };
+  const std::vector<gx::RenderExtConfig> off = keys(ao_frame(Quality::Off));
+  EXPECT_TRUE(std::ranges::any_of(off, [](const gx::RenderExtConfig& ext) { return ext.fwdEnv != 0; }));
+  EXPECT_TRUE(keys(ao_frame(Quality::High)) == off);
+  EXPECT_TRUE(keys(ao_frame(Quality::Ultra, 1)) == off);
+  fwd_env::testing::set_identity_override(true);
+  EXPECT_TRUE(keys(ao_frame(Quality::High)) == off);
+}
+
+TEST_F(RenderGxExt, ScreenAoReceiverRule) {
+  const gx::PipelineConfig base = layer_config();
+  const auto receiver = [](const scene::DrawClass& cls, const gx::PipelineConfig& config) {
+    return fwd_env::screen_ao_receiver(cls, config);
+  };
+  EXPECT_TRUE(receiver(forward_class(cat::Terrain), base));
+  EXPECT_TRUE(receiver(forward_class(cat::Decal), base));
+  EXPECT_TRUE(receiver(forward_class(cat::Static | cat::Terrain | cat::NoShadowReceive), base));
+  EXPECT_FALSE(receiver(forward_class(0), base));
+  EXPECT_FALSE(receiver(forward_class(cat::Static | cat::Foliage), base));
+  for (const uint32_t excluded : {cat::Water, cat::NoAo, cat::Emissive, cat::Particle, cat::Sky, cat::Ui, cat::Overlay,
+                                  cat::FakeShadow, cat::ScreenRead}) {
+    EXPECT_FALSE(receiver(forward_class(cat::Terrain | excluded), base)) << excluded;
+    EXPECT_FALSE(receiver(forward_class(cat::Decal | excluded), base)) << excluded;
+  }
+
+  struct Blend {
+    GXBlendMode mode;
+    GXBlendFactor src;
+    GXBlendFactor dst;
+  };
+  for (const Blend& blend :
+       {Blend{GX_BM_NONE, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA}, Blend{GX_BM_BLEND, GX_BL_ONE, GX_BL_ONE},
+        Blend{GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_ONE}, Blend{GX_BM_BLEND, GX_BL_ONE, GX_BL_ZERO},
+        Blend{GX_BM_SUBTRACT, GX_BL_ONE, GX_BL_ONE}, Blend{GX_BM_LOGIC, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA}}) {
+    gx::PipelineConfig config = base;
+    config.blendMode = blend.mode;
+    config.blendFacSrc = blend.src;
+    config.blendFacDst = blend.dst;
+    EXPECT_FALSE(receiver(forward_class(), config)) << int{blend.mode} << " " << int{blend.src};
+  }
+  gx::PipelineConfig noTest = base;
+  noTest.depthCompare = false;
+  gx::PipelineConfig depthWrite = base;
+  depthWrite.depthUpdate = true;
+  gx::PipelineConfig noColour = base;
+  noColour.colorUpdate = false;
+  for (const gx::PipelineConfig& config : {noTest, depthWrite, noColour, layer_config(false)}) {
+    EXPECT_FALSE(receiver(forward_class(), config));
+  }
+
+  scene::DrawClass notMain = forward_class();
+  notMain.mainClass = false;
+  scene::DrawClass offscreen = forward_class();
+  offscreen.offscreen = true;
+  EXPECT_FALSE(receiver(notMain, base));
+  EXPECT_FALSE(receiver(offscreen, base));
+  for (const scene::Window window : {scene::Window::PreScene, scene::Window::Opaque, scene::Window::Post}) {
+    scene::DrawClass cls = forward_class();
+    cls.key.window = window;
+    EXPECT_FALSE(receiver(cls, base)) << static_cast<int>(window);
+  }
+}
+
+TEST_F(RenderGxExt, ScreenAoFlagFollowsAoAndTier) {
+  const ScopedTargets targets;
+  const ScopedHints hints;
+  records::testing::set_push(&FakeStorage::push);
+  webgpu::g_graphicsConfig.gbuffer = true;
+  const auto stamp_forward = [](const gx::PipelineConfig& config, uint32_t categories = cat::Terrain) {
+    gx::DrawData draw{};
+    draw.instanceCount = 1;
+    records::stamp(draw, config, forward_class(categories));
+    return draw.immediateData._pad;
+  };
+  const auto flagged = [&](const gx::PipelineConfig& config, uint32_t categories = cat::Terrain) {
+    const uint32_t locator = stamp_forward(config, categories);
+    EXPECT_NE(locator, 0u);
+    return (FakeStorage::at<records::DrawRecord>(locator).flags & records::flag::ScreenAo) != 0;
+  };
+
+  apply_frame_state(ao_frame(Quality::High));
+  ASSERT_TRUE(records::gbuffer());
+  EXPECT_TRUE(fwd_env::testing::screen_ao_active());
+  EXPECT_TRUE(flagged(layer_config()));
+  EXPECT_FALSE(flagged(layer_config(false)));
+  EXPECT_FALSE(flagged(layer_config(), 0));
+  gx::PipelineConfig noEnv = layer_config();
+  noEnv.shaderConfig.ext.fwdEnv = 0;
+  EXPECT_FALSE(flagged(noEnv));
+  const uint32_t a = stamp_forward(layer_config());
+  EXPECT_EQ(stamp_forward(layer_config()), a);
+  EXPECT_NE(stamp_forward(layer_config(false)), a);
+  apply_frame_state(ao_frame(Quality::Off));
+  EXPECT_EQ(records::stats().screenAo, 3u);
+
+  const auto expect_off = [&](const detail::FrameState& state, std::string_view label) {
+    apply_frame_state(state);
+    EXPECT_FALSE(fwd_env::testing::screen_ao_active()) << label;
+    if (records::gbuffer()) {
+      EXPECT_FALSE(flagged(layer_config())) << label;
+    } else {
+      EXPECT_EQ(stamp_forward(layer_config()), 0u) << label;
+    }
+  };
+  expect_off(ao_frame(Quality::Off), "ao off");
+  expect_off(ao_frame(Quality::High, 1), "class view");
+  fwd_env::testing::set_identity_override(true);
+  expect_off(ao_frame(Quality::High), "identity");
+  fwd_env::testing::set_identity_override(std::nullopt);
+  webgpu::g_graphicsConfig.gbuffer = false;
+  expect_off(ao_frame(Quality::High), "tier off");
+  webgpu::g_graphicsConfig.gbuffer = true;
+  detail::remove_hints();
+  expect_off(ao_frame(Quality::High), "hints off");
+  apply_frame_state(ao_frame(Quality::Off));
+  EXPECT_EQ(records::stats().screenAo, 3u);
+}
+
+detail::GraphEnvironment tier_b_env() {
+  detail::GraphEnvironment env;
+  env.efbSize = {64, 32};
+  env.outputSize = {64, 32};
+  env.sceneSize = {64, 32};
+  const auto set = [&](detail::GxResource resource, wgpu::TextureFormat format, wgpu::TextureUsage usage) {
+    env.gxFormats[static_cast<size_t>(resource)] = format;
+    env.gxUsage[static_cast<size_t>(resource)] = usage;
+  };
+  constexpr wgpu::TextureUsage Target =
+      wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc;
+  set(detail::GxResource::Color, wgpu::TextureFormat::BGRA8Unorm, Target | wgpu::TextureUsage::CopyDst);
+  set(detail::GxResource::Depth, wgpu::TextureFormat::Depth32Float,
+      wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding);
+  set(detail::GxResource::Normal, wgpu::TextureFormat::RGB10A2Unorm, Target);
+  set(detail::GxResource::Motion, wgpu::TextureFormat::RG16Float, Target);
+  set(detail::GxResource::Reactive, wgpu::TextureFormat::R8Unorm, Target);
+  set(detail::GxResource::Fog, wgpu::TextureFormat::RGBA8Uint, Target);
+  return env;
+}
+
+void declare_stub_ao(detail::InternalPassBuilder& builder, const detail::PassSetup&, const void*) {
+  builder.after(phase::Ao);
+  builder.create(resource::AoFinal,
+                 {.format = wgpu::TextureFormat::RGBA8Unorm, .sizeClass = SizeClass::Efb, .divisor = 1},
+                 Access::CopyDst);
+}
+
+void encode_nothing(detail::PassContext&, const void*) {}
+
+struct PublisherGraph {
+  std::vector<detail::PassDesc> passes;
+  std::vector<detail::GxReadDesc> reads;
+  std::shared_ptr<detail::CompiledGraph> graph;
+};
+
+PublisherGraph compile_publisher(const Settings& settings, const detail::GraphEnvironment& env = tier_b_env()) {
+  static const Caps caps;
+  PublisherGraph out;
+  out.passes = {detail::composite::copy_pass_desc(), detail::composite::pass_desc(), fwd_env::pass_desc(),
+                detail::PassDesc{.name = "test.ao",
+                                 .stage = Stage::OpaqueDone,
+                                 .kind = PassKind::Copy,
+                                 .declare = declare_stub_ao,
+                                 .encode = encode_nothing}};
+  out.reads = {fwd_env::read_desc()};
+  out.graph = detail::compile_graph(detail::GraphInputs{
+      .passes = out.passes,
+      .gxReads = out.reads,
+      .settings = &settings,
+      .caps = &caps,
+      .env = env,
+      .sceneDepthSource = DepthSource::Direct,
+  });
+  return out;
+}
+
+detail::CullReason publisher_status(const detail::CompiledGraph& graph) {
+  const detail::NodeId id = graph.find_node(fwd_env::Pass);
+  EXPECT_NE(id, detail::InvalidNode);
+  return id != detail::InvalidNode ? graph.nodes[id].status : detail::CullReason::None;
+}
+
+bool reads_ao(const detail::CompiledGraph& graph) {
+  const detail::NodeId chain = graph.find_node(fwd_env::ReadNode);
+  if (chain == detail::InvalidNode) {
+    return false;
+  }
+  return std::ranges::any_of(graph.node_uses(chain), [&](const detail::CompiledUse& use) {
+    return graph.resources[use.resource].name == resource::AoFinal;
+  });
+}
+
+TEST_F(RenderGxExt, FwdEnvPublisherSkipsWithoutAoOrTier) {
+  Settings settings;
+  const PublisherGraph off = compile_publisher(settings);
+  ASSERT_NE(off.graph, nullptr);
+  EXPECT_EQ(publisher_status(*off.graph), detail::CullReason::Skipped);
+  EXPECT_FALSE(reads_ao(*off.graph));
+  settings.ao = Quality::High;
+  for (const detail::GxResource missing : {detail::GxResource::Fog, detail::GxResource::Normal}) {
+    detail::GraphEnvironment env = tier_b_env();
+    env.gxFormats[static_cast<size_t>(missing)] = wgpu::TextureFormat::Undefined;
+    const PublisherGraph noTier = compile_publisher(settings, env);
+    EXPECT_EQ(publisher_status(*noTier.graph), detail::CullReason::Skipped);
+    EXPECT_FALSE(reads_ao(*noTier.graph));
+  }
+  detail::GraphEnvironment msaa = tier_b_env();
+  msaa.gxSampleCount = 4;
+  EXPECT_EQ(publisher_status(*compile_publisher(settings, msaa).graph), detail::CullReason::Skipped);
+  const PublisherGraph on = compile_publisher(settings);
+  EXPECT_EQ(publisher_status(*on.graph), detail::CullReason::None);
+  EXPECT_TRUE(reads_ao(*on.graph));
+}
+
+TEST_F(RenderGxExt, FwdEnvPublisherSkipsUnderIdentity) {
+  Settings settings;
+  settings.ao = Quality::High;
+  fwd_env::testing::set_identity_override(true);
+  const PublisherGraph graph = compile_publisher(settings);
+  EXPECT_EQ(publisher_status(*graph.graph), detail::CullReason::Skipped);
+  EXPECT_FALSE(reads_ao(*graph.graph));
+  EXPECT_FALSE(fwd_env::forward_ao_wanted(settings));
+  fwd_env::testing::set_identity_override(false);
+  EXPECT_TRUE(fwd_env::forward_ao_wanted(settings));
+  settings.debugView = 1;
+  EXPECT_FALSE(fwd_env::forward_ao_wanted(settings));
+}
+
+TEST_F(RenderGxExt, FwdEnvPublisherSortsAfterComposite) {
+  Settings settings;
+  settings.ao = Quality::High;
+  const PublisherGraph built = compile_publisher(settings);
+  const detail::CompiledGraph& graph = *built.graph;
+  EXPECT_EQ(publisher_status(graph), detail::CullReason::None);
+  const std::vector<detail::NodeId>& program = graph.stages[static_cast<size_t>(Stage::OpaqueDone)].nodes;
+  const auto at = [&](std::string_view name) {
+    return std::ranges::find(program, graph.find_node(name)) - program.begin();
+  };
+  ASSERT_LT(at(detail::composite::Pass), static_cast<std::ptrdiff_t>(program.size()));
+  EXPECT_LT(at(detail::composite::Pass), at(fwd_env::Pass));
+  EXPECT_LT(at(fwd_env::Pass), at(phase::Overlay));
+  EXPECT_TRUE(graph.nodes[graph.find_node(fwd_env::Pass)].sink);
+  EXPECT_TRUE(reads_ao(graph));
+  const std::optional<std::string> contract = detail::composite::check_contract(graph);
+  EXPECT_FALSE(contract.has_value()) << contract.value_or("");
 }
 } // namespace
 } // namespace aurora::render::gx_ext

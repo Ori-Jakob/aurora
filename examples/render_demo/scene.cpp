@@ -51,6 +51,10 @@ constexpr u64 WaterObject = 0x400;
 constexpr u64 AoWallObject = 0x500;
 constexpr u64 AoPoleObject = 0x501;
 constexpr u64 AoSliderObject = 0x502;
+constexpr u64 FwdEnvWallObject = 0x600;
+constexpr u64 FwdEnvStripAObject = 0x610;
+constexpr u64 FwdEnvStripBObject = 0x611;
+constexpr u64 FwdEnvCardObject = 0x612;
 constexpr u32 GroundMaterial = 1;
 constexpr u32 SceneEpoch = 1;
 constexpr u32 GroundTextureSize = 64;
@@ -69,6 +73,19 @@ constexpr Slab AoWall{{14.f, 1.5f, -4.f}, {0.2f, 3.f, 6.f}};
 constexpr Slab AoPole{{14.65f, 1.3f, -4.f}, {0.1f, 2.6f, 0.1f}};
 constexpr Vec AoSliderStart{11.f, 0.5f, 1.f};
 constexpr f32 AoSliderSize = 1.f;
+// A corridor down the view from the near fog band to the ground's far edge, so its creases cover every q
+constexpr std::array<Slab, 2> FwdEnvWalls{
+    {{{-10.f, 1.f, 1.5f}, {60.f, 2.f, 0.4f}}, {{-10.f, 1.f, -1.5f}, {60.f, 2.f, 0.4f}}}};
+constexpr u32 FwdEnvStripCells = 12;
+constexpr GXColor StripAColor{200, 150, 100, 255};
+constexpr GXColor StripBColor{100, 170, 140, 255};
+constexpr GXColor CardColor{230, 90, 160, 255};
+constexpr f32 CardX = 8.f;
+// Ends nearer than band 0, so the corridor reaches q7 = 127 where its crease still spans several AO texels
+constexpr FogParams FwdEnvFog{GX_FOG_PERSP_LIN, 13.f, 40.f, 0.5f, 400.f, ClearColor};
+constexpr f32 CardZ0 = 0.5f;
+constexpr f32 CardZ1 = 1.28f;
+constexpr f32 CardTop = 1.2f;
 
 f32 ao_slider_z(u32 frame) noexcept {
   const u32 last = AoSliderRemoved - 1;
@@ -273,7 +290,7 @@ Lights setup_lights(const Mtx view, f32 t) {
   return lights;
 }
 
-void draw_ground(const Mtx view) {
+void set_ground_format() {
   GXClearVtxDesc();
   GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
   GXSetVtxDesc(GX_VA_NRM, GX_DIRECT);
@@ -283,6 +300,24 @@ void draw_ground(const Mtx view) {
   GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
   GXSetNumTexGens(1);
   GXSetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
+}
+
+// Shared by the ground and the strips laid on it, so both send bit-identical vertices
+void ground_cell(u32 cx, u32 cz) {
+  const f32 x0 = -GroundExtent + static_cast<f32>(cx) * GroundCellSize;
+  const f32 z0 = -GroundExtent + static_cast<f32>(cz) * GroundCellSize;
+  const f32 x1 = x0 + GroundCellSize;
+  const f32 z1 = z0 + GroundCellSize;
+  const f32 corners[4][2] = {{x0, z0}, {x1, z0}, {x1, z1}, {x0, z1}};
+  for (const auto& [x, z] : corners) {
+    GXPosition3f32(x, 0.f, z);
+    GXNormal3f32(0.f, 1.f, 0.f);
+    GXTexCoord2f32(x / GroundCellSize, z / GroundCellSize);
+  }
+}
+
+void draw_ground(const Mtx view) {
+  set_ground_format();
   GXLoadTexObj(&sGroundTexObj, GX_TEXMAP0);
   GXSetNumTevStages(1);
   GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
@@ -295,16 +330,7 @@ void draw_ground(const Mtx view) {
   GXBegin(GX_QUADS, GX_VTXFMT0, GroundCells * GroundCells * 4);
   for (u32 cz = 0; cz < GroundCells; ++cz) {
     for (u32 cx = 0; cx < GroundCells; ++cx) {
-      const f32 x0 = -GroundExtent + static_cast<f32>(cx) * GroundCellSize;
-      const f32 z0 = -GroundExtent + static_cast<f32>(cz) * GroundCellSize;
-      const f32 x1 = x0 + GroundCellSize;
-      const f32 z1 = z0 + GroundCellSize;
-      const f32 corners[4][2] = {{x0, z0}, {x1, z0}, {x1, z1}, {x0, z1}};
-      for (const auto& [x, z] : corners) {
-        GXPosition3f32(x, 0.f, z);
-        GXNormal3f32(0.f, 1.f, 0.f);
-        GXTexCoord2f32(x / GroundCellSize, z / GroundCellSize);
-      }
+      ground_cell(cx, cz);
     }
   }
   GXEnd();
@@ -547,6 +573,69 @@ void draw_ao_slabs(const Mtx view, u32 frame) {
                       {AoSliderSize, AoSliderSize, AoSliderSize}};
     draw_ao_slab(view, slider, AoSliderObject, AURORA_CAT_DYNAMIC, 0);
   }
+}
+
+void draw_fwd_env_walls(const Mtx view) {
+  set_lit_channel(GX_SRC_VTX);
+  set_pass_color_tev();
+  GXSetCurrentMtx(GX_PNMTX0);
+  GXSetCullMode(GX_CULL_BACK);
+  for (size_t i = 0; i < FwdEnvWalls.size(); ++i) {
+    draw_ao_slab(view, FwdEnvWalls[i], FwdEnvWallObject + i, AURORA_CAT_STATIC, AURORA_OBJ_IMMOBILE);
+  }
+}
+
+void set_konst_tev(GXColor colour) {
+  GXSetNumTevStages(1);
+  GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR_NULL);
+  GXSetTevKColor(GX_KCOLOR0, colour);
+  GXSetTevKColorSel(GX_TEVSTAGE0, GX_TEV_KCSEL_K0);
+  GXSetTevKAlphaSel(GX_TEVSTAGE0, GX_TEV_KASEL_K0_A);
+  GXSetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_KONST);
+  GXSetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_KONST);
+  GXSetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+  GXSetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+}
+
+void draw_fwd_env_layers(const Mtx view) {
+  set_ground_format();
+  set_lit_channel(GX_SRC_REG);
+  GXSetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+  GXSetZMode(GX_TRUE, GX_LEQUAL, GX_FALSE);
+  GXSetCullMode(GX_CULL_BACK);
+  load_matrices(view, GX_PNMTX0);
+  GXSetCurrentMtx(GX_PNMTX0);
+  set_fog(FwdEnvFog);
+  const auto strip = [](u64 object, u32 categories, GXColor colour, u32 cz) {
+    begin_object(object, categories, 0);
+    set_konst_tev(colour);
+    GXBegin(GX_QUADS, GX_VTXFMT0, FwdEnvStripCells * 4);
+    for (u32 cx = 0; cx < FwdEnvStripCells; ++cx) {
+      ground_cell(cx, cz);
+    }
+    GXEnd();
+    end_object();
+  };
+  strip(FwdEnvStripAObject, AURORA_CAT_TERRAIN | AURORA_CAT_DECAL, StripAColor, GroundCells / 2);
+  strip(FwdEnvStripBObject, 0, StripBColor, GroundCells / 2 - 1);
+
+  GXSetFog(GX_FOG_NONE, 0.f, 0.f, 0.f, 0.f, ClearColor);
+  GXSetCullMode(GX_CULL_NONE);
+  begin_object(FwdEnvCardObject, AURORA_CAT_TERRAIN | AURORA_CAT_DECAL, 0);
+  set_konst_tev(CardColor);
+  constexpr f32 Corners[4][2] = {{0.f, CardZ0}, {0.f, CardZ1}, {CardTop, CardZ1}, {CardTop, CardZ0}};
+  GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+  for (const auto& [y, z] : Corners) {
+    GXPosition3f32(CardX, y, z);
+    GXNormal3f32(1.f, 0.f, 0.f);
+    GXTexCoord2f32(0.f, 0.f);
+  }
+  GXEnd();
+  end_object();
+
+  set_fog(FogBands[1]);
+  GXSetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+  GXSetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
 }
 
 void emit_frame_hints(u32 frame, const Mtx view, const Mtx44 projection, const Lights& lights) {
@@ -812,13 +901,59 @@ std::vector<std::array<f32, 2>> ao_trail_probes(u32 frame) {
   return probes;
 }
 
+std::vector<FwdEnvProbe> fwd_env_probes() {
+  const SceneCamera camera = scene_camera(AoCheckClock);
+  const Vec eye{static_cast<f32>(camera.eye.x), static_cast<f32>(camera.eye.y), static_cast<f32>(camera.eye.z)};
+  std::vector<FwdEnvProbe> probes;
+  const auto add = [&](FwdEnvProbeClass cls, const Vec& world) {
+    const std::array<f32, 2> ndc = project(camera, world);
+    if (std::abs(ndc[0]) < 0.99f && std::abs(ndc[1]) < 0.99f) {
+      probes.push_back({.ndc = {ndc[0], ndc[1]}, .cls = cls});
+    }
+  };
+  // The card writes no depth or normal, so ground seen through it would pass for strip A
+  const auto behind_card = [&](f32 x, f32 z) {
+    if (x >= CardX) {
+      return false;
+    }
+    const f32 s = (eye.x - CardX) / (eye.x - x);
+    const f32 zc = eye.z + (z - eye.z) * s;
+    return eye.y * (1.f - s) <= CardTop + 0.1f && zc >= CardZ0 - 0.1f && zc <= CardZ1 + 0.1f;
+  };
+  for (f32 x = 19.6f; x > -39.9f; x -= x > 12.f || x < -8.f ? 0.2f : 1.f) {
+    for (const f32 z : {0.3f, 0.7f, 1.f, 1.1f, 1.16f, 1.2f, 1.23f, 1.25f, 1.27f, 1.285f}) {
+      if (!behind_card(x, z)) {
+        add(FwdEnvProbeClass::StripA, {x, 0.f, z});
+      }
+      add(FwdEnvProbeClass::StripB, {x, 0.f, -z});
+    }
+  }
+  for (f32 y = 0.6f; y < CardTop - 0.04f; y += 0.05f) {
+    for (f32 z = 0.95f; z < CardZ1 - 0.02f; z += 0.03f) {
+      add(FwdEnvProbeClass::Card, {CardX, y, z});
+    }
+  }
+  return probes;
+}
+
+FwdEnvExpect fwd_env_expect() noexcept {
+  const SceneCamera camera = scene_camera(AoCheckClock);
+  Vec up{camera.view[0][1], camera.view[1][1], camera.view[2][1]};
+  C_VECNormalize(&up, &up);
+  const auto rgb = [](GXColor c) { return std::array<u8, 3>{c.r, c.g, c.b}; };
+  return {
+      .colors = {rgb(StripAColor), rgb(StripBColor), rgb(CardColor)},
+      .groundNormal = {up.x, up.y, up.z},
+  };
+}
+
 FogResolveCounts fog_resolve_counts() noexcept { return sFogResolves; }
 
 void draw_scene(u32 frame, const SceneOptions& options) {
   // Not gated on hints_enabled() so the off capture proves emitters add only hint bytes; real producers do gate on it
   set_hint_emission(options.hints);
   upload_gpu_arrays(options);
-  const u32 clock = options.aoCheck ? AoCheckClock : frame;
+  const u32 clock = options.aoCheck || options.fwdEnvCheck ? AoCheckClock : frame;
   const f32 t = static_cast<f32>(clock) / 60.f;
   const SceneCamera camera = scene_camera(clock);
   GXSetCopyClear(ClearColor, GX_MAX_Z24);
@@ -838,8 +973,9 @@ void draw_scene(u32 frame, const SceneOptions& options) {
   hint_stage(AURORA_STAGE_SCENE_BEGIN);
 
   if (options.fogBands) {
-    set_fog(FogBands[0]);
+    set_fog(options.fwdEnvCheck ? FwdEnvFog : FogBands[0]);
   }
+
   begin_object(GroundObject, AURORA_CAT_STATIC | AURORA_CAT_TERRAIN, AURORA_OBJ_IMMOBILE);
   hint_material(GroundMaterial);
   draw_ground(view);
@@ -854,6 +990,9 @@ void draw_scene(u32 frame, const SceneOptions& options) {
   if (options.aoCheck) {
     draw_ao_slabs(view, frame);
   }
+  if (options.fwdEnvCheck) {
+    draw_fwd_env_walls(view);
+  }
 
   Mtx bones[TentacleBones];
   tentacle_bones(t, bones);
@@ -867,7 +1006,7 @@ void draw_scene(u32 frame, const SceneOptions& options) {
     draw_capture_only_box(view, eye, target);
   }
   hint_stage(AURORA_STAGE_OPAQUE_DONE);
-  if (options.fogBands) {
+  if (options.fogBands && !options.fwdEnvCheck) {
     resolve_fog_records();
   }
 
@@ -878,6 +1017,9 @@ void draw_scene(u32 frame, const SceneOptions& options) {
   hint_tev_policy(waterPolicy);
   draw_water(view);
   end_object();
+  if (options.fwdEnvCheck) {
+    draw_fwd_env_layers(view);
+  }
 
   hint_stage(AURORA_STAGE_PRE_POST);
   hint_stage(AURORA_STAGE_SCENE_END);

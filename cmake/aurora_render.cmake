@@ -73,6 +73,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/graph_slots.hpp
         lib/render/gx_ext/ext_provider.cpp
         lib/render/gx_ext/ext_provider.hpp
+        lib/render/gx_ext/fwd_env.cpp
+        lib/render/gx_ext/fwd_env.hpp
         lib/render/gx_ext/records.cpp
         lib/render/gx_ext/records.hpp
         lib/render/hints.cpp

@@ -90,8 +90,10 @@ color_target_states(const PipelineConfig& config, const gfx::RenderTargetLayout&
 gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout);
 uint64_t gbuffer_pipeline_failures() noexcept;
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass);
+// Render worker or after it stops; a published group lasts until the next worker frame begin, and null means neutral
+void set_forward_environment_group(wgpu::BindGroup group) noexcept;
 struct BindCounts {
-  uint64_t draws, texturedDraws, uniformBinds, textureBinds, indexBinds, encodeNs;
+  uint64_t draws, texturedDraws, uniformBinds, textureBinds, indexBinds, encodeNs, envBinds;
 };
 void reset_pass_bindings() noexcept;
 void add_encode_ns(uint64_t ns) noexcept;

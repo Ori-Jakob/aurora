@@ -698,6 +698,101 @@ TEST_F(GxShaderExtDevice, MotionPipelinesCompileOnBackend) {
   RecordProperty("compiled", static_cast<int>(compiled));
 }
 
+// Blended, colour-only opaque and a destination-alpha prepass, each with the forward environment bit
+std::array<PipelineConfig, 3> fwd_env_variants(const ShaderConfig& shader) {
+  ShaderConfig config = shader;
+  config.ext.fwdEnv = 1;
+  const PipelineConfig opaque = pipeline_for(config);
+  PipelineConfig colorOnly = opaque;
+  colorOnly.depthUpdate = false;
+  PipelineConfig prepass = blended(opaque);
+  prepass.dstAlpha = 0x80;
+  return {blended(opaque), colorOnly, prepass};
+}
+
+TEST_F(GxShaderExtDevice, FwdEnvPipelinesValidate) {
+  ASSERT_TRUE(start({.backend = wgpu::BackendType::Null, .core = true}, true));
+  gfx::set_blocking_pipelines(true);
+  const gfx::RenderTargetLayout layout = gbuffer_layout();
+  const ShaderTargets targets = shader_targets(layout);
+  ASSERT_TRUE(targets.fwdEnv);
+  const std::vector<ShaderConfig> configs = legacy_valid_configs(*m_device);
+  ASSERT_FALSE(configs.empty());
+  const uint64_t failures = gbuffer_pipeline_failures();
+  size_t built = 0;
+  size_t clamped = 0;
+  for (const ShaderConfig& config : configs) {
+    const std::array<PipelineConfig, 3> variants = fwd_env_variants(config);
+    for (size_t i = 0; i < variants.size(); ++i) {
+      const gfx::CompiledPipeline pipeline = create_pipeline(variants[i], layout);
+      EXPECT_TRUE(static_cast<bool>(pipeline.main));
+      EXPECT_EQ(pipeline.group3, Group3ForwardEnvironment);
+      if (i == 2) {
+        EXPECT_TRUE(static_cast<bool>(pipeline.prepass));
+      }
+      if (pipeline.main && tev_colour_clamped(config)) {
+        EXPECT_TRUE(static_cast<bool>(pipeline.main.GetBindGroupLayout(3)));
+      }
+      ++built;
+    }
+    clamped += tev_colour_clamped(config) ? 1 : 0;
+    EXPECT_EQ(create_pipeline(variants[0], scene_layout()).group3, 0u);
+    EXPECT_EQ(create_pipeline(render_ext::fallback_config(variants[0]), layout).group3, 0u);
+  }
+  EXPECT_GT(clamped, 0u);
+  EXPECT_EQ(gbuffer_pipeline_failures(), failures);
+  EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
+  std::printf("forward environment pipelines: %zu configs (%zu clamped), %zu pipelines\n", configs.size(), clamped,
+              built);
+  RecordProperty("configs", static_cast<int>(configs.size()));
+
+  const char* path = std::getenv("AURORA_GX_SHADER_CORPUS");
+  if (path == nullptr || *path == '\0') {
+    return;
+  }
+  std::string error;
+  const auto entries = corpus::read_corpus(path, &error);
+  ASSERT_TRUE(entries.has_value()) << error;
+  size_t validated = 0;
+  for (const corpus::Entry& entry : *entries) {
+    ShaderConfig config = corpus::decode(entry.record);
+    const DstAlphaMode mode = corpus::decode_variant(entry.record).dstAlphaMode;
+    if (mode == DstAlphaMode::DualSource || module_error(*m_device, build_shader_source(config, mode))) {
+      continue;
+    }
+    config.ext.fwdEnv = 1;
+    const auto failure = module_error(*m_device, build_shader_source(config, mode, targets));
+    EXPECT_FALSE(failure.has_value()) << entry.label << ": " << failure.value_or("");
+    ++validated;
+  }
+  EXPECT_GT(validated, 0u);
+  std::printf("TP corpus: %zu forward environment texts validated\n", validated);
+}
+
+TEST_F(GxShaderExtDevice, FwdEnvPipelinesCompileOnBackend) {
+  const auto backend = hardware_backend();
+  if (!backend) {
+    GTEST_SKIP() << "AURORA_TEST_BACKEND names no hardware backend";
+  }
+  if (!start({.backend = *backend, .core = true, .allowCpu = false}, true)) {
+    GTEST_SKIP() << "no adapter";
+  }
+  const gfx::RenderTargetLayout layout = gbuffer_layout();
+  const std::vector<ShaderConfig> configs = legacy_valid_configs(*m_device, 64);
+  ASSERT_EQ(configs.size(), 64u);
+  const uint64_t failures = gbuffer_pipeline_failures();
+  size_t compiled = 0;
+  for (const ShaderConfig& config : configs) {
+    for (const PipelineConfig& variant : fwd_env_variants(config)) {
+      const bool built = static_cast<bool>(create_pipeline(variant, layout).main);
+      EXPECT_TRUE(built);
+      compiled += built ? 1 : 0;
+    }
+  }
+  EXPECT_EQ(gbuffer_pipeline_failures(), failures);
+  RecordProperty("compiled", static_cast<int>(compiled));
+}
+
 TEST_F(GxShaderExtDevice, HexTapsPreserveTexelLength) {
   const auto backend = hardware_backend();
   if (!backend) {

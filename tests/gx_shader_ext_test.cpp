@@ -204,6 +204,17 @@ TEST_F(GxShaderExtTest, FallbackConfigClearsOutputAndVelocity) {
   }
 }
 
+TEST_F(GxShaderExtTest, FallbackConfigClearsFwdEnv) {
+  PipelineConfig config{};
+  config.shaderConfig.ext = {.output = 1, .fwdEnv = 1};
+  EXPECT_TRUE(render_ext::fallback_config(config).shaderConfig.ext == RenderExtConfig{});
+  EXPECT_EQ(persisted_version(render_ext::fallback_config(config)), 14u);
+  EXPECT_EQ(render_ext::legacy_config(config).shaderConfig.ext.fwdEnv, 1u);
+  config.shaderConfig.ext = {.fwdEnv = 1};
+  EXPECT_EQ(persisted_version(config), GXExtRowVersion);
+  EXPECT_EQ(persisted_version(render_ext::fallback_config(config)), 14u);
+}
+
 TEST_F(GxShaderExtTest, NormalizeKeepsOnlyEligibleStochastic) {
   const ShaderInfo info = build_shader_info(single_site());
   ASSERT_EQ(info.stochasticEligible.to_ulong(), 1u);
@@ -739,6 +750,12 @@ TEST_F(GxShaderExtTest, OutputRowsAdmittedOnlyUnderGbufferLayouts) {
   EXPECT_EQ(targets.gbufferNormal, 1u);
   EXPECT_EQ(shader_targets(without[1]).gbufferNormal, UINT32_MAX);
   EXPECT_EQ(shader_targets(without[1]).normal, 1u);
+  for (const auto& layout : with) {
+    EXPECT_TRUE(shader_targets(layout).fwdEnv);
+  }
+  for (const auto& layout : without) {
+    EXPECT_FALSE(shader_targets(layout).fwdEnv) << layout.colorAttachmentCount;
+  }
 }
 
 TEST_F(GxShaderExtTest, GbufferNormalAlphaCarriesReceiverCode) {
@@ -917,6 +934,94 @@ TEST_F(GxShaderExtTest, FogRecordPredicate) {
   EXPECT_TRUE(populated(GX_PF_RGB8_Z24, GX_BL_DSTALPHA, GX_BL_INVDSTALPHA));
   EXPECT_FALSE(populated(GX_PF_RGBA6_Z24, GX_BL_DSTALPHA, GX_BL_INVDSTALPHA));
   EXPECT_FALSE(populated(GX_PF_RGB8_Z24, GX_BL_INVDSTALPHA, GX_BL_DSTALPHA));
+}
+
+constexpr ShaderTargets FwdEnvTargets{.motion = 2, .reactive = 3, .gbufferNormal = 1, .fog = 4, .fwdEnv = true};
+constexpr std::string_view FwdBinding = "@group(3) @binding(0)";
+constexpr std::string_view FwdHelper = "fn fwd_screen_ao(";
+constexpr std::string_view FwdLoad = "textureLoad(fwd_ao,";
+
+ShaderConfig with_fwd_env(ShaderConfig config) {
+  config.ext.fwdEnv = 1;
+  return config;
+}
+
+// Clamped colour, wrapping alpha and a live alpha test, so the overflow and compare lines follow the block
+ShaderConfig clamped_with_tail(u8 fogType) {
+  ShaderConfig config = fogged(fogType);
+  config.tevStages[0].alphaOp.clamp = false;
+  config.alphaCompare = {.comp0 = GX_GREATER, .ref0 = 8, .op = GX_AOP_AND, .comp1 = GX_ALWAYS, .ref1 = 0};
+  return config;
+}
+
+TEST_F(GxShaderExtTest, FwdEnvNeedsLayoutAndBit) {
+  const ShaderConfig plain = single_site();
+  for (const auto mode : {DstAlphaMode::None, DstAlphaMode::Replace}) {
+    EXPECT_EQ(build_shader_source(with_fwd_env(plain), mode), build_shader_source(plain, mode));
+    EXPECT_EQ(build_shader_source(with_fwd_env(plain), mode, 1u), build_shader_source(plain, mode, 1u));
+    ShaderTargets noEnv = FwdEnvTargets;
+    noEnv.fwdEnv = false;
+    EXPECT_EQ(build_shader_source(plain, mode, FwdEnvTargets), build_shader_source(plain, mode, noEnv));
+    EXPECT_EQ(build_shader_source(with_fwd_env(plain), mode, noEnv), build_shader_source(plain, mode, noEnv));
+  }
+
+  for (const u8 fogType : {u8{GX_FOG_PERSP_LIN}, u8{GX_FOG_ORTHO_EXP}, u8{GX_FOG_NONE}}) {
+    const ShaderConfig config = with_fwd_env(clamped_with_tail(fogType));
+    ASSERT_TRUE(tev_colour_clamped(config));
+    const std::string text = build_shader_source(config, DstAlphaMode::None, FwdEnvTargets);
+    EXPECT_EQ(count(text, FwdBinding), 1u) << int{fogType};
+    EXPECT_EQ(count(text, FwdHelper), 1u) << int{fogType};
+    EXPECT_EQ(count(text, FwdLoad), 1u) << int{fogType};
+    const size_t block = text.find(FwdLoad);
+    const size_t body = text.find("fn fs_main(");
+    ASSERT_NE(body, std::string::npos);
+    EXPECT_LT(text.rfind("// TEV stage"), block) << int{fogType};
+    if (fogType != GX_FOG_NONE) {
+      const size_t mix = text.find("prev = vec4f(mix(prev.rgb, ubuf.fog.color.rgb");
+      ASSERT_NE(mix, std::string::npos);
+      EXPECT_LT(block, mix) << int{fogType};
+    }
+    const size_t overflow = text.find("prev.a = tev_overflow_f32(prev.a);", body);
+    const size_t compare = text.find("// Alpha compare", body);
+    ASSERT_NE(overflow, std::string::npos);
+    ASSERT_NE(compare, std::string::npos);
+    EXPECT_LT(block, overflow) << int{fogType};
+    EXPECT_LT(block, compare) << int{fogType};
+    EXPECT_NE(text.find("& 2048u) != 0u)"), std::string::npos);
+    EXPECT_NE(text.find("smoothstep(0.004, 0.020, gap)"), std::string::npos);
+    EXPECT_EQ(location_count(text),
+              location_count(build_shader_source(clamped_with_tail(fogType), DstAlphaMode::None, FwdEnvTargets)));
+    EXPECT_EQ(uniform_struct(text),
+              uniform_struct(build_shader_source(clamped_with_tail(fogType), DstAlphaMode::None, FwdEnvTargets)));
+  }
+
+  ShaderConfig unclamped = with_fwd_env(fogged(GX_FOG_PERSP_LIN));
+  unclamped.tevStages[0].colorOp.clamp = false;
+  ASSERT_FALSE(tev_colour_clamped(unclamped));
+  const std::string text = build_shader_source(unclamped, DstAlphaMode::None, FwdEnvTargets);
+  EXPECT_EQ(count(text, FwdBinding), 1u);
+  EXPECT_EQ(text.find(FwdHelper), std::string::npos);
+  EXPECT_EQ(text.find(FwdLoad), std::string::npos);
+}
+
+TEST_F(GxShaderExtTest, FwdEnvPredicateMatchesText) {
+  ShaderConfig unclamped = single_site();
+  unclamped.tevStages[0].colorOp.clamp = false;
+  const std::array configs{single_site(), fogged(GX_FOG_PERSP_EXP), unclamped, lit_normal_config()};
+  ShaderTargets noEnv = FwdEnvTargets;
+  noEnv.fwdEnv = false;
+  const std::array targets{FwdEnvTargets, noEnv, ShaderTargets{.normal = 1}, ShaderTargets{}};
+  for (const ShaderConfig& base : configs) {
+    for (const bool bit : {false, true}) {
+      const ShaderConfig config = bit ? with_fwd_env(base) : base;
+      for (const ShaderTargets& target : targets) {
+        const std::string text = build_shader_source(config, DstAlphaMode::None, target);
+        EXPECT_EQ(text.find(FwdBinding) != std::string::npos, uses_forward_env(config, target));
+        EXPECT_EQ(text.find(FwdLoad) != std::string::npos,
+                  uses_forward_env(config, target) && tev_colour_clamped(config));
+      }
+    }
+  }
 }
 } // namespace
 } // namespace aurora::gx

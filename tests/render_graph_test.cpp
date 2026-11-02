@@ -1806,6 +1806,43 @@ TEST_F(RenderGraphCull, GxReadKeepsProducerLive) {
   EXPECT_EQ(node(*graph, "maker").status, CullReason::NoConsumer);
 }
 
+TEST_F(RenderGraph, RegisteredGxReadReachesProductionCompile) {
+  testing::clear_passes();
+  const std::vector<TestPass> passes{creator_of("maker", "x")};
+  std::vector<PassDesc> descs = pass_descs(passes);
+  descs[0].encode = [](PassContext&, const void*) {};
+  ASSERT_NE(register_pass(descs[0]), InvalidPassId);
+  const Settings settings;
+  const Caps caps;
+  const GraphEnvironment env = test_inputs().env;
+  const LatchGraphInputs latch{.sceneDepthSource = DepthSource::Direct};
+  EXPECT_TRUE(consume_graph_dirty());
+  auto graph = compile_graph(settings, caps, env, latch);
+  ASSERT_NE(graph, nullptr);
+  EXPECT_EQ(node(*graph, "maker").status, CullReason::NoConsumer);
+
+  const GxReadId read = register_gx_read({.node = "gx@PrePost", .declare = declare_gx_read_of_x});
+  EXPECT_NE(read, InvalidGxReadId);
+  EXPECT_TRUE(consume_graph_dirty());
+  graph = compile_graph(settings, caps, env, latch);
+  EXPECT_TRUE(active(*graph, "maker"));
+  EXPECT_EQ(producer(*graph, "gx@PrePost", "x"), graph->find_node("maker"));
+
+  unregister_gx_read(read);
+  EXPECT_TRUE(consume_graph_dirty());
+  unregister_gx_read(read);
+  EXPECT_FALSE(consume_graph_dirty());
+  graph = compile_graph(settings, caps, env, latch);
+  EXPECT_EQ(node(*graph, "maker").status, CullReason::NoConsumer);
+
+  register_gx_read({.node = "gx@PrePost", .declare = declare_gx_read_of_x});
+  testing::clear_passes();
+  ASSERT_NE(register_pass(descs[0]), InvalidPassId);
+  graph = compile_graph(settings, caps, env, latch);
+  EXPECT_EQ(node(*graph, "maker").status, CullReason::NoConsumer);
+  testing::clear_passes();
+}
+
 TEST_F(RenderGraphCull, DiagnosticNeedsInspector) {
   const auto capture = [](bool sideEffect) {
     return TestPass{.name = "capture",

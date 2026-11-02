@@ -52,6 +52,7 @@ enum ExitCode : int {
   ExitMotionCheck = 11,
   ExitFogCheck = 12,
   ExitAoCheck = 13,
+  ExitFwdEnvCheck = 14,
 };
 
 std::atomic_uint32_t g_errorCount = 0;
@@ -246,6 +247,27 @@ AoCheckOutcome ao_check_outcome(const render_demo::AoCheckReport& report, bool n
     outcome.failure = failure;
   } else {
     outcome.failure = outcome.temporal.failure;
+  }
+  return outcome;
+}
+
+struct FwdEnvOutcome {
+  render_demo::FwdEnvSummary summary;
+  std::optional<std::string> failure;
+};
+
+FwdEnvOutcome fwd_env_outcome(const render_demo::FwdEnvCheckReport& report, bool nullBackend) {
+  FwdEnvOutcome outcome{.summary = render_demo::summarize_fwd_env(report.samples, render_demo::fwd_env_expect())};
+  // The null backend runs no shaders, so its values say nothing
+  if (nullBackend) {
+    return outcome;
+  }
+  if (report.encodes == 0) {
+    outcome.failure = "ao.final or a scene target never reached demo.fwd_env_check";
+  } else if (!report.ready || report.samples.empty()) {
+    outcome.failure = "check readback did not complete";
+  } else {
+    outcome.failure = render_demo::check_fwd_env(outcome.summary);
   }
   return outcome;
 }
@@ -606,7 +628,7 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  if (options.aoCheck) {
+  if (options.aoCheck || options.fwdEnvCheck) {
     // apply_settings alone cannot reach AO before its built bits ship, so the check builds it through the env
     SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_AO", "high", false);
   }
@@ -653,8 +675,9 @@ int main(int argc, char* argv[]) {
                                          .customDrawProbe = g_customDrawProbe.type,
                                          .gpuArrays = options.gpuArrays,
                                          .gpuPadMiB = options.gpuPadMiB,
-                                         .fogBands = options.fogCheck,
-                                         .aoCheck = options.aoCheck};
+                                         .fogBands = options.fogCheck || options.fwdEnvCheck,
+                                         .aoCheck = options.aoCheck,
+                                         .fwdEnvCheck = options.fwdEnvCheck};
   bool decodingChanged = false;
 
   GXInit(nullptr, 0);
@@ -673,7 +696,8 @@ int main(int argc, char* argv[]) {
                                                                    .motionCheck = options.motionCheck,
                                                                    .motionView = options.motionView,
                                                                    .fogCheck = options.fogCheck,
-                                                                   .aoCheck = options.aoCheck},
+                                                                   .aoCheck = options.aoCheck,
+                                                                   .fwdEnvCheck = options.fwdEnvCheck},
                                                                   graphError)) {
     std::fprintf(stderr, "render_demo: render graph setup failed: %s\n", graphError.c_str());
     render_demo::shutdown_scene();
@@ -838,6 +862,21 @@ int main(int argc, char* argv[]) {
         sigma.sigma, sigma.frames, sigma.pixels != 0 ? static_cast<double>(sigma.covered) / sigma.pixels : 0.0,
         sigma.mean, t.trailMargin, t.trailFrames, t.removal, t.removalProbes, t.shadow);
   }
+  const FwdEnvOutcome fwdEnvOutcome =
+      options.fwdEnvCheck ? fwd_env_outcome(graphReport.fwdEnv, info.backend == BACKEND_NULL) : FwdEnvOutcome{};
+  if (options.fwdEnvCheck) {
+    const std::string status = fwdEnvOutcome.failure          ? "FAILED: " + *fwdEnvOutcome.failure
+                               : info.backend == BACKEND_NULL ? std::string{"skipped (null backend)"}
+                                                              : std::string{"passed"};
+    const auto& s = fwdEnvOutcome.summary;
+    std::printf(
+        "render_demo: fwd-env check %s: %u samples at %ux%u; far A %u (%u at ao<=0.95, max %.2f), near A %u (%u at "
+        "ao<=0.9, max %.2f), B %u (%u, max %.2f), card %u (%u, max %.2f), alpha mismatches %u, exact-1 "
+        "violations %u\n",
+        status.c_str(), s.samples, graphReport.fwdEnv.width, graphReport.fwdEnv.height, s.far.checked, s.far.sensitive,
+        s.far.maxError, s.near.checked, s.near.sensitive, s.near.maxError, s.plain.checked, s.plain.sensitive,
+        s.plain.maxError, s.card.checked, s.card.sensitive, s.card.maxError, s.alphaMismatches, s.exactOneViolations);
+  }
   if (options.gpuCull != 0) {
     print_cull_report(graphReport.cull, frame, options.cullTimings);
   }
@@ -893,6 +932,10 @@ int main(int argc, char* argv[]) {
   if (aoOutcome.failure) {
     return ExitAoCheck;
   }
+  if (fwdEnvOutcome.failure) {
+    return ExitFwdEnvCheck;
+  }
+
   if (cullFailure) {
     return ExitCullCheck;
   }

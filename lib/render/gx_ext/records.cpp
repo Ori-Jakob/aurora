@@ -1,4 +1,5 @@
 #include "records.hpp"
+#include "fwd_env.hpp"
 
 #include "../hints.hpp"
 #include "../scene/classifier.hpp"
@@ -18,6 +19,7 @@ struct Counters {
   uint64_t records = 0;
   uint64_t reused = 0;
   uint64_t dropped = 0;
+  uint64_t screenAo = 0;
   std::array<uint64_t, 4> codes{};
 };
 
@@ -47,7 +49,9 @@ bool in_window(const scene::DrawClass& cls) noexcept {
   return cls.key.window == scene::Window::Opaque && !cls.offscreen;
 }
 
-uint32_t draw_inputs(const scene::DrawClass& cls) noexcept { return in_window(cls) ? InWindow : 0u; }
+uint32_t draw_inputs(const scene::DrawClass& cls) noexcept {
+  return (in_window(cls) ? InWindow : 0u) | (in_forward_window(cls) ? ForwardWindow : 0u);
+}
 
 uint32_t receiver_code(const scene::DrawClass& cls) noexcept {
   constexpr uint32_t NonReceivers = scene::category::Overlay | scene::category::Particle | scene::category::NoAo |
@@ -93,6 +97,7 @@ bool ensure_frame() noexcept {
 
 void count_code(Counters& counters, const DrawRecord& record) noexcept {
   ++counters.codes[(record.flags & flag::ReceiverMask) >> flag::ReceiverShift];
+  counters.screenAo += (record.flags & flag::ScreenAo) != 0 ? 1 : 0;
 }
 
 void fold() noexcept {
@@ -103,6 +108,7 @@ void fold() noexcept {
   g_totals.records += frame.records;
   g_totals.reused += frame.reused;
   g_totals.dropped += frame.dropped;
+  g_totals.screenAo += frame.screenAo;
   for (size_t i = 0; i < frame.codes.size(); ++i) {
     g_totals.codes[i] += frame.codes[i];
   }
@@ -132,14 +138,19 @@ void apply_frame_state(const detail::FrameState&) noexcept {
 
 Stats stats() noexcept { return g_totals; }
 
+bool in_forward_window(const scene::DrawClass& cls) noexcept {
+  return cls.key.window == scene::Window::Translucent && cls.mainClass && cls.colorWrite && !cls.offscreen;
+}
+
 bool gbuffer() noexcept { return g_gbuffer; }
 
 void shutdown() noexcept {
   fold();
   if (g_totals.records != 0) {
     const auto& codes = g_totals.codes;
-    Log.info("Render records: {} draws, {} reused, {} dropped over {} frames, codes {}/{}/{}/{}", g_totals.records,
-             g_totals.reused, g_totals.dropped, g_totals.frames, codes[0], codes[1], codes[2], codes[3]);
+    Log.info("Render records: {} draws, {} reused, {} dropped over {} frames, codes {}/{}/{}/{}, screen AO {}",
+             g_totals.records, g_totals.reused, g_totals.dropped, g_totals.frames, codes[0], codes[1], codes[2],
+             codes[3], g_totals.screenAo);
   }
   g_active = false;
   g_gbuffer = false;
@@ -168,7 +179,7 @@ void stamp(gx::DrawData& draw, const gx::PipelineConfig& config, const scene::Dr
   }
   DrawRecord record{.frameOff = g_frameLoc,
                     .flags = motion.flags | (receiver_code(cls) << flag::ReceiverShift) |
-                             (raises_reactive(config, cls) ? flag::Reactive : 0u),
+                             (raises_reactive(config, cls) ? flag::Reactive : 0u) | fwd_env::record_flags(cls, config),
                     .prevMtxOff = motion.prevMtxOff};
   if (cls.key.object.valid) {
     record.objectLo = static_cast<uint32_t>(cls.key.object.id);

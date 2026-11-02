@@ -15,6 +15,7 @@
 #include "geometry/compact.hpp"
 #include "geometry/hzb.hpp"
 #include "gx_ext/ext_provider.hpp"
+#include "gx_ext/fwd_env.hpp"
 #include "material/gx_lookup.hpp"
 #include "native/native.hpp"
 #include "post/composite.hpp"
@@ -101,6 +102,7 @@ void initialize() {
   taa::initialize();
   ao::initialize();
   composite::initialize();
+  gx_ext::fwd_env::initialize();
   upscale::initialize();
   systems::initialize();
   debug::initialize();
@@ -124,6 +126,7 @@ void shutdown() noexcept {
   material::remove_gx_lookup();
   clear_after_frame_callbacks();
   remove_hints();
+  gx_ext::fwd_env::shutdown();
   gx_ext::shutdown();
   scene::motion::shutdown();
   systems::shutdown();
@@ -156,6 +159,8 @@ void on_worker_frame_begin([[maybe_unused]] uint64_t frameId, [[maybe_unused]] c
   bind_cache_tick(frameId);
   compact::worker_frame_begin(frameId);
   hzb::worker_tick(frameId);
+  // Before any pass of the frame publishes, so no frame reuses last frame's textures
+  gx_ext::fwd_env::worker_frame_begin(frameId);
   ao::worker_tick(frameId);
   taa::worker_tick(frameId);
   systems::tick_worker(frameId);

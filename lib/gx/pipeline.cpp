@@ -17,6 +17,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include <tracy/Tracy.hpp>
 
@@ -29,11 +30,13 @@ struct BoundState {
   uint32_t uniformOffset = UINT32_MAX;
   gfx::BindGroupRef textureGroup = 0;
   bool indexBuffer = false;
+  WGPUBindGroup group3 = nullptr;
 };
 BoundState g_bound;
+wgpu::BindGroup g_fwdEnvGroup;
 
 struct Counters {
-  std::atomic_uint64_t draws, texturedDraws, uniformBinds, textureBinds, indexBinds, encodeNs;
+  std::atomic_uint64_t draws, texturedDraws, uniformBinds, textureBinds, indexBinds, encodeNs, envBinds;
   std::atomic_uint64_t dstAlphaDraws, prepassDraws;
 } g_counts;
 // MRT turns dual-source into an alpha prepass; these counts measure that cost
@@ -97,6 +100,7 @@ gfx::CompiledPipeline create_unchecked(const PipelineConfig& config, const gfx::
   if (!pipeline.main) {
     return {};
   }
+  pipeline.group3 = uses_forward_env(config.shaderConfig, shader_targets(layout)) ? Group3ForwardEnvironment : 0;
   return pipeline;
 }
 } // namespace
@@ -184,6 +188,15 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
       count(g_counts.textureBinds);
     }
   }
+  // Bound per draw from the pipeline, so a fallback draw never needs group 3
+  if (pipeline.group3 == Group3ForwardEnvironment) {
+    const wgpu::BindGroup& g = g_fwdEnvGroup ? g_fwdEnvGroup : detail::neutral_forward_environment_group();
+    if (g.Get() != g_bound.group3) {
+      pass.SetBindGroup(3, g);
+      g_bound.group3 = g.Get();
+      count(g_counts.envBinds);
+    }
+  }
   if (data.indexCount != 0) {
     // The whole buffer is bound, so nothing else bounds the read in builds that skip validation
     AURORA_ASSERT(data.idxRange.offset % sizeof(uint16_t) == 0 &&
@@ -220,6 +233,8 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
 
 void reset_pass_bindings() noexcept { g_bound = {}; }
 
+void set_forward_environment_group(wgpu::BindGroup group) noexcept { g_fwdEnvGroup = std::move(group); }
+
 void add_encode_ns(uint64_t ns) noexcept { count(g_counts.encodeNs, ns); }
 
 BindCounts bind_counts() noexcept {
@@ -230,6 +245,7 @@ BindCounts bind_counts() noexcept {
       .textureBinds = g_counts.textureBinds.load(std::memory_order_relaxed),
       .indexBinds = g_counts.indexBinds.load(std::memory_order_relaxed),
       .encodeNs = g_counts.encodeNs.load(std::memory_order_relaxed),
+      .envBinds = g_counts.envBinds.load(std::memory_order_relaxed),
   };
 }
 

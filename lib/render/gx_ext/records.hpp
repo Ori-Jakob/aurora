@@ -55,6 +55,7 @@ inline constexpr uint32_t Reactive = gx::render_ext::RecordFlagReactive;
 inline constexpr uint32_t CategoryShift = 16;
 inline constexpr uint32_t CategoryMask = 0xFFu << CategoryShift;
 } // namespace flag
+static_assert(flag::ScreenAo == gx::render_ext::RecordFlagScreenAo);
 
 struct FrameRecord {
   uint32_t frameSeq = 0;
@@ -74,11 +75,16 @@ struct Stats {
   uint64_t records = 0;
   uint64_t reused = 0;
   uint64_t dropped = 0;
+  uint64_t screenAo = 0;
   std::array<uint64_t, 4> codes{};
 };
 
 // Bit 1 stays reserved for a later velocity window
-enum DrawInput : uint32_t { InWindow = 1u << 0 };
+enum DrawInput : uint32_t {
+  InWindow = 1u << 0,
+  // Main colour writers between OPAQUE_DONE and PRE_POST get the group-3 forward environment
+  ForwardWindow = 1u << 2,
+};
 
 using PushFn = gfx::Range (*)(std::span<const uint8_t> bytes) noexcept;
 
@@ -87,6 +93,8 @@ void apply_frame_state(const detail::FrameState& state) noexcept;
 [[nodiscard]] Stats stats() noexcept;
 [[nodiscard]] bool gbuffer() noexcept;
 void shutdown() noexcept;
+
+[[nodiscard]] bool in_forward_window(const scene::DrawClass& cls) noexcept;
 
 // FIFO thread
 bool on_route(const scene::DrawClass& cls) noexcept;

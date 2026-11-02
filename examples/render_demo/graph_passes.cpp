@@ -1294,6 +1294,236 @@ void update_ao_check(u32 frame) {
   }
   aurora::render::set_pass_params(sAo.id, &sAo.params, sizeof(sAo.params));
 }
+
+constexpr u32 FwdEnvHeaderWords = 4;
+constexpr u32 FwdEnvSampleWords = 8;
+
+// Reads each probe pixel after the forward window, where the strips and the card have blended
+constexpr std::string_view FwdEnvCheckWgsl = R"(
+struct FwdProbe {
+  ndc: vec2f,
+  cls: u32,
+  pad: u32,
+};
+@group(1) @binding(0) var gx_color: texture_2d<f32>;
+@group(1) @binding(1) var gbuf_fog: texture_2d<u32>;
+@group(1) @binding(2) var ao_final: texture_2d<f32>;
+@group(1) @binding(3) var scene_normal: texture_2d<f32>;
+@group(1) @binding(4) var gx_depth: texture_2d<f32>;
+@group(2) @binding(0) var<storage, read_write> results: array<u32>;
+@group(2) @binding(1) var<storage, read> probes: array<FwdProbe>;
+
+fn pack_unorm(v: vec4f) -> u32 {
+  let b = vec4u(round(saturate(v) * 255.0));
+  return b.r | (b.g << 8u) | (b.b << 16u) | (b.a << 24u);
+}
+
+@compute @workgroup_size(64)
+fn cs_main(@builtin(global_invocation_id) id: vec3u) {
+  let size = textureDimensions(gx_color);
+  if (id.x == 0u) {
+    results[0] = size.x;
+    results[1] = size.y;
+    results[2] = 1u;
+  }
+  if (id.x >= arrayLength(&probes)) {
+    return;
+  }
+  let centre = (probes[id.x].ndc * vec2f(0.5, -0.5) + 0.5) * vec2f(size);
+  let p = clamp(vec2i(floor(centre)), vec2i(0), vec2i(size) - 1);
+  let base = 4u + id.x * 8u;
+  let rec = textureLoad(gbuf_fog, p, 0);
+  let n = textureLoad(scene_normal, p, 0);
+  results[base] = pack_unorm(textureLoad(gx_color, p, 0));
+  results[base + 1u] = rec.r | (rec.g << 8u) | (rec.b << 16u) | (rec.a << 24u);
+  results[base + 2u] = pack_unorm(textureLoad(ao_final, p, 0));
+  results[base + 3u] = (pack_unorm(vec4f(n.rgb, 0.0)) & 0xFFFFFFu) | (u32(round(saturate(n.a) * 3.0)) << 24u);
+  results[base + 4u] = bitcast<u32>(textureLoad(gx_depth, p, 0).r);
+  results[base + 5u] = u32(p.x) | (u32(p.y) << 16u);
+}
+)";
+
+struct FwdEnvCheckPass {
+  PassId id = aurora::render::InvalidPass;
+  std::atomic_uint32_t encodes = 0;
+  std::atomic_uint32_t armedFrame = UINT32_MAX;
+  // Main thread only
+  bool waitedForPipelines = false;
+  std::chrono::steady_clock::time_point deadline;
+  std::vector<FwdEnvProbe> probes;
+  uint64_t bytes = 0;
+  wgpu::Buffer output;
+  wgpu::Buffer readback;
+  wgpu::Buffer probeBuffer;
+  wgpu::BindGroupLayout layout;
+  wgpu::BindGroup group;
+  // Render worker only
+  wgpu::ComputePipeline pipeline;
+  wgpu::BindGroupLayout passLayout;
+  bool copied = false;
+  u32 copiedFrame = 0;
+  bool mapRequested = false;
+  std::atomic<ProbeResult> result = ProbeResult::Pending;
+  std::mutex mutex;
+  std::vector<u32> values;
+};
+
+FwdEnvCheckPass sFwdEnv;
+
+void declare_fwd_env_check(PassBuilder& builder, void*) {
+  using aurora::render::Missing;
+  namespace resource = aurora::render::resource;
+  for (const std::string_view name :
+       {resource::GxColor, resource::Fog, resource::AoFinal, resource::GxNormal, resource::GxDepth}) {
+    builder.use(name, Access::Sampled, Missing::DisablePass);
+  }
+  builder.side_effect();
+}
+
+void encode_fwd_env_check(PassContext& ctx, void* userdata) {
+  auto& check = *static_cast<FwdEnvCheckPass*>(userdata);
+  check.encodes.fetch_add(1, std::memory_order_relaxed);
+  if (!check.pipeline || check.passLayout.Get() != ctx.pass_layout().Get()) {
+    const std::string code{FwdEnvCheckWgsl};
+    const wgpu::ShaderSourceWGSL wgsl{wgpu::ShaderSourceWGSL::Init{.code = code.c_str()}};
+    const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl, .label = "demo.fwd_env_check"};
+    const std::array<wgpu::BindGroupLayout, 3> layouts{ctx.frame_layout(), ctx.pass_layout(), check.layout};
+    const wgpu::PipelineLayoutDescriptor layoutDescriptor{
+        .label = "demo.fwd_env_check",
+        .bindGroupLayoutCount = layouts.size(),
+        .bindGroupLayouts = layouts.data(),
+    };
+    const wgpu::ComputePipelineDescriptor descriptor{
+        .label = "demo.fwd_env_check",
+        .layout = ctx.device().CreatePipelineLayout(&layoutDescriptor),
+        .compute = {.module = ctx.device().CreateShaderModule(&moduleDescriptor), .entryPoint = "cs_main"},
+    };
+    check.pipeline = ctx.device().CreateComputePipeline(&descriptor);
+    check.passLayout = ctx.pass_layout();
+  }
+  const wgpu::ComputePassEncoder compute = ctx.begin_compute();
+  if (!compute) {
+    return;
+  }
+  compute.SetPipeline(check.pipeline);
+  compute.SetBindGroup(2, check.group);
+  compute.DispatchWorkgroups((static_cast<u32>(check.probes.size()) + 63) / 64);
+  compute.End();
+  if (!check.copied && ctx.frame() >= check.armedFrame.load(std::memory_order_acquire)) {
+    ctx.encoder().CopyBufferToBuffer(check.output, 0, check.readback, 0, check.bytes);
+    check.copied = true;
+    check.copiedFrame = ctx.frame();
+  }
+}
+
+void fwd_env_check_mapped(FwdEnvCheckPass& check, wgpu::MapAsyncStatus status) {
+  if (status != wgpu::MapAsyncStatus::Success) {
+    check.result.store(ProbeResult::Failed, std::memory_order_release);
+    return;
+  }
+  const auto* mapped = static_cast<const u32*>(check.readback.GetConstMappedRange(0, check.bytes));
+  if (mapped != nullptr) {
+    std::lock_guard lock{check.mutex};
+    check.values.assign(mapped, mapped + check.bytes / sizeof(u32));
+  }
+  check.readback.Unmap();
+  check.result.store(mapped != nullptr ? ProbeResult::Ready : ProbeResult::Failed, std::memory_order_release);
+}
+
+void fwd_env_check_submitted(u32 frame, void* userdata) {
+  auto& check = *static_cast<FwdEnvCheckPass*>(userdata);
+  if (!check.copied || check.mapRequested || frame != check.copiedFrame) {
+    return;
+  }
+  check.mapRequested = true;
+  check.readback.MapAsync(
+      wgpu::MapMode::Read, 0, check.bytes, wgpu::CallbackMode::AllowSpontaneous,
+      [&check](wgpu::MapAsyncStatus status, wgpu::StringView) { fwd_env_check_mapped(check, status); });
+}
+
+bool register_fwd_env_check(std::string& error) {
+  sFwdEnv.probes = fwd_env_probes();
+  if (sFwdEnv.probes.empty()) {
+    error = "demo.fwd_env_check has no probes on screen";
+    return false;
+  }
+  sFwdEnv.bytes = (FwdEnvHeaderWords + sFwdEnv.probes.size() * FwdEnvSampleWords) * sizeof(u32);
+  const wgpu::Device device = aurora::gfx::device();
+  const auto buffer = [&](const char* label, wgpu::BufferUsage usage, uint64_t size) {
+    const wgpu::BufferDescriptor descriptor{.label = label, .usage = usage, .size = size};
+    return device.CreateBuffer(&descriptor);
+  };
+  sFwdEnv.output =
+      buffer("demo.fwd_env_check output", wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc, sFwdEnv.bytes);
+  sFwdEnv.readback =
+      buffer("demo.fwd_env_check readback", wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst, sFwdEnv.bytes);
+  const uint64_t probeBytes = sFwdEnv.probes.size() * sizeof(FwdEnvProbe);
+  sFwdEnv.probeBuffer =
+      buffer("demo.fwd_env_check probes", wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, probeBytes);
+  device.GetQueue().WriteBuffer(sFwdEnv.probeBuffer, 0, sFwdEnv.probes.data(), probeBytes);
+  const std::array layoutEntries{
+      wgpu::BindGroupLayoutEntry{
+          .binding = 0,
+          .visibility = wgpu::ShaderStage::Compute,
+          .buffer = {.type = wgpu::BufferBindingType::Storage},
+      },
+      wgpu::BindGroupLayoutEntry{
+          .binding = 1,
+          .visibility = wgpu::ShaderStage::Compute,
+          .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage},
+      },
+  };
+  const wgpu::BindGroupLayoutDescriptor layoutDescriptor{
+      .label = "demo.fwd_env_check",
+      .entryCount = layoutEntries.size(),
+      .entries = layoutEntries.data(),
+  };
+  sFwdEnv.layout = device.CreateBindGroupLayout(&layoutDescriptor);
+  const std::array groupEntries{
+      wgpu::BindGroupEntry{.binding = 0, .buffer = sFwdEnv.output, .size = sFwdEnv.bytes},
+      wgpu::BindGroupEntry{.binding = 1, .buffer = sFwdEnv.probeBuffer, .size = probeBytes},
+  };
+  const wgpu::BindGroupDescriptor groupDescriptor{
+      .label = "demo.fwd_env_check",
+      .layout = sFwdEnv.layout,
+      .entryCount = groupEntries.size(),
+      .entries = groupEntries.data(),
+  };
+  sFwdEnv.group = device.CreateBindGroup(&groupDescriptor);
+  sFwdEnv.id = aurora::render::register_pass({
+      .name = "demo.fwd_env_check",
+      .stage = aurora::render::Stage::PrePost,
+      .kind = aurora::render::PassKind::Compute,
+      .declare = declare_fwd_env_check,
+      .encode = encode_fwd_env_check,
+      .afterSubmit = fwd_env_check_submitted,
+      .userdata = &sFwdEnv,
+  });
+  if (sFwdEnv.id == aurora::render::InvalidPass) {
+    error = "register_pass refused demo.fwd_env_check";
+    return false;
+  }
+  return true;
+}
+
+void update_fwd_env_check(u32 frame) {
+  if (sFwdEnv.id == aurora::render::InvalidPass || frame < FwdEnvCheckFrame ||
+      sFwdEnv.armedFrame.load(std::memory_order_relaxed) != UINT32_MAX) {
+    return;
+  }
+  if (!std::exchange(sFwdEnv.waitedForPipelines, true)) {
+    wait_for_pipelines();
+    sFwdEnv.deadline = std::chrono::steady_clock::now() + PipelineWait;
+  }
+  // AO compiles its own pipelines, so the strips are judged only once its history has had frames to settle
+  const u32 encodes = sFwdEnv.encodes.load(std::memory_order_relaxed);
+  const bool late = std::chrono::steady_clock::now() >= sFwdEnv.deadline;
+  if (!pipelines_compiling() && (encodes >= FwdEnvSettleFrames || (late && encodes != 0))) {
+    sFwdEnv.armedFrame.store(aurora::gfx::current_frame(), std::memory_order_release);
+  } else if (!late) {
+    std::this_thread::sleep_for(AoCompileWait);
+  }
+}
 } // namespace
 
 // Aurora's pipeline threads update the counter through atomic_ref, so it is read the same way
@@ -1338,6 +1568,9 @@ bool register_graph_passes(const GraphPassOptions& options, std::string& error) 
   if (options.aoCheck && !register_ao_check(error)) {
     return false;
   }
+  if (options.fwdEnvCheck && !register_fwd_env_check(error)) {
+    return false;
+  }
   return options.gpuCull == 0 ||
          register_cull_passes(
              {.instances = options.gpuCull, .check = options.cullCheck, .timings = options.cullTimings}, error);
@@ -1345,6 +1578,7 @@ bool register_graph_passes(const GraphPassOptions& options, std::string& error) 
 
 void update_graph_passes(u32 frame) {
   update_cull_passes(frame);
+  update_fwd_env_check(frame);
   if (sProbe.id != aurora::render::InvalidPass && frame >= DepthCheckFrame &&
       sProbe.armedFrame.load(std::memory_order_relaxed) == UINT32_MAX) {
     // Draws whose pipeline is still compiling are skipped, so depth read before they finish misses part of the scene
@@ -1414,6 +1648,7 @@ void finish_graph_passes() {
   const bool depth = waiting(sProbe.id, sProbe.encodes, sProbe.armedFrame);
   const bool motion = waiting(sMotion.id, sMotion.encodes, sMotion.armedFrame);
   const bool fog = waiting(sFog.id, sFog.encodes, sFog.armedFrame);
+  const bool fwdEnv = waiting(sFwdEnv.id, sFwdEnv.encodes, sFwdEnv.armedFrame);
   const auto aoPending = [] {
     return sAo.statsState.load(std::memory_order_acquire) != AoSlotState::Free ||
            std::ranges::any_of(sAo.slots, [](const AoCheckSlot& slot) {
@@ -1424,6 +1659,7 @@ void finish_graph_passes() {
   while (((depth && sProbe.result.load(std::memory_order_acquire) == ProbeResult::Pending) ||
           (motion && sMotion.result.load(std::memory_order_acquire) == ProbeResult::Pending) ||
           (fog && sFog.result.load(std::memory_order_acquire) == ProbeResult::Pending) ||
+          (fwdEnv && sFwdEnv.result.load(std::memory_order_acquire) == ProbeResult::Pending) ||
           (sAo.id != aurora::render::InvalidPass && aoPending())) &&
          std::chrono::steady_clock::now() < deadline) {
     aurora::gfx::synchronize();
@@ -1456,6 +1692,28 @@ GraphPassReport graph_pass_report() {
     std::lock_guard lock{sFog.mutex};
     report.fog = sFog.values;
   }
+  if (sFwdEnv.id != aurora::render::InvalidPass) {
+    report.fwdEnv.encodes = sFwdEnv.encodes.load(std::memory_order_relaxed);
+    report.fwdEnv.ready = sFwdEnv.result.load(std::memory_order_acquire) == ProbeResult::Ready;
+    std::lock_guard lock{sFwdEnv.mutex};
+    const std::vector<u32>& words = sFwdEnv.values;
+    if (report.fwdEnv.ready && words.size() >= FwdEnvHeaderWords && words[2] == 1) {
+      report.fwdEnv.width = words[0];
+      report.fwdEnv.height = words[1];
+      for (size_t i = 0; i < sFwdEnv.probes.size(); ++i) {
+        const size_t base = FwdEnvHeaderWords + i * FwdEnvSampleWords;
+        if (base + FwdEnvSampleWords > words.size()) {
+          break;
+        }
+        report.fwdEnv.samples.push_back({.cls = sFwdEnv.probes[i].cls,
+                                         .color = words[base],
+                                         .fog = words[base + 1],
+                                         .ao = words[base + 2],
+                                         .normal = words[base + 3],
+                                         .depthBits = words[base + 4]});
+      }
+    }
+  }
   if (sAo.id != aurora::render::InvalidPass) {
     std::lock_guard lock{sAo.mutex};
     report.ao = {
@@ -1477,10 +1735,11 @@ void unregister_graph_passes() {
   const bool cull = unregister_cull_passes();
   if (!cull && sVignette.id == aurora::render::InvalidPass && sProbe.id == aurora::render::InvalidPass &&
       sMotion.id == aurora::render::InvalidPass && sMotionView.id == aurora::render::InvalidPass &&
-      sFog.id == aurora::render::InvalidPass && sAo.id == aurora::render::InvalidPass) {
+      sFog.id == aurora::render::InvalidPass && sAo.id == aurora::render::InvalidPass &&
+      sFwdEnv.id == aurora::render::InvalidPass) {
     return;
   }
-  for (PassId* id : {&sVignette.id, &sProbe.id, &sMotion.id, &sMotionView.id, &sFog.id, &sAo.id}) {
+  for (PassId* id : {&sVignette.id, &sProbe.id, &sMotion.id, &sMotionView.id, &sFog.id, &sAo.id, &sFwdEnv.id}) {
     if (*id != aurora::render::InvalidPass) {
       aurora::render::unregister_pass(*id);
       *id = aurora::render::InvalidPass;
@@ -1526,5 +1785,14 @@ void unregister_graph_passes() {
     slot.readback = {};
   }
   sAo.waitedForPipelines = false;
+  sFwdEnv.pipeline = {};
+  sFwdEnv.passLayout = {};
+  sFwdEnv.group = {};
+  sFwdEnv.layout = {};
+  sFwdEnv.probeBuffer = {};
+  sFwdEnv.readback = {};
+  sFwdEnv.output = {};
+  sFwdEnv.waitedForPipelines = false;
 }
+
 } // namespace render_demo

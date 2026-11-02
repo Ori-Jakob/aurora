@@ -177,6 +177,29 @@ RenderExtConfig layout_hook(void* userData, const aurora::gx::PipelineConfig& co
 
 constexpr render_ext::Hooks LayoutHook{.derive = &layout_hook};
 
+constexpr u32 ForwardWindowInput = 1u << 2;
+
+RenderExtConfig fwd_env_hook(void*, const aurora::gx::PipelineConfig&, const aurora::gx::ShaderInfo&,
+                             const gfx::RenderTargetLayout&, render_ext::StochasticLanes&) noexcept {
+  ++g_deriveCalls;
+  RenderExtConfig ext;
+  ext.fwdEnv = (render_ext::g_drawInputs & ForwardWindowInput) != 0 ? 1 : 0;
+  return ext;
+}
+
+constexpr render_ext::Hooks FwdEnvHook{.derive = &fwd_env_hook};
+
+// Marks forward-window draws only under a G-buffer layout, as the provider's fwdEnv rule does
+RenderExtConfig fwd_env_layout_hook(void* userData, const aurora::gx::PipelineConfig& config,
+                                    const aurora::gx::ShaderInfo& info, const gfx::RenderTargetLayout& layout,
+                                    render_ext::StochasticLanes& lanes) noexcept {
+  RenderExtConfig ext = fwd_env_hook(userData, config, info, layout, lanes);
+  ext.fwdEnv = gfx::layout_has_gbuffer(layout) ? ext.fwdEnv : 0;
+  return ext;
+}
+
+constexpr render_ext::Hooks FwdEnvLayoutHook{.derive = &fwd_env_layout_hook};
+
 gfx::RenderTargetLayout pending_gbuffer_layout() {
   gfx::RenderTargetLayout layout = gfx::get_render_target_layout();
   layout.colorAttachments[layout.colorAttachmentCount++] = {gfx::ColorAttachmentSemantic::Motion,
@@ -1520,4 +1543,69 @@ TEST_F(GXDrawRouteTest, InputChangeWarmsWithoutRebind) {
   // The live layout has no G-buffer, so its bits never change and nothing is looked up or rebound
   EXPECT_EQ(gfx::g_testPipelineRefCount, lookups);
   EXPECT_EQ(zones.calls(fifo::CpuZoneBindGroupBuild), 0u);
+}
+
+TEST_F(GXDrawRouteTest, ForwardWindowInputRederivesWithoutRebind) {
+  gfx::g_testMergeDraws = false;
+  render_ext::set_hooks(&FwdEnvHook);
+  triangle();
+  decode();
+  EXPECT_EQ(gfx::g_testLastLookupExt.fwdEnv, 0u);
+  g_deriveCalls = 0;
+
+  const CpuZoneDelta zones;
+  const uint32_t lookups = gfx::g_testPipelineRefCount;
+  render_ext::g_drawInputs = ForwardWindowInput;
+  triangle();
+  decode();
+  EXPECT_EQ(g_deriveCalls, 1u);
+  EXPECT_EQ(gfx::g_testPipelineRefCount, lookups + 1);
+  EXPECT_TRUE(gfx::g_testLastLookupExt == (RenderExtConfig{.fwdEnv = 1}));
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, gfx::g_testLastPipelineRef);
+  triangle();
+  decode();
+  EXPECT_EQ(g_deriveCalls, 1u);
+
+  render_ext::g_drawInputs = 0;
+  triangle();
+  decode();
+  EXPECT_EQ(g_deriveCalls, 2u);
+  EXPECT_EQ(gfx::g_testPipelineRefCount, lookups + 2);
+  EXPECT_TRUE(gfx::g_testLastLookupExt == RenderExtConfig{});
+  EXPECT_EQ(zones.calls(fifo::CpuZoneBindGroupBuild), 0u);
+  EXPECT_EQ(g_gxState.dirty, 0u);
+}
+
+TEST_F(GXDrawRouteTest, FwdEnvVariantWarmsForPendingLayout) {
+  gfx::g_testMergeDraws = false;
+  render_ext::set_hooks(&FwdEnvLayoutHook);
+  render_ext::g_drawInputs = ForwardWindowInput;
+  const gfx::LayoutWarm warm{.pending = pending_gbuffer_layout(), .liveKey = gfx::get_render_target_layout().key};
+  const auto run = [&](const gfx::LayoutWarm* layoutWarm) {
+    fifo::invalidate_draw_cache();
+    gfx::testing::reset_stub_ranges();
+    gfx::g_testLayoutWarm = layoutWarm;
+    gfx::g_testWarmedConfigs.clear();
+    gfx::g_testPipelineRefCount = 0;
+    triangle();
+    decode();
+    gfx::g_testLayoutWarm = nullptr;
+    return gfx::g_testLastDraw;
+  };
+  const aurora::gx::DrawData plain = run(nullptr);
+  EXPECT_TRUE(gfx::g_testWarmedConfigs.empty());
+  const aurora::gx::DrawData warmed = run(&warm);
+  ASSERT_EQ(gfx::g_testWarmedConfigs.size(), 1u);
+  const aurora::gx::PipelineConfig& variant = gfx::g_testWarmedConfigs.front();
+  EXPECT_EQ(variant.shaderConfig.ext.fwdEnv, 1u);
+  EXPECT_TRUE(render_ext::fallback_config(variant).shaderConfig.ext == RenderExtConfig{});
+  EXPECT_EQ(gfx::g_testLastLookupExt.fwdEnv, 0u);
+  expect_same_draw(warmed, plain);
+
+  const gfx::RenderTargetLayout legacy = gfx::get_render_target_layout();
+  ASSERT_FALSE(gfx::layout_has_gbuffer(legacy));
+  const gfx::LayoutWarm noGbuffer{.pending = legacy, .liveKey = legacy.key};
+  run(&noGbuffer);
+  ASSERT_EQ(gfx::g_testWarmedConfigs.size(), 1u);
+  EXPECT_EQ(gfx::g_testWarmedConfigs.front().shaderConfig.ext.fwdEnv, 0u);
 }

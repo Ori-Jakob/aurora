@@ -47,6 +47,14 @@ struct AoCheckReport {
   AoTemporalSummary temporal;
 };
 
+struct FwdEnvCheckReport {
+  u32 encodes = 0;
+  bool ready = false;
+  u32 width = 0;
+  u32 height = 0;
+  std::vector<FwdEnvSample> samples;
+};
+
 struct GraphPassOptions {
   bool vignette = false;
   std::string vignetteAnchor;
@@ -58,6 +66,7 @@ struct GraphPassOptions {
   bool motionView = false;
   bool fogCheck = false;
   bool aoCheck = false;
+  bool fwdEnvCheck = false;
 };
 
 struct GraphPassReport {
@@ -74,6 +83,7 @@ struct GraphPassReport {
   bool fogReady = false;
   std::array<u32, FogCheckWords> fog{};
   AoCheckReport ao;
+  FwdEnvCheckReport fwdEnv;
 };
 
 bool pipelines_compiling() noexcept;

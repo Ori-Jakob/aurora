@@ -31,7 +31,9 @@ struct Options {
   bool motionView = false;
   bool fogCheck = false;
   bool aoCheck = false;
+  bool fwdEnvCheck = false;
   bool hints = true;
+
   bool checkHints = false;
   bool customDrawProbe = false;
   uint32_t gpuCull = 0;

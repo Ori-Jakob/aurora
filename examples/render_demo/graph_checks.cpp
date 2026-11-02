@@ -1,6 +1,7 @@
 #include "graph_checks.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <numbers>
@@ -181,5 +182,112 @@ AoTemporalOutcome check_ao_temporal(const AoTemporalSummary& summary) {
     outcome.failure = std::string{text};
   }
   return outcome;
+}
+namespace {
+std::array<u8, 4> word_bytes(u32 word) noexcept {
+  return {static_cast<u8>(word), static_cast<u8>(word >> 8), static_cast<u8>(word >> 16), static_cast<u8>(word >> 24)};
+}
+
+void judge(FwdEnvGate& gate, const std::array<u8, 4>& colour, const std::array<double, 3>& expected, double limit,
+           bool sensitive) {
+  double error = 0.0;
+  for (size_t i = 0; i < expected.size(); ++i) {
+    error = std::max(error, std::abs(static_cast<double>(colour[i]) - expected[i]));
+  }
+  ++gate.checked;
+  gate.sensitive += sensitive ? 1 : 0;
+  gate.failures += error > limit ? 1 : 0;
+  gate.maxError = std::max(gate.maxError, error);
+}
+
+std::optional<std::string> gate_failure(const FwdEnvGate& gate, std::string_view name, u32 needed, double aoLimit,
+                                        double limit) {
+  char text[192];
+  if (gate.sensitive < needed) {
+    std::snprintf(text, sizeof(text), "no occlusion at probe: %.*s has %u of %u pixels at ao <= %.2f (needs %u)",
+                  static_cast<int>(name.size()), name.data(), gate.sensitive, gate.checked, aoLimit, needed);
+    return std::string{text};
+  }
+  if (gate.failures != 0) {
+    std::snprintf(text, sizeof(text), "%.*s: %u of %u pixels off by up to %.2f LSB (limit %.0f)",
+                  static_cast<int>(name.size()), name.data(), gate.failures, gate.checked, gate.maxError, limit);
+    return std::string{text};
+  }
+  return std::nullopt;
+}
+} // namespace
+
+FwdEnvSummary summarize_fwd_env(std::span<const FwdEnvSample> samples, const FwdEnvExpect& expect) {
+  FwdEnvSummary summary{.samples = static_cast<u32>(samples.size())};
+  std::optional<u8> alpha;
+  for (const FwdEnvSample& sample : samples) {
+    const std::array<u8, 4> colour = word_bytes(sample.color);
+    const std::array<u8, 4> record = word_bytes(sample.fog);
+    const std::array<u8, 4> ao = word_bytes(sample.ao);
+    const std::array<u8, 4> normal = word_bytes(sample.normal);
+    const f32 depth = std::bit_cast<f32>(sample.depthBits);
+    const u32 code = normal[3];
+    if ((code == 0 || depth == 0.f) && ao[0] != 255) {
+      ++summary.exactOneViolations;
+    }
+    const double a = ao[0] / 255.0;
+    const u32 q7 = std::min<u32>(record[3] >> 1, 127);
+    const double q = q7 / 127.0;
+    const auto& p = expect.colors[static_cast<size_t>(sample.cls)];
+    if (sample.cls == FwdEnvProbeClass::Card) {
+      judge(summary.card, colour, {static_cast<double>(p[0]), static_cast<double>(p[1]), static_cast<double>(p[2])},
+            1.0, a <= 0.9);
+      continue;
+    }
+    double facing = 0.0;
+    for (size_t i = 0; i < 3; ++i) {
+      facing += (normal[i] / 255.0 * 2.0 - 1.0) * expect.groundNormal[i];
+    }
+    // Only pixels whose receiver is the ground the strips were cut from can hold the strip
+    if (code == 0 || depth == 0.f || facing < 0.98) {
+      continue;
+    }
+    const auto expected = [&](double factor) {
+      return std::array<double, 3>{p[0] * factor * (1.0 - q) + record[0] * q, p[1] * factor * (1.0 - q) + record[1] * q,
+                                   p[2] * factor * (1.0 - q) + record[2] * q};
+    };
+    if (alpha && *alpha != colour[3]) {
+      ++summary.alphaMismatches;
+    }
+    alpha = colour[3];
+    if (sample.cls == FwdEnvProbeClass::StripB) {
+      judge(summary.plain, colour, expected(1.0), 2.0, a <= 0.9);
+    } else if (q7 == 127) {
+      judge(summary.far, colour,
+            {static_cast<double>(record[0]), static_cast<double>(record[1]), static_cast<double>(record[2])}, 1.0,
+            a <= 0.95);
+    } else if (q7 <= 15) {
+      judge(summary.near, colour, expected(a), 2.0, a <= 0.9);
+    }
+  }
+  return summary;
+}
+
+std::optional<std::string> check_fwd_env(const FwdEnvSummary& summary) {
+  char text[160];
+  if (summary.exactOneViolations != 0) {
+    std::snprintf(text, sizeof(text), "%u sampled pixels with code 0 or clear depth have ao.final below 1",
+                  summary.exactOneViolations);
+    return std::string{text};
+  }
+  if (summary.alphaMismatches != 0) {
+    std::snprintf(text, sizeof(text), "%u strip pixels changed the EFB alpha", summary.alphaMismatches);
+    return std::string{text};
+  }
+  if (auto failure = gate_failure(summary.far, "strip A at q7 = 127", FwdEnvFarSensitive, 0.95, 1.0)) {
+    return failure;
+  }
+  if (auto failure = gate_failure(summary.near, "strip A at q7 <= 15", FwdEnvNearSensitive, 0.9, 2.0)) {
+    return failure;
+  }
+  if (auto failure = gate_failure(summary.plain, "strip B", FwdEnvNearSensitive, 0.9, 2.0)) {
+    return failure;
+  }
+  return gate_failure(summary.card, "card D", FwdEnvCardSensitive, 0.9, 1.0);
 }
 } // namespace render_demo

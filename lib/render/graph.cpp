@@ -706,6 +706,8 @@ std::vector<Slot> g_passSlots;
 std::vector<uint32_t> g_freePassSlots;
 uint64_t g_nextSequence = 1;
 std::atomic_bool g_graphDirty = false;
+std::vector<std::pair<GxReadId, GxReadDesc>> g_gxReads;
+GxReadId g_nextGxRead = 1;
 // Only the latch writes it, while the recording thread is idle, so recording reads it without the lock
 std::vector<LatchedParams> g_latchedParams;
 std::atomic<std::thread::id> g_latchThread;
@@ -2780,6 +2782,21 @@ void unregister_pass(PassId id) noexcept {
 
 bool consume_graph_dirty() noexcept { return g_graphDirty.exchange(false); }
 
+GxReadId register_gx_read(const GxReadDesc& desc) {
+  std::lock_guard lock{g_passMutex};
+  const GxReadId id = g_nextGxRead++;
+  g_gxReads.emplace_back(id, desc);
+  g_graphDirty = true;
+  return id;
+}
+
+void unregister_gx_read(GxReadId id) noexcept {
+  std::lock_guard lock{g_passMutex};
+  if (std::erase_if(g_gxReads, [id](const auto& read) { return read.first == id; }) != 0) {
+    g_graphDirty = true;
+  }
+}
+
 bool set_pass_params(PassId pass, std::span<const std::byte> payload) {
   if (payload.size() > MaxPassParamsSize) {
     Log.warn("set_pass_params: payload size {} exceeds {}", payload.size(), MaxPassParamsSize);
@@ -2838,12 +2855,16 @@ std::shared_ptr<CompiledGraph> compile_graph(const Settings& settings, const Cap
   // External nodes without an encode function would compile and then silently never run
   assert(latch.externals == nullptr || latch.externalEncode != nullptr);
   std::vector<RegisteredPass> registered;
+  std::vector<GxReadDesc> gxReads;
   {
     std::lock_guard lock{g_passMutex};
     for (const auto& slot : g_passSlots) {
       if (slot.pass) {
         registered.push_back(*slot.pass);
       }
+    }
+    for (const auto& read : g_gxReads) {
+      gxReads.push_back(read.second);
     }
   }
   std::ranges::sort(registered, {}, &RegisteredPass::sequence);
@@ -2865,6 +2886,7 @@ std::shared_ptr<CompiledGraph> compile_graph(const Settings& settings, const Cap
   return compile_graph(GraphInputs{
       .passes = passes,
       .ids = ids,
+      .gxReads = gxReads,
       .settings = &settings,
       .caps = &caps,
       .env = env,
@@ -3402,6 +3424,7 @@ void clear_passes() noexcept {
   std::lock_guard lock{g_passMutex};
   g_passSlots.clear();
   g_freePassSlots.clear();
+  g_gxReads.clear();
   g_nextSequence = 1;
   g_graphDirty = false;
   g_latchedParams.clear();

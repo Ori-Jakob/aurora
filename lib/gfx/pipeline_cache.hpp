@@ -29,6 +29,8 @@ enum class ShaderType : uint8_t {
 struct CompiledPipeline {
   wgpu::RenderPipeline main;
   wgpu::RenderPipeline prepass;
+  // The group-3 set the GX encoder binds for this pipeline; 0 means none
+  uint8_t group3 = 0;
 
   [[nodiscard]] uint32_t pipeline_count() const {
     return static_cast<uint32_t>(static_cast<bool>(main)) + static_cast<uint32_t>(static_cast<bool>(prepass));

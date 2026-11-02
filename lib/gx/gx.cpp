@@ -41,6 +41,9 @@ wgpu::TextureView sNeutralWhiteView;
 wgpu::TextureView sNeutralClearView;
 wgpu::BindGroupLayout sTextureBindGroupLayout;
 wgpu::PipelineLayout sPipelineLayout;
+wgpu::BindGroupLayout sFwdEnvBindGroupLayout;
+wgpu::PipelineLayout sFwdEnvPipelineLayout;
+wgpu::BindGroup sNeutralFwdEnvGroup;
 
 std::atomic<int> sPendingViewportPolicy{-1};
 
@@ -434,9 +437,13 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
       .targetCount = layout.colorAttachmentCount,
       .targets = colorTargets.data(),
   };
+  const ShaderTargets targets = shader_targets(layout);
+  CHECK(!(config.shaderConfig.ext.fwdEnv && config.shaderConfig.ext.tessFetch),
+        "GX pipeline asks for both the forward environment and tessellation fetch");
   const wgpu::RenderPipelineDescriptor descriptor{
       .label = label,
-      .layout = sPipelineLayout,
+      // Must follow the generator's test exactly, or pipeline creation fails
+      .layout = uses_forward_env(config.shaderConfig, targets) ? sFwdEnvPipelineLayout : sPipelineLayout,
       .vertex =
           {
               .module = shader,
@@ -730,11 +737,59 @@ void initialize() noexcept {
     };
     sPipelineLayout = g_device.CreatePipelineLayout(&desc);
   }
+  {
+    // Binding numbers are append-only; later screen factors bind after 0
+    const wgpu::BindGroupLayoutEntry entry{
+        .binding = 0,
+        .visibility = wgpu::ShaderStage::Fragment,
+        .texture =
+            {
+                .sampleType = wgpu::TextureSampleType::UnfilterableFloat,
+                .viewDimension = wgpu::TextureViewDimension::e2D,
+            },
+    };
+    const wgpu::BindGroupLayoutDescriptor descriptor{
+        .label = "GX Forward Environment Bind Group Layout",
+        .entryCount = 1,
+        .entries = &entry,
+    };
+    sFwdEnvBindGroupLayout = g_device.CreateBindGroupLayout(&descriptor);
+    const std::array layouts{
+        gfx::detail::resources().staticBindGroupLayout,
+        gfx::detail::resources().uniformBindGroupLayout,
+        sTextureBindGroupLayout,
+        sFwdEnvBindGroupLayout,
+    };
+    const wgpu::PipelineLayoutDescriptor desc{
+        .label = "GX Forward Environment Pipeline Layout",
+        .bindGroupLayoutCount = layouts.size(),
+        .bindGroupLayouts = layouts.data(),
+        .immediateSize = sizeof(DrawImmediateData),
+    };
+    sFwdEnvPipelineLayout = g_device.CreatePipelineLayout(&desc);
+    const wgpu::BindGroupEntry groupEntry{.binding = 0, .textureView = sNeutralWhiteView};
+    const wgpu::BindGroupDescriptor group{
+        .label = "GX Neutral Forward Environment Bind Group",
+        .layout = sFwdEnvBindGroupLayout,
+        .entryCount = 1,
+        .entries = &groupEntry,
+    };
+    sNeutralFwdEnvGroup = g_device.CreateBindGroup(&group);
+  }
 }
 
+const wgpu::BindGroupLayout& forward_environment_layout() noexcept { return sFwdEnvBindGroupLayout; }
+
+const wgpu::BindGroup& detail::neutral_forward_environment_group() noexcept { return sNeutralFwdEnvGroup; }
+
 void shutdown() noexcept {
+  // Backstop: the last published group must not outlive the device
+  set_forward_environment_group({});
   // TODO we should probably store this all in g_state.gx instead
   sTextureBindGroupLayout = {};
+  sNeutralFwdEnvGroup = {};
+  sFwdEnvPipelineLayout = {};
+  sFwdEnvBindGroupLayout = {};
   sNeutralWhiteView = {};
   sNeutralClearView = {};
   sNeutralWhite = {};

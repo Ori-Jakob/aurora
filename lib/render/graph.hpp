@@ -286,6 +286,12 @@ struct GxReadDesc {
   const void* state = nullptr;
 };
 
+using GxReadId = uint32_t;
+inline constexpr GxReadId InvalidGxReadId = 0;
+// GX draws that sample graph resources keep them alive until their chain node and count as their consumers
+GxReadId register_gx_read(const GxReadDesc& desc);
+void unregister_gx_read(GxReadId id) noexcept;
+
 struct GraphInputs {
   std::span<const PassDesc> passes;
   std::span<const PassId> ids;

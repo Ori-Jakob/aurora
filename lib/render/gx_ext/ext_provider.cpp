@@ -1,4 +1,5 @@
 #include "ext_provider.hpp"
+#include "fwd_env.hpp"
 #include "records.hpp"
 
 #include "../frame_state.hpp"
@@ -95,6 +96,8 @@ gx::RenderExtConfig derive(void*, const gx::PipelineConfig& config, const gx::Sh
   }
   if (gfx::layout_has_gbuffer(layout)) {
     ext.output = output_for(config, (gx::render_ext::g_drawInputs & records::InWindow) != 0);
+    // Follows the layout tier, never a setting, so AO toggles never change a pipeline
+    ext.fwdEnv = fwd_env_for(config, (gx::render_ext::g_drawInputs & records::ForwardWindow) != 0);
   }
   return ext;
 }
@@ -112,8 +115,13 @@ uint8_t output_for(const gx::PipelineConfig& c, bool inWindow) noexcept {
   return inWindow && ((c.depthCompare && c.depthUpdate) || c.colorUpdate) ? 1 : 0;
 }
 
+uint8_t fwd_env_for(const gx::PipelineConfig& c, bool forwardWindow) noexcept {
+  return forwardWindow && c.colorUpdate ? 1 : 0;
+}
+
 void apply_frame_state(const detail::FrameState& state) noexcept {
   records::apply_frame_state(state);
+  fwd_env::apply_frame_state(state);
   if (!g_envRead) {
     g_envRead = true;
     g_env = read_env();
@@ -148,6 +156,7 @@ bool active() noexcept { return g_active; }
 void reset() noexcept {
   shutdown();
   records::testing::reset();
+  fwd_env::testing::reset();
   g_testForce = false;
   g_envRead = false;
   g_env = EnvMode::Unset;
