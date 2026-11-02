@@ -89,7 +89,7 @@ struct GbufView {
 }
 
 // Target rows snapshot one scene target and decomposition rows decode several; both replace RGB before the HUD
-inline constexpr std::array<GbufView, 14> GbufViews{{
+inline constexpr std::array<GbufView, 19> GbufViews{{
     {16, "gbuf.motion", "G-buffer: motion", "gbuf.motion", "phase.post_taa", Stage::PrePost, 0, false},
     {17, "gbuf.reactive", "G-buffer: reactive", "gbuf.reactive", "phase.post_taa", Stage::PrePost, 1, false},
     {18, "gbuf.fog", "Fog record: weight", "gbuf.fog", "phase.composite", Stage::OpaqueDone, 2, true},
@@ -108,6 +108,12 @@ inline constexpr std::array<GbufView, 14> GbufViews{{
                DecompMode::Multiply),
     {28, "ao.raw", "AO: raw visibility", "ao.raw", "phase.ao", Stage::OpaqueDone, 8, false},
     {29, "ao.hiz", "AO: view depth (mip 0)", "ao.hiz", "phase.ao", Stage::OpaqueDone, 9, false},
+    {30, "gbuf.surface.albedo", "Surface: base colour", "gbuf.surface", "phase.composite", Stage::OpaqueDone, 10, true},
+    {31, "gbuf.surface.material", "Surface: roughness, metalness, occlusion", "gbuf.surface", "phase.composite",
+     Stage::OpaqueDone, 11, true},
+    {32, "gbuf.surface.class", "Surface: class", "gbuf.surface", "phase.composite", Stage::OpaqueDone, 12, true},
+    {33, "gbuf.surface.ambient", "Surface: ambient", "gbuf.surface", "phase.composite", Stage::OpaqueDone, 13, true},
+    {34, "gbuf.surface.emissive", "Surface: emissive", "gbuf.surface", "phase.composite", Stage::OpaqueDone, 14, true},
 }};
 
 struct ViewSelection {

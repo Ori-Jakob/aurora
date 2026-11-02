@@ -22,7 +22,26 @@ wgpu::ColorWriteMask clear_write_mask(bool clearColor, bool clearAlpha) {
 }
 
 bool clears_target(const PipelineConfig& config, ColorAttachmentSemantic semantic) {
-  return (config.clearDepth && clears_with_depth(semantic)) || (config.clearColor && clears_with_color(semantic));
+  return (config.clearDepth && clears_with_depth(semantic)) || (config.clearColor && clears_with_color(semantic)) ||
+         ((config.clearDepth || config.clearColor) && clears_with_either(semantic));
+}
+
+bool integer_target(wgpu::TextureFormat format) noexcept {
+  switch (format) {
+  case wgpu::TextureFormat::R8Uint:
+  case wgpu::TextureFormat::RG8Uint:
+  case wgpu::TextureFormat::RGBA8Uint:
+  case wgpu::TextureFormat::R16Uint:
+  case wgpu::TextureFormat::RG16Uint:
+  case wgpu::TextureFormat::RGBA16Uint:
+  case wgpu::TextureFormat::R32Uint:
+  case wgpu::TextureFormat::RG32Uint:
+  case wgpu::TextureFormat::RGBA32Uint:
+  case wgpu::TextureFormat::RGB10A2Uint:
+    return true;
+  default:
+    return false;
+  }
 }
 } // namespace
 
@@ -61,7 +80,8 @@ fn vs_main(@builtin(vertex_index) vtxIdx: u32) -> VertexOutput {
     if (semantic == ColorAttachmentSemantic::Normal) {
       outputs += fmt::format("    @location({0}) normal{0}: vec4f,\n", i);
       values += fmt::format("    out.normal{} = vec4f(0.0);\n", i);
-    } else if (semantic == ColorAttachmentSemantic::Fog) {
+    } else if (integer_target(layout.colorAttachments[i].format)) {
+      // An integer target needs an integer output, or the clear pipeline never builds and the clear is skipped
       outputs += fmt::format("    @location({0}) t{0}: vec4u,\n", i);
       values += fmt::format("    out.t{} = vec4u(0u);\n", i);
     } else {

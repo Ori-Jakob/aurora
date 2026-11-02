@@ -164,6 +164,9 @@ void set_efb_targets(RenderPass& pass, EfbMode mode) {
     case ColorAttachmentSemantic::DebugId:
       target = &webgpu::g_debugIdBuffer;
       break;
+    case ColorAttachmentSemantic::Surface:
+      target = &webgpu::g_surfaceBuffer;
+      break;
     }
     color.size = target->size;
     color.view = target->view;
@@ -1338,10 +1341,11 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
   for (uint32_t i = 0; i < newPass.colorAttachmentCount; ++i) {
     auto& color = newPass.colorAttachments[i];
     color.loadOp = wgpu::LoadOp::Undefined;
-    if (clears_with_depth(color.semantic) || clears_with_color(color.semantic)) {
-      // Geometry targets reset with depth, colour records with colour
+    if (clears_with_depth(color.semantic) || clears_with_color(color.semantic) || clears_with_either(color.semantic)) {
+      // Geometry targets reset with depth, colour records with colour, Surface with either
       color.clear = (clears_with_depth(color.semantic) && clearDepth && fullTarget) ||
-                    (clears_with_color(color.semantic) && clearColor && fullTarget);
+                    (clears_with_color(color.semantic) && clearColor && fullTarget) ||
+                    (clears_with_either(color.semantic) && (clearDepth || clearColor) && fullTarget);
     } else if (color.semantic == ColorAttachmentSemantic::DebugId) {
       color.clear = clearColor && fullTarget;
     } else {

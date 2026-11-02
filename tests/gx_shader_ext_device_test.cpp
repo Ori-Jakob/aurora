@@ -15,7 +15,9 @@
 #include "gx/pipeline.hpp"
 #include "gx/render_ext.hpp"
 #include "gx/shader_info.hpp"
+#include "gx/surface_pack.hpp"
 #include "render/shaders_embed.hpp"
+#include "webgpu/gpu.hpp"
 
 #include <algorithm>
 #include <array>
@@ -28,6 +30,8 @@
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <random>
+#include <span>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -166,6 +170,45 @@ std::optional<std::vector<float>> run_float_compute(test::TestDevice& device, co
   std::vector<float> values(words->size());
   std::memcpy(values.data(), words->data(), size);
   return values;
+}
+
+std::optional<std::vector<uint32_t>> run_word_compute(test::TestDevice& device, const std::string& text,
+                                                      uint32_t invocations, uint32_t fields,
+                                                      std::span<const uint32_t> input) {
+  const wgpu::ShaderSourceWGSL wgsl{wgpu::ShaderSourceWGSL::Init{.code = text.c_str()}};
+  const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl};
+  const wgpu::ShaderModule module = device.device.CreateShaderModule(&moduleDescriptor);
+  const wgpu::ComputePipelineDescriptor pipelineDescriptor{.compute = {.module = module, .entryPoint = "main"}};
+  const wgpu::ComputePipeline pipeline = device.device.CreateComputePipeline(&pipelineDescriptor);
+  const uint64_t size = uint64_t{invocations} * fields * sizeof(uint32_t);
+  const wgpu::BufferDescriptor outputDescriptor{.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc,
+                                                .size = size};
+  const wgpu::Buffer output = device.device.CreateBuffer(&outputDescriptor);
+  const uint64_t inputSize = input.size_bytes();
+  const wgpu::BufferDescriptor inputDescriptor{.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                                               .size = inputSize};
+  const wgpu::Buffer inputBuffer = device.device.CreateBuffer(&inputDescriptor);
+  device.queue.WriteBuffer(inputBuffer, 0, input.data(), inputSize);
+  const std::array entries{
+      wgpu::BindGroupEntry{.binding = 0, .buffer = output, .size = size},
+      wgpu::BindGroupEntry{.binding = 1, .buffer = inputBuffer, .size = inputSize},
+  };
+  const wgpu::BindGroupDescriptor groupDescriptor{
+      .layout = pipeline.GetBindGroupLayout(0), .entryCount = entries.size(), .entries = entries.data()};
+  const wgpu::BindGroup group = device.device.CreateBindGroup(&groupDescriptor);
+  const wgpu::CommandEncoder encoder = device.device.CreateCommandEncoder();
+  const wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
+  pass.SetPipeline(pipeline);
+  pass.SetBindGroup(0, group);
+  pass.DispatchWorkgroups(invocations / 64);
+  pass.End();
+  const wgpu::CommandBuffer commands = encoder.Finish();
+  device.queue.Submit(1, &commands);
+  auto words = test::read_buffer(device, output, 0, size);
+  if (!words || words->size() != uint64_t{invocations} * fields) {
+    return std::nullopt;
+  }
+  return std::vector<uint32_t>(words->begin(), words->end());
 }
 
 class GxShaderExtDevice : public ::testing::Test {
@@ -439,6 +482,11 @@ TEST_F(GxShaderExtDevice, GBufferLayoutPipelinesValidate) {
     EXPECT_TRUE(created([&] { return static_cast<bool>(create_pipeline(plain, layout).main); }));
     build_clears(layout);
   }
+  EXPECT_TRUE(webgpu::scene_tier_supported(webgpu::SceneTier::Base));
+  EXPECT_FALSE(webgpu::scene_tier_supported(webgpu::SceneTier::Pbr));
+  const uint64_t failures = gbuffer_pipeline_failures();
+  EXPECT_FALSE(create_pipeline(plain, gfx::compose_scene_layout({.gbuffer = true, .surface = true}, base)).main);
+  EXPECT_EQ(gbuffer_pipeline_failures(), failures + 1);
 }
 
 // Unique ext-0 synthetic configs; those whose legacy text already fails fail for older reasons
@@ -1705,6 +1753,277 @@ TEST_F(GxShaderExtDevice, GxFogMatchesGxOnSweep) {
   RecordProperty("fogged", static_cast<int>(fogged));
   RecordProperty("gxExempt", static_cast<int>(gxExempt));
   RecordProperty("libraryExempt", static_cast<int>(libraryExempt));
+}
+
+TEST_F(GxShaderExtDevice, PbrLayoutPipelinesValidate) {
+  const auto backend = hardware_backend();
+  if (!backend) {
+    GTEST_SKIP() << "AURORA_TEST_BACKEND names no hardware backend";
+  }
+  const gfx::SceneLayoutBase base{
+      .color = wgpu::TextureFormat::BGRA8Unorm,
+      .depth = wgpu::TextureFormat::Depth32Float,
+      .size = {64, 64, 1},
+      .samples = 1,
+  };
+  const auto created = [&](const auto& create) {
+    m_device->device.PushErrorScope(wgpu::ErrorFilter::Validation);
+    const bool built = create();
+    const auto error = test::pop_validation_error(*m_device);
+    EXPECT_FALSE(error.has_value()) << error.value_or("");
+    return built && !error;
+  };
+  const auto build_clears = [&](const gfx::RenderTargetLayout& layout) {
+    for (uint32_t bits = 0; bits < 8; ++bits) {
+      const gfx::clear::PipelineConfig clear{
+          .clearColor = (bits & 1) != 0, .clearAlpha = (bits & 2) != 0, .clearDepth = (bits & 4) != 0};
+      EXPECT_TRUE(created([&] { return static_cast<bool>(gfx::clear::create_pipeline(clear, layout)); })) << bits;
+    }
+  };
+  const gfx::RenderTargetLayout pbr = gfx::compose_scene_layout({.gbuffer = true, .surface = true}, base);
+  const gfx::RenderTargetLayout ids =
+      gfx::compose_scene_layout({.gbuffer = true, .surface = true, .debugId = true}, base);
+  size_t built = 0;
+  for (const AuroraFeatureProfile profile : {FEATURE_PROFILE_FULL, FEATURE_PROFILE_METAL}) {
+    if (!start({.backend = *backend, .core = true, .allowCpu = false, .profile = profile}, true)) {
+      GTEST_SKIP() << "no adapter";
+    }
+    wgpu::Limits limits{};
+    m_device->device.GetLimits(&limits);
+    if (!m_device->core || limits.maxColorAttachmentBytesPerSample < 48) {
+      GTEST_SKIP() << "no core device with 48 colour bytes under profile " << static_cast<int>(profile);
+    }
+    EXPECT_TRUE(webgpu::scene_tier_supported(webgpu::SceneTier::Pbr)) << static_cast<int>(profile);
+    const bool full = profile == FEATURE_PROFILE_FULL;
+    const uint64_t failures = gbuffer_pipeline_failures();
+    const std::vector<ShaderConfig> configs = legacy_valid_configs(*m_device, full ? 32 : 4);
+    ASSERT_FALSE(configs.empty());
+    for (size_t i = 0; i < configs.size(); ++i) {
+      const PipelineConfig plain = pipeline_for(configs[i]);
+      EXPECT_TRUE(created([&] { return static_cast<bool>(create_pipeline(plain, pbr).main); })) << i;
+      EXPECT_TRUE(created([&] { return static_cast<bool>(create_pipeline(plain, ids).main); })) << i;
+      built += 2;
+      if (!full) {
+        continue;
+      }
+      PipelineConfig prepass = plain;
+      prepass.dstAlpha = 0x80;
+      prepass.blendMode = GX_BM_BLEND;
+      prepass.blendFacSrc = GX_BL_SRCALPHA;
+      prepass.blendFacDst = GX_BL_INVSRCALPHA;
+      PipelineConfig colorOff = plain;
+      colorOff.colorUpdate = false;
+      EXPECT_TRUE(created([&] {
+        const gfx::CompiledPipeline pipeline = create_pipeline(prepass, pbr);
+        return pipeline.main && pipeline.prepass;
+      })) << i;
+      EXPECT_TRUE(created([&] { return static_cast<bool>(create_pipeline(colorOff, pbr).main); })) << i;
+      built += 2;
+      if (i < 8) {
+        EXPECT_TRUE(created([&] {
+          return static_cast<bool>(create_pipeline(pipeline_for(with_output(configs[i], 1)), pbr).main);
+        })) << i;
+        ++built;
+      }
+    }
+    build_clears(pbr);
+    build_clears(ids);
+    EXPECT_EQ(gbuffer_pipeline_failures(), failures) << static_cast<int>(profile);
+    gfx::shutdown_pipeline_cache();
+    m_globals.reset();
+    EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
+    m_device.reset();
+  }
+  RecordProperty("built", static_cast<int>(built));
+}
+
+std::string_view render_library(std::string_view id) {
+  for (const render::shaders::EmbeddedShader& shader : render::shaders::embedded_library()) {
+    if (std::string_view{shader.id} == id) {
+      return {reinterpret_cast<const char*>(shader.data), shader.size};
+    }
+  }
+  return {};
+}
+
+struct SurfaceCase {
+  surface::Fields fields;
+  std::array<uint32_t, 4> record{};
+  bool tieTolerant = false;
+};
+
+std::vector<SurfaceCase> surface_cases() {
+  namespace s = surface;
+  const auto f = [](uint32_t bits) { return std::bit_cast<float>(bits); };
+  const std::vector<float> unorms{0.f,
+                                  1.f,
+                                  f(0x7FC00000u),
+                                  f(0x7F800001u),
+                                  f(0xFFC00000u),
+                                  -0.f,
+                                  -1.f,
+                                  2.f,
+                                  1e6f,
+                                  f(0x7F800000u),
+                                  f(0xFF800000u),
+                                  s::unorm8_decode(1),
+                                  s::unorm8_decode(127),
+                                  s::unorm8_decode(128),
+                                  s::unorm8_decode(254)};
+  const std::vector<float> ufloats{
+      0.f,     -0.f,    -1.f,    f(0x7FC00000u), f(0xFF800000u), f(0x38000000u), f(0x38800000u), 1.f,  1.9921875f,
+      65024.f, 65025.f, 65536.f, f(0x7F800000u), 64512.f,        64513.f,        1e9f,           0.5f, 3.14159f};
+  std::mt19937 rng{0x5u};
+  std::uniform_int_distribution<uint32_t> word;
+  std::uniform_int_distribution<uint32_t> byte{0, 255};
+  std::uniform_real_distribution<float> unit{-0.25f, 1.25f};
+  std::uniform_int_distribution<uint32_t> ufloatBits{0x37000000u, 0x48000000u};
+  std::vector<SurfaceCase> cases;
+  for (uint32_t j = 0; j < 64; ++j) {
+    const auto u = [&](uint32_t k) { return unorms[(j + k) % unorms.size()]; };
+    const auto e = [&](uint32_t k) { return ufloats[(j + k) % ufloats.size()]; };
+    cases.push_back({.fields = {.albedo = {u(0), u(1), u(2)},
+                                .ao = u(3),
+                                .roughness = u(4),
+                                .metalness = u(5),
+                                .classId = static_cast<uint8_t>(j * 37),
+                                .flags = static_cast<uint8_t>(j * 11),
+                                .ambient = {u(6), u(7), u(8)},
+                                .category = static_cast<uint8_t>(j * 53),
+                                .emissive = {e(0), e(1), e(2)}},
+                     .record = {j == 0 ? 0u : ~0u, word(rng), word(rng), j == 1 ? 0u : word(rng)}});
+  }
+  for (uint32_t i = 0; i < 4096; ++i) {
+    const bool decoded = (i & 1) == 0;
+    const auto u = [&] { return decoded ? s::unorm8_decode(byte(rng)) : unit(rng); };
+    const auto e = [&] { return f(ufloatBits(rng) | ((word(rng) & 15) == 0 ? 0x80000000u : 0u)); };
+    s::Fields fields{};
+    fields.albedo = {u(), u(), u()};
+    fields.ao = u();
+    fields.roughness = u();
+    fields.metalness = u();
+    fields.classId = static_cast<uint8_t>(byte(rng));
+    fields.flags = static_cast<uint8_t>(byte(rng));
+    fields.ambient = {u(), u(), u()};
+    fields.category = static_cast<uint8_t>(byte(rng));
+    fields.emissive = {e(), e(), e()};
+    cases.push_back(
+        {.fields = fields, .record = {word(rng), word(rng), word(rng), word(rng)}, .tieTolerant = !decoded});
+  }
+  return cases;
+}
+
+bool unorm_bytes_match(uint32_t actual, uint32_t expected, uint32_t unormBytes, bool tieTolerant) {
+  for (uint32_t b = 0; b < 4; ++b) {
+    const int a = static_cast<int>((actual >> (8 * b)) & 0xFF);
+    const int x = static_cast<int>((expected >> (8 * b)) & 0xFF);
+    const bool unorm = (unormBytes & (1u << b)) != 0;
+    if (a != x && !(unorm && tieTolerant && std::abs(a - x) == 1)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+TEST_F(GxShaderExtDevice, SurfaceLibraryRoundTrips) {
+  const auto backend = hardware_backend();
+  if (!backend) {
+    GTEST_SKIP() << "AURORA_TEST_BACKEND names no hardware backend";
+  }
+  if (!start({.backend = *backend, .core = true, .allowCpu = false}, false)) {
+    GTEST_SKIP() << "no adapter";
+  }
+  const std::string_view library = render_library("aurora/surface");
+  ASSERT_FALSE(library.empty());
+  constexpr uint32_t Fields = 20;
+  const std::string text = std::string{library} + R"(
+@group(0) @binding(0) var<storage, read_write> out_words: array<u32>;
+@group(0) @binding(1) var<storage, read> in_words: array<u32>;
+
+fn in_f32(i: u32) -> f32 {
+  return bitcast<f32>(in_words[i]);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  let i = id.x * 20u;
+  let s = GbufSurface(vec3f(in_f32(i), in_f32(i + 1u), in_f32(i + 2u)), in_f32(i + 3u), in_f32(i + 4u),
+                      in_f32(i + 5u), in_words[i + 6u], in_words[i + 7u],
+                      vec3f(in_f32(i + 8u), in_f32(i + 9u), in_f32(i + 10u)), in_words[i + 11u],
+                      vec3f(in_f32(i + 12u), in_f32(i + 13u), in_f32(i + 14u)));
+  let p = gbuf_surface_pack(s);
+  let rec = vec4u(in_words[i + 16u], in_words[i + 17u], in_words[i + 18u], in_words[i + 19u]);
+  let d = gbuf_surface_decode(rec);
+  out_words[i + 0u] = p.x;
+  out_words[i + 1u] = p.y;
+  out_words[i + 2u] = p.z;
+  out_words[i + 3u] = p.w;
+  out_words[i + 4u] = bitcast<u32>(d.albedo.x);
+  out_words[i + 5u] = bitcast<u32>(d.albedo.y);
+  out_words[i + 6u] = bitcast<u32>(d.albedo.z);
+  out_words[i + 7u] = bitcast<u32>(d.ao);
+  out_words[i + 8u] = bitcast<u32>(d.roughness);
+  out_words[i + 9u] = bitcast<u32>(d.metalness);
+  out_words[i + 10u] = d.class_id;
+  out_words[i + 11u] = d.flags;
+  out_words[i + 12u] = bitcast<u32>(d.ambient.x);
+  out_words[i + 13u] = bitcast<u32>(d.ambient.y);
+  out_words[i + 14u] = bitcast<u32>(d.ambient.z);
+  out_words[i + 15u] = d.category;
+  out_words[i + 16u] = bitcast<u32>(d.emissive.x);
+  out_words[i + 17u] = bitcast<u32>(d.emissive.y);
+  out_words[i + 18u] = bitcast<u32>(d.emissive.z);
+  let albedoSame = all(bitcast<vec3u>(gbuf_surface_albedo(rec)) == bitcast<vec3u>(d.albedo));
+  out_words[i + 19u] = select(0u, 1u, gbuf_surface_is_pbr(rec)) | select(0u, 2u, albedoSame) |
+                       (gbuf_surface_class(rec) << 8u);
+}
+)";
+  const std::vector<SurfaceCase> cases = surface_cases();
+  ASSERT_EQ(cases.size() % 64, 0u);
+  const auto bits = [](float value) { return std::bit_cast<uint32_t>(value); };
+  std::vector<uint32_t> input;
+  for (const SurfaceCase& c : cases) {
+    const surface::Fields& s = c.fields;
+    const std::array<uint32_t, Fields> row{bits(s.albedo[0]),   bits(s.albedo[1]),   bits(s.albedo[2]),   bits(s.ao),
+                                           bits(s.roughness),   bits(s.metalness),   s.classId,           s.flags,
+                                           bits(s.ambient[0]),  bits(s.ambient[1]),  bits(s.ambient[2]),  s.category,
+                                           bits(s.emissive[0]), bits(s.emissive[1]), bits(s.emissive[2]), 0u,
+                                           c.record[0],         c.record[1],         c.record[2],         c.record[3]};
+    input.insert(input.end(), row.begin(), row.end());
+  }
+  const auto out = run_word_compute(*m_device, text, static_cast<uint32_t>(cases.size()), Fields, input);
+  ASSERT_TRUE(out.has_value());
+  size_t packMismatches = 0;
+  size_t decodeMismatches = 0;
+  size_t ties = 0;
+  for (size_t i = 0; i < cases.size(); ++i) {
+    const SurfaceCase& c = cases[i];
+    const uint32_t* w = &(*out)[i * Fields];
+    const std::array<uint32_t, 4> expected = surface::pack(c.fields);
+    const bool packed = unorm_bytes_match(w[0], expected[0], 0xF, c.tieTolerant) &&
+                        unorm_bytes_match(w[1], expected[1], 0x3, c.tieTolerant) &&
+                        unorm_bytes_match(w[2], expected[2], 0x7, c.tieTolerant) && w[3] == expected[3];
+    ties += packed && (w[0] != expected[0] || w[1] != expected[1] || w[2] != expected[2]) ? 1 : 0;
+    if (!packed && packMismatches++ < 8) {
+      ADD_FAILURE() << "pack case " << i << std::hex << ": " << w[0] << " " << w[1] << " " << w[2] << " " << w[3]
+                    << " expected " << expected[0] << " " << expected[1] << " " << expected[2] << " " << expected[3];
+    }
+    const surface::Fields d = surface::unpack(c.record);
+    const std::array<uint32_t, 15> decoded{bits(d.albedo[0]),   bits(d.albedo[1]),   bits(d.albedo[2]),  bits(d.ao),
+                                           bits(d.roughness),   bits(d.metalness),   d.classId,          d.flags,
+                                           bits(d.ambient[0]),  bits(d.ambient[1]),  bits(d.ambient[2]), d.category,
+                                           bits(d.emissive[0]), bits(d.emissive[1]), bits(d.emissive[2])};
+    const uint32_t accessors = (d.classId != 0 ? 1u : 0u) | 2u | (uint32_t{d.classId} << 8);
+    const bool same = std::equal(decoded.begin(), decoded.end(), w + 4) && w[19] == accessors;
+    if (!same && decodeMismatches++ < 8) {
+      ADD_FAILURE() << "decode case " << i;
+    }
+  }
+  EXPECT_EQ(packMismatches, 0u);
+  EXPECT_EQ(decodeMismatches, 0u);
+  RecordProperty("cases", static_cast<int>(cases.size()));
+  RecordProperty("ties", static_cast<int>(ties));
+  std::printf("surface library: %zu cases, %zu within one step at a pack4x8unorm tie\n", cases.size(), ties);
 }
 } // namespace
 } // namespace aurora::gx

@@ -84,6 +84,8 @@ std::string_view semantic_name(gfx::ColorAttachmentSemantic semantic) noexcept {
     return "Reactive";
   case gfx::ColorAttachmentSemantic::Fog:
     return "Fog record";
+  case gfx::ColorAttachmentSemantic::Surface:
+    return "Surface";
   }
   return "Unknown";
 }
@@ -102,6 +104,8 @@ bool input_present(std::string_view name) noexcept {
   case detail::GxResource::Reactive:
   case detail::GxResource::Fog:
     return webgpu::g_graphicsConfig.gbuffer;
+  case detail::GxResource::Surface:
+    return webgpu::g_graphicsConfig.surfaceBuffer;
   default:
     return false;
   }
@@ -143,7 +147,10 @@ void draw_layout() {
   ImGui::Text("Colour bytes per sample: %u", detail::color_bytes_per_sample(std::span{formats}.first(count)));
   const FeatureSupport support = feature_support(Feature::GBuffer);
   if (support.supported) {
-    ImGui::Text("G-buffer tier: %s", webgpu::g_graphicsConfig.gbuffer ? "live" : "supported, off");
+    const auto& config = webgpu::g_graphicsConfig;
+    ImGui::Text("G-buffer tier: %s", config.surfaceBuffer ? "PBR live"
+                                     : config.gbuffer     ? "base live"
+                                                          : "supported, off");
   } else {
     const std::string_view reason = reason_name(support.reason);
     ImGui::TextColored(WarningColor, "G-buffer tier unavailable: %.*s", static_cast<int>(reason.size()), reason.data());

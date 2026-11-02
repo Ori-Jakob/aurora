@@ -1233,6 +1233,177 @@ TEST_F(GraphBindDeviceTest, GxGBufferTargetsBindAsSampled) {
   EXPECT_EQ(test_inputs().env.gxFormats[normal], webgpu::NormalBufferFormat);
 }
 
+class GraphBindPbrDeviceTest : public GraphBindDeviceTest {
+protected:
+  void SetUp() override {
+    GraphBindDeviceTest::SetUp();
+    if (!m_device) {
+      return;
+    }
+    render::Caps c = render::caps();
+    m_deviceBudget = c.limits.maxColorAttachmentBytesPerSample;
+    c.limits.maxColorAttachmentBytesPerSample = 128;
+    webgpu::set_caps(c);
+  }
+
+  void TearDown() override {
+    if (m_device) {
+      webgpu::set_scene_render_size(0, 0);
+      webgpu::set_gbuffer(false);
+    }
+    GraphBindDeviceTest::TearDown();
+  }
+
+  static std::vector<TestPass> surface_read() {
+    return {{.name = "sf.read", .order = 0, .declare = [](InternalPassBuilder& b) {
+               b.use("gbuf.surface", Access::Sampled,
+                     UseOptions{.missing = Missing::BindDummyBlack, .sampleType = TextureSampleType::Uint});
+               b.side_effect();
+             }}};
+  }
+
+  static void expect_scene_sized(const webgpu::TextureWithSampler& target) {
+    const wgpu::Extent3D scene = webgpu::scene_extent();
+    ASSERT_TRUE(target.texture);
+    EXPECT_EQ(target.texture.GetWidth(), scene.width);
+    EXPECT_EQ(target.texture.GetHeight(), scene.height);
+    EXPECT_EQ(target.size.width, scene.width);
+    EXPECT_EQ(target.size.height, scene.height);
+  }
+
+  uint32_t m_deviceBudget = 0;
+};
+
+TEST_F(GraphBindPbrDeviceTest, GxSurfaceBindsOnlyUnderPbr) {
+  if (!webgpu::g_hasCoreFeatures) {
+    GTEST_SKIP() << "the PBR G-buffer needs a core device";
+  }
+  push_validation_scope();
+  ASSERT_TRUE(webgpu::set_scene_tier(webgpu::SceneTier::Pbr));
+  ASSERT_EQ(pop_validation_scope(), std::nullopt);
+  const webgpu::TextureWithSampler& surface = webgpu::g_surfaceBuffer;
+  EXPECT_EQ(webgpu::scene_tier(), webgpu::SceneTier::Pbr);
+  EXPECT_TRUE(webgpu::g_graphicsConfig.gbuffer);
+  EXPECT_TRUE(webgpu::g_graphicsConfig.surfaceBuffer);
+  expect_scene_sized(surface);
+  EXPECT_EQ(surface.texture.GetFormat(), TextureFormat::RGBA32Uint);
+  EXPECT_EQ(surface.texture.GetFormat(), gx_fixed_format(GxResource::Surface));
+  EXPECT_EQ(surface.texture.GetSampleCount(), 1u);
+  const wgpu::TextureUsage usage = surface.texture.GetUsage();
+  EXPECT_EQ(usage,
+            wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc);
+  EXPECT_TRUE(webgpu::g_motionBuffer.texture);
+  EXPECT_TRUE(webgpu::g_fogRecordBuffer.texture);
+  EXPECT_TRUE(webgpu::g_normalBuffer.texture);
+
+  const auto index = static_cast<size_t>(GxResource::Surface);
+  GraphInputs inputs = test_inputs();
+  EXPECT_EQ(inputs.env.gxFormats[index], TextureFormat::RGBA32Uint);
+  EXPECT_EQ(inputs.env.gxUsage[index], usage);
+  {
+    std::vector<TestPass> passes = surface_read();
+    const TestFrame frame{compile(passes, inputs)};
+    ASSERT_EQ(frame.graph->nodes[frame.node("sf.read")].status, CullReason::None);
+    EXPECT_FALSE(frame.use("sf.read", 0).staticDummy);
+    ASSERT_EQ(run_frame(frame, 1), std::nullopt);
+    EXPECT_EQ(passes[0].calls, 1);
+    const auto identities = testing::last_identities(frame.node("sf.read"));
+    ASSERT_EQ(identities.size(), 1u);
+    EXPECT_EQ(identities[0].kind, IdentityKind::Gx);
+    EXPECT_EQ(identities[0].value, reinterpret_cast<uintptr_t>(surface.view.Get()));
+  }
+
+  const WGPUTexture motion = webgpu::g_motionBuffer.texture.Get();
+  ASSERT_TRUE(webgpu::set_scene_tier(webgpu::SceneTier::Base));
+  EXPECT_FALSE(webgpu::g_surfaceBuffer.texture);
+  EXPECT_FALSE(webgpu::g_graphicsConfig.surfaceBuffer);
+  EXPECT_EQ(webgpu::g_motionBuffer.texture.Get(), motion);
+  inputs = test_inputs();
+  EXPECT_EQ(inputs.env.gxFormats[index], TextureFormat::Undefined);
+  {
+    std::vector<TestPass> passes = surface_read();
+    const TestFrame frame{compile(passes, inputs)};
+    ASSERT_EQ(frame.graph->nodes[frame.node("sf.read")].status, CullReason::None);
+    ASSERT_EQ(run_frame(frame, 1), std::nullopt);
+    const auto identities = testing::last_identities(frame.node("sf.read"));
+    ASSERT_EQ(identities.size(), 1u);
+    EXPECT_EQ(identities[0].kind, IdentityKind::Dummy);
+  }
+
+  ASSERT_TRUE(webgpu::set_gbuffer(false));
+  EXPECT_EQ(webgpu::scene_tier(), webgpu::SceneTier::Legacy);
+  EXPECT_FALSE(webgpu::g_surfaceBuffer.texture);
+  EXPECT_FALSE(webgpu::g_motionBuffer.texture);
+  EXPECT_FALSE(webgpu::g_reactiveBuffer.texture);
+  EXPECT_FALSE(webgpu::g_fogRecordBuffer.texture);
+  EXPECT_FALSE(webgpu::g_normalBuffer.texture);
+
+  ASSERT_TRUE(webgpu::set_scene_tier(webgpu::SceneTier::Pbr));
+  EXPECT_TRUE(webgpu::g_surfaceBuffer.texture);
+  EXPECT_TRUE(webgpu::g_motionBuffer.texture);
+  EXPECT_TRUE(webgpu::g_normalBuffer.texture);
+  ASSERT_TRUE(webgpu::set_scene_tier(webgpu::SceneTier::Legacy));
+  EXPECT_FALSE(webgpu::g_surfaceBuffer.texture);
+  EXPECT_FALSE(webgpu::g_motionBuffer.texture);
+  EXPECT_FALSE(webgpu::g_graphicsConfig.gbuffer);
+  EXPECT_FALSE(webgpu::g_graphicsConfig.surfaceBuffer);
+}
+
+TEST_F(GraphBindPbrDeviceTest, SurfaceFollowsSceneSplit) {
+  if (!webgpu::g_hasCoreFeatures) {
+    GTEST_SKIP() << "the PBR G-buffer needs a core device";
+  }
+  ASSERT_TRUE(webgpu::set_scene_tier(webgpu::SceneTier::Pbr));
+  expect_scene_sized(webgpu::g_surfaceBuffer);
+  webgpu::set_scene_render_size(32, 32);
+  ASSERT_EQ(webgpu::scene_extent().width, 32u);
+  expect_scene_sized(webgpu::g_surfaceBuffer);
+  expect_scene_sized(webgpu::g_fogRecordBuffer);
+  EXPECT_EQ(test_inputs().env.sceneSize.width, 32u);
+  webgpu::set_scene_render_size(0, 0);
+  ASSERT_EQ(webgpu::scene_extent().width, 64u);
+  expect_scene_sized(webgpu::g_surfaceBuffer);
+  EXPECT_EQ(webgpu::g_surfaceBuffer.texture.GetFormat(), TextureFormat::RGBA32Uint);
+}
+
+TEST_F(GraphBindPbrDeviceTest, SetSceneTierRefusesBelowBudget) {
+  if (!webgpu::g_hasCoreFeatures) {
+    GTEST_SKIP() << "the G-buffer tiers need a core device";
+  }
+  if (webgpu::g_backendType == wgpu::BackendType::Null) {
+    EXPECT_EQ(m_deviceBudget, 32u);
+  }
+  render::Caps c = render::caps();
+  c.limits.maxColorAttachmentBytesPerSample = m_deviceBudget;
+  webgpu::set_caps(c);
+  const bool pbrFits = m_deviceBudget >= webgpu::PbrSceneColorBytes;
+  EXPECT_TRUE(webgpu::scene_tier_supported(webgpu::SceneTier::Legacy));
+  EXPECT_TRUE(webgpu::scene_tier_supported(webgpu::SceneTier::Base));
+  EXPECT_EQ(webgpu::scene_tier_supported(webgpu::SceneTier::Pbr), pbrFits);
+  EXPECT_EQ(webgpu::set_scene_tier(webgpu::SceneTier::Pbr), pbrFits);
+  ASSERT_TRUE(webgpu::set_scene_tier(webgpu::SceneTier::Legacy));
+
+  for (const uint32_t budget : {32u, 43u}) {
+    c.limits.maxColorAttachmentBytesPerSample = budget;
+    webgpu::set_caps(c);
+    EXPECT_FALSE(webgpu::scene_tier_supported(webgpu::SceneTier::Pbr)) << budget;
+    EXPECT_FALSE(webgpu::set_scene_tier(webgpu::SceneTier::Pbr)) << budget;
+    EXPECT_FALSE(webgpu::g_surfaceBuffer.texture) << budget;
+    EXPECT_EQ(webgpu::scene_tier(), webgpu::SceneTier::Legacy) << budget;
+    ASSERT_TRUE(webgpu::set_scene_tier(webgpu::SceneTier::Base)) << budget;
+    EXPECT_FALSE(webgpu::set_scene_tier(webgpu::SceneTier::Pbr)) << budget;
+    EXPECT_EQ(webgpu::scene_tier(), webgpu::SceneTier::Base) << budget;
+    ASSERT_TRUE(webgpu::set_gbuffer(false)) << budget;
+  }
+  c.limits.maxColorAttachmentBytesPerSample = 24;
+  webgpu::set_caps(c);
+  EXPECT_FALSE(webgpu::set_gbuffer(true));
+  c.limits.maxColorAttachmentBytesPerSample = webgpu::PbrSceneColorBytes;
+  webgpu::set_caps(c);
+  EXPECT_TRUE(webgpu::set_scene_tier(webgpu::SceneTier::Pbr));
+  EXPECT_TRUE(webgpu::g_surfaceBuffer.texture);
+}
+
 TEST_F(GraphBindTest, LoadOpsFollowCreator) {
   using testing::AttachmentOps;
   std::vector<std::vector<AttachmentOps>> recorded;

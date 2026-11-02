@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace aurora::gfx {
@@ -141,8 +142,8 @@ SceneLayoutBase test_base() {
 
 // Every warmed pipeline resolved over two matched frames, so only the switch rules decide
 SceneLayoutInput warming_input() {
-  return {.want = true,
-          .live = false,
+  return {.want = SceneTier::Base,
+          .live = SceneTier::Legacy,
           .warming = true,
           .supported = true,
           .progress = {.ready = 4, .total = 4},
@@ -166,11 +167,16 @@ protected:
 };
 
 TEST(SceneLayout, FirstLatchAppliesDirectly) {
-  EXPECT_EQ(next_scene_layout_action({.want = true, .firstLatch = true, .supported = true}), SceneLayoutAction::Switch);
-  EXPECT_EQ(next_scene_layout_action({.live = true, .firstLatch = true, .supported = true}), SceneLayoutAction::Switch);
-  EXPECT_EQ(next_scene_layout_action({.want = true, .live = true, .firstLatch = true, .supported = true}),
+  EXPECT_EQ(next_scene_layout_action({.want = SceneTier::Base, .firstLatch = true, .supported = true}),
+            SceneLayoutAction::Switch);
+  EXPECT_EQ(next_scene_layout_action({.live = SceneTier::Base, .firstLatch = true, .supported = true}),
+            SceneLayoutAction::Switch);
+  EXPECT_EQ(next_scene_layout_action(
+                {.want = SceneTier::Base, .live = SceneTier::Base, .firstLatch = true, .supported = true}),
             SceneLayoutAction::None);
-  EXPECT_EQ(next_scene_layout_action({.want = true, .supported = true}), SceneLayoutAction::BeginWarm);
+  EXPECT_EQ(next_scene_layout_action({.want = SceneTier::Base, .supported = true}), SceneLayoutAction::BeginWarm);
+  EXPECT_EQ(next_scene_layout_action({.want = SceneTier::Pbr, .firstLatch = true, .supported = true}),
+            SceneLayoutAction::Switch);
 }
 
 TEST(SceneLayout, SwitchWaitsForEveryWarmPipeline) {
@@ -196,8 +202,8 @@ TEST(SceneLayout, HardFailureRefusesSwitch) {
   input.progress = {.ready = 1, .total = 4, .failed = 1};
   EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::None);
   input.progress = {.ready = 3, .total = 4, .failed = 1};
-  input.want = false;
-  input.live = true;
+  input.want = SceneTier::Legacy;
+  input.live = SceneTier::Base;
   EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::Switch);
 }
 
@@ -237,11 +243,11 @@ TEST(SceneLayout, SlowWarmNeverSwitchesEarly) {
     input.elapsedMs = elapsedMs;
     EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::None) << elapsedMs;
   }
-  input.want = false;
-  input.live = true;
+  input.want = SceneTier::Legacy;
+  input.live = SceneTier::Base;
   EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::None);
-  input.want = true;
-  input.live = false;
+  input.want = SceneTier::Base;
+  input.live = SceneTier::Legacy;
   input.progress = {.ready = 4, .total = 4};
   input.matchedFrames = 0;
   EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::None);
@@ -251,7 +257,7 @@ TEST(SceneLayout, SlowWarmNeverSwitchesEarly) {
 
 TEST(SceneLayout, ToggleBackCancelsWarm) {
   SceneLayoutInput input = warming_input();
-  input.want = false;
+  input.want = SceneTier::Legacy;
   input.progress = {.ready = 1, .total = 4};
   EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::Cancel);
   input.warming = false;
@@ -259,7 +265,8 @@ TEST(SceneLayout, ToggleBackCancelsWarm) {
 }
 
 TEST(SceneLayout, BlockingPipelinesSwitchAtOnce) {
-  EXPECT_EQ(next_scene_layout_action({.want = true, .blocking = true, .supported = true}), SceneLayoutAction::Switch);
+  EXPECT_EQ(next_scene_layout_action({.want = SceneTier::Base, .blocking = true, .supported = true}),
+            SceneLayoutAction::Switch);
   SceneLayoutInput input = warming_input();
   input.progress = {.ready = 0, .total = 4};
   input.blocking = true;
@@ -276,22 +283,108 @@ TEST(SceneLayout, PendingKeyChangeRestartsWarm) {
 
 TEST(SceneLayout, PendingLayoutExcludesDebugId) {
   const SceneLayoutBase base = test_base();
-  const RenderTargetLayout pending = pending_scene_layout(false, true, base);
+  const RenderTargetLayout pending = pending_scene_layout(false, SceneTier::Base, base);
   for (uint32_t i = 0; i < pending.colorAttachmentCount; ++i) {
     EXPECT_NE(pending.colorAttachments[i].semantic, ColorAttachmentSemantic::DebugId) << i;
   }
   EXPECT_EQ(pending.key, pipeline_base_layout(compose_scene_layout({.gbuffer = true, .debugId = true}, base)).key);
-  EXPECT_EQ(pending_scene_layout(true, true, base).key, pending.key);
-  EXPECT_EQ(pending_scene_layout(true, false, base).key,
+  EXPECT_EQ(pending_scene_layout(true, SceneTier::Base, base).key, pending.key);
+  EXPECT_EQ(pending_scene_layout(true, SceneTier::Legacy, base).key,
             pipeline_base_layout(compose_scene_layout({.normal = true, .debugId = true}, base)).key);
 }
 
+TEST(SceneLayout, PendingPbrLayoutCarriesSurface) {
+  const SceneLayoutBase base = test_base();
+  const RenderTargetLayout pending = pending_scene_layout(false, SceneTier::Pbr, base);
+  EXPECT_TRUE(layout_has_surface(pending));
+  EXPECT_TRUE(layout_has_gbuffer(pending));
+  EXPECT_EQ(pending.key, pipeline_base_layout(compose_scene_layout({.surface = true, .debugId = true}, base)).key);
+  EXPECT_EQ(pending_scene_layout(true, SceneTier::Pbr, base).key, pending.key);
+  EXPECT_NE(pending.key, pending_scene_layout(false, SceneTier::Base, base).key);
+  EXPECT_FALSE(layout_has_surface(pending_scene_layout(false, SceneTier::Base, base)));
+}
+
+TEST(SceneLayout, SwitchableLayoutsIncludePbr) {
+  const SceneLayoutBase base = test_base();
+  const std::array<uint64_t, 4> keys = switchable_scene_layout_keys(base);
+  EXPECT_EQ(keys[0], compose_scene_layout({}, base).key);
+  EXPECT_EQ(keys[1], compose_scene_layout({.normal = true}, base).key);
+  EXPECT_EQ(keys[2], compose_scene_layout({.gbuffer = true}, base).key);
+  EXPECT_EQ(keys[3], compose_scene_layout({.gbuffer = true, .surface = true}, base).key);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    for (size_t j = i + 1; j < keys.size(); ++j) {
+      EXPECT_NE(keys[i], keys[j]) << i << " " << j;
+    }
+  }
+}
+
 TEST(SceneLayout, UnsupportedDeviceNeverWarms) {
-  EXPECT_EQ(next_scene_layout_action({.want = true}), SceneLayoutAction::None);
-  EXPECT_EQ(next_scene_layout_action({.want = true, .firstLatch = true}), SceneLayoutAction::None);
+  EXPECT_EQ(next_scene_layout_action({.want = SceneTier::Base}), SceneLayoutAction::None);
+  EXPECT_EQ(next_scene_layout_action({.want = SceneTier::Base, .firstLatch = true}), SceneLayoutAction::None);
   SceneLayoutInput input = warming_input();
   input.supported = false;
   EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::Cancel);
+}
+
+TEST(SceneLayout, UnsupportedPbrNeverWarms) {
+  EXPECT_EQ(next_scene_layout_action({.want = SceneTier::Pbr, .live = SceneTier::Base}), SceneLayoutAction::None);
+  EXPECT_EQ(next_scene_layout_action({.want = SceneTier::Pbr, .firstLatch = true}), SceneLayoutAction::None);
+  EXPECT_EQ(next_scene_layout_action({.want = SceneTier::Pbr, .live = SceneTier::Base, .blocking = true}),
+            SceneLayoutAction::None);
+  SceneLayoutInput input = warming_input();
+  input.want = SceneTier::Pbr;
+  input.supported = false;
+  EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::Cancel);
+  input.want = SceneTier::Legacy;
+  input.live = SceneTier::Pbr;
+  EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::Switch);
+}
+
+TEST(SceneLayout, BaseToPbrWarmsThenSwitches) {
+  EXPECT_EQ(next_scene_layout_action({.want = SceneTier::Pbr, .live = SceneTier::Base, .supported = true}),
+            SceneLayoutAction::BeginWarm);
+  SceneLayoutInput input = warming_input();
+  input.want = SceneTier::Pbr;
+  input.live = SceneTier::Base;
+  input.progress = {.ready = 3, .total = 4};
+  EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::None);
+  input.progress.ready = 4;
+  EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::Switch);
+  input.want = SceneTier::Base;
+  input.live = SceneTier::Pbr;
+  input.matchedFrames = 1;
+  EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::None);
+  input.matchedFrames = SceneLayoutMatchedFrames;
+  EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::Switch);
+}
+
+TEST(SceneLayout, HardFailureRefusesAnyGBufferTier) {
+  SceneLayoutInput input = warming_input();
+  input.progress = {.ready = 3, .total = 4, .failed = 1};
+  input.hardFailed = 1;
+  const std::array<std::pair<SceneTier, SceneTier>, 3> refusable{
+      {{SceneTier::Base, SceneTier::Legacy}, {SceneTier::Pbr, SceneTier::Base}, {SceneTier::Base, SceneTier::Pbr}}};
+  for (const auto& [want, live] : refusable) {
+    input.want = want;
+    input.live = live;
+    EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::Refuse)
+        << static_cast<int>(want) << " " << static_cast<int>(live);
+  }
+  input.want = SceneTier::Pbr;
+  input.live = SceneTier::Legacy;
+  EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::Refuse);
+  for (const SceneTier live : {SceneTier::Base, SceneTier::Pbr}) {
+    input.want = SceneTier::Legacy;
+    input.live = live;
+    EXPECT_EQ(next_scene_layout_action(input), SceneLayoutAction::Switch) << static_cast<int>(live);
+  }
+}
+
+TEST(SceneLayout, RefusedPbrStepsDownToBase) {
+  EXPECT_EQ(scene_tier_after_refusal(SceneTier::Pbr, SceneTier::Legacy), SceneTier::Base);
+  EXPECT_EQ(scene_tier_after_refusal(SceneTier::Pbr, SceneTier::Base), SceneTier::Base);
+  EXPECT_EQ(scene_tier_after_refusal(SceneTier::Base, SceneTier::Legacy), SceneTier::Legacy);
+  EXPECT_EQ(scene_tier_after_refusal(SceneTier::Base, SceneTier::Pbr), SceneTier::Pbr);
 }
 
 TEST_F(SceneLayoutWarmTest, WarmSetCapsAndCountsOverflow) {
@@ -343,7 +436,8 @@ TEST(PipelineCacheLayouts, RebuildRemembersEverySwitchableLayout) {
   detail::finalize_render_target_layout(offscreen);
   std::vector<uint64_t> expected;
   for (const uint64_t key : {compose_scene_layout({}, base).key, compose_scene_layout({.normal = true}, base).key,
-                             compose_scene_layout({.gbuffer = true}, base).key, offscreen.key}) {
+                             compose_scene_layout({.gbuffer = true}, base).key,
+                             compose_scene_layout({.gbuffer = true, .surface = true}, base).key, offscreen.key}) {
     if (std::ranges::find(expected, key) == expected.end()) {
       expected.push_back(key);
     }

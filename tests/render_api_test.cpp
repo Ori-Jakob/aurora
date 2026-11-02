@@ -474,6 +474,41 @@ TEST_F(RenderApiTest, PbrTierNeedsFortyFourBytes) {
   EXPECT_EQ(evaluate_support(Feature::Reflections, 0, pbr, env(budget32, all)), unsupported(Reason::ColorBudget));
 }
 
+TEST_F(RenderApiTest, PbrDevBuildOnlyThroughEnv) {
+  const BuiltOptions& defaults = detail::default_built_options();
+  Caps budget32 = full_caps();
+  budget32.limits.maxColorAttachmentBytesPerSample = 32;
+  Caps budget64 = full_caps();
+  budget64.limits.maxColorAttachmentBytesPerSample = 64;
+  Settings pbr;
+  pbr.pbr = true;
+  EXPECT_EQ(evaluate_support(Feature::Pbr, 0, pbr, env(budget64, defaults)), unsupported(Reason::NotImplemented));
+  EXPECT_FALSE(detail::clamp_settings(pbr, env(budget64, defaults)).pbr);
+  EXPECT_EQ(detail::with_pbr_dev_built(defaults, false), defaults);
+  const BuiltOptions dev = detail::with_pbr_dev_built(defaults, true);
+  EXPECT_EQ(evaluate_support(Feature::Pbr, 0, pbr, env(budget64, dev)), Supported);
+  EXPECT_EQ(evaluate_support(Feature::Pbr, 0, pbr, env(budget32, dev)), unsupported(Reason::ColorBudget));
+  EXPECT_TRUE(detail::clamp_settings(pbr, env(budget64, dev)).pbr);
+  EXPECT_FALSE(detail::clamp_settings(pbr, env(budget32, dev)).pbr);
+}
+
+TEST_F(RenderApiTest, LegacyBlendEnvParses) {
+  EXPECT_EQ(detail::parse_legacy_blend("0"), 0.f);
+  EXPECT_EQ(detail::parse_legacy_blend("0.25"), 0.25f);
+  EXPECT_EQ(detail::parse_legacy_blend("1"), 1.f);
+  EXPECT_EQ(detail::parse_legacy_blend("1.5"), 1.5f);
+  EXPECT_EQ(detail::parse_legacy_blend("-2"), -2.f);
+  for (const std::string_view text : {"", "x", "0.5x", " 0.5", "nan", "NaN", "inf", "-inf", "infinity", "1e40"}) {
+    EXPECT_FALSE(detail::parse_legacy_blend(text).has_value()) << text;
+  }
+  Settings high;
+  high.legacyBlend = *detail::parse_legacy_blend("1.5");
+  EXPECT_EQ(detail::sanitize_settings(high).legacyBlend, 1.f);
+  Settings low;
+  low.legacyBlend = *detail::parse_legacy_blend("-2");
+  EXPECT_EQ(detail::sanitize_settings(low).legacyBlend, 0.f);
+}
+
 TEST_F(RenderApiTest, UnbuiltGBufferBlocksBaseFeatures) {
   const Caps caps = full_caps();
   BuiltOptions aoOnly = built_none();
@@ -1233,7 +1268,7 @@ TEST_F(RenderApiTest, FeatureReadyFollowsSceneLayout) {
 
   // Leaving the tier warms the legacy layout, which needs no device
   webgpu::g_graphicsConfig.gbuffer = true;
-  gfx::detail::latch_scene_layout(false);
+  gfx::detail::latch_scene_layout(gfx::SceneTier::Legacy);
   ASSERT_TRUE(gfx::scene_layout_transitioning());
   EXPECT_FALSE(feature_ready(Feature::GBuffer));
   EXPECT_FALSE(feature_active(Feature::GBuffer));
@@ -1241,7 +1276,7 @@ TEST_F(RenderApiTest, FeatureReadyFollowsSceneLayout) {
   EXPECT_TRUE(feature_ready(Feature::TextureMaterials));
   EXPECT_TRUE(feature_ready(Feature::Ssil));
 
-  gfx::detail::latch_scene_layout(true);
+  gfx::detail::latch_scene_layout(gfx::SceneTier::Base);
   EXPECT_FALSE(gfx::scene_layout_transitioning());
   EXPECT_TRUE(feature_ready(Feature::GBuffer));
   webgpu::g_graphicsConfig.gbuffer = false;

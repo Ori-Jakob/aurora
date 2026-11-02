@@ -7,13 +7,18 @@
 #include "gfx/hash.hpp"
 #include "gfx/pipeline_cache.hpp"
 #include "gfx/scene_targets.hpp"
+#include "gx/gx.hpp"
+#include "gx/surface_pack.hpp"
 #if AURORA_ENABLE_RENDER
 #include "render/graph.hpp"
 #endif
 #include "webgpu/gpu.hpp"
 
 #include <array>
+#include <bit>
 #include <cstdint>
+#include <limits>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -297,6 +302,171 @@ TEST(RenderTargetLayoutTest, SceneLayoutComposesBaseGBuffer) {
   webgpu::g_frameBuffer = savedFrame;
 }
 
+TEST(RenderTargetLayoutTest, SceneLayoutComposesPbrSurface) {
+  static_assert(static_cast<uint8_t>(ColorAttachmentSemantic::Fog) == 6);
+  static_assert(static_cast<uint8_t>(ColorAttachmentSemantic::Surface) == 7);
+  const RenderTargetLayout pbr = compose_scene_layout({.gbuffer = true, .surface = true}, TestBase);
+  ASSERT_EQ(pbr.colorAttachmentCount, 6u);
+  constexpr std::array Semantics{ColorAttachmentSemantic::SceneColor, ColorAttachmentSemantic::Normal,
+                                 ColorAttachmentSemantic::Motion,     ColorAttachmentSemantic::Reactive,
+                                 ColorAttachmentSemantic::Fog,        ColorAttachmentSemantic::Surface};
+  constexpr std::array Formats{wgpu::TextureFormat::RGBA8Unorm, wgpu::TextureFormat::RGB10A2Unorm,
+                               wgpu::TextureFormat::RG16Float,  wgpu::TextureFormat::R8Unorm,
+                               wgpu::TextureFormat::RGBA8Uint,  wgpu::TextureFormat::RGBA32Uint};
+  for (uint32_t i = 0; i < Semantics.size(); ++i) {
+    EXPECT_EQ(pbr.colorAttachments[i].semantic, Semantics[i]) << i;
+    EXPECT_EQ(pbr.colorAttachments[i].format, Formats[i]) << i;
+    EXPECT_EQ(pbr.colorAttachments[i].width, 640u) << i;
+    EXPECT_EQ(pbr.colorAttachments[i].height, 480u) << i;
+  }
+  EXPECT_EQ(pbr.key, reference_key(pbr));
+  EXPECT_TRUE(layout_has_gbuffer(pbr));
+  EXPECT_TRUE(layout_has_surface(pbr));
+  EXPECT_EQ(compose_scene_layout({.surface = true}, TestBase).key, pbr.key);
+  EXPECT_EQ(compose_scene_layout({.normal = true, .gbuffer = true, .surface = true}, TestBase).key, pbr.key);
+
+  const RenderTargetLayout ids = compose_scene_layout({.gbuffer = true, .surface = true, .debugId = true}, TestBase);
+  ASSERT_EQ(ids.colorAttachmentCount, 7u);
+  EXPECT_EQ(ids.colorAttachments[5].semantic, ColorAttachmentSemantic::Surface);
+  EXPECT_EQ(ids.colorAttachments[6].semantic, ColorAttachmentSemantic::DebugId);
+  EXPECT_EQ(pipeline_base_layout(ids).key, pbr.key);
+
+  const RenderTargetLayout gbuffer = compose_scene_layout({.gbuffer = true}, TestBase);
+  EXPECT_FALSE(layout_has_surface(gbuffer));
+  EXPECT_NE(gbuffer.key, pbr.key);
+  expect_same_layout(compose_scene_layout({}, TestBase), legacy_scene_layout(false));
+  expect_same_layout(compose_scene_layout({.normal = true}, TestBase), legacy_scene_layout(true));
+  EXPECT_FALSE(layout_has_surface(compose_scene_layout({.normal = true, .debugId = true}, TestBase)));
+
+  EXPECT_TRUE(clears_with_either(ColorAttachmentSemantic::Surface));
+  EXPECT_FALSE(clears_with_depth(ColorAttachmentSemantic::Surface));
+  EXPECT_FALSE(clears_with_color(ColorAttachmentSemantic::Surface));
+  for (const auto semantic :
+       {ColorAttachmentSemantic::SceneColor, ColorAttachmentSemantic::Normal, ColorAttachmentSemantic::Motion,
+        ColorAttachmentSemantic::Reactive, ColorAttachmentSemantic::Fog, ColorAttachmentSemantic::DebugId}) {
+    EXPECT_FALSE(clears_with_either(semantic)) << static_cast<int>(semantic);
+  }
+
+  auto& config = webgpu::g_graphicsConfig;
+  const webgpu::GraphicsConfig savedConfig = config;
+  const webgpu::TextureWithSampler savedFrame = webgpu::g_frameBuffer;
+  config.depthFormat = TestBase.depth;
+  config.msaaSamples = 1;
+  config.normalBuffer = false;
+  config.debugIdBuffer = false;
+  config.gbuffer = true;
+  config.surfaceBuffer = true;
+  webgpu::g_frameBuffer.size = TestBase.size;
+  webgpu::g_frameBuffer.format = TestBase.color;
+  EXPECT_EQ(webgpu::scene_tier(), SceneTier::Pbr);
+  EXPECT_EQ(live_scene_targets(), (SceneTargetFlags{.normal = true, .gbuffer = true, .surface = true}));
+  expect_same_layout(scene_render_target_layout(), pbr);
+  config.surfaceBuffer = false;
+  EXPECT_EQ(webgpu::scene_tier(), SceneTier::Base);
+  config.gbuffer = false;
+  EXPECT_EQ(webgpu::scene_tier(), SceneTier::Legacy);
+  config = savedConfig;
+  webgpu::g_frameBuffer = savedFrame;
+}
+
+TEST(RenderTargetLayoutTest, PbrShaderTargetsMatchBase) {
+  const gx::ShaderTargets base = gx::shader_targets(compose_scene_layout({.gbuffer = true}, TestBase));
+  const gx::ShaderTargets pbr = gx::shader_targets(compose_scene_layout({.gbuffer = true, .surface = true}, TestBase));
+  EXPECT_EQ(pbr.normal, base.normal);
+  EXPECT_EQ(pbr.gbufferNormal, base.gbufferNormal);
+  EXPECT_EQ(pbr.motion, base.motion);
+  EXPECT_EQ(pbr.reactive, base.reactive);
+  EXPECT_EQ(pbr.fog, base.fog);
+  EXPECT_EQ(pbr.debugId, base.debugId);
+  EXPECT_EQ(pbr.fwdEnv, base.fwdEnv);
+  EXPECT_TRUE(pbr.fwdEnv);
+  EXPECT_EQ(gx::shader_targets(compose_scene_layout({.gbuffer = true, .debugId = true}, TestBase)).debugId, 5u);
+  EXPECT_EQ(
+      gx::shader_targets(compose_scene_layout({.gbuffer = true, .surface = true, .debugId = true}, TestBase)).debugId,
+      6u);
+}
+
+uint32_t ufloat_code(uint32_t word, uint32_t channel) noexcept {
+  return channel == 2 ? word >> 22 : (word >> (11 * channel)) & 0x7FFu;
+}
+
+TEST(RenderTargetLayoutTest, SurfaceMirrorRoundTrips) {
+  namespace s = gx::surface;
+  EXPECT_EQ(std::bit_cast<uint32_t>(s::InvUnorm8), 0x3B808081u);
+  for (uint32_t b = 0; b < 256; ++b) {
+    EXPECT_EQ(std::bit_cast<uint32_t>(s::unorm8_decode(b)),
+              std::bit_cast<uint32_t>(static_cast<float>(b) * s::InvUnorm8))
+        << b;
+    EXPECT_EQ(s::unorm8(s::unorm8_decode(b)), b) << b;
+  }
+  for (const uint32_t bits : {0x7FC00000u, 0x7F800001u, 0xFFC00000u, 0x80000000u, 0xBF800000u, 0xFF800000u}) {
+    EXPECT_EQ(s::unorm8(std::bit_cast<float>(bits)), 0u) << std::hex << bits;
+  }
+  for (const float value : {2.f, 1e6f, std::numeric_limits<float>::infinity()}) {
+    EXPECT_EQ(s::unorm8(value), 255u) << value;
+  }
+
+  for (uint32_t code = 0x040; code <= s::RgMax; ++code) {
+    for (uint32_t channel = 0; channel < 2; ++channel) {
+      const uint32_t word = code << (11 * channel);
+      EXPECT_EQ(s::pack_r11g11b10(s::unpack_r11g11b10(word)), word) << code << " " << channel;
+    }
+  }
+  for (uint32_t code = 0x020; code <= s::BMax; ++code) {
+    EXPECT_EQ(s::pack_r11g11b10(s::unpack_r11g11b10(code << 22)), code << 22) << code;
+  }
+  const auto code_of = [](float value, uint32_t channel) {
+    std::array<float, 3> v{};
+    v[channel] = value;
+    return ufloat_code(s::pack_r11g11b10(v), channel);
+  };
+  for (const uint32_t bits : {0u, 0x80000000u, 0xBF800000u, 0x7FC00000u, 0xFF800000u, 0x38000000u}) {
+    for (uint32_t channel = 0; channel < 3; ++channel) {
+      EXPECT_EQ(code_of(std::bit_cast<float>(bits), channel), 0u) << std::hex << bits << " " << channel;
+    }
+  }
+  const float minNormal = std::bit_cast<float>(0x38800000u);
+  EXPECT_EQ(code_of(minNormal, 0), 0x040u);
+  EXPECT_EQ(code_of(minNormal, 2), 0x020u);
+  EXPECT_EQ(code_of(1.f, 1), 0x3C0u);
+  EXPECT_EQ(code_of(1.f, 2), 0x1E0u);
+  EXPECT_EQ(code_of(1.9921875f, 0), 0x400u);
+  EXPECT_EQ(code_of(65024.f, 0), s::RgMax);
+  for (uint32_t value = 65025; value <= 65536; ++value) {
+    EXPECT_EQ(code_of(static_cast<float>(value), 1), s::RgMax) << value;
+  }
+  EXPECT_EQ(code_of(std::numeric_limits<float>::infinity(), 0), s::RgMax);
+  EXPECT_EQ(code_of(64512.f, 2), s::BMax);
+  for (const float value : {64513.f, 65024.f, 1e9f, std::numeric_limits<float>::infinity()}) {
+    EXPECT_EQ(code_of(value, 2), s::BMax) << value;
+  }
+
+  std::mt19937 rng{0x5u};
+  std::uniform_int_distribution<uint32_t> word;
+  const auto legal_code = [&](uint32_t low, uint32_t high) {
+    const uint32_t code = std::uniform_int_distribution<uint32_t>{low - 1, high}(rng);
+    return code == low - 1 ? 0u : code;
+  };
+  for (int i = 0; i < 4096; ++i) {
+    const std::array<uint32_t, 4> words{word(rng), word(rng), word(rng),
+                                        legal_code(0x040, s::RgMax) | (legal_code(0x040, s::RgMax) << 11) |
+                                            (legal_code(0x020, s::BMax) << 22)};
+    EXPECT_EQ(s::pack(s::unpack(words)), words) << i;
+  }
+  const s::Fields fields{.albedo = {1.f, 0.5f, 0.f},
+                         .ao = 1.f,
+                         .roughness = 0.85f,
+                         .classId = s::ClassDefault,
+                         .flags = s::Unlit | s::BakedLight,
+                         .category = 0x81,
+                         .emissive = {1.f, 0.f, 2.f}};
+  const std::array<uint32_t, 4> packed = s::pack(fields);
+  EXPECT_EQ(packed[0], 0xFF0080FFu);
+  EXPECT_EQ(packed[1], 0x600100D9u);
+  EXPECT_EQ(packed[2], 0x81000000u);
+  EXPECT_EQ(packed[3], 0x3C0u | (0x200u << 22));
+}
+
 #if AURORA_ENABLE_RENDER
 uint32_t layout_cost(const RenderTargetLayout& layout) {
   std::vector<wgpu::TextureFormat> formats;
@@ -309,17 +479,15 @@ uint32_t layout_cost(const RenderTargetLayout& layout) {
 TEST(RenderTargetLayoutTest, SceneTargetCostsFollowTiers) {
   EXPECT_EQ(layout_cost(compose_scene_layout({}, TestBase)), 8u);
   EXPECT_EQ(layout_cost(compose_scene_layout({.normal = true}, TestBase)), 16u);
-  EXPECT_EQ(layout_cost(compose_scene_layout({.gbuffer = true}, TestBase)), 25u);
+  EXPECT_EQ(layout_cost(compose_scene_layout({.gbuffer = true}, TestBase)), webgpu::BaseSceneColorBytes);
   EXPECT_EQ(layout_cost(compose_scene_layout({.debugId = true}, TestBase)), 12u);
   EXPECT_EQ(layout_cost(compose_scene_layout({.normal = true, .debugId = true}, TestBase)), 20u);
   EXPECT_EQ(layout_cost(compose_scene_layout({.gbuffer = true, .debugId = true}, TestBase)), 32u);
-
-  std::vector<wgpu::TextureFormat> pbr{wgpu::TextureFormat::RGBA8Unorm, wgpu::TextureFormat::RGB10A2Unorm,
-                                       wgpu::TextureFormat::RG16Float,  wgpu::TextureFormat::R8Unorm,
-                                       wgpu::TextureFormat::RGBA8Uint,  wgpu::TextureFormat::RGBA32Uint};
-  EXPECT_EQ(render::detail::color_bytes_per_sample(pbr), 44u);
-  pbr.push_back(wgpu::TextureFormat::R32Uint);
-  EXPECT_EQ(render::detail::color_bytes_per_sample(pbr), 48u);
+  const RenderTargetLayout pbr = compose_scene_layout({.gbuffer = true, .surface = true}, TestBase);
+  EXPECT_EQ(layout_cost(pbr), webgpu::PbrSceneColorBytes);
+  EXPECT_EQ(layout_cost(compose_scene_layout({.gbuffer = true, .surface = true, .debugId = true}, TestBase)), 48u);
+  EXPECT_EQ(compose_scene_layout({.surface = true}, TestBase).key, pbr.key);
+  EXPECT_EQ(compose_scene_layout({.normal = true, .gbuffer = true, .surface = true}, TestBase).key, pbr.key);
 }
 #endif
 
@@ -381,6 +549,28 @@ TEST(RenderTargetLayoutTest, LegacyClearShaderTextUnchanged) {
       EXPECT_EQ(clear::detail::shader_source(config, clear_layout(normal)), legacy_clear_source(config, normal))
           << normal << " " << bits;
     }
+  }
+}
+
+TEST(RenderTargetLayoutTest, ClearShaderWritesSurfaceOnEitherClear) {
+  const RenderTargetLayout layout = compose_scene_layout({.gbuffer = true, .surface = true}, TestBase);
+  for (const uint32_t bits : {4u, 1u, 3u, 5u, 7u}) {
+    const std::string source = clear::detail::shader_source(clear_config(bits), layout);
+    EXPECT_NE(source.find("@location(5) t5: vec4u,"), std::string::npos) << bits;
+    EXPECT_NE(source.find("out.t5 = vec4u(0u);"), std::string::npos) << bits;
+  }
+  for (const uint32_t bits : {0u, 2u}) {
+    EXPECT_EQ(clear::detail::shader_source(clear_config(bits), layout).find("t5"), std::string::npos) << bits;
+  }
+  const std::string depth = clear::detail::shader_source(clear_config(4), layout);
+  EXPECT_EQ(depth.find("t4"), std::string::npos);
+  const std::string color = clear::detail::shader_source(clear_config(1), layout);
+  EXPECT_NE(color.find("@location(4) t4: vec4u,"), std::string::npos);
+  EXPECT_NE(color.find("out.t4 = vec4u(0u);"), std::string::npos);
+  EXPECT_EQ(color.find("normal1"), std::string::npos);
+  const RenderTargetLayout gbuffer = compose_scene_layout({.gbuffer = true}, TestBase);
+  for (uint32_t bits = 0; bits < 8; ++bits) {
+    EXPECT_EQ(clear::detail::shader_source(clear_config(bits), gbuffer).find("t5"), std::string::npos) << bits;
   }
 }
 

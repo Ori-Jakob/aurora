@@ -465,16 +465,42 @@ ForceMode gbuffer_env() noexcept {
       Log.warn("AURORA_RENDER_GBUFFER=cycle: switching the base G-buffer tier every {} frames", GBufferCycleLatches);
       return ForceMode::Cycle;
     }
-    Log.warn("AURORA_RENDER_GBUFFER={} is not on, off or cycle; ignored", text);
+    if (text == "pbr") {
+      Log.warn("AURORA_RENDER_GBUFFER=pbr: forcing the PBR G-buffer tier regardless of settings");
+      return ForceMode::Pbr;
+    }
+    if (text == "pbr-cycle") {
+      Log.warn("AURORA_RENDER_GBUFFER=pbr-cycle: switching between the base and PBR G-buffer tiers every {} frames",
+               GBufferCycleLatches);
+      return ForceMode::PbrCycle;
+    }
+    Log.warn("AURORA_RENDER_GBUFFER={} is not on, off, cycle, pbr or pbr-cycle; ignored", text);
     return ForceMode::Unset;
   }();
   return forced;
+}
+
+bool pbr_env() noexcept {
+  static const bool enabled = [] {
+    const char* value = SDL_getenv("AURORA_RENDER_PBR");
+    if (value == nullptr) {
+      return false;
+    }
+    if (std::string_view{value} != "on") {
+      Log.warn("AURORA_RENDER_PBR={} is not on; ignored", value);
+      return false;
+    }
+    Log.warn("AURORA_RENDER_PBR=on: requesting and building PBR for development regardless of settings");
+    return true;
+  }();
+  return enabled;
 }
 
 struct SettingsEnv {
   bool taa = false;
   std::optional<float> sharpness;
   std::optional<UpscalerOverride> upscaler;
+  std::optional<float> legacyBlend;
 };
 
 const SettingsEnv& settings_env() noexcept {
@@ -510,6 +536,14 @@ const SettingsEnv& settings_env() noexcept {
             value);
       }
     }
+    if (const char* value = SDL_getenv("AURORA_RENDER_LEGACY_BLEND")) {
+      out.legacyBlend = parse_legacy_blend(value);
+      if (out.legacyBlend) {
+        Log.warn("AURORA_RENDER_LEGACY_BLEND={}: overriding the PBR blend setting", value);
+      } else {
+        Log.warn("AURORA_RENDER_LEGACY_BLEND={} is not a finite number; ignored", value);
+      }
+    }
     return out;
   }();
   return env;
@@ -527,6 +561,12 @@ Settings with_env_overrides(Settings settings) noexcept {
     settings.upscaler = env.upscaler->upscaler;
     settings.upscalerQuality = env.upscaler->quality.value_or(settings.upscalerQuality);
   }
+  if (pbr_env()) {
+    settings.pbr = true;
+  }
+  if (env.legacyBlend) {
+    settings.legacyBlend = *env.legacyBlend;
+  }
 #if AURORA_ENABLE_RENDER
   if (const std::optional<Quality> ao = ao::env_ao_request()) {
     settings.ao = *ao;
@@ -538,25 +578,40 @@ Settings with_env_overrides(Settings settings) noexcept {
 // AURORA_RENDER_AO also ORs in AO's built bits, so verification runs never depend on the defaults
 BuiltOptions support_built(const BuiltOptions& built) noexcept {
 #if AURORA_ENABLE_RENDER
-  return ao::with_dev_built(built, ao::env_ao_request());
+  return with_pbr_dev_built(ao::with_dev_built(built, ao::env_ao_request()), pbr_env());
 #else
-  return built;
+  return with_pbr_dev_built(built, pbr_env());
 #endif
 }
 
-bool latch_gbuffer_want(uint32_t msaaSamples) {
+gfx::SceneTier latch_scene_tier_want(uint32_t msaaSamples) {
+  static_assert(static_cast<uint8_t>(Tier::None) == static_cast<uint8_t>(gfx::SceneTier::Legacy));
+  static_assert(static_cast<uint8_t>(Tier::Base) == static_cast<uint8_t>(gfx::SceneTier::Base));
+  static_assert(static_cast<uint8_t>(Tier::Pbr) == static_cast<uint8_t>(gfx::SceneTier::Pbr));
+  static_assert(PbrTierColorBytes == webgpu::PbrSceneColorBytes);
+  static_assert(BaseTierColorBytes == webgpu::BaseSceneColorBytes);
   static bool warnedUnsupported = false;
+  static bool warnedNoPbr = false;
   static uint64_t latchIndex = 0;
-  const ForceMode forced = forced_gbuffer(gbuffer_env(), latchIndex++);
+  const ForceMode mode = gbuffer_env();
+  const ForceMode forced = forced_gbuffer(mode, latchIndex++);
+  const bool forcedPbr = mode == ForceMode::Pbr || mode == ForceMode::PbrCycle;
   const Caps& deviceCaps = caps();
-  if (forced == ForceMode::On && deviceCaps.valid && device_tier(deviceCaps, msaaSamples) == Tier::None &&
+  const Tier device = device_tier(deviceCaps, msaaSamples);
+  const Reason reason = !deviceCaps.core  ? Reason::NeedsCore
+                        : msaaSamples > 1 ? Reason::MsaaActive
+                                          : Reason::ColorBudget;
+  if (forced == ForceMode::On && !forcedPbr && deviceCaps.valid && device == Tier::None &&
       !std::exchange(warnedUnsupported, true)) {
-    const Reason reason = !deviceCaps.core  ? Reason::NeedsCore
-                          : msaaSamples > 1 ? Reason::MsaaActive
-                                            : Reason::ColorBudget;
     Log.warn("AURORA_RENDER_GBUFFER=on: the base G-buffer tier is unavailable ({})", reason_name(reason));
   }
-  return gbuffer_wanted(latched_settings(), deviceCaps, msaaSamples, module_enabled(), forced);
+  if (forcedPbr && deviceCaps.valid && device != Tier::Pbr && !std::exchange(warnedNoPbr, true)) {
+    Log.warn("AURORA_RENDER_GBUFFER={}: the PBR G-buffer tier is unavailable ({}); using the {} tier",
+             mode == ForceMode::Pbr ? "pbr" : "pbr-cycle", reason_name(reason),
+             device == Tier::Base ? "base" : "legacy");
+  }
+  return static_cast<gfx::SceneTier>(
+      scene_tier_wanted(latched_settings(), deviceCaps, msaaSamples, module_enabled(), forced));
 }
 
 void log_latched_settings(uint64_t generation, FeatureMask previous, const Settings& latched) {
@@ -695,6 +750,24 @@ bool sun_shadows(const Settings& settings) noexcept {
   return settings.shadows.quality != Quality::Off || settings.rt != RtMode::Off;
 }
 
+Tier feature_tier(Feature feature, uint8_t level) noexcept {
+  return feature == Feature::Rt && level == 4 ? Tier::Pbr : feature_info(feature).tier;
+}
+
+Tier requested_scene_tier(const Settings& settings) noexcept {
+  Tier tier = Tier::None;
+  for (size_t i = 0; i < FeatureCount; ++i) {
+    const auto feature = static_cast<Feature>(i);
+    if (feature == Feature::GBuffer || feature == Feature::DeferredFog || FeatureTable[i].tier == Tier::None) {
+      continue;
+    }
+    if (const uint8_t level = requested_option(settings, feature); level != 0) {
+      tier = std::max(tier, feature_tier(feature, level));
+    }
+  }
+  return tier;
+}
+
 Tier device_tier(const Caps& caps, uint32_t msaaSamples) noexcept {
   const uint32_t budget = caps.limits.maxColorAttachmentBytesPerSample;
   if (!caps.core || msaaSamples != 1 || budget < BaseTierColorBytes) {
@@ -703,18 +776,54 @@ Tier device_tier(const Caps& caps, uint32_t msaaSamples) noexcept {
   return budget >= PbrTierColorBytes ? Tier::Pbr : Tier::Base;
 }
 
+Tier scene_tier_wanted(const Settings& settings, const Caps& caps, uint32_t msaaSamples, bool moduleEnabled,
+                       ForceMode forced) noexcept {
+  const Tier device = device_tier(caps, msaaSamples);
+  if (!moduleEnabled || device == Tier::None || forced == ForceMode::Off) {
+    return Tier::None;
+  }
+  Tier want = requested_scene_tier(settings);
+  if (forced == ForceMode::On) {
+    want = std::max(want, Tier::Base);
+  } else if (forced == ForceMode::Pbr) {
+    want = Tier::Pbr;
+  }
+  return std::min(want, device);
+}
+
 bool gbuffer_wanted(const Settings& settings, const Caps& caps, uint32_t msaaSamples, bool moduleEnabled,
                     ForceMode forced) noexcept {
-  return moduleEnabled && device_tier(caps, msaaSamples) != Tier::None && forced != ForceMode::Off &&
-         (requested_option(settings, Feature::GBuffer) != 0 || forced == ForceMode::On);
+  return scene_tier_wanted(settings, caps, msaaSamples, moduleEnabled, forced) != Tier::None;
 }
 
 // Counted in latches rather than time, so a replay switches on the same frames every run
 ForceMode forced_gbuffer(ForceMode mode, uint64_t latchIndex) noexcept {
-  if (mode != ForceMode::Cycle) {
+  const bool secondHalf = (latchIndex / GBufferCycleLatches) % 2 != 0;
+  switch (mode) {
+  case ForceMode::Cycle:
+    return secondHalf ? ForceMode::On : ForceMode::Off;
+  case ForceMode::PbrCycle:
+    return secondHalf ? ForceMode::Pbr : ForceMode::On;
+  default:
     return mode;
   }
-  return (latchIndex / GBufferCycleLatches) % 2 == 0 ? ForceMode::Off : ForceMode::On;
+}
+
+// AURORA_RENDER_PBR builds PBR for development before its lighting ships, as AURORA_RENDER_AO did for AO
+BuiltOptions with_pbr_dev_built(BuiltOptions built, bool requested) noexcept {
+  if (requested) {
+    built[feature_index(Feature::Pbr)] |= 1u << 1;
+  }
+  return built;
+}
+
+std::optional<float> parse_legacy_blend(std::string_view text) noexcept {
+  float value = 0.f;
+  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+  if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value)) {
+    return std::nullopt;
+  }
+  return value;
 }
 
 FeatureSupport evaluate_support(Feature feature, uint8_t option, const Settings& context,
@@ -734,7 +843,7 @@ FeatureSupport evaluate_support(Feature feature, uint8_t option, const Settings&
 
   const Caps& deviceCaps = env.caps;
   const uint32_t colorBudget = deviceCaps.limits.maxColorAttachmentBytesPerSample;
-  const Tier tier = feature == Feature::Rt && level == 4 ? Tier::Pbr : info.tier;
+  const Tier tier = feature_tier(feature, level);
   if (tier != Tier::None) {
     if (feature != Feature::GBuffer) {
       const FeatureSupport gbuffer = evaluate_support(Feature::GBuffer, 1, context, env);
@@ -1058,7 +1167,7 @@ std::shared_ptr<const FrameState> latch_frame() {
   // Unconditional so the value latched at init also reaches the loader
   gfx::texture_replacement::set_mip_repair(latched_settings().textureMaterials);
   // Before the inspector and the graph environment read the scene layout
-  gfx::detail::latch_scene_layout(latch_gbuffer_want(msaaSamples));
+  gfx::detail::latch_scene_layout(latch_scene_tier_want(msaaSamples));
   const bool generateMips = latched_settings().generateMissingMips || generate_mips_env();
   gx::texture::set_generate_missing_mips(generateMips);
   gfx::texture_replacement::set_mip_generation(generateMips);

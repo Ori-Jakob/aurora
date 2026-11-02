@@ -1,6 +1,7 @@
 //#import aurora/frame
 //#import aurora/gbuffer
 //#import aurora/ao
+//#import aurora/surface
 
 //#if SOURCE_UINT
 @group(1) @binding(0) var view_source: texture_2d<u32>;
@@ -29,7 +30,42 @@ fn view_texel_uv(dims: vec2u, uv: vec2f) -> vec2u {
 }
 
 //#if SOURCE_UINT
+fn surface_class_color(id: u32) -> vec3f {
+  if (id == GBUF_SURFACE_CLASS_NONE) {
+    return VIEW_GREY;
+  }
+  if (id == GBUF_SURFACE_CLASS_DEFAULT) {
+    return vec3f(0.0, 0.8, 0.0);
+  }
+  let hue = f32((id * 2654435761u) >> 8u) / 16777216.0;
+  return saturate(abs(fract(hue + vec3f(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0);
+}
+
+fn surface_view_color(uv: vec2f) -> vec3f {
+  let s = gbuf_surface_decode(gbuf_surface_fetch(view_source, view_texel_uv(textureDimensions(view_source), uv)));
+  switch VIEW_MODE {
+    case 10u: {
+      return select(s.albedo, VIEW_GREY, s.class_id == GBUF_SURFACE_CLASS_NONE);
+    }
+    case 11u: {
+      return vec3f(s.roughness, s.metalness, s.ao);
+    }
+    case 12u: {
+      return surface_class_color(s.class_id);
+    }
+    case 13u: {
+      return s.ambient;
+    }
+    default: {
+      return s.emissive / (1.0 + s.emissive);
+    }
+  }
+}
+
 fn view_color(texel: vec2u, uv: vec2f) -> vec3f {
+  if (VIEW_MODE >= 10u) {
+    return surface_view_color(uv);
+  }
   let rec = textureLoad(view_source, texel, 0);
   let fog = gbuf_fog_decode(rec);
   let empty = all(rec == vec4u(0u));

@@ -66,6 +66,10 @@ GraphEnvironment gather_graph_environment() {
     env.gxFormats[gx_index(GxResource::Fog)] = webgpu::FogRecordFormat;
     env.gxUsage[gx_index(GxResource::Fog)] = SceneTargetUsage;
   }
+  if (config.surfaceBuffer) {
+    env.gxFormats[gx_index(GxResource::Surface)] = webgpu::SurfaceBufferFormat;
+    env.gxUsage[gx_index(GxResource::Surface)] = SceneTargetUsage;
+  }
   if (config.debugIdBuffer) {
     env.gxFormats[gx_index(GxResource::DebugId)] = webgpu::DebugIdBufferFormat;
     env.gxUsage[gx_index(GxResource::DebugId)] =

@@ -22,6 +22,8 @@ enum class ColorAttachmentSemantic : uint8_t {
   Motion,
   Reactive,
   Fog,
+  // PBR tier record; appended so every earlier layout key stays as it was
+  Surface,
 };
 
 struct ColorAttachmentLayout {

@@ -173,18 +173,18 @@ TEST_F(RenderViews, GbufViewTableFollowsClassRange) {
       continue;
     }
     EXPECT_TRUE(targetModes.insert(view.mode).second) << view.name;
-    EXPECT_EQ(view.uintSource, view.resource == "gbuf.fog") << view.name;
+    EXPECT_EQ(view.uintSource, view.resource == "gbuf.fog" || view.resource == "gbuf.surface") << view.name;
     const bool gx = view.resource.starts_with("gbuf.") || view.resource.starts_with("gx.");
-    EXPECT_EQ(gx, view.id <= 22) << view.name;
+    EXPECT_EQ(gx, view.id <= 22 || view.id >= 30) << view.name;
     EXPECT_EQ(gx, detail::find_gx_resource(view.resource).has_value()) << view.name;
-    if (gx) {
+    if (gx && view.id <= 22) {
       EXPECT_EQ(view.mode, static_cast<uint32_t>(view.id - FirstGbufView));
     }
   }
-  EXPECT_EQ(expected, 30u);
-  EXPECT_EQ(targetModes, (std::set<uint32_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}));
+  EXPECT_EQ(expected, 35u);
+  EXPECT_EQ(targetModes, (std::set<uint32_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}));
   EXPECT_EQ(find_gbuf_view(LastReservedClassView), nullptr);
-  EXPECT_EQ(find_gbuf_view(30), nullptr);
+  EXPECT_EQ(find_gbuf_view(35), nullptr);
   EXPECT_EQ(find_gbuf_view(16)->stage, Stage::PrePost);
   EXPECT_EQ(find_gbuf_view(18)->anchor, "phase.composite");
   EXPECT_EQ(find_gbuf_view(22)->label, "G-buffer: receiver code");
@@ -246,6 +246,35 @@ TEST_F(RenderViews, DecompositionRowsAppendFrom23) {
   for (uint16_t id = FirstGbufView; id <= 22; ++id) {
     EXPECT_EQ(find_gbuf_view(id)->kind, GbufViewKind::Target) << id;
   }
+}
+
+TEST_F(RenderViews, SurfaceRowsAppendFrom30) {
+  struct Row {
+    uint16_t id;
+    std::string_view name;
+    std::string_view label;
+  };
+  constexpr std::array<Row, 5> Rows{{
+      {30, "gbuf.surface.albedo", "Surface: base colour"},
+      {31, "gbuf.surface.material", "Surface: roughness, metalness, occlusion"},
+      {32, "gbuf.surface.class", "Surface: class"},
+      {33, "gbuf.surface.ambient", "Surface: ambient"},
+      {34, "gbuf.surface.emissive", "Surface: emissive"},
+  }};
+  for (const Row& row : Rows) {
+    const GbufView* view = find_gbuf_view(row.id);
+    ASSERT_NE(view, nullptr) << row.id;
+    EXPECT_EQ(view->name, row.name);
+    EXPECT_EQ(view->label, row.label) << row.name;
+    EXPECT_EQ(view->resource, "gbuf.surface") << row.name;
+    EXPECT_EQ(view->anchor, "phase.composite") << row.name;
+    EXPECT_EQ(view->stage, Stage::OpaqueDone) << row.name;
+    EXPECT_EQ(view->kind, GbufViewKind::Target) << row.name;
+    EXPECT_EQ(view->mode, static_cast<uint32_t>(row.id - 20)) << row.name;
+    EXPECT_TRUE(view->uintSource) << row.name;
+    EXPECT_EQ(parse_view(row.name)->id, row.id) << row.name;
+  }
+  EXPECT_EQ(parse_view("surface.class")->id, 32u);
 }
 
 TEST_F(RenderViews, ShortNamesAreUnique) {

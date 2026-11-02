@@ -21,6 +21,10 @@ inline constexpr wgpu::TextureFormat DebugIdBufferFormat = wgpu::TextureFormat::
 inline constexpr wgpu::TextureFormat MotionBufferFormat = wgpu::TextureFormat::RG16Float;
 inline constexpr wgpu::TextureFormat ReactiveBufferFormat = wgpu::TextureFormat::R8Unorm;
 inline constexpr wgpu::TextureFormat FogRecordFormat = wgpu::TextureFormat::RGBA8Uint;
+inline constexpr wgpu::TextureFormat SurfaceBufferFormat = wgpu::TextureFormat::RGBA32Uint;
+inline constexpr uint32_t BaseSceneColorBytes = 25;
+inline constexpr uint32_t PbrSceneColorBytes = 44;
+enum class SceneTier : uint8_t { Legacy, Base, Pbr };
 
 struct GraphicsConfig {
   wgpu::SurfaceConfiguration surfaceConfiguration;
@@ -31,6 +35,8 @@ struct GraphicsConfig {
   bool debugIdBuffer = false;
   // Base G-buffer tier; normalBuffer stays the mod's sticky request that traces record
   bool gbuffer = false;
+  // PBR tier record; only ever set with gbuffer, so base-tier readers keep working
+  bool surfaceBuffer = false;
 };
 struct TextureWithSampler {
   wgpu::Texture texture;
@@ -67,6 +73,7 @@ extern TextureWithSampler g_debugIdBuffer;
 extern TextureWithSampler g_motionBuffer;
 extern TextureWithSampler g_reactiveBuffer;
 extern TextureWithSampler g_fogRecordBuffer;
+extern TextureWithSampler g_surfaceBuffer;
 extern wgpu::RenderPipeline g_CopyPipeline;
 extern wgpu::RenderPipeline g_CopyPremultipliedAlphaPipeline;
 extern wgpu::BindGroup g_CopyBindGroup;
@@ -89,6 +96,13 @@ bool scene_targets_supported() noexcept;
 bool enable_normal_buffer();
 bool set_debug_id_buffer(bool enabled);
 bool set_gbuffer(bool enabled);
+bool scene_tier_supported(SceneTier tier) noexcept;
+bool set_scene_tier(SceneTier tier);
+inline SceneTier scene_tier() noexcept {
+  return g_graphicsConfig.surfaceBuffer ? SceneTier::Pbr
+         : g_graphicsConfig.gbuffer     ? SceneTier::Base
+                                        : SceneTier::Legacy;
+}
 inline bool normal_present() noexcept { return g_graphicsConfig.normalBuffer || g_graphicsConfig.gbuffer; }
 const TextureWithSampler& present_source() noexcept;
 void set_scene_render_size(uint32_t width, uint32_t height);

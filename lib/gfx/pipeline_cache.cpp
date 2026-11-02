@@ -1358,9 +1358,8 @@ uint64_t skipped_draws() noexcept { return g_skippedDraws.load(std::memory_order
 
 // Dawn's startup prune keeps the blobs of every scene layout a switch can bring back, not just the live one
 static void remember_scene_layouts(uint64_t offscreenKey) {
-  const SceneLayoutBase base = live_layout_base();
-  const std::array keys{pending_scene_layout(false, false, base).key, pending_scene_layout(true, false, base).key,
-                        pending_scene_layout(false, true, base).key, offscreenKey};
+  const std::array<uint64_t, 4> switchable = switchable_scene_layout_keys(live_layout_base());
+  const std::array keys{switchable[0], switchable[1], switchable[2], switchable[3], offscreenKey};
   std::lock_guard lock{g_pipelineMutex};
   for (const uint64_t key : keys) {
     if (std::ranges::find(g_sceneLayoutKeys, key) == g_sceneLayoutKeys.end()) {

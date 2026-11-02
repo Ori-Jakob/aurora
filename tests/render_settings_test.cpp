@@ -286,5 +286,65 @@ TEST_F(RenderLatchTest, CycleForceTogglesEvery600Latches) {
     EXPECT_EQ(forced_gbuffer(mode, Period), mode);
   }
 }
+
+TEST_F(RenderLatchTest, SceneTierWantFollowsTierFeatures) {
+  using detail::ForceMode;
+  using detail::scene_tier_wanted;
+  using detail::Tier;
+  const Caps full = full_caps();
+  Caps metal = full;
+  metal.limits.maxColorAttachmentBytesPerSample = 64;
+  const Caps metal32 = metal32_caps();
+  Settings pbr;
+  pbr.pbr = true;
+  Settings reflections;
+  reflections.reflections = Reflections::Ssr;
+  Settings rt;
+  rt.rt = RtMode::PathTraceReference;
+  Settings rtShadows;
+  rtShadows.rt = RtMode::Shadows;
+  Settings taa;
+  taa.taa = true;
+  const Settings none;
+
+  EXPECT_EQ(scene_tier_wanted(pbr, full, 1, true, ForceMode::Unset), Tier::Pbr);
+  EXPECT_EQ(scene_tier_wanted(pbr, metal, 1, true, ForceMode::Unset), Tier::Pbr);
+  EXPECT_EQ(scene_tier_wanted(pbr, metal32, 1, true, ForceMode::Unset), Tier::Base);
+  EXPECT_EQ(scene_tier_wanted(pbr, compat_caps(), 1, true, ForceMode::Unset), Tier::None);
+  EXPECT_EQ(scene_tier_wanted(pbr, full, 4, true, ForceMode::Unset), Tier::None);
+  EXPECT_EQ(scene_tier_wanted(reflections, full, 1, true, ForceMode::Unset), Tier::Pbr);
+  EXPECT_EQ(scene_tier_wanted(rt, full, 1, true, ForceMode::Unset), Tier::Pbr);
+  EXPECT_EQ(scene_tier_wanted(rtShadows, full, 1, true, ForceMode::Unset), Tier::Base);
+  EXPECT_EQ(scene_tier_wanted(taa, full, 1, true, ForceMode::Unset), Tier::Base);
+  EXPECT_EQ(scene_tier_wanted(none, full, 1, true, ForceMode::Unset), Tier::None);
+
+  EXPECT_EQ(scene_tier_wanted(none, full, 1, true, ForceMode::Pbr), Tier::Pbr);
+  EXPECT_EQ(scene_tier_wanted(none, metal32, 1, true, ForceMode::Pbr), Tier::Base);
+  EXPECT_EQ(scene_tier_wanted(none, compat_caps(), 1, true, ForceMode::Pbr), Tier::None);
+  EXPECT_EQ(scene_tier_wanted(pbr, full, 1, true, ForceMode::On), Tier::Pbr);
+  EXPECT_EQ(scene_tier_wanted(none, full, 1, true, ForceMode::On), Tier::Base);
+  EXPECT_EQ(scene_tier_wanted(pbr, full, 1, true, ForceMode::Off), Tier::None);
+  EXPECT_EQ(scene_tier_wanted(pbr, full, 1, false, ForceMode::Pbr), Tier::None);
+
+  EXPECT_EQ(detail::requested_scene_tier(none), Tier::None);
+  EXPECT_EQ(detail::requested_scene_tier(taa), Tier::Base);
+  EXPECT_EQ(detail::requested_scene_tier(pbr), Tier::Pbr);
+  EXPECT_EQ(detail::feature_tier(Feature::Rt, 3), Tier::Base);
+  EXPECT_EQ(detail::feature_tier(Feature::Rt, 4), Tier::Pbr);
+  EXPECT_EQ(detail::feature_tier(Feature::TextureMaterials, 1), Tier::None);
+}
+
+TEST_F(RenderLatchTest, PbrCycleAlternatesBaseAndPbr) {
+  using detail::forced_gbuffer;
+  using detail::ForceMode;
+  constexpr uint64_t Period = detail::GBufferCycleLatches;
+  for (const uint64_t latch : {uint64_t{0}, Period - 1, 2 * Period, 3 * Period - 1}) {
+    EXPECT_EQ(forced_gbuffer(ForceMode::PbrCycle, latch), ForceMode::On) << latch;
+  }
+  for (const uint64_t latch : {Period, 2 * Period - 1, 3 * Period, 5 * Period + 7}) {
+    EXPECT_EQ(forced_gbuffer(ForceMode::PbrCycle, latch), ForceMode::Pbr) << latch;
+  }
+  EXPECT_EQ(forced_gbuffer(ForceMode::Pbr, Period), ForceMode::Pbr);
+}
 } // namespace
 } // namespace aurora::render::test

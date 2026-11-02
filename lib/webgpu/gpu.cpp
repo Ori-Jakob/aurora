@@ -53,6 +53,7 @@ TextureWithSampler g_debugIdBuffer;
 TextureWithSampler g_motionBuffer;
 TextureWithSampler g_reactiveBuffer;
 TextureWithSampler g_fogRecordBuffer;
+TextureWithSampler g_surfaceBuffer;
 static TextureWithSampler g_sceneColor;
 static TextureWithSampler g_sceneDepth;
 static wgpu::Extent3D g_sceneRequest{0, 0, 1};
@@ -633,9 +634,22 @@ static void create_gbuffer_targets(uint32_t width, uint32_t height) {
   g_fogRecordBuffer = create_scene_target("Scene fog records", FogRecordFormat, width, height);
 }
 
+static TextureWithSampler create_surface_texture(uint32_t width, uint32_t height) {
+  return create_scene_target("Scene surfaces", SurfaceBufferFormat, width, height);
+}
+
 bool scene_targets_supported() noexcept {
   const wgpu::Extent3D scene = scene_extent();
   return g_hasCoreFeatures && g_graphicsConfig.msaaSamples == 1 && g_device && scene.width != 0 && scene.height != 0;
+}
+
+bool scene_tier_supported(SceneTier tier) noexcept {
+  if (tier == SceneTier::Legacy) {
+    return true;
+  }
+  // Nothing checks the GX scene layout's colour budget, so a tier the device cannot hold is refused here
+  return scene_targets_supported() && render::caps().limits.maxColorAttachmentBytesPerSample >=
+                                          (tier == SceneTier::Pbr ? PbrSceneColorBytes : BaseSceneColorBytes);
 }
 
 static void create_scene_size_targets() {
@@ -645,6 +659,9 @@ static void create_scene_size_targets() {
   }
   if (g_graphicsConfig.gbuffer) {
     create_gbuffer_targets(scene.width, scene.height);
+  }
+  if (g_graphicsConfig.surfaceBuffer) {
+    g_surfaceBuffer = create_surface_texture(scene.width, scene.height);
   }
   if (g_graphicsConfig.debugIdBuffer) {
     g_debugIdBuffer = create_debug_id_texture(scene.width, scene.height);
@@ -714,22 +731,23 @@ bool set_debug_id_buffer(bool enabled) {
   return true;
 }
 
-bool set_gbuffer(bool enabled) {
-  if (g_graphicsConfig.gbuffer == enabled) {
+bool set_scene_tier(SceneTier tier) {
+  if (scene_tier() == tier) {
     return true;
   }
-  if (enabled && !scene_targets_supported()) {
+  if (tier != SceneTier::Legacy && !scene_tier_supported(tier)) {
     return false;
   }
   // The render worker resolves these globals, so it must be idle before the swap
   gfx::gpu_synchronize();
-  if (enabled) {
-    const wgpu::Extent3D scene = scene_extent();
+  const wgpu::Extent3D scene = scene_extent();
+  // Base and PBR share the M7 targets, so a step between them only creates or frees Surface
+  if (tier != SceneTier::Legacy && !g_graphicsConfig.gbuffer) {
     create_gbuffer_targets(scene.width, scene.height);
     if (!g_normalBuffer.texture) {
       g_normalBuffer = create_normal_texture(scene.width, scene.height);
     }
-  } else {
+  } else if (tier == SceneTier::Legacy) {
     g_motionBuffer = {};
     g_reactiveBuffer = {};
     g_fogRecordBuffer = {};
@@ -737,9 +755,13 @@ bool set_gbuffer(bool enabled) {
       g_normalBuffer = {};
     }
   }
-  g_graphicsConfig.gbuffer = enabled;
+  g_surfaceBuffer = tier == SceneTier::Pbr ? create_surface_texture(scene.width, scene.height) : TextureWithSampler{};
+  g_graphicsConfig.gbuffer = tier != SceneTier::Legacy;
+  g_graphicsConfig.surfaceBuffer = tier == SceneTier::Pbr;
   return true;
 }
+
+bool set_gbuffer(bool enabled) { return set_scene_tier(enabled ? SceneTier::Base : SceneTier::Legacy); }
 
 void create_copy_pipeline() {
   wgpu::ShaderSourceWGSL sourceDescriptor{};
@@ -1403,6 +1425,8 @@ void shutdown() {
   g_reactiveBuffer = {};
   g_fogRecordBuffer = {};
   g_graphicsConfig.gbuffer = false;
+  g_surfaceBuffer = {};
+  g_graphicsConfig.surfaceBuffer = false;
   g_queue = {};
   g_surface = {};
   g_device = {};

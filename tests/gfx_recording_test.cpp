@@ -324,6 +324,58 @@ TEST_F(GfxRecordingTest, EfbPassCarriesGBufferTargets) {
   next_frame();
 }
 
+TEST_F(GfxRecordingTest, EfbPassCarriesSurfaceTarget) {
+  struct TierReset {
+    ~TierReset() {
+      webgpu::g_graphicsConfig.gbuffer = false;
+      webgpu::g_graphicsConfig.surfaceBuffer = false;
+    }
+  } tierReset;
+  webgpu::g_graphicsConfig.gbuffer = true;
+  webgpu::g_graphicsConfig.surfaceBuffer = true;
+  constexpr std::array Semantics{ColorAttachmentSemantic::SceneColor, ColorAttachmentSemantic::Normal,
+                                 ColorAttachmentSemantic::Motion,     ColorAttachmentSemantic::Reactive,
+                                 ColorAttachmentSemantic::Fog,        ColorAttachmentSemantic::Surface};
+  const auto clears = [&] {
+    std::vector<bool> out;
+    const auto& pass = frame.renderPasses.back();
+    for (uint32_t i = 0; i < pass.colorAttachmentCount; ++i) {
+      out.push_back(pass.colorAttachments[i].clear);
+    }
+    return out;
+  };
+  const auto resolve = [](bool clearColor, bool clearAlpha, bool clearDepth) {
+    auto target = std::make_shared<TextureRef>(wgpu::Texture{}, wgpu::TextureView{}, wgpu::TextureView{},
+                                               wgpu::Extent3D{640, 480, 1}, ColorFormat, 1, GX_TF_RGBA8);
+    resolve_pass_into(std::move(target), {0, 0, 0, 0}, clearColor, clearAlpha, clearDepth, {}, 1.f, GX_TF_RGBA8,
+                      GX_PF_RGBA6_Z24);
+  };
+
+  webgpu::g_frameBuffer.size = {0, 0, 1};
+  next_frame();
+  const auto& first = frame.renderPasses.front();
+  ASSERT_EQ(first.colorAttachmentCount, Semantics.size());
+  for (uint32_t i = 0; i < Semantics.size(); ++i) {
+    EXPECT_EQ(first.colorAttachments[i].semantic, Semantics[i]) << i;
+  }
+  EXPECT_EQ(first.colorAttachments[5].format, wgpu::TextureFormat::RGBA32Uint);
+  EXPECT_EQ(clears(), (std::vector<bool>(6, true)));
+
+  resolve(false, false, true);
+  EXPECT_EQ(clears(), (std::vector<bool>{false, true, true, false, false, true}));
+  resolve(true, false, false);
+  EXPECT_EQ(clears(), (std::vector<bool>{false, false, false, true, true, true}));
+  resolve(true, true, false);
+  EXPECT_EQ(clears(), (std::vector<bool>{true, false, false, true, true, true}));
+  resolve(false, true, false);
+  EXPECT_EQ(clears(), (std::vector<bool>(6, false)));
+  resolve(false, false, false);
+  EXPECT_EQ(clears(), (std::vector<bool>(6, false)));
+
+  webgpu::g_frameBuffer.size = {640, 480, 1};
+  next_frame();
+}
+
 TEST_F(GfxRecordingTest, ResolveFogNullWithoutFogTarget) {
   const auto noFogSnapshot = [this] {
     return std::ranges::none_of(frame.renderPasses, [](const detail::RenderPass& pass) {
@@ -378,30 +430,81 @@ TEST_F(GfxRecordingTest, LegacyWarmCarriesModNormalRequest) {
   webgpu::g_graphicsConfig.gbuffer = true;
   next_frame();
   const SceneLayoutBase base = live_layout_base();
-  const uint64_t legacy = pending_scene_layout(false, false, base).key;
-  const uint64_t legacyNormal = pending_scene_layout(true, false, base).key;
+  const uint64_t legacy = pending_scene_layout(false, SceneTier::Legacy, base).key;
+  const uint64_t legacyNormal = pending_scene_layout(true, SceneTier::Legacy, base).key;
   ASSERT_NE(legacy, legacyNormal);
   // The first latch switches at once, so it is spent while the tier already matches
-  detail::latch_scene_layout(true);
+  detail::latch_scene_layout(SceneTier::Base);
   ResolvedTargets out;
   ASSERT_TRUE(resolve_pass({.color = false, .normal = true}, out));
   next_frame();
 
   // The mod arms its normal only after the switch, so the warm must already target that layout
-  detail::latch_scene_layout(false);
+  detail::latch_scene_layout(SceneTier::Legacy);
   ASSERT_NE(layout_warm(), nullptr);
   EXPECT_EQ(layout_warm()->pending.key, legacyNormal);
-  detail::latch_scene_layout(false);
+  detail::latch_scene_layout(SceneTier::Legacy);
   ASSERT_NE(layout_warm(), nullptr);
   EXPECT_EQ(layout_warm()->pending.key, legacyNormal);
 
   // Without a request since the last latch, the way out stays plain legacy
-  detail::latch_scene_layout(true);
+  detail::latch_scene_layout(SceneTier::Base);
   EXPECT_EQ(layout_warm(), nullptr);
-  detail::latch_scene_layout(false);
+  detail::latch_scene_layout(SceneTier::Legacy);
   ASSERT_NE(layout_warm(), nullptr);
   EXPECT_EQ(layout_warm()->pending.key, legacy);
   EXPECT_FALSE(webgpu::g_graphicsConfig.normalBuffer);
+}
+
+TEST_F(GfxRecordingTest, WantChangeMidWarmRestarts) {
+  struct TierReset {
+    bool core = std::exchange(webgpu::g_hasCoreFeatures, true);
+    ~TierReset() {
+      detail::reset_scene_layout();
+      // Warm requests only queue here, so shutting the cache down drops them unbuilt
+      shutdown_pipeline_cache();
+      webgpu::g_graphicsConfig.gbuffer = false;
+      webgpu::g_hasCoreFeatures = core;
+    }
+  } tierReset;
+  const auto pending = [] { return layout_warm() != nullptr ? layout_warm()->pending.key : uint64_t{0}; };
+  const auto start_arm = [this](bool liveBase, bool supported) {
+    detail::reset_scene_layout();
+    testing::set_scene_tier_supported(supported);
+    webgpu::g_graphicsConfig.gbuffer = liveBase;
+    next_frame();
+    detail::latch_scene_layout(liveBase ? SceneTier::Base : SceneTier::Legacy);
+  };
+  const SceneLayoutBase base = live_layout_base();
+  const uint64_t legacy = pending_scene_layout(false, SceneTier::Legacy, base).key;
+  const uint64_t gbuffer = pending_scene_layout(false, SceneTier::Base, base).key;
+  const uint64_t pbr = pending_scene_layout(false, SceneTier::Pbr, base).key;
+
+  start_arm(true, true);
+  EXPECT_EQ(layout_warm(), nullptr);
+  detail::latch_scene_layout(SceneTier::Pbr);
+  EXPECT_EQ(pending(), pbr);
+  detail::latch_scene_layout(SceneTier::Legacy);
+  EXPECT_EQ(pending(), legacy);
+  detail::latch_scene_layout(SceneTier::Pbr);
+  EXPECT_EQ(pending(), pbr);
+  detail::latch_scene_layout(SceneTier::Base);
+  EXPECT_EQ(layout_warm(), nullptr);
+  EXPECT_FALSE(scene_layout_transitioning());
+
+  start_arm(false, true);
+  detail::latch_scene_layout(SceneTier::Pbr);
+  EXPECT_EQ(pending(), pbr);
+  detail::latch_scene_layout(SceneTier::Base);
+  EXPECT_EQ(pending(), gbuffer);
+  detail::latch_scene_layout(SceneTier::Legacy);
+  EXPECT_EQ(layout_warm(), nullptr);
+
+  start_arm(false, false);
+  detail::latch_scene_layout(SceneTier::Pbr);
+  EXPECT_EQ(layout_warm(), nullptr);
+  EXPECT_FALSE(scene_layout_transitioning());
+  EXPECT_EQ(webgpu::scene_tier(), SceneTier::Legacy);
 }
 
 TEST_F(GfxRecordingTest, CopiedOffscreenPassIsRetainedOnRestore) {

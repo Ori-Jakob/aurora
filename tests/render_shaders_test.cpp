@@ -423,6 +423,16 @@ TEST_F(RenderShaders, GbufViewUintVariantCompiles) {
   EXPECT_TRUE(validate_module("debug/gbuf_view", defines, error)) << error;
   EXPECT_TRUE(validate_module("debug/gbuf_view", {}, error)) << error;
   EXPECT_TRUE(validate_module("aurora/gbuffer", {}, error)) << error;
+  EXPECT_TRUE(validate_module("aurora/surface", {}, error)) << error;
+  for (uint16_t row = 30; row <= 34; ++row) {
+    SCOPED_TRACE(row);
+    const debug::GbufView* view = debug::find_gbuf_view(row);
+    ASSERT_NE(view, nullptr);
+    ASSERT_TRUE(view->uintSource);
+    const PipelineId id = request_render(debug::gbuf_view::snapshot_pipeline_desc(*view));
+    ASSERT_TRUE(id);
+    EXPECT_EQ(wait(id, WaitNs), PipelineStatus::Ready);
+  }
 }
 
 TEST_F(RenderShaders, DecompViewPipelinesBuild) {
