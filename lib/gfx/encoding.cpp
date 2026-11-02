@@ -264,7 +264,9 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
   };
 
   auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
-  render_pass(pass, frame, passInfo);
+  if (!passInfo.dropDraws) {
+    render_pass(pass, frame, passInfo);
+  }
   pass.End();
 
   if (passInfo.captureDepthSnapshot) {
@@ -370,16 +372,35 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
 
 constexpr uint32_t align_down_copy_offset(uint32_t value) noexcept { return value & ~3u; }
 
-void copy_staging_buffer_range(wgpu::CommandEncoder& cmd, const FramePacket& frame, uint32_t& copied,
-                               uint32_t highWater, uint64_t stagingOffset, const wgpu::Buffer& dst) {
+void copy_buffer_range(wgpu::CommandEncoder& cmd, const wgpu::Buffer& src, uint64_t srcOffset, uint32_t& copied,
+                       uint32_t highWater, const wgpu::Buffer& dst) {
   if (highWater <= copied) {
     return;
   }
   const uint32_t copyStart = align_down_copy_offset(copied);
   const uint32_t copyEnd = AURORA_ALIGN(highWater, 4);
-  cmd.CopyBufferToBuffer(staging_buffer(frame.stagingBuffer), stagingOffset + copyStart, dst, copyStart,
-                         copyEnd - copyStart);
+  cmd.CopyBufferToBuffer(src, srcOffset + copyStart, dst, copyStart, copyEnd - copyStart);
   copied = highWater;
+}
+
+void copy_staging_buffer_range(wgpu::CommandEncoder& cmd, const FramePacket& frame, uint32_t& copied,
+                               uint32_t highWater, uint64_t stagingOffset, const wgpu::Buffer& dst) {
+  copy_buffer_range(cmd, staging_buffer(frame.stagingBuffer), stagingOffset, copied, highWater, dst);
+}
+
+void copy_stream_range(wgpu::CommandEncoder& cmd, const FramePacket& frame, FrameStream stream,
+                       const StagingSpill* spill, uint32_t& copied, uint32_t highWater, uint64_t stagingOffset) {
+  if (spill != nullptr && grow_device_stream(stream, spill->size)) {
+    // The spill holds the whole stream, so the empty new buffer is filled from the start
+    copied = 0;
+  }
+  const auto& res = resources();
+  const wgpu::Buffer& dst = stream == FrameStream::Vertex ? res.vertexBuffer : res.indexBuffer;
+  if (spill != nullptr) {
+    copy_buffer_range(cmd, spill->buffer, 0, copied, highWater, dst);
+  } else {
+    copy_staging_buffer_range(cmd, frame, copied, highWater, stagingOffset, dst);
+  }
 }
 
 bool needs_staging_copy(const FramePacket& frame, const FrameOp& op) {
@@ -402,9 +423,11 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
   const auto& highWater = op.highWater;
   auto& res = resources();
   const auto layout = staging_layout(frame.sizes);
-  copy_staging_buffer_range(cmd, frame, frame.copied.verts, highWater.verts, layout.vertex, res.vertexBuffer);
+  copy_stream_range(cmd, frame, FrameStream::Vertex, op.vertexSpill, frame.copied.verts, highWater.verts,
+                    layout.vertex);
   copy_staging_buffer_range(cmd, frame, frame.copied.uniforms, highWater.uniforms, layout.uniform, res.uniformBuffer);
-  copy_staging_buffer_range(cmd, frame, frame.copied.indices, highWater.indices, layout.index, res.indexBuffer);
+  copy_stream_range(cmd, frame, FrameStream::Index, op.indexSpill, frame.copied.indices, highWater.indices,
+                    layout.index);
   copy_staging_buffer_range(cmd, frame, frame.copied.storage, highWater.storage, layout.storage, res.storageBuffer);
 
   if constexpr (UseTextureBuffer) {

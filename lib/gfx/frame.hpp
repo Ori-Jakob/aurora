@@ -11,6 +11,8 @@ inline constexpr size_t FrameSlotCount = 2;
 inline constexpr size_t StagingBufferCount = FrameSlotCount + 3;
 
 const wgpu::Buffer& staging_buffer(size_t slot);
+bool spill_frame_stream(FramePacket& frame, FrameStream stream, uint64_t needed) noexcept;
+bool grow_device_stream(FrameStream stream, uint64_t size) noexcept;
 
 void request_streaming_sizes(const StreamingSizes& minimum) noexcept;
 StreamingSizes streaming_sizes() noexcept;
@@ -37,6 +39,7 @@ void reset_streaming_request() noexcept;
 void create_compute_layouts() noexcept;
 void release_compute_layouts() noexcept;
 void set_staging_buffer(size_t slot, wgpu::Buffer buffer) noexcept;
+void reset_stream_warnings() noexcept;
 } // namespace testing
 
 struct RegisteredDrawType {

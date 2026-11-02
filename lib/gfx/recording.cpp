@@ -357,7 +357,13 @@ FrameOp capture_frame_op(FramePacket& frame, FrameOpType type, uint32_t index) {
                           ? &frame.sceneComposes[index]
                           : nullptr,
       .highWater = current_high_water(frame),
+      .vertexSpill = frame.vertexSpill,
+      .indexSpill = frame.indexSpill,
   };
+  // Ranges pushed past the streaming limits were never filled, so no pass sealed after one may draw
+  if (op.renderPass != nullptr && (frame.vertexOverrun != 0 || frame.indexOverrun != 0)) {
+    op.renderPass->dropDraws = true;
+  }
   op.textureUploads.reserve(op.highWater.textureUploadCount);
   for (size_t i = 0; i < op.highWater.textureUploadCount; ++i) {
     op.textureUploads.push_back(&frame.textureUploads[i]);
@@ -388,6 +394,22 @@ Range push(ByteBuffer& target, const uint8_t* data, size_t length, size_t alignm
   if (length > 0) {
     target.append(data, length);
   }
+  return {static_cast<uint32_t>(begin), static_cast<uint32_t>(length)};
+}
+
+Range push_stream(FramePacket& frame, FrameStream stream, const uint8_t* data, size_t length, size_t alignment) {
+  const bool vertex = stream == FrameStream::Vertex;
+  ByteBuffer& target = vertex ? frame.verts : frame.indices;
+  uint64_t& overrun = vertex ? frame.vertexOverrun : frame.indexOverrun;
+  const uint64_t used = target.size() + overrun;
+  const uint64_t begin = alignment != 0 ? AURORA_ALIGN(used, uint64_t{alignment}) : used;
+  // Mapped staging cannot grow in place, so a push past its end moves the stream into a larger spill first
+  if (overrun == 0 &&
+      (target.owned() || begin + length <= target.capacity() || spill_frame_stream(frame, stream, begin + length))) {
+    return push(target, data, length, alignment);
+  }
+  // Offsets keep advancing without data, so merged draws stay contiguous until their pass drops them
+  overrun = begin + length - target.size();
   return {static_cast<uint32_t>(begin), static_cast<uint32_t>(length)};
 }
 
@@ -1688,7 +1710,7 @@ Range push_verts(const uint8_t* data, size_t length, size_t alignment) {
   if (!check_recording("push_verts")) {
     return {};
   }
-  return push(current_frame_packet().verts, data, length, alignment);
+  return push_stream(current_frame_packet(), FrameStream::Vertex, data, length, alignment);
 }
 
 Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
@@ -1696,7 +1718,7 @@ Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
   if (!check_recording("push_indices")) {
     return {};
   }
-  return push(current_frame_packet().indices, data, length, alignment);
+  return push_stream(current_frame_packet(), FrameStream::Index, data, length, alignment);
 }
 
 Range push_uniform(const uint8_t* data, size_t length) {

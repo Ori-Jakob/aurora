@@ -74,6 +74,8 @@ uint32_t g_residentCapacity = 0;
 ResidentLayout g_residentLayout{};
 uint32_t g_testGrowthFrame = 0;
 bool g_loggedStagingCap = false;
+bool g_loggedStreamSpill = false;
+bool g_warnedStreamOverrun = false;
 uint32_t g_frameIndex = UINT32_MAX;
 ChannelBudget g_channelBudget;
 uint64_t g_channelDemand = 0;
@@ -449,6 +451,69 @@ Resources& resources() noexcept { return g_resources; }
 
 const wgpu::Buffer& staging_buffer(size_t slot) { return g_stagingBuffers[slot]; }
 
+bool spill_frame_stream(FramePacket& frame, FrameStream stream, uint64_t needed) noexcept {
+  const bool vertex = stream == FrameStream::Vertex;
+  ByteBuffer& target = vertex ? frame.verts : frame.indices;
+  const char* name = vertex ? "vertex" : "index";
+  request_streaming_sizes({.vertex = vertex ? needed : 0, .index = vertex ? 0 : needed, .storage = 0});
+  const StreamingLimits limits = streaming_limits();
+  const uint64_t limit = vertex ? limits.vertex : limits.index;
+  const uint64_t size = std::min(std::max(round_streaming_request(needed), 2 * uint64_t{target.capacity()}), limit);
+  wgpu::Buffer buffer;
+  u8* mapped = nullptr;
+  if (size >= needed) {
+    const wgpu::BufferDescriptor descriptor{
+        .label = vertex ? "Vertex Staging Spill" : "Index Staging Spill",
+        .usage = StagingBufferUsage,
+        .size = size,
+        .mappedAtCreation = true,
+    };
+    buffer = g_device.CreateBuffer(&descriptor);
+    mapped = static_cast<u8*>(buffer.GetMappedRange(0, size));
+  }
+  if (mapped == nullptr) {
+    if (!std::exchange(g_warnedStreamOverrun, true)) {
+      Log.warn(
+          "Frame {} data needs {} MiB, more than a staging spill can hold ({} MiB); the rest of that frame's "
+          "draws are dropped",
+          name, (needed + MiB - 1) / MiB, limit / MiB);
+    }
+    return false;
+  }
+  // The whole stream moves, so every range handed out so far keeps its offset
+  ByteBuffer moved{mapped, static_cast<size_t>(size)};
+  moved.append(target.data(), target.size());
+  target = std::move(moved);
+  const StagingSpill& spill = frame.spills.emplace_back(StagingSpill{.buffer = std::move(buffer), .size = size});
+  (vertex ? frame.vertexSpill : frame.indexSpill) = &spill;
+  if (!std::exchange(g_loggedStreamSpill, true)) {
+    Log.info("Frame {} data outgrew its staging; spilled to {} MiB for that frame", name, size / MiB);
+  }
+  return true;
+}
+
+// Worker only, between ops; earlier ops keep the old buffer, so the caller refills the new one from offset 0
+bool grow_device_stream(FrameStream stream, uint64_t size) noexcept {
+  auto& current = g_resources.deviceSizes;
+  if (stream == FrameStream::Vertex) {
+    if (current.vertex >= size) {
+      return false;
+    }
+    create_buffer(g_resources.vertexBuffer, VertexBufferUsage, size, "Shared Vertex Buffer");
+    current.vertex = size;
+    create_static_bind_group();
+  } else {
+    if (current.index >= size) {
+      return false;
+    }
+    create_buffer(g_resources.indexBuffer, IndexBufferUsage, size, "Shared Index Buffer");
+    current.index = size;
+  }
+  Log.info("Streaming buffers resized mid-frame: vertex {} MiB, index {} MiB", current.vertex / MiB,
+           current.index / MiB);
+  return true;
+}
+
 void request_streaming_sizes(const StreamingSizes& minimum) noexcept {
   // Sizes stay 1 MiB multiples so every staging segment keeps the map and copy alignment
   const auto merge = [](uint64_t& requested, uint64_t wanted) {
@@ -497,6 +562,11 @@ void create_compute_layouts() noexcept { gfx::create_compute_layouts(); }
 void release_compute_layouts() noexcept { gfx::release_compute_layouts(); }
 
 void set_staging_buffer(size_t slot, wgpu::Buffer buffer) noexcept { g_stagingBuffers[slot] = std::move(buffer); }
+
+void reset_stream_warnings() noexcept {
+  g_loggedStreamSpill = false;
+  g_warnedStreamOverrun = false;
+}
 } // namespace testing
 
 StreamingGrowth next_streaming_sizes(const StreamingSizes& current, const AuroraStats& lastFrame,
@@ -810,6 +880,8 @@ void shutdown() {
   g_residentCapacity = 0;
   take_resident_request();
   g_loggedStagingCap = false;
+  g_loggedStreamSpill = false;
+  g_warnedStreamOverrun = false;
   for (auto& packet : g_framePackets) {
     packet = {};
   }
@@ -981,6 +1053,9 @@ void end_frame(EndFrameCallback callback) {
     auto& packet = g_framePackets[frameSlot];
     g_stagingBuffers[stagingSlot].Unmap();
     g_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
+    for (const StagingSpill& spill : packet.spills) {
+      spill.buffer.Unmap();
+    }
     const uint64_t stagedStorage = staging_layout(packet.sizes).storage;
     for (const auto& copy : packet.residentCopies) {
       const uint64_t dst = packet.sizes.storage + copy.dst;
@@ -995,6 +1070,8 @@ void end_frame(EndFrameCallback callback) {
     const auto stats = packet.stats;
     auto afterSubmitCallbacks = std::move(packet.afterSubmitCallbacks);
     g_submitState = std::move(packet.renderState);
+    // The submit below still copies from the spills
+    const std::deque<StagingSpill> spills = std::move(packet.spills);
     packet = {};
     g_resources.stats.drawCallCount = stats.drawCallCount;
     g_resources.stats.mergedDrawCallCount = stats.mergedDrawCallCount;

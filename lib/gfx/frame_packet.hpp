@@ -114,6 +114,7 @@ struct RenderPass {
   bool discardable = false;
   bool captureDepthSnapshot = false;
   bool sealed = false;
+  bool dropDraws = false;
   std::vector<tex_palette_conv::ConvRequest> paletteConvs;
 
   RenderTargetLayout target_layout() const noexcept;
@@ -224,6 +225,16 @@ struct ComputeBatch {
   std::vector<ComputeEntry> entries;
 };
 
+enum class FrameStream : uint8_t {
+  Vertex,
+  Index,
+};
+
+struct StagingSpill {
+  wgpu::Buffer buffer;
+  uint64_t size = 0;
+};
+
 enum class FrameOpType : uint8_t {
   RenderPass,
   TextureCopy,
@@ -243,6 +254,8 @@ struct FrameOp {
   const ComputeBatch* computeBatch = nullptr;
   const render::detail::SceneComposeData* sceneCompose = nullptr;
   StagingHighWater highWater;
+  const StagingSpill* vertexSpill = nullptr;
+  const StagingSpill* indexSpill = nullptr;
   std::vector<const TextureUpload*> textureUploads;
 };
 
@@ -305,6 +318,12 @@ struct FramePacket {
   ByteBuffer indices;
   ByteBuffer storage;
   ByteBuffer textureUpload;
+  // Each spill holds its whole stream from offset 0 and stays mapped until the end-frame item, like the slot
+  std::deque<StagingSpill> spills;
+  const StagingSpill* vertexSpill = nullptr;
+  const StagingSpill* indexSpill = nullptr;
+  uint64_t vertexOverrun = 0;
+  uint64_t indexOverrun = 0;
   wgpu::CommandEncoder encoder;
   std::vector<FrameSegment> segments;
   std::vector<AfterSubmitCallback> afterSubmitCallbacks;
