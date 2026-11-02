@@ -30,7 +30,7 @@ constexpr std::array<std::pair<std::string_view, AuroraFeatureProfile>, 4> Profi
 constexpr uint32_t DepthCheckMinFrames = 40;
 constexpr uint32_t MotionCheckMinFrames = 40;
 constexpr uint32_t FogCheckMinFrames = 40;
-constexpr uint32_t AoCheckMinFrames = 40;
+constexpr uint32_t AoCheckMinFrames = 240;
 constexpr uint32_t MaxGpuPadMiB = 1024;
 
 std::optional<uint32_t> parse_u32(std::string_view text) noexcept {
@@ -433,7 +433,7 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
     return std::nullopt;
   }
   if (options.aoCheck && options.frames != 0 && options.frames < AoCheckMinFrames) {
-    error = "--ao-check needs at least 40 frames";
+    error = "--ao-check needs at least 240 frames";
     return std::nullopt;
   }
   if ((options.cullCheck || options.cullTimings) && options.gpuCull == 0) {
@@ -479,8 +479,9 @@ std::string_view usage() noexcept {
          "                      gbuf.fog holds their exact records at OPAQUE_DONE and ResolveDesc.fog snapshots\n"
          "                      them while the fog target is live (needs at least 40 frames)\n"
          "  --ao-check          build AO at High, register demo.ao_check and exit with code 13 unless ao.final\n"
-         "                      darkens a box crease and keeps open ground and a wall beside a thin pole open\n"
-         "                      (needs at least 40 frames)\n"
+         "                      darkens a box crease, keeps open ground and a wall beside a thin pole open, and\n"
+         "                      leaves no trail behind a sliding cube or after its removal (needs at least 240\n"
+         "                      frames)\n"
          "  --no-hints          emit no render hints and no capture-only draw\n"
          "  --check-hints       exit with code 8 unless aurora decoded or skipped every emitted hint as expected\n"
          "  --custom-draw-probe record a custom draw that leaves foreign bindings behind between GX draws\n"

@@ -1,6 +1,6 @@
 #include "upsample.hpp"
 
-#include "gtao.hpp"
+#include "denoise.hpp"
 #include "hiz.hpp"
 
 #include "../pass_context.hpp"
@@ -21,7 +21,7 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
   builder.after(phase::Ao);
   constexpr UseOptions Unfilterable{.missing = Missing::DisablePass,
                                     .sampleType = wgpu::TextureSampleType::UnfilterableFloat};
-  builder.use(gtao::Resource, Access::Sampled, Missing::DisablePass);
+  builder.use(denoise::History, Access::Sampled, Missing::DisablePass);
   builder.use(hiz::Resource, Access::Sampled, Unfilterable);
   builder.use(resource::GxDepth, Access::Sampled, Unfilterable);
   builder.use(resource::GxNormal, Access::Sampled, Missing::DisablePass);

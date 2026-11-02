@@ -196,6 +196,8 @@ struct EnvOverrides {
 void fill_camera(const StageData& stage, const void* state, std::span<std::byte> params);
 void on_latch(const Settings& settings, const CompiledGraph* graph);
 [[nodiscard]] bool pipelines_live() noexcept;
+[[nodiscard]] bool ready(const Settings& settings) noexcept;
+[[nodiscard]] bool motion_valid(const StageData& stage) noexcept;
 [[nodiscard]] float effective_strength() noexcept;
 
 void initialize();

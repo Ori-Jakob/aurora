@@ -25,7 +25,7 @@
 //#import aurora/ao
 //#import aurora/gbuffer
 
-@group(1) @binding(0) var ao_raw: texture_2d<f32>;
+@group(1) @binding(0) var ao_history: texture_2d<f32>;
 @group(1) @binding(1) var ao_hiz: texture_2d<f32>;
 @group(1) @binding(2) var scene_depth: texture_2d<f32>;
 @group(1) @binding(3) var scene_normal: texture_2d<f32>;
@@ -43,14 +43,9 @@ fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
   return vec4f(uv * 2.0 - 1.0, 0.0, 1.0);
 }
 
-fn upsample_unpack_edges(packed_edges: f32) -> vec4f {
-  let bits = u32(packed_edges * 255.5);
-  return saturate(vec4f(f32((bits >> 6u) & 3u), f32((bits >> 4u) & 3u), f32((bits >> 2u) & 3u), f32(bits & 3u)) / 3.0);
-}
-
 fn upsample_tap(p: vec2i) -> UpsampleTap {
-  let t = textureLoad(ao_raw, p, 0);
-  return UpsampleTap(ao_raw_visibility(t), t.b > 0.5, textureLoad(ao_hiz, p, 0).r, upsample_unpack_edges(t.g));
+  let t = textureLoad(ao_history, p, 0);
+  return UpsampleTap(t.r, t.g > 0.0, textureLoad(ao_hiz, p, 0).r, ao_unpack_edges(t.a));
 }
 
 fn upsample_edge(e: vec4f, across: vec4f, down: vec4f, home: u32, i: u32) -> f32 {
@@ -77,7 +72,7 @@ fn upsample_visibility(f: vec2u, dz: f32) -> f32 {
     return 1.0;
   }
   let full = textureDimensions(scene_depth);
-  let grid = textureDimensions(ao_raw);
+  let grid = textureDimensions(ao_history);
   let d = ao_divisor(full, grid);
   let z = camera_view_depth(ao_params.camera, dz);
   let g = (vec2f(f) - f32(d / 2u)) / f32(d);

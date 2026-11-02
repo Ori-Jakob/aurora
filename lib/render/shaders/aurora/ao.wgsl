@@ -120,6 +120,22 @@ fn ao_raw_visibility(t: vec4f) -> f32 {
   return saturate(t.r * AO_RAW_SCALE);
 }
 
+fn ao_unpack_edges(packed_edges: f32) -> vec4f {
+  let bits = u32(packed_edges * 255.5);
+  return saturate(vec4f(f32((bits >> 6u) & 3u), f32((bits >> 4u) & 3u), f32((bits >> 2u) & 3u), f32(bits & 3u)) / 3.0);
+}
+
+fn ao_history_tap_weights(f: vec2f, counts: vec4f, log_depths: vec4f, z: f32, reject: f32) -> vec4f {
+  let bilinear = vec4f((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y);
+  let keep = (counts > vec4f(0.0)) & (abs(exp2(log_depths) - vec4f(z)) <= vec4f(reject * z));
+  return select(vec4f(0.0), bilinear, keep);
+}
+
+fn ao_temporal_cap(lag: f32, contrast_px: f32) -> f32 {
+  let cap = mix(AO_MAX_SAMPLES, AO_LAG_SAMPLES, saturate(lag));
+  return select(cap, min(cap, AO_MOVING_SAMPLES), contrast_px > AO_MOTION_CONTRAST_PX);
+}
+
 // Strength scales the darkening; above 1 it deepens mid-tones but stops at the floor
 fn ao_apply_strength(v: f32, k: f32, floor_value: f32) -> f32 {
   return max(1.0 - k * (1.0 - v), 1.0 - min(k, 1.0) * (1.0 - floor_value));

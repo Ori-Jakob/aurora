@@ -50,6 +50,7 @@ std::array<std::array<f32, 2>, 4> motion_probe_points(u32 frame) noexcept;
 std::optional<std::array<f32, 2>> motion_probe_expected(MotionProbe probe, u32 frame, std::array<f32, 2> ndc) noexcept;
 const std::array<FogParams, 2>& fog_bands() noexcept;
 std::vector<AoProbe> ao_check_probes();
+std::vector<std::array<f32, 2>> ao_trail_probes(u32 frame);
 FogResolveCounts fog_resolve_counts() noexcept;
 uint32_t gpu_uploads_per_frame(const SceneOptions& options) noexcept;
 bool init_scene();

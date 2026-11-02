@@ -7,6 +7,7 @@
 #include "gfx/resources.hpp"
 #include "gx/hints.hpp"
 #include "render/ao/ao.hpp"
+#include "render/ao/denoise.hpp"
 #include "render/ao/gtao.hpp"
 #include "render/ao/hiz.hpp"
 #include "render/ao/upsample.hpp"
@@ -34,6 +35,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -51,6 +53,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -86,6 +89,7 @@ std::shared_ptr<const SceneHints> camera_hints(const Mat4x4<float>& proj, std::a
       .gxProj = gx::hints::gx_projection(proj, type),
   };
   hints->present = SceneHasMainCamera;
+  hints->motionValid = true;
   hints->jitterPx[0] = jitter[0];
   hints->jitterPx[1] = jitter[1];
   if (unitsPerMetre) {
@@ -414,6 +418,9 @@ protected:
                                                        DepthSource source = DepthSource::Direct) {
     m_settings = settings;
     m_env = gather_graph_environment();
+    if (m_sceneSize) {
+      m_env.sceneSize = *m_sceneSize;
+    }
     std::shared_ptr<CompiledGraph> graph = compile_graph(m_settings, caps(), m_env, {.sceneDepthSource = source});
     prepare_graph_bindings(*graph, {.settings = &m_settings, .caps = &caps(), .env = &m_env, .sceneDepth = source});
     return graph;
@@ -439,6 +446,17 @@ protected:
       ASSERT_NE(id, 0u) << i;
       ASSERT_EQ(shaders::wait({id}, PipelineWaitNs), shaders::PipelineStatus::Ready) << i;
     }
+    for (const std::string_view name : {ao::gtao::Pass, ao::denoise::Pass, ao::upsample::Pass}) {
+      const NodeId chained = graph.find_node(name);
+      if (chained == InvalidNode || graph.nodes[chained].status != CullReason::None) {
+        continue;
+      }
+      for (const uint32_t id : graph.nodes[chained].pipelineIds) {
+        if (id != 0) {
+          ASSERT_EQ(shaders::wait({id}, PipelineWaitNs), shaders::PipelineStatus::Ready) << name;
+        }
+      }
+    }
   }
 
   std::shared_ptr<CompiledGraph> live_graph(const Settings& settings) {
@@ -454,10 +472,13 @@ protected:
   }
 
   StageData build(const FrameState& state, uint64_t frameId, std::shared_ptr<const SceneDepth> depth,
-                  bool atFinish = false) const {
+                  bool atFinish = false, bool invalidate = false) const {
     on_worker_frame_begin(frameId, &state);
     StageData begin{.stage = Stage::SceneBegin, .frameId = frameId, .markerSeen = true, .frame = &state};
     build_stage_data(begin);
+    if (invalidate) {
+      invalidate_frame_histories();
+    }
     StageData opaque{
         .stage = Stage::OpaqueDone,
         .frameId = frameId,
@@ -497,8 +518,8 @@ protected:
   }
 
   std::optional<std::string> run(const FrameState& state, uint64_t frameId, std::shared_ptr<const SceneDepth> depth,
-                                 bool atFinish = false) const {
-    StageData opaque = build(state, frameId, std::move(depth), atFinish);
+                                 bool atFinish = false, bool invalidate = false) const {
+    StageData opaque = build(state, frameId, std::move(depth), atFinish, invalidate);
     return encode(opaque);
   }
 
@@ -516,6 +537,7 @@ protected:
   bool m_started = false;
   Settings m_settings;
   GraphEnvironment m_env;
+  std::optional<GraphExtent> m_sceneSize;
 };
 
 class AoGraph : public AoDeviceTest {
@@ -565,15 +587,15 @@ TEST_F(AoGraph, SkippedWithoutDirectDepth) {
 
 TEST_F(AoGraph, CulledWithoutConsumer) {
   const auto graph = compile(ao_settings(Quality::High));
-  const NodeId node = pyramid_node(*graph);
-  ASSERT_NE(node, InvalidNode);
-  EXPECT_EQ(graph->nodes[node].status, CullReason::NoConsumer);
-  EXPECT_EQ(graph->nodes[node].pipelineIds, (std::array<uint32_t, MaxPassPipelines>{}));
-  latch(graph.get());
-  EXPECT_FALSE(ao::pipelines_live());
-  const FrameState state{.graph = graph};
-  EXPECT_EQ(run(state, 1, depth64()), std::nullopt);
-  EXPECT_EQ(ao::hiz::testing::counters().dispatches, 0u);
+  for (const std::string_view name : {ao::hiz::Pass, ao::gtao::Pass, ao::denoise::Pass}) {
+    const NodeId node = graph->find_node(name);
+    ASSERT_NE(node, InvalidNode) << name;
+    EXPECT_EQ(graph->nodes[node].status, CullReason::None) << name;
+  }
+  const NodeId upsample = graph->find_node(ao::upsample::Pass);
+  ASSERT_NE(upsample, InvalidNode);
+  EXPECT_EQ(graph->nodes[upsample].status, CullReason::NoConsumer);
+  EXPECT_EQ(graph->nodes[upsample].pipelineIds, (std::array<uint32_t, MaxPassPipelines>{}));
 }
 
 TEST_F(AoGraph, DisabledUnderClassView) {
@@ -714,7 +736,16 @@ TEST_F(AoGraph, CameraFilledAtStageBuild) {
   const uint32_t fillsBefore = ao::testing::counters().cameraFills;
   const StageData opaque = build(state, 70, depth64());
   ASSERT_TRUE(pyramid_enabled(*graph, opaque));
-  EXPECT_EQ(ao::testing::counters().cameraFills, fillsBefore + 1);
+  uint32_t enabled = 0;
+  for (const std::string_view name : {ao::hiz::Pass, ao::gtao::Pass, ao::denoise::Pass, ao::upsample::Pass}) {
+    const NodeId chained = graph->find_node(name);
+    enabled += chained != InvalidNode && graph->nodes[chained].programIndex != InvalidNode &&
+                       opaque.is_enabled(graph->nodes[chained].programIndex)
+                   ? 1
+                   : 0;
+  }
+  EXPECT_EQ(enabled, 3u);
+  EXPECT_EQ(ao::testing::counters().cameraFills, fillsBefore + enabled);
   const NodeId node = pyramid_node(*graph);
   const auto it = std::ranges::find(opaque.bindings.params, node, &StageBindings::Params::node);
   ASSERT_NE(it, opaque.bindings.params.end());
@@ -1160,7 +1191,8 @@ PassDesc reader_desc(Reader& reader) {
   };
 }
 
-constexpr std::array<std::string_view, 3> ChainPasses{ao::hiz::Pass, ao::gtao::Pass, ao::upsample::Pass};
+constexpr std::array<std::string_view, 4> ChainPasses{ao::hiz::Pass, ao::gtao::Pass, ao::denoise::Pass,
+                                                      ao::upsample::Pass};
 
 std::span<const CompiledUse> node_uses(const CompiledGraph& graph, NodeId node) {
   return std::span{graph.uses}.subspan(graph.nodes[node].firstUse, graph.nodes[node].useCount);
@@ -1238,7 +1270,7 @@ TEST_F(AoChainGraph, UpsampleReadsNormal) {
   ASSERT_NE(node, InvalidNode);
   const auto uses = node_uses(*graph, node);
   ASSERT_EQ(uses.size(), 5u);
-  const std::array<std::string_view, 5> names{ao::gtao::Resource, ao::hiz::Resource, resource::GxDepth,
+  const std::array<std::string_view, 5> names{ao::denoise::History, ao::hiz::Resource, resource::GxDepth,
                                               resource::GxNormal, resource::AoFinal};
   for (size_t i = 0; i < names.size(); ++i) {
     EXPECT_EQ(graph->resources[uses[i].resource].name, names[i]) << i;
@@ -1258,13 +1290,16 @@ TEST_F(AoChainGraph, FinalIsTransientNotHistory) {
     ASSERT_NE(id, InvalidResource) << name;
     EXPECT_EQ(graph->resources[id].kind, ResourceKind::Transient) << name;
   }
-  EXPECT_TRUE(graph->histories.empty());
+  ASSERT_EQ(graph->histories.size(), 1u);
+  EXPECT_EQ(graph->resources[graph->histories[0]].name, ao::denoise::History);
 }
 
 TEST_F(AoChainGraph, SinkEnvKeepsChainAlive) {
   const auto culled = compile(ao_settings(Quality::High));
   for (const std::string_view name : ChainPasses) {
-    EXPECT_EQ(culled->nodes[culled->find_node(name)].status, CullReason::NoConsumer) << name;
+    EXPECT_EQ(culled->nodes[culled->find_node(name)].status,
+              name == ao::upsample::Pass ? CullReason::NoConsumer : CullReason::None)
+        << name;
   }
   ao::testing::set_sink_override(true);
   const auto sunk = compile(ao_settings(Quality::High));
@@ -1389,6 +1424,298 @@ TEST_F(AoChainGraph, EncodesValidationClean) {
       EXPECT_EQ(ao::upsample::testing::counters().draws, 1u);
       EXPECT_EQ(reader.calls, 1);
     }
+  }
+}
+
+class AoDenoiseGraph : public AoChainGraph {
+protected:
+  std::shared_ptr<CompiledGraph> live_chain(const Settings& settings) {
+    std::shared_ptr<CompiledGraph> graph = compile(settings);
+    latch_chain(*graph);
+    return graph;
+  }
+
+  static ao::denoise::testing::Counters denoise_counters() { return ao::denoise::testing::counters(); }
+
+  static void set_chain_flags(const CompiledGraph& graph, uint32_t flags) {
+    for (const std::string_view name : ChainPasses) {
+      const NodeId node = graph.find_node(name);
+      if (node == InvalidNode || graph.nodes[node].status != CullReason::None) {
+        continue;
+      }
+      ao::Params params = params_from(latched_pass_params(graph.nodes[node].id));
+      params.flags = flags;
+      set_pass_params(graph.nodes[node].id, std::as_bytes(std::span{&params, 1}));
+    }
+    latch_pass_params();
+  }
+
+  void encode_sizes() {
+    for (const auto [width, height] :
+         {std::pair{1u, 1u}, std::pair{3u, 5u}, std::pair{61u, 37u}, std::pair{1280u, 720u}}) {
+      for (const Quality quality : {Quality::Low, Quality::High, Quality::Ultra}) {
+        SCOPED_TRACE(std::to_string(width) + "x" + std::to_string(height) + " q" +
+                     std::to_string(static_cast<int>(quality)));
+        use_globals({width, height, 1});
+        ao::testing::set_camera_override(camera_hints(perspective(Near, Far)));
+        Reader reader{.resource = resource::AoFinal};
+        register_pass(reader_desc(reader));
+        const auto graph = live_chain(ao_settings(quality));
+        const FrameState state{.graph = graph};
+        const auto depth = scene_depth(test::make_depth(*m_device, width, height));
+        EXPECT_EQ(run(state, 1, depth), std::nullopt);
+        EXPECT_EQ(run(state, 2, depth), std::nullopt);
+        EXPECT_EQ(denoise_counters().dispatches, 2u);
+        EXPECT_EQ(denoise_counters().temporalResets, 1u);
+        EXPECT_EQ(denoise_counters().temporalValid, 1u);
+        EXPECT_EQ(ao::upsample::testing::counters().draws, 2u);
+        EXPECT_EQ(reader.calls, 2);
+      }
+    }
+  }
+};
+
+TEST_F(AoDenoiseGraph, DenoiseOwnsHistory) {
+  const auto graph = compile(ao_settings(Quality::High));
+  const NodeId node = graph->find_node(ao::denoise::Pass);
+  ASSERT_NE(node, InvalidNode);
+  EXPECT_EQ(graph->nodes[node].status, CullReason::None);
+  EXPECT_EQ(graph->nodes[node].passKind, PassKind::Compute);
+  EXPECT_EQ(graph->nodes[node].order, 1u);
+  const auto uses = node_uses(*graph, node);
+  ASSERT_EQ(uses.size(), 4u);
+  const std::array<std::string_view, 4> names{ao::gtao::Resource, ao::hiz::Resource, resource::Motion,
+                                              ao::denoise::History};
+  for (size_t i = 0; i < names.size(); ++i) {
+    EXPECT_EQ(graph->resources[uses[i].resource].name, names[i]) << i;
+  }
+  EXPECT_EQ(uses[1].options.sampleType, wgpu::TextureSampleType::UnfilterableFloat);
+  EXPECT_EQ(uses[3].access, Access::StorageWrite);
+  const ResourceId id = graph->find_resource(ao::denoise::History);
+  ASSERT_NE(id, InvalidResource);
+  const CompiledResource& history = graph->resources[id];
+  EXPECT_EQ(history.kind, ResourceKind::History);
+  EXPECT_EQ(history.creator, node);
+  EXPECT_EQ(history.tex.format, wgpu::TextureFormat::RGBA16Float);
+  EXPECT_TRUE(history.textureUsage & wgpu::TextureUsage::StorageBinding);
+  EXPECT_TRUE(history.textureUsage & wgpu::TextureUsage::TextureBinding);
+  ASSERT_EQ(graph->histories.size(), 1u);
+  EXPECT_EQ(graph->histories[0], id);
+  EXPECT_NE(graph->nodes[node].pipelineIds[0], 0u);
+  EXPECT_NE(graph->nodes[node].pipelineIds[1], 0u);
+  EXPECT_NE(graph->nodes[node].pipelineIds[0], graph->nodes[node].pipelineIds[1]);
+}
+
+TEST_F(AoDenoiseGraph, ResetAfterInvalidate) {
+  const auto graph = live_chain(ao_settings(Quality::High));
+  const FrameState state{.graph = graph};
+  const std::array<std::pair<bool, uint32_t>, 4> frames{{{false, 1}, {false, 1}, {true, 2}, {false, 2}}};
+  uint64_t frame = 0;
+  for (const auto& [invalidate, resets] : frames) {
+    ++frame;
+    EXPECT_EQ(run(state, frame, depth64(), false, invalidate), std::nullopt);
+    EXPECT_EQ(denoise_counters().temporalResets, resets) << "frame " << frame;
+  }
+  EXPECT_EQ(denoise_counters().temporalValid, 2u);
+  EXPECT_EQ(denoise_counters().dispatches, 4u);
+}
+
+TEST_F(AoDenoiseGraph, InvalidMotionResets) {
+  const auto graph = live_chain(ao_settings(Quality::High));
+  const FrameState state{.graph = graph};
+  EXPECT_EQ(run(state, 1, depth64()), std::nullopt);
+  EXPECT_EQ(run(state, 2, depth64()), std::nullopt);
+  ASSERT_EQ(denoise_counters().temporalResets, 1u);
+  auto invalid = std::make_shared<SceneHints>(*camera_hints(perspective(Near, Far)));
+  invalid->motionValid = false;
+  ao::testing::set_camera_override(invalid);
+  StageData stage = build(state, 3, depth64());
+  const uint16_t slot = graph->resources[graph->find_resource(ao::denoise::History)].historySlot;
+  EXPECT_TRUE(stage.prev_valid(slot));
+  EXPECT_EQ(encode(stage), std::nullopt);
+  EXPECT_EQ(denoise_counters().temporalResets, 2u);
+  ao::testing::set_camera_override(camera_hints(perspective(Near, Far)));
+  EXPECT_EQ(run(state, 4, depth64()), std::nullopt);
+  EXPECT_EQ(denoise_counters().temporalResets, 2u);
+  EXPECT_EQ(denoise_counters().temporalValid, 2u);
+}
+
+TEST_F(AoDenoiseGraph, TemporalOffAlwaysResets) {
+  EXPECT_NE(ao::latched_params(ao_settings(Quality::High), {.flags = ao::FlagTemporalOff}).flags & ao::FlagTemporalOff,
+            0u);
+  const auto graph = live_chain(ao_settings(Quality::High));
+  set_chain_flags(*graph, ao::FlagTemporalOff);
+  const FrameState state{.graph = graph};
+  const NodeId gtao = graph->find_node(ao::gtao::Pass);
+  for (uint64_t frame = 1; frame <= 4; ++frame) {
+    StageData opaque = build(state, frame, depth64());
+    const auto it = std::ranges::find(opaque.bindings.params, gtao, &StageBindings::Params::node);
+    ASSERT_NE(it, opaque.bindings.params.end());
+    EXPECT_EQ(params_from(std::span{it->bytes}.first(it->size)).noiseIndex, frame % ao::NoisePeriod);
+    EXPECT_EQ(encode(opaque), std::nullopt);
+  }
+  EXPECT_EQ(denoise_counters().temporalResets, 4u);
+  EXPECT_EQ(denoise_counters().temporalValid, 0u);
+  set_chain_flags(*graph, 0);
+  EXPECT_EQ(run(state, 5, depth64()), std::nullopt);
+  EXPECT_EQ(denoise_counters().temporalValid, 1u);
+}
+
+TEST_F(AoDenoiseGraph, ResetsOnGraphHashChange) {
+  const auto first = live_chain(ao_settings(Quality::High));
+  ao::testing::set_sink_override(true);
+  const auto second = live_chain(ao_settings(Quality::High));
+  ASSERT_NE(second->graphHash, first->graphHash);
+  const FrameState a{.graph = first};
+  const FrameState b{.graph = second};
+  const std::array<std::pair<const FrameState*, uint32_t>, 5> frames{{{&a, 1}, {&a, 1}, {&b, 2}, {&b, 2}, {&a, 3}}};
+  uint64_t frame = 0;
+  for (const auto& [state, resets] : frames) {
+    ++frame;
+    latch(state->graph.get());
+    EXPECT_EQ(run(*state, frame, depth64()), std::nullopt);
+    EXPECT_EQ(denoise_counters().temporalResets, resets) << "frame " << frame;
+  }
+  EXPECT_EQ(denoise_counters().temporalValid, 2u);
+}
+
+TEST_F(AoDenoiseGraph, ResetsOnSceneSizeChange) {
+  const auto full = live_chain(ao_settings(Quality::High));
+  m_sceneSize = GraphExtent{640, 360};
+  const auto split = live_chain(ao_settings(Quality::High));
+  ASSERT_NE(split->graphHash, full->graphHash);
+  const auto extent = [](const CompiledGraph& graph) {
+    return graph.resources[graph.find_resource(ao::denoise::History)].extent;
+  };
+  EXPECT_EQ(extent(*full).width, 640u);
+  EXPECT_EQ(extent(*split).width, 320u);
+  EXPECT_EQ(extent(*split).height, 180u);
+  const FrameState a{.graph = full};
+  const FrameState b{.graph = split};
+  latch(full.get());
+  EXPECT_EQ(run(a, 1, depth64()), std::nullopt);
+  EXPECT_EQ(run(a, 2, depth64()), std::nullopt);
+  latch(split.get());
+  EXPECT_EQ(run(b, 3, depth64()), std::nullopt);
+  EXPECT_EQ(denoise_counters().temporalResets, 2u);
+  EXPECT_EQ(run(b, 4, depth64()), std::nullopt);
+  EXPECT_EQ(denoise_counters().temporalResets, 2u);
+  EXPECT_EQ(denoise_counters().temporalValid, 2u);
+}
+
+TEST_F(AoDenoiseGraph, TuningKeepsHistory) {
+  Settings settings = ao_settings(Quality::High);
+  const auto base = live_chain(settings);
+  const FrameState first{.graph = base};
+  EXPECT_EQ(run(first, 1, depth64()), std::nullopt);
+  EXPECT_EQ(run(first, 2, depth64()), std::nullopt);
+  ASSERT_EQ(denoise_counters().temporalResets, 1u);
+  uint64_t frame = 2;
+  for (const auto [radius, strength] : {std::pair{1.2f, 0.5f}, std::pair{0.25f, 0.f}, std::pair{1.5f, 1.5f}}) {
+    settings.aoRadius = radius;
+    settings.aoStrength = strength;
+    const auto tuned = live_chain(settings);
+    ASSERT_EQ(tuned->graphHash, base->graphHash);
+    const FrameState state{.graph = tuned};
+    StageData stage = build(state, ++frame, depth64());
+    const uint16_t slot = tuned->resources[tuned->find_resource(ao::denoise::History)].historySlot;
+    EXPECT_TRUE(stage.prev_valid(slot));
+    EXPECT_EQ(encode(stage), std::nullopt);
+  }
+  EXPECT_EQ(denoise_counters().temporalResets, 1u);
+  EXPECT_EQ(denoise_counters().temporalValid, 4u);
+}
+
+TEST_F(AoDenoiseGraph, HistoryIsWorkingSize) {
+  for (const auto [width, height] : {std::pair{2560u, 1440u}, std::pair{4779u, 2688u}, std::pair{61u, 37u}}) {
+    use_globals({width, height, 1});
+    for (const Quality quality : {Quality::Low, Quality::High, Quality::Ultra}) {
+      SCOPED_TRACE(std::to_string(width) + "x" + std::to_string(height) + " q" +
+                   std::to_string(static_cast<int>(quality)));
+      const uint32_t divisor = quality == Quality::Ultra ? 1u : 2u;
+      const auto graph = compile(ao_settings(quality));
+      const CompiledResource& history = graph->resources[graph->find_resource(ao::denoise::History)];
+      const CompiledResource& raw = graph->resources[graph->find_resource(ao::gtao::Resource)];
+      EXPECT_EQ(history.tex.divisor, divisor);
+      EXPECT_EQ(history.extent.width, (width + divisor - 1) / divisor);
+      EXPECT_EQ(history.extent.height, (height + divisor - 1) / divisor);
+      EXPECT_EQ(history.extent.width, raw.extent.width);
+      EXPECT_EQ(history.extent.height, raw.extent.height);
+      EXPECT_EQ(history.mipLevels, 1u);
+    }
+  }
+}
+
+TEST_F(AoDenoiseGraph, ReadyFollowsPipelines) {
+  install_hints();
+  struct HintsGuard {
+    bool installed = true;
+    HintsGuard() = default;
+    HintsGuard(const HintsGuard&) = delete;
+    HintsGuard& operator=(const HintsGuard&) = delete;
+    ~HintsGuard() {
+      if (installed) {
+        remove_hints();
+      }
+    }
+  } hints;
+  const Settings high = ao_settings(Quality::High);
+  EXPECT_TRUE(ao::ready(Settings{}));
+  ao::on_latch(high, nullptr);
+  EXPECT_FALSE(ao::ready(high));
+  std::atomic_bool release = false;
+  std::atomic_bool started = false;
+  const jobs::JobHandle gate = jobs::submit([&](const jobs::JobContext& context) {
+    started = true;
+    while (!release && !context.cancelled()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+  });
+  while (!started) {
+    std::this_thread::yield();
+  }
+  const auto graph = compile(high);
+  const NodeId node = graph->find_node(ao::denoise::Pass);
+  ASSERT_NE(node, InvalidNode);
+  EXPECT_EQ(shaders::status({graph->nodes[node].pipelineIds[0]}), shaders::PipelineStatus::Pending);
+  latch(graph.get());
+  EXPECT_FALSE(ao::ready(high));
+  EXPECT_TRUE(ao::ready(Settings{}));
+  release = true;
+  gate.wait();
+  latch_chain(*graph);
+  EXPECT_TRUE(ao::ready(high));
+  remove_hints();
+  hints.installed = false;
+  EXPECT_FALSE(ao::ready(high));
+  EXPECT_TRUE(ao::ready(Settings{}));
+}
+
+TEST_F(AoDenoiseGraph, EncodesValidationClean) { encode_sizes(); }
+
+TEST_F(AoDenoiseGraph, EncodesValidationCleanWithProductionToggles) {
+  TearDown();
+  m_started = false;
+  if (!open({.backend = wgpu::BackendType::Null, .productionToggles = true})) {
+    GTEST_SKIP() << "no null device: " << m_error;
+  }
+  encode_sizes();
+  for (const uint32_t flags : {uint32_t{ao::FlagTemporalOff}, uint32_t{ao::FlagIdentityForced},
+                               uint32_t{ao::FlagNormalFromDepth | ao::FlagSectorCeil}}) {
+    SCOPED_TRACE(flags);
+    use_globals({61, 37, 1});
+    auto hints = std::make_shared<SceneHints>(*camera_hints(perspective(Near, Far)));
+    ao::testing::set_camera_override(hints);
+    const auto graph = live_chain(ao_settings(Quality::High));
+    set_chain_flags(*graph, flags);
+    const FrameState state{.graph = graph};
+    const auto depth = scene_depth(test::make_depth(*m_device, 61, 37));
+    EXPECT_EQ(run(state, 1, depth), std::nullopt);
+    hints->motionValid = false;
+    EXPECT_EQ(run(state, 2, depth), std::nullopt);
+    hints->motionValid = true;
+    EXPECT_EQ(run(state, 3, depth), std::nullopt);
+    EXPECT_EQ(denoise_counters().dispatches, 3u);
   }
 }
 
@@ -1526,6 +1853,54 @@ float half_to_float(uint32_t bits) {
   return sign * std::ldexp(static_cast<float>(mantissa | 0x400u), static_cast<int>(exponent) - 25);
 }
 
+uint16_t float_to_half(float value) {
+  const uint32_t bits = std::bit_cast<uint32_t>(value);
+  const auto sign = static_cast<uint16_t>((bits >> 16) & 0x8000u);
+  const int32_t exponent = static_cast<int32_t>((bits >> 23) & 0xFFu) - 112;
+  uint32_t mantissa = bits & 0x7FFFFFu;
+  if (exponent >= 31) {
+    return sign | 0x7C00u;
+  }
+  uint32_t shift = 13;
+  uint32_t half = 0;
+  if (exponent <= 0) {
+    if (exponent < -10) {
+      return sign;
+    }
+    mantissa |= 0x800000u;
+    shift = static_cast<uint32_t>(14 - exponent);
+  } else {
+    half = static_cast<uint32_t>(exponent) << 10;
+  }
+  half |= mantissa >> shift;
+  const uint32_t rest = mantissa & ((1u << shift) - 1);
+  const uint32_t halfway = 1u << (shift - 1);
+  if (rest > halfway || (rest == halfway && (half & 1u) != 0)) {
+    ++half;
+  }
+  return static_cast<uint16_t>(sign | half);
+}
+
+uint8_t grid_edges(const std::vector<double>& hiz, uint32_t width, uint32_t height, uint32_t x, uint32_t y) {
+  const auto at = [&](int64_t px, int64_t py) {
+    px = std::clamp<int64_t>(px, 0, width - 1);
+    py = std::clamp<int64_t>(py, 0, height - 1);
+    return hiz[static_cast<size_t>(py) * width + static_cast<size_t>(px)];
+  };
+  return ref::pack_edges(ref::calculate_edges(at(x, y), at(int64_t{x} - 1, y), at(int64_t{x} + 1, y),
+                                              at(x, int64_t{y} - 1), at(x, int64_t{y} + 1)));
+}
+
+std::array<uint32_t, 2> history_from_raw(uint32_t raw, double z) {
+  const bool receiver = ((raw >> 16) & 0xFFu) > 127;
+  const auto visibility = static_cast<float>(std::min((raw & 0xFFu) / 255.0 * ao::RawScale, 1.0));
+  const uint16_t r = float_to_half(visibility);
+  const uint16_t g = float_to_half(receiver ? 1.f : 0.f);
+  const uint16_t b = float_to_half(static_cast<float>(std::log2(z)));
+  const uint16_t a = float_to_half(static_cast<float>(((raw >> 8) & 0xFFu) / 255.0));
+  return {r | (uint32_t{g} << 16), b | (uint32_t{a} << 16)};
+}
+
 struct TestPass {
   std::string name;
   PassKind kind = PassKind::Copy;
@@ -1660,37 +2035,33 @@ protected:
     Reader rawReader{.resource = ao::gtao::Resource};
     Reader finalReader{.resource = resource::AoFinal};
     std::vector<uint32_t> staged;
-    const uint32_t rowWords = ((result.gridWidth * 4 + 255) & ~255u) / 4;
+    const uint32_t rowWords = ((result.gridWidth * 8 + 255) & ~255u) / 4;
     wgpu::Buffer staging;
-    TestPass stub{.name = "t.raw"};
+    TestPass stub{.name = "t.history"};
     if (stubRaw) {
       ao::testing::unregister(ao::gtao::Pass);
+      ao::testing::unregister(ao::denoise::Pass);
       staged.assign(size_t{rowWords} * result.gridHeight, 0);
       result.raw.assign(size_t{result.gridWidth} * result.gridHeight, 0);
       const std::vector<double>& hiz = result.pyramid.levels[0];
       for (uint32_t y = 0; y < result.gridHeight; ++y) {
         for (uint32_t x = 0; x < result.gridWidth; ++x) {
-          const auto at = [&](int64_t px, int64_t py) {
-            px = std::clamp<int64_t>(px, 0, result.gridWidth - 1);
-            py = std::clamp<int64_t>(py, 0, result.gridHeight - 1);
-            return hiz[static_cast<size_t>(py) * result.gridWidth + static_cast<size_t>(px)];
-          };
-          const double z = at(x, y);
-          const uint8_t edges = ref::pack_edges(ref::calculate_edges(z, at(int64_t{x} - 1, y), at(int64_t{x} + 1, y),
-                                                                     at(x, int64_t{y} - 1), at(x, int64_t{y} + 1)));
-          const uint32_t value = stubRaw(x, y, z, edges);
+          const double z = hiz[size_t{y} * result.gridWidth + x];
+          const uint32_t value = stubRaw(x, y, z, grid_edges(hiz, result.gridWidth, result.gridHeight, x, y));
           result.raw[size_t{y} * result.gridWidth + x] = value;
-          staged[size_t{y} * rowWords + x] = value;
+          const std::array<uint32_t, 2> texel = history_from_raw(value, z);
+          staged[size_t{y} * rowWords + x * 2] = texel[0];
+          staged[size_t{y} * rowWords + x * 2 + 1] = texel[1];
         }
       }
       const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
                                               .size = staged.size() * 4};
       staging = m_device->device.CreateBuffer(&descriptor);
       m_device->queue.WriteBuffer(staging, 0, staged.data(), staged.size() * 4);
-      const TexDesc desc = ao::gtao::raw_desc(result.divisor);
+      const TexDesc desc = ao::denoise::history_desc(result.divisor);
       stub.declare = [desc](InternalPassBuilder& b) {
         b.after(phase::Ao);
-        b.create(ao::gtao::Resource, desc, Access::CopyDst);
+        b.create(ao::denoise::History, desc, Access::CopyDst);
       };
       stub.encode = [&](PassContext& ctx) {
         const wgpu::TexelCopyBufferInfo from{.layout = {.bytesPerRow = rowWords * 4, .rowsPerImage = result.gridHeight},
@@ -2273,6 +2644,524 @@ TEST_F(AoUpsampleGpu, OddSizesCovered) {
       EXPECT_EQ(key != 0, r.frame.depth[i] != 0.f) << i;
     }
     expect_matches_mirror(r, cpu_upsample(r), "odd size");
+  }
+}
+
+struct HistoryTexel {
+  float ao = 0.f;
+  float count = 0.f;
+  float logDepth = 0.f;
+  float edges = 0.f;
+};
+
+uint32_t raw_of(double visibility, uint8_t edges, bool receiver = true) {
+  const long r = std::clamp(std::lround(visibility / ao::RawScale * 255.0), 0L, 255L);
+  return raw_texel(static_cast<uint32_t>(r), edges, receiver);
+}
+
+uint32_t packed_edges(const HistoryTexel& texel) { return static_cast<uint32_t>(texel.edges * 255.5f); }
+
+class AoDenoiseGpu : public AoChainGpu {
+protected:
+  using RawFn = std::function<uint32_t(uint32_t x, uint32_t y, uint8_t edges)>;
+  using MotionFn = std::function<std::array<float, 2>(uint32_t x, uint32_t y)>;
+
+  void begin(const Rig& rig, Quality quality = Quality::High) {
+    use_globals({rig.width, rig.height, 1});
+    m_proj = perspective(Near, Far);
+    m_hints = camera_hints(m_proj);
+    ao::testing::set_camera_override(m_hints);
+    m_divisor = ao::working_divisor(quality);
+    m_gridWidth = ao::grid_size(rig.width, m_divisor);
+    m_gridHeight = ao::grid_size(rig.height, m_divisor);
+    m_scene = render_rig(rig, m_proj);
+    upload_normals(m_scene);
+    set_motion({});
+    m_depth = test::make_depth(*m_device, rig.width, rig.height);
+    set_depth(m_scene.depth);
+    m_rowWords = ((m_gridWidth * 4 + 255) & ~255u) / 4;
+    const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                            .size = uint64_t{m_rowWords} * m_gridHeight * 4};
+    m_staging = m_device->device.CreateBuffer(&descriptor);
+    ao::testing::unregister(ao::gtao::Pass);
+    const TexDesc desc = ao::gtao::raw_desc(m_divisor);
+    m_stub = TestPass{.name = "t.raw"};
+    m_stub.declare = [desc](InternalPassBuilder& b) {
+      b.after(phase::Ao);
+      b.create(ao::gtao::Resource, desc, Access::CopyDst);
+    };
+    m_stub.encode = [this](PassContext& ctx) {
+      const wgpu::TexelCopyBufferInfo from{.layout = {.bytesPerRow = m_rowWords * 4, .rowsPerImage = m_gridHeight},
+                                           .buffer = m_staging};
+      const wgpu::TexelCopyTextureInfo to{.texture = ctx.texture(TexRef{0})};
+      const wgpu::Extent3D extent{m_gridWidth, m_gridHeight, 1};
+      ctx.encoder().CopyBufferToTexture(&from, &to, &extent);
+    };
+    register_pass(desc_of(m_stub));
+    m_reader = Reader{.resource = ao::denoise::History};
+    register_pass(reader_desc(m_reader));
+    m_graph = chain(ao_settings(quality));
+  }
+
+  void set_depth(const std::vector<float>& depth) {
+    test::fill_depth(*m_device, m_depth, depth);
+    StageCamera camera;
+    ASSERT_TRUE(fill_stage_camera(m_hints.get(), camera));
+    m_hiz = ref::build_pyramid(depth, m_scene.width, m_scene.height, m_divisor, camera,
+                               double{ao::RadiusMetres} * DefaultUnitsPerMetre, 1)
+                .levels[0];
+  }
+
+  void set_motion(const MotionFn& motion) {
+    const uint32_t width = m_scene.width;
+    const uint32_t height = m_scene.height;
+    std::vector<uint32_t> texels(size_t{width} * height, 0);
+    if (motion) {
+      for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+          const std::array<float, 2> m = motion(x, y);
+          texels[size_t{y} * width + x] = float_to_half(m[0]) | (uint32_t{float_to_half(m[1])} << 16);
+        }
+      }
+    }
+    const wgpu::TextureDescriptor descriptor{
+        .label = "test motion",
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding |
+                 wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst,
+        .size = {width, height, 1},
+        .format = webgpu::MotionBufferFormat,
+    };
+    const wgpu::Texture texture = m_device->device.CreateTexture(&descriptor);
+    const wgpu::TexelCopyTextureInfo destination{.texture = texture};
+    const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = width * 4, .rowsPerImage = height};
+    const wgpu::Extent3D size{width, height, 1};
+    m_device->queue.WriteTexture(&destination, texels.data(), texels.size() * 4, &layout, &size);
+    webgpu::g_motionBuffer.texture = texture;
+    webgpu::g_motionBuffer.view = texture.CreateView();
+    webgpu::g_motionBuffer.size = size;
+    webgpu::g_motionBuffer.format = webgpu::MotionBufferFormat;
+  }
+
+  std::vector<HistoryTexel> step(uint64_t frameId, const RawFn& raw) {
+    std::vector<uint32_t> staged(size_t{m_rowWords} * m_gridHeight, 0);
+    m_raw.assign(size_t{m_gridWidth} * m_gridHeight, 0);
+    for (uint32_t y = 0; y < m_gridHeight; ++y) {
+      for (uint32_t x = 0; x < m_gridWidth; ++x) {
+        const uint32_t value = raw(x, y, grid_edges(m_hiz, m_gridWidth, m_gridHeight, x, y));
+        m_raw[size_t{y} * m_gridWidth + x] = value;
+        staged[size_t{y} * m_rowWords + x] = value;
+      }
+    }
+    m_device->queue.WriteBuffer(m_staging, 0, staged.data(), staged.size() * 4);
+    const FrameState state{.graph = m_graph};
+    EXPECT_EQ(run(state, frameId, scene_depth(m_depth)), std::nullopt);
+    if (!m_reader.texture) {
+      ADD_FAILURE() << "the denoiser did not run";
+      return {};
+    }
+    return read_history(m_reader.texture);
+  }
+
+  std::vector<HistoryTexel> read_history(const wgpu::Texture& texture) const {
+    const uint32_t width = texture.GetWidth();
+    const uint32_t height = texture.GetHeight();
+    const uint32_t rowBytes = (width * 8 + 255) & ~255u;
+    const uint64_t size = uint64_t{rowBytes} * height;
+    const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                            .size = size};
+    const wgpu::Buffer buffer = m_device->device.CreateBuffer(&descriptor);
+    const wgpu::TexelCopyTextureInfo source{.texture = texture};
+    const wgpu::TexelCopyBufferInfo destination{.layout = {.bytesPerRow = rowBytes, .rowsPerImage = height},
+                                                .buffer = buffer};
+    const wgpu::Extent3D extent{width, height, 1};
+    const wgpu::CommandEncoder encoder = m_device->device.CreateCommandEncoder();
+    encoder.CopyTextureToBuffer(&source, &destination, &extent);
+    const wgpu::CommandBuffer commands = encoder.Finish();
+    m_device->queue.Submit(1, &commands);
+    const std::optional<std::vector<uint32_t>> words = test::read_buffer(*m_device, buffer, 0, size);
+    if (!words) {
+      ADD_FAILURE() << "history readback failed";
+      return {};
+    }
+    std::vector<HistoryTexel> out(size_t{width} * height);
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x) {
+        const size_t at = size_t{y} * (rowBytes / 4) + size_t{x} * 2;
+        const uint32_t rg = (*words)[at];
+        const uint32_t ba = (*words)[at + 1];
+        out[size_t{y} * width + x] = {half_to_float(rg & 0xFFFFu), half_to_float(rg >> 16), half_to_float(ba & 0xFFFFu),
+                                      half_to_float(ba >> 16)};
+      }
+    }
+    return out;
+  }
+
+  std::vector<double> spatial(const std::vector<uint32_t>& raw) const {
+    const auto at = [&](int64_t x, int64_t y) {
+      x = std::clamp<int64_t>(x, 0, m_gridWidth - 1);
+      y = std::clamp<int64_t>(y, 0, m_gridHeight - 1);
+      return raw[static_cast<size_t>(y) * m_gridWidth + static_cast<size_t>(x)];
+    };
+    const auto visibility = [](uint32_t t) { return std::min((t & 0xFFu) / 255.0 * ao::RawScale, 1.0); };
+    const auto receiver = [](uint32_t t) { return ((t >> 16) & 0xFFu) > 127; };
+    const auto edges = [](uint32_t t) { return ref::unpack_edges(static_cast<uint8_t>(t >> 8)); };
+    std::vector<double> out(raw.size(), 1.0);
+    for (uint32_t y = 0; y < m_gridHeight; ++y) {
+      for (uint32_t x = 0; x < m_gridWidth; ++x) {
+        const int64_t ix = x;
+        const int64_t iy = y;
+        if (!receiver(at(ix, iy))) {
+          continue;
+        }
+        const auto l = edges(at(ix - 1, iy));
+        const auto r = edges(at(ix + 1, iy));
+        const auto t = edges(at(ix, iy - 1));
+        const auto b = edges(at(ix, iy + 1));
+        auto c = edges(at(ix, iy));
+        c = {c[0] * l[1], c[1] * r[0], c[2] * t[3], c[3] * b[2]};
+        const double leak = std::clamp(1.5 - (c[0] + c[1] + c[2] + c[3]), 0.0, 1.0) / 1.5 * 0.5;
+        for (double& side : c) {
+          side = std::clamp(side + leak, 0.0, 1.0);
+        }
+        const std::array<double, 9> weights{0.425 * (c[0] * l[2] + c[2] * t[0]),
+                                            c[2],
+                                            0.425 * (c[2] * t[1] + c[1] * r[2]),
+                                            c[0],
+                                            double{ao::DenoiseBeta},
+                                            c[1],
+                                            0.425 * (c[3] * b[0] + c[0] * l[3]),
+                                            c[3],
+                                            0.425 * (c[1] * r[3] + c[3] * b[1])};
+        double sum = 0.0;
+        double weightSum = 0.0;
+        bool open = true;
+        for (int i = 0; i < 9; ++i) {
+          const uint32_t tap = at(ix + i % 3 - 1, iy + i / 3 - 1);
+          if (!receiver(tap) || weights[i] <= 0.0) {
+            continue;
+          }
+          sum += weights[i] * visibility(tap);
+          weightSum += weights[i];
+          open = open && visibility(tap) >= 1.0;
+        }
+        out[size_t{y} * m_gridWidth + x] = open ? 1.0 : sum / weightSum;
+      }
+    }
+    return out;
+  }
+
+  [[nodiscard]] std::vector<float> depth_with_block(double distance, uint32_t x0, uint32_t y0, uint32_t x1,
+                                                    uint32_t y1) const {
+    std::vector<float> depth = m_scene.depth;
+    const auto stored = static_cast<float>(double{m_proj.m2[2]} - double{m_proj.m2[3]} / distance);
+    for (uint32_t y = y0; y < y1; ++y) {
+      for (uint32_t x = x0; x < x1; ++x) {
+        depth[size_t{y} * m_scene.width + x] = stored;
+      }
+    }
+    return depth;
+  }
+
+  [[nodiscard]] uint32_t rep(uint32_t p, uint32_t full) const { return ao::rep_texel(p, m_divisor, full); }
+
+  Mat4x4<float> m_proj{};
+  std::shared_ptr<const SceneHints> m_hints;
+  uint32_t m_divisor = 2;
+  uint32_t m_gridWidth = 0;
+  uint32_t m_gridHeight = 0;
+  uint32_t m_rowWords = 0;
+  Frame m_scene;
+  wgpu::Texture m_depth;
+  wgpu::Buffer m_staging;
+  std::vector<double> m_hiz;
+  std::vector<uint32_t> m_raw;
+  TestPass m_stub;
+  Reader m_reader;
+  std::shared_ptr<CompiledGraph> m_graph;
+};
+
+TEST_F(AoDenoiseGpu, ResetWritesSpatialResult) {
+  begin(frontal_rig(64, 48, 500.0));
+  std::mt19937 rng{0xD3A0u};
+  std::uniform_real_distribution<double> unit(0.2, 1.0);
+  std::vector<double> values(size_t{m_gridWidth} * m_gridHeight);
+  for (double& value : values) {
+    value = unit(rng);
+  }
+  const auto history = step(1, [&](uint32_t x, uint32_t y, uint8_t e) {
+    const size_t i = size_t{y} * m_gridWidth + x;
+    return raw_of(values[i], e, i % 7 != 0);
+  });
+  ASSERT_EQ(history.size(), m_raw.size());
+  const std::vector<double> want = spatial(m_raw);
+  for (size_t i = 0; i < history.size(); ++i) {
+    const bool receiver = i % 7 != 0;
+    EXPECT_NEAR(history[i].ao, receiver ? want[i] : 1.0, 2e-3) << i;
+    EXPECT_EQ(history[i].count, receiver ? 1.f : 0.f) << i;
+    EXPECT_NEAR(history[i].logDepth, std::log2(m_hiz[i]), 5e-3) << i;
+    EXPECT_EQ(packed_edges(history[i]), (m_raw[i] >> 8) & 0xFFu) << i;
+  }
+  EXPECT_EQ(ao::denoise::testing::counters().temporalResets, 1u);
+}
+
+TEST_F(AoDenoiseGpu, StaticInputConverges) {
+  begin(frontal_rig(64, 48, 500.0));
+  std::mt19937 rng{0x57A7u};
+  std::uniform_real_distribution<double> unit(0.3, 1.0);
+  std::vector<double> values(size_t{m_gridWidth} * m_gridHeight);
+  for (double& value : values) {
+    value = unit(rng);
+  }
+  std::vector<HistoryTexel> history;
+  for (uint64_t frame = 1; frame <= 20; ++frame) {
+    history = step(frame, [&](uint32_t x, uint32_t y, uint8_t e) { return raw_of(values[y * m_gridWidth + x], e); });
+  }
+  ASSERT_EQ(history.size(), m_raw.size());
+  const std::vector<double> want = spatial(m_raw);
+  for (size_t i = 0; i < history.size(); ++i) {
+    EXPECT_EQ(history[i].count, ao::MaxSamples) << i;
+    EXPECT_NEAR(history[i].ao, want[i], 2e-3) << i;
+  }
+  EXPECT_EQ(ao::denoise::testing::counters().temporalResets, 1u);
+  EXPECT_EQ(ao::denoise::testing::counters().temporalValid, 19u);
+}
+
+TEST_F(AoDenoiseGpu, NoisyStaticInputHoldsSamples) {
+  begin(frontal_rig(96, 64, 500.0));
+  std::mt19937 rng{0x5161Au};
+  std::normal_distribution<double> noise(0.6, 0.05);
+  std::vector<HistoryTexel> previous;
+  for (uint64_t frame = 1; frame <= 32; ++frame) {
+    const auto history = step(frame, [&](uint32_t, uint32_t, uint8_t e) { return raw_of(noise(rng), e); });
+    ASSERT_EQ(history.size(), m_raw.size());
+    if (!previous.empty()) {
+      size_t capped = 0;
+      for (size_t i = 0; i < history.size(); ++i) {
+        capped += history[i].count < std::min(previous[i].count + 1.f, ao::MaxSamples) - 0.5f ? 1 : 0;
+      }
+      EXPECT_LE(capped * 10, history.size()) << "frame " << frame << ": " << capped << " lag-capped texels";
+    }
+    previous = history;
+  }
+  double counts = 0.0;
+  for (const HistoryTexel& texel : previous) {
+    counts += texel.count;
+  }
+  EXPECT_GE(counts / static_cast<double>(previous.size()), 12.0);
+}
+
+TEST_F(AoDenoiseGpu, MovingOccluderTrailBounded) {
+  begin(frontal_rig(64, 48, 500.0));
+  std::mt19937 rng{0x7A11u};
+  std::uniform_real_distribution<double> jitter(-0.05, 0.05);
+  const auto patch = [](uint32_t x, uint32_t y) { return x >= 10 && x < 22 && y >= 8 && y < 16; };
+  std::vector<HistoryTexel> history;
+  for (uint64_t frame = 1; frame <= 36; ++frame) {
+    history = step(frame, [&](uint32_t x, uint32_t y, uint8_t e) {
+      return raw_of(frame <= 32 && patch(x, y) ? 0.4 : 0.9 + jitter(rng), e);
+    });
+  }
+  ASSERT_EQ(history.size(), m_raw.size());
+  size_t checked = 0;
+  for (uint32_t y = 10; y < 14; ++y) {
+    for (uint32_t x = 12; x < 20; ++x) {
+      EXPECT_NEAR(history[size_t{y} * m_gridWidth + x].ao, 0.9, 0.05) << x << "," << y;
+      ++checked;
+    }
+  }
+  EXPECT_EQ(checked, 32u);
+}
+
+TEST_F(AoDenoiseGpu, MotionContrastCapsSamples) {
+  constexpr float Pixel = 2.f / 64.f;
+  const auto constant = [](uint32_t, uint32_t, uint8_t e) { return raw_of(0.7, e); };
+  begin(frontal_rig(64, 48, 500.0));
+  set_motion([](uint32_t x, uint32_t) {
+    return x >= 24 && x < 40 ? std::array<float, 2>{3.f * Pixel, 0.f} : std::array<float, 2>{};
+  });
+  std::vector<HistoryTexel> history;
+  for (uint64_t frame = 1; frame <= 20; ++frame) {
+    history = step(frame, constant);
+  }
+  ASSERT_EQ(history.size(), m_raw.size());
+  ASSERT_LT(rep(11, 64), 24u);
+  ASSERT_GE(rep(12, 64), 24u);
+  ASSERT_LT(rep(19, 64), 40u);
+  ASSERT_GE(rep(20, 64), 40u);
+  for (uint32_t y = 2; y < m_gridHeight - 2; ++y) {
+    EXPECT_EQ(history[size_t{y} * m_gridWidth + 11].count, ao::MovingSamples) << y;
+    EXPECT_EQ(history[size_t{y} * m_gridWidth + 20].count, ao::MovingSamples) << y;
+    EXPECT_EQ(history[size_t{y} * m_gridWidth + 3].count, ao::MaxSamples) << y;
+  }
+
+  begin(frontal_rig(64, 48, 500.0));
+  set_motion([](uint32_t, uint32_t) { return std::array<float, 2>{3.f * Pixel, 0.f}; });
+  for (uint64_t frame = 1; frame <= 24; ++frame) {
+    history = step(frame, constant);
+  }
+  ASSERT_EQ(history.size(), m_raw.size());
+  for (uint32_t y = 2; y < m_gridHeight - 2; ++y) {
+    for (uint32_t x = 8; x < m_gridWidth; ++x) {
+      EXPECT_GT(history[size_t{y} * m_gridWidth + x].count, ao::MovingSamples) << x << "," << y;
+    }
+    for (uint32_t x = 26; x < m_gridWidth; ++x) {
+      EXPECT_EQ(history[size_t{y} * m_gridWidth + x].count, ao::MaxSamples) << x << "," << y;
+    }
+  }
+}
+
+TEST_F(AoDenoiseGpu, DisocclusionRejectsHistory) {
+  begin(frontal_rig(64, 48, 500.0));
+  const auto constant = [](uint32_t, uint32_t, uint8_t e) { return raw_of(0.8, e); };
+  for (uint64_t frame = 1; frame <= 10; ++frame) {
+    step(frame, constant);
+  }
+  set_depth(depth_with_block(250.0, 16, 12, 48, 36));
+  const auto history = step(11, constant);
+  ASSERT_EQ(history.size(), m_raw.size());
+  size_t inside = 0;
+  for (uint32_t y = 0; y < m_gridHeight; ++y) {
+    for (uint32_t x = 0; x < m_gridWidth; ++x) {
+      const uint32_t qx = rep(x, 64);
+      const uint32_t qy = rep(y, 48);
+      const float count = history[size_t{y} * m_gridWidth + x].count;
+      if (qx >= 18 && qx < 46 && qy >= 14 && qy < 34) {
+        EXPECT_EQ(count, 1.f) << x << "," << y;
+        ++inside;
+      } else if (qx < 12 || qx >= 52 || qy < 8 || qy >= 40) {
+        EXPECT_EQ(count, 11.f) << x << "," << y;
+      }
+    }
+  }
+  EXPECT_GT(inside, 100u);
+}
+
+TEST_F(AoDenoiseGpu, OffscreenMotionResets) {
+  constexpr float Pixel = 2.f / 64.f;
+  const auto constant = [](uint32_t, uint32_t, uint8_t e) { return raw_of(0.8, e); };
+  begin(frontal_rig(64, 48, 500.0));
+  set_motion([](uint32_t x, uint32_t y) {
+    return x >= 16 && x < 32 && y >= 16 && y < 32 ? std::array<float, 2>{4.f, 4.f} : std::array<float, 2>{};
+  });
+  std::vector<HistoryTexel> history;
+  for (uint64_t frame = 1; frame <= 6; ++frame) {
+    history = step(frame, constant);
+  }
+  ASSERT_EQ(history.size(), m_raw.size());
+  for (uint32_t y = 8; y < 16; ++y) {
+    for (uint32_t x = 8; x < 16; ++x) {
+      EXPECT_EQ(history[size_t{y} * m_gridWidth + x].count, 1.f) << x << "," << y;
+    }
+    EXPECT_EQ(history[size_t{y} * m_gridWidth + 24].count, 6.f) << y;
+  }
+
+  begin(frontal_rig(64, 48, 500.0));
+  set_motion([](uint32_t, uint32_t) { return std::array<float, 2>{10.f * Pixel, 0.f}; });
+  for (uint64_t frame = 1; frame <= 6; ++frame) {
+    history = step(frame, constant);
+  }
+  ASSERT_EQ(history.size(), m_raw.size());
+  for (uint32_t y = 0; y < m_gridHeight; ++y) {
+    for (uint32_t x = 0; x < m_gridWidth; ++x) {
+      const bool offscreen = rep(x, 64) + 0.5f < 10.f;
+      EXPECT_EQ(history[size_t{y} * m_gridWidth + x].count == 1.f, offscreen) << x << "," << y;
+    }
+  }
+}
+
+TEST_F(AoDenoiseGpu, NonReceiverWritesZeroCount) {
+  begin(frontal_rig(64, 48, 500.0));
+  const auto receiver = [](uint32_t x, uint32_t y) { return (x / 3 + y) % 4 != 0; };
+  std::vector<HistoryTexel> history;
+  for (uint64_t frame = 1; frame <= 3; ++frame) {
+    history = step(frame, [&](uint32_t x, uint32_t y, uint8_t e) { return raw_of(0.5, e, receiver(x, y)); });
+  }
+  ASSERT_EQ(history.size(), m_raw.size());
+  for (uint32_t y = 0; y < m_gridHeight; ++y) {
+    for (uint32_t x = 0; x < m_gridWidth; ++x) {
+      const HistoryTexel& texel = history[size_t{y} * m_gridWidth + x];
+      if (receiver(x, y)) {
+        EXPECT_EQ(texel.count, 3.f) << x << "," << y;
+        EXPECT_LT(texel.ao, 1.f) << x << "," << y;
+      } else {
+        EXPECT_EQ(texel.count, 0.f) << x << "," << y;
+        EXPECT_EQ(texel.ao, 1.f) << x << "," << y;
+      }
+    }
+  }
+}
+
+TEST_F(AoDenoiseGpu, HistoryCarriesEdges) {
+  begin(ground_rig(64, 48, 20.0));
+  for (uint64_t frame = 1; frame <= 2; ++frame) {
+    const auto history = step(frame, [&](uint32_t x, uint32_t y, uint8_t e) {
+      return raw_of(0.6, e, m_hiz[size_t{y} * m_gridWidth + x] < 0.5 * ao::SkyDepth);
+    });
+    ASSERT_EQ(history.size(), m_raw.size());
+    size_t edged = 0;
+    for (size_t i = 0; i < history.size(); ++i) {
+      EXPECT_EQ(packed_edges(history[i]), (m_raw[i] >> 8) & 0xFFu) << i;
+      edged += ((m_raw[i] >> 8) & 0xFFu) != 0xFFu ? 1 : 0;
+    }
+    EXPECT_GT(edged, 10u);
+  }
+}
+
+TEST_F(AoDenoiseGpu, EdgesStopBlur) {
+  constexpr uint8_t RightClosed = (3 << 6) | (0 << 4) | (3 << 2) | 3;
+  constexpr uint8_t LeftClosed = (0 << 6) | (3 << 4) | (3 << 2) | 3;
+  for (const bool edged : {true, false}) {
+    SCOPED_TRACE(edged ? "edges" : "open");
+    begin(frontal_rig(64, 48, 500.0));
+    const auto history = step(1, [&](uint32_t x, uint32_t, uint8_t e) {
+      uint8_t edges = e;
+      if (edged && x == 15) {
+        edges = RightClosed;
+      } else if (edged && x == 16) {
+        edges = LeftClosed;
+      }
+      return raw_of(x < 16 ? 0.3 : 1.0, edges);
+    });
+    ASSERT_EQ(history.size(), m_raw.size());
+    for (uint32_t y = 2; y < m_gridHeight - 2; ++y) {
+      const float left = history[size_t{y} * m_gridWidth + 15].ao;
+      const float right = history[size_t{y} * m_gridWidth + 16].ao;
+      if (edged) {
+        EXPECT_NEAR(left, 0.3f, 1e-3f) << y;
+        EXPECT_EQ(right, 1.f) << y;
+      } else {
+        EXPECT_GT(left, 0.32f) << y;
+        EXPECT_LT(right, 0.98f) << y;
+      }
+    }
+  }
+}
+
+TEST_F(AoDenoiseGpu, BorderTexelsValidationClean) {
+  std::mt19937 rng{0xB0DEu};
+  std::uniform_real_distribution<double> unit(0.2, 1.0);
+  for (const auto [width, height] : {std::pair{1u, 1u}, std::pair{3u, 5u}, std::pair{61u, 37u}}) {
+    for (const Quality quality : {Quality::High, Quality::Ultra}) {
+      SCOPED_TRACE(std::to_string(width) + "x" + std::to_string(height) + " q" +
+                   std::to_string(static_cast<int>(quality)));
+      begin(frontal_rig(width, height, 500.0), quality);
+      std::vector<double> values(size_t{m_gridWidth} * m_gridHeight);
+      for (double& value : values) {
+        value = unit(rng);
+      }
+      for (uint64_t frame = 1; frame <= 3; ++frame) {
+        const auto history =
+            step(frame, [&](uint32_t x, uint32_t y, uint8_t e) { return raw_of(values[y * m_gridWidth + x], e); });
+        ASSERT_EQ(history.size(), size_t{m_gridWidth} * m_gridHeight);
+        for (const HistoryTexel& texel : history) {
+          EXPECT_TRUE(std::isfinite(texel.ao) && std::isfinite(texel.logDepth));
+          EXPECT_EQ(texel.count, static_cast<float>(frame));
+          EXPECT_GE(texel.ao, 0.f);
+          EXPECT_LE(texel.ao, 1.f);
+        }
+      }
+      EXPECT_EQ(ao::denoise::testing::counters().dispatches, 3u);
+    }
   }
 }
 } // namespace

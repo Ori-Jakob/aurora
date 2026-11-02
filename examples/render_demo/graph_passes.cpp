@@ -16,7 +16,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -847,27 +849,36 @@ bool register_fog_check(std::string& error) {
   return true;
 }
 
+constexpr u32 AoDynamicSlots = 6;
+
 struct AoCheckParams {
   u32 probeCount;
-  u32 pad[3];
+  u32 frame;
+  u32 flags;
+  u32 dynamicCount;
+  f32 dynamic[AoDynamicSlots * 4];
 };
-static_assert(sizeof(AoCheckParams) == 16);
+static_assert(sizeof(AoCheckParams) == 112);
+static_assert(AoTrailProbeCount <= AoDynamicSlots * 2);
 
 constexpr u32 AoCheckHeaderWords = 8;
 constexpr u32 AoCheckProbeWords = 3;
-constexpr uint64_t AoCheckBytes = (AoCheckHeaderWords + AoCheckMaxProbes * AoCheckProbeWords) * sizeof(u32);
-constexpr size_t AoCheckRing = 4;
+constexpr uint64_t AoCheckBytes =
+    (AoCheckHeaderWords + (AoCheckMaxProbes + AoDynamicSlots * 2) * AoCheckProbeWords) * sizeof(u32);
+constexpr size_t AoCheckRing = 16;
 constexpr auto AoCompileWait = std::chrono::milliseconds{50};
 
-enum AoCheckWord : u32 { AoReceivers, AoPixels, AoWidth, AoHeight, AoWritten };
+enum AoCheckWord : u32 { AoReceivers, AoPixels, AoWidth, AoHeight, AoWritten, AoFrame, AoDynamic };
+enum AoCheckFlag : u32 { AoAccumulate = 1u << 0, AoCopyStats = 1u << 1 };
 enum class AoSlotState : u32 { Free, Copied, Mapping };
 
 constexpr std::string_view AoCheckWgsl = R"(
 struct AoCheckParams {
   probe_count: u32,
-  pad0: u32,
-  pad1: u32,
-  pad2: u32,
+  frame: u32,
+  flags: u32,
+  dynamic_count: u32,
+  dynamic: array<vec4f, 6>,
 };
 struct AoProbe {
   ndc: vec2f,
@@ -879,9 +890,21 @@ struct AoProbe {
 @group(1) @binding(1) var scene_normal: texture_2d<f32>;
 @group(2) @binding(0) var<storage, read_write> results: array<atomic<u32>>;
 @group(2) @binding(1) var<storage, read> probes: array<AoProbe>;
+@group(2) @binding(2) var<storage, read_write> stats: array<vec4f>;
 
 fn receiver_code(p: vec2i) -> u32 {
   return u32(round(saturate(textureLoad(scene_normal, p, 0).a) * 3.0));
+}
+
+fn probe_centre(index: u32, size: vec2u) -> vec2f {
+  if (index < params.probe_count) {
+    let probe = probes[index];
+    return (probe.ndc * vec2f(0.5, -0.5) + 0.5) * vec2f(size) + vec2f(probe.offset_px, 0.0);
+  }
+  let dynamic_index = index - params.probe_count;
+  let slot = params.dynamic[dynamic_index / 2u];
+  let ndc = select(slot.xy, slot.zw, (dynamic_index & 1u) != 0u);
+  return (ndc * vec2f(0.5, -0.5) + 0.5) * vec2f(size);
 }
 
 @compute @workgroup_size(8, 8)
@@ -891,12 +914,12 @@ fn cs_main(@builtin(global_invocation_id) id: vec3u, @builtin(num_workgroups) gr
     atomicStore(&results[2], size.x);
     atomicStore(&results[3], size.y);
     atomicStore(&results[4], 1u);
+    atomicStore(&results[5], params.frame);
+    atomicStore(&results[6], params.dynamic_count);
   }
   let index = id.y * groups.x * 8u + id.x;
-  if (index < params.probe_count) {
-    let probe = probes[index];
-    let centre = (probe.ndc * vec2f(0.5, -0.5) + 0.5) * vec2f(size);
-    let p = clamp(vec2i(floor(centre + vec2f(probe.offset_px, 0.0))), vec2i(0), vec2i(size) - 1);
+  if (index < params.probe_count + params.dynamic_count) {
+    let p = clamp(vec2i(floor(probe_centre(index, size))), vec2i(0), vec2i(size) - 1);
     let ao = textureLoad(ao_final, p, 0);
     let base = 8u + index * 3u;
     atomicStore(&results[base], bitcast<u32>(ao.r));
@@ -907,8 +930,14 @@ fn cs_main(@builtin(global_invocation_id) id: vec3u, @builtin(num_workgroups) gr
     return;
   }
   atomicAdd(&results[1], 1u);
-  if (receiver_code(vec2i(id.xy)) >= 1u) {
+  let receiver = receiver_code(vec2i(id.xy)) >= 1u;
+  if (receiver) {
     atomicAdd(&results[0], 1u);
+  }
+  if ((params.flags & 1u) != 0u && receiver) {
+    let a = textureLoad(ao_final, vec2i(id.xy), 0).r;
+    let pixel = id.y * size.x + id.x;
+    stats[pixel] = stats[pixel] + vec4f(a, a * a, 1.0, 0.0);
   }
 }
 )";
@@ -928,6 +957,14 @@ struct AoCheckPass {
   AoCheckParams params{};
   wgpu::Buffer output;
   wgpu::Buffer probeBuffer;
+  wgpu::Buffer stats;
+  wgpu::Buffer statsReadback;
+  wgpu::Extent3D statsSize{};
+  std::atomic<AoSlotState> statsState = AoSlotState::Free;
+  bool statsCopied = false;
+  u32 statsFrame = 0;
+  u32 sigmaFrames = 0;
+  u32 statsFrames = 0;
   wgpu::BindGroupLayout layout;
   wgpu::BindGroup group;
   std::array<AoCheckSlot, AoCheckRing> slots;
@@ -935,12 +972,14 @@ struct AoCheckPass {
   wgpu::BindGroupLayout passLayout;
   std::mutex mutex;
   std::vector<AoProbe> probes;
+  std::vector<size_t> contactProbes;
   u32 frames = 0;
   u32 failedMaps = 0;
   u32 receivers = 0;
   u32 pixels = 0;
   std::vector<double> sums;
   std::vector<u32> receiverFrames;
+  AoTemporalSummary temporal;
 };
 
 AoCheckPass sAo;
@@ -964,6 +1003,37 @@ wgpu::ComputePipeline create_ao_check_pipeline(const PassContext& ctx, const wgp
   return ctx.device().CreateComputePipeline(&descriptor);
 }
 
+void create_ao_stats(AoCheckPass& check, const wgpu::Device& device, const wgpu::Extent3D& size) {
+  const uint64_t bytes = std::max<uint64_t>(uint64_t{size.width} * size.height * 4 * sizeof(f32), 16);
+  const wgpu::BufferDescriptor statsDescriptor{
+      .label = "demo.ao_check stats",
+      .usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc,
+      .size = bytes,
+  };
+  check.stats = device.CreateBuffer(&statsDescriptor);
+  const wgpu::BufferDescriptor readbackDescriptor{
+      .label = "demo.ao_check stats readback",
+      .usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+      .size = bytes,
+  };
+  check.statsReadback = device.CreateBuffer(&readbackDescriptor);
+  check.statsSize = size;
+  check.sigmaFrames = 0;
+  const uint64_t probeBytes = check.probes.size() * sizeof(AoProbe);
+  const std::array groupEntries{
+      wgpu::BindGroupEntry{.binding = 0, .buffer = check.output, .size = AoCheckBytes},
+      wgpu::BindGroupEntry{.binding = 1, .buffer = check.probeBuffer, .size = probeBytes},
+      wgpu::BindGroupEntry{.binding = 2, .buffer = check.stats, .size = bytes},
+  };
+  const wgpu::BindGroupDescriptor groupDescriptor{
+      .label = "demo.ao_check",
+      .layout = check.layout,
+      .entryCount = groupEntries.size(),
+      .entries = groupEntries.data(),
+  };
+  check.group = device.CreateBindGroup(&groupDescriptor);
+}
+
 void declare_ao_check(PassBuilder& builder, void*) {
   builder.after(aurora::render::phase::Ao);
   builder.use(aurora::render::resource::AoFinal, Access::Sampled, aurora::render::Missing::DisablePass);
@@ -974,12 +1044,19 @@ void declare_ao_check(PassBuilder& builder, void*) {
 void encode_ao_check(PassContext& ctx, void* userdata) {
   auto& check = *static_cast<AoCheckPass*>(userdata);
   check.encodes.fetch_add(1, std::memory_order_relaxed);
+  AoCheckParams params{};
+  if (const std::span<const std::byte> bytes = ctx.params(); bytes.size() >= sizeof(params)) {
+    std::memcpy(&params, bytes.data(), sizeof(params));
+  }
   if (!check.pipeline || check.passLayout.Get() != ctx.pass_layout().Get()) {
     check.pipeline = create_ao_check_pipeline(ctx, check.layout);
     check.passLayout = ctx.pass_layout();
   }
   constexpr aurora::render::TexRef AoFinal{0};
   const wgpu::Extent3D size = ctx.extent(AoFinal);
+  if (!check.stats || check.statsSize.width != size.width || check.statsSize.height != size.height) {
+    create_ao_stats(check, ctx.device(), size);
+  }
   ctx.encoder().ClearBuffer(check.output, 0, AoCheckBytes);
   const wgpu::ComputePassEncoder compute = ctx.begin_compute();
   if (!compute) {
@@ -989,6 +1066,15 @@ void encode_ao_check(PassContext& ctx, void* userdata) {
   compute.SetBindGroup(2, check.group);
   compute.DispatchWorkgroups((size.width + 7) / 8, (size.height + 7) / 8);
   compute.End();
+  check.sigmaFrames += (params.flags & AoAccumulate) != 0 ? 1 : 0;
+  if ((params.flags & AoCopyStats) != 0 && !check.statsCopied &&
+      check.statsState.load(std::memory_order_acquire) == AoSlotState::Free) {
+    ctx.encoder().CopyBufferToBuffer(check.stats, 0, check.statsReadback, 0, check.stats.GetSize());
+    check.statsCopied = true;
+    check.statsFrame = ctx.frame();
+    check.statsFrames = check.sigmaFrames;
+    check.statsState.store(AoSlotState::Copied, std::memory_order_release);
+  }
   if (ctx.frame() < check.armedFrame.load(std::memory_order_acquire)) {
     return;
   }
@@ -1002,6 +1088,51 @@ void encode_ao_check(PassContext& ctx, void* userdata) {
   }
 }
 
+void ao_check_frame(AoCheckPass& check, const u32* mapped) {
+  const u32 frame = mapped[AoFrame];
+  const size_t probeCount = check.probes.size();
+  const auto value = [&](size_t index) { return std::bit_cast<f32>(mapped[AoCheckHeaderWords + index * 3]); };
+  const auto receiver = [&](size_t index) { return mapped[AoCheckHeaderWords + index * 3 + 1] >= 1; };
+  if (frame >= AoSigmaFirst && frame <= AoSigmaLast) {
+    ++check.frames;
+    check.receivers = mapped[AoReceivers];
+    check.pixels = mapped[AoPixels];
+    for (size_t i = 0; i < probeCount; ++i) {
+      check.sums[i] += value(i);
+      check.receiverFrames[i] += receiver(i) ? 1 : 0;
+    }
+  }
+  if (frame >= AoTrailFirst && frame <= AoTrailLast) {
+    AoTrailFrame row{.frame = frame};
+    for (size_t i = 0; i < probeCount; ++i) {
+      if (check.probes[i].cls == AoProbeClass::Open && receiver(i)) {
+        row.open += value(i);
+        ++row.openReceivers;
+      }
+    }
+    const size_t dynamic = std::min<size_t>(mapped[AoDynamic], AoDynamicSlots * 2);
+    for (size_t i = probeCount; i < probeCount + dynamic; ++i) {
+      if (receiver(i)) {
+        row.trail += value(i);
+        ++row.trailReceivers;
+      }
+    }
+    row.open = row.openReceivers != 0 ? row.open / row.openReceivers : 0.0;
+    row.trail = row.trailReceivers != 0 ? row.trail / row.trailReceivers : 0.0;
+    check.temporal.trail.push_back(row);
+  }
+  for (size_t k = 0; k < AoContactFrames.size(); ++k) {
+    if (frame != AoContactFrames[k]) {
+      continue;
+    }
+    std::vector<f32>& band = check.temporal.contact[k];
+    band.clear();
+    for (const size_t i : check.contactProbes) {
+      band.push_back(receiver(i) ? value(i) : std::numeric_limits<f32>::quiet_NaN());
+    }
+  }
+}
+
 void ao_check_mapped(AoCheckPass& check, AoCheckSlot& slot, wgpu::MapAsyncStatus status) {
   const auto* mapped = status == wgpu::MapAsyncStatus::Success
                            ? static_cast<const u32*>(slot.readback.GetConstMappedRange(0, AoCheckBytes))
@@ -1011,14 +1142,7 @@ void ao_check_mapped(AoCheckPass& check, AoCheckSlot& slot, wgpu::MapAsyncStatus
     if (mapped == nullptr || mapped[AoWritten] != 1) {
       ++check.failedMaps;
     } else {
-      ++check.frames;
-      check.receivers = mapped[AoReceivers];
-      check.pixels = mapped[AoPixels];
-      for (size_t i = 0; i < check.probes.size(); ++i) {
-        const u32* probe = mapped + AoCheckHeaderWords + i * AoCheckProbeWords;
-        check.sums[i] += std::bit_cast<f32>(probe[0]);
-        check.receiverFrames[i] += probe[1] >= 1 ? 1 : 0;
-      }
+      ao_check_frame(check, mapped);
     }
   }
   if (status == wgpu::MapAsyncStatus::Success) {
@@ -1027,8 +1151,46 @@ void ao_check_mapped(AoCheckPass& check, AoCheckSlot& slot, wgpu::MapAsyncStatus
   slot.state.store(AoSlotState::Free, std::memory_order_release);
 }
 
+void ao_stats_mapped(AoCheckPass& check, wgpu::MapAsyncStatus status) {
+  const uint64_t bytes = check.statsReadback.GetSize();
+  const auto* values = status == wgpu::MapAsyncStatus::Success
+                           ? static_cast<const f32*>(check.statsReadback.GetConstMappedRange(0, bytes))
+                           : nullptr;
+  AoSigma sigma{.frames = check.statsFrames, .pixels = check.statsSize.width * check.statsSize.height};
+  if (values != nullptr && sigma.frames != 0) {
+    double deviation = 0.0;
+    double mean = 0.0;
+    for (size_t i = 0; i < sigma.pixels; ++i) {
+      const double n = values[i * 4 + 2];
+      if (n + 0.5 < sigma.frames) {
+        continue;
+      }
+      const double m = values[i * 4] / n;
+      deviation += std::sqrt(std::max(values[i * 4 + 1] / n - m * m, 0.0));
+      mean += m;
+      ++sigma.covered;
+    }
+    sigma.sigma = sigma.covered != 0 ? deviation / sigma.covered : 0.0;
+    sigma.mean = sigma.covered != 0 ? mean / sigma.covered : 0.0;
+  }
+  {
+    std::lock_guard lock{check.mutex};
+    check.temporal.sigma = sigma;
+  }
+  if (status == wgpu::MapAsyncStatus::Success) {
+    check.statsReadback.Unmap();
+  }
+  check.statsState.store(AoSlotState::Free, std::memory_order_release);
+}
+
 void ao_check_submitted(u32 frame, void* userdata) {
   auto& check = *static_cast<AoCheckPass*>(userdata);
+  if (check.statsState.load(std::memory_order_acquire) == AoSlotState::Copied && check.statsFrame == frame) {
+    check.statsState.store(AoSlotState::Mapping, std::memory_order_release);
+    check.statsReadback.MapAsync(
+        wgpu::MapMode::Read, 0, check.statsReadback.GetSize(), wgpu::CallbackMode::AllowSpontaneous,
+        [&check](wgpu::MapAsyncStatus status, wgpu::StringView) { ao_stats_mapped(check, status); });
+  }
   for (AoCheckSlot& slot : check.slots) {
     if (slot.state.load(std::memory_order_acquire) != AoSlotState::Copied || slot.frame != frame) {
       continue;
@@ -1049,6 +1211,12 @@ bool register_ao_check(std::string& error) {
   sAo.params = {.probeCount = static_cast<u32>(sAo.probes.size())};
   sAo.sums.assign(sAo.probes.size(), 0.0);
   sAo.receiverFrames.assign(sAo.probes.size(), 0);
+  sAo.contactProbes.clear();
+  for (size_t i = 0; i < sAo.probes.size(); ++i) {
+    if (sAo.probes[i].cls == AoProbeClass::Contact) {
+      sAo.contactProbes.push_back(i);
+    }
+  }
   const wgpu::Device device = aurora::gfx::device();
   const wgpu::BufferDescriptor outputDescriptor{
       .label = "demo.ao_check output",
@@ -1084,6 +1252,11 @@ bool register_ao_check(std::string& error) {
           .visibility = wgpu::ShaderStage::Compute,
           .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage},
       },
+      wgpu::BindGroupLayoutEntry{
+          .binding = 2,
+          .visibility = wgpu::ShaderStage::Compute,
+          .buffer = {.type = wgpu::BufferBindingType::Storage},
+      },
   };
   const wgpu::BindGroupLayoutDescriptor layoutDescriptor{
       .label = "demo.ao_check",
@@ -1091,17 +1264,6 @@ bool register_ao_check(std::string& error) {
       .entries = layoutEntries.data(),
   };
   sAo.layout = device.CreateBindGroupLayout(&layoutDescriptor);
-  const std::array groupEntries{
-      wgpu::BindGroupEntry{.binding = 0, .buffer = sAo.output, .size = AoCheckBytes},
-      wgpu::BindGroupEntry{.binding = 1, .buffer = sAo.probeBuffer, .size = probeBytes},
-  };
-  const wgpu::BindGroupDescriptor groupDescriptor{
-      .label = "demo.ao_check",
-      .layout = sAo.layout,
-      .entryCount = groupEntries.size(),
-      .entries = groupEntries.data(),
-  };
-  sAo.group = device.CreateBindGroup(&groupDescriptor);
   sAo.id = aurora::render::register_pass({
       .name = "demo.ao_check",
       .stage = aurora::render::Stage::OpaqueDone,
@@ -1117,6 +1279,20 @@ bool register_ao_check(std::string& error) {
     return false;
   }
   return true;
+}
+
+void update_ao_check(u32 frame) {
+  const bool armed = sAo.armedFrame.load(std::memory_order_relaxed) != UINT32_MAX;
+  sAo.params.frame = frame;
+  sAo.params.flags = (armed && frame >= AoSigmaFirst && frame <= AoSigmaLast ? AoAccumulate : 0u) |
+                     (frame > AoSigmaLast ? AoCopyStats : 0u);
+  const std::vector<std::array<f32, 2>> trail = ao_trail_probes(frame);
+  sAo.params.dynamicCount = static_cast<u32>(std::min<size_t>(trail.size(), AoDynamicSlots * 2));
+  for (size_t i = 0; i < sAo.params.dynamicCount; ++i) {
+    sAo.params.dynamic[i * 2] = trail[i][0];
+    sAo.params.dynamic[i * 2 + 1] = trail[i][1];
+  }
+  aurora::render::set_pass_params(sAo.id, &sAo.params, sizeof(sAo.params));
 }
 } // namespace
 
@@ -1208,7 +1384,7 @@ void update_graph_passes(u32 frame) {
     }
   }
   if (sAo.id != aurora::render::InvalidPass) {
-    aurora::render::set_pass_params(sAo.id, &sAo.params, sizeof(sAo.params));
+    update_ao_check(frame);
     if (frame >= AoCheckFrame && sAo.armedFrame.load(std::memory_order_relaxed) == UINT32_MAX) {
       if (!std::exchange(sAo.waitedForPipelines, true)) {
         wait_for_pipelines();
@@ -1239,9 +1415,10 @@ void finish_graph_passes() {
   const bool motion = waiting(sMotion.id, sMotion.encodes, sMotion.armedFrame);
   const bool fog = waiting(sFog.id, sFog.encodes, sFog.armedFrame);
   const auto aoPending = [] {
-    return std::ranges::any_of(sAo.slots, [](const AoCheckSlot& slot) {
-      return slot.state.load(std::memory_order_acquire) != AoSlotState::Free;
-    });
+    return sAo.statsState.load(std::memory_order_acquire) != AoSlotState::Free ||
+           std::ranges::any_of(sAo.slots, [](const AoCheckSlot& slot) {
+             return slot.state.load(std::memory_order_acquire) != AoSlotState::Free;
+           });
   };
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
   while (((depth && sProbe.result.load(std::memory_order_acquire) == ProbeResult::Pending) ||
@@ -1290,6 +1467,7 @@ GraphPassReport graph_pass_report() {
         .probes = sAo.probes,
         .sums = sAo.sums,
         .receiverFrames = sAo.receiverFrames,
+        .temporal = sAo.temporal,
     };
   }
   return report;
@@ -1342,6 +1520,8 @@ void unregister_graph_passes() {
   sAo.layout = {};
   sAo.probeBuffer = {};
   sAo.output = {};
+  sAo.stats = {};
+  sAo.statsReadback = {};
   for (AoCheckSlot& slot : sAo.slots) {
     slot.readback = {};
   }

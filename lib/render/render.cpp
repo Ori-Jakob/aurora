@@ -203,6 +203,9 @@ bool feature_ready(Feature feature) noexcept {
   if (feature == Feature::Upscaler && !detail::upscale::ready(effective_settings())) {
     return false;
   }
+  if (feature == Feature::Ao && !detail::ao::ready(effective_settings())) {
+    return false;
+  }
 #endif
   // DeferredFog mirrors the gbuffer request but has no composite until its built bit is set
   return feature != Feature::DeferredFog || feature_support(Feature::DeferredFog, 1).supported;

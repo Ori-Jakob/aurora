@@ -1,5 +1,6 @@
 #include "graph_checks.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <numbers>
@@ -57,6 +58,9 @@ AoCheckSummary summarize_ao_check(std::span<const AoProbeStat> probes, double co
   u32 open = 0;
   for (const AoProbeStat& probe : probes) {
     const auto cls = static_cast<size_t>(probe.cls);
+    if (cls >= AoProbeClassCount) {
+      continue;
+    }
     ++summary.probes[cls];
     if (!probe.receiver) {
       continue;
@@ -103,5 +107,79 @@ std::optional<std::string> check_ao(const AoCheckSummary& summary) {
     return std::string{text};
   }
   return std::nullopt;
+}
+AoTemporalOutcome check_ao_temporal(const AoTemporalSummary& summary) {
+  AoTemporalOutcome outcome{.trailMargin = 1.0};
+  char text[160];
+  const AoSigma& sigma = summary.sigma;
+  if (sigma.frames == 0 || sigma.covered == 0) {
+    std::snprintf(text, sizeof(text), "the sigma window read %u frames over %u receiver pixels", sigma.frames,
+                  sigma.covered);
+    outcome.failure = std::string{text};
+    return outcome;
+  }
+  for (u32 frame = AoTrailFirst; frame <= AoTrailLast; ++frame) {
+    const auto it = std::ranges::find(summary.trail, frame, &AoTrailFrame::frame);
+    if (it == summary.trail.end()) {
+      std::snprintf(text, sizeof(text), "frame %u was not read back", frame);
+      outcome.failure = std::string{text};
+      return outcome;
+    }
+    if (it->trailReceivers * 2 < AoTrailProbeCount || it->openReceivers == 0) {
+      std::snprintf(text, sizeof(text), "frame %u: only %u of %u trail probes landed on receivers", frame,
+                    it->trailReceivers, AoTrailProbeCount);
+      outcome.failure = std::string{text};
+      return outcome;
+    }
+    ++outcome.trailFrames;
+    outcome.trailMargin = std::min(outcome.trailMargin, it->trail - (it->open - AoTrailMargin));
+    if (it->trail < it->open - AoTrailMargin) {
+      std::snprintf(text, sizeof(text), "frame %u: trail mean %.3f is below open-ground %.3f - %.2f", frame, it->trail,
+                    it->open, AoTrailMargin);
+      outcome.failure = std::string{text};
+      return outcome;
+    }
+  }
+  const auto& [before, settle, steady] = summary.contact;
+  if (before.empty() || settle.empty() || steady.empty() || settle.size() != steady.size() ||
+      before.size() != steady.size()) {
+    std::snprintf(text, sizeof(text), "the contact band was not read back on frames %u, %u and %u", AoContactFrames[0],
+                  AoContactFrames[1], AoContactFrames[2]);
+    outcome.failure = std::string{text};
+    return outcome;
+  }
+  double removal = 0.0;
+  double shadow = 0.0;
+  u32 shadowProbes = 0;
+  for (size_t i = 0; i < steady.size(); ++i) {
+    if (std::isnan(steady[i])) {
+      continue;
+    }
+    if (!std::isnan(settle[i])) {
+      removal += std::abs(double{settle[i]} - steady[i]);
+      ++outcome.removalProbes;
+    }
+    if (!std::isnan(before[i])) {
+      shadow += double{steady[i]} - before[i];
+      ++shadowProbes;
+    }
+  }
+  if (outcome.removalProbes * 2 < steady.size() || shadowProbes == 0) {
+    std::snprintf(text, sizeof(text), "only %u of %zu contact probes landed on receivers", outcome.removalProbes,
+                  steady.size());
+    outcome.failure = std::string{text};
+    return outcome;
+  }
+  outcome.removal = removal / outcome.removalProbes;
+  outcome.shadow = shadow / shadowProbes;
+  if (outcome.shadow < AoSliderShadowMin) {
+    std::snprintf(text, sizeof(text), "the slider darkened its contact band by only %.3f", outcome.shadow);
+    outcome.failure = std::string{text};
+  } else if (outcome.removal > AoRemovalMax) {
+    std::snprintf(text, sizeof(text), "contact band changed by %.3f between frames %u and %u", outcome.removal,
+                  AoSettleFrame, AoSteadyFrame);
+    outcome.failure = std::string{text};
+  }
+  return outcome;
 }
 } // namespace render_demo

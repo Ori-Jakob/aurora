@@ -1,5 +1,6 @@
 #include "ao.hpp"
 
+#include "denoise.hpp"
 #include "gtao.hpp"
 #include "hiz.hpp"
 #include "upsample.hpp"
@@ -27,7 +28,8 @@
 namespace aurora::render::detail::ao {
 namespace {
 constexpr Module Log{"aurora::render::ao"};
-constexpr std::array<std::string_view, 3> ChainPasses{hiz::Pass, gtao::Pass, upsample::Pass};
+constexpr std::array<std::string_view, 4> ChainPasses{hiz::Pass, gtao::Pass, upsample::Pass, denoise::Pass};
+static_assert(ChainPasses.size() <= MaxAoPasses);
 
 struct LatchSlot {
   bool live = false;
@@ -132,6 +134,9 @@ const EnvOverrides& env_overrides() noexcept {
     }
     if (const char* value = SDL_getenv("AURORA_RENDER_AO_SECTORS")) {
       out.flags |= parse_choice("AURORA_RENDER_AO_SECTORS", value, "round", "ceil", FlagSectorCeil);
+    }
+    if (const char* value = SDL_getenv("AURORA_RENDER_AO_TEMPORAL")) {
+      out.flags |= parse_choice("AURORA_RENDER_AO_TEMPORAL", value, "on", "off", FlagTemporalOff);
     }
     if (identity_forced()) {
       out.flags |= FlagIdentityForced;
@@ -288,6 +293,15 @@ void on_latch(const Settings& settings, const CompiledGraph* graph) {
 
 bool pipelines_live() noexcept { return g_slot.live && g_slot.ids[0] != 0 && shaders::pipelines_ready(g_slot.ids); }
 
+bool ready(const Settings& settings) noexcept {
+  return settings.ao == Quality::Off || (pipelines_live() && hints_enabled());
+}
+
+bool motion_valid(const StageData& stage) noexcept {
+  const SceneHints* hints = stage_hints(stage);
+  return hints != nullptr && hints->motionValid;
+}
+
 float effective_strength() noexcept { return g_strength.load(std::memory_order_relaxed); }
 
 void initialize() {
@@ -295,6 +309,7 @@ void initialize() {
     g_passes[0] = register_pass(hiz::pass_desc());
     g_passes[1] = register_pass(gtao::pass_desc());
     g_passes[2] = register_pass(upsample::pass_desc());
+    g_passes[3] = register_pass(denoise::pass_desc());
   }
 }
 
@@ -309,9 +324,13 @@ void shutdown() noexcept {
   g_classView.store(false, std::memory_order_relaxed);
   g_strength.store(1.f, std::memory_order_relaxed);
   hiz::clear_cache();
+  denoise::shutdown();
 }
 
-void worker_tick(uint64_t frameId) noexcept { hiz::worker_tick(frameId); }
+void worker_tick(uint64_t frameId) noexcept {
+  hiz::worker_tick(frameId);
+  denoise::worker_tick(frameId);
+}
 
 namespace testing {
 Counters counters() noexcept {
@@ -329,6 +348,7 @@ void reset() noexcept {
   hiz::testing::reset();
   gtao::testing::reset();
   upsample::testing::reset();
+  denoise::testing::reset();
 }
 
 void set_camera_override(std::shared_ptr<const SceneHints> hints) noexcept { g_cameraOverride = std::move(hints); }

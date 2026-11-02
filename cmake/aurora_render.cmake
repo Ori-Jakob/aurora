@@ -19,6 +19,8 @@ if (AURORA_ENABLE_RENDER)
     target_sources(aurora_gx PRIVATE
         lib/render/ao/ao.cpp
         lib/render/ao/ao.hpp
+        lib/render/ao/denoise.cpp
+        lib/render/ao/denoise.hpp
         lib/render/ao/gtao.cpp
         lib/render/ao/gtao.hpp
         lib/render/ao/hiz.cpp

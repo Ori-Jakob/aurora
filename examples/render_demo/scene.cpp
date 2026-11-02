@@ -50,6 +50,7 @@ constexpr u64 CaptureOnlyObject = 0x300;
 constexpr u64 WaterObject = 0x400;
 constexpr u64 AoWallObject = 0x500;
 constexpr u64 AoPoleObject = 0x501;
+constexpr u64 AoSliderObject = 0x502;
 constexpr u32 GroundMaterial = 1;
 constexpr u32 SceneEpoch = 1;
 constexpr u32 GroundTextureSize = 64;
@@ -66,6 +67,13 @@ struct Slab {
 };
 constexpr Slab AoWall{{14.f, 1.5f, -4.f}, {0.2f, 3.f, 6.f}};
 constexpr Slab AoPole{{14.65f, 1.3f, -4.f}, {0.1f, 2.6f, 0.1f}};
+constexpr Vec AoSliderStart{11.f, 0.5f, 1.f};
+constexpr f32 AoSliderSize = 1.f;
+
+f32 ao_slider_z(u32 frame) noexcept {
+  const u32 last = AoSliderRemoved - 1;
+  return AoSliderStart.z + AoSliderStep * static_cast<f32>(std::clamp(frame, AoSliderFirst, last) - AoSliderFirst);
+}
 
 struct BoxPlacement {
   f32 x;
@@ -511,24 +519,33 @@ void draw_hud_panel() {
   pop_scope();
 }
 
-void draw_ao_slabs(const Mtx view) {
+void draw_ao_slab(const Mtx view, const Slab& slab, u64 id, u32 category, u32 flags) {
+  Mtx model;
+  Mtx scale;
+  Mtx modelView;
+  C_MTXTrans(model, slab.centre.x, slab.centre.y, slab.centre.z);
+  C_MTXScale(scale, slab.size.x, slab.size.y, slab.size.z);
+  C_MTXConcat(model, scale, model);
+  C_MTXConcat(view, model, modelView);
+  begin_object(id, category, flags);
+  load_matrices(modelView, GX_PNMTX0);
+  set_box_format();
+  GXCallDisplayList(sBoxDisplayList, sBoxDisplayListSize);
+  end_object();
+}
+
+void draw_ao_slabs(const Mtx view, u32 frame) {
   set_lit_channel(GX_SRC_VTX);
   set_pass_color_tev();
   GXSetCurrentMtx(GX_PNMTX0);
   GXSetCullMode(GX_CULL_BACK);
   for (const auto& [slab, id] : {std::pair{AoWall, AoWallObject}, std::pair{AoPole, AoPoleObject}}) {
-    Mtx model;
-    Mtx scale;
-    Mtx modelView;
-    C_MTXTrans(model, slab.centre.x, slab.centre.y, slab.centre.z);
-    C_MTXScale(scale, slab.size.x, slab.size.y, slab.size.z);
-    C_MTXConcat(model, scale, model);
-    C_MTXConcat(view, model, modelView);
-    begin_object(id, AURORA_CAT_STATIC, AURORA_OBJ_IMMOBILE);
-    load_matrices(modelView, GX_PNMTX0);
-    set_box_format();
-    GXCallDisplayList(sBoxDisplayList, sBoxDisplayListSize);
-    end_object();
+    draw_ao_slab(view, slab, id, AURORA_CAT_STATIC, AURORA_OBJ_IMMOBILE);
+  }
+  if (frame >= AoSliderFirst && frame < AoSliderRemoved) {
+    const Slab slider{{AoSliderStart.x, AoSliderStart.y, ao_slider_z(frame)},
+                      {AoSliderSize, AoSliderSize, AoSliderSize}};
+    draw_ao_slab(view, slider, AoSliderObject, AURORA_CAT_DYNAMIC, 0);
   }
 }
 
@@ -766,6 +783,32 @@ std::vector<AoProbe> ao_check_probes() {
       probes.push_back({.ndc = {left, row}, .offsetPx = -static_cast<f32>(k), .cls = AoProbeClass::Strip});
     }
   }
+  const f32 half = AoSliderSize / 2.f;
+  const f32 z = ao_slider_z(AoSliderRemoved - 1);
+  for (const f32 gap : {AoContactNear, 0.15f, 0.3f, 0.45f, AoContactFar}) {
+    for (const f32 along : {-0.4f, -0.2f, 0.f, 0.2f, 0.4f}) {
+      add(AoProbeClass::Contact, {AoSliderStart.x + half + gap, 0.f, z + along});
+      add(AoProbeClass::Contact, {AoSliderStart.x - half - gap, 0.f, z + along});
+      add(AoProbeClass::Contact, {AoSliderStart.x + along, 0.f, z + half + gap});
+      add(AoProbeClass::Contact, {AoSliderStart.x + along, 0.f, z - half - gap});
+    }
+  }
+  return probes;
+}
+
+std::vector<std::array<f32, 2>> ao_trail_probes(u32 frame) {
+  if (frame < AoSliderFirst) {
+    return {};
+  }
+  const SceneCamera camera = scene_camera(AoCheckClock);
+  const f32 trailing = ao_slider_z(frame) - AoSliderSize / 2.f;
+  std::vector<std::array<f32, 2>> probes;
+  for (u32 i = 0; i < AoTrailProbeCount / 2; ++i) {
+    const f32 behind = AoTrailNear + (AoTrailFar - AoTrailNear) * static_cast<f32>(i) / (AoTrailProbeCount / 2 - 1);
+    for (const f32 side : {-0.25f, 0.25f}) {
+      probes.push_back(project(camera, {AoSliderStart.x + side, 0.f, trailing - behind}));
+    }
+  }
   return probes;
 }
 
@@ -809,7 +852,7 @@ void draw_scene(u32 frame, const SceneOptions& options) {
   }
   draw_boxes(view, t);
   if (options.aoCheck) {
-    draw_ao_slabs(view);
+    draw_ao_slabs(view, frame);
   }
 
   Mtx bones[TentacleBones];

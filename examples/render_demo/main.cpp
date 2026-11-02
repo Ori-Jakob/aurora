@@ -219,6 +219,7 @@ std::optional<std::string> fog_check_failure(const render_demo::GraphPassReport&
 
 struct AoCheckOutcome {
   render_demo::AoCheckSummary summary;
+  render_demo::AoTemporalOutcome temporal;
   std::optional<std::string> failure;
 };
 
@@ -236,12 +237,15 @@ AoCheckOutcome ao_check_outcome(const render_demo::AoCheckReport& report, bool n
   if (nullBackend) {
     return outcome;
   }
+  outcome.temporal = check_ao_temporal(report.temporal);
   if (report.encodes == 0) {
     outcome.failure = "ao.final or gx.normal unavailable";
   } else if (report.frames == 0) {
     outcome.failure = "no frame was read back";
+  } else if (const std::optional<std::string> failure = check_ao(outcome.summary)) {
+    outcome.failure = failure;
   } else {
-    outcome.failure = check_ao(outcome.summary);
+    outcome.failure = outcome.temporal.failure;
   }
   return outcome;
 }
@@ -826,6 +830,13 @@ int main(int argc, char* argv[]) {
         status.c_str(), graphReport.ao.frames, a.coverage, a.mean[0], a.receivers[0], a.probes[0], a.mean[1],
         a.openShare * 100.0, a.receivers[1], a.probes[1], a.mean[2], a.receivers[2], a.probes[2], a.mean[3],
         a.receivers[3], a.probes[3]);
+    const auto& sigma = graphReport.ao.temporal.sigma;
+    const auto& t = aoOutcome.temporal;
+    std::printf(
+        "render_demo: ao temporal: sigma %.5f over %u frames (coverage %.3f, mean %.4f), trail margin %+.3f over %u "
+        "frames, removal %.4f (%u probes), slider shadow %.3f\n",
+        sigma.sigma, sigma.frames, sigma.pixels != 0 ? static_cast<double>(sigma.covered) / sigma.pixels : 0.0,
+        sigma.mean, t.trailMargin, t.trailFrames, t.removal, t.removalProbes, t.shadow);
   }
   if (options.gpuCull != 0) {
     print_cull_report(graphReport.cull, frame, options.cullTimings);

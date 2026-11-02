@@ -6,6 +6,7 @@
 #include "render/frame_state.hpp"
 #include "render/module.hpp"
 #if AURORA_ENABLE_RENDER
+#include "render/ao/ao.hpp"
 #include "render/geometry/compact.hpp"
 #endif
 #include "render/settings.hpp"
@@ -482,6 +483,32 @@ TEST_F(RenderApiTest, AoNotBuiltBeforeComposite) {
             unsupported(Reason::NotImplemented));
   EXPECT_EQ(clamp_settings({.ao = Quality::High}, env(caps, built)).ao, Quality::Off);
 }
+
+#if AURORA_ENABLE_RENDER
+TEST_F(RenderApiTest, AoReadyTracksPipelines) {
+  detail::testing::set_caps(full_caps());
+  detail::testing::set_built_options(Feature::Ao, detail::ao::BuiltOptionMask);
+  detail::latch_frame();
+  EXPECT_TRUE(feature_ready(Feature::Ao));
+  EXPECT_TRUE(detail::ao::ready(effective_settings()));
+
+  apply_settings({.ao = Quality::High});
+  detail::latch_frame();
+  ASSERT_TRUE(feature_enabled(effective_settings(), Feature::Ao));
+  EXPECT_FALSE(detail::ao::pipelines_live());
+  EXPECT_FALSE(detail::ao::ready(effective_settings()));
+  EXPECT_FALSE(feature_ready(Feature::Ao));
+  EXPECT_FALSE(feature_active(Feature::Ao));
+  EXPECT_TRUE(feature_ready(Feature::GBuffer));
+
+  detail::testing::set_built_options(Feature::Ao, 0);
+  apply_settings({.ao = Quality::High});
+  detail::latch_frame();
+  EXPECT_FALSE(feature_enabled(effective_settings(), Feature::Ao));
+  EXPECT_TRUE(feature_ready(Feature::Ao));
+  gfx::shutdown_pipeline_cache();
+}
+#endif
 
 TEST_F(RenderApiTest, AoTuningSanitized) {
   for (const float bad : {NaN, Infinity, -Infinity}) {
@@ -1160,22 +1187,23 @@ TEST_F(RenderApiTest, FeatureReadyFollowsSceneLayout) {
   enable_all_built();
   apply_settings({.ao = Quality::High});
   detail::latch_frame();
-  ASSERT_TRUE(feature_enabled(effective_settings(), Feature::Ao));
-  ASSERT_NE(feature_info(Feature::Ao).tier, detail::Tier::None);
-  EXPECT_TRUE(feature_ready(Feature::Ao));
+  ASSERT_TRUE(feature_enabled(effective_settings(), Feature::GBuffer));
+  ASSERT_NE(feature_info(Feature::GBuffer).tier, detail::Tier::None);
+  EXPECT_TRUE(feature_ready(Feature::GBuffer));
 
   // Leaving the tier warms the legacy layout, which needs no device
   webgpu::g_graphicsConfig.gbuffer = true;
   gfx::detail::latch_scene_layout(false);
   ASSERT_TRUE(gfx::scene_layout_transitioning());
+  EXPECT_FALSE(feature_ready(Feature::GBuffer));
+  EXPECT_FALSE(feature_active(Feature::GBuffer));
   EXPECT_FALSE(feature_ready(Feature::Ao));
-  EXPECT_FALSE(feature_active(Feature::Ao));
   EXPECT_TRUE(feature_ready(Feature::TextureMaterials));
   EXPECT_TRUE(feature_ready(Feature::Ssil));
 
   gfx::detail::latch_scene_layout(true);
   EXPECT_FALSE(gfx::scene_layout_transitioning());
-  EXPECT_TRUE(feature_ready(Feature::Ao));
+  EXPECT_TRUE(feature_ready(Feature::GBuffer));
   webgpu::g_graphicsConfig.gbuffer = false;
   gfx::shutdown_pipeline_cache();
 }

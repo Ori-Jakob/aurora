@@ -33,7 +33,7 @@ enum FogCheckWord : u32 {
 };
 
 inline constexpr u32 AoCheckFrame = 30;
-inline constexpr u32 AoCheckMaxProbes = 256;
+inline constexpr u32 AoCheckMaxProbes = 512;
 
 struct AoCheckReport {
   u32 encodes = 0;
@@ -44,6 +44,7 @@ struct AoCheckReport {
   std::vector<AoProbe> probes;
   std::vector<double> sums;
   std::vector<u32> receiverFrames;
+  AoTemporalSummary temporal;
 };
 
 struct GraphPassOptions {
