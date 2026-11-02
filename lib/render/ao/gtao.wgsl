@@ -41,8 +41,9 @@ fn gtao_depth(p: vec2i, last: vec2i) -> f32 {
   return textureLoad(ao_hiz, clamp(p, vec2i(0), last), 0).r;
 }
 
+// Mip sizes are max(1, size >> mip), so no size query per sample
 fn gtao_mip_texel(p: vec2i, mip: u32, last: vec2i) -> vec2i {
-  return min(clamp(p, vec2i(0), last) >> vec2u(mip), vec2i(textureDimensions(ao_hiz, mip)) - 1);
+  return min(clamp(p, vec2i(0), last) >> vec2u(mip), max((last + 1) >> vec2u(mip), vec2i(1)) - 1);
 }
 
 fn gtao_calculate_edges(z: f32, l: f32, r: f32, t: f32, b: f32) -> vec4f {
@@ -72,14 +73,22 @@ fn gtao_depth_normal(edges: vec4f, c: vec3f, l: vec3f, r: vec3f, t: vec3f, b: ve
          accepted.w * cross(db, dl);
 }
 
-fn gtao_normal_angle(u: vec2f, full: vec2f, view_vec: vec3f, normal: vec3f) -> f32 {
-  let cam = ao_params.camera.depth;
-  let direction = normalize(vec3f(u.x / (full.x * cam.z), -u.y / (full.y * cam.w), 0.0));
-  let ortho = direction - dot(direction, view_vec) * view_vec;
-  let axis = normalize(cross(ortho, view_vec));
-  let projected = normal - axis * dot(normal, axis);
-  let cos_n = saturate(dot(projected, view_vec) / max(length(projected), 1e-6));
-  return sign(dot(ortho, projected)) * acos(cos_n);
+// Equals projecting the normal onto the slice plane through u, without building that plane's basis
+fn gtao_normal_angle(u: vec2f, dir_scale: vec2f, view_vec: vec3f, normal: vec3f, n_dot_v: f32) -> f32 {
+  let dir = u * dir_scale;
+  let d_dot_v = dot(dir, view_vec.xy);
+  let along = dot(normal.xy, dir) - d_dot_v * n_dot_v;
+  let ortho_sq = max(dot(dir, dir) - d_dot_v * d_dot_v, 0.0);
+  let len_sq = max(n_dot_v * n_dot_v * ortho_sq + along * along, 1e-30);
+  let cos_n = saturate(n_dot_v * sqrt(ortho_sq) * inverseSqrt(len_sq));
+  return sign(along) * gtao_acos(cos_n);
+}
+
+// Abramowitz and Stegun 4.4.45, within 7e-5 rad: a few thousandths of a sector
+fn gtao_acos(x: f32) -> f32 {
+  let a = abs(x);
+  let r = sqrt(1.0 - a) * (1.5707288 + a * (-0.2121144 + a * (0.0742610 - 0.0187293 * a)));
+  return select(GTAO_PI - r, r, x >= 0.0);
 }
 
 fn gtao_safe_normalize(v: vec3f, fallback: vec3f) -> vec3f {
@@ -145,6 +154,15 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   }
 
   let noise = ao_noise(id.xy, ao_params.noise_index);
+  let cam = ao_params.camera.depth;
+  let dir_scale = vec2f(1.0 / (fullf.x * cam.z), -1.0 / (fullf.y * cam.w));
+  // gtao_position's terms folded once, since only the cell and the depth change per sample
+  let inv_full = 1.0 / fullf;
+  let ndc_scale = vec2f(2.0, -2.0) * step_px * inv_full;
+  let ndc_bias = vec2f(2.0, -2.0) * (f32(d / 2u) + 0.5) * inv_full + vec2f(-1.0, 1.0) + ao_params.camera.offset.xy +
+                 vec2f(-2.0, 2.0) * ao_params.camera.offset.zw * inv_full;
+  let inv_proj = 1.0 / cam.zw;
+  let n_dot_v = dot(normal, view_vec);
   let falloff_range = ao_params.falloff_range * effect_radius;
   let falloff_from = effect_radius * (1.0 - ao_params.falloff_range);
   let falloff_mul = -1.0 / falloff_range;
@@ -176,15 +194,18 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         }
         let cell = (vec2f(texel) + 0.5) * f32(1u << mip) - 0.5;
         let towards = cell - vec2f(p);
-        let delta = gtao_position(cell * step_px + f32(d / 2u) + 0.5, sz, fullf) - pix_centre;
+        let delta = vec3f((cell * ndc_scale + ndc_bias) * (sz * inv_proj), sz) - pix_centre;
         let dist = length(delta);
         let weight = saturate(dist * falloff_mul + falloff_add);
         if (weight <= 0.0 || dist <= 0.0 || dot(towards, towards) < 0.25) {
           continue;
         }
-        let n = gtao_normal_angle(select(-towards, towards, side == 0u), fullf, view_vec, normal);
-        let front = acos(clamp(dot(delta / dist, view_vec), -1.0, 1.0));
-        let back = acos(clamp(dot(normalize(delta - view_vec * ao_params.thickness), view_vec), -1.0, 1.0));
+        let n = gtao_normal_angle(select(-towards, towards, side == 0u), dir_scale, view_vec, normal, n_dot_v);
+        let delta_v = dot(delta, view_vec);
+        let front = gtao_acos(clamp(delta_v / dist, -1.0, 1.0));
+        let thickness = ao_params.thickness;
+        let back_len_sq = max(dist * dist - 2.0 * thickness * delta_v + thickness * thickness, 1e-30);
+        let back = gtao_acos(clamp((delta_v - thickness) * inverseSqrt(back_len_sq), -1.0, 1.0));
         var lo: f32;
         var hi: f32;
         if (side == 0u) {
