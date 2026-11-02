@@ -92,6 +92,18 @@ TEST(StreamingSizesTest, VertexAndIndexIndependent) {
   EXPECT_EQ(growth.sizes.storage, StorageBufferSize);
 }
 
+TEST(StreamingSizesTest, UniformsGrowOnlyOnRequest) {
+  constexpr StreamingLimits limits{
+      .vertex = 128 * MiB, .index = 128 * MiB, .storage = 128 * MiB, .staging = 256 * MiB, .uniform = 64 * MiB};
+  AuroraStats full{};
+  full.lastUniformSize = static_cast<uint32_t>(UniformBufferSize);
+  // A frame that fit keeps its buffer, since a new one costs a worker sync and every uniform rebind
+  EXPECT_EQ(next_streaming_sizes({}, full, {}, limits).sizes, StreamingSizes{});
+  EXPECT_EQ(next_streaming_sizes({}, full, {.uniform = 32 * MiB}, limits).sizes.uniform, 32 * MiB);
+  EXPECT_EQ(next_streaming_sizes({}, full, {.uniform = 128 * MiB}, limits).sizes.uniform, 64 * MiB);
+  EXPECT_EQ(staging_layout({.uniform = 32 * MiB}).index, 37 * MiB);
+}
+
 TEST(ResidentCapacityTest, NoRequestKeepsCapacity) {
   EXPECT_EQ(next_resident_capacity(0, 0, 8 * MiB, 128 * MiB), 0u);
   EXPECT_EQ(next_resident_capacity(2 * MiB, 0, 8 * MiB, 128 * MiB), 2 * MiB);

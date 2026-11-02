@@ -7,7 +7,9 @@
 #include "gfx/frame_packet.hpp"
 #include "gfx/recording.hpp"
 #include "gfx/resources.hpp"
+#include "gx/gx.hpp"
 #include "internal.hpp"
+#include "render/graph_bind.hpp"
 
 #include <aurora/aurora.h>
 #include <aurora/gfx.hpp>
@@ -29,6 +31,8 @@ constexpr uint64_t MiB = 1024 * 1024;
 constexpr uint64_t Capacity = MiB;
 constexpr uint32_t CopyGroupSize = 256;
 constexpr std::string_view OverrunWarning = "more than a staging spill can hold";
+constexpr std::string_view UniformWarning = "Frame uniform data outgrew its 1 MiB staging";
+constexpr std::string_view StorageWarning = "Frame storage data outgrew its 1 MiB staging";
 
 constexpr const char* CopyWgsl = R"(
 @group(0) @binding(0) var<storage, read> src: array<u32>;
@@ -85,7 +89,8 @@ protected:
     g_warnings.clear();
     m_savedLog = std::exchange(g_config.logCallback, &capture_warning);
     detail::testing::reset_stream_warnings();
-    detail::testing::reset_streaming_request();
+    // From zero, so the request shows what this frame alone asked for
+    detail::testing::reset_streaming_request({.vertex = 0, .index = 0, .storage = 0, .uniform = 0});
 
     auto& res = detail::resources();
     m_savedVertex =
@@ -96,9 +101,14 @@ protected:
                                                             wgpu::BufferUsage::CopyDst));
     m_savedStorage =
         std::exchange(res.storageBuffer, buffer(Capacity, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst));
-    m_savedSizes = std::exchange(res.deviceSizes, {.vertex = Capacity, .index = Capacity, .storage = Capacity});
+    m_savedUniform =
+        std::exchange(res.uniformBuffer, buffer(Capacity, wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst));
+    m_savedSizes = std::exchange(res.deviceSizes,
+                                 {.vertex = Capacity, .index = Capacity, .storage = Capacity, .uniform = Capacity});
     m_savedStaticGroup = std::exchange(res.staticBindGroup, {});
     m_savedStaticLayout = std::exchange(res.staticBindGroupLayout, {});
+    m_savedUniformGroup = std::exchange(res.uniformBindGroup, {});
+    m_savedUniformLayout = std::exchange(res.uniformBindGroupLayout, {});
 
     // Mapped the way begin_frame maps a staging slot
     m_frame.sizes = res.deviceSizes;
@@ -110,7 +120,9 @@ protected:
     };
     m_staging = m_device->device.CreateBuffer(&stagingDescriptor);
     m_frame.verts = ByteBuffer{static_cast<uint8_t*>(m_staging.GetMappedRange(layout.vertex, Capacity)), Capacity};
+    m_frame.uniforms = ByteBuffer{static_cast<uint8_t*>(m_staging.GetMappedRange(layout.uniform, Capacity)), Capacity};
     m_frame.indices = ByteBuffer{static_cast<uint8_t*>(m_staging.GetMappedRange(layout.index, Capacity)), Capacity};
+    m_frame.storage = ByteBuffer{static_cast<uint8_t*>(m_staging.GetMappedRange(layout.storage, Capacity)), Capacity};
     detail::testing::set_staging_buffer(0, m_staging);
     m_frame.stagingBuffer = 0;
 
@@ -146,9 +158,12 @@ protected:
     res.vertexBuffer = std::move(m_savedVertex);
     res.indexBuffer = std::move(m_savedIndex);
     res.storageBuffer = std::move(m_savedStorage);
+    res.uniformBuffer = std::move(m_savedUniform);
     res.deviceSizes = m_savedSizes;
     res.staticBindGroup = std::move(m_savedStaticGroup);
     res.staticBindGroupLayout = std::move(m_savedStaticLayout);
+    res.uniformBindGroup = std::move(m_savedUniformGroup);
+    res.uniformBindGroupLayout = std::move(m_savedUniformLayout);
     detail::testing::reset_streaming_request();
     g_config.logCallback = m_savedLog;
     EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
@@ -237,9 +252,12 @@ protected:
   wgpu::Buffer m_savedVertex;
   wgpu::Buffer m_savedIndex;
   wgpu::Buffer m_savedStorage;
+  wgpu::Buffer m_savedUniform;
   detail::StreamingSizes m_savedSizes;
   wgpu::BindGroup m_savedStaticGroup;
   wgpu::BindGroupLayout m_savedStaticLayout;
+  wgpu::BindGroup m_savedUniformGroup;
+  wgpu::BindGroupLayout m_savedUniformLayout;
   wgpu::Buffer m_staging;
   wgpu::ComputePipeline m_copy;
   wgpu::Buffer m_vertexOut;
@@ -346,6 +364,99 @@ TEST_F(FrameStreamSpill, PastTheLimitDropsLaterDraws) {
   EXPECT_EQ(m_frame.stats.lastVertSize, 1664 * 1024);
   EXPECT_EQ(m_seen[1].vertex, 2 * MiB);
   EXPECT_EQ(warnings_with(OverrunWarning), 1u);
+}
+
+using FrameStreamOverrun = FrameStreamSpill;
+
+bool is_task_or_middle_pass(const detail::FrameOp& op) {
+  return is_task(op) || (op.type == detail::FrameOpType::RenderPass && op.index == 1);
+}
+
+TEST_F(FrameStreamOverrun, FullUniformsDropLaterDrawsAndGrow) {
+  const std::vector<uint8_t> u1 = pattern(640 * 1024, 1);
+  const std::vector<uint8_t> u2 = pattern(382 * 1024, 2);
+  const std::vector<uint8_t> u3 = pattern(4096, 3);
+
+  EXPECT_EQ(push_uniform(u1.data(), u1.size()), (Range{0, 640 * 1024}));
+  ASSERT_TRUE(push_custom_draw(m_draw, nullptr, 0));
+  ASSERT_NO_FATAL_FAILURE(push_task(0));
+  EXPECT_GT(uniform_space_left(), 0u);
+
+  // It fits the staging alone, but not with the gx window that finish pads behind the last push
+  EXPECT_EQ(push_uniform(u2.data(), u2.size()), (Range{0, 382 * 1024}));
+  EXPECT_EQ(push_uniform(u3.data(), u3.size()), (Range{0, 4096}));
+  EXPECT_EQ(m_frame.uniforms.size(), 640 * 1024);
+  EXPECT_EQ(m_frame.uniformOverrun, 386 * 1024);
+  EXPECT_EQ(uniform_space_left(), 0u);
+  EXPECT_EQ(warnings_with(UniformWarning), 1u);
+  EXPECT_EQ(detail::testing::requested_streaming_sizes().uniform, 2 * MiB);
+  ASSERT_TRUE(push_custom_draw(m_draw, nullptr, 0));
+  ASSERT_NO_FATAL_FAILURE(push_task(1));
+
+  ASSERT_EQ(m_frame.renderPasses.size(), 3u);
+  ASSERT_NO_FATAL_FAILURE(encode_and_submit(&is_task_or_middle_pass));
+  EXPECT_FALSE(m_frame.renderPasses[0].dropDraws);
+  EXPECT_FALSE(m_frame.renderPasses[0].dropResolve);
+  EXPECT_TRUE(m_frame.renderPasses[1].dropDraws);
+  EXPECT_TRUE(m_frame.renderPasses[1].dropResolve);
+  EXPECT_TRUE(m_frame.renderPasses[2].dropDraws);
+  EXPECT_EQ(m_draws, 0u);
+  EXPECT_EQ(m_frame.stats.lastUniformSize, 640 * 1024 + gx::MaxUniformSize);
+  EXPECT_EQ(warnings_with(UniformWarning), 1u);
+  EXPECT_EQ(warnings_with(StorageWarning), 0u);
+}
+
+TEST_F(FrameStreamOverrun, FullStorageRefusesAndDropsLaterDraws) {
+  const std::vector<uint8_t> s1 = pattern(640 * 1024, 1);
+  const std::vector<uint8_t> s2 = pattern(512 * 1024, 2);
+  const std::vector<uint8_t> s3 = pattern(16, 3);
+
+  EXPECT_EQ(push_storage(s1.data(), s1.size()), (Range{0, 640 * 1024}));
+  ASSERT_TRUE(push_custom_draw(m_draw, nullptr, 0));
+  ASSERT_NO_FATAL_FAILURE(push_task(0));
+
+  // Refused rather than spilled, since the resident arena sits right after streaming storage
+  EXPECT_EQ(push_storage(s2.data(), s2.size()), Range{});
+  EXPECT_EQ(push_storage(s3.data(), s3.size()), Range{});
+  EXPECT_EQ(m_frame.storage.size(), 640 * 1024);
+  EXPECT_NE(m_frame.storageOverrun, 0u);
+  EXPECT_EQ(warnings_with(StorageWarning), 1u);
+  EXPECT_EQ(detail::testing::requested_streaming_sizes().storage, 2 * MiB);
+  // Channel pushes check their own room, so GPU systems keep what still fits
+  EXPECT_EQ(push_channel_storage(s3).size, s3.size());
+  ASSERT_TRUE(push_custom_draw(m_draw, nullptr, 0));
+  ASSERT_NO_FATAL_FAILURE(push_task(1));
+
+  ASSERT_EQ(m_frame.renderPasses.size(), 3u);
+  ASSERT_NO_FATAL_FAILURE(encode_and_submit(&is_task_or_middle_pass));
+  EXPECT_FALSE(m_frame.renderPasses[0].dropDraws);
+  EXPECT_TRUE(m_frame.renderPasses[1].dropDraws);
+  EXPECT_FALSE(m_frame.renderPasses[1].dropResolve);
+  EXPECT_TRUE(m_frame.renderPasses[2].dropDraws);
+  EXPECT_EQ(m_draws, 0u);
+  EXPECT_EQ(m_frame.stats.lastStorageSize, 640 * 1024 + s3.size());
+  EXPECT_EQ(warnings_with(StorageWarning), 1u);
+  EXPECT_EQ(warnings_with(UniformWarning), 0u);
+}
+
+TEST_F(FrameStreamOverrun, GrownUniformBufferIsRebound) {
+  struct ScopedBindings {
+    ScopedBindings() { render::detail::shutdown_bindings(); }
+    ~ScopedBindings() { render::detail::shutdown_bindings(); }
+  };
+  const ScopedBindings bindings;
+  auto& res = detail::resources();
+  const wgpu::BindGroup frameGroup = render::detail::frame_group();
+  ASSERT_TRUE(frameGroup);
+  detail::grow_uniform_buffer(2 * MiB);
+  EXPECT_EQ(res.uniformBuffer.GetSize(), 2 * MiB);
+  EXPECT_EQ(res.deviceSizes.uniform, 2 * MiB);
+  EXPECT_TRUE(res.uniformBindGroup);
+  // The graph binds the uniform buffer in its own frame group, which has to follow the new buffer
+  const wgpu::BindGroup grown = render::detail::frame_group();
+  EXPECT_TRUE(grown);
+  EXPECT_NE(grown.Get(), frameGroup.Get());
+  EXPECT_EQ(render::detail::frame_group().Get(), grown.Get());
 }
 } // namespace
 } // namespace aurora::gfx

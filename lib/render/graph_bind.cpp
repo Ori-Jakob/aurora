@@ -90,13 +90,15 @@ struct LayoutRecord {
   std::shared_ptr<const BindingLayout> layout;
 };
 
-// Latch thread and render worker; created under the mutex and replaced only at shutdown
+// Latch thread and render worker; created under the mutex and replaced only at shutdown, except the frame group
 struct SharedObjects {
   std::mutex mutex;
   wgpu::BindGroupLayout frameLayout;
   wgpu::BindGroupLayout emptyLayout;
   std::array<wgpu::Sampler, 4> samplers;
   wgpu::BindGroup frameGroup;
+  // A frame that outgrows the uniform buffer gets a bigger one, and the frame group must follow it
+  wgpu::Buffer frameUniforms;
   std::vector<LayoutRecord> layouts;
   uint64_t nextSerial = 1;
 };
@@ -145,7 +147,7 @@ wgpu::Sampler create_sampler(const char* label, wgpu::FilterMode filter, wgpu::A
 void ensure_frame_group_locked() {
   ensure_frame_layout_locked();
   const wgpu::Buffer& uniforms = gfx::detail::resources().uniformBuffer;
-  if (g_shared.frameGroup || !g_shared.frameLayout || !uniforms) {
+  if ((g_shared.frameGroup && g_shared.frameUniforms.Get() == uniforms.Get()) || !g_shared.frameLayout || !uniforms) {
     return;
   }
   using wgpu::AddressMode;
@@ -174,6 +176,7 @@ void ensure_frame_group_locked() {
       .entries = entries.data(),
   };
   g_shared.frameGroup = webgpu::g_device.CreateBindGroup(&descriptor);
+  g_shared.frameUniforms = uniforms;
 }
 
 wgpu::BindGroupLayoutEntry layout_entry(const BindingSlot& slot) {
@@ -1099,6 +1102,7 @@ void shutdown_bindings() {
   {
     std::lock_guard lock{g_shared.mutex};
     g_shared.frameGroup = {};
+    g_shared.frameUniforms = {};
     g_shared.samplers = {};
     g_shared.layouts.clear();
     g_shared.emptyLayout = {};

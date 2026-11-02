@@ -115,6 +115,7 @@ struct RenderPass {
   bool captureDepthSnapshot = false;
   bool sealed = false;
   bool dropDraws = false;
+  bool dropResolve = false;
   std::vector<tex_palette_conv::ConvRequest> paletteConvs;
 
   RenderTargetLayout target_layout() const noexcept;
@@ -228,6 +229,8 @@ struct ComputeBatch {
 enum class FrameStream : uint8_t {
   Vertex,
   Index,
+  Uniform,
+  Storage,
 };
 
 struct StagingSpill {
@@ -256,6 +259,7 @@ struct FrameOp {
   StagingHighWater highWater;
   const StagingSpill* vertexSpill = nullptr;
   const StagingSpill* indexSpill = nullptr;
+  bool dropStage = false;
   std::vector<const TextureUpload*> textureUploads;
 };
 
@@ -324,6 +328,8 @@ struct FramePacket {
   const StagingSpill* indexSpill = nullptr;
   uint64_t vertexOverrun = 0;
   uint64_t indexOverrun = 0;
+  uint64_t uniformOverrun = 0;
+  uint64_t storageOverrun = 0;
   wgpu::CommandEncoder encoder;
   std::vector<FrameSegment> segments;
   std::vector<AfterSubmitCallback> afterSubmitCallbacks;

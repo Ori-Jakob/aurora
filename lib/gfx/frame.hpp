@@ -13,6 +13,8 @@ inline constexpr size_t StagingBufferCount = FrameSlotCount + 3;
 const wgpu::Buffer& staging_buffer(size_t slot);
 bool spill_frame_stream(FramePacket& frame, FrameStream stream, uint64_t needed) noexcept;
 bool grow_device_stream(FrameStream stream, uint64_t size) noexcept;
+void refuse_frame_stream(FrameStream stream, uint64_t needed, uint64_t capacity) noexcept;
+void grow_uniform_buffer(uint64_t size) noexcept;
 
 void request_streaming_sizes(const StreamingSizes& minimum) noexcept;
 StreamingSizes streaming_sizes() noexcept;
@@ -35,7 +37,7 @@ void set_compute_scratch(wgpu::Buffer buffer) noexcept;
 
 namespace testing {
 StreamingSizes requested_streaming_sizes() noexcept;
-void reset_streaming_request() noexcept;
+void reset_streaming_request(const StreamingSizes& sizes = {}) noexcept;
 void create_compute_layouts() noexcept;
 void release_compute_layouts() noexcept;
 void set_staging_buffer(size_t slot, wgpu::Buffer buffer) noexcept;

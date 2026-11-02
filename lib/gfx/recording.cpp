@@ -359,10 +359,14 @@ FrameOp capture_frame_op(FramePacket& frame, FrameOpType type, uint32_t index) {
       .highWater = current_high_water(frame),
       .vertexSpill = frame.vertexSpill,
       .indexSpill = frame.indexSpill,
+      // Its pass params were pushed after the uniforms ran out, so they all point at the placeholder range
+      .dropStage = type == FrameOpType::RenderStage && frame.uniformOverrun != 0,
   };
-  // Ranges pushed past the streaming limits were never filled, so no pass sealed after one may draw
-  if (op.renderPass != nullptr && (frame.vertexOverrun != 0 || frame.indexOverrun != 0)) {
+  // Ranges pushed past the streaming limits or a full staging were never filled, so no pass sealed after one may draw
+  if (op.renderPass != nullptr &&
+      (frame.vertexOverrun != 0 || frame.indexOverrun != 0 || frame.uniformOverrun != 0 || frame.storageOverrun != 0)) {
     op.renderPass->dropDraws = true;
+    op.renderPass->dropResolve = frame.uniformOverrun != 0;
   }
   op.textureUploads.reserve(op.highWater.textureUploadCount);
   for (size_t i = 0; i < op.highWater.textureUploadCount; ++i) {
@@ -1726,7 +1730,19 @@ Range push_uniform(const uint8_t* data, size_t length) {
   if (!check_recording("push_uniform")) {
     return {};
   }
-  return push(current_frame_packet().uniforms, data, length, resources().limits.minUniformBufferOffsetAlignment);
+  FramePacket& frame = current_frame_packet();
+  ByteBuffer& target = frame.uniforms;
+  const size_t alignment = resources().limits.minUniformBufferOffsetAlignment;
+  const uint64_t used = target.size() + frame.uniformOverrun;
+  const uint64_t begin = alignment != 0 ? AURORA_ALIGN(used, uint64_t{alignment}) : used;
+  // gx binds a whole MaxUniformSize window at any offset, so every push leaves one free behind it, as finish does
+  if (target.owned() || (frame.uniformOverrun == 0 && begin + length + gx::MaxUniformSize <= target.capacity())) {
+    return push(target, data, length, alignment);
+  }
+  frame.uniformOverrun = begin + length - target.size();
+  refuse_frame_stream(FrameStream::Uniform, begin + length + gx::MaxUniformSize, target.capacity());
+  // Any window bound at offset 0 stays inside the buffer, so what still reads this range cannot fail validation
+  return {0, static_cast<uint32_t>(length)};
 }
 
 Range push_storage(const uint8_t* data, size_t length) {
@@ -1734,7 +1750,22 @@ Range push_storage(const uint8_t* data, size_t length) {
   if (!check_recording("push_storage")) {
     return {};
   }
-  return push(current_frame_packet().storage, data, length, resources().limits.minStorageBufferOffsetAlignment);
+  FramePacket& frame = current_frame_packet();
+  ByteBuffer& storage = frame.storage;
+  const size_t alignment = resources().limits.minStorageBufferOffsetAlignment;
+  const uint64_t used = storage.size() + frame.storageOverrun;
+  const uint64_t begin = alignment != 0 ? AURORA_ALIGN(used, uint64_t{alignment}) : used;
+  if (storage.owned() || (frame.storageOverrun == 0 && begin + length <= storage.capacity())) {
+    return push(storage, data, length, alignment);
+  }
+  // gx pushes a refused array again on every draw, so only the first refusal sizes the next frame
+  if (frame.storageOverrun == 0) {
+    refuse_frame_stream(FrameStream::Storage, std::max(begin + length, 2 * uint64_t{storage.capacity()}),
+                        storage.capacity());
+  }
+  frame.storageOverrun = begin + length - storage.size();
+  // Empty like a full channel push, so gx never stages an unfilled range into the resident arena
+  return {};
 }
 
 Range push_channel_storage(std::span<const uint8_t> bytes) noexcept {
@@ -1851,9 +1882,13 @@ uint64_t uniform_space_left() noexcept {
   if (!g_recorder.active()) {
     return 0;
   }
-  const ByteBuffer& uniforms = current_frame_packet().uniforms;
+  const FramePacket& frame = current_frame_packet();
+  const ByteBuffer& uniforms = frame.uniforms;
   if (uniforms.owned()) {
     return UINT64_MAX;
+  }
+  if (frame.uniformOverrun != 0) {
+    return 0;
   }
   const size_t alignment = resources().limits.minUniformBufferOffsetAlignment;
   const size_t begin = alignment != 0 ? AURORA_ALIGN(uniforms.size(), alignment) : uniforms.size();

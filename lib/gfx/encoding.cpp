@@ -274,7 +274,7 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
                                       passInfo.colorAttachments[SceneColorAttachmentIndex].size, passInfo.msaaSamples);
   }
 
-  if (passInfo.resolveTarget) {
+  if (passInfo.resolveTarget && !passInfo.dropResolve) {
     const auto& dstSize = passInfo.resolveTarget->size;
     const bool needsConversion = tex_copy_conv::needs_conversion(passInfo.resolveFormat);
     const bool needsScaling = dstSize.width != static_cast<uint32_t>(passInfo.resolveRect.width) ||
@@ -582,7 +582,8 @@ void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op)
     }
     break;
   case FrameOpType::RenderStage:
-    if (op.stageData != nullptr) {
+    // A dropped stage runs no pass, so its histories stay unflipped as for passes skipped at bind time
+    if (op.stageData != nullptr && !op.dropStage) {
       ::aurora::render::detail::run_stage(cmd, *op.stageData);
     }
     break;

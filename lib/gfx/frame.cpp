@@ -56,6 +56,7 @@ constexpr auto VertexBufferUsage = wgpu::BufferUsage::Storage | wgpu::BufferUsag
 // Storage lets later stream-out passes read the u16 indices as u32 words
 constexpr auto IndexBufferUsage = wgpu::BufferUsage::Index | wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
 constexpr auto StorageBufferUsage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+constexpr auto UniformBufferUsage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
 constexpr auto StagingBufferUsage = wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc;
 
 enum class BufferMapState {
@@ -76,6 +77,8 @@ uint32_t g_testGrowthFrame = 0;
 bool g_loggedStagingCap = false;
 bool g_loggedStreamSpill = false;
 bool g_warnedStreamOverrun = false;
+bool g_warnedUniformOverrun = false;
+bool g_warnedStorageOverrun = false;
 uint32_t g_frameIndex = UINT32_MAX;
 ChannelBudget g_channelBudget;
 uint64_t g_channelDemand = 0;
@@ -342,6 +345,43 @@ void create_static_bind_group() {
   g_resources.staticBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
 }
 
+void create_uniform_bind_group() {
+  if (!g_resources.uniformBindGroupLayout) {
+    constexpr std::array layoutEntries{
+        // Uniform buffer (dynamic offset)
+        wgpu::BindGroupLayoutEntry{
+            .binding = 0,
+            .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
+            .buffer =
+                wgpu::BufferBindingLayout{
+                    .type = wgpu::BufferBindingType::Uniform,
+                    .hasDynamicOffset = true,
+                },
+        },
+    };
+    const wgpu::BindGroupLayoutDescriptor layoutDesc{
+        .label = "Uniform bind group layout",
+        .entryCount = layoutEntries.size(),
+        .entries = layoutEntries.data(),
+    };
+    g_resources.uniformBindGroupLayout = g_device.CreateBindGroupLayout(&layoutDesc);
+  }
+  const std::array entries{
+      wgpu::BindGroupEntry{
+          .binding = 0,
+          .buffer = g_resources.uniformBuffer,
+          .size = gx::MaxUniformSize,
+      },
+  };
+  const wgpu::BindGroupDescriptor bindGroupDescriptor{
+      .label = "Uniform bind group",
+      .layout = g_resources.uniformBindGroupLayout,
+      .entryCount = entries.size(),
+      .entries = entries.data(),
+  };
+  g_resources.uniformBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
+}
+
 // Worker only, between the previous frame's submit and this frame's first encode
 void ensure_device_buffers(const StreamingSizes& sizes, uint32_t residentCapacity) {
   auto& current = g_resources.deviceSizes;
@@ -393,7 +433,9 @@ StreamingLimits streaming_limits() noexcept {
   return {.vertex = bound,
           .index = bound,
           .storage = round_streaming_limit(streaming_storage_limit(bound, g_residentCapacity)),
-          .staging = g_resources.limits.maxBufferSize};
+          .staging = g_resources.limits.maxBufferSize,
+          // Uniforms are bound in windows at u32 dynamic offsets, so only the buffer size and that offset cap them
+          .uniform = round_streaming_limit(std::min<uint64_t>(g_resources.limits.maxBufferSize, UINT32_MAX))};
 }
 
 void create_compute_layouts() {
@@ -514,6 +556,26 @@ bool grow_device_stream(FrameStream stream, uint64_t size) noexcept {
   return true;
 }
 
+// Recording binds the uniform buffer directly and the resident arena sits right after storage, so neither can spill
+void refuse_frame_stream(FrameStream stream, uint64_t needed, uint64_t capacity) noexcept {
+  const bool uniform = stream == FrameStream::Uniform;
+  request_streaming_sizes({.vertex = 0, .index = 0, .storage = uniform ? 0 : needed, .uniform = uniform ? needed : 0});
+  if (!std::exchange(uniform ? g_warnedUniformOverrun : g_warnedStorageOverrun, true)) {
+    Log.warn(
+        "Frame {} data outgrew its {} MiB staging; the rest of that frame's draws are dropped and later frames "
+        "ask for more",
+        uniform ? "uniform" : "storage", capacity / MiB);
+  }
+}
+
+// Game-thread recording binds the old buffer, so this runs only between frames with the worker idle
+void grow_uniform_buffer(uint64_t size) noexcept {
+  create_buffer(g_resources.uniformBuffer, UniformBufferUsage, size, "Shared Uniform Buffer");
+  g_resources.deviceSizes.uniform = size;
+  create_uniform_bind_group();
+  Log.info("Uniform buffer resized: {} MiB", size / MiB);
+}
+
 void request_streaming_sizes(const StreamingSizes& minimum) noexcept {
   // Sizes stay 1 MiB multiples so every staging segment keeps the map and copy alignment
   const auto merge = [](uint64_t& requested, uint64_t wanted) {
@@ -524,6 +586,7 @@ void request_streaming_sizes(const StreamingSizes& minimum) noexcept {
   merge(g_requestedSizes.vertex, minimum.vertex);
   merge(g_requestedSizes.index, minimum.index);
   merge(g_requestedSizes.storage, minimum.storage);
+  merge(g_requestedSizes.uniform, minimum.uniform);
 }
 
 StreamingSizes streaming_sizes() noexcept { return g_targetSizes; }
@@ -555,7 +618,7 @@ wgpu::BindGroupLayout compute_stream_layout() noexcept { return g_resources.comp
 namespace testing {
 StreamingSizes requested_streaming_sizes() noexcept { return g_requestedSizes; }
 
-void reset_streaming_request() noexcept { g_requestedSizes = {}; }
+void reset_streaming_request(const StreamingSizes& sizes) noexcept { g_requestedSizes = sizes; }
 
 void create_compute_layouts() noexcept { gfx::create_compute_layouts(); }
 
@@ -566,6 +629,8 @@ void set_staging_buffer(size_t slot, wgpu::Buffer buffer) noexcept { g_stagingBu
 void reset_stream_warnings() noexcept {
   g_loggedStreamSpill = false;
   g_warnedStreamOverrun = false;
+  g_warnedUniformOverrun = false;
+  g_warnedStorageOverrun = false;
 }
 } // namespace testing
 
@@ -583,10 +648,13 @@ StreamingGrowth next_streaming_sizes(const StreamingSizes& current, const Aurora
       .vertex = target(current.vertex, requested.vertex, lastFrame.lastVertSize, limits.vertex),
       .index = target(current.index, requested.index, lastFrame.lastIndexSize, limits.index),
       .storage = target(current.storage, requested.storage, lastFrame.lastStorageSize, limits.storage),
+      // Only an overrun asks for uniforms, so a frame that fits never makes recording rebind a new buffer
+      .uniform = target(current.uniform, requested.uniform, 0, limits.uniform),
   };
   StreamingGrowth growth{.sizes = current};
   // Steps are taken in order while one staging slot still fits in a single buffer
-  for (const auto member : {&StreamingSizes::vertex, &StreamingSizes::index, &StreamingSizes::storage}) {
+  for (const auto member :
+       {&StreamingSizes::vertex, &StreamingSizes::index, &StreamingSizes::storage, &StreamingSizes::uniform}) {
     if (wanted.*member == current.*member) {
       continue;
     }
@@ -774,8 +842,7 @@ void initialize() {
       .alignment = g_resources.limits.minStorageBufferOffsetAlignment,
   };
 
-  create_buffer(g_resources.uniformBuffer, wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst, UniformBufferSize,
-                "Shared Uniform Buffer");
+  create_buffer(g_resources.uniformBuffer, UniformBufferUsage, g_targetSizes.uniform, "Shared Uniform Buffer");
   create_buffer(g_resources.vertexBuffer, VertexBufferUsage, g_targetSizes.vertex, "Shared Vertex Buffer");
   create_buffer(g_resources.indexBuffer, IndexBufferUsage, g_targetSizes.index, "Shared Index Buffer");
   create_buffer(g_resources.storageBuffer, StorageBufferUsage, g_targetSizes.storage, "Shared Storage Buffer");
@@ -792,41 +859,7 @@ void initialize() {
   }
 
   create_static_bind_group();
-
-  {
-    constexpr std::array layoutEntries{
-        // Uniform buffer (dynamic offset)
-        wgpu::BindGroupLayoutEntry{
-            .binding = 0,
-            .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
-            .buffer =
-                wgpu::BufferBindingLayout{
-                    .type = wgpu::BufferBindingType::Uniform,
-                    .hasDynamicOffset = true,
-                },
-        },
-    };
-    const wgpu::BindGroupLayoutDescriptor layoutDesc{
-        .label = "Uniform bind group layout",
-        .entryCount = layoutEntries.size(),
-        .entries = layoutEntries.data(),
-    };
-    g_resources.uniformBindGroupLayout = g_device.CreateBindGroupLayout(&layoutDesc);
-    const std::array entries{
-        wgpu::BindGroupEntry{
-            .binding = 0,
-            .buffer = g_resources.uniformBuffer,
-            .size = gx::MaxUniformSize,
-        },
-    };
-    const wgpu::BindGroupDescriptor bindGroupDescriptor{
-        .label = "Uniform bind group",
-        .layout = g_resources.uniformBindGroupLayout,
-        .entryCount = entries.size(),
-        .entries = entries.data(),
-    };
-    g_resources.uniformBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
-  }
+  create_uniform_bind_group();
   create_compute_layouts();
 
   gx::initialize();
@@ -882,6 +915,8 @@ void shutdown() {
   g_loggedStagingCap = false;
   g_loggedStreamSpill = false;
   g_warnedStreamOverrun = false;
+  g_warnedUniformOverrun = false;
+  g_warnedStorageOverrun = false;
   for (auto& packet : g_framePackets) {
     packet = {};
   }
@@ -957,6 +992,11 @@ bool begin_frame() {
     return false;
   }
 
+  if (g_targetSizes.uniform > g_resources.deviceSizes.uniform) {
+    // Recording binds the uniform buffer on this thread and encoding on the worker, so it is swapped with both idle
+    render_worker::synchronize();
+    grow_uniform_buffer(g_targetSizes.uniform);
+  }
   if (g_stagingSizes[*stagingSlot] != g_targetSizes) {
     // A held slot has no map callback in flight, so its buffer can be swapped for one mapped at creation
     g_stagingSizes[*stagingSlot] = g_targetSizes;
@@ -986,7 +1026,7 @@ bool begin_frame() {
     bufferOffset += size;
   };
   mapBuffer(frame.verts, frame.sizes.vertex);
-  mapBuffer(frame.uniforms, UniformBufferSize);
+  mapBuffer(frame.uniforms, frame.sizes.uniform);
   mapBuffer(frame.indices, frame.sizes.index);
   mapBuffer(frame.storage, frame.sizes.storage);
   if constexpr (UseTextureBuffer) {

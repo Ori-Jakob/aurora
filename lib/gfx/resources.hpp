@@ -18,6 +18,7 @@ struct StreamingSizes {
   uint64_t vertex = VertexBufferSize;
   uint64_t index = IndexBufferSize;
   uint64_t storage = StorageBufferSize;
+  uint64_t uniform = UniformBufferSize;
 
   bool operator==(const StreamingSizes&) const = default;
 };
@@ -34,7 +35,7 @@ struct StagingLayout {
 constexpr StagingLayout staging_layout(const StreamingSizes& sizes) noexcept {
   StagingLayout layout{};
   layout.uniform = layout.vertex + sizes.vertex;
-  layout.index = layout.uniform + UniformBufferSize;
+  layout.index = layout.uniform + sizes.uniform;
   layout.storage = layout.index + sizes.index;
   layout.textureUpload = layout.storage + sizes.storage;
   layout.total = layout.textureUpload + (UseTextureBuffer ? TextureUploadSize : 0);
@@ -82,6 +83,7 @@ struct StreamingLimits {
   uint64_t index = 0;
   uint64_t storage = 0;
   uint64_t staging = 0;
+  uint64_t uniform = 0;
 };
 
 struct StreamingGrowth {
