@@ -5,6 +5,7 @@
 #include <aurora/texture.hpp>
 #include <algorithm>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -122,12 +123,66 @@ struct CompanionFile {
   std::filesystem::path path;
 };
 
+struct CompanionSet {
+  uint32_t id = 0;
+  uint8_t roles = 0;
+};
+
+enum class CompanionLoadError : uint8_t { None, Failed, Format, NoBc };
+
+constexpr bool companion_role_accepts(CompanionRole role, wgpu::TextureFormat format) noexcept {
+  switch (role) {
+  case CompanionRole::Albedo:
+  case CompanionRole::Emit:
+    return format == wgpu::TextureFormat::BC7RGBAUnorm || format == wgpu::TextureFormat::BC7RGBAUnormSrgb;
+  case CompanionRole::Delight:
+  case CompanionRole::GrassMask:
+    return format == wgpu::TextureFormat::BC4RUnorm;
+  case CompanionRole::Nrm:
+    return format == wgpu::TextureFormat::BC5RGUnorm;
+  case CompanionRole::Orm:
+    return format == wgpu::TextureFormat::BC7RGBAUnorm;
+  case CompanionRole::Mat:
+    return format == wgpu::TextureFormat::BC1RGBAUnorm || format == wgpu::TextureFormat::BC3RGBAUnorm ||
+           format == wgpu::TextureFormat::BC5RGUnorm || format == wgpu::TextureFormat::BC7RGBAUnorm ||
+           format == wgpu::TextureFormat::RGBA8Unorm || format == wgpu::TextureFormat::BGRA8Unorm;
+  }
+  return false;
+}
+
+constexpr wgpu::TextureFormat companion_storage_format(CompanionRole role, wgpu::TextureFormat format) noexcept {
+  if (role != CompanionRole::Albedo && role != CompanionRole::Emit) {
+    return format;
+  }
+  switch (format) {
+  case wgpu::TextureFormat::RGBA8Unorm:
+    return wgpu::TextureFormat::RGBA8UnormSrgb;
+  case wgpu::TextureFormat::BGRA8Unorm:
+    return wgpu::TextureFormat::BGRA8UnormSrgb;
+  case wgpu::TextureFormat::BC1RGBAUnorm:
+    return wgpu::TextureFormat::BC1RGBAUnormSrgb;
+  case wgpu::TextureFormat::BC3RGBAUnorm:
+    return wgpu::TextureFormat::BC3RGBAUnormSrgb;
+  case wgpu::TextureFormat::BC7RGBAUnorm:
+    return wgpu::TextureFormat::BC7RGBAUnormSrgb;
+  default:
+    return format;
+  }
+}
+
 std::string_view companion_role_name(CompanionRole role) noexcept;
 std::optional<CompanionName> parse_companion_filename(std::string_view filename) noexcept;
 std::string companion_mip_filename(std::string_view path, uint32_t mip);
 std::optional<CompanionFile> find_companion(const texture::TextureSourceKey& key, CompanionRole role);
 uint32_t companion_roles(const texture::TextureSourceKey& key) noexcept;
 uint64_t companion_generation() noexcept;
+CompanionSet companion_set(const texture::TextureSourceKey& key) noexcept;
+std::optional<CompanionFile> companion_file(uint32_t set, CompanionRole role);
+bool has_companions() noexcept;
+bool synchronous_loads() noexcept;
+std::optional<ConvertedTexture> load_companion(CompanionRole role, const std::filesystem::path& path,
+                                               CompanionLoadError* error = nullptr) noexcept;
+void queue_companion_task(std::function<void()> task);
 
 namespace testing {
 void set_workers_paused(bool paused) noexcept;

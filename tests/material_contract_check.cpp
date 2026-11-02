@@ -1009,6 +1009,8 @@ std::span<const std::string_view> known_rules() noexcept { return KnownRules; }
 
 std::span<const std::string_view> companion_roles() noexcept { return CompanionRoles; }
 
+bool d7_role_accepts(std::string_view role, uint32_t code) noexcept { return role_accepts(role, code); }
+
 std::optional<std::vector<uint8_t>> read_file(const std::filesystem::path& path) {
   std::ifstream stream{path, std::ios::binary};
   if (!stream) {

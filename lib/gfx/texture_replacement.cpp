@@ -11,6 +11,7 @@
 #endif
 #include "../thread.hpp"
 #include "../webgpu/gpu.hpp"
+#include "companion_cache.hpp"
 #include "dds_io.hpp"
 #include "png_io.hpp"
 #include "texture_convert.hpp"
@@ -32,6 +33,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -118,6 +120,7 @@ struct EntryLoadSnapshot {
 struct LoadJob {
   Tier tier = Tier::Full;
   EntryLoadSnapshot entry;
+  std::function<void()> task;
 };
 
 struct LoadCompletion {
@@ -162,6 +165,7 @@ uint64_t s_nextRegistrationId = 1;
 uint64_t s_nextSequence = 1;
 uint32_t s_sourceEntryCount = 0;
 
+using gfx::texture_replacement::CompanionLoadError;
 using gfx::texture_replacement::CompanionName;
 using gfx::texture_replacement::CompanionRole;
 using gfx::texture_replacement::CompanionRoleCount;
@@ -173,7 +177,10 @@ struct CompanionEntry {
   std::filesystem::path path;
 };
 
-using CompanionSet = std::array<std::vector<CompanionEntry>, CompanionRoleCount>;
+struct CompanionSlots {
+  uint32_t id = 0;
+  std::array<std::vector<CompanionEntry>, CompanionRoleCount> roles;
+};
 
 constexpr std::array<std::string_view, CompanionRoleCount> CompanionRoleNames{"albedo", "delight",   "nrm", "orm",
                                                                               "emit",   "grassmask", "mat"};
@@ -183,8 +190,11 @@ static_assert(render::material::map_role_bit(static_cast<uint32_t>(CompanionRole
               render::material::map_role_bit(static_cast<uint32_t>(CompanionRole::Mat)) == 1u << 22);
 #endif
 
-absl::flat_hash_map<TextureSourceKey, CompanionSet, SourceKeyHash> s_companionsByKey;
+absl::flat_hash_map<TextureSourceKey, CompanionSlots, SourceKeyHash> s_companionsByKey;
+absl::flat_hash_map<uint32_t, TextureSourceKey> s_companionKeysById;
+uint32_t s_nextCompanionSetId = 1;
 std::atomic<uint64_t> s_companionGeneration{0};
+std::atomic_bool s_warnedCompanionBc{false};
 
 std::mutex s_jobMutex;
 std::condition_variable s_jobCv;
@@ -527,6 +537,22 @@ struct FileTextureSource {
   std::optional<gfx::ConvertedTexture> load_mip() { return load_texture_file(mipPath); }
 };
 
+struct CompanionFileSource {
+  const std::filesystem::path& path;
+  std::filesystem::path mipPath;
+
+  std::string name() const { return io::fs_path_to_string(path); }
+  std::optional<gfx::ConvertedTexture> load_base() { return load_texture_file(path); }
+  bool open_mip(uint32_t mipLevel) {
+    mipPath = io::fs_path_from_string(
+        gfx::texture_replacement::companion_mip_filename(io::fs_path_to_string(path), mipLevel));
+    std::error_code ec;
+    return std::filesystem::is_regular_file(mipPath, ec);
+  }
+  std::string mip_name() const { return io::fs_path_to_string(mipPath); }
+  std::optional<gfx::ConvertedTexture> load_mip() { return load_texture_file(mipPath); }
+};
+
 bool guarded_virtual_read(const std::shared_ptr<VirtualReadState>& state, const VirtualFileSource& source,
                           const char* path, std::vector<uint8_t>& outBytes) {
   if (!state || source.read == nullptr) {
@@ -705,15 +731,25 @@ struct InvalidMip {
 };
 
 template <typename Source>
-std::optional<gfx::ConvertedTexture> load_encoded_replacement(Source&& src, MipPolicy policy,
-                                                              ChainReport& report) noexcept {
+std::optional<gfx::ConvertedTexture> load_encoded_replacement(Source&& src, MipPolicy policy, ChainReport& report,
+                                                              std::optional<CompanionRole> role = std::nullopt,
+                                                              bool* roleRejected = nullptr) noexcept {
   report = {};
   auto base = src.load_base();
   if (!base.has_value()) {
     Log.warn("texture_replacement: failed to load texture {}", src.name());
     return std::nullopt;
   }
-  if (!gfx::texture_replacement::legacy_base_accepts(base->format)) {
+  if (role.has_value()) {
+    if (!gfx::texture_replacement::companion_role_accepts(*role, base->format)) {
+      Log.warn("texture_replacement: {} uses format {}, which the {} role does not accept", src.name(),
+               static_cast<uint32_t>(base->format), gfx::texture_replacement::companion_role_name(*role));
+      if (roleRejected != nullptr) {
+        *roleRejected = true;
+      }
+      return std::nullopt;
+    }
+  } else if (!gfx::texture_replacement::legacy_base_accepts(base->format)) {
     Log.warn("texture_replacement: {} uses format {}, which is only valid for material maps", src.name(),
              static_cast<uint32_t>(base->format));
     return std::nullopt;
@@ -959,6 +995,10 @@ void worker_main(std::stop_token token) {
         job = std::move(s_lowPriorityJobs.front());
         s_lowPriorityJobs.pop_front();
       }
+    }
+    if (job.task) {
+      job.task();
+      continue;
     }
 
     std::optional<gfx::ConvertedTexture> texture;
@@ -1514,6 +1554,7 @@ void clear_replacement_runtime_state_locked(std::vector<std::shared_ptr<VirtualR
   s_sourceEntryCount = 0;
   if (!s_companionsByKey.empty()) {
     s_companionsByKey.clear();
+    s_companionKeysById.clear();
     s_companionGeneration.fetch_add(1, std::memory_order_relaxed);
   }
 }
@@ -1555,7 +1596,12 @@ void register_companions(std::span<const CompanionName> names, std::span<const s
   std::lock_guard lk(s_registryMutex);
   for (size_t i = 0; i < names.size(); ++i) {
     const uint64_t id = s_nextRegistrationId++;
-    s_companionsByKey[names[i].key][static_cast<size_t>(names[i].role)].push_back({
+    auto& slots = s_companionsByKey[names[i].key];
+    if (slots.id == 0) {
+      slots.id = s_nextCompanionSetId++;
+      s_companionKeysById[slots.id] = names[i].key;
+    }
+    slots.roles[static_cast<size_t>(names[i].role)].push_back({
         .id = id,
         .priority = options.priority,
         .sequence = s_nextSequence++,
@@ -1573,7 +1619,7 @@ bool erase_companion_locked(const TextureSourceKey& key, uint64_t id) noexcept {
   }
   bool erased = false;
   bool empty = true;
-  for (auto& entries : it->second) {
+  for (auto& entries : it->second.roles) {
     const auto entry = std::find_if(entries.begin(), entries.end(),
                                     [id](const CompanionEntry& candidate) { return candidate.id == id; });
     if (entry != entries.end()) {
@@ -1583,12 +1629,13 @@ bool erase_companion_locked(const TextureSourceKey& key, uint64_t id) noexcept {
     empty &= entries.empty();
   }
   if (empty) {
+    s_companionKeysById.erase(it->second.id);
     s_companionsByKey.erase(it);
   }
   return erased;
 }
 
-const CompanionSet* find_companion_set_locked(TextureSourceKey key) noexcept {
+const CompanionSlots* find_companion_set_locked(TextureSourceKey key) noexcept {
   if (!key.hasTlut) {
     key.tlutHash = 0;
   }
@@ -1602,6 +1649,27 @@ const CompanionSet* find_companion_set_locked(TextureSourceKey key) noexcept {
     }
   }
   return nullptr;
+}
+
+const CompanionEntry* select_companion(const std::vector<CompanionEntry>& entries) noexcept {
+  const CompanionEntry* selected = nullptr;
+  for (const auto& entry : entries) {
+    if (selected == nullptr || entry.priority > selected->priority ||
+        (entry.priority == selected->priority && entry.sequence > selected->sequence)) {
+      selected = &entry;
+    }
+  }
+  return selected;
+}
+
+uint32_t companion_role_mask(const CompanionSlots& slots) noexcept {
+  uint32_t roles = 0;
+  for (uint32_t i = 0; i < CompanionRoleCount; ++i) {
+    if (!slots.roles[i].empty()) {
+      roles |= 1u << i;
+    }
+  }
+  return roles;
 }
 
 void reload_dependent_chains(bool ChainReport::* dependsOn) noexcept {
@@ -2041,6 +2109,7 @@ using namespace aurora::texture;
 void shutdown() noexcept {
   clear_replacements();
   stop_worker_pool();
+  companion_cache::shutdown();
 }
 
 ReplacementTextureDescriptors replacement_texture_descriptors(const ConvertedTexture& replacement,
@@ -2323,13 +2392,7 @@ std::optional<CompanionFile> find_companion(const TextureSourceKey& key, Compani
   if (set == nullptr) {
     return std::nullopt;
   }
-  const CompanionEntry* selected = nullptr;
-  for (const auto& entry : (*set)[index]) {
-    if (selected == nullptr || entry.priority > selected->priority ||
-        (entry.priority == selected->priority && entry.sequence > selected->sequence)) {
-      selected = &entry;
-    }
-  }
+  const auto* selected = select_companion(set->roles[index]);
   if (selected == nullptr) {
     return std::nullopt;
   }
@@ -2342,19 +2405,94 @@ uint32_t companion_roles(const TextureSourceKey& key) noexcept {
   }
   std::lock_guard lk(s_registryMutex);
   const auto* set = find_companion_set_locked(key);
-  if (set == nullptr) {
-    return 0;
-  }
-  uint32_t roles = 0;
-  for (uint32_t i = 0; i < CompanionRoleCount; ++i) {
-    if (!(*set)[i].empty()) {
-      roles |= 1u << i;
-    }
-  }
-  return roles;
+  return set != nullptr ? companion_role_mask(*set) : 0;
 }
 
 uint64_t companion_generation() noexcept { return s_companionGeneration.load(std::memory_order_relaxed); }
+
+CompanionSet companion_set(const TextureSourceKey& key) noexcept {
+  if (s_bypass.load(std::memory_order_relaxed)) {
+    return {};
+  }
+  std::lock_guard lk(s_registryMutex);
+  const auto* set = find_companion_set_locked(key);
+  if (set == nullptr) {
+    return {};
+  }
+  return {.id = set->id, .roles = static_cast<uint8_t>(companion_role_mask(*set))};
+}
+
+std::optional<CompanionFile> companion_file(uint32_t set, CompanionRole role) {
+  const auto index = static_cast<size_t>(role);
+  if (s_bypass.load(std::memory_order_relaxed) || index >= CompanionRoleCount) {
+    return std::nullopt;
+  }
+  std::lock_guard lk(s_registryMutex);
+  const auto key = s_companionKeysById.find(set);
+  if (key == s_companionKeysById.end()) {
+    return std::nullopt;
+  }
+  const auto slots = s_companionsByKey.find(key->second);
+  if (slots == s_companionsByKey.end()) {
+    return std::nullopt;
+  }
+  const auto* selected = select_companion(slots->second.roles[index]);
+  if (selected == nullptr) {
+    return std::nullopt;
+  }
+  return CompanionFile{.id = selected->id, .path = selected->path};
+}
+
+bool has_companions() noexcept {
+  if (s_bypass.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  std::lock_guard lk(s_registryMutex);
+  return !s_companionsByKey.empty();
+}
+
+bool synchronous_loads() noexcept { return s_synchronousLoads.load(std::memory_order_relaxed); }
+
+std::optional<ConvertedTexture> load_companion(CompanionRole role, const std::filesystem::path& path,
+                                               CompanionLoadError* error) noexcept {
+  const auto fail = [error](CompanionLoadError reason) noexcept -> std::optional<ConvertedTexture> {
+    if (error != nullptr) {
+      *error = reason;
+    }
+    return std::nullopt;
+  };
+  if (!webgpu::g_bcTexturesSupported) {
+    if (!s_warnedCompanionBc.exchange(true, std::memory_order_relaxed)) {
+      Log.warn("texture_replacement: companion material maps need BC texture support, which this device lacks");
+    }
+    return fail(CompanionLoadError::NoBc);
+  }
+  ChainReport report;
+  bool rejected = false;
+  auto texture =
+      load_encoded_replacement(CompanionFileSource{.path = path}, MipPolicy{.repair = false}, report, role, &rejected);
+  if (!texture.has_value()) {
+    return fail(rejected ? CompanionLoadError::Format : CompanionLoadError::Failed);
+  }
+  texture->format = companion_storage_format(role, texture->format);
+  if (error != nullptr) {
+    *error = CompanionLoadError::None;
+  }
+  return texture;
+}
+
+void queue_companion_task(std::function<void()> task) {
+  if constexpr (!gx::texture::AsyncTextureReplacements) {
+    task();
+    return;
+  }
+  start_worker_pool();
+  {
+    std::lock_guard lock{s_jobMutex};
+    s_highPriorityJobs.push_back({.tier = Tier::Full, .task = std::move(task)});
+  }
+  s_jobCv.notify_one();
+}
 
 void set_bypass(bool bypass) noexcept { s_bypass.store(bypass, std::memory_order_relaxed); }
 

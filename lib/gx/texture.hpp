@@ -76,6 +76,7 @@ void end_frame() noexcept;
 // Any thread; end_frame latches it with the FIFO drained
 void set_generate_missing_mips(bool enabled) noexcept;
 bool generate_missing_mips_requested() noexcept;
+void set_companion_consumer(bool consumed) noexcept;
 void shutdown() noexcept;
 
 GXState::CopyTextureRef resolve_copy_texture(const GXState::CopyTextureKey& key) noexcept;

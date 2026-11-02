@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <optional>
 #include <ostream>
@@ -474,6 +475,49 @@ TEST_F(MaterialContractTest, DdsCompanionRulesMatchIndex) {
     EXPECT_EQ(it->second.rule, text_of(entry, "rule"));
     EXPECT_EQ(it->second.chain, text_of(entry, "chain"));
   }
+}
+
+std::vector<uint8_t> dx10_dds(uint32_t code) {
+  std::vector<uint8_t> bytes(148 + 64);
+  const auto put = [&bytes](size_t offset, uint32_t value) {
+    std::memcpy(bytes.data() + offset, &value, sizeof(value));
+  };
+  put(0, 0x20534444u);
+  put(4, 124u);
+  put(8, 0x81007u);
+  put(12, 4u);
+  put(16, 4u);
+  put(28, 1u);
+  put(76, 32u);
+  put(80, 0x4u);
+  put(84, 0x30315844u);
+  put(108, 0x1000u);
+  put(128, code);
+  put(132, 3u);
+  put(140, 1u);
+  return bytes;
+}
+
+TEST_F(MaterialContractTest, ProductionD7MatchesOracle) {
+  using gfx::texture_replacement::CompanionRole;
+  const auto roles = companion_roles();
+  size_t accepted = 0;
+  for (uint32_t index = 0; index < gfx::texture_replacement::CompanionRoleCount; ++index) {
+    const auto role = static_cast<CompanionRole>(index);
+    const std::string_view name = gfx::texture_replacement::companion_role_name(role);
+    SCOPED_TRACE(std::string{name});
+    EXPECT_NE(std::find(roles.begin(), roles.end(), name), roles.end());
+    for (uint32_t code = 0; code < 256; ++code) {
+      SCOPED_TRACE(code);
+      const auto bytes = dx10_dds(code);
+      const auto parsed = gfx::dds::parse_dds_bytes({bytes.data(), bytes.size()});
+      const bool production =
+          parsed.has_value() && gfx::texture_replacement::companion_role_accepts(role, parsed->format);
+      EXPECT_EQ(production, d7_role_accepts(name, code));
+      accepted += production ? 1 : 0;
+    }
+  }
+  EXPECT_EQ(accepted, 14u);
 }
 
 TEST_F(MaterialContractTest, ClampedChainMirrorsPackLayout) {

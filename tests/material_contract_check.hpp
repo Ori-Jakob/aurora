@@ -102,6 +102,7 @@ struct DdsVerdict {
 
 std::span<const std::string_view> known_rules() noexcept;
 std::span<const std::string_view> companion_roles() noexcept;
+bool d7_role_accepts(std::string_view role, uint32_t code) noexcept;
 std::optional<std::vector<uint8_t>> read_file(const std::filesystem::path& path);
 JsonParse parse_json(std::string_view text);
 bool json_equal(const Json& a, const Json& b) noexcept;

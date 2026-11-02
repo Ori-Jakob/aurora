@@ -16,6 +16,8 @@ add_library(aurora_gx STATIC
         lib/gfx/texture_format.cpp
         lib/gfx/texture_convert.cpp
         lib/gfx/texture_replacement.cpp
+        lib/gfx/companion_cache.cpp
+        lib/gfx/companion_cache.hpp
         lib/gx/attr_fmt.cpp
         lib/gx/command_processor.cpp
         lib/gx/regs.cpp

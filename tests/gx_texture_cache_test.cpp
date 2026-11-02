@@ -1,6 +1,7 @@
 #include "gx/texture.hpp"
 #include "gx/guest_memory.hpp"
 #include "gfx/lru_cache.hpp"
+#include "gfx/texture_replacement.hpp"
 
 #include <aurora/texture.hpp>
 #include <gtest/gtest.h>
@@ -25,6 +26,11 @@ size_t last_generated_bytes();
 gfx::TextureHandle make_texture_handle(uint32_t width, uint32_t height, u32 format = GX_TF_RGBA8_PC);
 void set_replacement(gfx::TextureHandle handle, uint64_t id = 1);
 void set_source_replacement(aurora::texture::TextureSourceKey key, gfx::TextureHandle handle);
+void set_companions(bool indexed, gfx::texture_replacement::CompanionSet set);
+uint64_t companion_queries();
+std::optional<aurora::texture::TextureSourceKey> last_companion_key();
+void set_companion_generation(uint64_t generation);
+void set_companion_epoch(uint64_t epoch);
 } // namespace aurora::gx::testing
 
 namespace aurora::gx {
@@ -1575,6 +1581,141 @@ TEST_F(GxTextureCacheTest, CopiesAndTlutsNeverGetTails) {
     EXPECT_EQ(g_gxState.textures[i].ref->generatedMips, i == 2);
   }
   EXPECT_EQ(testing::generated_allocations(), 1);
+}
+
+class CompanionConsumerScope {
+public:
+  CompanionConsumerScope() { texture::set_companion_consumer(true); }
+  ~CompanionConsumerScope() { texture::set_companion_consumer(false); }
+  CompanionConsumerScope(const CompanionConsumerScope&) = delete;
+  CompanionConsumerScope& operator=(const CompanionConsumerScope&) = delete;
+};
+
+constexpr gfx::texture_replacement::CompanionSet CompanionsA{.id = 5, .roles = 0x45};
+
+TEST_F(GxTextureCacheTest, CompanionSetStoredAtMissAndReturnedOnObjectHit) {
+  LatchedLookup materials{MaterialA};
+  ScopedMaterialLookup scope{materials};
+  testing::set_companions(true, CompanionsA);
+  CompanionConsumerScope consumer;
+  std::array<uint8_t, 16> pixels{};
+  pixels[1] = 4;
+  std::array<uint8_t, 32> indices{};
+  std::array<uint8_t, 32> palette{};
+  const auto obj = make_texture(pixels.data(), 1);
+  const auto paletteObj = make_texture(indices.data(), 2, GX_TF_C4, 4, 4);
+  const auto tlut = make_tlut(palette.data(), 1);
+
+  gfx::TextureMaterialRef first;
+  texture::resolve_static_texture(obj, &first);
+  ASSERT_TRUE(testing::last_companion_key().has_value());
+  expect_key(*testing::last_companion_key(), materials.keys.back());
+  gfx::TextureMaterialRef firstPalette;
+  texture::resolve_static_palette_texture(paletteObj, tlut, &firstPalette);
+  ASSERT_TRUE(testing::last_companion_key().has_value());
+  expect_key(*testing::last_companion_key(), materials.keys.back());
+  testing::set_companions(true, {.id = 9, .roles = 1});
+  gfx::TextureMaterialRef second;
+  gfx::TextureMaterialRef secondPalette;
+  texture::resolve_static_texture(obj, &second);
+  texture::resolve_static_palette_texture(paletteObj, tlut, &secondPalette);
+
+  constexpr gfx::TextureMaterialRef Expected{
+      .id = MaterialA.id, .flags = MaterialA.flags, .companionSet = 5, .companionRoles = 0x45};
+  EXPECT_EQ(first, Expected);
+  EXPECT_EQ(firstPalette, Expected);
+  EXPECT_EQ(second, Expected);
+  EXPECT_EQ(secondPalette, Expected);
+  EXPECT_EQ(testing::companion_queries(), 2);
+  EXPECT_EQ(texture_stats().objectHits, 2);
+  EXPECT_EQ(materials.finds, 2);
+}
+
+TEST_F(GxTextureCacheTest, ConsumerOffLeavesZero) {
+  testing::set_companions(true, CompanionsA);
+  std::array<uint8_t, 16> pixels{};
+  std::array<uint8_t, 32> indices{};
+  std::array<uint8_t, 32> palette{};
+  const auto obj = make_texture(pixels.data(), 1);
+
+  gfx::TextureMaterialRef material{3, 3, 3, 3};
+  texture::resolve_static_texture(obj, &material);
+  EXPECT_EQ(material, gfx::TextureMaterialRef{});
+  material = {3, 3, 3, 3};
+  texture::resolve_static_palette_texture(make_texture(indices.data(), 2, GX_TF_C4, 4, 4), make_tlut(palette.data(), 1),
+                                          &material);
+  EXPECT_EQ(material, gfx::TextureMaterialRef{});
+  EXPECT_EQ(texture_stats().sourceKeyBuilds, 0);
+  EXPECT_EQ(testing::companion_queries(), 0);
+
+  const uint64_t generation = texture::current_bind_generation();
+  testing::set_companion_generation(4);
+  testing::set_companion_epoch(2);
+  texture::end_frame();
+  EXPECT_EQ(texture::current_bind_generation(), generation);
+  texture::resolve_static_texture(obj, &material);
+  EXPECT_EQ(texture_stats().objectHits, 1);
+  EXPECT_EQ(material, gfx::TextureMaterialRef{});
+}
+
+TEST_F(GxTextureCacheTest, CompanionOnlyDirectoryBuildsKeys) {
+  testing::set_companions(true, CompanionsA);
+  CompanionConsumerScope consumer;
+  std::array<uint8_t, 16> pixels{};
+  pixels[2] = 5;
+  std::array<uint8_t, 16> other{};
+  other[2] = 6;
+
+  gfx::TextureMaterialRef material;
+  texture::resolve_static_texture(make_texture(pixels.data(), 1), &material);
+  EXPECT_EQ(material, (gfx::TextureMaterialRef{.companionSet = 5, .companionRoles = 0x45}));
+  EXPECT_EQ(texture_stats().sourceKeyBuilds, 1);
+  EXPECT_EQ(testing::source_replacement_queries(), 0);
+  ASSERT_TRUE(testing::last_companion_key().has_value());
+  expect_key(*testing::last_companion_key(), aurora::texture::compute_source_key(GX_TF_RGBA8_PC, 2, 2, pixels));
+
+  testing::set_companions(false, {});
+  texture::resolve_static_texture(make_texture(other.data(), 2), &material);
+  EXPECT_EQ(material, gfx::TextureMaterialRef{});
+  EXPECT_EQ(texture_stats().sourceKeyBuilds, 1);
+  EXPECT_EQ(testing::companion_queries(), 1);
+}
+
+TEST_F(GxTextureCacheTest, CompanionChangesRebindOnlyWhileConsumed) {
+  std::array<uint8_t, 16> pixels{};
+  const auto obj = make_texture(pixels.data(), 1);
+  texture::resolve_static_texture(obj);
+  uint64_t generation = texture::current_bind_generation();
+
+  texture::set_companion_consumer(true);
+  EXPECT_GT(texture::current_bind_generation(), generation);
+  texture::resolve_static_texture(obj);
+  EXPECT_EQ(texture_stats().objectHits, 0);
+  generation = texture::current_bind_generation();
+  texture::end_frame();
+  EXPECT_EQ(texture::current_bind_generation(), generation);
+
+  testing::set_companion_epoch(1);
+  texture::end_frame();
+  EXPECT_GT(texture::current_bind_generation(), generation);
+  texture::resolve_static_texture(obj);
+  EXPECT_EQ(texture_stats().objectHits, 1);
+  generation = texture::current_bind_generation();
+
+  testing::set_companion_generation(3);
+  texture::end_frame();
+  EXPECT_GT(texture::current_bind_generation(), generation);
+  texture::resolve_static_texture(obj);
+  EXPECT_EQ(texture_stats().objectHits, 0);
+  generation = texture::current_bind_generation();
+
+  texture::set_companion_consumer(false);
+  EXPECT_GT(texture::current_bind_generation(), generation);
+  generation = texture::current_bind_generation();
+  testing::set_companion_epoch(2);
+  testing::set_companion_generation(4);
+  texture::end_frame();
+  EXPECT_EQ(texture::current_bind_generation(), generation);
 }
 } // namespace
 } // namespace aurora::gx

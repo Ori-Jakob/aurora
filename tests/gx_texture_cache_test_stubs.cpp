@@ -1,5 +1,6 @@
 #include "gx/texture.hpp"
 
+#include "gfx/companion_cache.hpp"
 #include "gfx/tex_palette_conv.hpp"
 #include "gfx/tex_copy_conv.hpp"
 #include "gfx/texture_convert.hpp"
@@ -25,6 +26,12 @@ uint64_t s_sourceReplacementQueries = 0;
 uint64_t s_generatedAllocations = 0;
 u32 s_lastGeneratedFormat = 0;
 size_t s_lastGeneratedBytes = 0;
+bool s_hasCompanions = false;
+aurora::gfx::texture_replacement::CompanionSet s_companionSet;
+std::optional<aurora::texture::TextureSourceKey> s_lastCompanionKey;
+uint64_t s_companionQueries = 0;
+uint64_t s_companionGeneration = 0;
+uint64_t s_companionEpoch = 0;
 } // namespace
 
 namespace aurora {
@@ -63,6 +70,12 @@ void reset_texture_stubs() {
   s_generatedAllocations = 0;
   s_lastGeneratedFormat = 0;
   s_lastGeneratedBytes = 0;
+  s_hasCompanions = false;
+  s_companionSet = {};
+  s_lastCompanionKey.reset();
+  s_companionQueries = 0;
+  s_companionGeneration = 0;
+  s_companionEpoch = 0;
 }
 
 uint64_t texture_allocations() { return s_textureAllocations; }
@@ -81,6 +94,14 @@ void set_source_replacement(aurora::texture::TextureSourceKey key, gfx::TextureH
   s_sourceReplacement = std::move(handle);
   s_sourceReplacementId = 2;
 }
+void set_companions(bool indexed, gfx::texture_replacement::CompanionSet set) {
+  s_hasCompanions = indexed;
+  s_companionSet = set;
+}
+uint64_t companion_queries() { return s_companionQueries; }
+std::optional<aurora::texture::TextureSourceKey> last_companion_key() { return s_lastCompanionKey; }
+void set_companion_generation(uint64_t generation) { s_companionGeneration = generation; }
+void set_companion_epoch(uint64_t epoch) { s_companionEpoch = epoch; }
 } // namespace testing
 } // namespace aurora::gx
 
@@ -170,4 +191,20 @@ std::string build_texture_replacement_name(const GXTexObj_& obj) noexcept { retu
 std::string build_texture_replacement_name(const aurora::texture::TextureSourceKey& sourceKey) noexcept {
   return "test texture";
 }
+
+bool has_companions() noexcept { return s_hasCompanions; }
+
+CompanionSet companion_set(const aurora::texture::TextureSourceKey& key) noexcept {
+  ++s_companionQueries;
+  s_lastCompanionKey = key;
+  return s_companionSet;
+}
+
+uint64_t companion_generation() noexcept { return s_companionGeneration; }
 } // namespace aurora::gfx::texture_replacement
+
+namespace aurora::gfx::companion_cache {
+void process() noexcept {}
+
+uint64_t epoch() noexcept { return s_companionEpoch; }
+} // namespace aurora::gfx::companion_cache

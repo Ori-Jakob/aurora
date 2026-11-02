@@ -1,5 +1,6 @@
 #include "texture.hpp"
 
+#include "../gfx/companion_cache.hpp"
 #include "../gfx/lru_cache.hpp"
 #include "../gfx/recording.hpp"
 #include "../gfx/tex_copy_conv.hpp"
@@ -145,6 +146,9 @@ std::atomic<const texture::MaterialLookup*> s_pendingMaterialLookup{nullptr};
 std::atomic<const texture::MaterialLookup*> s_materialLookup{nullptr};
 std::atomic<uint64_t> s_pendingMaterialChanges{0};
 std::atomic<uint64_t> s_sourceKeyBuildsTotal{0};
+std::atomic_bool s_companionConsumer{false};
+std::atomic<uint64_t> s_companionGenerationSeen{0};
+uint64_t s_companionEpochSeen = 0;
 
 #if DEBUG
 constexpr bool BuildSourceKeyForDebug = true;
@@ -516,6 +520,16 @@ bool mip_tail_eligible(const GXTexObj_& obj) noexcept {
          !gfx::is_pc_texture_format(obj.format());
 }
 
+bool companion_keys_wanted() noexcept {
+  return s_companionConsumer.load(std::memory_order_relaxed) && gfx::texture_replacement::has_companions();
+}
+
+void attach_companions(const aurora::texture::TextureSourceKey& sourceKey, gfx::TextureMaterialRef& ref) noexcept {
+  const auto set = gfx::texture_replacement::companion_set(sourceKey);
+  ref.companionSet = set.id;
+  ref.companionRoles = set.roles;
+}
+
 bool use_replacement(std::optional<gfx::texture_replacement::ReplacementResult> replacement, gfx::TextureHandle& handle,
                      uint64_t& replacementId) noexcept {
   if (!replacement.has_value()) {
@@ -667,6 +681,15 @@ void set_generate_missing_mips(bool enabled) noexcept {
 
 bool generate_missing_mips_requested() noexcept { return s_generateMipsRequest.load(std::memory_order_acquire); }
 
+void set_companion_consumer(bool consumed) noexcept {
+  if (s_companionConsumer.exchange(consumed, std::memory_order_acq_rel) == consumed) {
+    return;
+  }
+  s_companionGenerationSeen.store(gfx::texture_replacement::companion_generation(), std::memory_order_relaxed);
+  clear_static_texture_cache();
+  invalidate_bindings();
+}
+
 void set_material_lookup(const MaterialLookup* lookup) noexcept {
   s_pendingMaterialLookup.store(lookup, std::memory_order_release);
   s_pendingMaterialChanges.fetch_add(1, std::memory_order_release);
@@ -722,13 +745,17 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj, gfx::TextureMate
   if (!use_replacement(gfx::texture_replacement::find_pointer_replacement(obj), handle, replacementId)) {
     const auto* lookup = s_materialLookup.load(std::memory_order_acquire);
     const bool replacementKeys = gfx::texture_replacement::should_build_source_key() || BuildSourceKeyForDebug;
-    keys = hash_texture_source(obj, nullptr, replacementKeys || lookup != nullptr);
+    const bool companionKeys = companion_keys_wanted();
+    keys = hash_texture_source(obj, nullptr, replacementKeys || lookup != nullptr || companionKeys);
     if (replacementKeys && keys->sourceKey.has_value()) {
       use_replacement(gfx::texture_replacement::find_source_replacement(obj, *keys->sourceKey), handle, replacementId);
     }
     if (lookup != nullptr && keys->sourceKey.has_value()) {
       ++s_stats.materialLookups;
       ref = lookup->find(lookup->userData, *keys->sourceKey);
+    }
+    if (companionKeys && keys->sourceKey.has_value()) {
+      attach_companions(*keys->sourceKey, ref);
     }
   }
   if (!handle) {
@@ -795,13 +822,17 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
   if (!use_replacement(gfx::texture_replacement::find_pointer_replacement(obj), handle, replacementId)) {
     const auto* lookup = s_materialLookup.load(std::memory_order_acquire);
     const bool replacementKeys = gfx::texture_replacement::should_build_source_key();
-    keys = hash_texture_source(obj, &tlut, replacementKeys || lookup != nullptr);
+    const bool companionKeys = companion_keys_wanted();
+    keys = hash_texture_source(obj, &tlut, replacementKeys || lookup != nullptr || companionKeys);
     if (replacementKeys && keys->sourceKey.has_value()) {
       use_replacement(gfx::texture_replacement::find_source_replacement(obj, *keys->sourceKey), handle, replacementId);
     }
     if (lookup != nullptr && keys->sourceKey.has_value()) {
       ++s_stats.materialLookups;
       ref = lookup->find(lookup->userData, *keys->sourceKey);
+    }
+    if (companionKeys && keys->sourceKey.has_value()) {
+      attach_companions(*keys->sourceKey, ref);
     }
   }
   if (!handle) {
@@ -849,6 +880,19 @@ void end_frame() noexcept {
   s_stats.pendingLoads = streamingStats.pendingLoads;
   s_stats.publishes = streamingStats.publishes;
   s_stats.publishBytes = streamingStats.publishBytes;
+  gfx::companion_cache::process();
+  const uint64_t companionEpoch = gfx::companion_cache::epoch();
+  if (s_companionConsumer.load(std::memory_order_acquire)) {
+    const uint64_t generation = gfx::texture_replacement::companion_generation();
+    if (s_companionGenerationSeen.exchange(generation, std::memory_order_relaxed) != generation) {
+      clear_static_texture_cache();
+      invalidate_bindings();
+    }
+    if (companionEpoch != s_companionEpochSeen) {
+      invalidate_bindings();
+    }
+  }
+  s_companionEpochSeen = companionEpoch;
   TracyPlot("aurora: textureUploadBytes", static_cast<int64_t>(s_stats.uploadBytes));
   TracyPlot("aurora: textureHashedBytes", static_cast<int64_t>(s_stats.hashedBytes));
   TracyPlot("aurora: textureObjectHits", static_cast<int64_t>(s_stats.objectHits));
@@ -919,6 +963,9 @@ void shutdown() noexcept {
   s_pendingCacheClears.store(0, std::memory_order_release);
   s_generateMipsRequest.store(false, std::memory_order_release);
   s_generateMips = false;
+  s_companionConsumer.store(false, std::memory_order_release);
+  s_companionGenerationSeen.store(0, std::memory_order_relaxed);
+  s_companionEpochSeen = 0;
   s_stats = {};
 }
 

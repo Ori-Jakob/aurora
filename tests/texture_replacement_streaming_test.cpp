@@ -1,3 +1,4 @@
+#include "gfx/companion_cache.hpp"
 #include "gfx/dds_io.hpp"
 #include "gfx/texture_replacement.hpp"
 #include "internal.hpp"
@@ -2046,6 +2047,280 @@ TEST_F(ReplacementPackSweep, HasNoMipWarnings) {
               summarize(linearDelta, 1.0, "").c_str());
   std::printf("encoded vs box reference, first generated level, mean |d| per chain (RGBA): %s\n",
               summarize(encodeDelta, 1.0, "").c_str());
+  texture::unregister_replacements(group);
+}
+
+class CompanionLoadTest : public CompanionScanTest {
+protected:
+  void SetUp() override {
+    CompanionScanTest::SetUp();
+    m_savedBc = webgpu::g_bcTexturesSupported;
+    webgpu::g_bcTexturesSupported = true;
+    companion_cache::testing::set_deviceless(true);
+  }
+
+  void TearDown() override {
+    set_synchronous_loads(false);
+    set_mip_repair(false);
+    CompanionScanTest::TearDown();
+    companion_cache::testing::set_deviceless(false);
+    webgpu::g_bcTexturesSupported = m_savedBc;
+  }
+
+  std::filesystem::path write_bytes(const std::filesystem::path& relative, const std::vector<uint8_t>& bytes) const {
+    return write_file(relative, {reinterpret_cast<const char*>(bytes.data()), bytes.size()});
+  }
+
+  bool m_savedBc = false;
+};
+
+std::vector<uint8_t> payload(std::initializer_list<const std::vector<uint8_t>*> files) {
+  std::vector<uint8_t> out;
+  for (const auto* file : files) {
+    out.insert(out.end(), file->begin() + 148, file->end());
+  }
+  return out;
+}
+
+constexpr uint8_t view_bit(CompanionRole role) { return companion_cache::role_bit(role); }
+
+TEST_F(CompanionLoadTest, CompanionMipNamesUseRoleSuffix) {
+  const auto level0 = make_dds(83, Format::BC5RGUnorm, 16, 16, 1, 1);
+  const auto level1 = make_dds(83, Format::BC5RGUnorm, 8, 8, 1, 2);
+  const auto level2 = make_dds(83, Format::BC5RGUnorm, 4, 4, 1, 3);
+  const auto base = write_bytes(stem_a(".nrm.dds"), level0);
+  write_bytes(stem_a("_mip1.nrm.dds"), level1);
+  write_bytes(stem_a("_mip2.nrm.dds"), level2);
+  write_bytes(stem_a(".nrm_mip1.dds"), make_dds(83, Format::BC5RGUnorm, 16, 16, 1, 9));
+
+  CompanionLoadError error = CompanionLoadError::Failed;
+  const auto loaded = load_companion(CompanionRole::Nrm, base, &error);
+  ASSERT_TRUE(loaded.has_value());
+  EXPECT_EQ(error, CompanionLoadError::None);
+  EXPECT_EQ(loaded->format, Format::BC5RGUnorm);
+  EXPECT_EQ(loaded->width, 16u);
+  EXPECT_EQ(loaded->mips, 3u);
+  EXPECT_TRUE(holds_bytes(*loaded, payload({&level0, &level1, &level2})));
+
+  const auto legacy = testing::load_replacement_file(base, false);
+  ASSERT_TRUE(legacy.has_value());
+  EXPECT_EQ(legacy->mips, 1u);
+}
+
+TEST_F(CompanionLoadTest, CompanionFormatsFollowD7) {
+  constexpr std::array<CodeFormat, 10> Codes{{
+      {28, Format::RGBA8Unorm},
+      {29, Format::RGBA8UnormSrgb},
+      {71, Format::BC1RGBAUnorm},
+      {77, Format::BC3RGBAUnorm},
+      {80, Format::BC4RUnorm},
+      {83, Format::BC5RGUnorm},
+      {84, Format::BC5RGSnorm},
+      {87, Format::BGRA8Unorm},
+      {98, Format::BC7RGBAUnorm},
+      {99, Format::BC7RGBAUnormSrgb},
+  }};
+  const auto d7 = [](CompanionRole role, uint32_t code) {
+    switch (role) {
+    case CompanionRole::Albedo:
+    case CompanionRole::Emit:
+      return code == 98 || code == 99;
+    case CompanionRole::Delight:
+    case CompanionRole::GrassMask:
+      return code == 80;
+    case CompanionRole::Nrm:
+      return code == 83;
+    case CompanionRole::Orm:
+      return code == 98;
+    case CompanionRole::Mat:
+      return code == 71 || code == 77 || code == 83 || code == 98 || code == 28 || code == 87;
+    }
+    return false;
+  };
+  for (uint32_t index = 0; index < CompanionRoleCount; ++index) {
+    const auto role = static_cast<CompanionRole>(index);
+    for (const auto& [code, format] : Codes) {
+      SCOPED_TRACE(fmt::format("{} {}", companion_role_name(role), code));
+      const auto path = write_bytes(fmt::format("d7_{}_{}.dds", companion_role_name(role), code),
+                                    make_dds(code, format, 8, 8, 1, static_cast<uint8_t>(code)));
+      EXPECT_EQ(companion_role_accepts(role, format), d7(role, code));
+      CompanionLoadError error = CompanionLoadError::None;
+      const auto loaded = load_companion(role, path, &error);
+      EXPECT_EQ(loaded.has_value(), d7(role, code));
+      EXPECT_EQ(error, d7(role, code) ? CompanionLoadError::None : CompanionLoadError::Format);
+      if (loaded) {
+        EXPECT_EQ(loaded->format, companion_storage_format(role, format));
+      }
+    }
+  }
+
+  webgpu::g_bcTexturesSupported = false;
+  const auto path = write_bytes("nobc.dds", make_dds(80, Format::BC4RUnorm, 8, 8));
+  CompanionLoadError error = CompanionLoadError::None;
+  EXPECT_FALSE(load_companion(CompanionRole::Delight, path, &error).has_value());
+  EXPECT_EQ(error, CompanionLoadError::NoBc);
+}
+
+TEST_F(CompanionLoadTest, AlbedoCompanionIsSrgbOthersLinear) {
+  struct Case {
+    CompanionRole role;
+    uint32_t code;
+    Format file;
+    Format stored;
+  };
+  constexpr std::array<Case, 8> Cases{{
+      {CompanionRole::Albedo, 98, Format::BC7RGBAUnorm, Format::BC7RGBAUnormSrgb},
+      {CompanionRole::Albedo, 99, Format::BC7RGBAUnormSrgb, Format::BC7RGBAUnormSrgb},
+      {CompanionRole::Emit, 98, Format::BC7RGBAUnorm, Format::BC7RGBAUnormSrgb},
+      {CompanionRole::Emit, 99, Format::BC7RGBAUnormSrgb, Format::BC7RGBAUnormSrgb},
+      {CompanionRole::Orm, 98, Format::BC7RGBAUnorm, Format::BC7RGBAUnorm},
+      {CompanionRole::Mat, 98, Format::BC7RGBAUnorm, Format::BC7RGBAUnorm},
+      {CompanionRole::Mat, 28, Format::RGBA8Unorm, Format::RGBA8Unorm},
+      {CompanionRole::Nrm, 83, Format::BC5RGUnorm, Format::BC5RGUnorm},
+  }};
+  for (const auto& [role, code, file, stored] : Cases) {
+    SCOPED_TRACE(fmt::format("{} {}", companion_role_name(role), code));
+    const auto bytes = make_dds(code, file, 16, 16, 1, static_cast<uint8_t>(code));
+    const auto path = write_bytes(fmt::format("srgb_{}_{}.dds", companion_role_name(role), code), bytes);
+    const auto loaded = load_companion(role, path);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(loaded->format, stored);
+    EXPECT_TRUE(holds_bytes(*loaded, payload({&bytes})));
+  }
+  static_assert(companion_storage_format(CompanionRole::Albedo, Format::BC7RGBAUnorm) == Format::BC7RGBAUnormSrgb);
+  static_assert(companion_storage_format(CompanionRole::Orm, Format::BC7RGBAUnorm) == Format::BC7RGBAUnorm);
+  static_assert(companion_storage_format(CompanionRole::Albedo, Format::BC4RUnorm) == Format::BC4RUnorm);
+}
+
+TEST_F(CompanionLoadTest, CompanionChainsTruncateNotRepair) {
+  set_mip_repair(true);
+  const auto level0 = test_pixels(16, 16, 1);
+  const auto level1 = test_pixels(8, 8, 2);
+  const auto level2 = test_pixels(8, 8, 3);
+  const auto companion = write_bytes(stem_a(".mat.dds"), rgba8_dds(16, 16, level0));
+  write_bytes(stem_a("_mip1.mat.dds"), rgba8_dds(8, 8, level1));
+  write_bytes(stem_a("_mip2.mat.dds"), rgba8_dds(8, 8, level2));
+  write_bytes(stem_a("_mip3.mat.dds"), rgba8_dds(8, 8, level2));
+  const auto base = write_bytes("tex1_16x16_000000000000e002_6.dds", rgba8_dds(16, 16, level0));
+  write_bytes("tex1_16x16_000000000000e002_6_mip1.dds", rgba8_dds(8, 8, level1));
+  write_bytes("tex1_16x16_000000000000e002_6_mip2.dds", rgba8_dds(8, 8, level2));
+  write_bytes("tex1_16x16_000000000000e002_6_mip3.dds", rgba8_dds(8, 8, level2));
+
+  const auto loaded = load_companion(CompanionRole::Mat, companion);
+  ASSERT_TRUE(loaded.has_value());
+  EXPECT_EQ(loaded->format, Format::RGBA8Unorm);
+  EXPECT_EQ(loaded->mips, 2u);
+  EXPECT_TRUE(holds_bytes(*loaded, joined({&level0, &level1})));
+
+  ChainReport report;
+  const auto repaired = testing::load_replacement_file(base, true, &report);
+  ASSERT_TRUE(repaired.has_value());
+  EXPECT_EQ(report.verdict, ChainVerdict::Clamped);
+  if (mip_repair_built()) {
+    EXPECT_TRUE(report.repaired);
+    EXPECT_EQ(repaired->mips, 5u);
+  }
+}
+
+TEST_F(CompanionLoadTest, CompanionSetEmptyUnderBypassAndDropsOnGeneration) {
+  set_synchronous_loads(true);
+  const auto nrm = write_bytes(stem_a(".nrm.dds"), make_dds(83, Format::BC5RGUnorm, 8, 8));
+  write_bytes(stem_a(".orm.dds"), make_dds(98, Format::BC7RGBAUnorm, 8, 8));
+  EXPECT_FALSE(has_companions());
+  const uint64_t generation = companion_generation();
+  auto group = texture::load_replacement_directory(m_root);
+  ASSERT_EQ(group.companions.size(), 2u);
+  EXPECT_TRUE(has_companions());
+
+  const auto set = companion_set(KeyA);
+  EXPECT_NE(set.id, 0u);
+  EXPECT_EQ(set.roles, view_bit(CompanionRole::Nrm) | view_bit(CompanionRole::Orm));
+  EXPECT_EQ(companion_set(KeyA).id, set.id);
+  ASSERT_TRUE(companion_file(set.id, CompanionRole::Nrm).has_value());
+  EXPECT_EQ(companion_file(set.id, CompanionRole::Nrm)->path, nrm);
+  EXPECT_FALSE(companion_file(set.id, CompanionRole::Albedo).has_value());
+  auto other = KeyA;
+  other.textureHash = 0xa002;
+  EXPECT_EQ(companion_set(other).id, 0u);
+
+  set_bypass(true);
+  EXPECT_EQ(companion_set(KeyA).id, 0u);
+  EXPECT_EQ(companion_set(KeyA).roles, 0);
+  EXPECT_FALSE(has_companions());
+  EXPECT_FALSE(companion_file(set.id, CompanionRole::Nrm).has_value());
+  set_bypass(false);
+
+  std::array<WGPUTextureView, companion_cache::ViewSlotCount> views{};
+  EXPECT_EQ(companion_cache::views(set.id, view_bit(CompanionRole::Nrm), views), view_bit(CompanionRole::Nrm));
+  EXPECT_EQ(companion_cache::testing::resident_sets(), 1u);
+  const uint64_t epoch = companion_cache::epoch();
+
+  texture::unregister_replacements(group);
+  EXPECT_EQ(companion_generation(), generation + 2);
+  EXPECT_EQ(companion_set(KeyA).id, 0u);
+  EXPECT_FALSE(has_companions());
+  EXPECT_FALSE(companion_file(set.id, CompanionRole::Nrm).has_value());
+  companion_cache::process();
+  EXPECT_EQ(companion_cache::testing::resident_sets(), 0u);
+  EXPECT_EQ(companion_cache::epoch(), epoch + 1);
+  EXPECT_EQ(companion_cache::views(set.id, view_bit(CompanionRole::Nrm), views), 0);
+
+  group = texture::load_replacement_directory(m_root);
+  const auto fresh = companion_set(KeyA);
+  EXPECT_NE(fresh.id, 0u);
+  EXPECT_NE(fresh.id, set.id);
+  EXPECT_EQ(companion_cache::views(fresh.id, view_bit(CompanionRole::Nrm), views), view_bit(CompanionRole::Nrm));
+  texture::unregister_replacements(group);
+}
+
+TEST_F(CompanionLoadTest, CompanionEpochBumpsOnCompletion) {
+  write_bytes(stem_a(".nrm.dds"), make_dds(83, Format::BC5RGUnorm, 8, 8));
+  const auto group = texture::load_replacement_directory(m_root);
+  const auto set = companion_set(KeyA);
+  ASSERT_NE(set.id, 0u);
+  testing::set_workers_paused(false);
+  EXPECT_FALSE(synchronous_loads());
+
+  const uint64_t epoch = companion_cache::epoch();
+  std::array<WGPUTextureView, companion_cache::ViewSlotCount> views{};
+  EXPECT_EQ(companion_cache::views(set.id, view_bit(CompanionRole::Nrm), views), 0);
+  ASSERT_TRUE(companion_cache::testing::wait_idle(2000));
+  EXPECT_EQ(companion_cache::epoch(), epoch);
+  companion_cache::process();
+  EXPECT_EQ(companion_cache::epoch(), epoch + 1);
+  EXPECT_EQ(companion_cache::views(set.id, view_bit(CompanionRole::Nrm), views), view_bit(CompanionRole::Nrm));
+  companion_cache::process();
+  EXPECT_EQ(companion_cache::epoch(), epoch + 1);
+  const auto stats = companion_cache::testing::stats();
+  EXPECT_EQ(stats.sets, 1u);
+  EXPECT_EQ(stats.loaded, 1u);
+  EXPECT_EQ(stats.syncLoads, 0u);
+  texture::unregister_replacements(group);
+}
+
+TEST_F(CompanionLoadTest, CompanionCacheHonoursSynchronousLoads) {
+  write_bytes(stem_a(".albedo.dds"), make_dds(98, Format::BC7RGBAUnorm, 8, 8));
+  write_bytes(stem_a(".nrm.dds"), make_dds(83, Format::BC5RGUnorm, 8, 8));
+  write_bytes(stem_a(".orm.dds"), make_dds(98, Format::BC7RGBAUnorm, 8, 8));
+  write_bytes(stem_a(".mat.dds"), make_dds(98, Format::BC7RGBAUnorm, 8, 8));
+  write_bytes(stem_a(".emit.dds"), make_dds(83, Format::BC5RGUnorm, 8, 8));
+  const auto group = texture::load_replacement_directory(m_root);
+  const auto set = companion_set(KeyA);
+  ASSERT_NE(set.id, 0u);
+  set_synchronous_loads(true);
+
+  const auto wanted = static_cast<uint8_t>(view_bit(CompanionRole::Albedo) | view_bit(CompanionRole::Nrm) |
+                                           view_bit(CompanionRole::Orm));
+  std::array<WGPUTextureView, companion_cache::ViewSlotCount> views{};
+  EXPECT_EQ(companion_cache::views(set.id, static_cast<uint8_t>(wanted | view_bit(CompanionRole::Mat)), views), wanted);
+  EXPECT_EQ(companion_cache::views(set.id, wanted, views), wanted);
+  EXPECT_EQ(companion_cache::views(set.id, view_bit(CompanionRole::Emit), views), 0);
+  EXPECT_EQ(companion_cache::views(set.id, view_bit(CompanionRole::Emit), views), 0);
+  const auto stats = companion_cache::testing::stats();
+  EXPECT_EQ(stats.syncLoads, 4u);
+  EXPECT_EQ(stats.loaded, 3u);
+  EXPECT_EQ(stats.rejected, 1u);
+  EXPECT_EQ(stats.rejectedFormat, 1u);
   texture::unregister_replacements(group);
 }
 } // namespace
