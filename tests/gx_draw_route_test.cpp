@@ -1767,3 +1767,136 @@ TEST_F(GXDrawRouteTest, FwdEnvVariantWarmsForPendingLayout) {
   ASSERT_EQ(gfx::g_testWarmedConfigs.size(), 1u);
   EXPECT_EQ(gfx::g_testWarmedConfigs.front().shaderConfig.ext.fwdEnv, 0u);
 }
+
+namespace aurora::gx {
+extern uint32_t g_testCompanionBuilds;
+} // namespace aurora::gx
+namespace aurora::gfx::companion_cache {
+extern uint64_t g_testEpoch;
+extern uint8_t g_testLoaded;
+extern uint32_t g_testViewCalls;
+} // namespace aurora::gfx::companion_cache
+using aurora::gx::g_testCompanionBuilds;
+
+namespace {
+RenderExtConfig layer_hook(void*, const aurora::gx::PipelineConfig&, const aurora::gx::ShaderInfo&,
+                           const gfx::RenderTargetLayout&, render_ext::StochasticLanes&) noexcept {
+  ++g_deriveCalls;
+  RenderExtConfig ext;
+  ext.output = render_ext::g_drawInputs != 0 ? 2 : 0;
+  ext.layer0 = render_ext::g_drawInputs != 0 ? 1 : 0;
+  return ext;
+}
+
+constexpr render_ext::Hooks LayerHook{.derive = &layer_hook};
+constexpr uint8_t NrmRole = 1u << 2;
+
+struct CompanionFixture {
+  CompanionFixture() {
+    g_testSampledTextures.set(0);
+    g_gxState.textures[0].material = {.companionSet = 9, .companionRoles = NrmRole};
+    render_ext::set_companion_gates({.materials = true, .matMaps = false, .normals = true});
+    gfx::companion_cache::g_testLoaded = 0;
+    gfx::companion_cache::g_testEpoch = 0;
+    gfx::companion_cache::g_testViewCalls = 0;
+    g_testCompanionBuilds = 0;
+  }
+  ~CompanionFixture() {
+    render_ext::set_companion_gates({});
+    render_ext::store_companion_lane({});
+    gfx::companion_cache::g_testLoaded = 0;
+    gfx::companion_cache::g_testEpoch = 0;
+  }
+};
+} // namespace
+
+TEST_F(GXDrawRouteTest, FallbackDrawBindsLegacyGroup) {
+  gfx::g_testMergeDraws = false;
+  const CompanionFixture fixture;
+  render_ext::set_hooks(&LayerHook);
+  render_ext::g_drawInputs = 1;
+  gfx::g_testPipelineState = gfx::PipelineState::Pending;
+  gfx::g_testReadyTwinRef = 55;
+  gfx::g_testReadyLegacyRef = 77;
+  triangle();
+  decode();
+  ASSERT_FALSE(gfx::g_testLookupExts.empty());
+  EXPECT_EQ(gfx::g_testLookupExts.back().layer0, 1u);
+  ASSERT_FALSE(gfx::g_testReadyExts.empty());
+  for (const RenderExtConfig& ext : gfx::g_testReadyExts) {
+    EXPECT_EQ(ext.layer0, 0u) << int{ext.output};
+  }
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, 55u);
+  EXPECT_NE(gfx::g_testLastDraw.bindGroups.companionBindGroup, 0u);
+  EXPECT_EQ(g_testCompanionBuilds, 1u);
+
+  render_ext::g_drawInputs = 0;
+  triangle();
+  decode();
+  EXPECT_EQ(gfx::g_testLastLookupExt.layer0, 0u);
+  EXPECT_EQ(gfx::g_testLastDraw.bindGroups.companionBindGroup, 0u);
+  EXPECT_EQ(g_testCompanionBuilds, 1u);
+}
+
+TEST_F(GXDrawRouteTest, ResidencyFlipRebindsWithoutRecompile) {
+  gfx::g_testMergeDraws = false;
+  const CompanionFixture fixture;
+  render_ext::set_hooks(&LayerHook);
+  render_ext::g_drawInputs = 1;
+  triangle();
+  decode();
+  const uint32_t lookups = gfx::g_testPipelineRefCount;
+  const gfx::BindGroupRef first = gfx::g_testLastDraw.bindGroups.companionBindGroup;
+  const uint32_t uniforms = g_testUniformBuildCount;
+  EXPECT_NE(first, 0u);
+  EXPECT_EQ(render_ext::g_companionLane.v, (aurora::Vec4<float>{0.f, 0.f, 1.f, 0.f}));
+
+  triangle();
+  decode();
+  EXPECT_EQ(gfx::g_testLastDraw.bindGroups.companionBindGroup, first);
+  EXPECT_EQ(g_testCompanionBuilds, 1u);
+
+  gfx::companion_cache::g_testLoaded = NrmRole;
+  gfx::companion_cache::g_testEpoch = 1;
+  triangle();
+  decode();
+  EXPECT_EQ(gfx::g_testPipelineRefCount, lookups);
+  EXPECT_EQ(g_testCompanionBuilds, 2u);
+  EXPECT_NE(gfx::g_testLastDraw.bindGroups.companionBindGroup, first);
+  EXPECT_EQ(render_ext::g_companionLane.v,
+            (aurora::Vec4<float>{static_cast<float>(render_ext::LaneNrm), render_ext::NrmNormalStrength, 1.f, 0.f}));
+  EXPECT_EQ(g_testUniformBuildCount, uniforms + 1);
+
+  render_ext::set_companion_gates({.materials = true, .matMaps = false, .normals = false});
+  gfx::companion_cache::g_testEpoch = 2;
+  triangle();
+  decode();
+  EXPECT_EQ(gfx::g_testPipelineRefCount, lookups);
+  EXPECT_EQ(render_ext::g_companionLane.v,
+            (aurora::Vec4<float>{static_cast<float>(render_ext::LaneNrm), 0.f, 1.f, 0.f}));
+
+  g_gxState.textures[0].material.companionRoles = 1u << 6;
+  render_ext::set_companion_gates({.materials = true, .matMaps = true, .normals = true});
+  gfx::companion_cache::g_testLoaded = 1u << 6;
+  gfx::companion_cache::g_testEpoch = 3;
+  triangle();
+  decode();
+  EXPECT_EQ(gfx::g_testPipelineRefCount, lookups);
+  EXPECT_EQ(render_ext::g_companionLane.v,
+            (aurora::Vec4<float>{static_cast<float>(render_ext::LaneMat), render_ext::MatNormalStrength,
+                                 render_ext::MatNormalYSign, 0.f}));
+}
+
+TEST_F(GXDrawRouteTest, CompanionBindsSkippedWithoutLayer) {
+  gfx::g_testMergeDraws = false;
+  const CompanionFixture fixture;
+  render_ext::set_hooks(&Output2Hook);
+  render_ext::g_drawInputs = 1;
+  triangle();
+  decode();
+  EXPECT_EQ(gfx::g_testLastLookupExt.output, 2u);
+  EXPECT_EQ(gfx::g_testLastLookupExt.layer0, 0u);
+  EXPECT_EQ(gfx::g_testLastDraw.bindGroups.companionBindGroup, 0u);
+  EXPECT_EQ(g_testCompanionBuilds, 0u);
+  EXPECT_EQ(gfx::companion_cache::g_testViewCalls, 0u);
+}

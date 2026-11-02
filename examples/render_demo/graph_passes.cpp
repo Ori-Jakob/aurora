@@ -1734,6 +1734,223 @@ void update_unlit_check(u32 frame) {
   }
 }
 
+constexpr u32 CompanionHeaderWords = 4;
+constexpr u32 CompanionSampleWords = 8;
+
+constexpr std::string_view CompanionCheckWgsl = R"(
+struct CompanionProbe {
+  ndc: vec2f,
+  quad: u32,
+  cell: u32,
+};
+@group(1) @binding(0) var gx_normal: texture_2d<f32>;
+@group(1) @binding(1) var gbuf_surface: texture_2d<u32>;
+@group(2) @binding(0) var<storage, read_write> results: array<u32>;
+@group(2) @binding(1) var<storage, read> probes: array<CompanionProbe>;
+
+@compute @workgroup_size(64)
+fn cs_main(@builtin(global_invocation_id) id: vec3u) {
+  let size = textureDimensions(gx_normal);
+  if (id.x == 0u) {
+    results[0] = size.x;
+    results[1] = size.y;
+    results[2] = 1u;
+  }
+  if (id.x >= arrayLength(&probes)) {
+    return;
+  }
+  let centre = (probes[id.x].ndc * vec2f(0.5, -0.5) + 0.5) * vec2f(size);
+  let p = clamp(vec2i(floor(centre)), vec2i(0), vec2i(size) - 1);
+  let n = bitcast<vec4u>(textureLoad(gx_normal, p, 0));
+  let rec = textureLoad(gbuf_surface, min(vec2u(p), textureDimensions(gbuf_surface) - 1u), 0);
+  let base = 4u + id.x * 8u;
+  results[base] = n.x;
+  results[base + 1u] = n.y;
+  results[base + 2u] = n.z;
+  results[base + 3u] = n.w;
+  results[base + 4u] = rec.x;
+  results[base + 5u] = rec.y;
+  results[base + 6u] = rec.z;
+  results[base + 7u] = rec.w;
+}
+)";
+
+struct CompanionCheckPass {
+  PassId id = aurora::render::InvalidPass;
+  std::atomic_uint32_t encodes = 0;
+  // Main thread only
+  std::vector<CompanionProbe> probes;
+  uint64_t bytes = 0;
+  wgpu::Buffer output;
+  wgpu::Buffer probeBuffer;
+  wgpu::BindGroupLayout layout;
+  wgpu::BindGroup group;
+  // Render worker only
+  wgpu::ComputePipeline pipeline;
+  wgpu::BindGroupLayout passLayout;
+  std::array<UnlitCheckSlot, CompanionPhaseCount> slots;
+  std::mutex mutex;
+};
+
+CompanionCheckPass sCompanion;
+
+void declare_companion_check(PassBuilder& builder, void*) {
+  builder.use(aurora::render::resource::GxNormal, Access::Sampled, aurora::render::Missing::DisablePass);
+  builder.use(aurora::render::resource::Surface, Access::Sampled, aurora::render::Missing::DisablePass);
+  builder.side_effect();
+}
+
+void encode_companion_check(PassContext& ctx, void* userdata) {
+  auto& check = *static_cast<CompanionCheckPass*>(userdata);
+  check.encodes.fetch_add(1, std::memory_order_relaxed);
+  if (!check.pipeline || check.passLayout.Get() != ctx.pass_layout().Get()) {
+    const std::string code{CompanionCheckWgsl};
+    const wgpu::ShaderSourceWGSL wgsl{wgpu::ShaderSourceWGSL::Init{.code = code.c_str()}};
+    const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl, .label = "demo.companion_probe"};
+    const std::array<wgpu::BindGroupLayout, 3> layouts{ctx.frame_layout(), ctx.pass_layout(), check.layout};
+    const wgpu::PipelineLayoutDescriptor layoutDescriptor{
+        .label = "demo.companion_probe",
+        .bindGroupLayoutCount = layouts.size(),
+        .bindGroupLayouts = layouts.data(),
+    };
+    const wgpu::ComputePipelineDescriptor descriptor{
+        .label = "demo.companion_probe",
+        .layout = ctx.device().CreatePipelineLayout(&layoutDescriptor),
+        .compute = {.module = ctx.device().CreateShaderModule(&moduleDescriptor), .entryPoint = "cs_main"},
+    };
+    check.pipeline = ctx.device().CreateComputePipeline(&descriptor);
+    check.passLayout = ctx.pass_layout();
+  }
+  const wgpu::ComputePassEncoder compute = ctx.begin_compute();
+  if (!compute) {
+    return;
+  }
+  compute.SetPipeline(check.pipeline);
+  compute.SetBindGroup(2, check.group);
+  compute.DispatchWorkgroups((static_cast<u32>(check.probes.size()) + 63) / 64);
+  compute.End();
+  for (UnlitCheckSlot& slot : check.slots) {
+    if (!slot.copied && ctx.frame() >= slot.armedFrame.load(std::memory_order_acquire)) {
+      ctx.encoder().CopyBufferToBuffer(check.output, 0, slot.readback, 0, check.bytes);
+      slot.copied = true;
+      slot.copiedFrame = ctx.frame();
+      break;
+    }
+  }
+}
+
+void companion_check_mapped(UnlitCheckSlot& slot, uint64_t bytes, wgpu::MapAsyncStatus status) {
+  if (status != wgpu::MapAsyncStatus::Success) {
+    slot.result.store(ProbeResult::Failed, std::memory_order_release);
+    return;
+  }
+  const auto* mapped = static_cast<const u32*>(slot.readback.GetConstMappedRange(0, bytes));
+  if (mapped != nullptr) {
+    std::lock_guard lock{sCompanion.mutex};
+    slot.values.assign(mapped, mapped + bytes / sizeof(u32));
+  }
+  slot.readback.Unmap();
+  slot.result.store(mapped != nullptr ? ProbeResult::Ready : ProbeResult::Failed, std::memory_order_release);
+}
+
+void companion_check_submitted(u32 frame, void* userdata) {
+  auto& check = *static_cast<CompanionCheckPass*>(userdata);
+  for (UnlitCheckSlot& slot : check.slots) {
+    if (!slot.copied || slot.mapRequested || frame != slot.copiedFrame) {
+      continue;
+    }
+    slot.mapRequested = true;
+    const uint64_t bytes = check.bytes;
+    slot.readback.MapAsync(
+        wgpu::MapMode::Read, 0, bytes, wgpu::CallbackMode::AllowSpontaneous,
+        [&slot, bytes](wgpu::MapAsyncStatus status, wgpu::StringView) { companion_check_mapped(slot, bytes, status); });
+  }
+}
+
+bool register_companion_check(std::string& error) {
+  sCompanion.probes = companion_probes();
+  if (sCompanion.probes.empty()) {
+    error = "demo.companion_probe has no probes on screen";
+    return false;
+  }
+  sCompanion.bytes = (CompanionHeaderWords + sCompanion.probes.size() * CompanionSampleWords) * sizeof(u32);
+  const wgpu::Device device = aurora::gfx::device();
+  const auto buffer = [&](const char* label, wgpu::BufferUsage usage, uint64_t size) {
+    const wgpu::BufferDescriptor descriptor{.label = label, .usage = usage, .size = size};
+    return device.CreateBuffer(&descriptor);
+  };
+  sCompanion.output =
+      buffer("demo.companion_probe output", wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc, sCompanion.bytes);
+  for (UnlitCheckSlot& slot : sCompanion.slots) {
+    slot.readback = buffer("demo.companion_probe readback", wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+                           sCompanion.bytes);
+  }
+  const uint64_t probeBytes = sCompanion.probes.size() * sizeof(CompanionProbe);
+  sCompanion.probeBuffer =
+      buffer("demo.companion_probe probes", wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, probeBytes);
+  device.GetQueue().WriteBuffer(sCompanion.probeBuffer, 0, sCompanion.probes.data(), probeBytes);
+  const std::array layoutEntries{
+      wgpu::BindGroupLayoutEntry{
+          .binding = 0,
+          .visibility = wgpu::ShaderStage::Compute,
+          .buffer = {.type = wgpu::BufferBindingType::Storage},
+      },
+      wgpu::BindGroupLayoutEntry{
+          .binding = 1,
+          .visibility = wgpu::ShaderStage::Compute,
+          .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage},
+      },
+  };
+  const wgpu::BindGroupLayoutDescriptor layoutDescriptor{
+      .label = "demo.companion_probe",
+      .entryCount = layoutEntries.size(),
+      .entries = layoutEntries.data(),
+  };
+  sCompanion.layout = device.CreateBindGroupLayout(&layoutDescriptor);
+  const std::array groupEntries{
+      wgpu::BindGroupEntry{.binding = 0, .buffer = sCompanion.output, .size = sCompanion.bytes},
+      wgpu::BindGroupEntry{.binding = 1, .buffer = sCompanion.probeBuffer, .size = probeBytes},
+  };
+  const wgpu::BindGroupDescriptor groupDescriptor{
+      .label = "demo.companion_probe",
+      .layout = sCompanion.layout,
+      .entryCount = groupEntries.size(),
+      .entries = groupEntries.data(),
+  };
+  sCompanion.group = device.CreateBindGroup(&groupDescriptor);
+  sCompanion.id = aurora::render::register_pass({
+      .name = "demo.companion_probe",
+      .stage = aurora::render::Stage::PrePost,
+      .kind = aurora::render::PassKind::Compute,
+      .declare = declare_companion_check,
+      .encode = encode_companion_check,
+      .afterSubmit = companion_check_submitted,
+      .userdata = &sCompanion,
+  });
+  if (sCompanion.id == aurora::render::InvalidPass) {
+    error = "register_pass refused demo.companion_probe";
+    return false;
+  }
+  return true;
+}
+
+void update_companion_check(u32 frame) {
+  if (sCompanion.id == aurora::render::InvalidPass) {
+    return;
+  }
+  // Draws whose pipeline is still compiling are skipped, and each phase brings new companion pipelines
+  if (frame == CompanionPipelineWaitFrame || frame == CompanionMappedWaitFrame || frame == CompanionMatWaitFrame) {
+    wait_for_pipelines();
+  }
+  const std::array<u32, CompanionPhaseCount> frames{CompanionBareFrame, CompanionMappedFrame,
+                                                    CompanionBlendOneProbeFrame, CompanionMatProbeFrame};
+  for (size_t i = 0; i < frames.size(); ++i) {
+    if (frame == frames[i]) {
+      sCompanion.slots[i].armedFrame.store(aurora::gfx::current_frame(), std::memory_order_release);
+    }
+  }
+}
+
 void update_fwd_env_check(u32 frame) {
   if (sFwdEnv.id == aurora::render::InvalidPass || frame < FwdEnvCheckFrame ||
       sFwdEnv.armedFrame.load(std::memory_order_relaxed) != UINT32_MAX) {
@@ -1799,6 +2016,9 @@ bool register_graph_passes(const GraphPassOptions& options, std::string& error) 
   if (options.unlitCheck && !register_unlit_check(error)) {
     return false;
   }
+  if (options.companionCheck && !register_companion_check(error)) {
+    return false;
+  }
   if (options.fwdEnvCheck && !register_fwd_env_check(error)) {
     return false;
   }
@@ -1811,6 +2031,7 @@ void update_graph_passes(u32 frame) {
   update_cull_passes(frame);
   update_fwd_env_check(frame);
   update_unlit_check(frame);
+  update_companion_check(frame);
   if (sProbe.id != aurora::render::InvalidPass && frame >= DepthCheckFrame &&
       sProbe.armedFrame.load(std::memory_order_relaxed) == UINT32_MAX) {
     // Draws whose pipeline is still compiling are skipped, so depth read before they finish misses part of the scene
@@ -1888,6 +2109,13 @@ void finish_graph_passes() {
                     slot.result.load(std::memory_order_acquire) == ProbeResult::Pending;
            });
   };
+  const auto companionPending = [] {
+    return sCompanion.id != aurora::render::InvalidPass && sCompanion.encodes.load(std::memory_order_relaxed) != 0 &&
+           std::ranges::any_of(sCompanion.slots, [](const UnlitCheckSlot& slot) {
+             return slot.armedFrame.load(std::memory_order_relaxed) != UINT32_MAX &&
+                    slot.result.load(std::memory_order_acquire) == ProbeResult::Pending;
+           });
+  };
   const auto aoPending = [] {
     return sAo.statsState.load(std::memory_order_acquire) != AoSlotState::Free ||
            std::ranges::any_of(sAo.slots, [](const AoCheckSlot& slot) {
@@ -1899,7 +2127,7 @@ void finish_graph_passes() {
           (motion && sMotion.result.load(std::memory_order_acquire) == ProbeResult::Pending) ||
           (fog && sFog.result.load(std::memory_order_acquire) == ProbeResult::Pending) ||
           (fwdEnv && sFwdEnv.result.load(std::memory_order_acquire) == ProbeResult::Pending) || unlitPending() ||
-          (sAo.id != aurora::render::InvalidPass && aoPending())) &&
+          companionPending() || (sAo.id != aurora::render::InvalidPass && aoPending())) &&
          std::chrono::steady_clock::now() < deadline) {
     aurora::gfx::synchronize();
     aurora::gfx::device().Tick();
@@ -1979,6 +2207,34 @@ GraphPassReport graph_pass_report() {
       }
     }
   }
+  if (sCompanion.id != aurora::render::InvalidPass) {
+    report.companion.encodes = sCompanion.encodes.load(std::memory_order_relaxed);
+    report.companion.ready = std::ranges::all_of(sCompanion.slots, [](const UnlitCheckSlot& slot) {
+      return slot.result.load(std::memory_order_acquire) == ProbeResult::Ready;
+    });
+    std::lock_guard lock{sCompanion.mutex};
+    for (size_t s = 0; s < sCompanion.slots.size() && report.companion.ready; ++s) {
+      const std::vector<u32>& words = sCompanion.slots[s].values;
+      if (words.size() < CompanionHeaderWords || words[2] != 1) {
+        report.companion.ready = false;
+        break;
+      }
+      report.companion.width = words[0];
+      report.companion.height = words[1];
+      for (size_t i = 0; i < sCompanion.probes.size(); ++i) {
+        const size_t base = CompanionHeaderWords + i * CompanionSampleWords;
+        if (base + CompanionSampleWords > words.size()) {
+          break;
+        }
+        CompanionSample sample{.quad = sCompanion.probes[i].quad, .cell = sCompanion.probes[i].cell};
+        for (size_t c = 0; c < 4; ++c) {
+          sample.normal[c] = std::bit_cast<f32>(words[base + c]);
+          sample.surface[c] = words[base + 4 + c];
+        }
+        report.companion.phases[s].push_back(sample);
+      }
+    }
+  }
   if (sAo.id != aurora::render::InvalidPass) {
     std::lock_guard lock{sAo.mutex};
     report.ao = {
@@ -2001,11 +2257,12 @@ void unregister_graph_passes() {
   if (!cull && sVignette.id == aurora::render::InvalidPass && sProbe.id == aurora::render::InvalidPass &&
       sMotion.id == aurora::render::InvalidPass && sMotionView.id == aurora::render::InvalidPass &&
       sFog.id == aurora::render::InvalidPass && sAo.id == aurora::render::InvalidPass &&
-      sFwdEnv.id == aurora::render::InvalidPass && sUnlit.id == aurora::render::InvalidPass) {
+      sFwdEnv.id == aurora::render::InvalidPass && sUnlit.id == aurora::render::InvalidPass &&
+      sCompanion.id == aurora::render::InvalidPass) {
     return;
   }
-  for (PassId* id :
-       {&sVignette.id, &sProbe.id, &sMotion.id, &sMotionView.id, &sFog.id, &sAo.id, &sFwdEnv.id, &sUnlit.id}) {
+  for (PassId* id : {&sVignette.id, &sProbe.id, &sMotion.id, &sMotionView.id, &sFog.id, &sAo.id, &sFwdEnv.id,
+                     &sUnlit.id, &sCompanion.id}) {
     if (*id != aurora::render::InvalidPass) {
       aurora::render::unregister_pass(*id);
       *id = aurora::render::InvalidPass;
@@ -2069,6 +2326,15 @@ void unregister_graph_passes() {
     slot.readback = {};
   }
   sUnlit.waitedForPipelines = false;
+  sCompanion.pipeline = {};
+  sCompanion.passLayout = {};
+  sCompanion.group = {};
+  sCompanion.layout = {};
+  sCompanion.probeBuffer = {};
+  sCompanion.output = {};
+  for (UnlitCheckSlot& slot : sCompanion.slots) {
+    slot.readback = {};
+  }
 }
 
 } // namespace render_demo

@@ -329,6 +329,100 @@ std::optional<std::string> check_unlit(const UnlitCheckSummary& summary) {
   return std::nullopt;
 }
 
+CompanionCheckSummary summarize_companions(std::span<const std::vector<CompanionSample>, CompanionPhaseCount> phases,
+                                           const CompanionAxes& axes) {
+  CompanionCheckSummary summary{.minTilt = 1.f};
+  const auto& bare = phases[static_cast<size_t>(CompanionPhase::Bare)];
+  const auto& mapped = phases[static_cast<size_t>(CompanionPhase::Mapped)];
+  const auto& blendOne = phases[static_cast<size_t>(CompanionPhase::BlendOne)];
+  const auto& mat = phases[static_cast<size_t>(CompanionPhase::Mat)];
+  const size_t n = std::min({bare.size(), mapped.size(), blendOne.size(), mat.size()});
+  summary.probes = static_cast<u32>(n);
+  const auto decode = [](const std::array<f32, 4>& v) {
+    return std::array<f32, 3>{v[0] * 2.f - 1.f, v[1] * 2.f - 1.f, v[2] * 2.f - 1.f};
+  };
+  const auto tilt = [&](const CompanionSample& s, const CompanionSample& base, const std::array<f32, 3>& axis) {
+    const auto a = decode(s.normal);
+    const auto b = decode(base.normal);
+    return (a[0] - b[0]) * axis[0] + (a[1] - b[1]) * axis[1] + (a[2] - b[2]) * axis[2];
+  };
+  const auto byte = [](u32 word, u32 shift) { return static_cast<int>((word >> shift) & 0xFFu); };
+  for (size_t i = 0; i < n; ++i) {
+    const CompanionSample& b = bare[i];
+    for (size_t c = 0; c < 3; ++c) {
+      if (std::abs(b.normal[c] - bare[0].normal[c]) > CompanionBareTolerance) {
+        ++summary.bareMismatches;
+        break;
+      }
+    }
+    if (blendOne[i].normal != b.normal) {
+      ++summary.blendOneMismatches;
+    }
+    const bool uHigh = (b.cell & 1u) != 0;
+    const bool vHigh = (b.cell & 2u) != 0;
+    // R above 128 tilts toward +dP/du, which is world -X on the mirrored quad; upper rows tilt toward -dP/dv = -Z
+    const f32 wantX = (uHigh ? 1.f : -1.f) * (b.quad == 1 ? -1.f : 1.f);
+    const f32 wantZ = vHigh ? 1.f : -1.f;
+    const f32 tx = tilt(mapped[i], b, axes.x);
+    const f32 tz = tilt(mapped[i], b, axes.z);
+    summary.minTilt = std::min({summary.minTilt, std::abs(tx), std::abs(tz)});
+    if (tx * wantX < CompanionTiltMin || tz * wantZ < CompanionTiltMin) {
+      ++summary.tiltFailures;
+    }
+    const f32 mx = tilt(mat[i], b, axes.x);
+    const f32 mz = tilt(mat[i], b, axes.z);
+    if (mx * wantX < CompanionTiltMin * 0.5f || mz * wantZ * axes.matYSign < CompanionTiltMin * 0.5f) {
+      ++summary.matFailures;
+    }
+    const u32 x = mapped[i].surface[0];
+    const u32 y = mapped[i].surface[1];
+    const int metal = byte(y, 8);
+    const int rough = byte(y, 0);
+    if (byte(x, 24) == 255 || (uHigh ? metal < 200 : metal > 55) || (uHigh ? rough < 150 : rough > 110)) {
+      ++summary.ormFailures;
+    }
+    const int red = byte(x, 0);
+    if ((x & 0xFFFFFFu) == (b.surface[0] & 0xFFFFFFu) || (uHigh ? red < 150 : red > 110)) {
+      ++summary.albedoFailures;
+    }
+  }
+  if (n == 0) {
+    summary.minTilt = 0.f;
+  }
+  return summary;
+}
+
+std::optional<std::string> check_companions(const CompanionCheckSummary& summary) {
+  char text[200];
+  if (summary.probes == 0) {
+    return std::string{"no companion probe on screen"};
+  }
+  if (summary.bareMismatches != 0) {
+    std::snprintf(text, sizeof(text), "%u probes left the geometric normal with no companion loaded",
+                  summary.bareMismatches);
+    return std::string{text};
+  }
+  if (summary.tiltFailures != 0) {
+    std::snprintf(text, sizeof(text), "%u probes tilt against the C1 axes with the nrm companion",
+                  summary.tiltFailures);
+    return std::string{text};
+  }
+  if (summary.matFailures != 0) {
+    std::snprintf(text, sizeof(text), "%u probes tilt against the .mat axes", summary.matFailures);
+    return std::string{text};
+  }
+  if (summary.blendOneMismatches != 0) {
+    std::snprintf(text, sizeof(text), "%u probes changed gx.normal at PBR blend 1", summary.blendOneMismatches);
+    return std::string{text};
+  }
+  if (summary.ormFailures != 0 || summary.albedoFailures != 0) {
+    std::snprintf(text, sizeof(text), "%u probes miss the orm values and %u the albedo companion", summary.ormFailures,
+                  summary.albedoFailures);
+    return std::string{text};
+  }
+  return std::nullopt;
+}
+
 std::optional<std::string> check_fwd_env(const FwdEnvSummary& summary) {
   char text[160];
   if (summary.exactOneViolations != 0) {

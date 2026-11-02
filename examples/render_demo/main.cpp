@@ -1,4 +1,5 @@
 #include "bench_report.hpp"
+#include "companion_fixtures.hpp"
 #include "graph_checks.hpp"
 #include "graph_passes.hpp"
 #include "hint_checks.hpp"
@@ -54,6 +55,7 @@ enum ExitCode : int {
   ExitAoCheck = 13,
   ExitFwdEnvCheck = 14,
   ExitUnlitCheck = 15,
+  ExitCompanionCheck = 16,
 };
 
 std::atomic_uint32_t g_errorCount = 0;
@@ -290,6 +292,44 @@ UnlitOutcome unlit_outcome(const render_demo::UnlitCheckReport& report, bool nul
     outcome.failure = "check readback did not complete";
   } else {
     outcome.failure = render_demo::check_unlit(outcome.summary);
+  }
+  return outcome;
+}
+
+struct CompanionRun {
+  std::string setupError;
+  uint64_t loadedMapped = 0;
+  uint64_t loadedMat = 0;
+  uint64_t companionSkips = 0;
+};
+
+struct CompanionOutcome {
+  render_demo::CompanionCheckSummary summary;
+  std::optional<std::string> failure;
+};
+
+CompanionOutcome companion_outcome(const render_demo::CompanionCheckReport& report, const CompanionRun& run,
+                                   bool nullBackend) {
+  CompanionOutcome outcome{.summary = render_demo::summarize_companions(report.phases, render_demo::companion_axes())};
+  if (!run.setupError.empty()) {
+    outcome.failure = run.setupError;
+    return outcome;
+  }
+  // The null backend runs no shaders, so its values say nothing
+  if (nullBackend) {
+    return outcome;
+  }
+  if (run.loadedMapped < render_demo::CompanionNrmRoles ||
+      run.loadedMat < run.loadedMapped + render_demo::CompanionMatRoles) {
+    outcome.failure = "companion maps were not resident at their probe frames";
+  } else if (run.companionSkips != 0) {
+    outcome.failure = "companion draws were skipped for want of a companion group";
+  } else if (report.encodes == 0) {
+    outcome.failure = "gx.normal and gbuf.surface never reached demo.companion_probe";
+  } else if (!report.ready) {
+    outcome.failure = "check readback did not complete";
+  } else {
+    outcome.failure = render_demo::check_companions(outcome.summary);
   }
   return outcome;
 }
@@ -654,9 +694,12 @@ int main(int argc, char* argv[]) {
     // apply_settings alone cannot reach AO before its built bits ship, so the check builds it through the env
     SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_AO", "high", false);
   }
-  if (options.unlitCheck) {
+  if (options.unlitCheck || options.companionCheck) {
     // PBR ships no built bit in M9, so only the verification hook can reach the Surface layout
     SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_PBR", "on", false);
+  }
+  if (options.companionCheck) {
+    SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_MAT_MAPS", "on", false);
   }
 
   AuroraConfig config{};
@@ -704,7 +747,8 @@ int main(int argc, char* argv[]) {
                                          .fogBands = options.fogCheck || options.fwdEnvCheck,
                                          .aoCheck = options.aoCheck,
                                          .fwdEnvCheck = options.fwdEnvCheck,
-                                         .unlitCheck = options.unlitCheck};
+                                         .unlitCheck = options.unlitCheck,
+                                         .companionCheck = options.companionCheck};
   bool decodingChanged = false;
 
   GXInit(nullptr, 0);
@@ -725,7 +769,8 @@ int main(int argc, char* argv[]) {
                                                                    .fogCheck = options.fogCheck,
                                                                    .aoCheck = options.aoCheck,
                                                                    .fwdEnvCheck = options.fwdEnvCheck,
-                                                                   .unlitCheck = options.unlitCheck},
+                                                                   .unlitCheck = options.unlitCheck,
+                                                                   .companionCheck = options.companionCheck},
                                                                   graphError)) {
     std::fprintf(stderr, "render_demo: render graph setup failed: %s\n", graphError.c_str());
     render_demo::shutdown_scene();
@@ -734,6 +779,10 @@ int main(int argc, char* argv[]) {
   }
   const GpuDemo gpuDemo = create_gpu_demo(options);
   sceneOptions.gpuCopySystem = gpuDemo.copy;
+  CompanionRun companionRun;
+  if (options.companionCheck) {
+    render_demo::prepare_companion_loads();
+  }
 
   const auto start = std::chrono::steady_clock::now();
   const auto timeout = std::chrono::seconds{options.timeoutSeconds};
@@ -775,6 +824,26 @@ int main(int argc, char* argv[]) {
         return ExitTraceFailed;
       }
     }
+    if (options.companionCheck && companionRun.setupError.empty()) {
+      const auto set_blend = [](float blend) {
+        aurora::render::Settings settings = aurora::render::effective_settings();
+        settings.legacyBlend = blend;
+        aurora::render::apply_settings(settings);
+      };
+      if (frame == render_demo::CompanionLoadFrame || frame == render_demo::CompanionMatFrame) {
+        const bool mat = frame == render_demo::CompanionMatFrame;
+        if (mat) {
+          set_blend(0.f);
+        }
+        render_demo::load_companion_fixtures(mat, render_demo::ground_texture_base(), companionRun.setupError);
+      } else if (frame == render_demo::CompanionBlendOneFrame) {
+        set_blend(1.f);
+      } else if (frame == render_demo::CompanionMappedFrame) {
+        companionRun.loadedMapped = render_demo::companion_counts().loaded;
+      } else if (frame == render_demo::CompanionMatProbeFrame) {
+        companionRun.loadedMat = render_demo::companion_counts().loaded;
+      }
+    }
     // Params set before aurora_begin_frame apply to the frame it begins
     render_demo::update_graph_passes(frame);
     if (exiting || paused || !aurora_begin_frame()) {
@@ -797,6 +866,10 @@ int main(int argc, char* argv[]) {
   aurora::gfx::synchronize();
   render_demo::finish_graph_passes();
   const auto graphReport = render_demo::graph_pass_report();
+  if (options.companionCheck) {
+    companionRun.companionSkips = render_demo::companion_counts().companionSkips;
+    render_demo::release_companion_fixtures();
+  }
   HintCounterSnapshot hintCounters = read_hint_counters();
   const bool gpuChannel = options.gpuArrays || options.gpuPadMiB != 0;
   const GpuReport gpuReport = gpuChannel ? finish_gpu_demo(gpuDemo) : GpuReport{};
@@ -918,6 +991,25 @@ int main(int argc, char* argv[]) {
         status.c_str(), u.ground, u.classMismatches, u.paramMismatches, u.albedoChanges, u.minColourMove,
         u.maxColourMove, u.control, u.controlPbr, graphReport.unlit.width, graphReport.unlit.height);
   }
+  const CompanionOutcome companionOutcome =
+      options.companionCheck ? companion_outcome(graphReport.companion, companionRun, info.backend == BACKEND_NULL)
+                             : CompanionOutcome{};
+  if (options.companionCheck) {
+    const std::string status = companionOutcome.failure       ? "FAILED: " + *companionOutcome.failure
+                               : info.backend == BACKEND_NULL ? std::string{"skipped (null backend)"}
+                                                              : std::string{"passed"};
+    const auto& c = companionOutcome.summary;
+    std::printf(
+        "render_demo: companion check %s: %u probes, loaded %llu / wanted %u, then %llu / wanted %u, "
+        "companion skips %llu; off-geometric %u, C1 tilt off %u (min %.3f), .mat tilt off %u, blend-one "
+        "changes %u, orm off %u, albedo off %u at %ux%u\n",
+        status.c_str(), c.probes, static_cast<unsigned long long>(companionRun.loadedMapped),
+        render_demo::CompanionNrmRoles, static_cast<unsigned long long>(companionRun.loadedMat),
+        render_demo::CompanionNrmRoles + render_demo::CompanionMatRoles,
+        static_cast<unsigned long long>(companionRun.companionSkips), c.bareMismatches, c.tiltFailures, c.minTilt,
+        c.matFailures, c.blendOneMismatches, c.ormFailures, c.albedoFailures, graphReport.companion.width,
+        graphReport.companion.height);
+  }
   if (options.gpuCull != 0) {
     print_cull_report(graphReport.cull, frame, options.cullTimings);
   }
@@ -978,6 +1070,9 @@ int main(int argc, char* argv[]) {
   }
   if (unlitOutcome.failure) {
     return ExitUnlitCheck;
+  }
+  if (companionOutcome.failure) {
+    return ExitCompanionCheck;
   }
 
   if (cullFailure) {

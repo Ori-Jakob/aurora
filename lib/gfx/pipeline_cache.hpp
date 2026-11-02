@@ -31,6 +31,8 @@ struct CompiledPipeline {
   wgpu::RenderPipeline prepass;
   // The group-3 set the GX encoder binds for this pipeline; 0 means none
   uint8_t group3 = 0;
+  // 0 legacy textures, 1 companions; picked per pipeline so fallback draws never need companions
+  uint8_t group2 = 0;
 
   [[nodiscard]] uint32_t pipeline_count() const {
     return static_cast<uint32_t>(static_cast<bool>(main)) + static_cast<uint32_t>(static_cast<bool>(prepass));

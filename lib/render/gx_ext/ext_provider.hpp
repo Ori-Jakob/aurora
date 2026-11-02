@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 
 namespace aurora::gx {
 struct PipelineConfig;
@@ -20,5 +21,6 @@ namespace testing {
 void set_force(bool force) noexcept;
 bool active() noexcept;
 void reset() noexcept;
+void set_companion_support(std::optional<bool> supported) noexcept;
 } // namespace testing
 } // namespace aurora::render::gx_ext

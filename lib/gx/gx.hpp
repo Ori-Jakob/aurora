@@ -14,6 +14,8 @@
 #include <array>
 #include <cfloat>
 #include <span>
+#include <string>
+#include <string_view>
 
 #define M_PIF 3.14159265358979323846f
 
@@ -561,6 +563,7 @@ enum class Verdict : uint8_t;
 
 struct GXBindGroups {
   gfx::BindGroupRef textureBindGroup;
+  gfx::BindGroupRef companionBindGroup = 0;
 };
 // Output info from shader generation
 struct ShaderInfo {
@@ -589,6 +592,8 @@ struct ShaderInfo {
   u8 unlitRawVtx : 2 = 0;
   bool unlitPlanned : 1 = false;
   bool unlitAdmitted : 1 = false;
+  bool companionLane : 1 = false;
+  bool companionFits : 1 = false;
 };
 struct UnlitFacts {
   bool admitted = false;
@@ -627,6 +632,10 @@ inline bool uses_surface(const ShaderTargets& t) noexcept { return t.surface != 
 inline bool uses_unlit(const ShaderConfig& c, const ShaderInfo& info, const ShaderTargets& t) noexcept {
   return c.ext.output == 2 && uses_surface(t) && t.motion != UINT32_MAX && info.unlitAdmitted;
 }
+// Text, pipeline layout and the group-2 kind all key on this
+inline bool uses_companions(const ShaderConfig& c, const ShaderInfo& info, const ShaderTargets& t) noexcept {
+  return c.ext.layer0 != 0 && uses_unlit(c, info, t);
+}
 // The generator's prevColorNormalized; flag stamping uses it too, so flags never land on draws without the AO block
 inline bool tev_colour_clamped(const ShaderConfig& c) noexcept {
   return c.tevStageCount != 0 && c.tevStages[c.tevStageCount - 1].colorOp.clamp;
@@ -645,6 +654,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
 std::string receiver_alpha_wgsl();
 namespace testing {
 uint64_t shader_hash(const ShaderConfig& config, DstAlphaMode dstAlphaMode, const ShaderTargets& targets) noexcept;
+std::string_view companion_wgsl() noexcept;
 } // namespace testing
 wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout,
                                 DstAlphaMode dstAlphaMode) noexcept;
@@ -653,6 +663,10 @@ GXBindGroups build_bind_groups(const ShaderInfo& info, bool baseLevel = false) n
 GXBindGroups build_neutral_bind_groups(const ShaderInfo& info, u8 whiteMask, u8 clearMask,
                                        bool baseLevel = false) noexcept;
 constexpr uint8_t Group3ForwardEnvironment = 1;
+constexpr uint8_t Group2Companion = 1;
+constexpr uint32_t CompanionViewCount = 4;
+GXBindGroups build_companion_bind_group(const ShaderInfo& info, bool baseLevel, u8 layerMap,
+                                        const std::array<WGPUTextureView, CompanionViewCount>& views) noexcept;
 const wgpu::BindGroupLayout& forward_environment_layout() noexcept;
 
 namespace detail {

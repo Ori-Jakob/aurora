@@ -95,7 +95,7 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass);
 // Render worker or after it stops; a published group lasts until the next worker frame begin, and null means neutral
 void set_forward_environment_group(wgpu::BindGroup group) noexcept;
 struct BindCounts {
-  uint64_t draws, texturedDraws, uniformBinds, textureBinds, indexBinds, encodeNs, envBinds;
+  uint64_t draws, texturedDraws, uniformBinds, textureBinds, indexBinds, encodeNs, envBinds, companionSkips;
 };
 void reset_pass_bindings() noexcept;
 void add_encode_ns(uint64_t ns) noexcept;

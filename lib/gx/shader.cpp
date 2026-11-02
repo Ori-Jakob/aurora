@@ -18,6 +18,7 @@
 #include <absl/container/flat_hash_set.h>
 #include <algorithm>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -886,6 +887,65 @@ std::string replace_all(std::string text, std::string_view from, std::string_vie
   }
   return text;
 }
+
+bool direct_stage(const TevStage& stage) noexcept {
+  return stage.indTexMtxId == GX_ITM_OFF && stage.indTexWrapS == GX_ITW_OFF && stage.indTexWrapT == GX_ITW_OFF &&
+         !stage.indTexAddPrev;
+}
+
+struct CompanionSite {
+  u32 map = 0;
+  u32 coord = 0;
+};
+
+CompanionSite companion_site(const ShaderConfig& config, const ShaderInfo& info) noexcept {
+  const u32 map = config.ext.layer0 - 1u;
+  std::optional<u32> fallback;
+  for (u32 s = 0; s < config.tevStageCount; ++s) {
+    const auto& stage = config.tevStages[s];
+    if (!uses_texture_sample(stage) || stage.texMapId != map || stage.texCoordId == GX_TEXCOORD_NULL) {
+      continue;
+    }
+    if ((info.unlitLayerStages >> s & 1u) != 0) {
+      return {map, static_cast<u32>(stage.texCoordId)};
+    }
+    if (!fallback && direct_stage(stage)) {
+      fallback = static_cast<u32>(stage.texCoordId);
+    }
+  }
+  return {map, fallback.value_or(0)};
+}
+
+constexpr std::string_view CompanionWgsl = R"(
+fn gx_linear_to_srgb(c: vec3f) -> vec3f {
+    let hi = 1.055 * pow(max(c, vec3f(0.0)), vec3f(1.0 / 2.4)) - 0.055;
+    return select(hi, c * 12.92, c <= vec3f(0.0031308));
+}
+fn gx_view_pos(c: vec3f) -> vec3f {
+    let z = -c.z;
+    return vec3f((c.x - ubuf.proj[0].z * z - ubuf.proj[0].w) / ubuf.proj[0].x,
+                 (c.y - ubuf.proj[1].z * z - ubuf.proj[1].w) / ubuf.proj[1].y, z);
+}
+// C1 +Y up: green points toward v = 0, the first stored row; the solve ignores screen y direction and handles mirrored UVs
+fn gx_perturb(n: vec3f, dp1: vec3f, dp2: vec3f, duv1: vec2f, duv2: vec2f, t: vec3f) -> vec3f {
+    let j = duv1.x * duv2.y - duv2.x * duv1.y;
+    let s = select(-1.0, 1.0, j >= 0.0);
+    let pu = s * (dp1 * duv2.y - dp2 * duv1.y);
+    let pv = s * (dp2 * duv1.x - dp1 * duv2.x);
+    let tu = pu - n * dot(n, pu);
+    let tv = pv - n * dot(n, pv);
+    let uv2 = dot(duv1, duv1) + dot(duv2, duv2);
+    let p2 = (dot(dp1, dp1) + dot(dp2, dp2)) * uv2;
+    if (abs(j) <= 1e-6 * uv2 || dot(tu, tu) <= 1e-6 * p2 || dot(tv, tv) <= 1e-6 * p2) {
+        return n;
+    }
+    return normalize(t.x * normalize(tu) - t.y * normalize(tv) + t.z * n);
+}
+fn gx_companion_tangent(c: vec4f, lane: vec4f) -> vec3f {
+    let mat = (u32(lane.x) & 4u) != 0u;
+    let xy = select(c.rg * 2.0 - 1.0, vec2f(c.a, c.g) * (255.0 / 127.0) - 128.0 / 127.0, mat) * vec2f(1.0, lane.z);
+    return normalize(vec3f(xy * lane.y, sqrt(saturate(1.0 - dot(xy, xy)))));
+})";
 } // namespace
 
 std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlphaMode,
@@ -901,6 +961,9 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
   const bool receiverNormal = nrmTarget != UINT32_MAX && nrmTarget != targets.normal;
   const auto hash = shader_hash(config, dstAlphaMode, targets);
   const auto info = build_shader_info(config);
+  const bool companionText = uses_companions(config, info, targets);
+  const CompanionSite companion = companionText ? companion_site(config, info) : CompanionSite{};
+  CHECK(!companionText || targets.motion != UINT32_MAX, "companion text needs the clip position varying");
   if (EnableDebugPrints && !s_seenShaders.contains(hash)) {
     s_seenShaders.insert(hash);
 
@@ -1561,6 +1624,19 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
         fmt::format("\n    var sampled{0} = textureSampleBias(tex{1}, tex{1}_samp, {2}, ubuf.tex{1}_size_bias.z);", i,
                     underlying(stage.texMapId), uvIn);
   }
+  if (companionText) {
+    fragmentFnPre += fmt::format(
+        "\n    let cmp_alb = textureSampleBias(ctex_alb, tex{0}_samp, tex{1}_uv, ubuf.tex{0}_size_bias.z);"
+        "\n    let cmp_nrm = textureSampleBias(ctex_nrm, tex{0}_samp, tex{1}_uv, ubuf.tex{0}_size_bias.z);"
+        "\n    let cmp_orm = textureSampleBias(ctex_orm, tex{0}_samp, tex{1}_uv, ubuf.tex{0}_size_bias.z);"
+        "\n    let cmp_p = gx_view_pos(in.mo_cur);"
+        "\n    let cmp_dp1 = dpdx(cmp_p);"
+        "\n    let cmp_dp2 = dpdy(cmp_p);"
+        "\n    let cmp_duv1 = dpdx(tex{1}_uv);"
+        "\n    let cmp_duv2 = dpdy(tex{1}_uv);",
+        companion.map, companion.coord);
+    uniformPre += CompanionWgsl;
+  }
   if (info.usesPTTexMtx.any()) {
     uniBufAttrs += fmt::format("\n    postmtx: array<mat3x4f, {}>,", MaxPTTexMtx);
   }
@@ -1666,6 +1742,14 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
       }
     }
     append_hex_module(uniformPre, static_cast<uint32_t>(info.stochasticTextures.to_ulong()));
+  }
+  if (companionText) {
+    uniBufAttrs += "\n    mat0: vec4f,";
+    texBindings += fmt::format(
+        "\n@group(2) @binding({0})\nvar ctex_alb: texture_2d<f32>;"
+        "\n@group(2) @binding({1})\nvar ctex_nrm: texture_2d<f32>;"
+        "\n@group(2) @binding({2})\nvar ctex_orm: texture_2d<f32>;",
+        MaxTextures * 2, MaxTextures * 2 + 1, MaxTextures * 2 + 2);
   }
   if (!prevColorNormalized && !prevAlphaNormalized) {
     fragmentFn += "\n    prev = tev_overflow_vec4f(prev);";
@@ -1804,6 +1888,19 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
                               "\n    out.normal = vec4f(unit_nrm * 0.5 + 0.5, {});",
                               alpha)
                         : "\n    out.normal = vec4f(0.5, 0.5, 0.5, 0.0);"s;
+    if (useNormalTarget && companionText) {
+      assignment = fmt::format(
+          "\n    let nrm_len_sq = dot(in.mv_nrm, in.mv_nrm);"
+          "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm), nrm_len_sq > 1e-10);"
+          "\n    let legacy_normal = vec4f(unit_nrm * 0.5 + 0.5, {0});"
+          "\n    // Perspective only: mo_cur carries clip xyw, so an orthographic view depth is not recoverable"
+          "\n    let use_mapped = ubuf.mat0.y > 0.0 && (u32(ubuf.mat0.x) & 6u) != 0u && ubuf.proj[3].w == 0.0 && "
+          "nrm_len_sq > 1e-10;"
+          "\n    let mapped_nrm = gx_perturb(unit_nrm, cmp_dp1, cmp_dp2, cmp_duv1, cmp_duv2, "
+          "gx_companion_tangent(cmp_nrm, ubuf.mat0));"
+          "\n    out.normal = select(legacy_normal, vec4f(mapped_nrm * 0.5 + 0.5, {0}), use_mapped);",
+          alpha);
+    }
     if (useNormalTarget && receiverNormal) {
       uniformPre += "\n" + receiver_alpha_wgsl();
     }
@@ -1888,6 +1985,12 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
         if (((unlitPlan.neutralOne | unlitPlan.neutralZero) & map) != 0) {
           inner +=
               fmt::format("\n    let sampled{} = vec4f({});", i, (unlitPlan.neutralOne & map) != 0 ? "1.0" : "0.0");
+        } else if (companionText && stage.texMapId == companion.map && stage.texCoordId == companion.coord &&
+                   direct_stage(stage) && !info.stochasticTextures.test(stage.texMapId)) {
+          inner += fmt::format(
+              "\n    let sampled{0} = select(sampled{0}, vec4f(gx_linear_to_srgb(cmp_alb.rgb), "
+              "sampled{0}.a), (u32(ubuf.mat0.x) & 1u) != 0u);",
+              i);
         }
       }
       const UnlitPass pass{.scaleDivide = unlitPlan.scaleDivide};
@@ -1907,12 +2010,18 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
           "\n    let urx = (urec >> {2}u) & 3u;"
           "\n    let uflags = select(0u, {3}u, urx == 2u) | select(0u, {4}u, urx == 1u) | {5} | "
           "select(0u, {6}u, ((urec >> {7}u) & 3u) == 1u);"
-          "\n    out.surface = gx_surface_pack(unlit_rgb, 1.0, {8:.2f}, 0.0, {9}u, uflags, vec3f(0.0), "
+          "{11}"
+          "\n    out.surface = gx_surface_pack(unlit_rgb, {12}, {8}, {13}, {9}u, uflags, vec3f(0.0), "
           "(urec >> {10}u) & 0xffu, vec3f(0.0));",
           replace_all(std::move(inner), "\n", "\n    "), render_ext::DrawRecordFlagsWord,
           render_ext::DrawRecordReceiverShift, surface::CloudReceiver, surface::NoShadowReceive, unlitFlag,
-          surface::BakedLight, render_ext::RecordVertexColorShift, UnlitDefaultRoughness, surface::ClassDefault,
-          UnlitCategoryShift);
+          surface::BakedLight, render_ext::RecordVertexColorShift,
+          companionText ? fmt::format("select({:.2f}, cmp_orm.g, uorm)", UnlitDefaultRoughness)
+                        : fmt::format("{:.2f}", UnlitDefaultRoughness),
+          surface::ClassDefault, UnlitCategoryShift,
+          companionText ? "\n    let uorm = (u32(ubuf.mat0.x) & 8u) != 0u;"sv : ""sv,
+          companionText ? "select(1.0, cmp_orm.r, uorm)"sv : "1.0"sv,
+          companionText ? "select(0.0, cmp_orm.b, uorm)"sv : "0.0"sv);
     }
     members.push_back(
         {targets.surface, fmt::format("    @location({}) surface: vec4u,\n", targets.surface), std::move(assignment)});
@@ -2349,6 +2458,8 @@ namespace testing {
 uint64_t shader_hash(const ShaderConfig& config, DstAlphaMode dstAlphaMode, const ShaderTargets& targets) noexcept {
   return gx::shader_hash(config, dstAlphaMode, targets);
 }
+
+std::string_view companion_wgsl() noexcept { return CompanionWgsl; }
 } // namespace testing
 
 std::string receiver_alpha_wgsl() {

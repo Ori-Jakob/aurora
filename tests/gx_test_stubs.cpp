@@ -4,6 +4,7 @@
 
 #include "gx/gx.hpp"
 #include "gfx/clear.hpp"
+#include "gfx/companion_cache.hpp"
 #include "gfx/frame_packet.hpp"
 #include "gfx/resources.hpp"
 #include "gfx/scene_targets.hpp"
@@ -154,6 +155,12 @@ u32 g_testPopulateTevStageCount = 0;
 std::bitset<MaxTextures> g_testStochasticEligible;
 std::bitset<MaxTextures> g_testSampledTextures;
 bool g_testLastBindBaseLevel = false;
+uint32_t g_testCompanionBuilds = 0;
+GXBindGroups build_companion_bind_group(const ShaderInfo&, bool, u8,
+                                        const std::array<WGPUTextureView, CompanionViewCount>&) noexcept {
+  ++g_testCompanionBuilds;
+  return {.companionBindGroup = 0x1000 + g_testCompanionBuilds};
+}
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
   ++g_testPipelineBuildCount;
   config.depthFunc = g_testPopulateDepthFunc;
@@ -168,6 +175,7 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
   info.sampledTextures |= g_testSampledTextures;
   info.stochasticEligible = g_testStochasticEligible;
   info.stochasticTextures = std::bitset<MaxTextures>{config.ext.stochasticMask} & g_testStochasticEligible;
+  info.companionFits = true;
   return info;
 }
 gfx::Range build_draw_uniform(const ShaderInfo& info) noexcept {
@@ -181,6 +189,18 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
   g_testLastResolveInfoSize = info.uniformSize;
 }
 } // namespace aurora::gx
+
+namespace aurora::gfx::companion_cache {
+uint64_t g_testEpoch = 0;
+uint8_t g_testLoaded = 0;
+uint32_t g_testViewCalls = 0;
+uint8_t views(uint32_t, uint8_t wanted, std::array<WGPUTextureView, ViewSlotCount>& out) noexcept {
+  ++g_testViewCalls;
+  out.fill(nullptr);
+  return wanted & g_testLoaded;
+}
+uint64_t epoch() noexcept { return g_testEpoch; }
+} // namespace aurora::gfx::companion_cache
 
 // --- Buffer push stubs ---
 namespace aurora::gfx {

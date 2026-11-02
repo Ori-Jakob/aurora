@@ -69,6 +69,11 @@ constexpr f32 UnlitControlX1 = 20.f;
 constexpr f32 UnlitControlZ0 = -11.f;
 constexpr f32 UnlitControlZ1 = -7.f;
 constexpr GXColor UnlitDimSun{60, 56, 48, 255};
+constexpr u64 CompanionMirrorObject = 0x500;
+constexpr f32 CompanionMirrorX0 = 14.f;
+constexpr f32 CompanionMirrorX1 = 21.f;
+constexpr f32 CompanionMirrorZ0 = -12.f;
+constexpr f32 CompanionMirrorZ1 = -5.f;
 constexpr size_t AoCreaseBox = 2;
 
 struct Slab {
@@ -536,6 +541,30 @@ void draw_unlit_control(const Mtx view) {
   GXEnd();
 }
 
+// u falls to the right, so a tangent frame tied to the screen instead of the UVs points the wrong way here
+void draw_companion_mirror(const Mtx view) {
+  set_ground_format();
+  GXLoadTexObj(&sGroundTexObj, GX_TEXMAP0);
+  GXSetNumTevStages(1);
+  GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
+  GXSetTevOp(GX_TEVSTAGE0, GX_MODULATE);
+  set_lit_channel(GX_SRC_REG);
+  load_matrices(view, GX_PNMTX0);
+  GXSetCurrentMtx(GX_PNMTX0);
+  GXSetCullMode(GX_CULL_BACK);
+  GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+  const f32 corners[4][2] = {{CompanionMirrorX0, CompanionMirrorZ0},
+                             {CompanionMirrorX1, CompanionMirrorZ0},
+                             {CompanionMirrorX1, CompanionMirrorZ1},
+                             {CompanionMirrorX0, CompanionMirrorZ1}};
+  for (const auto& [x, z] : corners) {
+    GXPosition3f32(x, 0.02f, z);
+    GXNormal3f32(0.f, 1.f, 0.f);
+    GXTexCoord2f32(-x / GroundCellSize, z / GroundCellSize);
+  }
+  GXEnd();
+}
+
 // Sets every piece of state it draws with and restores blend and Z, so the depth probe and the next frame see M2 state
 void draw_hud_panel() {
   push_scope(AURORA_CAT_UI, 0, AURORA_CAMERA_UI);
@@ -998,13 +1027,54 @@ std::vector<UnlitProbe> unlit_probes() {
   return probes;
 }
 
+std::vector<CompanionProbe> companion_probes() {
+  const SceneCamera camera = scene_camera(AoCheckClock);
+  std::vector<CompanionProbe> probes;
+  const auto add = [&](u32 quad, const Vec& world, f32 u) {
+    const f32 uf = u - std::floor(u);
+    const f32 v = world.z / GroundCellSize;
+    const f32 vf = v - std::floor(v);
+    const std::array<f32, 2> ndc = project(camera, world);
+    if (std::abs(ndc[0]) < 0.95f && std::abs(ndc[1]) < 0.95f) {
+      probes.push_back({.ndc = {ndc[0], ndc[1]}, .quad = quad, .cell = (uf > 0.5f ? 1u : 0u) | (vf > 0.5f ? 2u : 0u)});
+    }
+  };
+  for (const f32 x : {13.75f, 16.25f, 18.75f}) {
+    for (const f32 z : {-3.75f, -1.25f, 1.25f, 3.75f, 6.25f}) {
+      add(0, {x, 0.f, z}, x / GroundCellSize);
+    }
+    for (const f32 z : {-11.25f, -8.75f, -6.25f}) {
+      if (x > CompanionMirrorX0 && x < CompanionMirrorX1) {
+        add(1, {x, 0.02f, z}, -x / GroundCellSize);
+      }
+    }
+  }
+  return probes;
+}
+
+CompanionAxes companion_axes() noexcept {
+  const SceneCamera camera = scene_camera(AoCheckClock);
+  const auto axis = [&](const Vec& world) {
+    Vec view;
+    C_MTXMultVecSR(camera.view, &world, &view);
+    C_VECNormalize(&view, &view);
+    return std::array<f32, 3>{view.x, view.y, view.z};
+  };
+  return {.x = axis({1.f, 0.f, 0.f}), .z = axis({0.f, 0.f, 1.f})};
+}
+
+std::span<const u8> ground_texture_base() noexcept {
+  return {sGroundTexture.data(), std::min<size_t>(sGroundTexture.size(), GroundTextureSize * GroundTextureSize * 4)};
+}
+
 FogResolveCounts fog_resolve_counts() noexcept { return sFogResolves; }
 
 void draw_scene(u32 frame, const SceneOptions& options) {
   // Not gated on hints_enabled() so the off capture proves emitters add only hint bytes; real producers do gate on it
   set_hint_emission(options.hints);
   upload_gpu_arrays(options);
-  const u32 clock = options.aoCheck || options.fwdEnvCheck || options.unlitCheck ? AoCheckClock : frame;
+  const u32 clock =
+      options.aoCheck || options.fwdEnvCheck || options.unlitCheck || options.companionCheck ? AoCheckClock : frame;
   const f32 t = static_cast<f32>(clock) / 60.f;
   const SceneCamera camera = scene_camera(clock);
   GXSetCopyClear(ClearColor, GX_MAX_Z24);
@@ -1047,6 +1117,11 @@ void draw_scene(u32 frame, const SceneOptions& options) {
   if (options.unlitCheck) {
     begin_object(UnlitControlObject, AURORA_CAT_STATIC | AURORA_CAT_TERRAIN | AURORA_CAT_NO_PBR, AURORA_OBJ_IMMOBILE);
     draw_unlit_control(view);
+    end_object();
+  }
+  if (options.companionCheck) {
+    begin_object(CompanionMirrorObject, AURORA_CAT_STATIC | AURORA_CAT_TERRAIN, AURORA_OBJ_IMMOBILE);
+    draw_companion_mirror(view);
     end_object();
   }
 

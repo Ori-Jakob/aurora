@@ -211,7 +211,10 @@ gx::GXBindGroups neutral_groups(const gx::GXBindGroups& base, const gx::ShaderIn
   for (size_t i = 0; i < g_memoSize; ++i) {
     const MemoEntry& entry = g_memo[i];
     if (entry.base == base.textureBindGroup && entry.white == decision.white && entry.clear == decision.clear) {
-      return {.textureBindGroup = entry.group};
+      // Replace only the legacy group, so fields added later survive
+      gx::GXBindGroups out = base;
+      out.textureBindGroup = entry.group;
+      return out;
     }
   }
   const bool baseLevel = gx::g_gxState.proj[3][3] != 0.f || static_cast<bool>(gx::g_gxState.alphaCompare);
@@ -224,7 +227,9 @@ gx::GXBindGroups neutral_groups(const gx::GXBindGroups& base, const gx::ShaderIn
         .group = groups.textureBindGroup,
     };
   }
-  return groups;
+  gx::GXBindGroups out = base;
+  out.textureBindGroup = groups.textureBindGroup;
+  return out;
 }
 } // namespace
 

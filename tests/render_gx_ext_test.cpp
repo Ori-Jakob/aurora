@@ -28,6 +28,7 @@
 #include <array>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -1397,6 +1398,160 @@ TEST_F(RenderGxExt, PbrOffRecordsByteIdentical) {
   records::on_route(main_opaque());
   EXPECT_EQ(gx::render_ext::g_drawInputs, records::InWindow);
   EXPECT_EQ(pbr_output(pbr_writer(), scene_layout(true)), 1u);
+}
+
+constexpr uint8_t NrmRole = 1u << 2;
+constexpr uint8_t MatRole = 1u << 6;
+
+detail::FrameState pbr_state(float legacyBlend, bool textureMaterials = true) {
+  detail::FrameState state;
+  state.settings.pbr = true;
+  state.settings.textureMaterials = textureMaterials;
+  state.settings.legacyBlend = legacyBlend;
+  return state;
+}
+
+uint8_t pbr_layer(const gx::PipelineConfig& config, const gfx::RenderTargetLayout& layout) {
+  const gx::render_ext::Hooks* hooks = gx::render_ext::hooks();
+  EXPECT_NE(hooks, nullptr);
+  gx::render_ext::StochasticLanes lanes{};
+  return hooks != nullptr
+             ? hooks->derive(hooks->userData, config, gx::build_shader_info(config.shaderConfig), layout, lanes).layer0
+             : 0xFF;
+}
+
+gx::PipelineConfig cloud_writer() {
+  gx::PipelineConfig config = pbr_writer();
+  gx::ShaderConfig& shader = config.shaderConfig;
+  shader.tcgs[1] = {.type = GX_TG_MTX3x4, .src = GX_TG_POS, .mtx = GX_TEXMTX1};
+  gx::TevStage& cloud = shader.tevStages[1];
+  cloud.colorPass = {GX_CC_ZERO, GX_CC_CPREV, GX_CC_TEXC, GX_CC_ZERO};
+  cloud.texMapId = GX_TEXMAP1;
+  cloud.texCoordId = GX_TEXCOORD1;
+  cloud.channelId = GX_COLOR_ZERO;
+  shader.tevStageCount = 2;
+  return config;
+}
+
+struct CompanionScope {
+  CompanionScope() {
+    testing::set_companion_support(true);
+    pbr_frame();
+    records::on_route(main_opaque());
+  }
+  ~CompanionScope() { testing::set_companion_support(std::nullopt); }
+  ScopedTargets targets;
+  ScopedHints hints;
+};
+
+TEST_F(RenderGxExt, Layer0Rules) {
+  const CompanionScope scope;
+  const gfx::RenderTargetLayout pbr = pbr_layout();
+  ASSERT_EQ(pbr_output(pbr_writer(), pbr), 2u);
+  EXPECT_EQ(pbr_layer(pbr_writer(), pbr), 0u);
+  gx::g_gxState.textures[0].material = {.companionSet = 3, .companionRoles = NrmRole};
+  EXPECT_EQ(pbr_layer(pbr_writer(), pbr), 1u);
+  EXPECT_EQ(pbr_layer(pbr_writer(), scene_layout(true)), 0u);
+  gx::g_gxState.textures[0].material.companionRoles = 1u << 5;
+  EXPECT_EQ(pbr_layer(pbr_writer(), pbr), 0u);
+  gx::g_gxState.textures[0].material.companionRoles = MatRole;
+  EXPECT_EQ(pbr_layer(pbr_writer(), pbr), 1u);
+  testing::set_companion_support(false);
+  EXPECT_EQ(pbr_layer(pbr_writer(), pbr), 0u);
+  testing::set_companion_support(true);
+
+  const gx::PipelineConfig clouded = cloud_writer();
+  ASSERT_EQ(pbr_output(clouded, pbr), 2u);
+  gx::g_gxState.textures[0].material = {};
+  gx::g_gxState.textures[1].material = {.companionSet = 4, .companionRoles = NrmRole};
+  EXPECT_EQ(pbr_layer(clouded, pbr), 0u);
+  gx::g_gxState.textures[0].material = {.companionSet = 3, .companionRoles = NrmRole};
+  EXPECT_EQ(pbr_layer(clouded, pbr), 1u);
+
+  SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_COMPANIONS", "off", true);
+  testing::reset();
+  testing::set_companion_support(true);
+  pbr_frame();
+  records::on_route(main_opaque());
+  EXPECT_EQ(pbr_output(pbr_writer(), pbr), 2u);
+  EXPECT_EQ(pbr_layer(pbr_writer(), pbr), 0u);
+  SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_COMPANIONS");
+  testing::reset();
+}
+
+TEST_F(RenderGxExt, Layer0SkipsFakeShadowSlots) {
+  const CompanionScope scope;
+  const gfx::RenderTargetLayout pbr = pbr_layout();
+  const gx::PipelineConfig clouded = cloud_writer();
+  gx::g_gxState.textures[0].material = {.companionSet = 3, .companionRoles = NrmRole};
+  ASSERT_EQ(pbr_layer(clouded, pbr), 1u);
+  gx::g_gxState.textures[1].material = {.id = 2, .flags = material::FakeShadow};
+  EXPECT_EQ(pbr_layer(clouded, pbr), 0u);
+  gx::g_gxState.textures[1].material = {};
+  gx::g_gxState.textures[0].material.flags = material::FakeShadow;
+  EXPECT_EQ(pbr_layer(clouded, pbr), 0u);
+}
+
+TEST_F(RenderGxExt, Layer0IndependentOfResidencyAndSettings) {
+  const CompanionScope scope;
+  const gfx::RenderTargetLayout pbr = pbr_layout();
+  gx::g_gxState.textures[0].material = {.companionSet = 3, .companionRoles = NrmRole | MatRole};
+  const uint8_t expected = pbr_layer(pbr_writer(), pbr);
+  ASSERT_EQ(expected, 1u);
+  for (const detail::FrameState& state :
+       {pbr_state(0.f), pbr_state(1.f), pbr_state(0.5f, false), frame(false, false)}) {
+    apply_frame_state(state);
+    records::on_route(main_opaque());
+    for (const gx::render_ext::CompanionGates gates :
+         {gx::render_ext::CompanionGates{}, gx::render_ext::CompanionGates{true, true, true}}) {
+      gx::render_ext::set_companion_gates(gates);
+      gx::render_ext::store_companion_lane({.v = {15.f, 1.f, -1.f, 0.f}});
+      EXPECT_EQ(pbr_layer(pbr_writer(), pbr), expected);
+    }
+  }
+  gx::render_ext::set_companion_gates({});
+  gx::render_ext::store_companion_lane({});
+}
+
+TEST_F(RenderGxExt, GateFlipInvalidatesBindings) {
+  const ScopedTargets targets;
+  const ScopedHints hints;
+  webgpu::g_graphicsConfig.gbuffer = true;
+  webgpu::g_graphicsConfig.surfaceBuffer = true;
+  apply_frame_state(frame(false, true));
+  EXPECT_EQ(gx::render_ext::g_companionGates, gx::render_ext::CompanionGates{});
+  uint64_t generation = gx::texture::current_bind_generation();
+  apply_frame_state(pbr_state(0.f));
+  EXPECT_EQ(gx::render_ext::g_companionGates, (gx::render_ext::CompanionGates{true, false, true}));
+  EXPECT_NE(gx::texture::current_bind_generation(), generation);
+  generation = gx::texture::current_bind_generation();
+  apply_frame_state(pbr_state(0.f));
+  EXPECT_EQ(gx::texture::current_bind_generation(), generation);
+  apply_frame_state(pbr_state(0.f, false));
+  EXPECT_EQ(gx::render_ext::g_companionGates, (gx::render_ext::CompanionGates{false, false, true}));
+  EXPECT_NE(gx::texture::current_bind_generation(), generation);
+  generation = gx::texture::current_bind_generation();
+  apply_frame_state(frame(false, true));
+  EXPECT_EQ(gx::render_ext::g_companionGates, gx::render_ext::CompanionGates{});
+  EXPECT_NE(gx::texture::current_bind_generation(), generation);
+}
+
+TEST_F(RenderGxExt, NormalsOffAtBlendOne) {
+  const ScopedTargets targets;
+  const ScopedHints hints;
+  webgpu::g_graphicsConfig.gbuffer = true;
+  webgpu::g_graphicsConfig.surfaceBuffer = true;
+  apply_frame_state(pbr_state(0.f));
+  EXPECT_TRUE(gx::render_ext::g_companionGates.normals);
+  apply_frame_state(pbr_state(0.99f));
+  EXPECT_TRUE(gx::render_ext::g_companionGates.normals);
+  apply_frame_state(pbr_state(1.f));
+  EXPECT_FALSE(gx::render_ext::g_companionGates.normals);
+  EXPECT_TRUE(gx::render_ext::g_companionGates.materials);
+  webgpu::g_graphicsConfig.surfaceBuffer = false;
+  apply_frame_state(pbr_state(0.f));
+  EXPECT_FALSE(gx::render_ext::g_companionGates.normals);
+  EXPECT_FALSE(gx::render_ext::g_companionGates.materials);
 }
 } // namespace
 } // namespace aurora::render::gx_ext

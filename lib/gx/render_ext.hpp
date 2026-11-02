@@ -45,6 +45,45 @@ inline bool store_lanes(const StochasticLanes& lanes, u8 mask) noexcept {
   return changed;
 }
 
+struct CompanionLane {
+  Vec4<float> v{0.f, 0.f, 1.f, 0.f};
+
+  bool operator==(const CompanionLane&) const = default;
+};
+inline constexpr u32 LaneAlbedo = 1;
+inline constexpr u32 LaneNrm = 2;
+inline constexpr u32 LaneMat = 4;
+inline constexpr u32 LaneOrm = 8;
+inline constexpr float MatNormalYSign = -1.f;
+inline constexpr float MatNormalStrength = 0.5f;
+inline constexpr float NrmNormalStrength = 1.f;
+inline CompanionLane g_companionLane{};
+
+inline bool store_companion_lane(const CompanionLane& lane) noexcept {
+  if (g_companionLane == lane) {
+    return false;
+  }
+  g_companionLane = lane;
+  return true;
+}
+
+struct CompanionGates {
+  bool materials = false;
+  bool matMaps = false;
+  bool normals = false;
+
+  bool operator==(const CompanionGates&) const = default;
+};
+inline CompanionGates g_companionGates{};
+
+inline bool set_companion_gates(const CompanionGates& gates) noexcept {
+  if (g_companionGates == gates) {
+    return false;
+  }
+  g_companionGates = gates;
+  return true;
+}
+
 // The FIFO also derives for a pending layout, so derive only writes lanes and keeps output bits to G-buffer layouts
 struct Hooks {
   RenderExtConfig (*derive)(void* userData, const PipelineConfig& config, const ShaderInfo& info,
@@ -110,6 +149,23 @@ inline RenderExtConfig normalize(RenderExtConfig ext, const ShaderInfo& info) no
     ext.output = 1;
     g_stats.fwdEnvDemotions.fetch_add(1, std::memory_order_relaxed);
   }
+  if (ext.output != 2) {
+    ext.layer0 = 0;
+    ext.layer1 = 0;
+    ext.pom = 0;
+  }
+  if (ext.layer0 != 0) {
+    const u32 map = ext.layer0 - 1u;
+    if (map >= MaxTextures || !info.sampledTextures.test(map) || info.sampledIndTextures.test(map) ||
+        (ext.stochasticMask >> map & 1u) != 0) {
+      ext.layer0 = 0;
+    } else if (!info.companionFits) {
+      ext.layer0 = 0;
+      g_stats.budgetDrops.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  ext.layer1 = 0;
+  ext.pom = 0;
   return ext;
 }
 
@@ -142,6 +198,9 @@ inline PipelineConfig output1_config(const PipelineConfig& config) noexcept {
   if (twin.shaderConfig.ext.output == 2) {
     twin.shaderConfig.ext.output = 1;
   }
+  twin.shaderConfig.ext.layer0 = 0;
+  twin.shaderConfig.ext.layer1 = 0;
+  twin.shaderConfig.ext.pom = 0;
   return twin;
 }
 

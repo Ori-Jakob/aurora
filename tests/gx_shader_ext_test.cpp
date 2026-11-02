@@ -12,6 +12,8 @@
 #include "gx/shader_info.hpp"
 #include "gx/unlit_plan.hpp"
 
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -224,8 +226,24 @@ TEST_F(GxShaderExtTest, NormalizeKeepsOnlyEligibleStochastic) {
   const RenderExtConfig normalized = render_ext::normalize(ext, info);
   EXPECT_EQ(normalized.stochasticMask, 1u);
   EXPECT_EQ(normalized.output, 2u);
-  EXPECT_EQ(normalized.layer0, 1u);
+  EXPECT_EQ(normalized.layer0, 0u);
   EXPECT_TRUE(render_ext::normalize(normalized, info) == normalized);
+  ASSERT_TRUE(info.companionFits);
+  EXPECT_EQ(render_ext::normalize({.output = 2, .pom = 1, .layer0 = 1, .layer1 = 2}, info),
+            (RenderExtConfig{.output = 2, .layer0 = 1}));
+  for (const RenderExtConfig other :
+       {RenderExtConfig{.output = 1, .layer0 = 1}, RenderExtConfig{.layer0 = 1},
+        RenderExtConfig{.output = 2, .layer0 = 2}, RenderExtConfig{.output = 2, .layer0 = 9}}) {
+    EXPECT_EQ(render_ext::normalize(other, info).layer0, 0u) << int{other.output} << " " << int{other.layer0};
+  }
+  ShaderInfo indirect = info;
+  indirect.sampledIndTextures.set(0);
+  EXPECT_EQ(render_ext::normalize({.output = 2, .layer0 = 1}, indirect).layer0, 0u);
+  ShaderInfo full = info;
+  full.companionFits = false;
+  const uint64_t drops = render_ext::g_stats.budgetDrops.load();
+  EXPECT_EQ(render_ext::normalize({.output = 2, .layer0 = 1}, full).layer0, 0u);
+  EXPECT_EQ(render_ext::g_stats.budgetDrops.load(), drops + 1);
   const RenderExtConfig legacy = render_ext::without_texture_bits(ext);
   EXPECT_EQ(legacy.stochasticMask, 0u);
   EXPECT_EQ(legacy.layer0, 0u);
@@ -1383,7 +1401,173 @@ TEST_F(GxShaderExtTest, NormalizeDemotesOutput2WithFwdEnv) {
   PipelineConfig config{};
   config.shaderConfig.ext = {.output = 2, .stochasticMask = 3, .layer0 = 1};
   const PipelineConfig twin = render_ext::output1_config(config);
-  EXPECT_TRUE(twin.shaderConfig.ext == (RenderExtConfig{.output = 1, .stochasticMask = 3, .layer0 = 1}));
+  EXPECT_TRUE(twin.shaderConfig.ext == (RenderExtConfig{.output = 1, .stochasticMask = 3}));
+}
+
+ShaderConfig layered(ShaderConfig config, u8 layer0 = 1) {
+  config.ext.layer0 = layer0;
+  return config;
+}
+
+std::string companion_text(const ShaderConfig& config, const ShaderTargets& targets = PbrTargets) {
+  return build_shader_source(config, DstAlphaMode::None, targets);
+}
+
+TEST_F(GxShaderExtTest, CompanionTextNeedsSurfaceAndLayer) {
+  const ShaderConfig config = layered(modulate());
+  const ShaderInfo info = build_shader_info(config);
+  ASSERT_TRUE(info.unlitAdmitted);
+  EXPECT_TRUE(info.companionLane);
+  for (const ShaderTargets& targets : {PbrTargets, PbrIdTargets}) {
+    EXPECT_TRUE(uses_companions(config, info, targets));
+    const std::string text = companion_text(config, targets);
+    EXPECT_EQ(count(text, "@group(2) @binding(16)\nvar ctex_alb: texture_2d<f32>;"), 1u);
+    EXPECT_EQ(count(text, "@group(2) @binding(17)\nvar ctex_nrm: texture_2d<f32>;"), 1u);
+    EXPECT_EQ(count(text, "@group(2) @binding(18)\nvar ctex_orm: texture_2d<f32>;"), 1u);
+    EXPECT_EQ(count(text, "fn gx_perturb("), 1u);
+    EXPECT_EQ(count(text, "fn gx_linear_to_srgb("), 1u);
+    EXPECT_EQ(count(text, "let cmp_p = gx_view_pos(in.mo_cur);"), 1u);
+    EXPECT_NE(text.find("textureSampleBias(ctex_nrm, tex0_samp, tex0_uv, ubuf.tex0_size_bias.z)"), std::string::npos);
+  }
+  const std::array<ShaderTargets, 3> without{GbufferTargets, ShaderTargets{}, ShaderTargets{.normal = 1}};
+  for (const ShaderTargets& targets : without) {
+    EXPECT_FALSE(uses_companions(config, info, targets));
+    EXPECT_EQ(companion_text(config, targets).find("ctex_"), std::string::npos);
+  }
+  for (const ShaderConfig& other : {modulate(), layered(modulate(1)), layered(modulate(0))}) {
+    const ShaderInfo otherInfo = build_shader_info(other);
+    EXPECT_FALSE(uses_companions(other, otherInfo, PbrTargets));
+    EXPECT_FALSE(otherInfo.companionLane);
+    EXPECT_EQ(companion_text(other).find("ctex_"), std::string::npos);
+  }
+  ShaderConfig noNormal = layered(modulate());
+  noNormal.attrs[GX_VA_NRM] = {};
+  EXPECT_FALSE(uses_companions(noNormal, build_shader_info(noNormal), PbrTargets));
+  ShaderTargets noMotion = PbrTargets;
+  noMotion.motion = UINT32_MAX;
+  EXPECT_FALSE(uses_companions(config, info, noMotion));
+}
+
+TEST_F(GxShaderExtTest, CompanionsAddNoVaryings) {
+  for (const ShaderConfig& base : {modulate(), ma00_like(), crowded(MaxTexCoord - 1)}) {
+    const ShaderConfig config = layered(base);
+    ASSERT_TRUE(build_shader_info(config).unlitAdmitted);
+    EXPECT_EQ(build_shader_info(config).varyings, build_shader_info(base).varyings);
+    for (const ShaderTargets& targets : {PbrTargets, PbrIdTargets}) {
+      const std::string text = companion_text(config, targets);
+      ASSERT_NE(text.find("ctex_alb"), std::string::npos);
+      EXPECT_EQ(vertex_output(text), vertex_output(companion_text(base, targets)));
+      EXPECT_EQ(location_count(text), varying_count(config, targets));
+      EXPECT_EQ(varying_count(config, targets), varying_count(base, targets));
+    }
+  }
+}
+
+TEST_F(GxShaderExtTest, CompanionNormalSelectKeepsLegacyExpression) {
+  const ShaderConfig base = modulate();
+  const std::string plain = companion_text(base);
+  const std::string text = companion_text(layered(base));
+  constexpr std::string_view Alpha = "gbuffer_rx_alpha(imm._pad, nrm_len_sq)";
+  const std::string legacy = fmt::format("out.normal = vec4f(unit_nrm * 0.5 + 0.5, {});", Alpha);
+  EXPECT_EQ(count(plain, legacy), 1u);
+  EXPECT_EQ(count(text, legacy), 0u);
+  EXPECT_EQ(count(text, fmt::format("let legacy_normal = vec4f(unit_nrm * 0.5 + 0.5, {});", Alpha)), 1u);
+  EXPECT_EQ(count(text, fmt::format("out.normal = select(legacy_normal, vec4f(mapped_nrm * 0.5 + 0.5, {}), "
+                                    "use_mapped);",
+                                    Alpha)),
+            1u);
+  EXPECT_NE(text.find("ubuf.mat0.y > 0.0 && (u32(ubuf.mat0.x) & 6u) != 0u && ubuf.proj[3].w == 0.0"),
+            std::string::npos);
+  const std::string lets =
+      "\n    let nrm_len_sq = dot(in.mv_nrm, in.mv_nrm);"
+      "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm), nrm_len_sq > 1e-10);";
+  EXPECT_EQ(count(plain, lets), 1u);
+  EXPECT_EQ(count(text, lets), 1u);
+  const std::string body = fs_body(text);
+  const std::string plainBody = fs_body(plain);
+  const size_t taps = body.find("\n    let cmp_alb = ");
+  ASSERT_NE(taps, std::string::npos);
+  EXPECT_EQ(body.substr(0, taps), plainBody.substr(0, taps));
+  EXPECT_LT(taps, body.find("discard"));
+  EXPECT_EQ(fragment_output(text), fragment_output(plain));
+}
+
+TEST_F(GxShaderExtTest, CompanionLaneIsLastUniform) {
+  ShaderConfig config = layered(modulate());
+  const ShaderInfo info = build_shader_info(config);
+  const ShaderInfo plain = build_shader_info(modulate());
+  ASSERT_TRUE(info.companionLane);
+  const std::string uniforms = uniform_struct(companion_text(config));
+  ASSERT_FALSE(uniforms.empty());
+  EXPECT_EQ(uniforms.substr(uniforms.rfind("\n    ")), "\n    mat0: vec4f,\n");
+  render_ext::g_companionLane = {.v = {3.f, 0.5f, -1.f, 0.f}};
+  const std::vector<uint8_t> bytes = testing::uniform_bytes(info);
+  const std::vector<uint8_t> plainBytes = testing::uniform_bytes(plain);
+  ASSERT_EQ(bytes.size(), plainBytes.size() + 16);
+  EXPECT_TRUE(std::equal(plainBytes.begin(), plainBytes.end(), bytes.begin()));
+  const Vec4<float> lane = read_vec4(bytes, plainBytes.size());
+  EXPECT_EQ(lane, render_ext::g_companionLane.v);
+  EXPECT_EQ(info.uniformSize, gfx::align_uniform(static_cast<uint32_t>(bytes.size())));
+  render_ext::g_companionLane = {};
+  ShaderConfig stochastic =
+      layered(staged(unlit_base(), {unlit_tev(GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASC, GX_CC_ZERO),
+                                    unlit_tev(GX_CC_ZERO, GX_CC_CPREV, GX_CC_TEXC, GX_CC_ZERO, 1, 1)}));
+  stochastic.ext.stochasticMask = 0b10;
+  const ShaderInfo both = build_shader_info(stochastic);
+  ASSERT_TRUE(both.companionLane);
+  ASSERT_TRUE(both.stochasticTextures.test(1));
+  const std::string bothUniforms = uniform_struct(companion_text(stochastic));
+  EXPECT_LT(bothUniforms.find("tex1_hex: vec4f,"), bothUniforms.find("mat0: vec4f,"));
+  EXPECT_EQ(bothUniforms.substr(bothUniforms.rfind("\n    ")), "\n    mat0: vec4f,\n");
+}
+
+TEST_F(GxShaderExtTest, AlbedoSubstitutesOnlyLayerPair) {
+  ShaderConfig config = staged(unlit_base(), {unlit_tev(GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASC, GX_CC_ZERO, 0, 0),
+                                              unlit_tev(GX_CC_ZERO, GX_CC_CPREV, GX_CC_TEXC, GX_CC_ZERO, 0, 1),
+                                              unlit_tev(GX_CC_ZERO, GX_CC_CPREV, GX_CC_TEXC, GX_CC_ZERO, 1, 0),
+                                              unlit_tev(GX_CC_ZERO, GX_CC_CPREV, GX_CC_TEXC, GX_CC_ZERO, 0, 0)});
+  config = layered(config);
+  ASSERT_TRUE(unlit::plan(config).pass());
+  ASSERT_TRUE(build_shader_info(config).unlitAdmitted);
+  const std::string text = companion_text(config);
+  const std::string block = unlit_block(text);
+  ASSERT_FALSE(block.empty());
+  const auto substituted = [&](u32 stage) {
+    return block.find(fmt::format("let sampled{0} = select(sampled{0}, vec4f(gx_linear_to_srgb(cmp_alb.rgb), "
+                                  "sampled{0}.a), (u32(ubuf.mat0.x) & 1u) != 0u);",
+                                  stage)) != std::string::npos;
+  };
+  EXPECT_TRUE(substituted(0));
+  EXPECT_FALSE(substituted(1));
+  EXPECT_FALSE(substituted(2));
+  EXPECT_TRUE(substituted(3));
+  const std::string lit = text.substr(0, text.find(UnlitBlock));
+  EXPECT_EQ(lit.find("cmp_alb.rgb"), std::string::npos);
+  EXPECT_NE(text.find("out.surface = gx_surface_pack(unlit_rgb, select(1.0, cmp_orm.r, uorm), select(0.85, cmp_orm.g, "
+                      "uorm), select(0.0, cmp_orm.b, uorm), "),
+            std::string::npos);
+  const std::string plain = companion_text(modulate());
+  EXPECT_NE(plain.find("out.surface = gx_surface_pack(unlit_rgb, 1.0, 0.85, 0.0, "), std::string::npos);
+}
+
+TEST_F(GxShaderExtTest, CompanionPredicateDrivesLayoutAndKind) {
+  const ShaderConfig config = layered(modulate());
+  const ShaderInfo info = build_shader_info(config);
+  EXPECT_TRUE(uses_companions(config, info, PbrTargets));
+  EXPECT_FALSE(uses_forward_env(config, PbrTargets));
+  RenderExtConfig fwd = config.ext;
+  fwd.fwdEnv = 1;
+  const RenderExtConfig normalized = render_ext::normalize(fwd, info);
+  EXPECT_EQ(normalized.output, 1u);
+  EXPECT_EQ(normalized.layer0, 0u);
+  PipelineConfig pipeline{};
+  pipeline.shaderConfig = config;
+  const PipelineConfig twin = render_ext::output1_config(pipeline);
+  EXPECT_EQ(twin.shaderConfig.ext.layer0, 0u);
+  EXPECT_FALSE(uses_companions(twin.shaderConfig, build_shader_info(twin.shaderConfig), PbrTargets));
+  const PipelineConfig fallback = render_ext::fallback_config(pipeline);
+  EXPECT_EQ(fallback.shaderConfig.ext.layer0, 0u);
+  EXPECT_FALSE(uses_companions(fallback.shaderConfig, build_shader_info(fallback.shaderConfig), PbrTargets));
 }
 } // namespace
 } // namespace aurora::gx

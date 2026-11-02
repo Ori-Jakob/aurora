@@ -9,6 +9,7 @@
 
 #include <array>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace render_demo {
@@ -23,6 +24,7 @@ struct SceneOptions {
   bool aoCheck = false;
   bool fwdEnvCheck = false;
   bool unlitCheck = false;
+  bool companionCheck = false;
 };
 
 struct SceneCamera {
@@ -55,6 +57,13 @@ struct UnlitProbe {
 };
 static_assert(sizeof(UnlitProbe) == 16);
 
+struct CompanionProbe {
+  f32 ndc[2];
+  u32 quad;
+  u32 cell;
+};
+static_assert(sizeof(CompanionProbe) == 16);
+
 struct FogResolveCounts {
   u32 checked = 0;
   u32 live = 0;
@@ -70,6 +79,9 @@ std::vector<std::array<f32, 2>> ao_trail_probes(u32 frame);
 std::vector<FwdEnvProbe> fwd_env_probes();
 FwdEnvExpect fwd_env_expect() noexcept;
 std::vector<UnlitProbe> unlit_probes();
+std::vector<CompanionProbe> companion_probes();
+CompanionAxes companion_axes() noexcept;
+std::span<const u8> ground_texture_base() noexcept;
 FogResolveCounts fog_resolve_counts() noexcept;
 uint32_t gpu_uploads_per_frame(const SceneOptions& options) noexcept;
 bool init_scene();

@@ -437,6 +437,7 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     render_ext::g_stats.budgetDrops.fetch_add(1, std::memory_order_relaxed);
   }
   info.stochasticTextures = std::bitset<MaxTextures>{config.ext.stochasticMask} & info.stochasticEligible;
+  info.companionFits = stochastic_fits(info.uniformSize, static_cast<u32>(info.stochasticEligible.count()) + 1);
   info.uniformSize += info.stochasticTextures.count() * sizeof(Vec4<float>);
   // Output 2 adds up to two raw vertex colours; admission keeps it at output 1 when they do not fit
   static_assert(1 + MaxColorChannels / 2 + MaxTexCoord + MotionVaryings <= MaxGxVaryings);
@@ -451,6 +452,10 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     info.unlitAdmitted = unlit::admitted(plan, config, base);
     if (info.unlitAdmitted) {
       info.varyings = static_cast<u8>(base + unlit::raw_vertex_varyings(plan));
+    }
+    info.companionLane = info.unlitAdmitted && config.ext.layer0 != 0 && info.companionFits;
+    if (info.companionLane) {
+      info.uniformSize += sizeof(Vec4<float>);
     }
   }
   info.uniformSize = gfx::align_uniform(info.uniformSize);
@@ -628,6 +633,9 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
     if (info.stochasticTextures.test(i)) {
       buf.append(render_ext::g_stochasticUniforms[i]);
     }
+  }
+  if (info.companionLane) {
+    buf.append(render_ext::g_companionLane.v);
   }
 }
 

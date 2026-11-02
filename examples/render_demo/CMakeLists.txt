@@ -3,6 +3,8 @@ include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/AuroraCopyRuntimeDLLs.cmake)
 add_executable(render_demo
   bench_report.cpp
   bench_report.hpp
+  companion_fixtures.cpp
+  companion_fixtures.hpp
   cull_pass.cpp
   cull_pass.hpp
   cull_reference.cpp
@@ -25,6 +27,10 @@ add_executable(render_demo
   scene.cpp
   scene.hpp
 )
-target_link_libraries(render_demo PRIVATE aurora::core aurora::gx aurora::main aurora::vi aurora::mtx)
+target_link_libraries(render_demo PRIVATE aurora::core aurora::gx aurora::main aurora::vi aurora::mtx
+  absl::flat_hash_map)
+target_include_directories(render_demo PRIVATE ../../lib)
+target_compile_definitions(render_demo PRIVATE
+  RENDER_DEMO_MATERIAL_FIXTURES="${CMAKE_CURRENT_LIST_DIR}/../../tests/fixtures/materials/dds")
 set_target_properties(render_demo PROPERTIES FOLDER "aurora/examples")
 aurora_copy_runtime_dlls(render_demo)

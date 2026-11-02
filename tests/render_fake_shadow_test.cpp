@@ -680,6 +680,31 @@ TEST_F(RenderFakeShadow, MemoBuildsOncePerFramePerVariant) {
   EXPECT_EQ(Builder::calls, 4);
 }
 
+TEST_F(RenderFakeShadow, NeutralGroupsKeepCompanionGroup) {
+  const std::array rules{rule(5, Neutral::White, Gate::Light, category::Terrain)};
+  testing::set_rules(rules);
+  set_force(Gate::Light, Force::On);
+  latch();
+  main_scene();
+  scope(category::Terrain);
+  bind(0, 5);
+
+  constexpr gfx::BindGroupRef Companion = 0xC0FFEE;
+  gx::DrawData built = draw_data();
+  built.bindGroups.companionBindGroup = Companion;
+  EXPECT_TRUE(push_draw(built));
+  EXPECT_EQ(Builder::calls, 1);
+  EXPECT_NE(built.bindGroups.textureBindGroup, BaseGroup);
+  EXPECT_EQ(built.bindGroups.companionBindGroup, Companion);
+
+  gx::DrawData memo = draw_data();
+  memo.bindGroups.companionBindGroup = Companion + 1;
+  EXPECT_TRUE(push_draw(memo));
+  EXPECT_EQ(Builder::calls, 1);
+  EXPECT_EQ(memo.bindGroups.textureBindGroup, built.bindGroups.textureBindGroup);
+  EXPECT_EQ(memo.bindGroups.companionBindGroup, Companion + 1);
+}
+
 TEST_F(RenderFakeShadow, ReportTotalsAndReset) {
   const std::array rules{rule(5, Neutral::White, Gate::Light, category::Terrain),
                          rule(6, Neutral::Clear, Gate::Cloud, category::Water)};

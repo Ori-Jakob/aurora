@@ -5,13 +5,22 @@
 
 #include "../frame_state.hpp"
 #include "../material/registry.hpp"
+#include "../post/composite.hpp"
+#include "../settings.hpp"
+#include "../../gfx/companion_cache.hpp"
+#include "../../gfx/scene_targets.hpp"
+#include "../../gx/pipeline.hpp"
 #include "../../gx/render_ext.hpp"
 #include "../../gx/texture.hpp"
 #include "../../logging.hpp"
 
+#include <aurora/render_caps.hpp>
+
 #include <SDL3/SDL_stdinc.h>
 
+#include <atomic>
 #include <memory>
+#include <optional>
 #include <string_view>
 #include <utility>
 
@@ -27,6 +36,17 @@ bool g_active = false;
 bool g_testForce = false;
 bool g_envRead = false;
 EnvMode g_env = EnvMode::Unset;
+bool g_companionsOff = false;
+bool g_warnedManifestMaps = false;
+std::optional<bool> g_companionSupport;
+std::atomic_uint64_t g_layerDraws{0};
+
+constexpr uint32_t CompanionSampledTextures = 16;
+constexpr uint32_t ManifestMapRoleCount = 7;
+constexpr uint8_t LayerRoles = gfx::companion_cache::role_bit(gfx::texture_replacement::CompanionRole::Albedo) |
+                               gfx::companion_cache::role_bit(gfx::texture_replacement::CompanionRole::Nrm) |
+                               gfx::companion_cache::role_bit(gfx::texture_replacement::CompanionRole::Orm) |
+                               gfx::companion_cache::role_bit(gfx::texture_replacement::CompanionRole::Mat);
 
 EnvMode read_env() noexcept {
   const char* value = SDL_getenv("AURORA_RENDER_STOCHASTIC");
@@ -89,6 +109,40 @@ u8 stochastic_mask(const gx::ShaderInfo& info, gx::render_ext::StochasticLanes& 
   return mask;
 }
 
+bool companions_supported() noexcept {
+  if (g_companionSupport) {
+    return *g_companionSupport;
+  }
+  const Caps& caps = render::caps();
+  return caps.core && caps.bcTextures && caps.limits.maxSampledTexturesPerShaderStage >= CompanionSampledTextures;
+}
+
+uint8_t layer0_for(const gx::PipelineConfig& config, const gx::ShaderInfo& info) noexcept {
+  if (g_companionsOff || !companions_supported()) {
+    return 0;
+  }
+  for (u32 i = 0; i < gx::MaxTextures; ++i) {
+    if ((info.sampledTextures.test(i) || info.sampledIndTextures.test(i)) &&
+        (gx::g_gxState.textures[i].material.flags & material::FakeShadow) != 0) {
+      return 0;
+    }
+  }
+  const gx::ShaderConfig& shader = config.shaderConfig;
+  const uint16_t stages = gx::unlit_facts(shader, info).layerStages;
+  for (u32 s = 0; s < shader.tevStageCount && s < gx::MaxTevStages; ++s) {
+    const u32 map = shader.tevStages[s].texMapId;
+    if ((stages >> s & 1u) == 0 || map > GX_TEXMAP7) {
+      continue;
+    }
+    const gfx::TextureBind& bind = gx::g_gxState.textures[map];
+    if ((bind.material.companionRoles & LayerRoles) == 0 || (bind.ref != nullptr && bind.ref->attachmentTextureView)) {
+      continue;
+    }
+    return static_cast<uint8_t>(map + 1);
+  }
+  return 0;
+}
+
 gx::RenderExtConfig derive(void*, const gx::PipelineConfig& config, const gx::ShaderInfo& info,
                            const gfx::RenderTargetLayout& layout, gx::render_ext::StochasticLanes& lanes) noexcept {
   gx::RenderExtConfig ext{};
@@ -102,6 +156,10 @@ gx::RenderExtConfig derive(void*, const gx::PipelineConfig& config, const gx::Sh
     if (ext.output == 1 && gfx::layout_has_surface(layout) &&
         unlit::output2(config, info, gx::render_ext::g_drawInputs)) {
       ext.output = 2;
+      ext.layer0 = layer0_for(config, info);
+      if (ext.layer0 != 0) {
+        g_layerDraws.fetch_add(1, std::memory_order_relaxed);
+      }
     }
   }
   return ext;
@@ -124,6 +182,38 @@ uint8_t fwd_env_for(const gx::PipelineConfig& c, bool forwardWindow) noexcept {
   return forwardWindow && c.colorUpdate ? 1 : 0;
 }
 
+namespace {
+void apply_companions(const detail::FrameState& state) noexcept {
+  const gfx::LayoutWarm* warm = gfx::layout_warm();
+  const bool surface = gfx::layout_has_surface(gfx::scene_render_target_layout()) ||
+                       (warm != nullptr && gfx::layout_has_surface(warm->pending));
+  const Settings& s = state.settings;
+  const bool consumer = s.pbr && surface;
+  gx::texture::set_companion_consumer(consumer);
+  gx::render_ext::CompanionGates gates{};
+  if (consumer) {
+    gates = {
+        .materials = s.textureMaterials,
+        .matMaps = (s.textureMaterials && s.legacyMatMaps) || detail::mat_maps_env(),
+        .normals = s.legacyBlend < 1.f && !detail::composite::identity_forced(),
+    };
+  }
+  if (gx::render_ext::set_companion_gates(gates)) {
+    gx::texture::invalidate_bindings();
+  }
+  if (consumer && g_snapshot != nullptr && !g_warnedManifestMaps) {
+    uint32_t mapped = 0;
+    for (uint32_t role = 0; role < ManifestMapRoleCount; ++role) {
+      mapped += g_snapshot->summaryCount[material::MapRoleShift + role];
+    }
+    if (mapped != 0) {
+      g_warnedManifestMaps = true;
+      Log.warn("Material manifests name {} map role(s); only companion files are sampled for now", mapped);
+    }
+  }
+}
+} // namespace
+
 void apply_frame_state(const detail::FrameState& state) noexcept {
   records::apply_frame_state(state);
   fwd_env::apply_frame_state(state);
@@ -131,6 +221,11 @@ void apply_frame_state(const detail::FrameState& state) noexcept {
   if (!g_envRead) {
     g_envRead = true;
     g_env = read_env();
+    if (const char* value = SDL_getenv("AURORA_RENDER_COMPANIONS");
+        value != nullptr && std::string_view{value} == "off") {
+      Log.warn("AURORA_RENDER_COMPANIONS=off: no draw samples companion material maps");
+      g_companionsOff = true;
+    }
   }
   std::shared_ptr<const material::Snapshot> latched = material::latched_snapshot();
   const bool generationChanged = g_snapshot == nullptr || latched->generation != g_snapshot->generation;
@@ -143,13 +238,19 @@ void apply_frame_state(const detail::FrameState& state) noexcept {
   if (want != g_active || force != g_force || (want && generationChanged)) {
     set_active(want, force);
   }
+  apply_companions(state);
   gx::render_ext::set_hooks(g_active || records::gbuffer() || gfx::gbuffer_live_or_pending() ? &kHooks : nullptr);
 }
 
 void shutdown() noexcept {
+  if (const uint64_t layered = g_layerDraws.exchange(0, std::memory_order_relaxed); layered != 0) {
+    Log.info("Companion layer: {} output-2 derivations with layer 0, companion skips {}", layered,
+             gx::bind_counts().companionSkips);
+  }
   unlit::shutdown();
   records::shutdown();
   gx::render_ext::set_hooks(nullptr);
+  gx::render_ext::set_companion_gates({});
   g_snapshot.reset();
   g_active = false;
   g_force = false;
@@ -168,6 +269,13 @@ void reset() noexcept {
   g_testForce = false;
   g_envRead = false;
   g_env = EnvMode::Unset;
+  g_companionsOff = false;
+  g_warnedManifestMaps = false;
+  g_companionSupport.reset();
+  g_layerDraws.store(0, std::memory_order_relaxed);
+  gx::texture::set_companion_consumer(false);
 }
+
+void set_companion_support(std::optional<bool> supported) noexcept { g_companionSupport = supported; }
 } // namespace testing
 } // namespace aurora::render::gx_ext

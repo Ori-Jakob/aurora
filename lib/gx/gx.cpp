@@ -1,6 +1,7 @@
 #include "gx.hpp"
 
 #include "pipeline.hpp"
+#include "shader_info.hpp"
 #include "texture.hpp"
 #include "../dolphin/vi/vi_internal.hpp"
 #include "../webgpu/gpu.hpp"
@@ -44,6 +45,10 @@ wgpu::PipelineLayout sPipelineLayout;
 wgpu::BindGroupLayout sFwdEnvBindGroupLayout;
 wgpu::PipelineLayout sFwdEnvPipelineLayout;
 wgpu::BindGroup sNeutralFwdEnvGroup;
+wgpu::BindGroupLayout sCompanionBindGroupLayout;
+wgpu::PipelineLayout sCompanionPipelineLayout;
+constexpr uint32_t CompanionFirstBinding = MaxTextures * 2;
+constexpr uint32_t CompanionBindings = 8;
 
 std::atomic<int> sPendingViewportPolicy{-1};
 
@@ -443,10 +448,16 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
   const ShaderTargets targets = shader_targets(layout);
   CHECK(!(config.shaderConfig.ext.fwdEnv && config.shaderConfig.ext.tessFetch),
         "GX pipeline asks for both the forward environment and tessellation fetch");
+  CHECK(!(config.shaderConfig.ext.layer0 && config.shaderConfig.ext.fwdEnv),
+        "GX pipeline asks for both companion maps and the forward environment");
+  const bool companions = config.shaderConfig.ext.layer0 != 0 &&
+                          uses_companions(config.shaderConfig, build_shader_info(config.shaderConfig), targets);
   const wgpu::RenderPipelineDescriptor descriptor{
       .label = label,
       // Must follow the generator's test exactly, or pipeline creation fails
-      .layout = uses_forward_env(config.shaderConfig, targets) ? sFwdEnvPipelineLayout : sPipelineLayout,
+      .layout = companions                                       ? sCompanionPipelineLayout
+                : uses_forward_env(config.shaderConfig, targets) ? sFwdEnvPipelineLayout
+                                                                 : sPipelineLayout,
       .vertex =
           {
               .module = shader,
@@ -646,6 +657,35 @@ GXBindGroups build_neutral_bind_groups(const ShaderInfo& info, u8 whiteMask, u8 
   return texture_bind_groups(info, whiteMask, clearMask, baseLevel, "GX Neutral Texture Bind Group");
 }
 
+GXBindGroups build_companion_bind_group(const ShaderInfo& info, bool baseLevel, u8 layerMap,
+                                        const std::array<WGPUTextureView, CompanionViewCount>& views) noexcept {
+  ZoneScoped;
+  if (layerMap >= MaxTextures || !sCompanionBindGroupLayout) {
+    return {};
+  }
+  std::array<WGPUBindGroupEntry, CompanionFirstBinding + CompanionBindings> entries{};
+  detail::fill_texture_entries(info, 0, 0, baseLevel,
+                               {
+                                   .empty = sEmptyTextureView.Get(),
+                                   .white = sNeutralWhiteView.Get(),
+                                   .clear = sNeutralClearView.Get(),
+                                   .emptySampler = sEmptySampler.Get(),
+                               },
+                               std::span<WGPUBindGroupEntry, MaxTextures * 2>{entries.data(), MaxTextures * 2});
+  for (uint32_t i = 0; i < CompanionBindings; ++i) {
+    WGPUBindGroupEntry& entry = entries[CompanionFirstBinding + i];
+    entry.binding = CompanionFirstBinding + i;
+    entry.textureView = i < CompanionViewCount && views[i] != nullptr ? views[i] : sNeutralWhiteView.Get();
+  }
+  const WGPUBindGroupDescriptor descriptor{
+      .label = {"GX Companion Texture Bind Group", WGPU_STRLEN},
+      .layout = sCompanionBindGroupLayout.Get(),
+      .entryCount = entries.size(),
+      .entries = entries.data(),
+  };
+  return {.companionBindGroup = gfx::bind_group_ref(descriptor)};
+}
+
 void initialize() noexcept {
   {
     std::array<wgpu::BindGroupLayoutEntry, MaxTextures * 2> textureEntries;
@@ -779,6 +819,56 @@ void initialize() noexcept {
     };
     sNeutralFwdEnvGroup = g_device.CreateBindGroup(&group);
   }
+  {
+    // 16 albedo, 17 nrm or .mat, 18 orm, 19 emit, 20-23 layer 1; append-only
+    std::array<wgpu::BindGroupLayoutEntry, CompanionFirstBinding + CompanionBindings> entries;
+    for (u32 i = 0; i < MaxTextures; ++i) {
+      entries[i * 2] = {
+          .binding = i * 2,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .texture =
+              {
+                  .sampleType = wgpu::TextureSampleType::Float,
+                  .viewDimension = wgpu::TextureViewDimension::e2D,
+              },
+      };
+      entries[i * 2 + 1] = {
+          .binding = i * 2 + 1,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .sampler = {.type = wgpu::SamplerBindingType::Filtering},
+      };
+    }
+    for (u32 i = 0; i < CompanionBindings; ++i) {
+      entries[CompanionFirstBinding + i] = {
+          .binding = CompanionFirstBinding + i,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .texture =
+              {
+                  .sampleType = wgpu::TextureSampleType::Float,
+                  .viewDimension = wgpu::TextureViewDimension::e2D,
+              },
+      };
+    }
+    const wgpu::BindGroupLayoutDescriptor descriptor{
+        .label = "GX Companion Texture Bind Group Layout",
+        .entryCount = entries.size(),
+        .entries = entries.data(),
+    };
+    sCompanionBindGroupLayout = g_device.CreateBindGroupLayout(&descriptor);
+    const std::array layouts{
+        gfx::detail::resources().staticBindGroupLayout,
+        gfx::detail::resources().uniformBindGroupLayout,
+        sCompanionBindGroupLayout,
+    };
+    // render() sets immediates on every draw, so every GX layout needs them
+    const wgpu::PipelineLayoutDescriptor desc{
+        .label = "GX Companion Pipeline Layout",
+        .bindGroupLayoutCount = layouts.size(),
+        .bindGroupLayouts = layouts.data(),
+        .immediateSize = sizeof(DrawImmediateData),
+    };
+    sCompanionPipelineLayout = g_device.CreatePipelineLayout(&desc);
+  }
 }
 
 const wgpu::BindGroupLayout& forward_environment_layout() noexcept { return sFwdEnvBindGroupLayout; }
@@ -793,6 +883,8 @@ void shutdown() noexcept {
   sNeutralFwdEnvGroup = {};
   sFwdEnvPipelineLayout = {};
   sFwdEnvBindGroupLayout = {};
+  sCompanionPipelineLayout = {};
+  sCompanionBindGroupLayout = {};
   sNeutralWhiteView = {};
   sNeutralClearView = {};
   sNeutralWhite = {};

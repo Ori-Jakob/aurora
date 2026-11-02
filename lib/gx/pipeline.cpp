@@ -31,12 +31,14 @@ struct BoundState {
   gfx::BindGroupRef textureGroup = 0;
   bool indexBuffer = false;
   WGPUBindGroup group3 = nullptr;
+  uint8_t group2Kind = 0;
 };
 BoundState g_bound;
 wgpu::BindGroup g_fwdEnvGroup;
 
 struct Counters {
   std::atomic_uint64_t draws, texturedDraws, uniformBinds, textureBinds, indexBinds, encodeNs, envBinds;
+  std::atomic_uint64_t companionSkips;
   std::atomic_uint64_t dstAlphaDraws, prepassDraws;
 } g_counts;
 // MRT turns dual-source into an alpha prepass; these counts measure that cost
@@ -100,7 +102,12 @@ gfx::CompiledPipeline create_unchecked(const PipelineConfig& config, const gfx::
   if (!pipeline.main) {
     return {};
   }
-  pipeline.group3 = uses_forward_env(config.shaderConfig, shader_targets(layout)) ? Group3ForwardEnvironment : 0;
+  const ShaderTargets targets = shader_targets(layout);
+  pipeline.group3 = uses_forward_env(config.shaderConfig, targets) ? Group3ForwardEnvironment : 0;
+  pipeline.group2 = config.shaderConfig.ext.layer0 != 0 &&
+                            uses_companions(config.shaderConfig, build_shader_info(config.shaderConfig), targets)
+                        ? Group2Companion
+                        : 0;
   return pipeline;
 }
 } // namespace
@@ -171,6 +178,13 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     }
     return;
   }
+  const uint8_t kind = pipeline.group2;
+  const auto group = kind == Group2Companion ? data.bindGroups.companionBindGroup : data.bindGroups.textureBindGroup;
+  if (kind == Group2Companion && group == 0) {
+    count(g_counts.companionSkips);
+    gfx::note_skipped_draw();
+    return;
+  }
   const auto& resources = gfx::detail::resources();
   count(g_counts.draws);
   pass.SetImmediates(0, &data.immediateData, sizeof(data.immediateData));
@@ -180,14 +194,19 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     g_bound.uniformOffset = data.uniformRange.offset;
     count(g_counts.uniformBinds);
   }
-  if (const auto group = data.bindGroups.textureBindGroup; group != 0) {
+  if (group != 0) {
     count(g_counts.texturedDraws);
     if (group != g_bound.textureGroup) {
       pass.SetBindGroup(2, gfx::find_bind_group(group));
       g_bound.textureGroup = group;
       count(g_counts.textureBinds);
     }
+  } else if (g_bound.group2Kind != 0) {
+    // A legacy draw with no textures must not inherit a companion group
+    pass.SetBindGroup(2, g_emptyTextureBindGroup);
+    g_bound.textureGroup = 0;
   }
+  g_bound.group2Kind = kind;
   // Bound per draw from the pipeline, so a fallback draw never needs group 3
   if (pipeline.group3 == Group3ForwardEnvironment) {
     const wgpu::BindGroup& g = g_fwdEnvGroup ? g_fwdEnvGroup : detail::neutral_forward_environment_group();
@@ -246,6 +265,7 @@ BindCounts bind_counts() noexcept {
       .indexBinds = g_counts.indexBinds.load(std::memory_order_relaxed),
       .encodeNs = g_counts.encodeNs.load(std::memory_order_relaxed),
       .envBinds = g_counts.envBinds.load(std::memory_order_relaxed),
+      .companionSkips = g_counts.companionSkips.load(std::memory_order_relaxed),
   };
 }
 

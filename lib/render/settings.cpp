@@ -395,7 +395,7 @@ void write_level(Settings& settings, Feature feature, uint8_t value) noexcept {
     settings.stochasticTiling = value != 0;
     break;
   case Feature::LegacyMatMaps:
-    settings.legacyMatMaps = false;
+    settings.legacyMatMaps = value != 0;
     break;
   case Feature::Upscaler:
     settings.upscaler = static_cast<Upscaler>(value);
@@ -496,6 +496,22 @@ bool pbr_env() noexcept {
   return enabled;
 }
 
+bool mat_maps_env_read() noexcept {
+  static const bool enabled = [] {
+    const char* value = SDL_getenv("AURORA_RENDER_MAT_MAPS");
+    if (value == nullptr) {
+      return false;
+    }
+    if (std::string_view{value} != "on") {
+      Log.warn("AURORA_RENDER_MAT_MAPS={} is not on; ignored", value);
+      return false;
+    }
+    Log.warn("AURORA_RENDER_MAT_MAPS=on: using original .mat normal maps for development regardless of settings");
+    return true;
+  }();
+  return enabled;
+}
+
 struct SettingsEnv {
   bool taa = false;
   std::optional<float> sharpness;
@@ -578,10 +594,14 @@ Settings with_env_overrides(Settings settings) noexcept {
 // AURORA_RENDER_AO also ORs in AO's built bits, so verification runs never depend on the defaults
 BuiltOptions support_built(const BuiltOptions& built) noexcept {
 #if AURORA_ENABLE_RENDER
-  return with_pbr_dev_built(ao::with_dev_built(built, ao::env_ao_request()), pbr_env());
+  BuiltOptions out = with_pbr_dev_built(ao::with_dev_built(built, ao::env_ao_request()), pbr_env());
 #else
-  return with_pbr_dev_built(built, pbr_env());
+  BuiltOptions out = with_pbr_dev_built(built, pbr_env());
 #endif
+  if (mat_maps_env_read()) {
+    out[feature_index(Feature::LegacyMatMaps)] |= 1u << 1;
+  }
+  return out;
 }
 
 gfx::SceneTier latch_scene_tier_want(uint32_t msaaSamples) {
@@ -817,6 +837,8 @@ BuiltOptions with_pbr_dev_built(BuiltOptions built, bool requested) noexcept {
   return built;
 }
 
+bool mat_maps_env() noexcept { return mat_maps_env_read(); }
+
 std::optional<float> parse_legacy_blend(std::string_view text) noexcept {
   float value = 0.f;
   const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
@@ -879,6 +901,12 @@ FeatureSupport evaluate_support(Feature feature, uint8_t option, const Settings&
     }
     break;
   case Feature::TerrainParallax:
+    if (deviceCaps.limits.maxSampledTexturesPerShaderStage < CompanionSampledTextures) {
+      return {false, Reason::NeedsCompanions};
+    }
+    break;
+  case Feature::LegacyMatMaps:
+    // Companions never share a pipeline with fwdEnv, so 8 + 8 is the whole count
     if (deviceCaps.limits.maxSampledTexturesPerShaderStage < CompanionSampledTextures) {
       return {false, Reason::NeedsCompanions};
     }

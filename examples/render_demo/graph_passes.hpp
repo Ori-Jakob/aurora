@@ -64,6 +64,14 @@ struct UnlitCheckReport {
   std::vector<UnlitSample> after;
 };
 
+struct CompanionCheckReport {
+  u32 encodes = 0;
+  bool ready = false;
+  u32 width = 0;
+  u32 height = 0;
+  std::array<std::vector<CompanionSample>, CompanionPhaseCount> phases;
+};
+
 struct GraphPassOptions {
   bool vignette = false;
   std::string vignetteAnchor;
@@ -77,6 +85,7 @@ struct GraphPassOptions {
   bool aoCheck = false;
   bool fwdEnvCheck = false;
   bool unlitCheck = false;
+  bool companionCheck = false;
 };
 
 struct GraphPassReport {
@@ -95,6 +104,7 @@ struct GraphPassReport {
   AoCheckReport ao;
   FwdEnvCheckReport fwdEnv;
   UnlitCheckReport unlit;
+  CompanionCheckReport companion;
 };
 
 bool pipelines_compiling() noexcept;

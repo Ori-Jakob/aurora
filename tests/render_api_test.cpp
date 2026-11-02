@@ -752,6 +752,36 @@ TEST_F(RenderApiTest, TerrainFallsBackToParallax) {
             unsupported(Reason::NeedsCompanions));
 }
 
+TEST_F(RenderApiTest, LegacyMatMapsSetterStores) {
+  Settings request;
+  request.textureMaterials = true;
+  request.legacyMatMaps = true;
+  const Settings built = clamp_settings(request, env(full_caps(), built_all()));
+  EXPECT_TRUE(built.legacyMatMaps);
+  EXPECT_TRUE(feature_enabled(built, Feature::LegacyMatMaps));
+  const Settings unbuilt = clamp_settings(request, env(full_caps(), detail::default_built_options()));
+  EXPECT_FALSE(unbuilt.legacyMatMaps);
+  EXPECT_TRUE(unbuilt.textureMaterials);
+  EXPECT_FALSE(feature_enabled(unbuilt, Feature::LegacyMatMaps));
+}
+
+TEST_F(RenderApiTest, NeedsCompanionsBelowSixteen) {
+  const BuiltOptions all = built_all();
+  Settings request;
+  request.textureMaterials = true;
+  request.legacyMatMaps = true;
+  request.pbr = true;
+  Caps caps = full_caps();
+  EXPECT_EQ(evaluate_support(Feature::LegacyMatMaps, 1, request, env(caps, all)), Supported);
+  caps.limits.maxSampledTexturesPerShaderStage = 15;
+  EXPECT_EQ(evaluate_support(Feature::LegacyMatMaps, 1, request, env(caps, all)), unsupported(Reason::NeedsCompanions));
+  const Settings clamped = clamp_settings(request, env(caps, all));
+  EXPECT_FALSE(clamped.legacyMatMaps);
+  EXPECT_TRUE(clamped.textureMaterials);
+  EXPECT_NE(evaluate_support(Feature::Pbr, 1, request, env(caps, all)), unsupported(Reason::NeedsCompanions));
+  EXPECT_TRUE(clamped.pbr);
+}
+
 TEST_F(RenderApiTest, NativeTraceReasons) {
   const BuiltOptions all = built_all();
   Settings request;

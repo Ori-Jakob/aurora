@@ -2227,5 +2227,429 @@ TEST_F(GxShaderExtDevice, UnlitKeepsColourPath) {
   EXPECT_EQ(gbuffer_pipeline_failures(), failures);
   RecordProperty("checked", static_cast<int>(checked));
 }
+
+// Puts layer 0 on the first layer stage's map, as derive does for a draw with companions
+std::optional<ShaderConfig> with_layer(ShaderConfig config) {
+  config.ext.output = 2;
+  const ShaderInfo info = build_shader_info(config);
+  if (!info.unlitAdmitted) {
+    return std::nullopt;
+  }
+  for (u32 s = 0; s < config.tevStageCount; ++s) {
+    const u32 map = config.tevStages[s].texMapId;
+    if ((info.unlitLayerStages >> s & 1u) != 0 && map < MaxTextures && !info.stochasticTextures.test(map)) {
+      config.ext.layer0 = static_cast<u8>(map + 1);
+      config.ext = render_ext::normalize(config.ext, info);
+      if (config.ext.layer0 != 0) {
+        return config;
+      }
+      return std::nullopt;
+    }
+  }
+  return std::nullopt;
+}
+
+TEST_F(GxShaderExtDevice, CompanionTextValidates) {
+  ASSERT_TRUE(start({.backend = wgpu::BackendType::Null, .core = true}, false));
+  size_t validated = 0;
+  for (const ShaderConfig& config : unlit_corpus()) {
+    ShaderConfig legacy = config;
+    legacy.ext = {};
+    if (module_error(*m_device, build_shader_source(legacy, DstAlphaMode::None))) {
+      continue;
+    }
+    const std::optional<ShaderConfig> layered = with_layer(config);
+    if (!layered) {
+      continue;
+    }
+    const ShaderInfo info = build_shader_info(*layered);
+    for (const bool debugId : {false, true}) {
+      const ShaderTargets targets = shader_targets(pbr_layout(debugId));
+      ASSERT_TRUE(uses_companions(*layered, info, targets));
+      for (const auto mode : {DstAlphaMode::None, DstAlphaMode::Replace}) {
+        const std::string text = build_shader_source(*layered, mode, targets);
+        const auto error = module_error(*m_device, text);
+        EXPECT_FALSE(error.has_value()) << error.value_or("") << "\n" << text;
+        ++validated;
+      }
+    }
+  }
+  EXPECT_GT(validated, 0u);
+  EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
+  RecordProperty("validated", static_cast<int>(validated));
+}
+
+TEST_F(GxShaderExtDevice, CompanionPipelinesValidate) {
+  const auto backend = hardware_backend();
+  if (!backend) {
+    GTEST_SKIP() << "AURORA_TEST_BACKEND names no hardware backend";
+  }
+  size_t built = 0;
+  for (const AuroraFeatureProfile profile : {FEATURE_PROFILE_FULL, FEATURE_PROFILE_METAL}) {
+    if (!start({.backend = *backend, .core = true, .allowCpu = false, .profile = profile}, true)) {
+      GTEST_SKIP() << "no adapter";
+    }
+    wgpu::Limits limits{};
+    m_device->device.GetLimits(&limits);
+    if (!m_device->core || limits.maxColorAttachmentBytesPerSample < 48 ||
+        limits.maxSampledTexturesPerShaderStage < 16) {
+      GTEST_SKIP() << "no core device with 48 colour bytes and 16 sampled textures under profile "
+                   << static_cast<int>(profile);
+    }
+    const uint64_t failures = gbuffer_pipeline_failures();
+    size_t checked = 0;
+    for (const ShaderConfig& base : legacy_valid_configs(*m_device, profile == FEATURE_PROFILE_FULL ? SIZE_MAX : 64)) {
+      const std::optional<ShaderConfig> layered = with_layer(base);
+      if (!layered) {
+        continue;
+      }
+      for (const bool debugId : {false, true}) {
+        const gfx::RenderTargetLayout layout = pbr_layout(debugId);
+        const PipelineConfig companion = pipeline_for(*layered);
+        m_device->device.PushErrorScope(wgpu::ErrorFilter::Validation);
+        const gfx::CompiledPipeline pipeline = create_pipeline(companion, layout);
+        const gfx::CompiledPipeline twin = create_pipeline(render_ext::output1_config(companion), layout);
+        const gfx::CompiledPipeline fallback = create_pipeline(render_ext::fallback_config(companion), layout);
+        PipelineConfig prepass = companion;
+        prepass.dstAlpha = 0x80;
+        prepass.blendMode = GX_BM_BLEND;
+        prepass.blendFacSrc = GX_BL_SRCALPHA;
+        prepass.blendFacDst = GX_BL_INVSRCALPHA;
+        const gfx::CompiledPipeline split = create_pipeline(prepass, layout);
+        const auto error = test::pop_validation_error(*m_device);
+        EXPECT_FALSE(error.has_value()) << error.value_or("");
+        EXPECT_TRUE(pipeline.main && twin.main && fallback.main && split.main && split.prepass);
+        EXPECT_EQ(pipeline.group2, Group2Companion);
+        EXPECT_EQ(split.group2, Group2Companion);
+        EXPECT_EQ(twin.group2, 0u);
+        EXPECT_EQ(fallback.group2, 0u);
+        EXPECT_EQ(pipeline.group3, 0u);
+        built += 4;
+      }
+      if (++checked == 24) {
+        break;
+      }
+    }
+    EXPECT_GT(checked, 0u);
+    EXPECT_EQ(gbuffer_pipeline_failures(), failures) << static_cast<int>(profile);
+    gfx::shutdown_pipeline_cache();
+    m_globals.reset();
+    EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
+    m_device.reset();
+  }
+  RecordProperty("built", static_cast<int>(built));
+}
+
+std::string companion_harness(std::string_view body) {
+  return std::string{R"(
+struct U {
+  proj: mat4x4f,
+  mat0: vec4f,
+};
+var<private> ubuf: U;
+)"} + std::string{testing::companion_wgsl()} +
+         R"(
+@group(0) @binding(0) var<storage, read_write> out_words: array<u32>;
+@group(0) @binding(1) var<storage, read> in_words: array<u32>;
+
+fn in_f32(i: u32) -> f32 {
+  return bitcast<f32>(in_words[i]);
+}
+fn in_vec3(i: u32) -> vec3f {
+  return vec3f(in_f32(i), in_f32(i + 1u), in_f32(i + 2u));
+}
+fn in_vec4(i: u32) -> vec4f {
+  return vec4f(in_f32(i), in_f32(i + 1u), in_f32(i + 2u), in_f32(i + 3u));
+}
+fn out_vec4(i: u32, v: vec4f) {
+  out_words[i] = bitcast<u32>(v.x);
+  out_words[i + 1u] = bitcast<u32>(v.y);
+  out_words[i + 2u] = bitcast<u32>(v.z);
+  out_words[i + 3u] = bitcast<u32>(v.w);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  ubuf.proj = mat4x4f(in_vec4(0u), in_vec4(4u), in_vec4(8u), in_vec4(12u));
+  ubuf.mat0 = in_vec4(16u);
+  let i = 20u + id.x * 32u;
+  let o = id.x * 16u;
+)" + std::string{body} +
+         "\n}\n";
+}
+
+using V3 = std::array<double, 3>;
+
+V3 sub(const V3& a, const V3& b) { return {a[0] - b[0], a[1] - b[1], a[2] - b[2]}; }
+V3 scale(const V3& a, double s) { return {a[0] * s, a[1] * s, a[2] * s}; }
+double dot(const V3& a, const V3& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+V3 unit(const V3& a) { return scale(a, 1.0 / std::sqrt(dot(a, a))); }
+V3 cross(const V3& a, const V3& b) {
+  return {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+}
+
+std::array<float, 16> gx_perspective() {
+  // A GX perspective projection with reversed Z, as fill_uniform hands it to the shader
+  return {1.2f, 0.f, 0.1f, 0.f, 0.f, 1.6f, -0.05f, 0.f, 0.f, 0.f, 0.02f, 0.5f, 0.f, 0.f, -1.f, 0.f};
+}
+
+void push_floats(std::vector<uint32_t>& words, std::span<const float> values) {
+  for (const float v : values) {
+    words.push_back(std::bit_cast<uint32_t>(v));
+  }
+}
+
+TEST_F(GxShaderExtDevice, CompanionFrameMatchesAnalyticTangents) {
+  const auto backend = hardware_backend();
+  if (!backend) {
+    GTEST_SKIP() << "AURORA_TEST_BACKEND names no hardware backend";
+  }
+  if (!start({.backend = *backend, .core = true, .allowCpu = false}, false)) {
+    GTEST_SKIP() << "no adapter";
+  }
+  const std::string text = companion_harness(R"(
+  let n = in_vec3(i);
+  let dp1 = in_vec3(i + 3u);
+  let dp2 = in_vec3(i + 6u);
+  let duv1 = vec2f(in_f32(i + 9u), in_f32(i + 10u));
+  let duv2 = vec2f(in_f32(i + 11u), in_f32(i + 12u));
+  out_vec4(o, vec4f(gx_perturb(n, dp1, dp2, duv1, duv2, vec3f(1.0, 0.0, 0.0)), 0.0));
+  out_vec4(o + 4u, vec4f(gx_perturb(n, dp1, dp2, duv1, duv2, vec3f(0.0, 1.0, 0.0)), 0.0));
+  out_vec4(o + 8u, vec4f(gx_perturb(n, dp1, dp2, duv1, duv2, vec3f(0.0, 0.0, 1.0)), 0.0));)");
+  struct Case {
+    V3 n, dpdu, dpdv;
+    V3 tu, tv;
+  };
+  std::vector<Case> cases;
+  std::vector<uint32_t> input;
+  push_floats(input, gx_perspective());
+  push_floats(input, std::array{0.f, 0.f, 1.f, 0.f});
+  std::mt19937 rng{7};
+  std::uniform_real_distribution<double> angle{-1.2, 1.2};
+  std::uniform_real_distribution<double> step{0.2, 1.5};
+  for (uint32_t c = 0; c < 64; ++c) {
+    // A tilted plane with a uv parameterisation; odd cases mirror u
+    const double a = angle(rng), b = angle(rng);
+    const V3 du{std::cos(a), std::sin(a) * std::sin(b), std::sin(a) * std::cos(b) * 0.3};
+    const V3 n = unit(cross(du, V3{0.2 * std::sin(b), std::cos(b), -0.4}));
+    const V3 dv = unit(cross(n, du));
+    const double su = (c & 1u) != 0 ? -step(rng) : step(rng);
+    const double sv = step(rng);
+    const V3 dpdu = scale(unit(du), su);
+    const V3 dpdv = scale(dv, sv);
+    const std::array<double, 2> d1{0.7 * step(rng), -0.3 * step(rng)};
+    const std::array<double, 2> d2{0.25 * step(rng), -0.8 * step(rng)};
+    const V3 dp1 = sub(scale(dpdu, d1[0]), scale(dpdv, -d1[1]));
+    const V3 dp2 = sub(scale(dpdu, d2[0]), scale(dpdv, -d2[1]));
+    const std::array<double, 4> words{d1[0], d1[1], d2[0], d2[1]};
+    const std::array<float, 16> row{static_cast<float>(n[0]),
+                                    static_cast<float>(n[1]),
+                                    static_cast<float>(n[2]),
+                                    static_cast<float>(dp1[0]),
+                                    static_cast<float>(dp1[1]),
+                                    static_cast<float>(dp1[2]),
+                                    static_cast<float>(dp2[0]),
+                                    static_cast<float>(dp2[1]),
+                                    static_cast<float>(dp2[2]),
+                                    static_cast<float>(words[0]),
+                                    static_cast<float>(words[1]),
+                                    static_cast<float>(words[2]),
+                                    static_cast<float>(words[3]),
+                                    0.f,
+                                    0.f,
+                                    0.f};
+    push_floats(input, row);
+    input.resize(input.size() + 16, 0u);
+    const V3 tu = unit(sub(dpdu, scale(n, dot(n, dpdu))));
+    const V3 tv = unit(sub(dpdv, scale(n, dot(n, dpdv))));
+    cases.push_back({n, dpdu, dpdv, tu, tv});
+  }
+  const auto out = run_word_compute(*m_device, text, 64, 16, input);
+  ASSERT_TRUE(out.has_value());
+  size_t failures = 0;
+  for (size_t c = 0; c < cases.size(); ++c) {
+    const auto read = [&](size_t k) {
+      return V3{std::bit_cast<float>((*out)[c * 16 + k]), std::bit_cast<float>((*out)[c * 16 + k + 1]),
+                std::bit_cast<float>((*out)[c * 16 + k + 2])};
+    };
+    const V3 t = read(0);
+    const V3 bitangent = read(4);
+    const V3 normal = read(8);
+    const V3 wantB = scale(cases[c].tv, -1.0);
+    const auto close = [](const V3& a, const V3& b) {
+      return std::abs(a[0] - b[0]) < 1e-4 && std::abs(a[1] - b[1]) < 1e-4 && std::abs(a[2] - b[2]) < 1e-4;
+    };
+    if ((!close(t, cases[c].tu) || !close(bitangent, wantB) || !close(normal, cases[c].n)) && failures++ < 8) {
+      ADD_FAILURE() << "case " << c << " (mirrored " << (c & 1u) << "): T " << t[0] << " " << t[1] << " " << t[2]
+                    << " want " << cases[c].tu[0] << " " << cases[c].tu[1] << " " << cases[c].tu[2] << "; B "
+                    << bitangent[0] << " " << bitangent[1] << " " << bitangent[2] << " want " << wantB[0] << " "
+                    << wantB[1] << " " << wantB[2];
+    }
+  }
+  EXPECT_EQ(failures, 0u);
+}
+
+TEST_F(GxShaderExtDevice, ViewPositionFromClipMatchesMvPos) {
+  const auto backend = hardware_backend();
+  if (!backend) {
+    GTEST_SKIP() << "AURORA_TEST_BACKEND names no hardware backend";
+  }
+  if (!start({.backend = *backend, .core = true, .allowCpu = false}, false)) {
+    GTEST_SKIP() << "no adapter";
+  }
+  const std::string text = companion_harness(R"(
+  let mv = in_vec3(i);
+  let clip = vec4f(mv, 1.0) * ubuf.proj;
+  out_vec4(o, vec4f(gx_view_pos(clip.xyw), 0.0));)");
+  std::vector<uint32_t> input;
+  const std::array<float, 16> proj = gx_perspective();
+  push_floats(input, proj);
+  push_floats(input, std::array{0.f, 0.f, 1.f, 0.f});
+  std::vector<V3> points;
+  std::mt19937 rng{11};
+  std::uniform_real_distribution<double> lateral{-40.0, 40.0};
+  std::uniform_real_distribution<double> depth{-400.0, -0.5};
+  for (uint32_t c = 0; c < 64; ++c) {
+    const V3 mv{lateral(rng), lateral(rng), depth(rng)};
+    points.push_back(mv);
+    push_floats(input, std::array{static_cast<float>(mv[0]), static_cast<float>(mv[1]), static_cast<float>(mv[2])});
+    input.resize(input.size() + 29, 0u);
+  }
+  const auto out = run_word_compute(*m_device, text, 64, 16, input);
+  ASSERT_TRUE(out.has_value());
+  size_t failures = 0;
+  for (size_t c = 0; c < points.size(); ++c) {
+    for (size_t k = 0; k < 3; ++k) {
+      const double got = std::bit_cast<float>((*out)[c * 16 + k]);
+      const double want = points[c][k];
+      if (std::abs(got - want) > 1e-4 * std::max(1.0, std::abs(points[c][2])) && failures++ < 8) {
+        ADD_FAILURE() << "point " << c << " axis " << k << ": " << got << " want " << want;
+      }
+    }
+  }
+  EXPECT_EQ(failures, 0u);
+}
+
+// Runs the generated normal member against stand-ins for its inputs, so the select and its gate are the shipped text
+std::string normal_member_harness(const std::string& member) {
+  return std::string{R"(
+struct In {
+  mv_nrm: vec3f,
+};
+struct Imm {
+  _pad: u32,
+};
+struct Out {
+  normal: vec4f,
+};
+var<private> in: In;
+var<private> imm: Imm;
+fn gbuffer_rx_alpha(rec: u32, len_sq: f32) -> f32 {
+  return select(0.0, 1.0, len_sq > 1e-10);
+}
+)"} + companion_harness(
+             "  in.mv_nrm = in_vec3(i);"
+             "\n  imm._pad = 0u;"
+             "\n  let cmp_nrm = in_vec4(i + 3u);"
+             "\n  let cmp_dp1 = in_vec3(i + 7u);"
+             "\n  let cmp_dp2 = in_vec3(i + 10u);"
+             "\n  let cmp_duv1 = vec2f(in_f32(i + 13u), in_f32(i + 14u));"
+             "\n  let cmp_duv2 = vec2f(in_f32(i + 15u), in_f32(i + 16u));"
+             "\n  var out: Out;" +
+             member + "\n  out_vec4(o, out.normal);\n  out_vec4(o + 4u, legacy_normal);");
+}
+
+std::optional<std::vector<uint32_t>> run_normal_member(test::TestDevice& device, std::array<float, 16> proj,
+                                                       float strength) {
+  const ShaderConfig config = [] {
+    ShaderConfig c{};
+    c.attrs[GX_VA_POS] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32};
+    c.attrs[GX_VA_NRM] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32};
+    c.attrs[GX_VA_TEX0] = {.attrType = GX_DIRECT, .cnt = 2, .compType = GX_F32};
+    c.tcgs[0] = {.type = GX_TG_MTX2x4, .src = GX_TG_TEX0};
+    c.colorChannels[GX_COLOR0] = {.matSrc = GX_SRC_REG};
+    c.colorChannels[GX_ALPHA0] = {.matSrc = GX_SRC_REG};
+    c.tevStages[0].colorPass = {GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASC, GX_CC_ZERO};
+    c.tevStages[0].texMapId = GX_TEXMAP0;
+    c.tevStages[0].texCoordId = GX_TEXCOORD0;
+    c.tevStages[0].channelId = GX_COLOR0A0;
+    c.tevStageCount = 1;
+    c.ext = {.output = 2, .layer0 = 1};
+    return c;
+  }();
+  const std::string text = build_shader_source(config, DstAlphaMode::None, shader_targets(pbr_layout(false)));
+  const size_t begin = text.find("\n    let nrm_len_sq = ");
+  const size_t end = text.find("use_mapped);", begin);
+  if (begin == std::string::npos || end == std::string::npos) {
+    ADD_FAILURE() << "no companion normal member in\n" << text;
+    return std::nullopt;
+  }
+  const std::string member = text.substr(begin, end + 12 - begin);
+  std::vector<uint32_t> input;
+  push_floats(input, proj);
+  push_floats(input, std::array{2.f, strength, 1.f, 0.f});
+  std::mt19937 rng{3};
+  std::uniform_real_distribution<float> unit{-1.f, 1.f};
+  for (uint32_t c = 0; c < 64; ++c) {
+    const std::array<float, 17> row{unit(rng),
+                                    0.5f + 0.5f * std::abs(unit(rng)),
+                                    unit(rng),
+                                    0.5f + 0.4f * unit(rng),
+                                    0.5f + 0.4f * unit(rng),
+                                    1.f,
+                                    1.f,
+                                    1.f,
+                                    0.f,
+                                    0.f,
+                                    0.f,
+                                    0.f,
+                                    1.f,
+                                    0.01f,
+                                    0.f,
+                                    0.f,
+                                    0.01f};
+    push_floats(input, row);
+    input.resize(input.size() + 15, 0u);
+  }
+  return run_word_compute(device, normal_member_harness(member), 64, 16, input);
+}
+
+size_t mapped_normals(const std::vector<uint32_t>& out) {
+  size_t mapped = 0;
+  for (size_t c = 0; c < 64; ++c) {
+    mapped += std::equal(out.begin() + c * 16, out.begin() + c * 16 + 4, out.begin() + c * 16 + 4) ? 0 : 1;
+  }
+  return mapped;
+}
+
+TEST_F(GxShaderExtDevice, CompanionNormalExactAtZeroStrength) {
+  const auto backend = hardware_backend();
+  if (!backend) {
+    GTEST_SKIP() << "AURORA_TEST_BACKEND names no hardware backend";
+  }
+  if (!start({.backend = *backend, .core = true, .allowCpu = false}, false)) {
+    GTEST_SKIP() << "no adapter";
+  }
+  const auto zero = run_normal_member(*m_device, gx_perspective(), 0.f);
+  ASSERT_TRUE(zero.has_value());
+  EXPECT_EQ(mapped_normals(*zero), 0u);
+  const auto full = run_normal_member(*m_device, gx_perspective(), 1.f);
+  ASSERT_TRUE(full.has_value());
+  EXPECT_EQ(mapped_normals(*full), 64u);
+}
+
+TEST_F(GxShaderExtDevice, CompanionOrthoKeepsLegacyNormal) {
+  const auto backend = hardware_backend();
+  if (!backend) {
+    GTEST_SKIP() << "AURORA_TEST_BACKEND names no hardware backend";
+  }
+  if (!start({.backend = *backend, .core = true, .allowCpu = false}, false)) {
+    GTEST_SKIP() << "no adapter";
+  }
+  std::array<float, 16> ortho{0.01f, 0.f, 0.f, -1.f, 0.f, 0.01f, 0.f, 1.f, 0.f, 0.f, 0.001f, 0.5f, 0.f, 0.f, 0.f, 1.f};
+  const auto out = run_normal_member(*m_device, ortho, 1.f);
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(mapped_normals(*out), 0u);
+}
 } // namespace
 } // namespace aurora::gx

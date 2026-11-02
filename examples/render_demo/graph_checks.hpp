@@ -175,6 +175,48 @@ struct UnlitCheckSummary {
   u32 controlPbr = 0;
 };
 
+inline constexpr u32 CompanionPipelineWaitFrame = 4;
+inline constexpr u32 CompanionBareFrame = 16;
+inline constexpr u32 CompanionLoadFrame = 18;
+inline constexpr u32 CompanionMappedWaitFrame = 22;
+inline constexpr u32 CompanionMappedFrame = 30;
+inline constexpr u32 CompanionBlendOneFrame = 31;
+inline constexpr u32 CompanionBlendOneProbeFrame = 38;
+inline constexpr u32 CompanionMatFrame = 39;
+inline constexpr u32 CompanionMatWaitFrame = 43;
+inline constexpr u32 CompanionMatProbeFrame = 52;
+inline constexpr u32 CompanionPhaseCount = 4;
+inline constexpr u32 CompanionNrmRoles = 3;
+inline constexpr u32 CompanionMatRoles = 1;
+inline constexpr f32 CompanionTiltMin = 0.05f;
+inline constexpr f32 CompanionBareTolerance = 2e-3f;
+
+enum class CompanionPhase : u32 { Bare, Mapped, BlendOne, Mat };
+
+struct CompanionSample {
+  u32 quad = 0;
+  u32 cell = 0;
+  std::array<f32, 4> normal{};
+  std::array<u32, 4> surface{};
+};
+
+struct CompanionAxes {
+  std::array<f32, 3> x{};
+  std::array<f32, 3> z{};
+  f32 matYSign = -1.f;
+};
+
+struct CompanionCheckSummary {
+  u32 probes = 0;
+  u32 bareMismatches = 0;
+  u32 tiltFailures = 0;
+  u32 matFailures = 0;
+  u32 blendOneMismatches = 0;
+  u32 ormFailures = 0;
+  u32 albedoFailures = 0;
+  f32 minTilt = 0.f;
+};
+
 VignetteParams vignette_params(u32 frame) noexcept;
 bool is_unknown_anchor_warning(AuroraLogLevel level, std::string_view module, std::string_view message) noexcept;
 std::optional<std::string> check_depth_probe(std::span<const f32, 4> values, bool reversedZ);
@@ -185,4 +227,7 @@ FwdEnvSummary summarize_fwd_env(std::span<const FwdEnvSample> samples, const Fwd
 std::optional<std::string> check_fwd_env(const FwdEnvSummary& summary);
 UnlitCheckSummary summarize_unlit(std::span<const UnlitSample> before, std::span<const UnlitSample> after);
 std::optional<std::string> check_unlit(const UnlitCheckSummary& summary);
+CompanionCheckSummary summarize_companions(std::span<const std::vector<CompanionSample>, CompanionPhaseCount> phases,
+                                           const CompanionAxes& axes);
+std::optional<std::string> check_companions(const CompanionCheckSummary& summary);
 } // namespace render_demo
