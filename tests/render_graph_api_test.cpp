@@ -5,6 +5,7 @@
 #include "render/frame_state.hpp"
 #include "render/graph.hpp"
 #include "render/graph_api.hpp"
+#include "render/scene/overlay.hpp"
 #include "render/scene_depth.hpp"
 #include "render/stage.hpp"
 #include "render/stage_data.hpp"
@@ -602,6 +603,41 @@ TEST_F(RenderGraphApi, KnownAnchorOrdersPass) {
   const auto post = stage_nodes(*graph, Stage::PrePost);
   EXPECT_LT(position(post, "mod.pre_taa"), position(post, phase::Taa));
   EXPECT_EQ(count_logs(LOG_WARNING), 0u);
+}
+
+TEST_F(RenderGraphApi, OverlayPassAfterDetected) {
+  add("mod.composite", Stage::OpaqueDone, PassKind::Render, [](PassBuilder& b) {
+    writes_gx_color(b);
+    b.after(phase::Composite);
+    b.before(phase::Overlay);
+  });
+  const auto anchored = compile_externals();
+  ASSERT_EQ(status(*anchored, "mod.composite"), CullReason::None);
+  EXPECT_FALSE(scene::overlay::pass_after_overlay(*anchored));
+
+  add("mod.opaque", Stage::OpaqueDone, PassKind::Render, writes_gx_color);
+  const auto defaulted = compile_externals();
+  ASSERT_EQ(status(*defaulted, "mod.opaque"), CullReason::None);
+  EXPECT_TRUE(scene::overlay::pass_after_overlay(*defaulted));
+  const NodeId first = scene::overlay::first_pass_after_overlay(*defaulted);
+  ASSERT_NE(first, InvalidNode);
+  EXPECT_EQ(defaulted->nodes[first].name, "mod.opaque");
+}
+
+TEST_F(RenderGraphApi, OverlayPassAfterRecomputedOnRecompile) {
+  const PassId id = add("mod.opaque", Stage::OpaqueDone, PassKind::Render, writes_gx_color);
+  const auto before = compile_externals();
+  EXPECT_TRUE(scene::overlay::pass_after_overlay(*before));
+  render::unregister_pass(id);
+  add("mod.composite", Stage::OpaqueDone, PassKind::Render, [](PassBuilder& b) {
+    writes_gx_color(b);
+    b.after(phase::Composite);
+  });
+  const auto after = compile_externals();
+  ASSERT_EQ(status(*after, "mod.composite"), CullReason::None);
+  EXPECT_FALSE(scene::overlay::pass_after_overlay(*after));
+  // Each graph carries its own answer, so the replaced one still reports what it was compiled with
+  EXPECT_TRUE(scene::overlay::pass_after_overlay(*before));
 }
 
 TEST_F(RenderGraphApi, UnknownAnchorFallsBackToStageEnd) {

@@ -34,6 +34,7 @@ constexpr uint32_t AoCheckMinFrames = 240;
 constexpr uint32_t FwdEnvCheckMinFrames = 40;
 constexpr uint32_t UnlitCheckMinFrames = 40;
 constexpr uint32_t CompanionCheckMinFrames = 60;
+constexpr uint32_t OverlayCheckMinFrames = 40;
 constexpr uint32_t MaxGpuPadMiB = 1024;
 
 std::optional<uint32_t> parse_u32(std::string_view text) noexcept {
@@ -209,6 +210,11 @@ bool apply_companion_check(Options& options, std::string_view) {
   return true;
 }
 
+bool apply_overlay_check(Options& options, std::string_view) {
+  options.overlayCheck = true;
+  return true;
+}
+
 bool apply_no_hints(Options& options, std::string_view) {
   options.hints = false;
   return true;
@@ -299,7 +305,7 @@ struct Flag {
   bool frameLoop = false;
 };
 
-constexpr std::array<Flag, 35> Flags{{
+constexpr std::array<Flag, 36> Flags{{
     {"--frames", true, apply_frames, true},
     {"--timeout", true, apply_timeout, true},
     {"--backend", true, apply_backend},
@@ -322,6 +328,7 @@ constexpr std::array<Flag, 35> Flags{{
     {"--fwd-env-check", false, apply_fwd_env_check, true},
     {"--unlit-check", false, apply_unlit_check, true},
     {"--companion-check", false, apply_companion_check, true},
+    {"--overlay-check", false, apply_overlay_check, true},
     {"--no-hints", false, apply_no_hints, true},
     {"--check-hints", false, apply_check_hints, true},
     {"--custom-draw-probe", false, apply_custom_draw_probe, true},
@@ -422,7 +429,7 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
   }
   // Graph passes and custom draws record GPU work outside the GX FIFO, so the capture would be discarded
   if ((options.vignette || options.depthCheck || options.motionCheck || options.motionView || options.fogCheck ||
-       options.aoCheck || options.fwdEnvCheck || options.unlitCheck || options.companionCheck ||
+       options.aoCheck || options.fwdEnvCheck || options.unlitCheck || options.companionCheck || options.overlayCheck ||
        options.gpuCull != 0) &&
       !options.tracePath.empty()) {
     error = "render graph passes cannot be traced";
@@ -480,6 +487,14 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
   }
   if (options.companionCheck && options.frames != 0 && options.frames < CompanionCheckMinFrames) {
     error = "--companion-check needs at least 60 frames";
+    return std::nullopt;
+  }
+  if (options.overlayCheck && (!options.hints || options.msaa > 1)) {
+    error = "--overlay-check cannot be combined with --no-hints or --msaa above 1";
+    return std::nullopt;
+  }
+  if (options.overlayCheck && options.frames != 0 && options.frames < OverlayCheckMinFrames) {
+    error = "--overlay-check needs at least 40 frames";
     return std::nullopt;
   }
   if ((options.cullCheck || options.cullTimings) && options.gpuCull == 0) {
@@ -541,6 +556,11 @@ std::string_view usage() noexcept {
          "                      follows C1 on a normal and a mirrored quad, keeps the geometric normal with no\n"
          "                      map and at PBR blend 1, and gbuf.surface carries the orm and albedo maps (needs\n"
          "                      at least 60 frames)\n"
+         "  --overlay-check     build the base G-buffer, draw a see-through overlay quad in front of an opaque\n"
+         "                      box, register demo.overlay_probe_a and _b and exit with code 17 unless the\n"
+         "                      quad follows AURORA_RENDER_OVERLAY_DEFER: drawn after OPAQUE_DONE under force\n"
+         "                      and put back in place on frame 32, which has no OPAQUE_DONE marker (needs at\n"
+         "                      least 40 frames)\n"
          "  --no-hints          emit no render hints and no capture-only draw\n"
 
          "  --check-hints       exit with code 8 unless aurora decoded or skipped every emitted hint as expected\n"

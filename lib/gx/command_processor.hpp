@@ -19,6 +19,7 @@ struct DrawRouteStats {
   // Merges actually prevented; classify.json's mergeBreaks counts every requested break
   uint64_t mergeBreaks = 0;
   uint64_t substituted = 0;
+  uint64_t deferred = 0;
 };
 
 struct ArrayUploadStats {

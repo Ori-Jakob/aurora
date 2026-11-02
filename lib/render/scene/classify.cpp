@@ -1,4 +1,5 @@
 #include "classify.hpp"
+#include "overlay.hpp"
 
 #include "../fakeshadow/texture_gate.hpp"
 #include "../frame_state.hpp"
@@ -137,6 +138,10 @@ gx::draw_route::Decision route(void*, const gx::draw_route::Query& query) noexce
   }
   // Each command carries one draw record, so a changed class must start its own command
   const bool records = gx_ext::records::on_route(cls);
+  // Its colour would be mixed away by the PBR term, so it draws after the composite instead
+  if (overlay::defers(cls, inputs.depthWrite)) {
+    return {.route = gx::draw_route::Route::Defer};
+  }
   // A merged follower skips the push hook, so a changed class after a flagged lead must start its own command
   const bool breakMerge = cls.keyChanged && (identity_collecting() || records || fakeshadow::lead_flagged());
   if (breakMerge) {
@@ -170,6 +175,7 @@ void install() noexcept {
   }
   g_env = read_identity_env();
   fakeshadow::install();
+  overlay::install();
   apply_merge_key();
   gx::draw_route::set_router(&g_router);
 }
@@ -179,6 +185,7 @@ void remove() noexcept {
     gx::draw_route::set_router(nullptr);
   }
   fakeshadow::remove();
+  overlay::remove();
   reset();
 }
 
@@ -207,6 +214,7 @@ void apply_frame_state(const detail::FrameState& state) noexcept {
   g_classifier.set_record(state.inspectorOpen || g_request.records);
   g_classifier.set_objects(state.inspectorOpen || g_request.objects);
   apply_merge_key();
+  overlay::apply_frame_state(state);
 }
 
 void seal_frame() noexcept {
@@ -317,6 +325,7 @@ void reset() noexcept {
   g_hooks = nullptr;
   g_observer = nullptr;
   fakeshadow::testing::reset();
+  overlay::testing::reset();
   scene::reset();
 }
 } // namespace testing

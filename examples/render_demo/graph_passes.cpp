@@ -1734,6 +1734,242 @@ void update_unlit_check(u32 frame) {
   }
 }
 
+constexpr u32 OverlayProbeWords = 4;
+constexpr u32 OverlayPipelineWaitFrame = 4;
+
+constexpr std::string_view OverlayProbeWgsl = R"(
+struct OverlayProbe {
+  ndc: vec2f,
+  pad: vec2f,
+};
+@group(1) @binding(0) var gx_color: texture_2d<f32>;
+@group(2) @binding(0) var<storage, read_write> results: array<u32>;
+@group(2) @binding(1) var<storage, read> probe: OverlayProbe;
+
+@compute @workgroup_size(1)
+fn cs_main() {
+  let size = textureDimensions(gx_color);
+  let centre = (probe.ndc * vec2f(0.5, -0.5) + 0.5) * vec2f(size);
+  let p = clamp(vec2i(floor(centre)), vec2i(0), vec2i(size) - 1);
+  let b = vec4u(round(saturate(textureLoad(gx_color, p, 0)) * 255.0));
+  results[0] = b.r | (b.g << 8u) | (b.b << 16u) | (b.a << 24u);
+  results[1] = size.x;
+  results[2] = size.y;
+  results[3] = 1u;
+}
+)";
+
+struct OverlayProbePass {
+  PassId id = aurora::render::InvalidPass;
+  std::atomic_uint32_t encodes = 0;
+  u32 slotCount = 0;
+  wgpu::Buffer output;
+  wgpu::Buffer probeBuffer;
+  wgpu::BindGroupLayout layout;
+  wgpu::BindGroup group;
+  // Render worker only
+  wgpu::ComputePipeline pipeline;
+  wgpu::BindGroupLayout passLayout;
+  std::array<UnlitCheckSlot, 2> slots;
+  std::mutex mutex;
+};
+
+// A reads between the composite and gx.overlay, where a deferred quad has not drawn yet; B reads at PRE_POST
+OverlayProbePass sOverlayA;
+OverlayProbePass sOverlayB;
+bool sOverlayWaited = false;
+
+void declare_overlay_probe_a(PassBuilder& builder, void*) {
+  builder.use(aurora::render::resource::GxColor, Access::Sampled, aurora::render::Missing::DisablePass);
+  builder.after(aurora::render::phase::Composite);
+  builder.before(aurora::render::phase::Overlay);
+  builder.side_effect();
+}
+
+void declare_overlay_probe_b(PassBuilder& builder, void*) {
+  builder.use(aurora::render::resource::GxColor, Access::Sampled, aurora::render::Missing::DisablePass);
+  builder.side_effect();
+}
+
+void encode_overlay_probe(PassContext& ctx, void* userdata) {
+  auto& probe = *static_cast<OverlayProbePass*>(userdata);
+  probe.encodes.fetch_add(1, std::memory_order_relaxed);
+  if (!probe.pipeline || probe.passLayout.Get() != ctx.pass_layout().Get()) {
+    const std::string code{OverlayProbeWgsl};
+    const wgpu::ShaderSourceWGSL wgsl{wgpu::ShaderSourceWGSL::Init{.code = code.c_str()}};
+    const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl, .label = "demo.overlay_probe"};
+    const std::array<wgpu::BindGroupLayout, 3> layouts{ctx.frame_layout(), ctx.pass_layout(), probe.layout};
+    const wgpu::PipelineLayoutDescriptor layoutDescriptor{
+        .label = "demo.overlay_probe",
+        .bindGroupLayoutCount = layouts.size(),
+        .bindGroupLayouts = layouts.data(),
+    };
+    const wgpu::ComputePipelineDescriptor descriptor{
+        .label = "demo.overlay_probe",
+        .layout = ctx.device().CreatePipelineLayout(&layoutDescriptor),
+        .compute = {.module = ctx.device().CreateShaderModule(&moduleDescriptor), .entryPoint = "cs_main"},
+    };
+    probe.pipeline = ctx.device().CreateComputePipeline(&descriptor);
+    probe.passLayout = ctx.pass_layout();
+  }
+  const wgpu::ComputePassEncoder compute = ctx.begin_compute();
+  if (!compute) {
+    return;
+  }
+  compute.SetPipeline(probe.pipeline);
+  compute.SetBindGroup(2, probe.group);
+  compute.DispatchWorkgroups(1);
+  compute.End();
+  // Exactly the armed frame, since the frames on either side of 32 replay and would hide a missed restore
+  for (u32 i = 0; i < probe.slotCount; ++i) {
+    UnlitCheckSlot& slot = probe.slots[i];
+    if (!slot.copied && ctx.frame() == slot.armedFrame.load(std::memory_order_acquire)) {
+      ctx.encoder().CopyBufferToBuffer(probe.output, 0, slot.readback, 0, OverlayProbeWords * sizeof(u32));
+      slot.copied = true;
+      slot.copiedFrame = ctx.frame();
+    }
+  }
+}
+
+void overlay_probe_mapped(OverlayProbePass& probe, UnlitCheckSlot& slot, wgpu::MapAsyncStatus status) {
+  constexpr uint64_t Bytes = OverlayProbeWords * sizeof(u32);
+  if (status != wgpu::MapAsyncStatus::Success) {
+    slot.result.store(ProbeResult::Failed, std::memory_order_release);
+    return;
+  }
+  const auto* mapped = static_cast<const u32*>(slot.readback.GetConstMappedRange(0, Bytes));
+  if (mapped != nullptr) {
+    std::lock_guard lock{probe.mutex};
+    slot.values.assign(mapped, mapped + OverlayProbeWords);
+  }
+  slot.readback.Unmap();
+  slot.result.store(mapped != nullptr ? ProbeResult::Ready : ProbeResult::Failed, std::memory_order_release);
+}
+
+void overlay_probe_submitted(u32 frame, void* userdata) {
+  auto& probe = *static_cast<OverlayProbePass*>(userdata);
+  for (u32 i = 0; i < probe.slotCount; ++i) {
+    UnlitCheckSlot& slot = probe.slots[i];
+    if (!slot.copied || slot.mapRequested || frame != slot.copiedFrame) {
+      continue;
+    }
+    slot.mapRequested = true;
+    slot.readback.MapAsync(
+        wgpu::MapMode::Read, 0, OverlayProbeWords * sizeof(u32), wgpu::CallbackMode::AllowSpontaneous,
+        [&probe, &slot](wgpu::MapAsyncStatus status, wgpu::StringView) { overlay_probe_mapped(probe, slot, status); });
+  }
+}
+
+bool register_overlay_probe(OverlayProbePass& probe, const char* name, aurora::render::Stage stage,
+                            aurora::render::PassDeclareCallback declare, u32 slots, std::string& error) {
+  const wgpu::Device device = aurora::gfx::device();
+  const auto buffer = [&](const char* label, wgpu::BufferUsage usage, uint64_t size) {
+    const wgpu::BufferDescriptor descriptor{.label = label, .usage = usage, .size = size};
+    return device.CreateBuffer(&descriptor);
+  };
+  constexpr uint64_t Bytes = OverlayProbeWords * sizeof(u32);
+  probe.slotCount = slots;
+  probe.output = buffer(name, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc, Bytes);
+  for (u32 i = 0; i < slots; ++i) {
+    probe.slots[i].readback = buffer(name, wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst, Bytes);
+  }
+  const std::array<f32, 4> ndc{overlay_probe()[0], overlay_probe()[1], 0.f, 0.f};
+  probe.probeBuffer = buffer(name, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, sizeof(ndc));
+  device.GetQueue().WriteBuffer(probe.probeBuffer, 0, ndc.data(), sizeof(ndc));
+  const std::array layoutEntries{
+      wgpu::BindGroupLayoutEntry{
+          .binding = 0,
+          .visibility = wgpu::ShaderStage::Compute,
+          .buffer = {.type = wgpu::BufferBindingType::Storage},
+      },
+      wgpu::BindGroupLayoutEntry{
+          .binding = 1,
+          .visibility = wgpu::ShaderStage::Compute,
+          .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage},
+      },
+  };
+  const wgpu::BindGroupLayoutDescriptor layoutDescriptor{
+      .label = name,
+      .entryCount = layoutEntries.size(),
+      .entries = layoutEntries.data(),
+  };
+  probe.layout = device.CreateBindGroupLayout(&layoutDescriptor);
+  const std::array groupEntries{
+      wgpu::BindGroupEntry{.binding = 0, .buffer = probe.output, .size = Bytes},
+      wgpu::BindGroupEntry{.binding = 1, .buffer = probe.probeBuffer, .size = sizeof(ndc)},
+  };
+  const wgpu::BindGroupDescriptor groupDescriptor{
+      .label = name,
+      .layout = probe.layout,
+      .entryCount = groupEntries.size(),
+      .entries = groupEntries.data(),
+  };
+  probe.group = device.CreateBindGroup(&groupDescriptor);
+  probe.id = aurora::render::register_pass({
+      .name = name,
+      .stage = stage,
+      .kind = aurora::render::PassKind::Compute,
+      .declare = declare,
+      .encode = encode_overlay_probe,
+      .afterSubmit = overlay_probe_submitted,
+      .userdata = &probe,
+  });
+  if (probe.id == aurora::render::InvalidPass) {
+    error = std::string{"register_pass refused "} + name;
+    return false;
+  }
+  return true;
+}
+
+bool register_overlay_check(std::string& error) {
+  return register_overlay_probe(sOverlayA, "demo.overlay_probe_a", aurora::render::Stage::OpaqueDone,
+                                declare_overlay_probe_a, 1, error) &&
+         register_overlay_probe(sOverlayB, "demo.overlay_probe_b", aurora::render::Stage::PrePost,
+                                declare_overlay_probe_b, 2, error);
+}
+
+void update_overlay_check(u32 frame) {
+  if (sOverlayA.id == aurora::render::InvalidPass) {
+    return;
+  }
+  // Draws whose pipeline is still compiling are skipped, so the quad and the box must be compiled before the reads
+  if (frame >= OverlayPipelineWaitFrame && !std::exchange(sOverlayWaited, true)) {
+    wait_for_pipelines();
+  }
+  if (frame == OverlayCheckFrame) {
+    sOverlayA.slots[0].armedFrame.store(aurora::gfx::current_frame(), std::memory_order_release);
+    sOverlayB.slots[0].armedFrame.store(aurora::gfx::current_frame(), std::memory_order_release);
+  } else if (frame == OverlayLateFrame) {
+    sOverlayB.slots[1].armedFrame.store(aurora::gfx::current_frame(), std::memory_order_release);
+  }
+}
+
+bool overlay_pending(const OverlayProbePass& probe) {
+  if (probe.id == aurora::render::InvalidPass || probe.encodes.load(std::memory_order_relaxed) == 0) {
+    return false;
+  }
+  for (u32 i = 0; i < probe.slotCount; ++i) {
+    const UnlitCheckSlot& slot = probe.slots[i];
+    if (slot.armedFrame.load(std::memory_order_relaxed) != UINT32_MAX &&
+        slot.result.load(std::memory_order_acquire) == ProbeResult::Pending) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void release_overlay_probe(OverlayProbePass& probe) {
+  probe.pipeline = {};
+  probe.passLayout = {};
+  probe.group = {};
+  probe.layout = {};
+  probe.probeBuffer = {};
+  probe.output = {};
+  for (UnlitCheckSlot& slot : probe.slots) {
+    slot.readback = {};
+  }
+}
+
 constexpr u32 CompanionHeaderWords = 4;
 constexpr u32 CompanionSampleWords = 8;
 
@@ -2022,6 +2258,9 @@ bool register_graph_passes(const GraphPassOptions& options, std::string& error) 
   if (options.fwdEnvCheck && !register_fwd_env_check(error)) {
     return false;
   }
+  if (options.overlayCheck && !register_overlay_check(error)) {
+    return false;
+  }
   return options.gpuCull == 0 ||
          register_cull_passes(
              {.instances = options.gpuCull, .check = options.cullCheck, .timings = options.cullTimings}, error);
@@ -2032,6 +2271,7 @@ void update_graph_passes(u32 frame) {
   update_fwd_env_check(frame);
   update_unlit_check(frame);
   update_companion_check(frame);
+  update_overlay_check(frame);
   if (sProbe.id != aurora::render::InvalidPass && frame >= DepthCheckFrame &&
       sProbe.armedFrame.load(std::memory_order_relaxed) == UINT32_MAX) {
     // Draws whose pipeline is still compiling are skipped, so depth read before they finish misses part of the scene
@@ -2127,7 +2367,8 @@ void finish_graph_passes() {
           (motion && sMotion.result.load(std::memory_order_acquire) == ProbeResult::Pending) ||
           (fog && sFog.result.load(std::memory_order_acquire) == ProbeResult::Pending) ||
           (fwdEnv && sFwdEnv.result.load(std::memory_order_acquire) == ProbeResult::Pending) || unlitPending() ||
-          companionPending() || (sAo.id != aurora::render::InvalidPass && aoPending())) &&
+          companionPending() || (sAo.id != aurora::render::InvalidPass && aoPending()) || overlay_pending(sOverlayA) ||
+          overlay_pending(sOverlayB)) &&
          std::chrono::steady_clock::now() < deadline) {
     aurora::gfx::synchronize();
     aurora::gfx::device().Tick();
@@ -2235,6 +2476,27 @@ GraphPassReport graph_pass_report() {
       }
     }
   }
+  if (sOverlayA.id != aurora::render::InvalidPass && sOverlayB.id != aurora::render::InvalidPass) {
+    auto& overlay = report.overlay;
+    overlay.encodesA = sOverlayA.encodes.load(std::memory_order_relaxed);
+    overlay.encodesB = sOverlayB.encodes.load(std::memory_order_relaxed);
+    overlay.ready = true;
+    const std::array<std::pair<OverlayProbePass*, u32>, OverlaySampleCount> samples{
+        {{&sOverlayA, 0}, {&sOverlayB, 0}, {&sOverlayB, 1}}};
+    for (u32 i = 0; i < OverlaySampleCount; ++i) {
+      auto& [probe, slot] = samples[i];
+      std::lock_guard lock{probe->mutex};
+      const std::vector<u32>& words = probe->slots[slot].values;
+      if (probe->slots[slot].result.load(std::memory_order_acquire) != ProbeResult::Ready ||
+          words.size() < OverlayProbeWords || words[3] != 1) {
+        overlay.ready = false;
+        continue;
+      }
+      overlay.colors[i] = words[0];
+      overlay.width = words[1];
+      overlay.height = words[2];
+    }
+  }
   if (sAo.id != aurora::render::InvalidPass) {
     std::lock_guard lock{sAo.mutex};
     report.ao = {
@@ -2258,11 +2520,12 @@ void unregister_graph_passes() {
       sMotion.id == aurora::render::InvalidPass && sMotionView.id == aurora::render::InvalidPass &&
       sFog.id == aurora::render::InvalidPass && sAo.id == aurora::render::InvalidPass &&
       sFwdEnv.id == aurora::render::InvalidPass && sUnlit.id == aurora::render::InvalidPass &&
-      sCompanion.id == aurora::render::InvalidPass) {
+      sCompanion.id == aurora::render::InvalidPass && sOverlayA.id == aurora::render::InvalidPass &&
+      sOverlayB.id == aurora::render::InvalidPass) {
     return;
   }
   for (PassId* id : {&sVignette.id, &sProbe.id, &sMotion.id, &sMotionView.id, &sFog.id, &sAo.id, &sFwdEnv.id,
-                     &sUnlit.id, &sCompanion.id}) {
+                     &sUnlit.id, &sCompanion.id, &sOverlayA.id, &sOverlayB.id}) {
     if (*id != aurora::render::InvalidPass) {
       aurora::render::unregister_pass(*id);
       *id = aurora::render::InvalidPass;
@@ -2335,6 +2598,9 @@ void unregister_graph_passes() {
   for (UnlitCheckSlot& slot : sCompanion.slots) {
     slot.readback = {};
   }
+  release_overlay_probe(sOverlayA);
+  release_overlay_probe(sOverlayB);
+  sOverlayWaited = false;
 }
 
 } // namespace render_demo

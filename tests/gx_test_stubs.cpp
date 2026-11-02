@@ -420,9 +420,17 @@ uint32_t g_testDrawCount = 0;
 std::atomic<uint32_t> g_testProcessedDrawCount{0};
 // Off by default so tests written before merging was emulated still see one command per draw
 bool g_testMergeDraws = false;
+bool g_testOverlayTarget = false;
+std::vector<gx::DrawData> g_testOverlayDraws;
 
 template <>
 void push_draw_command<gx::DrawData>(gx::DrawData data) {
+  // A deferred draw lands in its own list, so it never becomes the main pass's merge target
+  if (g_testOverlayTarget) {
+    g_testOverlayDraws.push_back(data);
+    g_testProcessedDrawCount.fetch_add(1, std::memory_order_release);
+    return;
+  }
   g_testLastDraw = data;
   ++g_testDrawCount;
   s_lastCommandIsGxDraw = true;
@@ -485,6 +493,14 @@ void end_offscreen() {
 }
 bool g_testOffscreen = false;
 bool is_offscreen() noexcept { return g_testOffscreen; }
+// Refused offscreen, as the recorder refuses outside an open scene pass
+bool set_overlay_target(bool on) noexcept {
+  if (on && g_testOffscreen) {
+    return false;
+  }
+  g_testOverlayTarget = on;
+  return true;
+}
 } // namespace aurora::gfx
 
 namespace aurora::gfx::depth_peek {

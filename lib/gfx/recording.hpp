@@ -13,6 +13,11 @@
 #include <span>
 #include <string>
 #include <type_traits>
+#include <vector>
+
+namespace aurora::render::detail {
+struct StageData;
+} // namespace aurora::render::detail
 
 namespace aurora::gfx::detail {
 
@@ -55,6 +60,14 @@ void override_scene_depth_source(std::optional<render::DepthSource> source) noex
 void fake_depth_snapshots(bool fake) noexcept;
 uint32_t stage_depth_snapshot_generation(render::Stage slot) noexcept;
 uint32_t stage_depth_snapshot_requests(render::Stage slot) noexcept;
+size_t overlay_command_count() noexcept;
+struct RecordedShape {
+  uint32_t frameIndex = 0;
+  uint32_t ops = 0;
+  std::vector<uint32_t> passCommands;
+};
+void keep_frame_shapes(bool keep) noexcept;
+std::vector<RecordedShape> take_frame_shapes();
 }
 
 } // namespace aurora::gfx::detail
@@ -230,6 +243,22 @@ void set_scissor(const ClipRect& scissor) noexcept;
 void push_debug_group(std::string label);
 void insert_debug_marker(std::string label);
 void record_stage(render::Stage stage);
+bool set_overlay_target(bool on) noexcept;
+enum class OverlayDisposition : uint8_t { Restore, Replay, Discard };
+using OverlayPolicy = OverlayDisposition (*)(const render::detail::StageData* opaqueDone) noexcept;
+void set_overlay_policy(OverlayPolicy policy) noexcept;
+struct OverlayStats {
+  uint64_t draws = 0;
+  uint64_t replayFrames = 0;
+  uint64_t restoredSeal = 0;
+  uint64_t restoredLate = 0;
+  uint64_t restoredUnapplied = 0;
+  uint64_t discarded = 0;
+  uint64_t refused = 0;
+  uint64_t dropped = 0;
+  uint64_t inPlaceAfter = 0;
+};
+OverlayStats overlay_stats() noexcept;
 EfbMode current_efb_mode() noexcept;
 bool in_scene_pass() noexcept;
 render::DepthSource current_scene_depth_source() noexcept;

@@ -27,7 +27,9 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <iterator>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <ranges>
@@ -69,6 +71,18 @@ struct FrameRecorder {
   EfbMode efbMode = EfbMode::Scene;
   bool composeWanted = false;
   bool composed = false;
+  // One list per deferral target; M12's capture list adds its own
+  struct SideList {
+    CommandList commands;
+    std::vector<std::pair<uint32_t, uint32_t>> draws;
+    Viewport viewport;
+    ClipRect scissor;
+    bool hasState = false;
+    uint64_t layoutKey = 0;
+    OverlayDisposition kept = OverlayDisposition::Restore;
+    bool keep = false;
+  } overlay;
+  bool overlayTarget = false;
 #ifdef AURORA_GFX_DEBUG_GROUPS
   std::vector<std::string> debugGroupStack;
 #endif
@@ -84,6 +98,11 @@ struct FrameRecorder {
 };
 
 FrameRecorder g_recorder;
+OverlayStats g_overlayStats;
+std::atomic<OverlayPolicy> g_overlayPolicy{nullptr};
+bool g_keepShapes = false;
+std::mutex g_shapeMutex;
+std::vector<detail::testing::RecordedShape> g_shapes;
 uint32_t g_lastRecordedUniformSize = 0;
 std::atomic_uint64_t g_residentRequest{0};
 uint64_t g_channelStorageBytes = 0;
@@ -722,7 +741,103 @@ void emit_op(FramePacket& frame, FrameOpType type, uint32_t index) {
   enqueue_op(frame, opIndex);
 }
 
+constexpr uint8_t OpaqueStage = static_cast<uint8_t>(render::Stage::OpaqueDone);
+
+enum class RestoreReason : uint8_t { Seal, Late, Unapplied };
+
+bool is_efb_depth_pass(const RenderPass& pass) noexcept;
+
+bool overlay_pass_open() noexcept {
+  if (!g_recorder.active() || g_recorder.inOffscreen || g_recorder.efbMode != EfbMode::Scene || g_recorder.composed ||
+      g_recorder.currentRenderPass >= current_render_passes().size()) {
+    return false;
+  }
+  const RenderPass& pass = current_render_passes()[g_recorder.currentRenderPass];
+  return is_efb_depth_pass(pass) && !pass.sealed;
+}
+
+void clear_overlays() noexcept {
+  auto& list = g_recorder.overlay;
+  list.commands.clear();
+  list.draws.clear();
+  list.hasState = false;
+  list.layoutKey = 0;
+  list.kept = OverlayDisposition::Restore;
+  list.keep = false;
+}
+
+void restore_overlays(RestoreReason reason) {
+  auto& list = g_recorder.overlay;
+  if (list.draws.empty()) {
+    return;
+  }
+  AURORA_ASSERT(overlay_pass_open(), "Deferred overlay draws restored outside the pass they were recorded in");
+  RenderPass& pass = current_render_passes()[g_recorder.currentRenderPass];
+  auto& commands = pass.commands;
+  size_t read = commands.size();
+  size_t next = list.draws.size();
+  commands.resize(read + next, list.commands[list.draws.front().first]);
+  for (size_t write = commands.size(); next > 0;) {
+    --write;
+    if (list.draws[next - 1].second >= read) {
+      commands[write] = std::move(list.commands[list.draws[--next].first]);
+    } else {
+      commands[write] = std::move(commands[--read]);
+    }
+  }
+  pass.hasDraws = true;
+  // Callers set discardable before sealing, and the restored draws are real content
+  pass.discardable = false;
+  switch (reason) {
+  case RestoreReason::Seal:
+    ++g_overlayStats.restoredSeal;
+    break;
+  case RestoreReason::Late:
+    ++g_overlayStats.restoredLate;
+    break;
+  case RestoreReason::Unapplied:
+    ++g_overlayStats.restoredUnapplied;
+    break;
+  }
+  clear_overlays();
+}
+
+void replay_overlays() {
+  auto& list = g_recorder.overlay;
+  if (list.draws.empty()) {
+    clear_overlays();
+    return;
+  }
+  AURORA_ASSERT(overlay_pass_open(), "Deferred overlay draws replayed outside an open EFB scene pass");
+  RenderPass& pass = current_render_passes()[g_recorder.currentRenderPass];
+  // The deferred pipelines were built for this layout
+  AURORA_ASSERT(pass.target_layout().key == list.layoutKey, "Deferred overlay draws replayed into another layout");
+  pass.commands.insert(pass.commands.end(), std::make_move_iterator(list.commands.begin()),
+                       std::make_move_iterator(list.commands.end()));
+  pass.hasDraws = true;
+  push_command(CommandType::SetViewport, Command::Data{.setViewport = g_recorder.cachedViewport});
+  push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
+  ++g_overlayStats.replayFrames;
+  clear_overlays();
+}
+
+void settle_kept() {
+  if (g_recorder.overlay.kept == OverlayDisposition::Replay) {
+    replay_overlays();
+    return;
+  }
+  if (!g_recorder.overlay.draws.empty()) {
+    ++g_overlayStats.discarded;
+  }
+  clear_overlays();
+}
+
 void enqueue_pass(FramePacket& frame, uint32_t passIndex) {
+  // Every seal passes here, so deferred draws never outlive the pass they were recorded in
+  if (!g_recorder.overlay.draws.empty() && !g_recorder.overlay.keep && passIndex == g_recorder.currentRenderPass &&
+      overlay_pass_open()) {
+    restore_overlays(g_recorder.nextStage > OpaqueStage ? RestoreReason::Late : RestoreReason::Seal);
+  }
   seal_pass(frame, passIndex);
   emit_op(frame, FrameOpType::RenderPass, passIndex);
 }
@@ -871,7 +986,25 @@ void emit_stage_batch(StageBatch& batch, const render::detail::SceneDepth& depth
 
 // The open pass is sealed only once a stage has work, so an empty graph leaves the EFB pass untouched
 bool emit_stage_ops(uint8_t end, uint8_t liveMarker, bool atFinish) {
+  const uint8_t start = g_recorder.nextStage;
   StageBatch batch = build_stage_batch(end, liveMarker, atFinish);
+  if (!g_recorder.overlay.draws.empty() && start <= OpaqueStage && end == OpaqueStage + 1) {
+    const render::detail::StageData* opaqueDone = nullptr;
+    for (uint8_t i = 0; i < batch.count; ++i) {
+      if (batch.stages[i].stage == render::Stage::OpaqueDone) {
+        opaqueDone = &batch.stages[i];
+      }
+    }
+    // The composite's final mask for this frame decides; a frame without P keeps the original order
+    const OverlayPolicy policy = g_overlayPolicy.load(std::memory_order_acquire);
+    const OverlayDisposition disposition = policy != nullptr ? policy(opaqueDone) : OverlayDisposition::Restore;
+    if (disposition == OverlayDisposition::Restore) {
+      restore_overlays(RestoreReason::Unapplied);
+    } else {
+      g_recorder.overlay.keep = true;
+      g_recorder.overlay.kept = disposition;
+    }
+  }
   if (batch.count == 0) {
     return false;
   }
@@ -940,6 +1073,7 @@ void switch_to_output(bool reopen) {
 }
 
 void run_stages_until(uint8_t end, uint8_t liveMarker) {
+  const bool crossesOpaque = g_recorder.nextStage <= OpaqueStage && end > OpaqueStage;
   if (switch_pending(end)) {
     const bool hadScenePass = g_recorder.currentRenderPass != UINT32_MAX;
     emit_stage_ops(SceneStageEnd, liveMarker, false);
@@ -951,6 +1085,11 @@ void run_stages_until(uint8_t end, uint8_t liveMarker) {
   const bool hadPass = g_recorder.currentRenderPass != UINT32_MAX;
   if (emit_stage_ops(end, liveMarker, false) && hadPass) {
     resume_efb_pass_loading(current_render_passes()[g_recorder.currentRenderPass]);
+  }
+  if (g_recorder.overlay.keep) {
+    settle_kept();
+  } else if (crossesOpaque) {
+    restore_overlays(end > OpaqueStage + 1 ? RestoreReason::Late : RestoreReason::Unapplied);
   }
 }
 
@@ -994,6 +1133,12 @@ void begin_recording(FramePacket& packet, size_t frameSlot) {
   g_recorder.efbMode = EfbMode::Scene;
   g_recorder.composeWanted = render::detail::scene_compose_wanted();
   g_recorder.composed = false;
+  g_recorder.overlayTarget = false;
+  clear_overlays();
+  if (g_recorder.overlay.draws.capacity() < 256) {
+    g_recorder.overlay.commands.reserve(256);
+    g_recorder.overlay.draws.reserve(256);
+  }
   note_scene_pass_change();
   g_channelStorageBytes = 0;
 
@@ -1017,6 +1162,16 @@ RecordedFrame end_recording() {
                 "end_frame called before finish finalized the current render pass");
   CHECK(g_recorder.pendingStageEnd == 0, "end_frame called with render stages still pending");
   CHECK(g_recorder.frame().pendingCompute == UINT32_MAX, "end_frame called with a compute batch still pending");
+  // Unreachable while every seal goes through enqueue_pass
+  if (!g_recorder.overlay.draws.empty()) {
+    static bool warned = false;
+    if (!std::exchange(warned, true)) {
+      Log.warn("Dropped {} deferred overlay draws that outlived their pass", g_recorder.overlay.draws.size());
+    }
+    g_overlayStats.dropped += g_recorder.overlay.draws.size();
+    clear_overlays();
+  }
+  g_recorder.overlayTarget = false;
   auto& frame = g_recorder.frame();
   frame.stats.drawCallCount = g_recorder.drawCallCount;
   frame.stats.mergedDrawCallCount = g_recorder.mergedDrawCallCount;
@@ -1027,6 +1182,15 @@ RecordedFrame end_recording() {
   frame.stats.lastStorageSize = frame.storage.size();
   frame.stats.lastTextureUploadSize = frame.textureUpload.size();
   g_lastChannelStorageBytes = g_channelStorageBytes;
+  if (g_keepShapes) {
+    detail::testing::RecordedShape shape{.frameIndex = frame.frameIndex,
+                                         .ops = static_cast<uint32_t>(frame.ops.size())};
+    for (const RenderPass& pass : frame.renderPasses) {
+      shape.passCommands.push_back(static_cast<uint32_t>(pass.commands.size()));
+    }
+    std::lock_guard lock{g_shapeMutex};
+    g_shapes.push_back(std::move(shape));
+  }
 
   for (auto& array : gx::g_gxState.arrays) {
     array.cachedRange = {};
@@ -1076,6 +1240,8 @@ void shutdown_recording() {
   g_recorder.efbMode = EfbMode::Scene;
   g_recorder.composeWanted = false;
   g_recorder.composed = false;
+  g_recorder.overlayTarget = false;
+  clear_overlays();
 }
 
 namespace testing {
@@ -1108,6 +1274,19 @@ void fake_depth_snapshots(bool fake) noexcept { g_fakeDepthSnapshots = fake; }
 uint32_t stage_depth_snapshot_generation(render::Stage slot) noexcept {
   const auto index = static_cast<size_t>(slot);
   return index < g_stageDepthSnapshots.size() ? g_stageDepthSnapshots[index].generation : 0;
+}
+
+size_t overlay_command_count() noexcept { return g_recorder.overlay.commands.size(); }
+
+void keep_frame_shapes(bool keep) noexcept {
+  std::lock_guard lock{g_shapeMutex};
+  g_keepShapes = keep;
+  g_shapes.clear();
+}
+
+std::vector<RecordedShape> take_frame_shapes() {
+  std::lock_guard lock{g_shapeMutex};
+  return std::exchange(g_shapes, {});
 }
 
 uint32_t stage_depth_snapshot_requests(render::Stage slot) noexcept {
@@ -1285,6 +1464,10 @@ void set_scissor(const ClipRect& cmd) noexcept {
 
 template <>
 void push_draw_command(clear::DrawData data) {
+  // Lands before deferred draws only if they replay; counted, never moved
+  if (!g_recorder.overlay.commands.empty()) {
+    ++g_overlayStats.inPlaceAfter;
+  }
   push_draw_command(make_draw_command<clear::render>(data));
 }
 
@@ -1438,6 +1621,10 @@ bool push_custom_draw(DrawTypeId type, const void* payload, size_t payloadSize) 
     return false;
   }
 
+  // Lands before deferred draws only if they replay; counted, never moved
+  if (!g_recorder.overlay.commands.empty()) {
+    ++g_overlayStats.inPlaceAfter;
+  }
   CustomDrawCommand draw{};
   draw.type = type;
   draw.payloadSize = static_cast<uint32_t>(payloadSize);
@@ -1643,8 +1830,55 @@ void record_stage(render::Stage stage) {
 
 template <>
 void push_draw_command(gx::DrawData data) {
-  push_draw_command(make_draw_command<gx::render>(data));
+  if (!g_recorder.overlayTarget) {
+    push_draw_command(make_draw_command<gx::render>(data));
+    return;
+  }
+  auto& list = g_recorder.overlay;
+  const RenderPass& pass = current_render_passes()[g_recorder.currentRenderPass];
+  if (list.draws.empty()) {
+    list.layoutKey = pass.target_layout().key;
+  }
+  const auto append = [&list](CommandType type, const Command::Data& data) {
+    list.commands.push_back({
+        .type = type,
+#ifdef AURORA_GFX_DEBUG_GROUPS
+        .debugGroupStack = g_recorder.debugGroupStack,
+#endif
+        .data = data,
+    });
+  };
+  if (!list.hasState || list.viewport != g_recorder.cachedViewport) {
+    list.viewport = g_recorder.cachedViewport;
+    append(CommandType::SetViewport, Command::Data{.setViewport = list.viewport});
+  }
+  if (!list.hasState || list.scissor != g_recorder.cachedScissor) {
+    list.scissor = g_recorder.cachedScissor;
+    append(CommandType::SetScissor, Command::Data{.setScissor = list.scissor});
+  }
+  list.hasState = true;
+  list.draws.emplace_back(static_cast<uint32_t>(list.commands.size()), static_cast<uint32_t>(pass.commands.size()));
+  append(CommandType::Draw, Command::Data{.draw = make_draw_command<gx::render>(data)});
+  ++g_recorder.drawCallCount;
+  ++g_overlayStats.draws;
 }
+
+bool set_overlay_target(bool on) noexcept {
+  if (!on) {
+    g_recorder.overlayTarget = false;
+    return true;
+  }
+  if (!overlay_pass_open() || g_recorder.nextStage > OpaqueStage) {
+    ++g_overlayStats.refused;
+    return false;
+  }
+  g_recorder.overlayTarget = true;
+  return true;
+}
+
+void set_overlay_policy(OverlayPolicy policy) noexcept { g_overlayPolicy.store(policy, std::memory_order_release); }
+
+OverlayStats overlay_stats() noexcept { return g_overlayStats; }
 
 #ifdef AURORA_ENABLE_RMLUI
 template <>

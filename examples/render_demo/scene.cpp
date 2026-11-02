@@ -75,6 +75,13 @@ constexpr f32 CompanionMirrorX1 = 21.f;
 constexpr f32 CompanionMirrorZ0 = -12.f;
 constexpr f32 CompanionMirrorZ1 = -5.f;
 constexpr size_t AoCreaseBox = 2;
+constexpr GXColor OverlayQuadColor{240, 40, 20, 128};
+constexpr GXColor OverlayBoxColor{30, 80, 220, 255};
+// View-space centres on one ray, so the box sits right behind the quad and covers more of the screen
+constexpr Vec OverlayQuadCentre{0.9f, 0.75f, -3.f};
+constexpr f32 OverlayQuadHalf = 0.3f;
+constexpr Vec OverlayBoxCentre{1.2f, 1.f, -4.f};
+constexpr f32 OverlayBoxHalf = 0.8f;
 
 struct Slab {
   Vec centre;
@@ -696,6 +703,40 @@ void draw_fwd_env_layers(const Mtx view) {
   GXSetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
 }
 
+void view_quad(const Vec& centre, f32 half) {
+  constexpr f32 Corners[4][2] = {{-1.f, -1.f}, {1.f, -1.f}, {1.f, 1.f}, {-1.f, 1.f}};
+  GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+  for (const auto& [x, y] : Corners) {
+    GXPosition3f32(centre.x + x * half, centre.y + y * half, centre.z);
+    GXNormal3f32(0.f, 0.f, 1.f);
+    GXTexCoord2f32(0.f, 0.f);
+  }
+  GXEnd();
+}
+
+// The quad goes first and writes no depth, so in place the box covers it and only a deferred quad shows
+void draw_overlay_check() {
+  Mtx identity;
+  C_MTXIdentity(identity);
+  set_ground_format();
+  set_lit_channel(GX_SRC_REG);
+  load_matrices(identity, GX_PNMTX0);
+  GXSetCurrentMtx(GX_PNMTX0);
+  GXSetFog(GX_FOG_NONE, 0.f, 0.f, 0.f, 0.f, ClearColor);
+  GXSetCullMode(GX_CULL_NONE);
+  push_scope(AURORA_CAT_PARTICLE | AURORA_CAT_OVERLAY | AURORA_CAT_NO_PBR, 0, AURORA_CAMERA_INHERIT);
+  set_konst_tev(OverlayQuadColor);
+  GXSetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+  GXSetZMode(GX_TRUE, GX_LEQUAL, GX_FALSE);
+  view_quad(OverlayQuadCentre, OverlayQuadHalf);
+  pop_scope();
+  set_konst_tev(OverlayBoxColor);
+  GXSetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+  GXSetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
+  view_quad(OverlayBoxCentre, OverlayBoxHalf);
+  set_fog(Fog);
+}
+
 void emit_frame_hints(u32 frame, const Mtx view, const Mtx44 projection, const Lights& lights) {
   if (!hint_emission()) {
     return;
@@ -1067,6 +1108,17 @@ std::span<const u8> ground_texture_base() noexcept {
   return {sGroundTexture.data(), std::min<size_t>(sGroundTexture.size(), GroundTextureSize * GroundTextureSize * 4)};
 }
 
+std::array<f32, 2> overlay_probe() noexcept {
+  SceneCamera camera = scene_camera(AoCheckClock);
+  C_MTXIdentity(camera.view);
+  return project(camera, OverlayQuadCentre);
+}
+
+OverlayColors overlay_colors() noexcept {
+  const auto rgba = [](GXColor c) { return std::array<u8, 4>{c.r, c.g, c.b, c.a}; };
+  return {.quad = rgba(OverlayQuadColor), .box = rgba(OverlayBoxColor)};
+}
+
 FogResolveCounts fog_resolve_counts() noexcept { return sFogResolves; }
 
 void draw_scene(u32 frame, const SceneOptions& options) {
@@ -1074,7 +1126,9 @@ void draw_scene(u32 frame, const SceneOptions& options) {
   set_hint_emission(options.hints);
   upload_gpu_arrays(options);
   const u32 clock =
-      options.aoCheck || options.fwdEnvCheck || options.unlitCheck || options.companionCheck ? AoCheckClock : frame;
+      options.aoCheck || options.fwdEnvCheck || options.unlitCheck || options.companionCheck || options.overlayCheck
+          ? AoCheckClock
+          : frame;
   const f32 t = static_cast<f32>(clock) / 60.f;
   const SceneCamera camera = scene_camera(clock);
   GXSetCopyClear(ClearColor, GX_MAX_Z24);
@@ -1136,7 +1190,13 @@ void draw_scene(u32 frame, const SceneOptions& options) {
   if (options.captureOnlyBox) {
     draw_capture_only_box(view, eye, target);
   }
-  hint_stage(AURORA_STAGE_OPAQUE_DONE);
+  if (options.overlayCheck) {
+    draw_overlay_check();
+  }
+  // Without the marker the deferred quad never reaches a replay, so this frame must put it back in place
+  if (!options.overlayCheck || frame != OverlayLateFrame) {
+    hint_stage(AURORA_STAGE_OPAQUE_DONE);
+  }
   if (options.fogBands && !options.fwdEnvCheck) {
     resolve_fog_records();
   }

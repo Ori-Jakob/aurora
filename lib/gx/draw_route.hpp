@@ -15,6 +15,8 @@ namespace aurora::gx::draw_route {
 enum class Route : uint8_t {
   Push,
   Suppress,
+  // Recorded into the overlay side list; replayed after the OPAQUE_DONE stage or put back in place
+  Defer,
 };
 
 struct Query {

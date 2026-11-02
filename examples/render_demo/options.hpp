@@ -34,6 +34,7 @@ struct Options {
   bool fwdEnvCheck = false;
   bool unlitCheck = false;
   bool companionCheck = false;
+  bool overlayCheck = false;
   bool hints = true;
 
   bool checkHints = false;

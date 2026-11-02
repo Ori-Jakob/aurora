@@ -168,6 +168,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/scene/classify.hpp
         lib/render/scene/motion.cpp
         lib/render/scene/motion.hpp
+        lib/render/scene/overlay.cpp
+        lib/render/scene/overlay.hpp
         lib/render/shader_resolve.cpp
         lib/render/shader_resolve.hpp
         lib/render/shaders.cpp

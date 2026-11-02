@@ -52,6 +52,8 @@ extern std::unordered_map<PipelineRef, PipelineState> g_testRefStates;
 extern const LayoutWarm* g_testLayoutWarm;
 extern std::vector<gx::PipelineConfig> g_testWarmedConfigs;
 extern bool g_testOffscreen;
+extern bool g_testOverlayTarget;
+extern std::vector<gx::DrawData> g_testOverlayDraws;
 namespace testing {
 void reset_stub_ranges() noexcept;
 } // namespace testing
@@ -295,6 +297,8 @@ protected:
     gfx::g_testLookupExts.clear();
     gfx::g_testRefStates.clear();
     gfx::g_testReadyTwinRef = 0;
+    gfx::g_testOverlayTarget = false;
+    gfx::g_testOverlayDraws.clear();
     g_deriveCalls = 0;
   }
 
@@ -323,6 +327,8 @@ protected:
     gfx::g_testLayoutWarm = nullptr;
     gfx::g_testWarmedConfigs.clear();
     gfx::g_testOffscreen = false;
+    gfx::g_testOverlayTarget = false;
+    gfx::g_testOverlayDraws.clear();
     g_testPopulateDepthFunc = GX_NEVER;
     g_testPopulateTevStageCount = 0;
     GXFifoTest::TearDown();
@@ -441,6 +447,9 @@ protected:
     if (test.capture_only()) {
       return {.route = route::Route::Suppress};
     }
+    if (std::ranges::find(test.deferAt, test.queries.size()) != test.deferAt.end()) {
+      return {.route = route::Route::Defer};
+    }
     return {.route = route::Route::Push, .breakMerge = test.queries.size() == test.breakAt};
   }
 
@@ -465,6 +474,7 @@ protected:
   // Breaks the router contract on purpose so merge_target's own empty-draw test is what stops the merge
   size_t emptyQuietAt = 0;
   size_t pushes = 0;
+  std::vector<size_t> deferAt;
 };
 
 TEST_F(GXDrawRouteTest, WithoutRouterCleanDrawsMerge) {
@@ -567,6 +577,81 @@ TEST_F(GXDrawRouteTest, BreakMergeOnIndexedDrawNotCounted) {
   EXPECT_EQ(gfx::g_testDrawCount, 2u);
   EXPECT_EQ(gfx::g_testLastDraw.indexCount, 3u);
   EXPECT_EQ(fifo::draw_route_stats().mergeBreaks, 0u);
+}
+
+TEST_F(GXDrawRouteTest, DeferredDrawGoesToOverlayList) {
+  deferAt = {2};
+  install_router(true);
+  triangle();
+  triangle();
+  triangle();
+  decode();
+  ASSERT_EQ(gfx::g_testOverlayDraws.size(), 1u);
+  EXPECT_EQ(gfx::g_testOverlayDraws[0].vtxCount, 3u);
+  EXPECT_EQ(gfx::g_testOverlayDraws[0].vertRange.offset, 3 * kVtxSize);
+  EXPECT_EQ(gfx::g_testDrawCount, 2u);
+  EXPECT_EQ(gfx::g_testMergedDrawCount, 0u);
+  EXPECT_EQ(gfx::g_testLastDraw.vertRange.offset, 6 * kVtxSize);
+  // The push hook still sees the deferred draw, so its record and gate edits match an in-place draw
+  EXPECT_EQ(pushes, 3u);
+  EXPECT_FALSE(gfx::g_testOverlayTarget);
+  const fifo::DrawRouteStats stats = fifo::draw_route_stats();
+  EXPECT_EQ(stats.routed, 3u);
+  EXPECT_EQ(stats.deferred, 1u);
+  EXPECT_EQ(stats.suppressed, 0u);
+  EXPECT_EQ(g_gxState.dirty, 0u);
+}
+
+TEST_F(GXDrawRouteTest, DeferredDrawsNeverMerge) {
+  deferAt = {2, 3};
+  install_router();
+  for (int i = 0; i < 5; ++i) {
+    triangle();
+  }
+  decode();
+  // A alone, B and C one command each in the list, then D starts a chain that E joins
+  ASSERT_EQ(gfx::g_testOverlayDraws.size(), 2u);
+  EXPECT_EQ(gfx::g_testOverlayDraws[0].vtxCount, 3u);
+  EXPECT_EQ(gfx::g_testOverlayDraws[1].vtxCount, 3u);
+  EXPECT_EQ(gfx::g_testOverlayDraws[1].vertRange.offset, 6 * kVtxSize);
+  EXPECT_EQ(gfx::g_testDrawCount, 2u);
+  EXPECT_EQ(gfx::g_testMergedDrawCount, 1u);
+  EXPECT_EQ(gfx::g_testLastDraw.vtxCount, 6u);
+  EXPECT_EQ(gfx::g_testLastDraw.vertRange.offset, 9 * kVtxSize);
+  EXPECT_EQ(fifo::draw_route_stats().deferred, 2u);
+}
+
+TEST_F(GXDrawRouteTest, DeferredIndexedDraw) {
+  deferAt = {2};
+  install_router();
+  triangle();
+  indexed_triangle();
+  triangle();
+  decode_then_bp();
+  ASSERT_EQ(gfx::g_testOverlayDraws.size(), 1u);
+  EXPECT_EQ(gfx::g_testOverlayDraws[0].vtxCount, 3u);
+  EXPECT_EQ(gfx::g_testOverlayDraws[0].indexCount, 3u);
+  EXPECT_EQ(gfx::g_testPushedIndexBytes, 3 * sizeof(u16));
+  // The last triangle would otherwise merge into the first, across the deferred draw
+  EXPECT_EQ(gfx::g_testDrawCount, 2u);
+  EXPECT_EQ(gfx::g_testMergedDrawCount, 0u);
+  EXPECT_EQ(fifo::draw_route_stats().deferred, 1u);
+}
+
+TEST_F(GXDrawRouteTest, DeferRefusedOutsideScenePassDrawsInPlace) {
+  deferAt = {1};
+  install_router();
+  gfx::g_testOffscreen = true;
+  triangle();
+  triangle();
+  decode();
+  EXPECT_TRUE(gfx::g_testOverlayDraws.empty());
+  EXPECT_EQ(gfx::g_testDrawCount, 1u);
+  EXPECT_EQ(gfx::g_testMergedDrawCount, 1u);
+  EXPECT_EQ(gfx::g_testLastDraw.vtxCount, 6u);
+  const fifo::DrawRouteStats stats = fifo::draw_route_stats();
+  EXPECT_EQ(stats.routed, 2u);
+  EXPECT_EQ(stats.deferred, 0u);
 }
 
 TEST_F(GXDrawRouteTest, SuppressedIndexedDrawConsumesPayload) {

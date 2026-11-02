@@ -1069,16 +1069,137 @@ struct FrameShape {
   bool operator==(const FrameShape&) const = default;
 };
 
+struct CommandEntry {
+  detail::CommandType type{};
+  uint32_t vtxCount = 0;
+  Viewport viewport{};
+  ClipRect scissor{};
+
+  bool operator==(const CommandEntry&) const = default;
+};
+
+struct OverlayRun {
+  FrameShape shape;
+  std::vector<std::vector<CommandEntry>> commands;
+  OverlayStats stats;
+};
+
+constexpr auto SetViewportCmd = detail::CommandType::SetViewport;
+constexpr auto SetScissorCmd = detail::CommandType::SetScissor;
+constexpr auto DrawCmd = detail::CommandType::Draw;
+
+std::vector<std::vector<CommandEntry>> pass_commands(const detail::FramePacket& frame) {
+  std::vector<std::vector<CommandEntry>> passes;
+  for (const auto& pass : frame.renderPasses) {
+    auto& entries = passes.emplace_back();
+    for (const auto& command : pass.commands) {
+      CommandEntry entry{.type = command.type};
+      if (command.type == DrawCmd) {
+        gx::DrawData draw;
+        std::memcpy(&draw, command.data.draw.payload.data(), sizeof(draw));
+        entry.vtxCount = draw.vtxCount;
+      } else if (command.type == SetViewportCmd) {
+        entry.viewport = command.data.setViewport;
+      } else if (command.type == SetScissorCmd) {
+        entry.scissor = command.data.setScissor;
+      }
+      entries.push_back(entry);
+    }
+  }
+  return passes;
+}
+
+std::vector<uint32_t> draw_ids(const std::vector<CommandEntry>& entries) {
+  std::vector<uint32_t> ids;
+  for (const auto& entry : entries) {
+    if (entry.type == DrawCmd) {
+      ids.push_back(entry.vtxCount);
+    }
+  }
+  return ids;
+}
+
+std::vector<detail::CommandType> command_types(const std::vector<CommandEntry>& entries) {
+  std::vector<detail::CommandType> types;
+  for (const auto& entry : entries) {
+    types.push_back(entry.type);
+  }
+  return types;
+}
+
+OverlayStats stats_since(const OverlayStats& before) {
+  const OverlayStats now = overlay_stats();
+  return {
+      .draws = now.draws - before.draws,
+      .replayFrames = now.replayFrames - before.replayFrames,
+      .restoredSeal = now.restoredSeal - before.restoredSeal,
+      .restoredLate = now.restoredLate - before.restoredLate,
+      .restoredUnapplied = now.restoredUnapplied - before.restoredUnapplied,
+      .discarded = now.discarded - before.discarded,
+      .refused = now.refused - before.refused,
+      .dropped = now.dropped - before.dropped,
+      .inPlaceAfter = now.inPlaceAfter - before.inPlaceAfter,
+  };
+}
+
+// The vertex count names each draw, so a command list reads as the order the draws will encode in
+void push_draw(uint32_t id) {
+  gx::DrawData draw;
+  draw.vtxCount = id;
+  draw.instanceCount = 1;
+  push_draw_command(draw);
+}
+
+void defer_draw(uint32_t id) {
+  EXPECT_TRUE(set_overlay_target(true));
+  push_draw(id);
+  set_overlay_target(false);
+}
+
+void draw_or_defer(uint32_t id, bool defer) {
+  if (defer) {
+    defer_draw(id);
+  } else {
+    push_draw(id);
+  }
+}
+
+uint32_t g_policyCalls = 0;
+bool g_policySawOpaqueDone = false;
+
+void note_policy(const render::detail::StageData* opaqueDone) noexcept {
+  ++g_policyCalls;
+  g_policySawOpaqueDone = opaqueDone != nullptr && opaqueDone->stage == Stage::OpaqueDone;
+}
+
+OverlayDisposition replay_policy(const render::detail::StageData* opaqueDone) noexcept {
+  note_policy(opaqueDone);
+  return OverlayDisposition::Replay;
+}
+
+OverlayDisposition restore_policy(const render::detail::StageData* opaqueDone) noexcept {
+  note_policy(opaqueDone);
+  return OverlayDisposition::Restore;
+}
+
+OverlayDisposition discard_policy(const render::detail::StageData* opaqueDone) noexcept {
+  note_policy(opaqueDone);
+  return OverlayDisposition::Discard;
+}
+
 class GfxRenderStageTest : public GfxRecordingTest {
 protected:
   void SetUp() override {
     render::detail::testing::reset();
     render::detail::testing::reset_external_passes();
+    g_policyCalls = 0;
+    g_policySawOpaqueDone = false;
     GfxRecordingTest::SetUp();
   }
 
   void TearDown() override {
     GfxRecordingTest::TearDown();
+    set_overlay_policy(nullptr);
     render::detail::testing::reset();
     render::detail::testing::reset_external_passes();
   }
@@ -1203,6 +1324,55 @@ protected:
                             stage.markerSeen && !stage.deferred && stage.frame == self.frame.renderState.get();
     return self.stageDataChecked;
   }
+
+  OverlayRun overlay_run(size_t passCount, const std::function<void(bool)>& script, bool defer) {
+    OverlayRun run;
+    latch_new_frame(passCount);
+    const OverlayStats before = overlay_stats();
+    script(defer);
+    finish();
+    run.shape = frame_shape();
+    run.commands = pass_commands(frame);
+    run.stats = stats_since(before);
+    return run;
+  }
+
+  // Restores must give exactly the order the same draws have when nothing defers them
+  OverlayRun expect_restored(size_t passCount, const std::function<void(bool)>& script) {
+    const OverlayRun plain = overlay_run(passCount, script, false);
+    const OverlayRun deferred = overlay_run(passCount, script, true);
+    EXPECT_EQ(deferred.shape, plain.shape);
+    EXPECT_EQ(deferred.commands, plain.commands);
+    EXPECT_EQ(deferred.stats.replayFrames, 0u);
+    EXPECT_EQ(deferred.stats.dropped, 0u);
+    EXPECT_EQ(detail::testing::overlay_command_count(), 0u);
+    return deferred;
+  }
+
+  void expect_restored_at_seal(const std::function<void()>& seal, bool drawsAfter) {
+    // A seal inside the window wins over any disposition the stage would have chosen
+    set_overlay_policy(&replay_policy);
+    const OverlayRun run = expect_restored(0, [&](bool defer) {
+      push_draw(1);
+      draw_or_defer(2, defer);
+      push_draw(3);
+      seal();
+      if (drawsAfter) {
+        push_draw(4);
+      }
+    });
+    EXPECT_EQ(run.stats.restoredSeal, 1u);
+    EXPECT_EQ(run.stats.restoredLate + run.stats.restoredUnapplied, 0u);
+    EXPECT_EQ(g_policyCalls, 0u);
+  }
+
+  void give_current_pass_a_consumer() {
+    auto& pass = frame.renderPasses.back();
+    pass.resolveTarget = std::make_shared<TextureRef>(wgpu::Texture{}, wgpu::TextureView{}, wgpu::TextureView{},
+                                                      wgpu::Extent3D{64, 64, 1}, ColorFormat, 1, GX_TF_RGBA8);
+  }
+
+  static void encode_nothing(const EncoderTaskContext&, const wgpu::CommandEncoder&, const void*, size_t, void*) {}
 
   std::deque<TestPass> passes;
   std::vector<std::string> encoded;
@@ -2900,6 +3070,377 @@ protected:
 
   wgpu::Limits savedLimits;
 };
+
+TEST_F(GfxRenderStageTest, OverlayReplaysAfterOpaqueDoneStage) {
+  add_pass("opaque", Stage::OpaqueDone);
+  set_overlay_policy(&replay_policy);
+  const OverlayRun run = overlay_run(
+      1,
+      [](bool) {
+        push_draw(1);
+        defer_draw(2);
+        push_draw(3);
+        record_stage(Stage::OpaqueDone);
+        push_draw(4);
+      },
+      true);
+  EXPECT_EQ(run.shape.ops, (std::vector{PassOp, StageOp, PassOp}));
+  ASSERT_EQ(run.commands.size(), 2u);
+  EXPECT_EQ(draw_ids(run.commands[0]), (std::vector<uint32_t>{1, 3}));
+  EXPECT_EQ(draw_ids(run.commands[1]), (std::vector<uint32_t>{2, 4}));
+  // The continuation's own state, the draw's state, the draw, then the recorder's state again
+  EXPECT_EQ(command_types(run.commands[1]), (std::vector{SetViewportCmd, SetScissorCmd, SetViewportCmd, SetScissorCmd,
+                                                         DrawCmd, SetViewportCmd, SetScissorCmd, DrawCmd}));
+  EXPECT_EQ(run.stats.draws, 1u);
+  EXPECT_EQ(run.stats.replayFrames, 1u);
+  EXPECT_EQ(run.stats.restoredSeal + run.stats.restoredLate + run.stats.restoredUnapplied, 0u);
+  EXPECT_EQ(g_policyCalls, 1u);
+  EXPECT_TRUE(g_policySawOpaqueDone);
+}
+
+TEST_F(GfxRenderStageTest, OverlayReplaysInOpenPassWithoutStageOps) {
+  set_overlay_policy(&replay_policy);
+  const OverlayRun run = overlay_run(
+      0,
+      [](bool) {
+        push_draw(1);
+        defer_draw(2);
+        push_draw(3);
+        record_stage(Stage::OpaqueDone);
+        push_draw(4);
+      },
+      true);
+  EXPECT_EQ(run.shape.ops, (std::vector{PassOp}));
+  ASSERT_EQ(run.commands.size(), 1u);
+  EXPECT_EQ(draw_ids(run.commands[0]), (std::vector<uint32_t>{1, 3, 2, 4}));
+  EXPECT_EQ(run.stats.replayFrames, 1u);
+  EXPECT_EQ(g_policyCalls, 1u);
+  EXPECT_FALSE(g_policySawOpaqueDone);
+}
+
+TEST_F(GfxRenderStageTest, OverlayKeepsPerDrawViewport) {
+  add_pass("opaque", Stage::OpaqueDone);
+  set_overlay_policy(&replay_policy);
+  const Viewport first{10.f, 20.f, 300.f, 200.f, 0.f, 1.f};
+  const Viewport second{30.f, 40.f, 100.f, 50.f, 0.f, 1.f};
+  const Viewport third{0.f, 0.f, 64.f, 64.f, 0.f, 1.f};
+  const OverlayRun run = overlay_run(
+      1,
+      [&](bool) {
+        set_viewport(first);
+        defer_draw(2);
+        set_viewport(second);
+        defer_draw(3);
+        set_viewport(third);
+        push_draw(4);
+        record_stage(Stage::OpaqueDone);
+      },
+      true);
+  ASSERT_EQ(run.commands.size(), 2u);
+  const auto& main = run.commands[0];
+  ASSERT_EQ(main.size(), 6u);
+  const ClipRect scissor = main[1].scissor;
+  EXPECT_EQ(main[2].viewport, first);
+  EXPECT_EQ(main[3].viewport, second);
+  EXPECT_EQ(main[4].viewport, third);
+  EXPECT_EQ(draw_ids(main), (std::vector<uint32_t>{4}));
+  const std::vector<CommandEntry> continuation{
+      {.type = SetViewportCmd, .viewport = third},
+      {.type = SetScissorCmd, .scissor = scissor},
+      {.type = SetViewportCmd, .viewport = first},
+      {.type = SetScissorCmd, .scissor = scissor},
+      {.type = DrawCmd, .vtxCount = 2},
+      {.type = SetViewportCmd, .viewport = second},
+      {.type = DrawCmd, .vtxCount = 3},
+      {.type = SetViewportCmd, .viewport = third},
+      {.type = SetScissorCmd, .scissor = scissor},
+  };
+  EXPECT_EQ(run.commands[1], continuation);
+}
+
+TEST_F(GfxRenderStageTest, OverlayMarkerDuringOffscreenReplaysAtRestore) {
+  add_pass("opaque", Stage::OpaqueDone);
+  set_overlay_policy(&replay_policy);
+  seed(320, 180);
+  const OverlayRun run = overlay_run(
+      1,
+      [](bool) {
+        push_draw(1);
+        defer_draw(2);
+        begin_offscreen(320, 180);
+        record_stage(Stage::OpaqueDone);
+        EXPECT_FALSE(set_overlay_target(true));
+        push_draw(5);
+        end_offscreen();
+        push_draw(4);
+      },
+      true);
+  EXPECT_EQ(run.shape.ops, (std::vector{PassOp, PassOp, StageOp, PassOp}));
+  ASSERT_EQ(run.commands.size(), 3u);
+  EXPECT_EQ(draw_ids(run.commands[0]), (std::vector<uint32_t>{5}));
+  EXPECT_EQ(draw_ids(run.commands[1]), (std::vector<uint32_t>{1}));
+  EXPECT_EQ(draw_ids(run.commands[2]), (std::vector<uint32_t>{2, 4}));
+  EXPECT_EQ(run.stats.replayFrames, 1u);
+  EXPECT_EQ(run.stats.refused, 1u);
+}
+
+TEST_F(GfxRenderStageTest, OverlayRestoredWhenNotApplied) {
+  add_pass("opaque", Stage::OpaqueDone);
+  set_overlay_policy(&restore_policy);
+  const OverlayRun run = expect_restored(1, [](bool defer) {
+    push_draw(1);
+    draw_or_defer(2, defer);
+    push_draw(3);
+    record_stage(Stage::OpaqueDone);
+    push_draw(4);
+  });
+  EXPECT_EQ(run.stats.restoredUnapplied, 1u);
+  EXPECT_EQ(g_policyCalls, 1u);
+  EXPECT_TRUE(g_policySawOpaqueDone);
+}
+
+TEST_F(GfxRenderStageTest, OverlayRestoredWithoutStageOps) {
+  set_overlay_policy(&restore_policy);
+  const OverlayRun run = expect_restored(0, [](bool defer) {
+    push_draw(1);
+    draw_or_defer(2, defer);
+    push_draw(3);
+    record_stage(Stage::OpaqueDone);
+    push_draw(4);
+  });
+  EXPECT_EQ(run.stats.restoredUnapplied, 1u);
+  EXPECT_FALSE(g_policySawOpaqueDone);
+}
+
+TEST_F(GfxRenderStageTest, OverlayRestoredWithoutPolicy) {
+  add_pass("opaque", Stage::OpaqueDone);
+  const OverlayRun run = expect_restored(1, [](bool defer) {
+    push_draw(1);
+    draw_or_defer(2, defer);
+    push_draw(3);
+    record_stage(Stage::OpaqueDone);
+    push_draw(4);
+  });
+  EXPECT_EQ(run.stats.restoredUnapplied, 1u);
+}
+
+TEST_F(GfxRenderStageTest, OverlayRestoredBeforeEfbCopy) {
+  expect_restored_at_seal([this] { copy_current_offscreen(); }, true);
+}
+
+TEST_F(GfxRenderStageTest, OverlayRestoredBeforeResolvePass) {
+  expect_restored_at_seal(
+      [] {
+        ResolvedTargets out;
+        EXPECT_TRUE(resolve_pass({.color = false, .depth = false}, out));
+      },
+      true);
+}
+
+TEST_F(GfxRenderStageTest, OverlayRestoredBeforeEncoderTask) {
+  const EncoderTaskId task = register_encoder_task_type({.label = "test.overlay_task", .callback = &encode_nothing});
+  ASSERT_NE(task, InvalidEncoderTask);
+  expect_restored_at_seal([task] { EXPECT_TRUE(push_encoder_task(task, nullptr, 0)); }, true);
+  unregister_encoder_task_type(task);
+}
+
+TEST_F(GfxRenderStageTest, OverlayRestoredBeforeTextureCopy) {
+  expect_restored_at_seal([] { queue_texture_copy({}, {}, {1, 1, 1}); }, false);
+}
+
+TEST_F(GfxRenderStageTest, OverlayRestoredBeforeColorPass) {
+  expect_restored_at_seal(
+      [] {
+        begin_color_pass({.label = "test.color", .colorFormat = ColorFormat, .targetSize = {64, 64, 1}});
+        end_color_pass();
+      },
+      false);
+}
+
+TEST_F(GfxRenderStageTest, OverlayRestoredBeforeSuspendWithConsumer) {
+  seed(320, 180);
+  expect_restored_at_seal(
+      [this] {
+        give_current_pass_a_consumer();
+        begin_offscreen(320, 180);
+        end_offscreen();
+      },
+      true);
+}
+
+TEST_F(GfxRenderStageTest, OverlaySurvivesOffscreenSuspend) {
+  add_pass("opaque", Stage::OpaqueDone);
+  set_overlay_policy(&restore_policy);
+  seed(320, 180);
+  const OverlayRun run = expect_restored(1, [](bool defer) {
+    push_draw(1);
+    draw_or_defer(2, defer);
+    begin_offscreen(320, 180);
+    push_draw(5);
+    end_offscreen();
+    push_draw(3);
+    record_stage(Stage::OpaqueDone);
+    push_draw(4);
+  });
+  EXPECT_EQ(run.stats.restoredSeal, 0u);
+  EXPECT_EQ(run.stats.restoredUnapplied, 1u);
+}
+
+TEST_F(GfxRenderStageTest, OverlayRestoredWhenBatchSpansPastOpaqueDone) {
+  add_pass("opaque", Stage::OpaqueDone);
+  add_pass("post", Stage::PrePost);
+  set_overlay_policy(&replay_policy);
+  const OverlayRun run = expect_restored(2, [](bool defer) {
+    push_draw(1);
+    draw_or_defer(2, defer);
+    push_draw(3);
+    record_stage(Stage::PrePost);
+    push_draw(4);
+  });
+  EXPECT_EQ(run.stats.restoredLate, 1u);
+  EXPECT_EQ(g_policyCalls, 0u);
+}
+
+TEST_F(GfxRenderStageTest, OverlayRestoredAtFinishBeforeLaterDraws) {
+  add_pass("opaque", Stage::OpaqueDone);
+  set_overlay_policy(&replay_policy);
+  const OverlayRun run = expect_restored(1, [](bool defer) {
+    push_draw(1);
+    draw_or_defer(2, defer);
+    push_draw(3);
+    push_draw(4);
+  });
+  EXPECT_EQ(draw_ids(run.commands.back()), (std::vector<uint32_t>{1, 2, 3, 4}));
+  EXPECT_EQ(run.stats.restoredLate, 1u);
+}
+
+TEST_F(GfxRenderStageTest, OverlayRestoreSkipsListViewport) {
+  set_overlay_policy(&restore_policy);
+  const OverlayRun run = expect_restored(0, [](bool defer) {
+    set_viewport({10.f, 20.f, 300.f, 200.f, 0.f, 1.f});
+    draw_or_defer(2, defer);
+    if (defer) {
+      EXPECT_EQ(detail::testing::overlay_command_count(), 3u);
+    }
+    set_viewport({0.f, 0.f, 64.f, 64.f, 0.f, 1.f});
+    push_draw(3);
+    record_stage(Stage::OpaqueDone);
+  });
+  EXPECT_EQ(run.stats.restoredUnapplied, 1u);
+}
+
+TEST_F(GfxRenderStageTest, OverlayRestoreKeepsPassAlive) {
+  const OverlayRun run = expect_restored(0, [](bool defer) {
+    ResolvedTargets out;
+    EXPECT_TRUE(resolve_pass({.color = false, .depth = false}, out));
+    draw_or_defer(1, defer);
+    EXPECT_TRUE(resolve_pass({.color = false, .depth = false}, out));
+  });
+  ASSERT_GE(run.shape.passes.size(), 2u);
+  EXPECT_FALSE(run.shape.passes[1].discardable);
+  EXPECT_EQ(draw_ids(run.commands[1]), (std::vector<uint32_t>{1}));
+  EXPECT_EQ(run.stats.restoredSeal, 1u);
+}
+
+TEST_F(GfxRenderStageTest, OverlayDiscardedUnderDrop) {
+  add_pass("opaque", Stage::OpaqueDone);
+  set_overlay_policy(&discard_policy);
+  const OverlayRun run = overlay_run(
+      1,
+      [](bool) {
+        push_draw(1);
+        defer_draw(2);
+        push_draw(3);
+        record_stage(Stage::OpaqueDone);
+        push_draw(4);
+      },
+      true);
+  ASSERT_EQ(run.commands.size(), 2u);
+  EXPECT_EQ(draw_ids(run.commands[0]), (std::vector<uint32_t>{1, 3}));
+  EXPECT_EQ(draw_ids(run.commands[1]), (std::vector<uint32_t>{4}));
+  EXPECT_EQ(run.stats.discarded, 1u);
+  EXPECT_EQ(run.stats.replayFrames, 0u);
+  EXPECT_EQ(run.stats.restoredSeal + run.stats.restoredLate + run.stats.restoredUnapplied, 0u);
+}
+
+TEST_F(GfxRenderStageTest, OverlayOnlyTakesGxDraws) {
+  set_overlay_policy(&restore_policy);
+  const OverlayRun run = overlay_run(
+      0,
+      [](bool) {
+        defer_draw(1);
+        push_draw_command(clear::DrawData{});
+        EXPECT_TRUE(set_overlay_target(true));
+        push_draw_command(clear::DrawData{});
+        set_overlay_target(false);
+        EXPECT_EQ(detail::testing::overlay_command_count(), 3u);
+      },
+      true);
+  ASSERT_EQ(run.commands.size(), 1u);
+  EXPECT_EQ(command_types(run.commands[0]), (std::vector{SetViewportCmd, SetScissorCmd, DrawCmd, DrawCmd, DrawCmd}));
+  EXPECT_EQ(run.commands[0][2].vtxCount, 1u);
+  EXPECT_EQ(run.stats.inPlaceAfter, 2u);
+  EXPECT_EQ(run.stats.draws, 1u);
+}
+
+TEST_F(GfxRenderStageTest, EmptyOverlayListAddsNothing) {
+  add_pass("opaque", Stage::OpaqueDone);
+  const auto script = [](bool) {
+    push_draw(1);
+    push_draw(3);
+    record_stage(Stage::OpaqueDone);
+    push_draw(4);
+  };
+  const OverlayRun without = overlay_run(1, script, false);
+  set_overlay_policy(&replay_policy);
+  const OverlayRun with = overlay_run(1, script, false);
+  EXPECT_EQ(with.shape, without.shape);
+  EXPECT_EQ(with.commands, without.commands);
+  EXPECT_EQ(g_policyCalls, 0u);
+  EXPECT_EQ(with.stats.draws + with.stats.replayFrames + with.stats.restoredUnapplied + with.stats.inPlaceAfter, 0u);
+}
+
+TEST_F(GfxRenderStageTest, OverlayNeverOutlivesItsPass) {
+  add_pass("opaque", Stage::OpaqueDone);
+  set_overlay_policy(&restore_policy);
+  seed(320, 180);
+  const EncoderTaskId task = register_encoder_task_type({.label = "test.overlay_task", .callback = &encode_nothing});
+  const std::vector<std::function<void()>> seals{
+      [] {
+        ResolvedTargets out;
+        resolve_pass({.color = false, .depth = false}, out);
+      },
+      [this] { copy_current_offscreen(); },
+      [task] { push_encoder_task(task, nullptr, 0); },
+      [] { queue_texture_copy({}, {}, {1, 1, 1}); },
+      [] {
+        begin_color_pass({.label = "test.color", .colorFormat = ColorFormat, .targetSize = {64, 64, 1}});
+        end_color_pass();
+      },
+      [this] {
+        give_current_pass_a_consumer();
+        begin_offscreen(320, 180);
+        end_offscreen();
+      },
+      [] { record_stage(Stage::OpaqueDone); },
+      [] { record_stage(Stage::PrePost); },
+      [] { finish(); },
+  };
+  const OverlayStats before = overlay_stats();
+  for (size_t i = 0; i < seals.size(); ++i) {
+    ASSERT_NO_FATAL_FAILURE(latch_new_frame(1));
+    push_draw(1);
+    defer_draw(2);
+    seals[i]();
+    EXPECT_EQ(detail::testing::overlay_command_count(), 0u) << i;
+  }
+  unregister_encoder_task_type(task);
+  next_frame();
+  const OverlayStats stats = stats_since(before);
+  EXPECT_EQ(stats.draws, seals.size());
+  EXPECT_EQ(stats.restoredSeal + stats.restoredLate + stats.restoredUnapplied, seals.size());
+  EXPECT_EQ(stats.dropped, 0u);
+}
 
 TEST_F(GfxDispatchStageTest, StageOpFlushesPendingDispatch) {
   add_pass("opaque", Stage::OpaqueDone);

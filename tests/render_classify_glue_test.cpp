@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "gfx/recording.hpp"
 #include "gx/draw_route.hpp"
 #include "gx/gx.hpp"
 #include "gx/hints.hpp"
@@ -8,11 +9,29 @@
 #include "render/frame_state.hpp"
 #include "render/gx_ext/records.hpp"
 #include "render/hints.hpp"
+#include "render/ao/denoise.hpp"
+#include "render/ao/gtao.hpp"
+#include "render/ao/hiz.hpp"
+#include "render/ao/upsample.hpp"
+#include "render/geometry/hzb.hpp"
+#include "render/graph.hpp"
+#include "render/gx_ext/fwd_env.hpp"
+#include "render/post/composite.hpp"
+#include "render/post/taa.hpp"
+#include "render/post/upscale/fsr/fsr_pass.hpp"
 #include "render/scene/classify.hpp"
+#include "render/scene/overlay.hpp"
 #include "render/settings.hpp"
+#include "render/stage_data.hpp"
 #include "render_test_caps.hpp"
 
+#include <SDL3/SDL_stdinc.h>
+
+#include <array>
 #include <cmath>
+#include <memory>
+#include <utility>
+#include <vector>
 #include <limits>
 #include <string>
 
@@ -513,6 +532,177 @@ TEST_F(RenderClassifyGlue, BlendedRule) {
   gx::g_gxState.colorUpdate = false;
   draw();
   EXPECT_EQ(last().kind, Kind::MainDepthOnly);
+}
+
+TEST_F(RenderClassifyGlue, OverlayArmingTruthTable) {
+  using overlay::ArmInputs;
+  using overlay::Env;
+  const ArmInputs pbr{.hints = true, .gbufferLayout = true, .surfaceLayout = true, .pbr = true, .legacyBlend = 0.f};
+  EXPECT_TRUE(overlay::pbr_can_change_pixels(pbr));
+  EXPECT_TRUE(overlay::armed_for(pbr));
+  const auto with = [](ArmInputs in, auto change) {
+    change(in);
+    return in;
+  };
+  EXPECT_TRUE(overlay::armed_for(with(pbr, [](ArmInputs& in) { in.legacyBlend = 0.999f; })));
+  EXPECT_FALSE(overlay::armed_for(with(pbr, [](ArmInputs& in) { in.legacyBlend = 1.f; })));
+  EXPECT_FALSE(overlay::armed_for(with(pbr, [](ArmInputs& in) { in.hints = false; })));
+  EXPECT_FALSE(overlay::armed_for(with(pbr, [](ArmInputs& in) { in.gbufferLayout = false; })));
+  EXPECT_FALSE(overlay::armed_for(with(pbr, [](ArmInputs& in) { in.surfaceLayout = false; })));
+  EXPECT_FALSE(overlay::armed_for(with(pbr, [](ArmInputs& in) { in.pbr = false; })));
+  EXPECT_FALSE(overlay::armed_for(with(pbr, [](ArmInputs& in) { in.identityForced = true; })));
+  EXPECT_FALSE(overlay::armed_for(with(pbr, [](ArmInputs& in) { in.classView = true; })));
+  EXPECT_FALSE(overlay::armed_for(with(pbr, [](ArmInputs& in) { in.passAfterOverlay = true; })));
+  EXPECT_FALSE(overlay::armed_for(with(pbr, [](ArmInputs& in) { in.env = Env::Off; })));
+
+  // The verification modes arm on any G-buffer frame, but never past the same vetoes
+  const ArmInputs tierB{.hints = true, .gbufferLayout = true, .legacyBlend = 1.f};
+  EXPECT_FALSE(overlay::armed_for(tierB));
+  for (const Env env : {Env::Force, Env::Drop, Env::Restore}) {
+    ArmInputs in = tierB;
+    in.env = env;
+    EXPECT_TRUE(overlay::armed_for(in));
+    EXPECT_FALSE(overlay::armed_for(with(in, [](ArmInputs& v) { v.hints = false; })));
+    EXPECT_FALSE(overlay::armed_for(with(in, [](ArmInputs& v) { v.gbufferLayout = false; })));
+    EXPECT_FALSE(overlay::armed_for(with(in, [](ArmInputs& v) { v.identityForced = true; })));
+    EXPECT_FALSE(overlay::armed_for(with(in, [](ArmInputs& v) { v.classView = true; })));
+    EXPECT_FALSE(overlay::armed_for(with(in, [](ArmInputs& v) { v.passAfterOverlay = true; })));
+  }
+}
+
+TEST_F(RenderClassifyGlue, OverlayEnvParsedOnce) {
+  using overlay::Env;
+  overlay::testing::reset();
+  SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_OVERLAY_DEFER", "force", true);
+  EXPECT_EQ(overlay::env(), Env::Force);
+  SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_OVERLAY_DEFER", "drop", true);
+  EXPECT_EQ(overlay::env(), Env::Force);
+  const std::array<std::pair<const char*, Env>, 6> cases{{
+      {"drop", Env::Drop},
+      {"restore", Env::Restore},
+      {"off", Env::Off},
+      {"0", Env::Off},
+      {"on", Env::Unset},
+      {"force", Env::Force},
+  }};
+  for (const auto& [text, expected] : cases) {
+    overlay::testing::reset();
+    SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_OVERLAY_DEFER", text, true);
+    EXPECT_EQ(overlay::env(), expected) << text;
+  }
+  SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_OVERLAY_DEFER");
+  overlay::testing::reset();
+  EXPECT_EQ(overlay::env(), Env::Unset);
+}
+
+bool g_applied = false;
+bool applied_source(const detail::StageData&) noexcept { return g_applied; }
+
+TEST_F(RenderClassifyGlue, OverlayDispositionFollowsMode) {
+  using gfx::OverlayDisposition;
+  using overlay::Env;
+  const detail::StageData opaqueDone{.stage = Stage::OpaqueDone};
+  overlay::testing::set_env(Env::Drop);
+  EXPECT_EQ(overlay::disposition(&opaqueDone), OverlayDisposition::Discard);
+  overlay::testing::set_env(Env::Restore);
+  EXPECT_EQ(overlay::disposition(&opaqueDone), OverlayDisposition::Restore);
+  overlay::testing::set_env(Env::Force);
+  EXPECT_EQ(overlay::disposition(nullptr), OverlayDisposition::Replay);
+
+  // Without W5's source nothing can say the PBR term ran, so every frame keeps the original order
+  overlay::testing::set_env(Env::Unset);
+  EXPECT_EQ(overlay::disposition(&opaqueDone), OverlayDisposition::Restore);
+  overlay::set_pbr_applied_source(&applied_source);
+  g_applied = true;
+  EXPECT_EQ(overlay::disposition(&opaqueDone), OverlayDisposition::Replay);
+  EXPECT_EQ(overlay::disposition(nullptr), OverlayDisposition::Restore);
+  g_applied = false;
+  EXPECT_EQ(overlay::disposition(&opaqueDone), OverlayDisposition::Restore);
+  overlay::set_pbr_applied_source(nullptr);
+}
+
+TEST_F(RenderClassifyGlue, OverlayKindDefersOnlyWhileArmed) {
+  main_scene();
+  sink().scopePush(sink().userData, {.categories = AURORA_CAT_PARTICLE | AURORA_CAT_OVERLAY | AURORA_CAT_NO_PBR});
+  gx::g_gxState.blendMode = GX_BM_BLEND;
+  gx::g_gxState.blendFacSrc = GX_BL_SRCALPHA;
+  gx::g_gxState.blendFacDst = GX_BL_INVSRCALPHA;
+  gx::g_gxState.depthUpdate = false;
+  EXPECT_EQ(draw().route, Route::Push);
+  EXPECT_EQ(last().kind, Kind::Overlay);
+
+  overlay::testing::set_armed(true);
+  const uint32_t before = stats().draws;
+  EXPECT_EQ(draw().route, Route::Defer);
+  // Classified and counted like an in-place draw, so records and reports do not change
+  EXPECT_EQ(stats().draws, before + 1);
+  gx::g_gxState.depthUpdate = true;
+  EXPECT_EQ(draw().route, Route::Push);
+  gx::g_gxState.depthUpdate = false;
+  gx::g_gxState.colorUpdate = false;
+  EXPECT_EQ(draw().route, Route::Push);
+  gx::g_gxState.colorUpdate = true;
+  sink().scopePush(sink().userData, {.categories = AURORA_CAT_FAKE_SHADOW});
+  EXPECT_EQ(draw().route, Route::Push);
+  sink().scopePop(sink().userData);
+  EXPECT_EQ(draw().route, Route::Defer);
+  sink().scopePop(sink().userData);
+  EXPECT_EQ(draw().route, Route::Push);
+  EXPECT_NE(last().kind, Kind::Overlay);
+
+  sink().scopePush(sink().userData, {.categories = AURORA_CAT_OVERLAY});
+  stage(Stage::OpaqueDone);
+  EXPECT_EQ(draw().route, Route::Push);
+  EXPECT_NE(last().kind, Kind::Overlay);
+  sink().scopePop(sink().userData);
+}
+
+std::shared_ptr<const detail::CompiledGraph> builtin_graph(const Settings& settings) {
+  static const Caps caps = test::full_caps();
+  const std::vector<detail::PassDesc> passes{
+      detail::hzb::opaque_pass_desc(),        detail::ao::hiz::pass_desc(),     detail::ao::gtao::pass_desc(),
+      detail::ao::upsample::pass_desc(),      detail::ao::denoise::pass_desc(), detail::composite::copy_pass_desc(),
+      detail::composite::pass_desc(),         gx_ext::fwd_env::pass_desc(),     detail::taa::pass_desc(),
+      detail::upscale::fsr_pass::pass_desc(),
+  };
+  const std::vector<detail::GxReadDesc> reads{gx_ext::fwd_env::read_desc()};
+  detail::GraphEnvironment env;
+  env.efbSize = {1280, 720};
+  env.outputSize = {1920, 1080};
+  env.sceneSize = {1280, 720};
+  const auto set = [&](detail::GxResource resource, wgpu::TextureFormat format) {
+    env.gxFormats[static_cast<size_t>(resource)] = format;
+    env.gxUsage[static_cast<size_t>(resource)] = wgpu::TextureUsage::RenderAttachment |
+                                                 wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc |
+                                                 wgpu::TextureUsage::CopyDst;
+  };
+  set(detail::GxResource::Color, wgpu::TextureFormat::BGRA8Unorm);
+  set(detail::GxResource::Depth, wgpu::TextureFormat::Depth32Float);
+  set(detail::GxResource::Normal, wgpu::TextureFormat::RGB10A2Unorm);
+  set(detail::GxResource::Motion, wgpu::TextureFormat::RG16Float);
+  set(detail::GxResource::Reactive, wgpu::TextureFormat::R8Unorm);
+  set(detail::GxResource::Fog, wgpu::TextureFormat::RGBA8Uint);
+  set(detail::GxResource::Surface, wgpu::TextureFormat::RGBA32Uint);
+  return detail::compile_graph(detail::GraphInputs{
+      .passes = passes,
+      .gxReads = reads,
+      .settings = &settings,
+      .caps = &caps,
+      .env = env,
+      .sceneDepthSource = DepthSource::Direct,
+  });
+}
+
+TEST_F(RenderClassifyGlue, OverlayPassAfterIgnoresBuiltIns) {
+  Settings settings;
+  settings.ao = Quality::High;
+  settings.taa = true;
+  settings.upscaler = Upscaler::Fsr;
+  const std::shared_ptr<const detail::CompiledGraph> graph = builtin_graph(settings);
+  ASSERT_NE(graph, nullptr);
+  ASSERT_NE(graph->find_node(detail::composite::Pass), detail::InvalidNode);
+  EXPECT_EQ(graph->nodes[graph->find_node(detail::composite::Pass)].status, detail::CullReason::None);
+  EXPECT_FALSE(overlay::pass_after_overlay(*graph));
 }
 
 TEST_F(RenderClassifyGlue, ResetClearsEverything) {

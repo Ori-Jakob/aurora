@@ -13,6 +13,9 @@
 #include <vector>
 
 namespace render_demo {
+inline constexpr u32 OverlayCheckFrame = 30;
+inline constexpr u32 OverlayLateFrame = 32;
+
 struct SceneOptions {
   bool hints = true;
   bool captureOnlyBox = false;
@@ -25,6 +28,12 @@ struct SceneOptions {
   bool fwdEnvCheck = false;
   bool unlitCheck = false;
   bool companionCheck = false;
+  bool overlayCheck = false;
+};
+
+struct OverlayColors {
+  std::array<u8, 4> quad{};
+  std::array<u8, 4> box{};
 };
 
 struct SceneCamera {
@@ -82,6 +91,8 @@ std::vector<UnlitProbe> unlit_probes();
 std::vector<CompanionProbe> companion_probes();
 CompanionAxes companion_axes() noexcept;
 std::span<const u8> ground_texture_base() noexcept;
+std::array<f32, 2> overlay_probe() noexcept;
+OverlayColors overlay_colors() noexcept;
 FogResolveCounts fog_resolve_counts() noexcept;
 uint32_t gpu_uploads_per_frame(const SceneOptions& options) noexcept;
 bool init_scene();

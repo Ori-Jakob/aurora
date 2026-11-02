@@ -221,6 +221,7 @@ std::atomic<uint64_t> g_routed{0};
 std::atomic<uint64_t> g_suppressed{0};
 std::atomic<uint64_t> g_mergeBreaks{0};
 std::atomic<uint64_t> g_substituted{0};
+std::atomic<uint64_t> g_deferred{0};
 std::atomic_uint32_t g_cpuZoneTimed{0};
 std::array<std::atomic_uint64_t, CpuZoneCount> g_cpuZoneCalls{};
 std::array<std::atomic_uint64_t, CpuZoneCount> g_cpuZoneNs{};
@@ -1124,26 +1125,48 @@ static DrawData* merge_target(GXPrimitive prim, GXVtxFmt fmt) noexcept {
   return lastDraw != nullptr && lastDraw->instanceCount == 1 ? lastDraw : nullptr;
 }
 
+enum class RouteAction : uint8_t { Push, Skip, Defer };
+
 // A diverted draw ends the merge chain, so no later draw can merge across what was left out
-static bool route_draw(const draw_route::Query& query) noexcept {
+static RouteAction route_draw(const draw_route::Query& query) noexcept {
   const auto* router = draw_route::router();
   if (router == nullptr || router->route == nullptr) {
-    return false;
+    return RouteAction::Push;
   }
   g_routed.fetch_add(1, std::memory_order_relaxed);
   const draw_route::Decision decision = router->route(router->userData, query);
-  if (decision.route != draw_route::Route::Push) {
+  if (decision.route == draw_route::Route::Suppress) {
     break_draw_merge();
     g_suppressed.fetch_add(1, std::memory_order_relaxed);
-    return true;
+    return RouteAction::Skip;
+  }
+  if (decision.route == draw_route::Route::Defer) {
+    break_draw_merge();
+    return RouteAction::Defer;
   }
   // Only a break that prevents a merge counts; an indexed draw always starts its own command
   if (decision.breakMerge && !query.indexed && merge_target(query.prim, query.fmt) != nullptr) {
     break_draw_merge();
     g_mergeBreaks.fetch_add(1, std::memory_order_relaxed);
   }
-  return false;
+  return RouteAction::Push;
 }
+
+// No draw may merge into or across a deferred one, so replay and restore both keep the original order
+struct OverlayDraw {
+  bool on;
+  explicit OverlayDraw(bool d) noexcept : on(d && gfx::set_overlay_target(true)) {
+    if (on) {
+      g_deferred.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  ~OverlayDraw() {
+    if (on) {
+      gfx::set_overlay_target(false);
+      break_draw_merge();
+    }
+  }
+};
 
 static bool gpu_arrays_ready() noexcept {
   for (u32 mask = g_gxState.gpuArrayMask; mask != 0; mask &= mask - 1) {
@@ -1196,10 +1219,12 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
       return;
     }
 
-  if (route_draw({.prim = prim, .fmt = fmt, .vtxCount = vtxCount})) {
+  const RouteAction action = route_draw({.prim = prim, .fmt = fmt, .vtxCount = vtxCount});
+  if (action == RouteAction::Skip) {
     reader.skip(totalVtxBytes);
     return;
   }
+  const OverlayDraw overlay{action == RouteAction::Defer};
 
   auto* lastDraw = merge_target(prim, fmt);
   const bool canMerge = lastDraw != nullptr;
@@ -1276,10 +1301,14 @@ static void handle_draw_indexed(ByteReader& reader) noexcept {
       gpu_channel::note_suppressed_draw();
       return;
     }
-  if (indexCount != 0 && route_draw({.prim = prim, .fmt = fmt, .vtxCount = vtxCount, .indexed = true})) {
+  const RouteAction action = indexCount != 0
+                                 ? route_draw({.prim = prim, .fmt = fmt, .vtxCount = vtxCount, .indexed = true})
+                                 : RouteAction::Push;
+  if (action == RouteAction::Skip) {
     reader.skip(idxBytes + totalVtxBytes);
     return;
   }
+  const OverlayDraw overlay{action == RouteAction::Defer};
   // Index data is always host-endian; push it to the GPU buffer as-is
   const auto indexData = reader.take(idxBytes);
   const gfx::Range idxRange = gfx::push_indices(indexData.data(), indexData.size(), 4);
@@ -1513,6 +1542,7 @@ DrawRouteStats draw_route_stats() noexcept {
       .suppressed = g_suppressed.load(std::memory_order_relaxed),
       .mergeBreaks = g_mergeBreaks.load(std::memory_order_relaxed),
       .substituted = g_substituted.load(std::memory_order_relaxed),
+      .deferred = g_deferred.load(std::memory_order_relaxed),
   };
 }
 
@@ -1675,6 +1705,7 @@ void reset_draw_route_stats() noexcept {
   g_suppressed.store(0, std::memory_order_relaxed);
   g_mergeBreaks.store(0, std::memory_order_relaxed);
   g_substituted.store(0, std::memory_order_relaxed);
+  g_deferred.store(0, std::memory_order_relaxed);
 }
 
 void reset_array_upload_stats() noexcept {

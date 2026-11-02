@@ -72,6 +72,18 @@ struct CompanionCheckReport {
   std::array<std::vector<CompanionSample>, CompanionPhaseCount> phases;
 };
 
+enum OverlaySample : u32 { OverlayOpaqueDone30, OverlayPrePost30, OverlayPrePost32, OverlaySampleCount };
+
+struct OverlayCheckReport {
+  u32 encodesA = 0;
+  u32 encodesB = 0;
+  bool ready = false;
+  u32 width = 0;
+  u32 height = 0;
+  // Packed RGBA8 at the quad centre, in OverlaySample order
+  std::array<u32, OverlaySampleCount> colors{};
+};
+
 struct GraphPassOptions {
   bool vignette = false;
   std::string vignetteAnchor;
@@ -86,6 +98,7 @@ struct GraphPassOptions {
   bool fwdEnvCheck = false;
   bool unlitCheck = false;
   bool companionCheck = false;
+  bool overlayCheck = false;
 };
 
 struct GraphPassReport {
@@ -105,6 +118,7 @@ struct GraphPassReport {
   FwdEnvCheckReport fwdEnv;
   UnlitCheckReport unlit;
   CompanionCheckReport companion;
+  OverlayCheckReport overlay;
 };
 
 bool pipelines_compiling() noexcept;

@@ -1,5 +1,6 @@
 #include "bench_report.hpp"
 #include "companion_fixtures.hpp"
+#include "gfx/recording.hpp"
 #include "graph_checks.hpp"
 #include "graph_passes.hpp"
 #include "hint_checks.hpp"
@@ -18,6 +19,7 @@
 #include <dolphin/gx.h>
 #include <SDL3/SDL_stdinc.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -56,6 +58,7 @@ enum ExitCode : int {
   ExitFwdEnvCheck = 14,
   ExitUnlitCheck = 15,
   ExitCompanionCheck = 16,
+  ExitOverlayCheck = 17,
 };
 
 std::atomic_uint32_t g_errorCount = 0;
@@ -332,6 +335,105 @@ CompanionOutcome companion_outcome(const render_demo::CompanionCheckReport& repo
     outcome.failure = render_demo::check_companions(outcome.summary);
   }
   return outcome;
+}
+
+struct OverlayShape {
+  uint64_t ops = 0;
+  uint64_t passes = 0;
+  uint64_t commands = 0;
+  std::string checkFrame;
+  std::string lateFrame;
+};
+
+// From frame 20 on, so the run-to-run timing of the G-buffer switch never shows in the counts
+constexpr uint32_t OverlayShapeFirstFrame = 20;
+
+OverlayShape overlay_shape(const std::vector<aurora::gfx::detail::testing::RecordedShape>& shapes) {
+  OverlayShape shape;
+  const auto list = [](const std::vector<uint32_t>& counts) {
+    std::string text;
+    for (const uint32_t count : counts) {
+      text += (text.empty() ? "" : ",") + std::to_string(count);
+    }
+    return text;
+  };
+  for (const auto& frame : shapes) {
+    if (frame.frameIndex < OverlayShapeFirstFrame) {
+      continue;
+    }
+    shape.ops += frame.ops;
+    shape.passes += frame.passCommands.size();
+    for (const uint32_t count : frame.passCommands) {
+      shape.commands += count;
+    }
+    if (frame.frameIndex == render_demo::OverlayCheckFrame) {
+      shape.checkFrame = list(frame.passCommands);
+    } else if (frame.frameIndex == render_demo::OverlayLateFrame) {
+      shape.lateFrame = list(frame.passCommands);
+    }
+  }
+  return shape;
+}
+
+uint32_t pack_rgb(const std::array<u8, 4>& rgba) { return rgba[0] | (rgba[1] << 8) | (rgba[2] << 16); }
+
+uint32_t overlay_blend_rgb() {
+  const render_demo::OverlayColors colors = render_demo::overlay_colors();
+  const double alpha = colors.quad[3] / 255.0;
+  std::array<u8, 4> blend{};
+  for (size_t i = 0; i < 3; ++i) {
+    blend[i] = static_cast<u8>(std::lround(colors.quad[i] * alpha + colors.box[i] * (1.0 - alpha)));
+  }
+  return pack_rgb(blend);
+}
+
+uint32_t rgb_distance(uint32_t a, uint32_t b) {
+  uint32_t worst = 0;
+  for (uint32_t shift = 0; shift < 24; shift += 8) {
+    const int delta = static_cast<int>((a >> shift) & 0xff) - static_cast<int>((b >> shift) & 0xff);
+    worst = std::max<uint32_t>(worst, static_cast<uint32_t>(std::abs(delta)));
+  }
+  return worst;
+}
+
+std::optional<std::string> overlay_failure(const render_demo::OverlayCheckReport& report,
+                                           const aurora::gfx::OverlayStats& stats, std::string_view mode,
+                                           bool nullBackend) {
+  const bool force = mode == "force";
+  const bool deferring = force || mode == "drop" || mode == "restore";
+  char text[160];
+  if (deferring ? stats.draws < 2 : stats.draws != 0) {
+    std::snprintf(text, sizeof(text), "%llu draws deferred under %.*s", static_cast<unsigned long long>(stats.draws),
+                  static_cast<int>(mode.size()), mode.data());
+    return std::string{text};
+  }
+  if (stats.refused != 0 || stats.dropped != 0) {
+    return std::string{"deferred draws were refused or dropped"};
+  }
+  // Frame 32 has no OPAQUE_DONE marker, so it alone restores late; every other frame replays
+  if (force && (stats.restoredLate != 1 || stats.restoredSeal != 0 || stats.restoredUnapplied != 0)) {
+    return std::string{"restores under force were not exactly the late frame"};
+  }
+  // The null backend runs no shaders, so its values say nothing
+  if (nullBackend) {
+    return std::nullopt;
+  }
+  if (report.encodesA == 0 || report.encodesB == 0) {
+    return std::string{"gx.color never reached demo.overlay_probe_a and _b"};
+  }
+  if (!report.ready) {
+    return std::string{"probe readback did not complete"};
+  }
+  const uint32_t box = pack_rgb(render_demo::overlay_colors().box);
+  const auto rgb = [&](render_demo::OverlaySample sample) { return report.colors[sample] & 0xffffffu; };
+  if (rgb(render_demo::OverlayOpaqueDone30) != box || rgb(render_demo::OverlayPrePost32) != box) {
+    return std::string{"the box was not exactly in place before gx.overlay on frame 30 or after frame 32's restore"};
+  }
+  if (force ? rgb_distance(rgb(render_demo::OverlayPrePost30), overlay_blend_rgb()) > 1
+            : rgb(render_demo::OverlayPrePost30) != box) {
+    return std::string{force ? "the replayed quad did not blend over the box" : "the quad showed through the box"};
+  }
+  return std::nullopt;
 }
 
 struct HintCounterSnapshot {
@@ -701,6 +803,10 @@ int main(int argc, char* argv[]) {
   if (options.companionCheck) {
     SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_MAT_MAPS", "on", false);
   }
+  if (options.overlayCheck) {
+    // Deferral arms only on a G-buffer layout, which the demo's own settings never request
+    SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_GBUFFER", "on", false);
+  }
 
   AuroraConfig config{};
   config.appName = "render_demo";
@@ -748,7 +854,8 @@ int main(int argc, char* argv[]) {
                                          .aoCheck = options.aoCheck,
                                          .fwdEnvCheck = options.fwdEnvCheck,
                                          .unlitCheck = options.unlitCheck,
-                                         .companionCheck = options.companionCheck};
+                                         .companionCheck = options.companionCheck,
+                                         .overlayCheck = options.overlayCheck};
   bool decodingChanged = false;
 
   GXInit(nullptr, 0);
@@ -770,7 +877,8 @@ int main(int argc, char* argv[]) {
                                                                    .aoCheck = options.aoCheck,
                                                                    .fwdEnvCheck = options.fwdEnvCheck,
                                                                    .unlitCheck = options.unlitCheck,
-                                                                   .companionCheck = options.companionCheck},
+                                                                   .companionCheck = options.companionCheck,
+                                                                   .overlayCheck = options.overlayCheck},
                                                                   graphError)) {
     std::fprintf(stderr, "render_demo: render graph setup failed: %s\n", graphError.c_str());
     render_demo::shutdown_scene();
@@ -782,6 +890,9 @@ int main(int argc, char* argv[]) {
   CompanionRun companionRun;
   if (options.companionCheck) {
     render_demo::prepare_companion_loads();
+  }
+  if (options.overlayCheck) {
+    aurora::gfx::detail::testing::keep_frame_shapes(true);
   }
 
   const auto start = std::chrono::steady_clock::now();
@@ -869,6 +980,12 @@ int main(int argc, char* argv[]) {
   if (options.companionCheck) {
     companionRun.companionSkips = render_demo::companion_counts().companionSkips;
     render_demo::release_companion_fixtures();
+  }
+  const aurora::gfx::OverlayStats overlayStats = aurora::gfx::overlay_stats();
+  const OverlayShape overlayShape =
+      options.overlayCheck ? overlay_shape(aurora::gfx::detail::testing::take_frame_shapes()) : OverlayShape{};
+  if (options.overlayCheck) {
+    aurora::gfx::detail::testing::keep_frame_shapes(false);
   }
   HintCounterSnapshot hintCounters = read_hint_counters();
   const bool gpuChannel = options.gpuArrays || options.gpuPadMiB != 0;
@@ -1010,6 +1127,38 @@ int main(int argc, char* argv[]) {
         c.matFailures, c.blendOneMismatches, c.ormFailures, c.albedoFailures, graphReport.companion.width,
         graphReport.companion.height);
   }
+  const char* overlayEnv = SDL_getenv("AURORA_RENDER_OVERLAY_DEFER");
+  const std::string_view overlayMode = overlayEnv != nullptr ? overlayEnv : "unset";
+  const std::optional<std::string> overlayFailure =
+      options.overlayCheck
+          ? overlay_failure(graphReport.overlay, overlayStats, overlayMode, info.backend == BACKEND_NULL)
+          : std::nullopt;
+  if (options.overlayCheck) {
+    const std::string status = overlayFailure                 ? "FAILED: " + *overlayFailure
+                               : info.backend == BACKEND_NULL ? std::string{"skipped (null backend)"}
+                                                              : std::string{"passed"};
+    const auto& s = overlayStats;
+    const auto& o = graphReport.overlay;
+    std::printf(
+        "render_demo: overlay check %s (%.*s): deferred %llu, replayed frames %llu, restored %llu seal / %llu late / "
+        "%llu unapplied, discarded %llu, refused %llu, dropped %llu, in-place after %llu; A30 %06x, B30 %06x, B32 "
+        "%06x, box %06x, blend %06x at %ux%u\n",
+        status.c_str(), static_cast<int>(overlayMode.size()), overlayMode.data(),
+        static_cast<unsigned long long>(s.draws), static_cast<unsigned long long>(s.replayFrames),
+        static_cast<unsigned long long>(s.restoredSeal), static_cast<unsigned long long>(s.restoredLate),
+        static_cast<unsigned long long>(s.restoredUnapplied), static_cast<unsigned long long>(s.discarded),
+        static_cast<unsigned long long>(s.refused), static_cast<unsigned long long>(s.dropped),
+        static_cast<unsigned long long>(s.inPlaceAfter), o.colors[render_demo::OverlayOpaqueDone30] & 0xffffffu,
+        o.colors[render_demo::OverlayPrePost30] & 0xffffffu, o.colors[render_demo::OverlayPrePost32] & 0xffffffu,
+        pack_rgb(render_demo::overlay_colors().box), overlay_blend_rgb(), o.width, o.height);
+    std::printf(
+        "render_demo: overlay shape from frame %u: ops %llu, passes %llu, commands %llu; frame %u [%s]; "
+        "frame %u [%s]\n",
+        OverlayShapeFirstFrame, static_cast<unsigned long long>(overlayShape.ops),
+        static_cast<unsigned long long>(overlayShape.passes), static_cast<unsigned long long>(overlayShape.commands),
+        render_demo::OverlayCheckFrame, overlayShape.checkFrame.c_str(), render_demo::OverlayLateFrame,
+        overlayShape.lateFrame.c_str());
+  }
   if (options.gpuCull != 0) {
     print_cull_report(graphReport.cull, frame, options.cullTimings);
   }
@@ -1073,6 +1222,9 @@ int main(int argc, char* argv[]) {
   }
   if (companionOutcome.failure) {
     return ExitCompanionCheck;
+  }
+  if (overlayFailure) {
+    return ExitOverlayCheck;
   }
 
   if (cullFailure) {
