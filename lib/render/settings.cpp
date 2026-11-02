@@ -13,12 +13,13 @@
 #include "../gx/texture.hpp"
 #include "../logging.hpp"
 #include "../webgpu/caps.hpp"
+#include "ao/ao.hpp"
 
 #if AURORA_ENABLE_RENDER
-#include "ao/ao.hpp"
 #include "debug/debug.hpp"
 #include "gx_ext/ext_provider.hpp"
 #include "hints.hpp"
+#include "post/composite.hpp"
 #include "post/taa.hpp"
 #include "post/upscale/upscale.hpp"
 #include "scene/classify.hpp"
@@ -123,6 +124,9 @@ constexpr BuiltOptions DefaultBuiltOptions = [] {
   built[static_cast<size_t>(Feature::Upscaler)] = (1u << 1) | (1u << 4);
   built[static_cast<size_t>(Feature::Upscaler)] |= 1u << 3;
   built[static_cast<size_t>(Feature::Upscaler)] |= 1u << 2;
+  // AO reaches the screen only through the deferred-fog composite, so their bits ship together
+  built[static_cast<size_t>(Feature::Ao)] = ao::BuiltOptionMask;
+  built[static_cast<size_t>(Feature::DeferredFog)] = 1u << 1;
   return built;
 }();
 
@@ -531,7 +535,7 @@ Settings with_env_overrides(Settings settings) noexcept {
   return settings;
 }
 
-// AURORA_RENDER_AO builds AO for development before the composite exists, as AURORA_RENDER_GBUFFER forced tier B in M7
+// AURORA_RENDER_AO also ORs in AO's built bits, so verification runs never depend on the defaults
 BuiltOptions support_built(const BuiltOptions& built) noexcept {
 #if AURORA_ENABLE_RENDER
   return ao::with_dev_built(built, ao::env_ao_request());
@@ -1100,6 +1104,7 @@ std::shared_ptr<const FrameState> latch_frame() {
   }
   upscale::latch_graph(latched_settings(), graph.get());
   ao::on_latch(latched_settings(), graph.get());
+  composite::on_latch(latched_settings(), graph.get());
   latch_pass_params();
   inspectorOpen = g_graphEnvironment.inspectorOpen;
 #endif

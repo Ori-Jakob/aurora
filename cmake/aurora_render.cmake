@@ -140,6 +140,8 @@ if (AURORA_ENABLE_RENDER)
         target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_NATIVE_D3D12=0)
     endif ()
     target_sources(aurora_gx PRIVATE
+        lib/render/post/composite.cpp
+        lib/render/post/composite.hpp
         lib/render/post/taa.cpp
         lib/render/post/taa.hpp
         lib/render/post/temporal_resolve.cpp

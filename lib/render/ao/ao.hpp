@@ -49,7 +49,7 @@ inline constexpr uint32_t HilbertWidth = 64;
 inline constexpr uint32_t NoiseStride = 288;
 inline constexpr std::array<uint32_t, 2> R2Steps{3242174889u, 2447445414u};
 
-// W4 sets these with the composite; until then AO is reachable only through AURORA_RENDER_AO
+// Built by default with the composite, the only way AO reaches the screen
 inline constexpr uint32_t BuiltOptionMask = (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4);
 
 enum ParamFlags : uint32_t {

@@ -5,9 +5,10 @@
 #include "render/debug/debug.hpp"
 #include "render/frame_state.hpp"
 #include "render/module.hpp"
-#if AURORA_ENABLE_RENDER
 #include "render/ao/ao.hpp"
+#if AURORA_ENABLE_RENDER
 #include "render/geometry/compact.hpp"
+#include "render/post/composite.hpp"
 #endif
 #include "render/settings.hpp"
 #include "render_test_caps.hpp"
@@ -313,8 +314,12 @@ TEST_F(RenderApiTest, TaaAndGBufferBuiltByDefault) {
     EXPECT_EQ(evaluate_support(feature, 1, Settings{}, env(budget24, built)), unsupported(Reason::ColorBudget))
         << feature_name(feature);
   }
-  EXPECT_EQ(evaluate_support(Feature::DeferredFog, 1, Settings{}, env(full_caps(), built)),
-            unsupported(Reason::NotImplemented));
+  EXPECT_EQ(evaluate_support(Feature::DeferredFog, 1, Settings{}, env(full_caps(), built)), Supported);
+  EXPECT_EQ(evaluate_support(Feature::DeferredFog, 1, Settings{}, env(metal32_caps(), built)), Supported);
+  EXPECT_EQ(evaluate_support(Feature::DeferredFog, 1, Settings{}, env(compat_caps(), built)),
+            unsupported(Reason::NeedsCore));
+  EXPECT_EQ(evaluate_support(Feature::DeferredFog, 1, Settings{}, env(full_caps(), built, 4)),
+            unsupported(Reason::MsaaActive));
 
   const Settings full = clamp_settings({.taa = true}, env(full_caps(), built));
   EXPECT_TRUE(full.taa);
@@ -329,8 +334,8 @@ TEST_F(RenderApiTest, TaaAndGBufferBuiltByDefault) {
   detail::latch_frame();
   EXPECT_TRUE(feature_enabled(effective_settings(), Feature::Taa));
   EXPECT_TRUE(feature_enabled(effective_settings(), Feature::DeferredFog));
-  EXPECT_FALSE(feature_ready(Feature::DeferredFog));
-  EXPECT_FALSE(feature_active(Feature::DeferredFog));
+  EXPECT_TRUE(feature_ready(Feature::DeferredFog));
+  EXPECT_TRUE(feature_active(Feature::DeferredFog));
   gfx::shutdown_pipeline_cache();
 #endif
 }
@@ -476,13 +481,48 @@ TEST_F(RenderApiTest, UnbuiltGBufferBlocksBaseFeatures) {
   EXPECT_EQ(evaluate_support(Feature::Ao, 0, Settings{}, env(caps, aoOnly)), unsupported(Reason::NotImplemented));
 }
 
-TEST_F(RenderApiTest, AoNotBuiltBeforeComposite) {
-  const Caps caps = full_caps();
+TEST_F(RenderApiTest, AoBuiltByDefault) {
   const BuiltOptions& built = detail::default_built_options();
-  EXPECT_EQ(evaluate_support(Feature::Ao, static_cast<uint8_t>(Quality::High), Settings{}, env(caps, built)),
-            unsupported(Reason::NotImplemented));
-  EXPECT_EQ(clamp_settings({.ao = Quality::High}, env(caps, built)).ao, Quality::Off);
+  EXPECT_EQ(built[static_cast<size_t>(Feature::Ao)], detail::ao::BuiltOptionMask);
+  for (const Quality quality : {Quality::Low, Quality::Medium, Quality::High, Quality::Ultra}) {
+    EXPECT_EQ(evaluate_support(Feature::Ao, static_cast<uint8_t>(quality), Settings{}, env(full_caps(), built)),
+              Supported)
+        << static_cast<int>(quality);
+    EXPECT_EQ(clamp_settings({.ao = quality}, env(full_caps(), built)).ao, quality);
+  }
+  EXPECT_EQ(evaluate_support(Feature::Ao, 0, Settings{}, env(compat_caps(), built)), unsupported(Reason::NeedsCore));
+  EXPECT_EQ(evaluate_support(Feature::Ao, 0, Settings{}, env(full_caps(), built, 4)), unsupported(Reason::MsaaActive));
+  EXPECT_EQ(clamp_settings({.ao = Quality::High}, env(compat_caps(), built)).ao, Quality::Off);
 }
+
+#if AURORA_ENABLE_RENDER
+TEST_F(RenderApiTest, DeferredFogFollowsComposite) {
+  detail::testing::set_caps(full_caps());
+  apply_settings({.taa = true});
+  detail::latch_frame();
+  ASSERT_TRUE(feature_enabled(effective_settings(), Feature::DeferredFog));
+  EXPECT_TRUE(feature_ready(Feature::DeferredFog));
+  EXPECT_TRUE(detail::composite::ready(effective_settings()));
+
+  apply_settings({.ao = Quality::High});
+  detail::latch_frame();
+  ASSERT_TRUE(feature_enabled(effective_settings(), Feature::Ao));
+  ASSERT_TRUE(feature_enabled(effective_settings(), Feature::DeferredFog));
+  EXPECT_FALSE(detail::composite::live());
+  EXPECT_FALSE(detail::composite::ready(effective_settings()));
+  EXPECT_FALSE(feature_ready(Feature::Ao));
+  EXPECT_FALSE(feature_ready(Feature::DeferredFog));
+  EXPECT_FALSE(feature_active(Feature::DeferredFog));
+  EXPECT_TRUE(feature_ready(Feature::GBuffer));
+  EXPECT_TRUE(feature_ready(Feature::Taa));
+
+  apply_settings({});
+  detail::latch_frame();
+  EXPECT_TRUE(feature_ready(Feature::Ao));
+  EXPECT_TRUE(feature_ready(Feature::DeferredFog));
+  gfx::shutdown_pipeline_cache();
+}
+#endif
 
 #if AURORA_ENABLE_RENDER
 TEST_F(RenderApiTest, AoReadyTracksPipelines) {

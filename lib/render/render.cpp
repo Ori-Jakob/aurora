@@ -17,6 +17,7 @@
 #include "gx_ext/ext_provider.hpp"
 #include "material/gx_lookup.hpp"
 #include "native/native.hpp"
+#include "post/composite.hpp"
 #include "post/taa.hpp"
 #include "post/temporal_resolve.hpp"
 #include "post/upscale/upscale.hpp"
@@ -99,6 +100,7 @@ void initialize() {
   hzb::initialize();
   taa::initialize();
   ao::initialize();
+  composite::initialize();
   upscale::initialize();
   systems::initialize();
   debug::initialize();
@@ -132,6 +134,7 @@ void shutdown() noexcept {
   shaders::shutdown();
   jobs::shutdown();
   hzb::shutdown();
+  composite::shutdown();
   ao::shutdown();
   taa::shutdown();
   upscale::shutdown();
@@ -206,9 +209,12 @@ bool feature_ready(Feature feature) noexcept {
   if (feature == Feature::Ao && !detail::ao::ready(effective_settings())) {
     return false;
   }
+  // AO is visible only through the composite, so its pipeline and input contract gate Applying...
+  if ((feature == Feature::Ao || feature == Feature::DeferredFog) && !detail::composite::ready(effective_settings())) {
+    return false;
+  }
 #endif
-  // DeferredFog mirrors the gbuffer request but has no composite until its built bit is set
-  return feature != Feature::DeferredFog || feature_support(Feature::DeferredFog, 1).supported;
+  return true;
 }
 
 std::string_view feature_name(Feature feature) noexcept { return detail::feature_info(feature).name; }
