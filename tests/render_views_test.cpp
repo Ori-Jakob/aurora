@@ -4,6 +4,7 @@
 #include "gx/gx.hpp"
 #include "gx/pipeline.hpp"
 #include "gx/shader_info.hpp"
+#include "render/debug/decomp_view.hpp"
 #include "render/debug/views.hpp"
 #include "render/frame_state.hpp"
 #include "render/scene/classify.hpp"
@@ -160,18 +161,30 @@ TEST_F(RenderViews, GbufViewTableFollowsClassRange) {
     names.insert(view.name);
   }
   uint16_t expected = FirstGbufView;
+  std::set<uint32_t> targetModes;
   for (const GbufView& view : GbufViews) {
     EXPECT_EQ(view.id, expected++);
     EXPECT_TRUE(names.insert(view.name).second) << view.name;
     EXPECT_EQ(find_gbuf_view(view.id), &view);
     EXPECT_EQ(find_view(view.id), nullptr);
-    EXPECT_TRUE(view.resource.starts_with("gbuf.") || view.resource.starts_with("gx.")) << view.resource;
+    if (view.kind == GbufViewKind::Decomposition) {
+      EXPECT_FALSE(view.uintSource) << view.name;
+      EXPECT_TRUE(view.name.starts_with("composite.")) << view.name;
+      continue;
+    }
+    EXPECT_TRUE(targetModes.insert(view.mode).second) << view.name;
     EXPECT_EQ(view.uintSource, view.resource == "gbuf.fog") << view.name;
-    EXPECT_EQ(view.mode, static_cast<uint32_t>(view.id - FirstGbufView));
+    const bool gx = view.resource.starts_with("gbuf.") || view.resource.starts_with("gx.");
+    EXPECT_EQ(gx, view.id <= 22) << view.name;
+    EXPECT_EQ(gx, detail::find_gx_resource(view.resource).has_value()) << view.name;
+    if (gx) {
+      EXPECT_EQ(view.mode, static_cast<uint32_t>(view.id - FirstGbufView));
+    }
   }
-  EXPECT_EQ(expected, 23u);
+  EXPECT_EQ(expected, 30u);
+  EXPECT_EQ(targetModes, (std::set<uint32_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}));
   EXPECT_EQ(find_gbuf_view(LastReservedClassView), nullptr);
-  EXPECT_EQ(find_gbuf_view(23), nullptr);
+  EXPECT_EQ(find_gbuf_view(30), nullptr);
   EXPECT_EQ(find_gbuf_view(16)->stage, Stage::PrePost);
   EXPECT_EQ(find_gbuf_view(18)->anchor, "phase.composite");
   EXPECT_EQ(find_gbuf_view(22)->label, "G-buffer: receiver code");
@@ -196,6 +209,129 @@ TEST_F(RenderViews, ParseGbufViewNames) {
   for (const std::string_view bad : {"gbuf.", "gbuf.fog.", "fog.colour", "gx.motion"}) {
     EXPECT_EQ(id(bad), std::nullopt) << bad;
   }
+}
+
+TEST_F(RenderViews, DecompositionRowsAppendFrom23) {
+  struct Row {
+    uint16_t id;
+    std::string_view name;
+    std::string_view resource;
+    std::string_view anchor;
+    GbufViewKind kind;
+    uint32_t mode;
+  };
+  constexpr std::array<Row, 7> Rows{{
+      {23, "ao.final", "ao.final", "phase.composite", GbufViewKind::Target, 7},
+      {24, "composite.defog", "gx.color", "phase.volumetrics", GbufViewKind::Decomposition, 0},
+      {25, "composite.identity", "legacyTex", "phase.composite", GbufViewKind::Decomposition, 1},
+      {26, "composite.coverage", "gbuf.fog", "phase.volumetrics", GbufViewKind::Decomposition, 2},
+      {27, "composite.multiply", "gx.color", "phase.volumetrics", GbufViewKind::Decomposition, 3},
+      {28, "ao.raw", "ao.raw", "phase.ao", GbufViewKind::Target, 8},
+      {29, "ao.hiz", "ao.hiz", "phase.ao", GbufViewKind::Target, 9},
+  }};
+  for (const Row& row : Rows) {
+    const GbufView* view = find_gbuf_view(row.id);
+    ASSERT_NE(view, nullptr) << row.id;
+    EXPECT_EQ(view->name, row.name);
+    EXPECT_EQ(view->resource, row.resource) << row.name;
+    EXPECT_EQ(view->anchor, row.anchor) << row.name;
+    EXPECT_EQ(view->stage, Stage::OpaqueDone) << row.name;
+    EXPECT_EQ(view->kind, row.kind) << row.name;
+    EXPECT_EQ(view->mode, row.mode) << row.name;
+    EXPECT_FALSE(view->uintSource) << row.name;
+    EXPECT_EQ(find_view(row.id), nullptr) << row.name;
+  }
+  EXPECT_EQ(decomp_mode(*find_gbuf_view(25)), DecompMode::Identity);
+  EXPECT_EQ(decomp_mode(*find_gbuf_view(27)), DecompMode::Multiply);
+  for (uint16_t id = FirstGbufView; id <= 22; ++id) {
+    EXPECT_EQ(find_gbuf_view(id)->kind, GbufViewKind::Target) << id;
+  }
+}
+
+TEST_F(RenderViews, ShortNamesAreUnique) {
+  std::set<std::string_view> names;
+  for (const DebugView& view : ClassViews) {
+    EXPECT_TRUE(names.insert(view.name).second) << view.name;
+    EXPECT_TRUE(names.insert(view.name.substr(std::string_view{"class."}.size())).second) << view.name;
+  }
+  for (const GbufView& view : GbufViews) {
+    EXPECT_TRUE(names.insert(view.name).second) << view.name;
+    EXPECT_TRUE(names.insert(view.name.substr(view.name.find('.') + 1)).second) << view.name;
+  }
+  EXPECT_EQ(names.size(), 2 * (ClassViews.size() + GbufViews.size()));
+}
+
+TEST_F(RenderViews, ParseDecompositionViewNames) {
+  const auto id = [](std::string_view text) {
+    const auto selection = parse_view(text);
+    return selection ? std::optional{selection->id} : std::nullopt;
+  };
+  using Pair = std::pair<std::string_view, uint16_t>;
+  for (const auto& [text, expected] :
+       {Pair{"ao.final", 23}, Pair{"final", 23}, Pair{"composite.defog", 24}, Pair{"defog", 24},
+        Pair{"composite.identity", 25}, Pair{"identity", 25}, Pair{"composite.coverage", 26}, Pair{"coverage", 26},
+        Pair{"composite.multiply", 27}, Pair{"multiply", 27}, Pair{"ao.raw", 28}, Pair{"raw", 28}, Pair{"ao.hiz", 29},
+        Pair{"hiz", 29}, Pair{"29", 29}}) {
+    EXPECT_EQ(id(text), expected) << text;
+  }
+  EXPECT_EQ(parse_view("composite.identity")->bit, 0u);
+  for (const std::string_view bad : {"composite.", "ao.", "composite.ident", "ao.final.r", "composite"}) {
+    EXPECT_EQ(id(bad), std::nullopt) << bad;
+  }
+}
+
+TEST_F(RenderViews, DecompositionColorsAreFrozen) {
+  EXPECT_EQ(identity_class_color(IdentityClass::Unchanged), (Rgb8{0, 0, 0}));
+  EXPECT_EQ(identity_class_color(IdentityClass::Lifted), (Rgb8{255, 128, 0}));
+  EXPECT_EQ(identity_class_color(IdentityClass::Brightened), (Rgb8{0, 255, 255}));
+  EXPECT_EQ(identity_class_color(IdentityClass::CodeZero), (Rgb8{255, 0, 0}));
+  EXPECT_EQ(identity_class_color(IdentityClass::AlphaChanged), (Rgb8{255, 255, 0}));
+  EXPECT_EQ(identity_grey(0), 63);
+  EXPECT_EQ(identity_grey(1), 71);
+  EXPECT_EQ(identity_grey(24), 255);
+  EXPECT_EQ(identity_grey(1000), 255);
+  EXPECT_EQ(coverage_touched(coverage_class_color(CoverageClass::Receiver)), (Rgb8{168, 208, 255}));
+  EXPECT_EQ(coverage_touched(coverage_class_color(CoverageClass::FoggedReceiver)), (Rgb8{158, 228, 158}));
+  EXPECT_EQ(coverage_touched(coverage_class_color(CoverageClass::LockedReceiver)), (Rgb8{255, 208, 128}));
+  EXPECT_EQ(coverage_class_color(CoverageClass::Untouched), (Rgb8{64, 64, 64}));
+  EXPECT_EQ(coverage_class_color(CoverageClass::FoggedNonReceiver), (Rgb8{40, 40, 110}));
+  EXPECT_EQ(coverage_class_color(CoverageClass::Receiver), (Rgb8{80, 160, 255}));
+  EXPECT_EQ(coverage_class_color(CoverageClass::FoggedReceiver), (Rgb8{60, 200, 60}));
+  EXPECT_EQ(coverage_class_color(CoverageClass::LockedReceiver), (Rgb8{255, 160, 0}));
+  EXPECT_EQ(coverage_class_color(CoverageClass::Bad), (Rgb8{255, 0, 255}));
+  EXPECT_EQ(DefogBadColor, (Rgb8{255, 0, 255}));
+  EXPECT_TRUE(all_distinct(IdentityColors));
+  EXPECT_TRUE(all_distinct(CoverageColors));
+}
+
+TEST_F(RenderViews, DecompositionMirrorsClassify) {
+  using decomp_view::Texel;
+  constexpr Texel Legacy{100, 100, 100, 7};
+  constexpr Texel NoFog{};
+  constexpr Texel Fogged{101, 50, 50, 127 << 1};
+  const auto grey = [](uint8_t v) { return Rgb8{v, v, v}; };
+  EXPECT_EQ(decomp_view::identity_color(Legacy, Legacy, NoFog, 3), (Rgb8{0, 0, 0}));
+  EXPECT_EQ(decomp_view::identity_color(Legacy, {99, 100, 100, 7}, NoFog, 3), grey(71));
+  EXPECT_EQ(decomp_view::identity_color(Legacy, {90, 100, 97, 7}, NoFog, 1), grey(143));
+  EXPECT_EQ(decomp_view::identity_color(Legacy, {101, 100, 100, 7}, Fogged, 2), (Rgb8{255, 128, 0}));
+  EXPECT_EQ(decomp_view::identity_color(Legacy, {101, 100, 100, 7}, NoFog, 2), (Rgb8{0, 255, 255}));
+  EXPECT_EQ(decomp_view::identity_color(Legacy, {101, 101, 100, 7}, Fogged, 2), (Rgb8{0, 255, 255}));
+  EXPECT_EQ(decomp_view::identity_color(Legacy, {99, 100, 100, 7}, NoFog, 0), (Rgb8{255, 0, 0}));
+  EXPECT_EQ(decomp_view::identity_color(Legacy, {100, 100, 100, 8}, NoFog, 0), (Rgb8{255, 255, 0}));
+
+  constexpr Texel Bad{110, 0, 0, 127 << 1};
+  EXPECT_EQ(decomp_view::coverage_color(Bad, 3, Legacy, 0), (Rgb8{255, 0, 255}));
+  EXPECT_EQ(decomp_view::defog_color(Legacy, Bad), (Rgb8{255, 0, 255}));
+  EXPECT_EQ(decomp_view::defog_color(Legacy, NoFog), (Rgb8{100, 100, 100}));
+  EXPECT_EQ(decomp_view::coverage_color(NoFog, 0, Legacy, 0), (Rgb8{64, 64, 64}));
+  EXPECT_EQ(decomp_view::coverage_color({10, 10, 10, 2}, 0, Legacy, 9), (Rgb8{40, 40, 110}));
+  EXPECT_EQ(decomp_view::coverage_color(NoFog, 1, Legacy, 0), (Rgb8{80, 160, 255}));
+  EXPECT_EQ(decomp_view::coverage_color({0, 0, 0, 1}, 1, Legacy, 0), (Rgb8{80, 160, 255}));
+  EXPECT_EQ(decomp_view::coverage_color({10, 10, 10, 2}, 2, Legacy, 0), (Rgb8{60, 200, 60}));
+  EXPECT_EQ(decomp_view::coverage_color({10, 10, 10, 2}, 2, Legacy, 1), (Rgb8{158, 228, 158}));
+  EXPECT_EQ(decomp_view::coverage_color({10, 10, 10, 3}, 3, Legacy, 0), (Rgb8{255, 160, 0}));
+  EXPECT_EQ(decomp_view::multiply_color(Legacy, 0, 51), (Rgb8{100, 100, 100}));
+  EXPECT_EQ(decomp_view::multiply_color({200, 100, 0, 0}, 1, 51), (Rgb8{40, 20, 0}));
 }
 
 TEST_F(RenderViews, GbufIdSelectsNoClassView) {

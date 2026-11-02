@@ -1,9 +1,11 @@
 #include "views.hpp"
 
 #include "capture.hpp"
+#include "decomp_view.hpp"
 #include "dual_source.hpp"
 #include "gbuf_view.hpp"
 
+#include "../frame_state.hpp"
 #include "../graph.hpp"
 #include "../../gx/pipeline.hpp"
 #include "../../webgpu/gpu.hpp"
@@ -29,6 +31,32 @@ constexpr ImGuiTableFlags TableFlags =
 constexpr std::array<std::string_view, 5> CaptureResources{
     resource::GxColor, resource::GxNormal, resource::Motion, resource::Reactive, resource::Fog,
 };
+
+struct LegendEntry {
+  Rgb8 color;
+  std::string_view label;
+};
+
+constexpr std::string_view TouchedLabel = "touched by a see-through draw (order unknown)";
+constexpr std::array<LegendEntry, 6> IdentityLegend{{
+    {identity_class_color(IdentityClass::Unchanged), "unchanged"},
+    {{identity_grey(1), identity_grey(1), identity_grey(1)}, "darkened (lighter grey for larger steps)"},
+    {identity_class_color(IdentityClass::Lifted), "lifted where S < 0"},
+    {identity_class_color(IdentityClass::Brightened), "brightened, not explained by S"},
+    {identity_class_color(IdentityClass::CodeZero), "changed on receiver code 0"},
+    {identity_class_color(IdentityClass::AlphaChanged), "alpha changed"},
+}};
+constexpr std::array<LegendEntry, 9> CoverageLegend{{
+    {coverage_class_color(CoverageClass::Untouched), "untouched"},
+    {coverage_class_color(CoverageClass::FoggedNonReceiver), "fogged non-receiver"},
+    {coverage_class_color(CoverageClass::Receiver), "receiver"},
+    {coverage_class_color(CoverageClass::FoggedReceiver), "fogged receiver"},
+    {coverage_class_color(CoverageClass::LockedReceiver), "locked receiver"},
+    {coverage_touched(coverage_class_color(CoverageClass::Receiver)), TouchedLabel},
+    {coverage_touched(coverage_class_color(CoverageClass::FoggedReceiver)), TouchedLabel},
+    {coverage_touched(coverage_class_color(CoverageClass::LockedReceiver)), TouchedLabel},
+    {coverage_class_color(CoverageClass::Bad), "bad: fog record above the colour"},
+}};
 
 struct TabState {
   int resource = 0;
@@ -122,23 +150,73 @@ void draw_layout() {
   }
 }
 
+std::optional<std::string> view_blocked(const GbufView& view, const detail::FrameState* frame) {
+  const Settings settings = frame != nullptr ? frame->settings : Settings{};
+  if (view.kind == GbufViewKind::Decomposition) {
+    if (decomp_view::available(view, settings, frame != nullptr ? frame->graph.get() : nullptr)) {
+      return std::nullopt;
+    }
+    switch (decomp_mode(view)) {
+    case DecompMode::Multiply:
+      return "needs Ambient Occlusion";
+    case DecompMode::Identity:
+      return "needs a composite effect";
+    case DecompMode::Defog:
+    case DecompMode::Coverage:
+      break;
+    }
+    return "needs the G-buffer";
+  }
+  if (detail::find_gx_resource(view.resource)) {
+    if (input_present(view.resource)) {
+      return std::nullopt;
+    }
+    return std::string{view.resource} + " is not in the scene layout";
+  }
+  if (feature_enabled(settings, Feature::Ao)) {
+    return std::nullopt;
+  }
+  return "needs Ambient Occlusion";
+}
+
+void draw_legend(std::span<const LegendEntry> entries) {
+  ImGui::Indent();
+  for (size_t i = 0; i < entries.size(); ++i) {
+    const Rgb8 c = entries[i].color;
+    ImGui::PushID(static_cast<int>(i));
+    ImGui::ColorButton("##swatch", ImVec4{c.r / 255.f, c.g / 255.f, c.b / 255.f, 1.f}, ImGuiColorEditFlags_NoTooltip,
+                       ImVec2{12.f, 12.f});
+    ImGui::PopID();
+    ImGui::SameLine();
+    text(entries[i].label);
+  }
+  ImGui::Unindent();
+}
+
 void draw_view_buttons() {
   ImGui::SeparatorText("G-buffer view");
   const uint16_t current = view_override();
   if (ImGui::RadioButton("Off", current == 0 || find_gbuf_view(current) == nullptr)) {
     set_view_override(0);
   }
+  const std::shared_ptr<const detail::FrameState> frame = detail::current_frame_state();
   for (const GbufView& view : GbufViews) {
-    const bool present = input_present(view.resource);
-    ImGui::BeginDisabled(!present);
+    const std::optional<std::string> blocked = view_blocked(view, frame.get());
+    ImGui::BeginDisabled(blocked.has_value());
     const std::string label{view.label};
     if (ImGui::RadioButton(label.c_str(), current == view.id)) {
       set_view_override(view.id);
     }
     ImGui::EndDisabled();
-    if (!present && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-      ImGui::SetTooltip("%.*s is not in the scene layout", static_cast<int>(view.resource.size()),
-                        view.resource.data());
+    if (blocked && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+      ImGui::SetTooltip("%s", blocked->c_str());
+    }
+    if (view.kind == GbufViewKind::Decomposition && current == view.id) {
+      if (decomp_mode(view) == DecompMode::Identity) {
+        draw_legend(IdentityLegend);
+      } else if (decomp_mode(view) == DecompMode::Coverage) {
+        draw_legend(CoverageLegend);
+      }
     }
   }
   if (const GbufView* active = gbuf_view::active_view()) {

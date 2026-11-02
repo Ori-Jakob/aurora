@@ -1,5 +1,7 @@
 #include "gbuf_view.hpp"
 
+#include "decomp_view.hpp"
+
 #include "../hints.hpp"
 #include "../pass_context.hpp"
 #include "../stage_data.hpp"
@@ -17,7 +19,7 @@ namespace {
 constexpr std::array<std::string_view, 1> UintDefines{"SOURCE_UINT"};
 constexpr wgpu::ColorWriteMask RgbMask =
     wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue;
-constexpr std::array<shaders::Constant, 7> ModeConstants{{
+constexpr std::array<shaders::Constant, 10> ModeConstants{{
     {"VIEW_MODE", 0},
     {"VIEW_MODE", 1},
     {"VIEW_MODE", 2},
@@ -25,6 +27,9 @@ constexpr std::array<shaders::Constant, 7> ModeConstants{{
     {"VIEW_MODE", 4},
     {"VIEW_MODE", 5},
     {"VIEW_MODE", 6},
+    {"VIEW_MODE", 7},
+    {"VIEW_MODE", 8},
+    {"VIEW_MODE", 9},
 }};
 
 std::atomic_uint64_t g_generation{0};
@@ -45,8 +50,11 @@ bool current(const detail::PassContext& ctx) noexcept {
 }
 
 bool source_available(const GbufView& view, const detail::PassSetup& setup) noexcept {
+  if (view.kind == GbufViewKind::Decomposition) {
+    return decomp_view::declarable(view, setup);
+  }
   const std::optional<detail::GxResource> gx = detail::find_gx_resource(view.resource);
-  return gx && setup.gx_available(*gx);
+  return !gx || setup.gx_available(*gx);
 }
 
 void declare_snapshot(detail::InternalPassBuilder& builder, const detail::PassSetup& setup, const void* state) {
@@ -57,6 +65,10 @@ void declare_snapshot(detail::InternalPassBuilder& builder, const detail::PassSe
   }
   store_generation(builder);
   builder.after(view.anchor);
+  if (view.kind == GbufViewKind::Decomposition) {
+    decomp_view::declare(builder, setup, view);
+    return;
+  }
   builder.use(
       view.resource, Access::Sampled,
       detail::UseOptions{
@@ -73,7 +85,12 @@ bool snapshot_enabled(const detail::StageData& stage, const void*) {
 
 void snapshot_pipelines(const detail::PipelineSetup& setup, const void* state,
                         std::span<uint32_t, detail::MaxPassPipelines> ids) {
-  shaders::RenderPipelineDesc desc = snapshot_pipeline_desc(*static_cast<const GbufView*>(state));
+  const auto& view = *static_cast<const GbufView*>(state);
+  if (view.kind == GbufViewKind::Decomposition) {
+    decomp_view::pipelines(setup, view, ids);
+    return;
+  }
+  shaders::RenderPipelineDesc desc = snapshot_pipeline_desc(view);
   desc.layout = setup.layout;
   desc.layoutKey = setup.layoutHash;
   ids[0] = shaders::request_render(desc).value;

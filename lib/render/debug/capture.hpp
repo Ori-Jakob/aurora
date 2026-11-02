@@ -84,6 +84,18 @@ struct NormalSummary {
   std::array<uint64_t, 4> codeCounts{};
 };
 
+struct ColorCount {
+  uint32_t rgb = 0;
+  uint64_t count = 0;
+  bool operator==(const ColorCount&) const = default;
+};
+
+struct ColorSummary {
+  uint64_t nonBlack = 0;
+  std::vector<ColorCount> distinct;
+  bool distinctOverflow = false;
+};
+
 struct Capture {
   std::string resource;
   std::string anchor;
@@ -101,6 +113,7 @@ struct Capture {
 [[nodiscard]] FogSummary summarize_fog(std::span<const uint8_t> bytes);
 [[nodiscard]] MotionSummary summarize_motion(std::span<const uint8_t> bytes, uint32_t width, uint32_t height);
 [[nodiscard]] NormalSummary summarize_normal(std::span<const uint8_t> bytes);
+[[nodiscard]] ColorSummary summarize_colors(std::span<const uint8_t> bytes);
 [[nodiscard]] std::string header_json(const Capture& capture, std::string_view binName);
 [[nodiscard]] std::vector<uint8_t> preview_rgba(const Capture& capture);
 [[nodiscard]] std::string file_stem(std::string_view resource, std::string_view anchor, std::optional<uint64_t> frame);

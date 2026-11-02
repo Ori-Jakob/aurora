@@ -2,8 +2,11 @@
 
 #include "render_test_device.hpp"
 
+#include "render/ao/ao.hpp"
+#include "render/ao/gtao.hpp"
 #include "render/debug/capture.hpp"
 #include "render/debug/debug.hpp"
+#include "render/debug/decomp_view.hpp"
 #include "render/debug/dual_source.hpp"
 #include "render/debug/gbuf_view.hpp"
 #include "render/debug/views.hpp"
@@ -14,8 +17,10 @@
 #include "render/graph_pool.hpp"
 #include "render/jobs.hpp"
 #include "render/json.hpp"
+#include "render/post/composite.hpp"
 #include "render/scene/classify.hpp"
 #include "render/settings.hpp"
+#include "render/shaders.hpp"
 #include "render/stage.hpp"
 #include "webgpu/gpu_prof.hpp"
 
@@ -25,14 +30,19 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace aurora::render {
@@ -756,6 +766,43 @@ const detail::CompiledUse* find_use(const detail::CompiledGraph& graph, detail::
   return nullptr;
 }
 
+using UseSummary = std::tuple<std::string, detail::Access, Missing, wgpu::TextureSampleType>;
+
+struct PassSummary {
+  std::string name;
+  std::vector<UseSummary> uses;
+  uint64_t layoutHash = 0;
+  uint32_t paramsSize = 0;
+  detail::CullReason status = detail::CullReason::None;
+  bool sink = false;
+  uint16_t order = 0;
+  bool operator==(const PassSummary&) const = default;
+};
+
+std::vector<PassSummary> summarize_passes(const detail::CompiledGraph& graph) {
+  std::vector<PassSummary> out;
+  for (const std::string_view name :
+       {detail::composite::CopyPass, detail::composite::Pass, std::string_view{"depth.pyramid"}, detail::ao::gtao::Pass,
+        std::string_view{"ao.denoise"}, std::string_view{"ao.upsample"}}) {
+    const detail::NodeId node = graph.find_node(name);
+    EXPECT_NE(node, detail::InvalidNode) << name;
+    if (node == detail::InvalidNode) {
+      continue;
+    }
+    PassSummary& summary = out.emplace_back();
+    summary.name = name;
+    for (const detail::CompiledUse& use : graph.node_uses(node)) {
+      summary.uses.emplace_back(graph.resources[use.resource].name, use.access, use.missing, use.options.sampleType);
+    }
+    summary.layoutHash = graph.bindingPlans[node].layoutHash;
+    summary.paramsSize = graph.nodes[node].paramsSize;
+    summary.status = graph.nodes[node].status;
+    summary.sink = graph.nodes[node].sink;
+    summary.order = graph.nodes[node].order;
+  }
+  return out;
+}
+
 class RenderDebugViews : public RenderDebugWindow {
 protected:
   void SetUp() override {
@@ -767,6 +814,9 @@ protected:
   void TearDown() override {
     debug::set_view_override(0);
     debug::capture::testing::reset();
+    if (m_composite) {
+      stop_composite();
+    }
     RenderDebugWindow::TearDown();
   }
 
@@ -775,6 +825,34 @@ protected:
     debug::views_on_latch();
     return compile_env(scene_env(gbuffer));
   }
+
+  void start_composite() {
+    stop_composite();
+    detail::ao::initialize();
+    detail::composite::initialize();
+    m_composite = true;
+  }
+
+  static void stop_composite() {
+    detail::composite::shutdown();
+    detail::composite::testing::reset();
+    detail::ao::shutdown();
+    detail::ao::testing::reset();
+  }
+
+  static std::shared_ptr<detail::CompiledGraph> compile_ao(const detail::GraphEnvironment& env) {
+    Settings settings = detail::latched_settings();
+    settings.ao = Quality::High;
+    return detail::compile_graph(settings, caps(), env, {.sceneDepthSource = DepthSource::Direct});
+  }
+
+  std::shared_ptr<detail::CompiledGraph> select_ao(uint16_t id) {
+    debug::set_view_override(id);
+    debug::views_on_latch();
+    return compile_ao(scene_env(true));
+  }
+
+  bool m_composite = false;
 };
 
 TEST_F(RenderDebugViews, SelectionRegistersSnapshotAndBlit) {
@@ -851,6 +929,218 @@ TEST_F(RenderDebugViews, DeselectRestoresGraphHash) {
   EXPECT_EQ(restored->graphHash, plain->graphHash);
   EXPECT_EQ(restored->find_node(debug::gbuf_view::SnapshotPass), detail::InvalidNode);
   EXPECT_EQ(debug::gbuf_view::active_view(), nullptr);
+
+  start_composite();
+  const auto composited = select_ao(0);
+  ASSERT_NE(composited, nullptr);
+  for (const uint16_t id : {uint16_t{23}, uint16_t{25}, uint16_t{26}}) {
+    SCOPED_TRACE(id);
+    const uint64_t before = debug::gbuf_view::generation();
+    const auto shown = select_ao(id);
+    ASSERT_NE(shown, nullptr);
+    const detail::NodeId snapshot = shown->find_node(debug::gbuf_view::SnapshotPass);
+    ASSERT_NE(snapshot, detail::InvalidNode);
+    EXPECT_EQ(shown->nodes[snapshot].status, detail::CullReason::None);
+    EXPECT_NE(shown->graphHash, composited->graphHash);
+    EXPECT_GT(debug::gbuf_view::generation(), before);
+    const auto back = select_ao(0);
+    ASSERT_NE(back, nullptr);
+    EXPECT_EQ(back->graphHash, composited->graphHash);
+    EXPECT_EQ(back->find_node(debug::gbuf_view::SnapshotPass), detail::InvalidNode);
+  }
+}
+
+TEST_F(RenderDebugViews, DecompositionSelectionRegistersPerModeUses) {
+  start_composite();
+  struct Row {
+    uint16_t id;
+    std::string_view input;
+    std::string_view after;
+    std::string_view before;
+  };
+  constexpr std::array<Row, 4> Rows{{
+      {24, "", "phase.volumetrics", "phase.composite"},
+      {25, "legacyTex", "phase.composite", "gx.overlay"},
+      {26, "gbuf.reactive", "phase.volumetrics", "phase.composite"},
+      {27, "ao.final", "phase.volumetrics", "phase.composite"},
+  }};
+  for (const Row& row : Rows) {
+    SCOPED_TRACE(row.id);
+    const auto graph = select_ao(row.id);
+    ASSERT_NE(graph, nullptr);
+    const detail::NodeId snapshot = graph->find_node(debug::gbuf_view::SnapshotPass);
+    const detail::NodeId blit = graph->find_node(debug::gbuf_view::BlitPass);
+    ASSERT_NE(snapshot, detail::InvalidNode);
+    ASSERT_NE(blit, detail::InvalidNode);
+    EXPECT_EQ(graph->nodes[snapshot].status, detail::CullReason::None);
+    EXPECT_EQ(graph->nodes[blit].status, detail::CullReason::None);
+    EXPECT_EQ(graph->nodes[snapshot].stage, Stage::OpaqueDone);
+    EXPECT_EQ(graph->nodes[snapshot].passKind, detail::PassKind::Render);
+    EXPECT_EQ(graph->nodes[snapshot].order, debug::gbuf_view::LastPassOrder);
+    EXPECT_GT(position(*graph, Stage::OpaqueDone, debug::gbuf_view::SnapshotPass),
+              position(*graph, Stage::OpaqueDone, row.after));
+    EXPECT_LT(position(*graph, Stage::OpaqueDone, debug::gbuf_view::SnapshotPass),
+              position(*graph, Stage::OpaqueDone, row.before));
+    std::vector<std::string_view> expected{"gx.color", "gbuf.fog", "gx.normal"};
+    if (!row.input.empty()) {
+      expected.push_back(row.input);
+    }
+    std::vector<std::string_view> sampled;
+    for (const detail::CompiledUse& use : graph->node_uses(snapshot)) {
+      const std::string_view name = graph->resources[use.resource].name;
+      if (use.access == detail::Access::ColorWrite) {
+        EXPECT_EQ(name, debug::gbuf_view::SnapshotResource);
+        continue;
+      }
+      EXPECT_EQ(use.access, detail::Access::Sampled) << name;
+      EXPECT_EQ(use.missing, Missing::DisablePass) << name;
+      EXPECT_EQ(use.options.sampleType,
+                name == "gbuf.fog" ? wgpu::TextureSampleType::Uint : wgpu::TextureSampleType::UnfilterableFloat)
+          << name;
+      sampled.push_back(name);
+    }
+    EXPECT_EQ(sampled, expected);
+    const detail::BindingPlan& plan = graph->bindingPlans[snapshot];
+    ASSERT_EQ(plan.slots.size(), expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+      EXPECT_EQ(graph->resources[plan.slots[i].resource].name, expected[i]);
+      EXPECT_EQ(plan.slots[i].binding, i);
+    }
+    const detail::CompiledResource& target = graph->resources[graph->find_resource(debug::gbuf_view::SnapshotResource)];
+    EXPECT_EQ(target.tex.format, wgpu::TextureFormat::RGBA8Unorm);
+    EXPECT_NE(find_use(*graph, blit, "gx.color"), nullptr);
+  }
+}
+
+TEST_F(RenderDebugViews, IdentityViewSortsAfterCompositeWriter) {
+  start_composite();
+  const auto expect_after = [](const detail::CompiledGraph& graph) {
+    const detail::NodeId composite = graph.find_node(detail::composite::Pass);
+    const detail::NodeId view = graph.find_node(debug::gbuf_view::SnapshotPass);
+    ASSERT_NE(composite, detail::InvalidNode);
+    ASSERT_NE(view, detail::InvalidNode);
+    EXPECT_EQ(graph.nodes[composite].status, detail::CullReason::None);
+    EXPECT_EQ(graph.nodes[view].status, detail::CullReason::None);
+    const detail::ResourceId color = graph.find_resource(resource::GxColor);
+    EXPECT_TRUE(std::ranges::any_of(graph.edges, [&](const detail::Edge& edge) {
+      return edge.from == composite && edge.to == view && edge.kind == detail::EdgeKind::Raw && edge.resource == color;
+    }));
+    EXPECT_GT(position(graph, Stage::OpaqueDone, debug::gbuf_view::SnapshotPass),
+              position(graph, Stage::OpaqueDone, detail::composite::Pass));
+    EXPECT_LT(position(graph, Stage::OpaqueDone, debug::gbuf_view::SnapshotPass),
+              position(graph, Stage::OpaqueDone, "gx.overlay"));
+  };
+  const auto first = select_ao(25);
+  ASSERT_NE(first, nullptr);
+  expect_after(*first);
+  detail::composite::shutdown();
+  detail::composite::initialize();
+  const auto reregistered = compile_ao(scene_env(true));
+  ASSERT_NE(reregistered, nullptr);
+  expect_after(*reregistered);
+}
+
+TEST_F(RenderDebugViews, PreCompositeRowsSeeLegacyColour) {
+  start_composite();
+  for (const uint16_t id : {uint16_t{24}, uint16_t{26}, uint16_t{27}}) {
+    SCOPED_TRACE(id);
+    const auto graph = select_ao(id);
+    ASSERT_NE(graph, nullptr);
+    const std::vector<detail::NodeId>& program = graph->stages[static_cast<size_t>(Stage::OpaqueDone)].nodes;
+    const auto copy = std::ranges::find(program, graph->find_node(detail::composite::CopyPass));
+    const auto view = std::ranges::find(program, graph->find_node(debug::gbuf_view::SnapshotPass));
+    const auto composite = std::ranges::find(program, graph->find_node(detail::composite::Pass));
+    ASSERT_NE(copy, program.end());
+    ASSERT_NE(view, program.end());
+    ASSERT_NE(composite, program.end());
+    EXPECT_LT(copy, view);
+    EXPECT_LT(view, composite);
+    for (auto it = std::next(copy); it != view; ++it) {
+      for (const detail::CompiledUse& use : graph->node_uses(*it)) {
+        EXPECT_FALSE(use.access == detail::Access::ColorRMW && graph->resources[use.resource].name == "gx.color")
+            << graph->nodes[*it].name;
+      }
+    }
+    const detail::CompiledUse* color = find_use(*graph, *view, "gx.color");
+    ASSERT_NE(color, nullptr);
+    EXPECT_EQ(color->access, detail::Access::Sampled);
+    EXPECT_EQ(detail::composite::check_contract(*graph), std::nullopt);
+  }
+}
+
+TEST_F(RenderDebugViews, ViewLeavesOtherPassesUnchanged) {
+  start_composite();
+  const auto plain = select_ao(0);
+  ASSERT_NE(plain, nullptr);
+  const std::vector<PassSummary> expected = summarize_passes(*plain);
+  ASSERT_EQ(expected.size(), 6u);
+  for (const PassSummary& pass : expected) {
+    EXPECT_EQ(pass.status, detail::CullReason::None) << pass.name;
+  }
+  for (const uint16_t id : {uint16_t{25}, uint16_t{27}}) {
+    SCOPED_TRACE(id);
+    const auto viewed = select_ao(id);
+    ASSERT_NE(viewed, nullptr);
+    EXPECT_EQ(viewed->nodes[viewed->find_node(debug::gbuf_view::SnapshotPass)].status, detail::CullReason::None);
+    EXPECT_EQ(summarize_passes(*viewed), expected);
+    EXPECT_EQ(detail::composite::check_contract(*viewed), std::nullopt);
+  }
+}
+
+TEST_F(RenderDebugViews, DecompositionSkipsWithoutGbuffer) {
+  for (uint16_t id = 24; id <= 27; ++id) {
+    SCOPED_TRACE(id);
+    const auto graph = select(id, false);
+    ASSERT_NE(graph, nullptr);
+    const detail::NodeId snapshot = graph->find_node(debug::gbuf_view::SnapshotPass);
+    const detail::NodeId blit = graph->find_node(debug::gbuf_view::BlitPass);
+    ASSERT_NE(snapshot, detail::InvalidNode);
+    ASSERT_NE(blit, detail::InvalidNode);
+    EXPECT_EQ(graph->nodes[snapshot].status, detail::CullReason::Skipped);
+    EXPECT_EQ(graph->nodes[blit].status, detail::CullReason::Skipped);
+    EXPECT_TRUE(graph->stage_empty(Stage::BeforeHud));
+  }
+}
+
+TEST_F(RenderDebugViews, AoRowWithoutProducerSkipsBlit) {
+  for (const uint16_t id : {uint16_t{23}, uint16_t{28}, uint16_t{29}}) {
+    SCOPED_TRACE(id);
+    const auto graph = select(id, true);
+    ASSERT_NE(graph, nullptr);
+    const detail::NodeId snapshot = graph->find_node(debug::gbuf_view::SnapshotPass);
+    const detail::NodeId blit = graph->find_node(debug::gbuf_view::BlitPass);
+    ASSERT_NE(snapshot, detail::InvalidNode);
+    ASSERT_NE(blit, detail::InvalidNode);
+    EXPECT_NE(graph->nodes[snapshot].status, detail::CullReason::None);
+    EXPECT_NE(graph->nodes[snapshot].status, detail::CullReason::Skipped);
+    EXPECT_NE(graph->nodes[blit].status, detail::CullReason::None);
+    EXPECT_TRUE(graph->stage_empty(Stage::BeforeHud));
+  }
+}
+
+TEST_F(RenderDebugViews, AoRawHasSingleWriter) {
+  start_composite();
+  const auto graph = select_ao(28);
+  ASSERT_NE(graph, nullptr);
+  const detail::ResourceId raw = graph->find_resource(detail::ao::gtao::Resource);
+  ASSERT_NE(raw, detail::InvalidResource);
+  std::vector<std::string_view> writers;
+  for (const detail::CompiledUse& use : graph->uses) {
+    if (use.resource == raw && use.access != detail::Access::Sampled) {
+      writers.push_back(graph->nodes[use.node].name);
+    }
+  }
+  EXPECT_EQ(writers, (std::vector<std::string_view>{detail::ao::gtao::Pass}));
+  EXPECT_EQ(graph->resources[raw].creator, graph->find_node(detail::ao::gtao::Pass));
+  const detail::NodeId snapshot = graph->find_node(debug::gbuf_view::SnapshotPass);
+  ASSERT_NE(snapshot, detail::InvalidNode);
+  EXPECT_EQ(graph->nodes[snapshot].status, detail::CullReason::None);
+  const detail::CompiledUse* read = find_use(*graph, snapshot, detail::ao::gtao::Resource);
+  ASSERT_NE(read, nullptr);
+  EXPECT_EQ(read->access, detail::Access::Sampled);
+  EXPECT_EQ(read->options.sampleType, wgpu::TextureSampleType::UnfilterableFloat);
+  EXPECT_GT(position(*graph, Stage::OpaqueDone, debug::gbuf_view::SnapshotPass),
+            position(*graph, Stage::OpaqueDone, detail::ao::gtao::Pass));
 }
 
 TEST_F(RenderDebugViews, BlitTargetKeepsAlpha) {
@@ -876,6 +1166,12 @@ TEST_F(RenderDebugViews, BlitTargetKeepsAlpha) {
   const shaders::RenderPipelineDesc motion = debug::gbuf_view::snapshot_pipeline_desc(*debug::find_gbuf_view(16));
   EXPECT_TRUE(motion.defines.empty());
   EXPECT_EQ(motion.constants[0].value, 0.0);
+  for (const debug::GbufView& view : debug::GbufViews) {
+    if (view.kind == debug::GbufViewKind::Target) {
+      ASSERT_EQ(debug::gbuf_view::snapshot_pipeline_desc(view).constants.size(), 1u) << view.name;
+      EXPECT_EQ(debug::gbuf_view::snapshot_pipeline_desc(view).constants[0].value, view.mode) << view.name;
+    }
+  }
 }
 
 void declare_texture_source(detail::InternalPassBuilder& builder, const detail::PassSetup&, const void*) {
@@ -1017,6 +1313,76 @@ TEST_F(RenderDebugCapture, HeaderJson) {
   ASSERT_NE(normalDoc, nullptr);
   yyjson_val* codes = yyjson_obj_get(yyjson_obj_get(yyjson_doc_get_root(normalDoc.get()), "normal"), "codeCounts");
   EXPECT_EQ(yyjson_arr_size(codes), 4u);
+}
+
+TEST_F(RenderDebugCapture, ViewSummaryCountsColours) {
+  std::vector<uint8_t> bytes;
+  const auto add = [&bytes](uint32_t rgb, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+      bytes.insert(bytes.end(),
+                   {static_cast<uint8_t>(rgb >> 16), static_cast<uint8_t>(rgb >> 8), static_cast<uint8_t>(rgb), 255});
+    }
+  };
+  add(0x000000, 5);
+  add(0x474747, 3);
+  add(0xFF8000, 2);
+  add(0x474747, 3);
+  add(0xFF0000, 1);
+  const debug::capture::ColorSummary summary = debug::capture::summarize_colors(bytes);
+  EXPECT_EQ(summary.nonBlack, 9u);
+  EXPECT_EQ(summary.distinct,
+            (std::vector<debug::capture::ColorCount>{{0x474747, 6}, {0x000000, 5}, {0xFF8000, 2}, {0xFF0000, 1}}));
+  EXPECT_FALSE(summary.distinctOverflow);
+
+  std::vector<uint8_t> many;
+  for (uint32_t i = 1; i <= 65; ++i) {
+    many.insert(many.end(), {static_cast<uint8_t>(i), 0, 0, 255});
+  }
+  const debug::capture::ColorSummary full = debug::capture::summarize_colors(std::span{many}.first(64 * 4));
+  EXPECT_EQ(full.distinct.size(), debug::capture::MaxDistinctColors);
+  EXPECT_FALSE(full.distinctOverflow);
+  const debug::capture::ColorSummary overflow = debug::capture::summarize_colors(many);
+  EXPECT_EQ(overflow.distinct.size(), debug::capture::MaxDistinctColors);
+  EXPECT_TRUE(overflow.distinctOverflow);
+  EXPECT_EQ(overflow.nonBlack, 65u);
+
+  const debug::capture::Capture view{.resource = std::string{debug::gbuf_view::SnapshotResource},
+                                     .anchor = std::string{debug::gbuf_view::SnapshotPass},
+                                     .frame = 7,
+                                     .format = wgpu::TextureFormat::RGBA8Unorm,
+                                     .width = 14,
+                                     .height = 1,
+                                     .bytes = bytes};
+  const std::string text = debug::capture::header_json(view, "debug.view@debug.view.bin");
+  const json::Doc doc = json::read(text);
+  ASSERT_NE(doc, nullptr) << text;
+  yyjson_val* root = yyjson_doc_get_root(doc.get());
+  EXPECT_EQ(yyjson_get_uint(yyjson_obj_get(root, "frame")), 7u);
+  yyjson_val* colour = yyjson_obj_get(root, "colour");
+  ASSERT_NE(colour, nullptr);
+  EXPECT_EQ(yyjson_get_uint(yyjson_obj_get(colour, "nonBlack")), 9u);
+  EXPECT_FALSE(yyjson_get_bool(yyjson_obj_get(colour, "distinctOverflow")));
+  yyjson_val* distinct = yyjson_obj_get(colour, "distinct");
+  ASSERT_EQ(yyjson_arr_size(distinct), 4u);
+  EXPECT_STREQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(distinct, 0), "rgb")), "#474747");
+  EXPECT_EQ(yyjson_get_uint(yyjson_obj_get(yyjson_arr_get(distinct, 0), "count")), 6u);
+  EXPECT_STREQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(distinct, 3), "rgb")), "#ff0000");
+  EXPECT_STREQ(yyjson_get_str(yyjson_obj_get(root, "schema")), "aurora.render.capture");
+  EXPECT_EQ(yyjson_get_uint(yyjson_obj_get(root, "version")), 1u);
+
+  debug::capture::Capture later = view;
+  later.frame = 8;
+  std::string expected = text;
+  const size_t frame = expected.find("\"frame\": 7");
+  ASSERT_NE(frame, std::string::npos) << text;
+  expected.replace(frame, std::string_view{"\"frame\": 7"}.size(), "\"frame\": 8");
+  EXPECT_EQ(debug::capture::header_json(later, "debug.view@debug.view.bin"), expected);
+
+  debug::capture::Capture color = view;
+  color.resource = "gx.color";
+  const json::Doc plain = json::read(debug::capture::header_json(color, "gx.color.bin"));
+  ASSERT_NE(plain, nullptr);
+  EXPECT_EQ(yyjson_obj_get(yyjson_doc_get_root(plain.get()), "colour"), nullptr);
 }
 
 TEST_F(RenderDebugCapture, ChainAnchorPlacesAtSlotEnd) {
@@ -1216,6 +1582,319 @@ TEST_F(RenderDebugCaptureDevice, RoundTripOnBackend) {
   EXPECT_EQ(written, pixels);
   bin.close();
   std::filesystem::remove_all(dir);
+}
+
+constexpr uint64_t ViewPipelineWaitNs = 60'000'000'000;
+
+class ViewShaderGpu : public RenderDebugCaptureDevice {
+protected:
+  void SetUp() override {
+    RenderDebugCaptureDevice::SetUp();
+    if (IsSkipped() || !m_device) {
+      return;
+    }
+    jobs::initialize(1);
+    shaders::initialize();
+    m_shaders = true;
+  }
+
+  void TearDown() override {
+    if (m_shaders) {
+      shaders::shutdown();
+      jobs::shutdown();
+    }
+    RenderDebugCaptureDevice::TearDown();
+  }
+
+  wgpu::Texture texture(wgpu::TextureFormat format, uint32_t width, uint32_t height, uint32_t bpp,
+                        std::span<const uint8_t> bytes) const {
+    const wgpu::TextureDescriptor descriptor{
+        .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
+        .size = {width, height, 1},
+        .format = format,
+    };
+    const wgpu::Texture out = m_device->device.CreateTexture(&descriptor);
+    const wgpu::TexelCopyTextureInfo destination{.texture = out};
+    const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = width * bpp, .rowsPerImage = height};
+    const wgpu::Extent3D extent{width, height, 1};
+    m_device->queue.WriteTexture(&destination, bytes.data(), bytes.size(), &layout, &extent);
+    return out;
+  }
+
+  std::optional<debug::capture::Capture> draw(shaders::RenderPipelineDesc desc, std::span<const wgpu::Texture> inputs,
+                                              uint32_t width, uint32_t height, uint64_t key) const {
+    const wgpu::BindGroupLayoutEntry frameEntry{
+        .binding = 0,
+        .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
+        .buffer = {.type = wgpu::BufferBindingType::Uniform},
+    };
+    const wgpu::BindGroupLayoutDescriptor frameDesc{.entryCount = 1, .entries = &frameEntry};
+    const wgpu::BindGroupLayout frameLayout = m_device->device.CreateBindGroupLayout(&frameDesc);
+    std::vector<wgpu::BindGroupLayoutEntry> passEntries;
+    for (uint32_t i = 0; i < inputs.size(); ++i) {
+      const bool uint = inputs[i].GetFormat() == wgpu::TextureFormat::RGBA8Uint;
+      passEntries.push_back({
+          .binding = i,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .texture = {.sampleType = uint ? wgpu::TextureSampleType::Uint : wgpu::TextureSampleType::UnfilterableFloat},
+      });
+    }
+    const wgpu::BindGroupLayoutDescriptor passDesc{.entryCount = passEntries.size(), .entries = passEntries.data()};
+    const wgpu::BindGroupLayout passLayout = m_device->device.CreateBindGroupLayout(&passDesc);
+    const std::array layouts{frameLayout, passLayout};
+    const wgpu::PipelineLayoutDescriptor layoutDesc{.bindGroupLayoutCount = layouts.size(),
+                                                    .bindGroupLayouts = layouts.data()};
+    desc.layout = m_device->device.CreatePipelineLayout(&layoutDesc);
+    desc.layoutKey = key;
+    const shaders::PipelineId id = shaders::request_render(desc);
+    EXPECT_EQ(shaders::wait(id, ViewPipelineWaitNs), shaders::PipelineStatus::Ready);
+    const wgpu::RenderPipeline pipeline = shaders::render_pipeline(id);
+    if (!pipeline) {
+      return std::nullopt;
+    }
+    const wgpu::BufferDescriptor bufferDesc{.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst,
+                                            .size = 256};
+    const wgpu::Buffer frame = m_device->device.CreateBuffer(&bufferDesc);
+    const wgpu::BindGroupEntry frameBinding{.binding = 0, .buffer = frame, .size = 256};
+    const wgpu::BindGroupDescriptor frameGroupDesc{.layout = frameLayout, .entryCount = 1, .entries = &frameBinding};
+    const wgpu::BindGroup frameGroup = m_device->device.CreateBindGroup(&frameGroupDesc);
+    std::vector<wgpu::BindGroupEntry> passBindings;
+    for (uint32_t i = 0; i < inputs.size(); ++i) {
+      passBindings.push_back({.binding = i, .textureView = inputs[i].CreateView()});
+    }
+    const wgpu::BindGroupDescriptor passGroupDesc{
+        .layout = passLayout, .entryCount = passBindings.size(), .entries = passBindings.data()};
+    const wgpu::BindGroup passGroup = m_device->device.CreateBindGroup(&passGroupDesc);
+    const wgpu::TextureDescriptor targetDesc{
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc,
+        .size = {width, height, 1},
+        .format = wgpu::TextureFormat::RGBA8Unorm,
+    };
+    const wgpu::Texture target = m_device->device.CreateTexture(&targetDesc);
+    const wgpu::RenderPassColorAttachment attachment{
+        .view = target.CreateView(),
+        .loadOp = wgpu::LoadOp::Clear,
+        .storeOp = wgpu::StoreOp::Store,
+        .clearValue = {0.0, 0.0, 0.0, 0.0},
+    };
+    const wgpu::RenderPassDescriptor passDescriptor{.colorAttachmentCount = 1, .colorAttachments = &attachment};
+    const wgpu::CommandEncoder encoder = m_device->device.CreateCommandEncoder();
+    const wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&passDescriptor);
+    pass.SetPipeline(pipeline);
+    pass.SetBindGroup(0, frameGroup);
+    pass.SetBindGroup(1, passGroup);
+    pass.Draw(3);
+    pass.End();
+    EXPECT_TRUE(test::submit_and_wait(*m_device, encoder.Finish()));
+    return debug::capture::testing::read_texture(target, 1);
+  }
+
+  bool m_shaders = false;
+};
+
+using DecompViewGpu = ViewShaderGpu;
+using GbufViewGpu = ViewShaderGpu;
+
+struct DecompCase {
+  debug::decomp_view::Texel legacy;
+  debug::decomp_view::Texel out;
+  debug::decomp_view::Texel rec;
+  uint32_t code = 0;
+  uint8_t reactive = 0;
+};
+
+std::vector<uint8_t> texel_bytes(std::span<const DecompCase> cases, debug::decomp_view::Texel DecompCase::* field) {
+  std::vector<uint8_t> bytes;
+  for (const DecompCase& c : cases) {
+    const debug::decomp_view::Texel& t = c.*field;
+    bytes.insert(bytes.end(), t.begin(), t.end());
+  }
+  return bytes;
+}
+
+std::vector<uint8_t> normal_bytes(std::span<const DecompCase> cases) {
+  std::vector<uint8_t> bytes;
+  for (const DecompCase& c : cases) {
+    const uint32_t packed = 512u | 512u << 10 | 1023u << 20 | c.code << 30;
+    bytes.insert(bytes.end(), {static_cast<uint8_t>(packed), static_cast<uint8_t>(packed >> 8),
+                               static_cast<uint8_t>(packed >> 16), static_cast<uint8_t>(packed >> 24)});
+  }
+  return bytes;
+}
+
+debug::Rgb8 pixel(const debug::capture::Capture& capture, size_t index) {
+  return {capture.bytes[index * 4], capture.bytes[index * 4 + 1], capture.bytes[index * 4 + 2]};
+}
+
+TEST_F(DecompViewGpu, ClassifiesSyntheticTexels) {
+  constexpr debug::decomp_view::Texel L{100, 100, 100, 7};
+  constexpr debug::decomp_view::Texel NoFog{};
+  constexpr debug::decomp_view::Texel Lifting{101, 50, 50, 127 << 1};
+  constexpr debug::decomp_view::Texel Bad{110, 0, 0, 127 << 1};
+  constexpr debug::decomp_view::Texel Fogged{30, 30, 30, 10 << 1};
+  constexpr debug::decomp_view::Texel Locked{30, 30, 30, (10 << 1) | 1};
+  const std::array<DecompCase, 8> cases{{
+      {L, L, NoFog, 3, 0},
+      {L, {99, 100, 100, 7}, NoFog, 3, 0},
+      {L, {101, 100, 100, 7}, Lifting, 2, 0},
+      {L, {101, 100, 100, 7}, NoFog, 2, 0},
+      {L, {99, 100, 100, 7}, NoFog, 0, 0},
+      {L, {100, 100, 100, 8}, Fogged, 1, 200},
+      {L, {70, 100, 100, 7}, Bad, 2, 1},
+      {L, {100, 100, 100, 7}, Locked, 3, 0},
+  }};
+  constexpr uint32_t Width = 8;
+  const wgpu::Texture legacy =
+      texture(wgpu::TextureFormat::RGBA8Unorm, Width, 1, 4, texel_bytes(cases, &DecompCase::legacy));
+  const wgpu::Texture out = texture(wgpu::TextureFormat::RGBA8Unorm, Width, 1, 4, texel_bytes(cases, &DecompCase::out));
+  const wgpu::Texture fog = texture(wgpu::TextureFormat::RGBA8Uint, Width, 1, 4, texel_bytes(cases, &DecompCase::rec));
+  const wgpu::Texture normal = texture(wgpu::TextureFormat::RGB10A2Unorm, Width, 1, 4, normal_bytes(cases));
+  std::vector<uint8_t> reactiveBytes;
+  for (const DecompCase& c : cases) {
+    reactiveBytes.push_back(c.reactive);
+  }
+  const wgpu::Texture reactive = texture(wgpu::TextureFormat::R8Unorm, Width, 1, 1, reactiveBytes);
+
+  const std::array identityInputs{out, fog, normal, legacy};
+  const auto identity =
+      draw(debug::decomp_view::pipeline_desc(debug::DecompMode::Identity), identityInputs, Width, 1, 0xD1);
+  ASSERT_TRUE(identity.has_value());
+  const std::array<debug::Rgb8, 8> identityExpected{{
+      {0, 0, 0},
+      {71, 71, 71},
+      {255, 128, 0},
+      {0, 255, 255},
+      {255, 0, 0},
+      {255, 255, 0},
+      {0, 0, 0},
+      {0, 0, 0},
+  }};
+  for (size_t i = 0; i < cases.size(); ++i) {
+    const DecompCase& c = cases[i];
+    const debug::Rgb8 mirror = debug::decomp_view::identity_color(c.legacy, c.out, c.rec, c.code);
+    EXPECT_EQ(pixel(*identity, i), mirror) << i;
+    if (i < 6) {
+      EXPECT_EQ(pixel(*identity, i), identityExpected[i]) << i;
+    }
+    EXPECT_EQ(identity->bytes[i * 4 + 3], 255) << i;
+  }
+  const debug::Rgb8 darkened = pixel(*identity, 6);
+  EXPECT_EQ(darkened, (debug::Rgb8{debug::identity_grey(30), debug::identity_grey(30), debug::identity_grey(30)}));
+
+  const std::array baseInputs{legacy, fog, normal};
+  const auto defog = draw(debug::decomp_view::pipeline_desc(debug::DecompMode::Defog), baseInputs, Width, 1, 0xD0);
+  ASSERT_TRUE(defog.has_value());
+  EXPECT_EQ(pixel(*defog, 0), (debug::Rgb8{100, 100, 100}));
+  EXPECT_EQ(pixel(*defog, 6), debug::DefogBadColor);
+  for (size_t i = 0; i < cases.size(); ++i) {
+    const debug::Rgb8 mirror = debug::decomp_view::defog_color(cases[i].legacy, cases[i].rec);
+    const debug::Rgb8 got = pixel(*defog, i);
+    EXPECT_LE(std::abs(int{got.r} - int{mirror.r}), 1) << i;
+    EXPECT_LE(std::abs(int{got.g} - int{mirror.g}), 1) << i;
+    EXPECT_LE(std::abs(int{got.b} - int{mirror.b}), 1) << i;
+  }
+
+  const std::array coverageInputs{legacy, fog, normal, reactive};
+  const auto coverage =
+      draw(debug::decomp_view::pipeline_desc(debug::DecompMode::Coverage), coverageInputs, Width, 1, 0xD2);
+  ASSERT_TRUE(coverage.has_value());
+  EXPECT_EQ(pixel(*coverage, 5), (debug::Rgb8{158, 228, 158}));
+  EXPECT_EQ(pixel(*coverage, 6), (debug::Rgb8{255, 0, 255}));
+  EXPECT_EQ(pixel(*coverage, 7), (debug::Rgb8{255, 160, 0}));
+  EXPECT_EQ(pixel(*coverage, 4), (debug::Rgb8{64, 64, 64}));
+  EXPECT_EQ(pixel(*coverage, 0), (debug::Rgb8{80, 160, 255}));
+  for (size_t i = 0; i < cases.size(); ++i) {
+    const DecompCase& c = cases[i];
+    EXPECT_EQ(pixel(*coverage, i), debug::decomp_view::coverage_color(c.rec, c.code, c.legacy, c.reactive)) << i;
+  }
+
+  constexpr uint32_t MulWidth = 4;
+  constexpr uint32_t MulHeight = 2;
+  const std::array<DecompCase, 8> mulCases{{
+      {{200, 100, 40, 0}, {}, NoFog, 1, 0},
+      {{200, 100, 40, 0}, {}, NoFog, 2, 0},
+      {{200, 100, 40, 0}, {}, NoFog, 3, 0},
+      {{200, 100, 40, 0}, {}, NoFog, 1, 0},
+      {{200, 100, 40, 0}, {}, NoFog, 0, 0},
+      {{180, 90, 30, 0}, {}, Fogged, 2, 0},
+      {{180, 90, 30, 0}, {}, Fogged, 0, 0},
+      {{180, 90, 30, 0}, {}, Fogged, 1, 0},
+  }};
+  const wgpu::Texture mulLegacy =
+      texture(wgpu::TextureFormat::RGBA8Unorm, MulWidth, MulHeight, 4, texel_bytes(mulCases, &DecompCase::legacy));
+  const wgpu::Texture mulFog =
+      texture(wgpu::TextureFormat::RGBA8Uint, MulWidth, MulHeight, 4, texel_bytes(mulCases, &DecompCase::rec));
+  const wgpu::Texture mulNormal =
+      texture(wgpu::TextureFormat::RGB10A2Unorm, MulWidth, MulHeight, 4, normal_bytes(mulCases));
+  const std::array<uint8_t, 8> aoBytes{64, 0, 0, 0, 255, 0, 0, 0};
+  const wgpu::Texture ao = texture(wgpu::TextureFormat::RGBA8Unorm, 2, 1, 4, aoBytes);
+  const std::array multiplyInputs{mulLegacy, mulFog, mulNormal, ao};
+  const auto multiply =
+      draw(debug::decomp_view::pipeline_desc(debug::DecompMode::Multiply), multiplyInputs, MulWidth, MulHeight, 0xD3);
+  ASSERT_TRUE(multiply.has_value());
+  EXPECT_EQ(pixel(*multiply, 0), (debug::Rgb8{50, 25, 10}));
+  EXPECT_EQ(pixel(*multiply, 2), (debug::Rgb8{200, 100, 40}));
+  EXPECT_EQ(pixel(*multiply, 4), (debug::Rgb8{200, 100, 40}));
+  for (size_t i = 0; i < mulCases.size(); ++i) {
+    const uint8_t a = aoBytes[(i % MulWidth) / 2 * 4];
+    const debug::Rgb8 mirror = debug::decomp_view::multiply_color(mulCases[i].legacy, mulCases[i].code, a);
+    const debug::Rgb8 got = pixel(*multiply, i);
+    EXPECT_LE(std::abs(int{got.r} - int{mirror.r}), 1) << i;
+    EXPECT_LE(std::abs(int{got.g} - int{mirror.g}), 1) << i;
+    EXPECT_LE(std::abs(int{got.b} - int{mirror.b}), 1) << i;
+  }
+}
+
+TEST_F(GbufViewGpu, AoRowsDecode) {
+  const auto grey = [](uint8_t v) { return debug::Rgb8{v, v, v}; };
+  const std::array<uint8_t, 8> finalBytes{40, 0, 0, 0, 220, 0, 0, 0};
+  const std::array finalInputs{texture(wgpu::TextureFormat::RGBA8Unorm, 2, 1, 4, finalBytes)};
+  const auto final =
+      draw(debug::gbuf_view::snapshot_pipeline_desc(*debug::find_gbuf_view(23)), finalInputs, 4, 2, 0xE7);
+  ASSERT_TRUE(final.has_value());
+  for (size_t i = 0; i < 8; ++i) {
+    EXPECT_EQ(pixel(*final, i), grey(i % 4 < 2 ? 40 : 220)) << i;
+  }
+
+  std::vector<uint8_t> rawBytes;
+  for (const uint8_t r : {uint8_t{0}, uint8_t{100}, uint8_t{170}, uint8_t{255}}) {
+    rawBytes.insert(rawBytes.end(), {r, 77, 1, 0});
+  }
+  const std::array rawInputs{texture(wgpu::TextureFormat::RGBA8Unorm, 4, 1, 4, rawBytes)};
+  const auto raw = draw(debug::gbuf_view::snapshot_pipeline_desc(*debug::find_gbuf_view(28)), rawInputs, 4, 1, 0xE8);
+  ASSERT_TRUE(raw.has_value());
+  EXPECT_EQ(pixel(*raw, 0), grey(0));
+  EXPECT_EQ(pixel(*raw, 1), grey(150));
+  EXPECT_EQ(pixel(*raw, 2), grey(255));
+  EXPECT_EQ(pixel(*raw, 3), grey(255));
+
+  const std::array<float, 8> depths{0.f,
+                                    std::numeric_limits<float>::quiet_NaN(),
+                                    std::numeric_limits<float>::infinity(),
+                                    1000.f,
+                                    1e30f,
+                                    -std::numeric_limits<float>::infinity(),
+                                    1.f,
+                                    65535.f};
+  std::vector<uint8_t> depthBytes(depths.size() * 4);
+  std::memcpy(depthBytes.data(), depths.data(), depthBytes.size());
+  const std::array hizInputs{texture(wgpu::TextureFormat::R32Float, 4, 2, 4, depthBytes)};
+  const auto hiz = draw(debug::gbuf_view::snapshot_pipeline_desc(*debug::find_gbuf_view(29)), hizInputs, 4, 2, 0xE9);
+  ASSERT_TRUE(hiz.has_value());
+  constexpr debug::Rgb8 Magenta{255, 0, 255};
+  EXPECT_EQ(pixel(*hiz, 0), grey(0));
+  EXPECT_EQ(pixel(*hiz, 1), Magenta);
+  EXPECT_EQ(pixel(*hiz, 2), Magenta);
+  EXPECT_EQ(pixel(*hiz, 4), grey(255));
+  EXPECT_EQ(pixel(*hiz, 5), Magenta);
+  for (const size_t i : {size_t{3}, size_t{6}, size_t{7}}) {
+    const auto expected =
+        static_cast<int>(std::lround(std::clamp(std::log2(1.0 + depths[i]) / 18.0, 0.0, 1.0) * 255.0));
+    const debug::Rgb8 got = pixel(*hiz, i);
+    EXPECT_LE(std::abs(int{got.r} - expected), 1) << i;
+    EXPECT_EQ(got.r, got.g) << i;
+    EXPECT_EQ(got.r, got.b) << i;
+  }
 }
 
 TEST(RenderDebugDualSource, JsonAggregatesByLayout) {

@@ -6,6 +6,8 @@
 #include "gfx/frame.hpp"
 #include "gfx/pipeline_cache.hpp"
 #include "logging.hpp"
+#include "render/debug/decomp_view.hpp"
+#include "render/debug/gbuf_view.hpp"
 #include "render/geometry/compact.hpp"
 #include "render/geometry/hzb.hpp"
 #include "render/geometry/indirect.hpp"
@@ -421,6 +423,31 @@ TEST_F(RenderShaders, GbufViewUintVariantCompiles) {
   EXPECT_TRUE(validate_module("debug/gbuf_view", defines, error)) << error;
   EXPECT_TRUE(validate_module("debug/gbuf_view", {}, error)) << error;
   EXPECT_TRUE(validate_module("aurora/gbuffer", {}, error)) << error;
+}
+
+TEST_F(RenderShaders, DecompViewPipelinesBuild) {
+  for (const debug::DecompMode mode : {debug::DecompMode::Defog, debug::DecompMode::Identity,
+                                       debug::DecompMode::Coverage, debug::DecompMode::Multiply}) {
+    SCOPED_TRACE(static_cast<int>(mode));
+    const RenderPipelineDesc desc = debug::decomp_view::pipeline_desc(mode);
+    EXPECT_EQ(desc.shader, debug::decomp_view::Shader);
+    EXPECT_EQ(desc.defines.size(), mode == debug::DecompMode::Defog ? 0u : 1u);
+    ASSERT_EQ(desc.colorCount, 1u);
+    EXPECT_EQ(desc.colors[0].format, wgpu::TextureFormat::RGBA8Unorm);
+    EXPECT_EQ(desc.colors[0].writeMask, wgpu::ColorWriteMask::All);
+    EXPECT_EQ(desc.depthFormat, wgpu::TextureFormat::Undefined);
+    std::string error;
+    EXPECT_TRUE(validate_module(desc.shader, desc.defines, error)) << error;
+    const PipelineId id = request_render(desc);
+    ASSERT_TRUE(id);
+    EXPECT_EQ(wait(id, WaitNs), PipelineStatus::Ready);
+  }
+  for (const uint16_t row : {uint16_t{23}, uint16_t{28}, uint16_t{29}}) {
+    SCOPED_TRACE(row);
+    const PipelineId id = request_render(debug::gbuf_view::snapshot_pipeline_desc(*debug::find_gbuf_view(row)));
+    ASSERT_TRUE(id);
+    EXPECT_EQ(wait(id, WaitNs), PipelineStatus::Ready);
+  }
 }
 
 TEST_F(RenderShaders, AoGtaoSsilHookCompiles) {

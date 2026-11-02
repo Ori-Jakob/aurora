@@ -1,5 +1,6 @@
 //#import aurora/frame
 //#import aurora/gbuffer
+//#import aurora/ao
 
 //#if SOURCE_UINT
 @group(1) @binding(0) var view_source: texture_2d<u32>;
@@ -11,14 +12,24 @@ override VIEW_MODE: u32 = 0u;
 
 const VIEW_GREY = vec3f(0.25, 0.25, 0.25);
 
+struct ViewVarying {
+  @builtin(position) position: vec4f,
+  @location(0) uv: vec2f,
+}
+
 @vertex
-fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+fn vs_main(@builtin(vertex_index) index: u32) -> ViewVarying {
   let uv = vec2f(f32((index << 1u) & 2u), f32(index & 2u));
-  return vec4f(uv * 2.0 - 1.0, 0.0, 1.0);
+  return ViewVarying(vec4f(uv * 2.0 - 1.0, 0.0, 1.0), vec2f(uv.x, 1.0 - uv.y));
+}
+
+// AO can run below scene size and dummies are 1x1, so these rows map UV to texels
+fn view_texel_uv(dims: vec2u, uv: vec2f) -> vec2u {
+  return min(vec2u(uv * vec2f(dims)), dims - 1u);
 }
 
 //#if SOURCE_UINT
-fn view_color(texel: vec2u) -> vec3f {
+fn view_color(texel: vec2u, uv: vec2f) -> vec3f {
   let rec = textureLoad(view_source, texel, 0);
   let fog = gbuf_fog_decode(rec);
   let empty = all(rec == vec4u(0u));
@@ -43,7 +54,28 @@ fn finite2(v: vec2f) -> bool {
   return all(bits != vec2u(0x7f800000u));
 }
 
-fn view_color(texel: vec2u) -> vec3f {
+fn ao_view_color(uv: vec2f) -> vec3f {
+  let value = textureLoad(view_source, view_texel_uv(textureDimensions(view_source), uv), 0);
+  switch VIEW_MODE {
+    case 7u: {
+      return vec3f(value.r);
+    }
+    case 8u: {
+      return vec3f(ao_raw_visibility(value));
+    }
+    default: {
+      if ((bitcast<u32>(value.r) & 0x7f800000u) == 0x7f800000u) {
+        return vec3f(1.0, 0.0, 1.0);
+      }
+      return vec3f(saturate(log2(1.0 + value.r) / 18.0));
+    }
+  }
+}
+
+fn view_color(texel: vec2u, uv: vec2f) -> vec3f {
+  if (VIEW_MODE >= 7u) {
+    return ao_view_color(uv);
+  }
   let value = textureLoad(view_source, texel, 0);
   switch VIEW_MODE {
     case 0u: {
@@ -74,6 +106,6 @@ fn fs_blit(@builtin(position) position: vec4f) -> @location(0) vec4f {
 //#endif
 
 @fragment
-fn fs_view(@builtin(position) position: vec4f) -> @location(0) vec4f {
-  return vec4f(view_color(vec2u(position.xy)), 1.0);
+fn fs_view(in: ViewVarying) -> @location(0) vec4f {
+  return vec4f(view_color(vec2u(in.position.xy), in.uv), 1.0);
 }

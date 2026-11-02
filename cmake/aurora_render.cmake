@@ -32,6 +32,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/debug/class_view.cpp
         lib/render/debug/debug.hpp
         lib/render/debug/debug_window.cpp
+        lib/render/debug/decomp_view.cpp
+        lib/render/debug/decomp_view.hpp
         lib/render/debug/dual_source.cpp
         lib/render/debug/dual_source.hpp
         lib/render/debug/fake_shadows.cpp

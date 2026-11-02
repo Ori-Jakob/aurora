@@ -1,5 +1,7 @@
 #include "capture.hpp"
 
+#include "gbuf_view.hpp"
+
 #include "../frame_state.hpp"
 #include "../graph_bind.hpp"
 #include "../jobs.hpp"
@@ -563,6 +565,19 @@ void write_latest() {
     }
   }
 }
+
+std::optional<size_t> distinct_index(std::vector<uint32_t>& distinct, uint32_t rgb, bool& overflow) {
+  const auto it = std::ranges::find(distinct, rgb);
+  if (it != distinct.end()) {
+    return static_cast<size_t>(it - distinct.begin());
+  }
+  if (distinct.size() < MaxDistinctColors) {
+    distinct.push_back(rgb);
+    return distinct.size() - 1;
+  }
+  overflow = true;
+  return std::nullopt;
+}
 } // namespace
 
 std::string_view status_name(Status status) noexcept {
@@ -624,14 +639,35 @@ FogSummary summarize_fog(std::span<const uint8_t> bytes) {
     ++summary.qHistogram[q];
     summary.withFog += q != 0 ? 1 : 0;
     summary.locked += (a & 1u) != 0 ? 1 : 0;
-    if (std::ranges::find(summary.distinct, rgb) == summary.distinct.end()) {
-      if (summary.distinct.size() < MaxDistinctColors) {
-        summary.distinct.push_back(rgb);
-      } else {
-        summary.distinctOverflow = true;
-      }
+    distinct_index(summary.distinct, rgb, summary.distinctOverflow);
+  }
+  return summary;
+}
+
+ColorSummary summarize_colors(std::span<const uint8_t> bytes) {
+  ColorSummary summary;
+  std::vector<uint32_t> distinct;
+  std::vector<uint64_t> counts;
+  uint32_t last = UINT32_MAX;
+  std::optional<size_t> lastIndex;
+  for (size_t i = 0; i + 4 <= bytes.size(); i += 4) {
+    const uint32_t rgb = uint32_t{bytes[i]} << 16 | uint32_t{bytes[i + 1]} << 8 | bytes[i + 2];
+    summary.nonBlack += rgb != 0 ? 1 : 0;
+    if (rgb != last) {
+      last = rgb;
+      lastIndex = distinct_index(distinct, rgb, summary.distinctOverflow);
+      counts.resize(distinct.size());
+    }
+    if (lastIndex) {
+      ++counts[*lastIndex];
     }
   }
+  for (size_t i = 0; i < distinct.size(); ++i) {
+    summary.distinct.push_back({distinct[i], counts[i]});
+  }
+  std::ranges::sort(summary.distinct, [](const ColorCount& a, const ColorCount& b) {
+    return a.count != b.count ? a.count > b.count : a.rgb < b.rgb;
+  });
   return summary;
 }
 
@@ -729,6 +765,24 @@ std::string header_json(const Capture& capture, std::string_view binName) {
     for (const uint64_t count : normal.codeCounts) {
       yyjson_mut_arr_add_uint(d, counts, count);
     }
+    break;
+  }
+  case wgpu::TextureFormat::RGBA8Unorm: {
+    if (capture.resource != gbuf_view::SnapshotResource) {
+      break;
+    }
+    // Views draw flat class colours, so this histogram is the view's class count
+    const ColorSummary colors = summarize_colors(capture.bytes);
+    yyjson_mut_val* obj = yyjson_mut_obj_add_obj(d, root, "colour");
+    yyjson_mut_obj_add_uint(d, obj, "nonBlack", colors.nonBlack);
+    yyjson_mut_val* distinct = yyjson_mut_obj_add_arr(d, obj, "distinct");
+    for (const ColorCount& entry : colors.distinct) {
+      yyjson_mut_val* item = yyjson_mut_arr_add_obj(d, distinct);
+      const std::string text = fmt::format("#{:06x}", entry.rgb);
+      yyjson_mut_obj_add_strncpy(d, item, "rgb", text.data(), text.size());
+      yyjson_mut_obj_add_uint(d, item, "count", entry.count);
+    }
+    yyjson_mut_obj_add_bool(d, obj, "distinctOverflow", colors.distinctOverflow);
     break;
   }
   default:

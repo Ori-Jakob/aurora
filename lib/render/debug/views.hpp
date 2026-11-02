@@ -4,6 +4,7 @@
 
 #include "../../gfx/types.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <optional>
@@ -52,6 +53,9 @@ inline constexpr std::array<DebugView, 8> ClassViews{{
     {8, "class.bit", "Classification: one category"},
 }};
 
+enum class GbufViewKind : uint8_t { Target, Decomposition };
+enum class DecompMode : uint32_t { Defog, Identity, Coverage, Multiply };
+
 struct GbufView {
   uint16_t id = 0;
   std::string_view name;
@@ -61,10 +65,31 @@ struct GbufView {
   Stage stage = Stage::OpaqueDone;
   uint32_t mode = 0;
   bool uintSource = false;
+  GbufViewKind kind = GbufViewKind::Target;
 };
 
-// Ids after the classification range; each snapshots one scene target and replaces the frame's RGB before the HUD
-inline constexpr std::array<GbufView, 7> GbufViews{{
+[[nodiscard]] constexpr DecompMode decomp_mode(const GbufView& view) noexcept {
+  return static_cast<DecompMode>(view.mode);
+}
+
+[[nodiscard]] constexpr GbufView decomp_row(uint16_t id, std::string_view name, std::string_view label,
+                                            std::string_view resource, std::string_view anchor,
+                                            DecompMode mode) noexcept {
+  return {
+      id,
+      name,
+      label,
+      resource,
+      anchor,
+      Stage::OpaqueDone,
+      static_cast<uint32_t>(mode),
+      false,
+      GbufViewKind::Decomposition,
+  };
+}
+
+// Target rows snapshot one scene target and decomposition rows decode several; both replace RGB before the HUD
+inline constexpr std::array<GbufView, 14> GbufViews{{
     {16, "gbuf.motion", "G-buffer: motion", "gbuf.motion", "phase.post_taa", Stage::PrePost, 0, false},
     {17, "gbuf.reactive", "G-buffer: reactive", "gbuf.reactive", "phase.post_taa", Stage::PrePost, 1, false},
     {18, "gbuf.fog", "Fog record: weight", "gbuf.fog", "phase.composite", Stage::OpaqueDone, 2, true},
@@ -72,6 +97,17 @@ inline constexpr std::array<GbufView, 7> GbufViews{{
     {20, "gbuf.fog.lock", "Fog record: lock", "gbuf.fog", "phase.composite", Stage::OpaqueDone, 4, true},
     {21, "gx.normal", "G-buffer: normal", "gx.normal", "phase.composite", Stage::OpaqueDone, 5, false},
     {22, "gx.normal.code", "G-buffer: receiver code", "gx.normal", "phase.composite", Stage::OpaqueDone, 6, false},
+    {23, "ao.final", "AO: final visibility", "ao.final", "phase.composite", Stage::OpaqueDone, 7, false},
+    decomp_row(24, "composite.defog", "Composite: defogged colour (S)", "gx.color", "phase.volumetrics",
+               DecompMode::Defog),
+    decomp_row(25, "composite.identity", "Composite: changed pixels", "legacyTex", "phase.composite",
+               DecompMode::Identity),
+    decomp_row(26, "composite.coverage", "Composite: decomposition coverage", "gbuf.fog", "phase.volumetrics",
+               DecompMode::Coverage),
+    decomp_row(27, "composite.multiply", "Composite: plain AO multiply (old look)", "gx.color", "phase.volumetrics",
+               DecompMode::Multiply),
+    {28, "ao.raw", "AO: raw visibility", "ao.raw", "phase.ao", Stage::OpaqueDone, 8, false},
+    {29, "ao.hiz", "AO: view depth (mip 0)", "ao.hiz", "phase.ao", Stage::OpaqueDone, 9, false},
 }};
 
 struct ViewSelection {
@@ -119,6 +155,33 @@ inline constexpr std::array<CategoryColor, 14> CategoryColors{{
     {scene::category::Dynamic, {0, 220, 220}},
     {scene::category::Static, {180, 180, 180}},
 }};
+
+enum class IdentityClass : uint8_t { Unchanged, Lifted, Brightened, CodeZero, AlphaChanged };
+enum class CoverageClass : uint8_t { Untouched, FoggedNonReceiver, Receiver, FoggedReceiver, LockedReceiver, Bad };
+
+// Frozen like the ids; capture histograms read these colours as classes
+inline constexpr std::array<Rgb8, 5> IdentityColors{
+    {{0, 0, 0}, {255, 128, 0}, {0, 255, 255}, {255, 0, 0}, {255, 255, 0}}};
+inline constexpr std::array<Rgb8, 6> CoverageColors{
+    {{64, 64, 64}, {40, 40, 110}, {80, 160, 255}, {60, 200, 60}, {255, 160, 0}, {255, 0, 255}}};
+inline constexpr Rgb8 DefogBadColor{255, 0, 255};
+
+[[nodiscard]] constexpr Rgb8 identity_class_color(IdentityClass cls) noexcept {
+  return IdentityColors[static_cast<size_t>(cls)];
+}
+
+[[nodiscard]] constexpr Rgb8 coverage_class_color(CoverageClass cls) noexcept {
+  return CoverageColors[static_cast<size_t>(cls)];
+}
+
+[[nodiscard]] constexpr uint8_t identity_grey(uint32_t d) noexcept {
+  return static_cast<uint8_t>(63 + 8 * std::min(d, 24u));
+}
+
+[[nodiscard]] constexpr Rgb8 coverage_touched(Rgb8 color) noexcept {
+  const auto tint = [](uint8_t c) { return static_cast<uint8_t>((c + 256) / 2); };
+  return {tint(color.r), tint(color.g), tint(color.b)};
+}
 
 [[nodiscard]] constexpr const DebugView* find_view(uint16_t id) noexcept {
   for (const DebugView& view : ClassViews) {
