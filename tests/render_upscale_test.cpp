@@ -495,6 +495,36 @@ TEST_F(Upscale, SwitchWaitsForWarm) {
   EXPECT_EQ(status.outputSize[0], OutputWidth);
 }
 
+using LatchedView = UpscaleTest;
+
+TEST_F(LatchedView, FollowsTheGraphEnvironment) {
+  struct ScopedOverride {
+    explicit ScopedOverride(uint16_t id) noexcept { debug::set_view_override(id); }
+    ~ScopedOverride() { debug::set_view_override(0); }
+  };
+  Settings request;
+  request.debugView = 3;
+  apply_settings(request);
+  const auto latched_view = [this] {
+    start_frame();
+    const std::shared_ptr<const FrameState> state = m_frame.renderState;
+    const GraphEnvironment env = gather_graph_environment();
+    // TAA, the upscalers and every per-frame view term must see the view the graph was compiled for
+    EXPECT_EQ(state->debugView, (PassSetup{.settings = &state->settings, .env = &env}.debug_view()));
+    end_frame();
+    return state->debugView;
+  };
+  EXPECT_EQ(latched_view(), 3u);
+  const GraphEnvironment before = gather_graph_environment();
+  for (const uint16_t id : {uint16_t{16}, uint16_t{25}, uint16_t{1}}) {
+    SCOPED_TRACE(id);
+    const ScopedOverride view{id};
+    EXPECT_NE(gather_graph_environment(), before);
+    EXPECT_EQ(latched_view(), id);
+  }
+  EXPECT_EQ(latched_view(), 3u);
+}
+
 constexpr gfx::Viewport FullViewport{0.f, 0.f, 640.f, 480.f, 0.f, 1.f};
 gfx::TextureBind bias_texture(bool arbitraryMips) {
   auto ref = std::make_shared<gfx::TextureRef>(wgpu::Texture{}, wgpu::TextureView{}, wgpu::TextureView{},

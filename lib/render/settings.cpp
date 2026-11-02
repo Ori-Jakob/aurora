@@ -1064,6 +1064,7 @@ std::shared_ptr<const FrameState> latch_frame() {
   gfx::texture_replacement::set_mip_generation(generateMips);
   std::shared_ptr<const CompiledGraph> graph = g_frameState ? g_frameState->graph : nullptr;
   bool inspectorOpen = false;
+  uint16_t debugView = 0;
 #if AURORA_ENABLE_RENDER
   begin_hint_frame();
   latch_external_passes();
@@ -1103,16 +1104,19 @@ std::shared_ptr<const FrameState> latch_frame() {
     taa::on_latch(latched_settings(), graph.get());
   }
   upscale::latch_graph(latched_settings(), graph.get());
-  ao::on_latch(latched_settings(), graph.get());
-  composite::on_latch(latched_settings(), graph.get());
+  const PassSetup latched{
+      .settings = &latched_settings(), .caps = &caps(), .env = &g_graphEnvironment, .sceneDepth = g_sceneDepthSource};
+  ao::on_latch(latched, graph.get());
+  composite::on_latch(latched, graph.get());
   latch_pass_params();
   inspectorOpen = g_graphEnvironment.inspectorOpen;
+  debugView = latched.debug_view();
 #endif
-  // An empty graph compiles to the same shared object, so the flag needs its own check
+  // An empty graph compiles to the same shared object, so the flags need their own check
   if (!g_frameState || g_frameState->settingsGeneration != g_generation || g_frameState->graph != graph ||
-      g_frameState->inspectorOpen != inspectorOpen) {
+      g_frameState->inspectorOpen != inspectorOpen || g_frameState->debugView != debugView) {
     g_frameState = std::make_shared<const FrameState>(
-        FrameState{g_generation, latched_settings(), std::move(graph), inspectorOpen});
+        FrameState{g_generation, latched_settings(), std::move(graph), inspectorOpen, debugView});
   }
 #if AURORA_ENABLE_RENDER
   // The FIFO worker is idle until fifo::begin_frame

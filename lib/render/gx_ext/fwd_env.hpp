@@ -25,7 +25,7 @@ inline constexpr std::string_view Pass = "fwd_env.publish";
 inline constexpr std::string_view ReadNode = "gx@PrePost";
 
 [[nodiscard]] bool screen_ao_receiver(const scene::DrawClass& cls, const gx::PipelineConfig& config) noexcept;
-[[nodiscard]] bool forward_ao_wanted(const Settings& settings) noexcept;
+[[nodiscard]] bool forward_ao_wanted(const Settings& settings, uint16_t debugView) noexcept;
 
 // Game thread, while the FIFO is idle
 void apply_frame_state(const detail::FrameState& state) noexcept;

@@ -366,7 +366,7 @@ void shutdown() noexcept {
   }
 }
 
-void on_latch(const Settings& settings, const CompiledGraph* graph) {
+void on_latch(const PassSetup& latched, const CompiledGraph* graph) {
   if (g_pass != InvalidPassId) {
     const Params params{.flags = g_flagsOverride.value_or(params_flags(identity_forced(), nullptr) |
                                                           (no_fog_forced() ? uint32_t{FlagNoFog} : 0u))};
@@ -397,8 +397,8 @@ void on_latch(const Settings& settings, const CompiledGraph* graph) {
   } else if (g_encodeMismatch.load(std::memory_order_relaxed)) {
     g_slot.live = false;
   }
-  // Latched like the class view (class_view.cpp:124), so a view and the composite agree on every frame
-  g_slot.classView = debug::find_view(debug::selected_view_id(settings)) != nullptr;
+  // The view the graph was compiled for, so the composite and TAA's declare never disagree
+  g_slot.classView = debug::find_view(latched.debug_view()) != nullptr;
 }
 
 bool ready(const Settings& settings) noexcept {

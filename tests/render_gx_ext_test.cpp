@@ -798,6 +798,7 @@ detail::FrameState ao_frame(Quality ao, uint16_t view = 0) {
   detail::FrameState state;
   state.settings.ao = ao;
   state.settings.debugView = view;
+  state.debugView = view;
   return state;
 }
 
@@ -974,6 +975,9 @@ TEST_F(RenderGxExt, ScreenAoFlagFollowsAoAndTier) {
   };
   expect_off(ao_frame(Quality::Off), "ao off");
   expect_off(ao_frame(Quality::High, 1), "class view");
+  detail::FrameState overridden = ao_frame(Quality::High);
+  overridden.debugView = 1;
+  expect_off(overridden, "inspector class view");
   fwd_env::testing::set_identity_override(true);
   expect_off(ao_frame(Quality::High), "identity");
   fwd_env::testing::set_identity_override(std::nullopt);
@@ -1088,11 +1092,11 @@ TEST_F(RenderGxExt, FwdEnvPublisherSkipsUnderIdentity) {
   const PublisherGraph graph = compile_publisher(settings);
   EXPECT_EQ(publisher_status(*graph.graph), detail::CullReason::Skipped);
   EXPECT_FALSE(reads_ao(*graph.graph));
-  EXPECT_FALSE(fwd_env::forward_ao_wanted(settings));
+  EXPECT_FALSE(fwd_env::forward_ao_wanted(settings, 0));
   fwd_env::testing::set_identity_override(false);
-  EXPECT_TRUE(fwd_env::forward_ao_wanted(settings));
-  settings.debugView = 1;
-  EXPECT_FALSE(fwd_env::forward_ao_wanted(settings));
+  EXPECT_TRUE(fwd_env::forward_ao_wanted(settings, 0));
+  EXPECT_FALSE(fwd_env::forward_ao_wanted(settings, 1));
+  EXPECT_TRUE(fwd_env::forward_ao_wanted(settings, 16));
 }
 
 TEST_F(RenderGxExt, FwdEnvPublisherSortsAfterComposite) {

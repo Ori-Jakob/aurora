@@ -13,6 +13,8 @@ struct FrameState {
   Settings settings;
   std::shared_ptr<const CompiledGraph> graph;
   bool inspectorOpen = false;
+  // The view the graph was compiled for, so per-frame view terms never disagree with its declares
+  uint16_t debugView = 0;
 };
 
 std::shared_ptr<const FrameState> latch_frame();

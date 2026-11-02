@@ -269,15 +269,15 @@ void fill_camera(const StageData& stage, const void*, std::span<std::byte> bytes
   bump(g_cameraFills);
 }
 
-void on_latch(const Settings& settings, const CompiledGraph* graph) {
-  const Params params = latched_params(settings, env_overrides());
+void on_latch(const PassSetup& latched, const CompiledGraph* graph) {
+  const Params params = latched_params(*latched.settings, env_overrides());
   for (const PassId pass : g_passes) {
     if (pass != InvalidPassId) {
       set_pass_params(pass, std::as_bytes(std::span{&params, 1}));
     }
   }
   g_strength.store(params.strength, std::memory_order_relaxed);
-  g_classView.store(debug::find_view(debug::selected_view_id(settings)) != nullptr, std::memory_order_relaxed);
+  g_classView.store(debug::find_view(latched.debug_view()) != nullptr, std::memory_order_relaxed);
   LatchSlot slot;
   if (graph != nullptr && node_live(*graph, hiz::Pass)) {
     slot.live = true;

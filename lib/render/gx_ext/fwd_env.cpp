@@ -182,14 +182,13 @@ bool screen_ao_receiver(const scene::DrawClass& cls, const gx::PipelineConfig& c
          !config.depthUpdate && (categories & Layers) != 0 && (categories & Excluded) == 0;
 }
 
-bool forward_ao_wanted(const Settings& settings) noexcept {
+bool forward_ao_wanted(const Settings& settings, uint16_t debugView) noexcept {
   // Identity runs and class views must leave translucents untouched
-  return detail::composite::wanted(settings) && !identity() &&
-         debug::find_view(debug::selected_view_id(settings)) == nullptr;
+  return detail::composite::wanted(settings) && !identity() && debug::find_view(debugView) == nullptr;
 }
 
 void apply_frame_state(const detail::FrameState& state) noexcept {
-  g_screenAo = records::gbuffer() && forward_ao_wanted(state.settings);
+  g_screenAo = records::gbuffer() && forward_ao_wanted(state.settings, state.debugView);
 }
 
 uint32_t record_flags(const scene::DrawClass& cls, const gx::PipelineConfig& config) noexcept {

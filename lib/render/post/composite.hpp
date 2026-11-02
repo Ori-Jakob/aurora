@@ -50,7 +50,7 @@ PassDesc copy_pass_desc();
 PassDesc pass_desc();
 void initialize();
 void shutdown() noexcept;
-void on_latch(const Settings& settings, const CompiledGraph* graph);
+void on_latch(const PassSetup& latched, const CompiledGraph* graph);
 [[nodiscard]] bool ready(const Settings& settings) noexcept;
 [[nodiscard]] bool live() noexcept;
 [[nodiscard]] bool enabled_this_frame(uint64_t frameId) noexcept;

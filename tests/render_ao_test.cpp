@@ -427,7 +427,7 @@ protected:
   }
 
   void latch(const CompiledGraph* graph) {
-    ao::on_latch(m_settings, graph);
+    ao::on_latch({.settings = &m_settings, .env = &m_env}, graph);
     latch_pass_params();
   }
 
@@ -606,12 +606,21 @@ TEST_F(AoGraph, DisabledUnderClassView) {
   uint64_t frame = 1;
   EXPECT_TRUE(pyramid_enabled(*graph, build(state, frame++, depth64())));
   for (const debug::DebugView& view : debug::ClassViews) {
-    debug::set_view_override(view.id);
+    m_env.viewOverride = view.id;
     latch(graph.get());
     EXPECT_FALSE(pyramid_enabled(*graph, build(state, frame++, depth64()))) << view.name;
   }
+  m_env.viewOverride = 0;
+  // Only the override the graph environment latched counts, the way TAA's declare sees it
+  debug::set_view_override(debug::ClassViews.front().id);
+  latch(graph.get());
+  EXPECT_TRUE(pyramid_enabled(*graph, build(state, frame++, depth64())));
   debug::set_view_override(0);
+  m_env.viewOverride = 16;
   m_settings.debugView = 3;
+  latch(graph.get());
+  EXPECT_TRUE(pyramid_enabled(*graph, build(state, frame++, depth64())));
+  m_env.viewOverride = 0;
   latch(graph.get());
   EXPECT_FALSE(pyramid_enabled(*graph, build(state, frame++, depth64())));
   m_settings.debugView = 0;
@@ -625,13 +634,14 @@ TEST_F(AoGraph, RunsUnderGbufView) {
   const auto graph = live_graph(ao_settings(Quality::High));
   const FrameState state{.graph = graph};
   for (const debug::GbufView& view : debug::GbufViews) {
-    debug::set_view_override(view.id);
+    m_env.viewOverride = view.id;
     latch(graph.get());
     EXPECT_TRUE(pyramid_enabled(*graph, build(state, view.id, depth64()))) << view.name;
   }
-  debug::set_view_override(29);
+  m_env.viewOverride = 29;
   latch(graph.get());
   EXPECT_TRUE(pyramid_enabled(*graph, build(state, 40, depth64())));
+  m_env.viewOverride = 0;
 }
 
 TEST_F(AoGraph, DisabledWithoutUsableCamera) {
@@ -1336,12 +1346,12 @@ TEST_F(AoChainGraph, ChainDisabledWhenPyramidDisabled) {
   EXPECT_EQ(run(state, 2, depth64()), std::nullopt);
   EXPECT_EQ(encoded(), live);
   ao::testing::set_camera_override(camera_hints(perspective(Near, Far)));
-  debug::set_view_override(debug::ClassViews.front().id);
+  m_env.viewOverride = debug::ClassViews.front().id;
   latch(graph.get());
   EXPECT_EQ(run(state, 3, depth64()), std::nullopt);
   EXPECT_EQ(encoded(), live);
   EXPECT_EQ(reader.calls, 1);
-  debug::set_view_override(0);
+  m_env.viewOverride = 0;
   latch(graph.get());
   EXPECT_EQ(run(state, 4, depth64()), std::nullopt);
   EXPECT_EQ(encoded()[2], 2u);
@@ -1661,7 +1671,7 @@ TEST_F(AoDenoiseGraph, ReadyFollowsPipelines) {
   } hints;
   const Settings high = ao_settings(Quality::High);
   EXPECT_TRUE(ao::ready(Settings{}));
-  ao::on_latch(high, nullptr);
+  ao::on_latch({.settings = &high}, nullptr);
   EXPECT_FALSE(ao::ready(high));
   std::atomic_bool release = false;
   std::atomic_bool started = false;

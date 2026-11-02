@@ -386,8 +386,9 @@ protected:
   }
 
   void latch(const CompiledGraph* graph) {
-    ao::on_latch(m_settings, graph);
-    composite::on_latch(m_settings, graph);
+    const PassSetup latched{.settings = &m_settings, .env = &m_env};
+    ao::on_latch(latched, graph);
+    composite::on_latch(latched, graph);
     latch_pass_params();
   }
 
@@ -408,7 +409,7 @@ protected:
     std::shared_ptr<CompiledGraph> graph = compile(settings);
     wait_ready(*graph);
     // A freed graph's address can come back, and the latch only re-checks a graph it has not seen
-    composite::on_latch(m_settings, nullptr);
+    composite::on_latch({.settings = &m_settings, .env = &m_env}, nullptr);
     latch(graph.get());
     return graph;
   }
@@ -684,9 +685,9 @@ TEST_F(CompositeGraph, ClassViewDisablesPerFrame) {
     EXPECT_TRUE(composite::live());
     ++frame;
   };
-  debug::set_view_override(1);
+  m_env.viewOverride = 1;
   expect_view_off();
-  debug::set_view_override(0);
+  m_env.viewOverride = 0;
   for (const uint16_t view : {uint16_t{1}, uint16_t{8}}) {
     m_settings.debugView = view;
     expect_view_off();
@@ -886,12 +887,12 @@ TEST_F(CompositeGraph, EnabledThisFrameFollowsCull) {
   EXPECT_FALSE(white_in_prepost(frame));
   ++frame;
 
-  debug::set_view_override(1);
+  m_env.viewOverride = 1;
   latch(graph.get());
   build(state, frame);
   EXPECT_FALSE(composite::enabled_this_frame(frame));
   EXPECT_FALSE(white_in_prepost(frame));
-  debug::set_view_override(0);
+  m_env.viewOverride = 0;
   latch(graph.get());
   ++frame;
 
@@ -980,7 +981,7 @@ TEST_F(CompositeGraph, ReadyFollowsPipelines) {
   register_pass(stub_ao_desc(stub));
   const Settings high = ao_settings();
   EXPECT_TRUE(composite::ready(Settings{}));
-  composite::on_latch(high, nullptr);
+  composite::on_latch({.settings = &high}, nullptr);
   EXPECT_FALSE(composite::ready(high));
   std::atomic_bool release = false;
   std::atomic_bool started = false;
@@ -1032,7 +1033,7 @@ TEST_F(CompositeGraph, AoGateFollowsComposite) {
   m_settings.aoStrength = 0.5f;
   latch(graph.get());
   EXPECT_TRUE(composite::ao_gate(state));
-  composite::on_latch(m_settings, nullptr);
+  composite::on_latch({.settings = &m_settings}, nullptr);
   EXPECT_FALSE(composite::ao_gate(state));
 }
 
