@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
+#include <unordered_map>
 #include <vector>
 
 // --- aurora::g_config ---
@@ -357,10 +358,12 @@ PipelineRef g_testLastPipelineRef = 0;
 // Resolves seen by the last lookup, so a test can tell whether it came after the draw's resolve
 uint32_t g_testResolvesAtLookup = 0;
 gx::RenderExtConfig g_testLastLookupExt{};
+std::vector<gx::RenderExtConfig> g_testLookupExts;
 template <>
 PipelineRef pipeline_ref<gx::PipelineConfig>(const gx::PipelineConfig& config) {
   g_testResolvesAtLookup = gx::g_testResolveCount;
   g_testLastLookupExt = config.shaderConfig.ext;
+  g_testLookupExts.push_back(config.shaderConfig.ext);
   g_testLastPipelineRef = ++g_testPipelineRefCount;
   return g_testLastPipelineRef;
 }
@@ -368,17 +371,22 @@ PipelineState g_testPipelineState = PipelineState::Ready;
 uint64_t g_testPipelineEpoch = 0;
 uint32_t g_testPipelineStateQueries = 0;
 PipelineRef g_testReadyLegacyRef = 0;
+PipelineRef g_testReadyTwinRef = 0;
 uint32_t g_testReadyProbes = 0;
 gx::RenderExtConfig g_testLastReadyExt{};
+std::vector<gx::RenderExtConfig> g_testReadyExts;
+std::unordered_map<PipelineRef, PipelineState> g_testRefStates;
 PipelineState pipeline_state(PipelineRef ref) noexcept {
   ++g_testPipelineStateQueries;
-  return g_testPipelineState;
+  const auto it = g_testRefStates.find(ref);
+  return it != g_testRefStates.end() ? it->second : g_testPipelineState;
 }
 uint64_t pipeline_epoch() noexcept { return g_testPipelineEpoch; }
 PipelineRef ready_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) noexcept {
   ++g_testReadyProbes;
   g_testLastReadyExt = config.shaderConfig.ext;
-  return g_testReadyLegacyRef;
+  g_testReadyExts.push_back(config.shaderConfig.ext);
+  return config.shaderConfig.ext.output == 1 ? g_testReadyTwinRef : g_testReadyLegacyRef;
 }
 bool g_testBlockingPipelines = false;
 void set_blocking_pipelines(bool blocking) noexcept { g_testBlockingPipelines = blocking; }

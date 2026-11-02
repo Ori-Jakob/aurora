@@ -16,6 +16,7 @@
 #include "gx/render_ext.hpp"
 #include "gx/shader_info.hpp"
 #include "gx/surface_pack.hpp"
+#include "gx/surface_wgsl.hpp"
 #include "render/shaders_embed.hpp"
 #include "webgpu/gpu.hpp"
 
@@ -2024,6 +2025,207 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   RecordProperty("cases", static_cast<int>(cases.size()));
   RecordProperty("ties", static_cast<int>(ties));
   std::printf("surface library: %zu cases, %zu within one step at a pack4x8unorm tie\n", cases.size(), ties);
+}
+constexpr std::string_view UnlitHeader = "// Unlit TEV (SP1 rules v1)";
+
+gfx::RenderTargetLayout pbr_layout(bool debugId) {
+  return gfx::compose_scene_layout({.gbuffer = true, .surface = true, .debugId = debugId},
+                                   {.color = wgpu::TextureFormat::BGRA8Unorm,
+                                    .depth = wgpu::TextureFormat::Depth32Float,
+                                    .size = {64, 64, 1},
+                                    .samples = 1});
+}
+
+std::vector<ShaderConfig> unlit_corpus() {
+  std::vector<ShaderConfig> configs;
+  std::unordered_set<uint64_t> seen;
+  const auto add = [&](const std::vector<corpus::Entry>& entries) {
+    for (const corpus::Entry& entry : entries) {
+      ShaderConfig config = corpus::decode(entry.record);
+      config.ext = {.output = 2};
+      if (seen.insert(xxh3_hash(config)).second) {
+        configs.push_back(config);
+      }
+    }
+  };
+  add(corpus::generate_synthetic());
+  if (const char* path = std::getenv("AURORA_GX_SHADER_CORPUS"); path != nullptr && *path != '\0') {
+    std::string error;
+    const auto entries = corpus::read_corpus(path, &error);
+    EXPECT_TRUE(entries.has_value()) << error;
+    if (entries) {
+      add(*entries);
+    }
+  }
+  return configs;
+}
+
+TEST_F(GxShaderExtDevice, UnlitValidatesWhereLegacyValidates) {
+  ASSERT_TRUE(start({.backend = wgpu::BackendType::Null, .core = true}, false));
+  size_t admitted = 0;
+  size_t zero = 0;
+  for (const ShaderConfig& config : unlit_corpus()) {
+    ShaderConfig legacy = config;
+    legacy.ext = {};
+    if (module_error(*m_device, build_shader_source(legacy, DstAlphaMode::None))) {
+      continue;
+    }
+    const ShaderInfo info = build_shader_info(config);
+    for (const bool debugId : {false, true}) {
+      const ShaderTargets targets = shader_targets(pbr_layout(debugId));
+      for (const auto mode : {DstAlphaMode::None, DstAlphaMode::Replace}) {
+        const std::string text = build_shader_source(config, mode, targets);
+        const bool unlit = uses_unlit(config, info, targets);
+        EXPECT_EQ(text.find(UnlitHeader) != std::string::npos, unlit);
+        const auto error = module_error(*m_device, text);
+        EXPECT_FALSE(error.has_value()) << error.value_or("") << "\n" << text;
+        ++(unlit ? admitted : zero);
+      }
+    }
+  }
+  EXPECT_GT(admitted, 0u);
+  EXPECT_GT(zero, 0u);
+  EXPECT_TRUE(test::take_uncaptured_errors(*m_device).empty());
+  RecordProperty("admitted", static_cast<int>(admitted));
+  RecordProperty("zero", static_cast<int>(zero));
+}
+
+TEST_F(GxShaderExtDevice, SurfacePackMatchesLibrary) {
+  const auto backend = hardware_backend();
+  if (!backend) {
+    GTEST_SKIP() << "AURORA_TEST_BACKEND names no hardware backend";
+  }
+  if (!start({.backend = *backend, .core = true, .allowCpu = false}, false)) {
+    GTEST_SKIP() << "no adapter";
+  }
+  const std::string_view library = render_library("aurora/surface");
+  ASSERT_FALSE(library.empty());
+  std::string generator;
+  append_surface_pack(generator);
+  constexpr uint32_t Fields = 16;
+  const std::string text = std::string{library} + generator + R"(
+@group(0) @binding(0) var<storage, read_write> out_words: array<u32>;
+@group(0) @binding(1) var<storage, read> in_words: array<u32>;
+
+fn in_f32(i: u32) -> f32 {
+  return bitcast<f32>(in_words[i]);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  let i = id.x * 16u;
+  let rgb = vec3f(in_f32(i), in_f32(i + 1u), in_f32(i + 2u));
+  let ambient = vec3f(in_f32(i + 8u), in_f32(i + 9u), in_f32(i + 10u));
+  let emissive = vec3f(in_f32(i + 12u), in_f32(i + 13u), in_f32(i + 14u));
+  let g = gx_surface_pack(rgb, in_f32(i + 3u), in_f32(i + 4u), in_f32(i + 5u), in_words[i + 6u], in_words[i + 7u],
+                          ambient, in_words[i + 11u], emissive);
+  let r = gbuf_surface_pack(GbufSurface(rgb, in_f32(i + 3u), in_f32(i + 4u), in_f32(i + 5u), in_words[i + 6u],
+                                        in_words[i + 7u], ambient, in_words[i + 11u], emissive));
+  out_words[i + 0u] = g.x;
+  out_words[i + 1u] = g.y;
+  out_words[i + 2u] = g.z;
+  out_words[i + 3u] = g.w;
+  out_words[i + 4u] = r.x;
+  out_words[i + 5u] = r.y;
+  out_words[i + 6u] = r.z;
+  out_words[i + 7u] = r.w;
+}
+)";
+  const std::vector<SurfaceCase> cases = surface_cases();
+  ASSERT_EQ(cases.size() % 64, 0u);
+  const auto bits = [](float value) { return std::bit_cast<uint32_t>(value); };
+  std::vector<uint32_t> input;
+  for (const SurfaceCase& c : cases) {
+    const surface::Fields& f = c.fields;
+    const std::array<uint32_t, Fields> row{bits(f.albedo[0]),   bits(f.albedo[1]),   bits(f.albedo[2]),   bits(f.ao),
+                                           bits(f.roughness),   bits(f.metalness),   f.classId,           f.flags,
+                                           bits(f.ambient[0]),  bits(f.ambient[1]),  bits(f.ambient[2]),  f.category,
+                                           bits(f.emissive[0]), bits(f.emissive[1]), bits(f.emissive[2]), 0u};
+    input.insert(input.end(), row.begin(), row.end());
+  }
+  const auto out = run_word_compute(*m_device, text, static_cast<uint32_t>(cases.size()), Fields, input);
+  ASSERT_TRUE(out.has_value());
+  size_t mismatches = 0;
+  size_t copyMismatches = 0;
+  for (size_t i = 0; i < cases.size(); ++i) {
+    const uint32_t* w = &(*out)[i * Fields];
+    const std::array<uint32_t, 4> expected = surface::pack(cases[i].fields);
+    const bool tie = cases[i].tieTolerant;
+    const bool packed = unorm_bytes_match(w[0], expected[0], 0xF, tie) &&
+                        unorm_bytes_match(w[1], expected[1], 0x3, tie) &&
+                        unorm_bytes_match(w[2], expected[2], 0x7, tie) && w[3] == expected[3];
+    if (!packed && mismatches++ < 8) {
+      ADD_FAILURE() << "generator pack case " << i << std::hex << ": " << w[0] << " " << w[1] << " " << w[2] << " "
+                    << w[3] << " expected " << expected[0] << " " << expected[1] << " " << expected[2] << " "
+                    << expected[3];
+    }
+    if (!std::equal(w, w + 4, w + 4) && copyMismatches++ < 8) {
+      ADD_FAILURE() << "generator and library differ at case " << i;
+    }
+  }
+  EXPECT_EQ(mismatches, 0u);
+  EXPECT_EQ(copyMismatches, 0u);
+  RecordProperty("cases", static_cast<int>(cases.size()));
+}
+
+TEST_F(GxShaderExtDevice, UnlitKeepsColourPath) {
+  const auto backend = hardware_backend();
+  if (!backend) {
+    GTEST_SKIP() << "AURORA_TEST_BACKEND names no hardware backend";
+  }
+  if (!start({.backend = *backend, .core = true, .allowCpu = false, .profile = FEATURE_PROFILE_FULL}, true)) {
+    GTEST_SKIP() << "no adapter";
+  }
+  wgpu::Limits limits{};
+  m_device->device.GetLimits(&limits);
+  if (!m_device->core || limits.maxColorAttachmentBytesPerSample < 48) {
+    GTEST_SKIP() << "no core device with 48 colour bytes";
+  }
+  constexpr size_t MaxChecked = 24;
+  const uint64_t failures = gbuffer_pipeline_failures();
+  size_t checked = 0;
+  for (const ShaderConfig& base : legacy_valid_configs(*m_device)) {
+    const ShaderConfig unlit = with_output(base, 2);
+    const ShaderInfo info = build_shader_info(unlit);
+    if (!info.unlitAdmitted) {
+      continue;
+    }
+    const ShaderConfig twin = with_output(base, 1);
+    for (const bool debugId : {false, true}) {
+      const gfx::RenderTargetLayout layout = pbr_layout(debugId);
+      const ShaderTargets targets = shader_targets(layout);
+      ASSERT_TRUE(uses_unlit(unlit, info, targets));
+      const std::string unlitText = build_shader_source(unlit, DstAlphaMode::None, targets);
+      const std::string twinText = build_shader_source(twin, DstAlphaMode::None, targets);
+      const size_t body = twinText.find("fn fs_main(");
+      const size_t split = twinText.find("\n    out.surface = vec4u(0u);", body);
+      ASSERT_NE(split, std::string::npos);
+      const size_t unlitBody = unlitText.find("fn fs_main(");
+      EXPECT_EQ(unlitText.substr(unlitBody, split - body), twinText.substr(body, split - body));
+      const PipelineConfig unlitPipeline = pipeline_for(unlit);
+      const PipelineConfig twinPipeline = pipeline_for(twin);
+      const PipelineOptions options{.colorUpdate = true, .alphaUpdate = true, .depthUpdate = true};
+      const auto unlitStates = color_target_states(unlitPipeline, layout, options);
+      const auto twinStates = color_target_states(twinPipeline, layout, options);
+      for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
+        EXPECT_EQ(unlitStates[i].writeMask, twinStates[i].writeMask) << i;
+        EXPECT_EQ(unlitStates[i].blend, twinStates[i].blend) << i;
+        EXPECT_EQ(unlitStates[i].format, twinStates[i].format) << i;
+      }
+      EXPECT_EQ(unlitStates[targets.surface].writeMask, wgpu::ColorWriteMask::All);
+      m_device->device.PushErrorScope(wgpu::ErrorFilter::Validation);
+      const bool built = create_pipeline(unlitPipeline, layout).main && create_pipeline(twinPipeline, layout).main;
+      const auto error = test::pop_validation_error(*m_device);
+      EXPECT_TRUE(built);
+      EXPECT_FALSE(error.has_value()) << error.value_or("");
+    }
+    if (++checked == MaxChecked) {
+      break;
+    }
+  }
+  EXPECT_GT(checked, 0u);
+  EXPECT_EQ(gbuffer_pipeline_failures(), failures);
+  RecordProperty("checked", static_cast<int>(checked));
 }
 } // namespace
 } // namespace aurora::gx

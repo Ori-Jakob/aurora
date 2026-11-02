@@ -325,7 +325,9 @@ void warm_scene_variant(const gx::PipelineConfig& config) {
   }
   g_warmSet.seen.insert(key);
   WarmPair pair{.variant = warm_pipeline(config, warm->pending)};
-  const gx::PipelineConfig fallback = gx::render_ext::fallback_config(config);
+  // The output-1 twin clears the surface class, so it is the better stand-in and costs no extra compile
+  const gx::PipelineConfig fallback = config.shaderConfig.ext.output == 2 ? gx::render_ext::output1_config(config)
+                                                                          : gx::render_ext::fallback_config(config);
   if (std::memcmp(&fallback, &config, sizeof(config)) != 0) {
     pair.fallback = warm_pipeline(fallback, warm->pending);
   }

@@ -71,6 +71,9 @@ inline constexpr u32 MotionSourceCamera = 1;
 inline constexpr u32 MotionSourceObject = 2;
 inline constexpr u32 MotionSourcePalette = 3;
 inline constexpr u32 RecordFlagJitter = 1u << 2;
+inline constexpr u32 RecordVertexColorShift = 3;
+inline constexpr u32 RecordFlagUnlit = 1u << 5;
+inline constexpr u32 DrawRecordTevPolicyWord = 7;
 // Core-visible copy of records::flag::ScreenAo for the generator
 inline constexpr u32 RecordFlagScreenAo = 1u << 11;
 inline constexpr u32 RecordFlagPrevProjFrame = 1u << 12;
@@ -89,8 +92,24 @@ inline bool stochastic_bind_ok(const gfx::TextureBind& bind) noexcept {
          bind.texObj.wrap_t() == GX_REPEAT;
 }
 
+struct Stats {
+  std::atomic_uint64_t fallbackDraws{0};
+  std::atomic_uint64_t pendingDraws{0};
+  std::atomic_uint64_t failedVariants{0};
+  std::atomic_uint64_t budgetDrops{0};
+  std::atomic_uint64_t pbrFallbackOutput1{0};
+  std::atomic_uint64_t pbrFallbackOutput0{0};
+  std::atomic_uint64_t pbrTwinAdopted{0};
+  std::atomic_uint64_t fwdEnvDemotions{0};
+};
+inline Stats g_stats;
+
 inline RenderExtConfig normalize(RenderExtConfig ext, const ShaderInfo& info) noexcept {
   ext.stochasticMask &= static_cast<u8>(info.stochasticEligible.to_ulong());
+  if (ext.output == 2 && ext.fwdEnv != 0) {
+    ext.output = 1;
+    g_stats.fwdEnvDemotions.fetch_add(1, std::memory_order_relaxed);
+  }
   return ext;
 }
 
@@ -117,20 +136,22 @@ inline PipelineConfig fallback_config(const PipelineConfig& config) noexcept {
   return fallback;
 }
 
+// A PBR draw still clears the surface class while its output-2 variant compiles
+inline PipelineConfig output1_config(const PipelineConfig& config) noexcept {
+  PipelineConfig twin = config;
+  if (twin.shaderConfig.ext.output == 2) {
+    twin.shaderConfig.ext.output = 1;
+  }
+  return twin;
+}
+
 inline bool needs_gbuffer(const RenderExtConfig& ext) noexcept {
   return ext.output != 0 || ext.velocity != 0 || ext.fwdEnv != 0;
 }
 
 // Output bits mean something only under the M7 targets; elsewhere their text and targets are the ext-0 pipeline's
 inline bool output_admitted(const RenderExtConfig& ext, const gfx::RenderTargetLayout& layout) noexcept {
-  return !needs_gbuffer(ext) || gfx::layout_has_gbuffer(layout);
+  return !needs_gbuffer(ext) ||
+         (gfx::layout_has_gbuffer(layout) && (ext.output != 2 || gfx::layout_has_surface(layout)));
 }
-
-struct Stats {
-  std::atomic_uint64_t fallbackDraws{0};
-  std::atomic_uint64_t pendingDraws{0};
-  std::atomic_uint64_t failedVariants{0};
-  std::atomic_uint64_t budgetDrops{0};
-};
-inline Stats g_stats;
 } // namespace aurora::gx::render_ext

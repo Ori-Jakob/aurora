@@ -320,7 +320,7 @@ TEST_F(RenderClassify, CategoriesAndFlagsAccumulate) {
 TEST_F(RenderClassify, MaterialAndTevPolicyFollowInnermost) {
   classifier.material(7);
   classifier.object_begin(object(1));
-  classifier.tev_policy(0x10);
+  classifier.tev_policy({.mask = 0x10});
   classifier.material(0x1234);
   const DrawClass& inside = classifier.route(main_draw());
   EXPECT_EQ(inside.key.tevPolicy, 0x10u);
@@ -330,6 +330,36 @@ TEST_F(RenderClassify, MaterialAndTevPolicyFollowInnermost) {
   EXPECT_EQ(after.key.tevPolicy, 0u);
   EXPECT_EQ(after.key.materialClass, 7u);
   EXPECT_EQ(stats().tevPolicyDraws, 1u);
+}
+
+TEST_F(RenderClassify, TevPolicyKeepsNeutrals) {
+  AuroraTevPolicy outer{.mask = 0x10000};
+  outer.neutral[4][0] = 255;
+  AuroraTevPolicy inner{.mask = 0x08010070};
+  inner.neutral[4][0] = 255;
+  inner.neutral[1][2] = 9;
+  classifier.tev_policy(outer);
+  classifier.object_begin(object(1));
+  const DrawClass& first = classifier.route(main_draw());
+  EXPECT_EQ(first.key.tevPolicy, 0x10000u);
+  EXPECT_EQ(first.key.tevNeutral[4 * 4], 255u);
+  EXPECT_EQ(first.key.tevNeutral[1 * 4 + 2], 0u);
+  classifier.tev_policy(inner);
+  const DrawClass& second = classifier.route(main_draw());
+  EXPECT_EQ(second.key.tevPolicy, 0x08010070u);
+  EXPECT_EQ(second.key.tevNeutral[1 * 4 + 2], 9u);
+  EXPECT_TRUE(second.keyChanged);
+  AuroraTevPolicy sameMask = inner;
+  sameMask.neutral[1][2] = 10;
+  classifier.tev_policy(sameMask);
+  const DrawClass& third = classifier.route(main_draw());
+  EXPECT_EQ(third.key.tevNeutral[1 * 4 + 2], 10u);
+  EXPECT_TRUE(third.keyChanged);
+  classifier.object_end();
+  const DrawClass& after = classifier.route(main_draw());
+  EXPECT_EQ(after.key.tevPolicy, 0x10000u);
+  EXPECT_EQ(after.key.tevNeutral[1 * 4 + 2], 0u);
+  EXPECT_EQ(after.key.tevNeutral[4 * 4], 255u);
 }
 
 TEST_F(RenderClassify, NestedObjectBeginEndsOuter) {

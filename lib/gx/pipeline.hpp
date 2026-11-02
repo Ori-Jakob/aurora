@@ -2,6 +2,7 @@
 
 #include "../gfx/pipeline_cache.hpp"
 #include "gx.hpp"
+#include "unlit_plan.hpp"
 
 #include <array>
 #include <optional>
@@ -24,6 +25,7 @@ struct DrawData {
 constexpr uint32_t GXPipelineConfigVersion = 14;
 // Bumped when a stored ext != 0 config would mean or normalize differently; WGSL text changes never need it
 constexpr uint32_t RenderShaderRev = 1;
+static_assert(unlit::RuleTableVersion == 1 && RenderShaderRev == 1, "a rule-table verdict change bumps both");
 static_assert(GXPipelineConfigVersion < 0x10000);
 constexpr uint32_t GXExtRowVersion = (RenderShaderRev << 16) | GXPipelineConfigVersion;
 struct PipelineConfig {

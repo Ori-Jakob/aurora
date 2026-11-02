@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstring>
 
 namespace aurora::render::scene {
 namespace {
@@ -222,10 +223,12 @@ void Classifier::material(uint32_t materialClass) noexcept {
   m_keyDirty = true;
 }
 
-void Classifier::tev_policy(uint32_t mask) noexcept {
+void Classifier::tev_policy(const AuroraTevPolicy& policy) noexcept {
   Entry& entry = innermost();
   entry.hasTevPolicy = true;
-  entry.tevPolicy = mask;
+  entry.tevPolicy = policy.mask;
+  static_assert(sizeof(policy.neutral) == sizeof(entry.tevNeutral));
+  std::memcpy(entry.tevNeutral.data(), policy.neutral, sizeof(policy.neutral));
   m_keyDirty = true;
 }
 
@@ -285,6 +288,7 @@ const ClassKey& Classifier::key() noexcept {
     }
     if (entry.hasTevPolicy && !tevPolicy) {
       key.tevPolicy = entry.tevPolicy;
+      key.tevNeutral = entry.tevNeutral;
       tevPolicy = true;
     }
   }

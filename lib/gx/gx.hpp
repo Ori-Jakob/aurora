@@ -555,6 +555,9 @@ static_assert(offsetof(ShaderConfig, ext) + sizeof(RenderExtConfig) == sizeof(Sh
 
 struct PipelineConfig;
 struct PipelineOptions;
+namespace unlit {
+enum class Verdict : uint8_t;
+} // namespace unlit
 
 struct GXBindGroups {
   gfx::BindGroupRef textureBindGroup;
@@ -580,7 +583,20 @@ struct ShaderInfo {
   bool usesFog : 1 = false;
   bool lightingEnabled : 1 = false;
   u8 lineMode : 2 = 0;
+  // Config-only unlit facts, filled only at output 2; unlit_facts() answers for other outputs
+  u16 unlitLayerStages = 0;
+  u8 unlitVerdict : 3 = 0;
+  u8 unlitRawVtx : 2 = 0;
+  bool unlitPlanned : 1 = false;
+  bool unlitAdmitted : 1 = false;
 };
+struct UnlitFacts {
+  bool admitted = false;
+  u8 rawVtx = 0;
+  u16 layerStages = 0;
+  unlit::Verdict verdict{};
+};
+UnlitFacts unlit_facts(const ShaderConfig& config, const ShaderInfo& info) noexcept;
 struct BindGroupRanges {
   std::array<gfx::Range, MaxIndexAttr> vaRanges{};
 };
@@ -598,12 +614,18 @@ struct ShaderTargets {
   uint32_t reactive = UINT32_MAX;
   uint32_t gbufferNormal = UINT32_MAX;
   uint32_t fog = UINT32_MAX;
+  uint32_t surface = UINT32_MAX;
   // Group-3 forward environment; a layout property, so the 3-argument form never has it
   bool fwdEnv = false;
 };
 // Text, pipeline layout and the group-3 bind all key on this, so they never disagree
 inline bool uses_forward_env(const ShaderConfig& c, const ShaderTargets& t) noexcept {
   return c.ext.fwdEnv != 0 && t.fwdEnv;
+}
+inline bool uses_surface(const ShaderTargets& t) noexcept { return t.surface != UINT32_MAX; }
+// Text, varyings, write mask and derive all key on this, so they never disagree
+inline bool uses_unlit(const ShaderConfig& c, const ShaderInfo& info, const ShaderTargets& t) noexcept {
+  return c.ext.output == 2 && uses_surface(t) && t.motion != UINT32_MAX && info.unlitAdmitted;
 }
 // The generator's prevColorNormalized; flag stamping uses it too, so flags never land on draws without the AO block
 inline bool tev_colour_clamped(const ShaderConfig& c) noexcept {
@@ -621,6 +643,9 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
                                 const ShaderTargets& targets) noexcept;
 // The gbuffer receiver read, shared with the device test
 std::string receiver_alpha_wgsl();
+namespace testing {
+uint64_t shader_hash(const ShaderConfig& config, DstAlphaMode dstAlphaMode, const ShaderTargets& targets) noexcept;
+} // namespace testing
 wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout,
                                 DstAlphaMode dstAlphaMode) noexcept;
 GXBindGroups build_bind_groups(const ShaderInfo& info, bool baseLevel = false) noexcept;

@@ -32,6 +32,7 @@ constexpr uint32_t MotionCheckMinFrames = 40;
 constexpr uint32_t FogCheckMinFrames = 40;
 constexpr uint32_t AoCheckMinFrames = 240;
 constexpr uint32_t FwdEnvCheckMinFrames = 40;
+constexpr uint32_t UnlitCheckMinFrames = 40;
 constexpr uint32_t MaxGpuPadMiB = 1024;
 
 std::optional<uint32_t> parse_u32(std::string_view text) noexcept {
@@ -197,6 +198,11 @@ bool apply_fwd_env_check(Options& options, std::string_view) {
   return true;
 }
 
+bool apply_unlit_check(Options& options, std::string_view) {
+  options.unlitCheck = true;
+  return true;
+}
+
 bool apply_no_hints(Options& options, std::string_view) {
   options.hints = false;
   return true;
@@ -287,7 +293,7 @@ struct Flag {
   bool frameLoop = false;
 };
 
-constexpr std::array<Flag, 33> Flags{{
+constexpr std::array<Flag, 34> Flags{{
     {"--frames", true, apply_frames, true},
     {"--timeout", true, apply_timeout, true},
     {"--backend", true, apply_backend},
@@ -308,6 +314,7 @@ constexpr std::array<Flag, 33> Flags{{
     {"--fog-check", false, apply_fog_check, true},
     {"--ao-check", false, apply_ao_check, true},
     {"--fwd-env-check", false, apply_fwd_env_check, true},
+    {"--unlit-check", false, apply_unlit_check, true},
     {"--no-hints", false, apply_no_hints, true},
     {"--check-hints", false, apply_check_hints, true},
     {"--custom-draw-probe", false, apply_custom_draw_probe, true},
@@ -408,7 +415,7 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
   }
   // Graph passes and custom draws record GPU work outside the GX FIFO, so the capture would be discarded
   if ((options.vignette || options.depthCheck || options.motionCheck || options.motionView || options.fogCheck ||
-       options.aoCheck || options.fwdEnvCheck || options.gpuCull != 0) &&
+       options.aoCheck || options.fwdEnvCheck || options.unlitCheck || options.gpuCull != 0) &&
       !options.tracePath.empty()) {
     error = "render graph passes cannot be traced";
     return std::nullopt;
@@ -449,6 +456,14 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
   }
   if (options.fwdEnvCheck && options.frames != 0 && options.frames < FwdEnvCheckMinFrames) {
     error = "--fwd-env-check needs at least 40 frames";
+    return std::nullopt;
+  }
+  if (options.unlitCheck && (!options.hints || options.msaa > 1)) {
+    error = "--unlit-check cannot be combined with --no-hints or --msaa above 1";
+    return std::nullopt;
+  }
+  if (options.unlitCheck && options.frames != 0 && options.frames < UnlitCheckMinFrames) {
+    error = "--unlit-check needs at least 40 frames";
     return std::nullopt;
   }
   if ((options.cullCheck || options.cullTimings) && options.gpuCull == 0) {
@@ -501,6 +516,10 @@ std::string_view usage() noexcept {
          "                      demo.fwd_env_check and exit with code 14 unless tagged strips take the AO under\n"
          "                      their fog, untagged strips and floating cards keep their look and ao.final stays\n"
          "                      exactly 1 where nothing receives (needs at least 40 frames)\n"
+         "  --unlit-check       build PBR, dim the sun at frame 20, register demo.unlit_check and exit with code 15\n"
+         "                      unless gbuf.surface keeps the ground's base colour through the change, carries\n"
+         "                      class 1, roughness 217 and metalness 0, and reads class 0 on a NoPbr quad (needs\n"
+         "                      at least 40 frames)\n"
          "  --no-hints          emit no render hints and no capture-only draw\n"
 
          "  --check-hints       exit with code 8 unless aurora decoded or skipped every emitted hint as expected\n"

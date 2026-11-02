@@ -53,6 +53,7 @@ enum ExitCode : int {
   ExitFogCheck = 12,
   ExitAoCheck = 13,
   ExitFwdEnvCheck = 14,
+  ExitUnlitCheck = 15,
 };
 
 std::atomic_uint32_t g_errorCount = 0;
@@ -268,6 +269,27 @@ FwdEnvOutcome fwd_env_outcome(const render_demo::FwdEnvCheckReport& report, bool
     outcome.failure = "check readback did not complete";
   } else {
     outcome.failure = render_demo::check_fwd_env(outcome.summary);
+  }
+  return outcome;
+}
+
+struct UnlitOutcome {
+  render_demo::UnlitCheckSummary summary;
+  std::optional<std::string> failure;
+};
+
+UnlitOutcome unlit_outcome(const render_demo::UnlitCheckReport& report, bool nullBackend) {
+  UnlitOutcome outcome{.summary = render_demo::summarize_unlit(report.before, report.after)};
+  // The null backend runs no shaders, so its values say nothing
+  if (nullBackend) {
+    return outcome;
+  }
+  if (report.encodes == 0) {
+    outcome.failure = "gbuf.surface never reached demo.unlit_check";
+  } else if (!report.ready || report.before.empty() || report.after.empty()) {
+    outcome.failure = "check readback did not complete";
+  } else {
+    outcome.failure = render_demo::check_unlit(outcome.summary);
   }
   return outcome;
 }
@@ -632,6 +654,10 @@ int main(int argc, char* argv[]) {
     // apply_settings alone cannot reach AO before its built bits ship, so the check builds it through the env
     SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_AO", "high", false);
   }
+  if (options.unlitCheck) {
+    // PBR ships no built bit in M9, so only the verification hook can reach the Surface layout
+    SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_PBR", "on", false);
+  }
 
   AuroraConfig config{};
   config.appName = "render_demo";
@@ -677,7 +703,8 @@ int main(int argc, char* argv[]) {
                                          .gpuPadMiB = options.gpuPadMiB,
                                          .fogBands = options.fogCheck || options.fwdEnvCheck,
                                          .aoCheck = options.aoCheck,
-                                         .fwdEnvCheck = options.fwdEnvCheck};
+                                         .fwdEnvCheck = options.fwdEnvCheck,
+                                         .unlitCheck = options.unlitCheck};
   bool decodingChanged = false;
 
   GXInit(nullptr, 0);
@@ -697,7 +724,8 @@ int main(int argc, char* argv[]) {
                                                                    .motionView = options.motionView,
                                                                    .fogCheck = options.fogCheck,
                                                                    .aoCheck = options.aoCheck,
-                                                                   .fwdEnvCheck = options.fwdEnvCheck},
+                                                                   .fwdEnvCheck = options.fwdEnvCheck,
+                                                                   .unlitCheck = options.unlitCheck},
                                                                   graphError)) {
     std::fprintf(stderr, "render_demo: render graph setup failed: %s\n", graphError.c_str());
     render_demo::shutdown_scene();
@@ -877,6 +905,19 @@ int main(int argc, char* argv[]) {
         s.far.maxError, s.near.checked, s.near.sensitive, s.near.maxError, s.plain.checked, s.plain.sensitive,
         s.plain.maxError, s.card.checked, s.card.sensitive, s.card.maxError, s.alphaMismatches, s.exactOneViolations);
   }
+  const UnlitOutcome unlitOutcome =
+      options.unlitCheck ? unlit_outcome(graphReport.unlit, info.backend == BACKEND_NULL) : UnlitOutcome{};
+  if (options.unlitCheck) {
+    const std::string status = unlitOutcome.failure           ? "FAILED: " + *unlitOutcome.failure
+                               : info.backend == BACKEND_NULL ? std::string{"skipped (null backend)"}
+                                                              : std::string{"passed"};
+    const auto& u = unlitOutcome.summary;
+    std::printf(
+        "render_demo: unlit check %s: %u ground probes (class off %u, params off %u, base colour changed "
+        "%u, gx.color moved %u-%u) and %u NoPbr probes (%u with a PBR class) at %ux%u\n",
+        status.c_str(), u.ground, u.classMismatches, u.paramMismatches, u.albedoChanges, u.minColourMove,
+        u.maxColourMove, u.control, u.controlPbr, graphReport.unlit.width, graphReport.unlit.height);
+  }
   if (options.gpuCull != 0) {
     print_cull_report(graphReport.cull, frame, options.cullTimings);
   }
@@ -934,6 +975,9 @@ int main(int argc, char* argv[]) {
   }
   if (fwdEnvOutcome.failure) {
     return ExitFwdEnvCheck;
+  }
+  if (unlitOutcome.failure) {
+    return ExitUnlitCheck;
   }
 
   if (cullFailure) {

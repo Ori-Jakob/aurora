@@ -26,6 +26,8 @@ add_library(aurora_gx STATIC
         lib/gx/hex_wgsl.cpp
         lib/gx/hex_wgsl.hpp
         lib/gx/surface_pack.hpp
+        lib/gx/surface_wgsl.cpp
+        lib/gx/surface_wgsl.hpp
         lib/gx/unlit_plan.cpp
         lib/gx/unlit_plan.hpp
         lib/gx/render_ext.hpp

@@ -3,8 +3,10 @@
 #include "../gfx/frame.hpp"
 #include "../gfx/recording.hpp"
 #include "render_ext.hpp"
+#include "unlit_plan.hpp"
 
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <utility>
@@ -276,6 +278,11 @@ bool stochastic_fits(u32 unalignedUniformSize, u32 maps) noexcept {
   return gfx::align_uniform(unalignedUniformSize + maps * sizeof(Vec4<float>)) <= MaxUniformSize;
 }
 
+static u8 base_varyings(const ShaderConfig& config, const ShaderInfo& info) noexcept {
+  return static_cast<u8>((config.attrs[GX_VA_NRM].attrType != GX_NONE || EnableNormalVisualization ? 1 : 0) +
+                         info.sampledColorChannels.count() + info.sampledTexCoords.count() + MotionVaryings);
+}
+
 ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
   ZoneScoped;
 
@@ -431,10 +438,21 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
   }
   info.stochasticTextures = std::bitset<MaxTextures>{config.ext.stochasticMask} & info.stochasticEligible;
   info.uniformSize += info.stochasticTextures.count() * sizeof(Vec4<float>);
-  // A milestone that adds varyings must widen this bound and add a drop rule
+  // Output 2 adds up to two raw vertex colours; admission keeps it at output 1 when they do not fit
   static_assert(1 + MaxColorChannels / 2 + MaxTexCoord + MotionVaryings <= MaxGxVaryings);
-  info.varyings = static_cast<u8>((config.attrs[GX_VA_NRM].attrType != GX_NONE || EnableNormalVisualization ? 1 : 0) +
-                                  info.sampledColorChannels.count() + info.sampledTexCoords.count() + MotionVaryings);
+  const u8 base = base_varyings(config, info);
+  info.varyings = base;
+  if (config.ext.output == 2) {
+    const unlit::Plan plan = unlit::plan(config);
+    info.unlitPlanned = true;
+    info.unlitVerdict = static_cast<u8>(plan.verdict);
+    info.unlitRawVtx = plan.rawVtx;
+    info.unlitLayerStages = plan.layerStages;
+    info.unlitAdmitted = unlit::admitted(plan, config, base);
+    if (info.unlitAdmitted) {
+      info.varyings = static_cast<u8>(base + unlit::raw_vertex_varyings(plan));
+    }
+  }
   info.uniformSize = gfx::align_uniform(info.uniformSize);
   if (info.uniformSize > MaxUniformSize) {
     Log.fatal("Uniform size exceeds maximum: {} > {}", info.uniformSize, MaxUniformSize);
@@ -442,11 +460,26 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
   return info;
 }
 
+UnlitFacts unlit_facts(const ShaderConfig& config, const ShaderInfo& info) noexcept {
+  if (info.unlitPlanned) {
+    return {.admitted = info.unlitAdmitted,
+            .rawVtx = static_cast<u8>(info.unlitRawVtx),
+            .layerStages = info.unlitLayerStages,
+            .verdict = static_cast<unlit::Verdict>(info.unlitVerdict)};
+  }
+  const unlit::Plan plan = unlit::plan(config);
+  return {.admitted = unlit::admitted(plan, config, base_varyings(config, info)),
+          .rawVtx = plan.rawVtx,
+          .layerStages = plan.layerStages,
+          .verdict = plan.verdict};
+}
+
 static u32 count_varyings(const ShaderConfig& config, const ShaderInfo& info, const ShaderTargets& targets) noexcept {
   const bool normal = (normal_target(config, targets) != UINT32_MAX && config.attrs[GX_VA_NRM].attrType != GX_NONE) ||
                       EnableNormalVisualization;
   return (normal ? 1u : 0u) + static_cast<u32>(info.sampledColorChannels.count() + info.sampledTexCoords.count()) +
-         (targets.motion != UINT32_MAX ? MotionVaryings : 0u);
+         (targets.motion != UINT32_MAX ? MotionVaryings : 0u) +
+         (uses_unlit(config, info, targets) ? static_cast<u32>(std::popcount(info.unlitRawVtx)) : 0u);
 }
 
 u32 varying_count(const ShaderConfig& config, const ShaderTargets& targets) noexcept {

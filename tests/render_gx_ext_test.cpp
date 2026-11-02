@@ -6,12 +6,14 @@
 #include "gx/hints.hpp"
 #include "gx/pipeline.hpp"
 #include "gx/render_ext.hpp"
+#include "gx/shader_info.hpp"
 #include "gx/texture.hpp"
 #include "render/frame_state.hpp"
 #include "render/graph.hpp"
 #include "render/gx_ext/ext_provider.hpp"
 #include "render/gx_ext/fwd_env.hpp"
 #include "render/gx_ext/records.hpp"
+#include "render/gx_ext/unlit.hpp"
 #include "render/hints.hpp"
 #include "render/post/composite.hpp"
 #include "render/material/registry.hpp"
@@ -118,7 +120,7 @@ scene::DrawClass draw_class(scene::Window window = scene::Window::Opaque, uint64
 uint32_t stamp(const scene::DrawClass& cls, uint32_t instances = 1) {
   gx::DrawData draw{};
   draw.instanceCount = instances;
-  records::stamp(draw, gx::PipelineConfig{}, cls);
+  records::stamp(draw, gx::PipelineConfig{}, gx::ShaderInfo{}, cls);
   return draw.immediateData._pad;
 }
 
@@ -126,9 +128,11 @@ struct ScopedTargets {
   ~ScopedTargets() {
     webgpu::g_graphicsConfig.gbuffer = gbuffer;
     webgpu::g_graphicsConfig.debugIdBuffer = debugId;
+    webgpu::g_graphicsConfig.surfaceBuffer = surface;
   }
   bool gbuffer = webgpu::g_graphicsConfig.gbuffer;
   bool debugId = webgpu::g_graphicsConfig.debugIdBuffer;
+  bool surface = webgpu::g_graphicsConfig.surfaceBuffer;
 };
 
 struct ScopedHints {
@@ -529,7 +533,7 @@ bool stamped_reactive(scene::Window window, scene::Role role, const gx::Pipeline
   cls.kind = role == scene::Role::Sky ? scene::Kind::Sky : scene::Kind::MainBlended;
   gx::DrawData draw{};
   draw.instanceCount = 1;
-  records::stamp(draw, config, cls);
+  records::stamp(draw, config, gx::ShaderInfo{}, cls);
   EXPECT_NE(draw.immediateData._pad, 0u);
   return (FakeStorage::at<records::DrawRecord>(draw.immediateData._pad).flags & records::flag::Reactive) != 0;
 }
@@ -940,7 +944,7 @@ TEST_F(RenderGxExt, ScreenAoFlagFollowsAoAndTier) {
   const auto stamp_forward = [](const gx::PipelineConfig& config, uint32_t categories = cat::Terrain) {
     gx::DrawData draw{};
     draw.instanceCount = 1;
-    records::stamp(draw, config, forward_class(categories));
+    records::stamp(draw, config, gx::ShaderInfo{}, forward_class(categories));
     return draw.immediateData._pad;
   };
   const auto flagged = [&](const gx::PipelineConfig& config, uint32_t categories = cat::Terrain) {
@@ -1116,6 +1120,283 @@ TEST_F(RenderGxExt, FwdEnvPublisherSortsAfterComposite) {
   EXPECT_TRUE(reads_ao(graph));
   const std::optional<std::string> contract = detail::composite::check_contract(graph);
   EXPECT_FALSE(contract.has_value()) << contract.value_or("");
+}
+gfx::RenderTargetLayout pbr_layout() {
+  return gfx::compose_scene_layout({.gbuffer = true, .surface = true}, {.color = wgpu::TextureFormat::BGRA8Unorm,
+                                                                        .depth = wgpu::TextureFormat::Depth32Float,
+                                                                        .size = {64, 64, 1},
+                                                                        .samples = 1});
+}
+
+gx::PipelineConfig pbr_writer() {
+  gx::PipelineConfig config = writer(true, true);
+  config.blendMode = GX_BM_NONE;
+  gx::ShaderConfig& shader = config.shaderConfig;
+  shader.attrs[GX_VA_POS] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32};
+  shader.attrs[GX_VA_NRM] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32};
+  shader.attrs[GX_VA_TEX0] = {.attrType = GX_DIRECT, .cnt = 2, .compType = GX_F32};
+  shader.tcgs[0] = {.type = GX_TG_MTX2x4, .src = GX_TG_TEX0};
+  shader.colorChannels[GX_COLOR0] = {
+      .matSrc = GX_SRC_REG, .ambSrc = GX_SRC_REG, .diffFn = GX_DF_CLAMP, .attnFn = GX_AF_SPOT, .lightingEnabled = true};
+  shader.colorChannels[GX_ALPHA0] = {.matSrc = GX_SRC_REG};
+  gx::TevStage& stage = shader.tevStages[0];
+  stage.colorPass = {GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASC, GX_CC_ZERO};
+  stage.texMapId = GX_TEXMAP0;
+  stage.texCoordId = GX_TEXCOORD0;
+  stage.channelId = GX_COLOR0A0;
+  shader.tevStageCount = 1;
+  return config;
+}
+
+scene::DrawClass main_opaque(uint32_t categories = cat::Static | cat::Terrain, uint64_t object = 1) {
+  scene::DrawClass cls = draw_class(scene::Window::Opaque, object);
+  cls.kind = scene::Kind::MainOpaque;
+  cls.mainClass = true;
+  cls.key.categories = categories;
+  return cls;
+}
+
+uint8_t pbr_output(const gx::PipelineConfig& config, const gfx::RenderTargetLayout& layout) {
+  const gx::render_ext::Hooks* hooks = gx::render_ext::hooks();
+  EXPECT_NE(hooks, nullptr);
+  gx::render_ext::StochasticLanes lanes{};
+  return hooks != nullptr
+             ? hooks->derive(hooks->userData, config, gx::build_shader_info(config.shaderConfig), layout, lanes).output
+             : 0xFF;
+}
+
+void pbr_frame() {
+  webgpu::g_graphicsConfig.gbuffer = true;
+  webgpu::g_graphicsConfig.surfaceBuffer = true;
+  apply_frame_state(frame(false, false));
+}
+
+records::DrawRecord stamped(const gx::PipelineConfig& config, const scene::DrawClass& cls) {
+  gx::DrawData draw{};
+  draw.instanceCount = 1;
+  records::stamp(draw, config, gx::build_shader_info(config.shaderConfig), cls);
+  return FakeStorage::at<records::DrawRecord>(draw.immediateData._pad);
+}
+
+gx::PipelineConfig with_output(gx::PipelineConfig config, uint8_t output) {
+  config.shaderConfig.ext.output = output;
+  return config;
+}
+
+TEST_F(RenderGxExt, Output2TruthTable) {
+  const ScopedTargets targets;
+  const ScopedHints hints;
+  pbr_frame();
+  ASSERT_TRUE(records::gbuffer());
+  const gfx::RenderTargetLayout pbr = pbr_layout();
+  const gfx::RenderTargetLayout base = scene_layout(true);
+  records::on_route(main_opaque());
+  ASSERT_NE(gx::render_ext::g_drawInputs & records::PbrEligible, 0u);
+  EXPECT_EQ(pbr_output(pbr_writer(), pbr), 2u);
+  EXPECT_EQ(pbr_output(pbr_writer(), base), 1u);
+  EXPECT_EQ(pbr_output(pbr_writer(), scene_layout(false)), 0u);
+
+  gx::PipelineConfig blendedWriter = pbr_writer();
+  blendedWriter.blendMode = GX_BM_BLEND;
+  blendedWriter.blendFacSrc = GX_BL_SRCALPHA;
+  blendedWriter.blendFacDst = GX_BL_INVSRCALPHA;
+  gx::PipelineConfig noDepth = pbr_writer();
+  noDepth.depthUpdate = false;
+  gx::PipelineConfig noColor = pbr_writer();
+  noColor.colorUpdate = false;
+  gx::PipelineConfig noNormal = pbr_writer();
+  noNormal.shaderConfig.attrs[GX_VA_NRM] = {};
+  gx::PipelineConfig failing = pbr_writer();
+  failing.shaderConfig.tevStages[0].colorPass = {GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASA, GX_CC_ZERO};
+  failing.shaderConfig.colorChannels[GX_ALPHA0] = failing.shaderConfig.colorChannels[GX_COLOR0];
+  gx::PipelineConfig lines = pbr_writer();
+  lines.shaderConfig.lineMode = 1;
+  for (const gx::PipelineConfig& config : {blendedWriter, noDepth, noColor, noNormal, failing, lines}) {
+    EXPECT_EQ(pbr_output(config, pbr), 1u);
+  }
+
+  gx::g_gxState.textures[0].material = {.id = 1, .flags = material::NoPbr};
+  EXPECT_EQ(pbr_output(pbr_writer(), pbr), 1u);
+  gx::g_gxState.textures[0].material = {};
+  EXPECT_EQ(pbr_output(pbr_writer(), pbr), 2u);
+
+  for (const uint32_t excluded :
+       {cat::NoPbr, cat::Water, cat::ScreenRead, cat::Particle, cat::Ui, cat::Sky, cat::FakeShadow, cat::Overlay}) {
+    records::on_route(main_opaque(cat::Static | excluded));
+    EXPECT_EQ(gx::render_ext::g_drawInputs & records::PbrEligible, 0u) << excluded;
+    EXPECT_EQ(pbr_output(pbr_writer(), pbr), 1u) << excluded;
+  }
+  scene::DrawClass blended = main_opaque();
+  blended.kind = scene::Kind::MainBlended;
+  records::on_route(blended);
+  EXPECT_EQ(pbr_output(pbr_writer(), pbr), 1u);
+
+  SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_UNLIT", "off", true);
+  unlit::testing::reset();
+  apply_frame_state(frame(false, false));
+  records::on_route(main_opaque());
+  EXPECT_EQ(pbr_output(pbr_writer(), pbr), 1u);
+  SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_UNLIT");
+  unlit::testing::reset();
+  apply_frame_state(frame(false, false));
+  records::on_route(main_opaque());
+  EXPECT_EQ(pbr_output(pbr_writer(), pbr), 2u);
+}
+
+TEST_F(RenderGxExt, PbrEligibleOnlyWithSurfaceLayout) {
+  const ScopedTargets targets;
+  const ScopedHints hints;
+  webgpu::g_graphicsConfig.gbuffer = true;
+  apply_frame_state(frame(false, false));
+  records::on_route(main_opaque());
+  EXPECT_EQ(gx::render_ext::g_drawInputs, records::InWindow);
+  EXPECT_EQ(pbr_output(pbr_writer(), pbr_layout()), 1u);
+
+  pbr_frame();
+  records::on_route(main_opaque());
+  EXPECT_EQ(gx::render_ext::g_drawInputs, records::InWindow | records::PbrEligible);
+
+  webgpu::g_graphicsConfig.surfaceBuffer = false;
+  webgpu::g_graphicsConfig.gbuffer = false;
+  apply_frame_state(frame(false, false));
+  records::on_route(main_opaque());
+  EXPECT_EQ(gx::render_ext::g_drawInputs & records::PbrEligible, 0u);
+}
+
+TEST_F(RenderGxExt, PbrEligibleNeverInTranslucentWindow) {
+  const ScopedTargets targets;
+  const ScopedHints hints;
+  pbr_frame();
+  for (const scene::Window window : {scene::Window::PreScene, scene::Window::Translucent, scene::Window::Post}) {
+    scene::DrawClass cls = main_opaque();
+    cls.key.window = window;
+    records::on_route(cls);
+    EXPECT_EQ(gx::render_ext::g_drawInputs & records::PbrEligible, 0u) << static_cast<int>(window);
+    EXPECT_NE(pbr_output(pbr_writer(), pbr_layout()), 2u) << static_cast<int>(window);
+  }
+  scene::DrawClass offscreen = main_opaque();
+  offscreen.offscreen = true;
+  records::on_route(offscreen);
+  EXPECT_EQ(gx::render_ext::g_drawInputs & records::PbrEligible, 0u);
+  records::on_route(forward_class());
+  EXPECT_EQ(gx::render_ext::g_drawInputs, records::ForwardWindow);
+}
+
+TEST_F(RenderGxExt, RecordBitsOnlyOnOutput2) {
+  records::testing::set_push(&FakeStorage::push);
+  records::testing::set_active(true, true, false);
+  records::testing::set_surface(true);
+  scene::DrawClass cls = main_opaque(cat::Static | cat::Emissive, 5);
+  cls.key.flags = scene::object_flag::BakedVertexLight;
+  cls.key.tevPolicy = 0x10000;
+  for (const uint8_t output : {uint8_t{0}, uint8_t{1}}) {
+    const records::DrawRecord record = stamped(with_output(pbr_writer(), output), cls);
+    EXPECT_EQ(record.flags & (records::flag::VertexColorMask | records::flag::Unlit), 0u) << int{output};
+    EXPECT_EQ(record.tevPolicyOff, 0u) << int{output};
+  }
+  const records::DrawRecord record = stamped(with_output(pbr_writer(), 2), cls);
+  EXPECT_EQ((record.flags & records::flag::VertexColorMask) >> records::flag::VertexColorShift, 1u);
+  EXPECT_NE(record.flags & records::flag::Unlit, 0u);
+  EXPECT_NE(record.tevPolicyOff, 0u);
+  EXPECT_EQ(record.materialOff0, 0u);
+  EXPECT_EQ(record.materialOff1, 0u);
+  apply_frame_state(frame(false, false));
+  EXPECT_EQ(records::stats().pbrRecords, 1u);
+  EXPECT_EQ(records::stats().policyBlocks, 1u);
+}
+
+TEST_F(RenderGxExt, TevPolicyBlockCarriesNeutralsAndDedupes) {
+  records::testing::set_push(&FakeStorage::push);
+  records::testing::set_active(true, true, false);
+  records::testing::set_surface(true);
+  scene::DrawClass cls = main_opaque(cat::Static, 5);
+  cls.key.tevPolicy = 0x08010070;
+  cls.key.tevNeutral[4 * 4 + 0] = 255;
+  cls.key.tevNeutral[1 * 4 + 1] = 17;
+  const gx::PipelineConfig config = with_output(pbr_writer(), 2);
+  const records::DrawRecord first = stamped(config, cls);
+  ASSERT_NE(first.tevPolicyOff, 0u);
+  const auto block = FakeStorage::at<AuroraTevPolicy>(first.tevPolicyOff);
+  EXPECT_EQ(block.mask, 0x08010070u);
+  EXPECT_EQ(block.neutral[4][0], 255u);
+  EXPECT_EQ(block.neutral[1][1], 17u);
+  EXPECT_EQ(block.neutral[6][3], 0u);
+
+  scene::DrawClass other = cls;
+  other.key.object.id = 6;
+  EXPECT_EQ(stamped(config, other).tevPolicyOff, first.tevPolicyOff);
+  scene::DrawClass changed = cls;
+  changed.key.tevNeutral[4 * 4 + 0] = 128;
+  const records::DrawRecord third = stamped(config, changed);
+  EXPECT_NE(third.tevPolicyOff, first.tevPolicyOff);
+  EXPECT_EQ(FakeStorage::at<AuroraTevPolicy>(third.tevPolicyOff).neutral[4][0], 128u);
+  scene::DrawClass none = cls;
+  none.key.tevPolicy = 0;
+  EXPECT_EQ(stamped(config, none).tevPolicyOff, 0u);
+  apply_frame_state(frame(false, false));
+  EXPECT_EQ(records::stats().policyBlocks, 2u);
+
+  SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_UNLIT_POLICY", "off", true);
+  unlit::testing::reset();
+  apply_frame_state(frame(false, false));
+  records::testing::set_active(true, true, false);
+  records::testing::set_surface(true);
+  EXPECT_EQ(stamped(config, cls).tevPolicyOff, 0u);
+  SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_UNLIT_POLICY");
+  unlit::testing::reset();
+}
+
+TEST_F(RenderGxExt, VertexPolicyPrecedence) {
+  const gx::PipelineConfig config = with_output(pbr_writer(), 2);
+  const gx::ShaderInfo info = gx::build_shader_info(config.shaderConfig);
+  ASSERT_EQ(info.unlitLayerStages, 1u);
+  scene::DrawClass cls = main_opaque();
+  EXPECT_EQ(unlit::vertex_policy(config, info, cls), 0u);
+  cls.key.flags = scene::object_flag::BakedVertexLight;
+  EXPECT_EQ(unlit::vertex_policy(config, info, cls), 1u);
+  for (const uint32_t vc : {1u, 2u, 3u}) {
+    gx::g_gxState.textures[0].material = {.id = 1, .flags = vc << material::VertexColorShift};
+    EXPECT_EQ(unlit::vertex_policy(config, info, cls), vc - 1) << vc;
+  }
+  gx::g_gxState.textures[1].material = {.id = 2, .flags = 3u << material::VertexColorShift};
+  gx::g_gxState.textures[0].material = {};
+  EXPECT_EQ(unlit::vertex_policy(config, info, cls), 1u);
+  cls.key.flags = 0;
+  EXPECT_EQ(unlit::vertex_policy(config, info, cls), 0u);
+
+  EXPECT_FALSE(unlit::unlit_flag(config, info, cls));
+  gx::g_gxState.textures[0].material = {.id = 1, .flags = material::Unlit};
+  EXPECT_TRUE(unlit::unlit_flag(config, info, cls));
+  gx::g_gxState.textures[0].material = {};
+  cls.key.categories |= cat::Emissive;
+  EXPECT_TRUE(unlit::unlit_flag(config, info, cls));
+
+  SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_VERTEX_COLOR", "ignore", true);
+  unlit::testing::reset();
+  unlit::apply_frame_state(frame(false, false));
+  EXPECT_EQ(unlit::vertex_policy(config, info, cls), 2u);
+  SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_VERTEX_COLOR");
+  unlit::testing::reset();
+}
+
+TEST_F(RenderGxExt, PbrOffRecordsByteIdentical) {
+  records::testing::set_push(&FakeStorage::push);
+  records::testing::set_active(true, true, false);
+  scene::DrawClass cls = main_opaque(cat::Static | cat::Emissive, 9);
+  cls.key.tevPolicy = 0x10000;
+  const records::DrawRecord plain = stamped(with_output(pbr_writer(), 0), cls);
+  const records::DrawRecord marked = stamped(with_output(pbr_writer(), 1), cls);
+  EXPECT_EQ(std::memcmp(&plain, &marked, sizeof(plain)), 0);
+  EXPECT_EQ(plain.tevPolicyOff, 0u);
+  EXPECT_EQ(plain.flags & (records::flag::VertexColorMask | records::flag::Unlit), 0u);
+
+  const ScopedTargets targets;
+  const ScopedHints hints;
+  webgpu::g_graphicsConfig.gbuffer = true;
+  apply_frame_state(frame(false, false));
+  records::on_route(main_opaque());
+  EXPECT_EQ(gx::render_ext::g_drawInputs, records::InWindow);
+  EXPECT_EQ(pbr_output(pbr_writer(), scene_layout(true)), 1u);
 }
 } // namespace
 } // namespace aurora::render::gx_ext

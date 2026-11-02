@@ -11,6 +11,7 @@
 #include <bitset>
 #include <cstring>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 namespace aurora::gx {
@@ -42,8 +43,12 @@ extern PipelineState g_testPipelineState;
 extern uint64_t g_testPipelineEpoch;
 extern uint32_t g_testPipelineStateQueries;
 extern PipelineRef g_testReadyLegacyRef;
+extern PipelineRef g_testReadyTwinRef;
 extern uint32_t g_testReadyProbes;
 extern gx::RenderExtConfig g_testLastReadyExt;
+extern std::vector<gx::RenderExtConfig> g_testReadyExts;
+extern std::vector<gx::RenderExtConfig> g_testLookupExts;
+extern std::unordered_map<PipelineRef, PipelineState> g_testRefStates;
 extern const LayoutWarm* g_testLayoutWarm;
 extern std::vector<gx::PipelineConfig> g_testWarmedConfigs;
 extern bool g_testOffscreen;
@@ -162,6 +167,16 @@ RenderExtConfig input_hook(void* userData, const aurora::gx::PipelineConfig& con
 
 constexpr render_ext::Hooks InputHook{.derive = &input_hook};
 
+RenderExtConfig output2_hook(void*, const aurora::gx::PipelineConfig&, const aurora::gx::ShaderInfo&,
+                             const gfx::RenderTargetLayout&, render_ext::StochasticLanes&) noexcept {
+  ++g_deriveCalls;
+  RenderExtConfig ext;
+  ext.output = render_ext::g_drawInputs != 0 ? 2 : 0;
+  return ext;
+}
+
+constexpr render_ext::Hooks Output2Hook{.derive = &output2_hook};
+
 // Marks in-window draws only under a G-buffer layout, as the provider does, and gives that layout its own lanes
 RenderExtConfig layout_hook(void* userData, const aurora::gx::PipelineConfig& config,
                             const aurora::gx::ShaderInfo& info, const gfx::RenderTargetLayout& layout,
@@ -224,10 +239,16 @@ struct ExtStats {
   uint64_t fallbackDraws = render_ext::g_stats.fallbackDraws.load();
   uint64_t pendingDraws = render_ext::g_stats.pendingDraws.load();
   uint64_t failedVariants = render_ext::g_stats.failedVariants.load();
+  uint64_t output1 = render_ext::g_stats.pbrFallbackOutput1.load();
+  uint64_t output0 = render_ext::g_stats.pbrFallbackOutput0.load();
+  uint64_t adopted = render_ext::g_stats.pbrTwinAdopted.load();
 
   [[nodiscard]] uint64_t fallback() const { return render_ext::g_stats.fallbackDraws.load() - fallbackDraws; }
   [[nodiscard]] uint64_t pending() const { return render_ext::g_stats.pendingDraws.load() - pendingDraws; }
   [[nodiscard]] uint64_t failed() const { return render_ext::g_stats.failedVariants.load() - failedVariants; }
+  [[nodiscard]] uint64_t twin_draws() const { return render_ext::g_stats.pbrFallbackOutput1.load() - output1; }
+  [[nodiscard]] uint64_t ext0_draws() const { return render_ext::g_stats.pbrFallbackOutput0.load() - output0; }
+  [[nodiscard]] uint64_t twins_adopted() const { return render_ext::g_stats.pbrTwinAdopted.load() - adopted; }
 };
 } // namespace
 
@@ -270,6 +291,10 @@ protected:
     gfx::g_testPipelineStateQueries = 0;
     gfx::g_testReadyProbes = 0;
     gfx::g_testLastReadyExt = {};
+    gfx::g_testReadyExts.clear();
+    gfx::g_testLookupExts.clear();
+    gfx::g_testRefStates.clear();
+    gfx::g_testReadyTwinRef = 0;
     g_deriveCalls = 0;
   }
 
@@ -283,6 +308,8 @@ protected:
     gfx::g_testPipelineState = gfx::PipelineState::Ready;
     gfx::g_testPipelineEpoch = 0;
     gfx::g_testReadyLegacyRef = 0;
+    gfx::g_testReadyTwinRef = 0;
+    gfx::g_testRefStates.clear();
     g_hookLane = aurora::Vec4<float>{1.f, 0.f, 0.6f, 7.f};
     for (auto& texture : g_gxState.textures) {
       texture = {};
@@ -1308,6 +1335,137 @@ TEST_F(GXDrawRouteTest, PendingOutputVariantThatFailsLooksUpExtZero) {
   EXPECT_EQ(gfx::g_testLastDraw.pipeline, gfx::g_testLastPipelineRef);
   EXPECT_EQ(stats.failed(), 1u);
   EXPECT_EQ(stats.fallback(), 1u);
+}
+
+std::vector<u8> outputs(const std::vector<RenderExtConfig>& exts) {
+  std::vector<u8> values;
+  for (const RenderExtConfig& ext : exts) {
+    values.push_back(ext.output);
+  }
+  return values;
+}
+
+TEST_F(GXDrawRouteTest, PendingOutput2ProbesTwinThenExt0) {
+  gfx::g_testMergeDraws = false;
+  const ExtStats stats;
+  render_ext::set_hooks(&Output2Hook);
+  render_ext::g_drawInputs = 1;
+  gfx::g_testPipelineState = gfx::PipelineState::Pending;
+  gfx::g_testReadyTwinRef = 55;
+  gfx::g_testReadyLegacyRef = 77;
+  triangle();
+  decode();
+  EXPECT_EQ(outputs(gfx::g_testLookupExts), (std::vector<u8>{2}));
+  EXPECT_EQ(outputs(gfx::g_testReadyExts), (std::vector<u8>{1}));
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, 55u);
+  EXPECT_EQ(stats.twin_draws(), 1u);
+  EXPECT_EQ(stats.fallback(), 1u);
+
+  fifo::invalidate_draw_cache();
+  gfx::g_testReadyExts.clear();
+  gfx::g_testReadyTwinRef = 0;
+  triangle();
+  decode();
+  EXPECT_EQ(outputs(gfx::g_testReadyExts), (std::vector<u8>{1, 0}));
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, 77u);
+  EXPECT_EQ(stats.ext0_draws(), 1u);
+
+  gfx::g_testReadyExts.clear();
+  gfx::g_testReadyLegacyRef = 0;
+  fifo::invalidate_draw_cache();
+  triangle();
+  decode();
+  EXPECT_EQ(outputs(gfx::g_testReadyExts), (std::vector<u8>{1, 0}));
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, gfx::g_testLastPipelineRef);
+  EXPECT_EQ(outputs(gfx::g_testLookupExts), (std::vector<u8>{2, 2, 2}));
+  EXPECT_EQ(stats.pending(), 1u);
+  EXPECT_EQ(stats.failed(), 0u);
+}
+
+TEST_F(GXDrawRouteTest, FailedOutput2RequestsAndAdoptsTwin) {
+  gfx::g_testMergeDraws = false;
+  const ExtStats stats;
+  render_ext::set_hooks(&Output2Hook);
+  render_ext::g_drawInputs = 1;
+  gfx::g_testPipelineState = gfx::PipelineState::Failed;
+  gfx::g_testRefStates[2] = gfx::PipelineState::Pending;
+  gfx::g_testReadyLegacyRef = 77;
+  triangle();
+  decode();
+  EXPECT_EQ(outputs(gfx::g_testLookupExts), (std::vector<u8>{2, 1}));
+  EXPECT_EQ(outputs(gfx::g_testReadyExts), (std::vector<u8>{0}));
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, 77u);
+  EXPECT_EQ(stats.failed(), 1u);
+  EXPECT_EQ(stats.ext0_draws(), 1u);
+
+  gfx::g_testRefStates[2] = gfx::PipelineState::Ready;
+  gfx::g_testPipelineEpoch = 1;
+  triangle();
+  decode();
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, 2u);
+  EXPECT_EQ(gfx::g_testPipelineRefCount, 2u);
+  EXPECT_EQ(stats.twins_adopted(), 1u);
+  EXPECT_EQ(stats.twin_draws(), 1u);
+  EXPECT_EQ(stats.failed(), 1u);
+
+  triangle();
+  decode();
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, 2u);
+  EXPECT_EQ(stats.twins_adopted(), 1u);
+  EXPECT_EQ(stats.twin_draws(), 2u);
+}
+
+TEST_F(GXDrawRouteTest, FailedTwinFallsBackToExt0) {
+  gfx::g_testMergeDraws = false;
+  const ExtStats stats;
+  render_ext::set_hooks(&Output2Hook);
+  render_ext::g_drawInputs = 1;
+  gfx::g_testPipelineState = gfx::PipelineState::Failed;
+  triangle();
+  decode();
+  EXPECT_EQ(outputs(gfx::g_testLookupExts), (std::vector<u8>{2, 1, 0}));
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, 3u);
+  EXPECT_EQ(gfx::g_testReadyProbes, 0u);
+  EXPECT_EQ(stats.failed(), 2u);
+  EXPECT_EQ(stats.twins_adopted(), 0u);
+  EXPECT_EQ(stats.ext0_draws(), 1u);
+
+  gfx::g_testPipelineState = gfx::PipelineState::Pending;
+  gfx::g_testRefStates[5] = gfx::PipelineState::Failed;
+  fifo::invalidate_draw_cache();
+  gfx::g_testLookupExts.clear();
+  triangle();
+  decode();
+  EXPECT_EQ(outputs(gfx::g_testLookupExts), (std::vector<u8>{2}));
+  gfx::g_testRefStates[4] = gfx::PipelineState::Failed;
+  gfx::g_testPipelineEpoch = 1;
+  triangle();
+  decode();
+  EXPECT_EQ(outputs(gfx::g_testLookupExts), (std::vector<u8>{2, 1, 0}));
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, 6u);
+  EXPECT_EQ(stats.failed(), 4u);
+}
+
+TEST_F(GXDrawRouteTest, OutputOneVariantsKeepTodaysPath) {
+  gfx::g_testMergeDraws = false;
+  const ExtStats stats;
+  render_ext::set_hooks(&InputHook);
+  render_ext::g_drawInputs = 1;
+  gfx::g_testPipelineState = gfx::PipelineState::Pending;
+  gfx::g_testReadyTwinRef = 55;
+  gfx::g_testReadyLegacyRef = 77;
+  triangle();
+  decode();
+  EXPECT_EQ(outputs(gfx::g_testReadyExts), (std::vector<u8>{0}));
+  EXPECT_EQ(gfx::g_testLastDraw.pipeline, 77u);
+
+  gfx::g_testPipelineState = gfx::PipelineState::Failed;
+  gfx::g_testPipelineEpoch = 1;
+  triangle();
+  decode();
+  EXPECT_EQ(outputs(gfx::g_testLookupExts), (std::vector<u8>{1, 0}));
+  EXPECT_EQ(stats.failed(), 1u);
+  EXPECT_EQ(stats.twin_draws() + stats.ext0_draws() + stats.twins_adopted(), 0u);
 }
 
 TEST_F(GXDrawRouteTest, RegistryRepublishRelooks) {

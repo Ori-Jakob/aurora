@@ -1,6 +1,7 @@
 #pragma once
 
 #include <aurora/render.hpp>
+#include <dolphin/gx/GXAurora.h>
 
 #include <array>
 #include <cstddef>
@@ -96,6 +97,7 @@ struct ClassKey {
   uint8_t roleScopes = 0;
   uint8_t materialClass = 0;
   uint32_t tevPolicy = 0;
+  std::array<uint8_t, 28> tevNeutral{};
   uint32_t categories = 0;
   uint32_t flags = 0;
   uint32_t scope = 0;
@@ -264,7 +266,7 @@ public:
   void scope_pop() noexcept;
   bool stage(Stage stage) noexcept;
   void material(uint32_t materialClass) noexcept;
-  void tev_policy(uint32_t mask) noexcept;
+  void tev_policy(const AuroraTevPolicy& policy) noexcept;
 
   const DrawClass& route(const DrawInputs& inputs) noexcept;
   void count_merge_break() noexcept { ++m_stats.mergeBreaks; }
@@ -289,6 +291,7 @@ private:
     uint8_t materialClass = 0;
     bool hasTevPolicy = false;
     uint32_t tevPolicy = 0;
+    std::array<uint8_t, 28> tevNeutral{};
   };
 
   Entry& innermost() noexcept;

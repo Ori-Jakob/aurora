@@ -79,6 +79,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/gx_ext/fwd_env.hpp
         lib/render/gx_ext/records.cpp
         lib/render/gx_ext/records.hpp
+        lib/render/gx_ext/unlit.cpp
+        lib/render/gx_ext/unlit.hpp
         lib/render/hints.cpp
         lib/render/hints.hpp
         lib/render/history_reset.cpp

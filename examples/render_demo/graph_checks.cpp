@@ -4,6 +4,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <numbers>
 #include <string_view>
 
@@ -266,6 +267,66 @@ FwdEnvSummary summarize_fwd_env(std::span<const FwdEnvSample> samples, const Fwd
     }
   }
   return summary;
+}
+
+UnlitCheckSummary summarize_unlit(std::span<const UnlitSample> before, std::span<const UnlitSample> after) {
+  UnlitCheckSummary summary{.minColourMove = UINT32_MAX};
+  const auto surface_class = [](const UnlitSample& s) { return (s.surface[1] >> 16) & 0xFFu; };
+  for (size_t i = 0; i < before.size() && i < after.size(); ++i) {
+    const UnlitSample& a = before[i];
+    const UnlitSample& b = after[i];
+    if (a.cls == UnlitProbeClass::Control) {
+      ++summary.control;
+      summary.controlPbr += surface_class(a) != 0 || surface_class(b) != 0 ? 1 : 0;
+      continue;
+    }
+    ++summary.ground;
+    summary.classMismatches += surface_class(a) != 1 || surface_class(b) != 1 ? 1 : 0;
+    for (const UnlitSample* s : {&a, &b}) {
+      const u32 roughness = s->surface[1] & 0xFFu;
+      const u32 metalness = (s->surface[1] >> 8) & 0xFFu;
+      summary.paramMismatches += roughness != UnlitRoughness || metalness != 0 ? 1 : 0;
+    }
+    summary.albedoChanges += (a.surface[0] & 0xFFFFFFu) != (b.surface[0] & 0xFFFFFFu) ? 1 : 0;
+    u32 move = 0;
+    for (u32 c = 0; c < 3; ++c) {
+      const int x = static_cast<int>((a.color >> (8 * c)) & 0xFFu);
+      const int y = static_cast<int>((b.color >> (8 * c)) & 0xFFu);
+      move = std::max(move, static_cast<u32>(std::abs(x - y)));
+    }
+    summary.minColourMove = std::min(summary.minColourMove, move);
+    summary.maxColourMove = std::max(summary.maxColourMove, move);
+  }
+  if (summary.ground == 0) {
+    summary.minColourMove = 0;
+  }
+  return summary;
+}
+
+std::optional<std::string> check_unlit(const UnlitCheckSummary& summary) {
+  char text[160];
+  if (summary.ground == 0 || summary.control == 0) {
+    return std::string{"no ground or control probe on screen"};
+  }
+  if (summary.classMismatches != 0 || summary.paramMismatches != 0) {
+    std::snprintf(text, sizeof(text), "%u ground probes off class 1 and %u reads off roughness %u or metalness 0",
+                  summary.classMismatches, summary.paramMismatches, UnlitRoughness);
+    return std::string{text};
+  }
+  if (summary.albedoChanges != 0) {
+    std::snprintf(text, sizeof(text), "%u ground probes changed base colour with the sun", summary.albedoChanges);
+    return std::string{text};
+  }
+  if (summary.minColourMove < UnlitColourMove) {
+    std::snprintf(text, sizeof(text), "the sun moved gx.color by only %u at a ground probe (needs %u)",
+                  summary.minColourMove, UnlitColourMove);
+    return std::string{text};
+  }
+  if (summary.controlPbr != 0) {
+    std::snprintf(text, sizeof(text), "%u NoPbr probes carry a PBR class", summary.controlPbr);
+    return std::string{text};
+  }
+  return std::nullopt;
 }
 
 std::optional<std::string> check_fwd_env(const FwdEnvSummary& summary) {

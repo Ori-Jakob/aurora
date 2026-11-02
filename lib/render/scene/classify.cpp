@@ -153,7 +153,7 @@ bool push(void*, gx::DrawData& draw, const gx::PipelineConfig& config, const gx:
   const bool changed = gate != fakeshadow::Edit::Skipped && g_hooks != nullptr && g_hooks->push != nullptr &&
                        g_hooks->push(draw, config, info, cls);
   // Before the inspector's observer, which reads the record locator
-  gx_ext::records::stamp(draw, config, cls);
+  gx_ext::records::stamp(draw, config, info, cls);
   // Last, so the inspector records the draw that is actually pushed
   if (g_observer != nullptr && g_observer->observe != nullptr) {
     g_observer->observe(draw, config, info, cls);
@@ -279,7 +279,7 @@ void on_stage(Stage stage) noexcept { g_classifier.stage(stage); }
 
 void on_material(uint32_t materialClass) noexcept { g_classifier.material(materialClass); }
 
-void on_tev_policy(const AuroraTevPolicy& policy) noexcept { g_classifier.tev_policy(policy.mask); }
+void on_tev_policy(const AuroraTevPolicy& policy) noexcept { g_classifier.tev_policy(policy); }
 
 std::shared_ptr<const FrameReport> latest_report() noexcept {
   std::lock_guard lock{g_reportMutex};

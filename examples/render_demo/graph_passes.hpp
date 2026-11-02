@@ -55,6 +55,15 @@ struct FwdEnvCheckReport {
   std::vector<FwdEnvSample> samples;
 };
 
+struct UnlitCheckReport {
+  u32 encodes = 0;
+  bool ready = false;
+  u32 width = 0;
+  u32 height = 0;
+  std::vector<UnlitSample> before;
+  std::vector<UnlitSample> after;
+};
+
 struct GraphPassOptions {
   bool vignette = false;
   std::string vignetteAnchor;
@@ -67,6 +76,7 @@ struct GraphPassOptions {
   bool fogCheck = false;
   bool aoCheck = false;
   bool fwdEnvCheck = false;
+  bool unlitCheck = false;
 };
 
 struct GraphPassReport {
@@ -84,6 +94,7 @@ struct GraphPassReport {
   std::array<u32, FogCheckWords> fog{};
   AoCheckReport ao;
   FwdEnvCheckReport fwdEnv;
+  UnlitCheckReport unlit;
 };
 
 bool pipelines_compiling() noexcept;

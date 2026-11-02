@@ -32,6 +32,7 @@ struct Options {
   bool fogCheck = false;
   bool aoCheck = false;
   bool fwdEnvCheck = false;
+  bool unlitCheck = false;
   bool hints = true;
 
   bool checkHints = false;

@@ -149,6 +149,32 @@ inline constexpr u32 FwdEnvFarSensitive = 8;
 inline constexpr u32 FwdEnvNearSensitive = 16;
 inline constexpr u32 FwdEnvCardSensitive = 16;
 
+inline constexpr u32 UnlitCheckFirstFrame = 18;
+inline constexpr u32 UnlitCheckSecondFrame = 38;
+inline constexpr u32 UnlitSunFrame = 20;
+inline constexpr u32 UnlitPipelineWaitFrame = 4;
+inline constexpr u32 UnlitColourMove = 8;
+inline constexpr u32 UnlitRoughness = 217;
+
+enum class UnlitProbeClass : u32 { Ground, Control };
+
+struct UnlitSample {
+  UnlitProbeClass cls = UnlitProbeClass::Ground;
+  u32 color = 0;
+  std::array<u32, 4> surface{};
+};
+
+struct UnlitCheckSummary {
+  u32 ground = 0;
+  u32 control = 0;
+  u32 classMismatches = 0;
+  u32 paramMismatches = 0;
+  u32 albedoChanges = 0;
+  u32 minColourMove = 0;
+  u32 maxColourMove = 0;
+  u32 controlPbr = 0;
+};
+
 VignetteParams vignette_params(u32 frame) noexcept;
 bool is_unknown_anchor_warning(AuroraLogLevel level, std::string_view module, std::string_view message) noexcept;
 std::optional<std::string> check_depth_probe(std::span<const f32, 4> values, bool reversedZ);
@@ -157,4 +183,6 @@ std::optional<std::string> check_ao(const AoCheckSummary& summary);
 AoTemporalOutcome check_ao_temporal(const AoTemporalSummary& summary);
 FwdEnvSummary summarize_fwd_env(std::span<const FwdEnvSample> samples, const FwdEnvExpect& expect);
 std::optional<std::string> check_fwd_env(const FwdEnvSummary& summary);
+UnlitCheckSummary summarize_unlit(std::span<const UnlitSample> before, std::span<const UnlitSample> after);
+std::optional<std::string> check_unlit(const UnlitCheckSummary& summary);
 } // namespace render_demo

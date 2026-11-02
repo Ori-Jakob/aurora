@@ -1506,6 +1506,234 @@ bool register_fwd_env_check(std::string& error) {
   return true;
 }
 
+constexpr u32 UnlitHeaderWords = 4;
+constexpr u32 UnlitSampleWords = 8;
+
+constexpr std::string_view UnlitCheckWgsl = R"(
+struct UnlitProbe {
+  ndc: vec2f,
+  cls: u32,
+  pad: u32,
+};
+@group(1) @binding(0) var gx_color: texture_2d<f32>;
+@group(1) @binding(1) var gbuf_surface: texture_2d<u32>;
+@group(2) @binding(0) var<storage, read_write> results: array<u32>;
+@group(2) @binding(1) var<storage, read> probes: array<UnlitProbe>;
+
+fn pack_unorm(v: vec4f) -> u32 {
+  let b = vec4u(round(saturate(v) * 255.0));
+  return b.r | (b.g << 8u) | (b.b << 16u) | (b.a << 24u);
+}
+
+@compute @workgroup_size(64)
+fn cs_main(@builtin(global_invocation_id) id: vec3u) {
+  let size = textureDimensions(gx_color);
+  if (id.x == 0u) {
+    results[0] = size.x;
+    results[1] = size.y;
+    results[2] = 1u;
+  }
+  if (id.x >= arrayLength(&probes)) {
+    return;
+  }
+  let centre = (probes[id.x].ndc * vec2f(0.5, -0.5) + 0.5) * vec2f(size);
+  let p = clamp(vec2i(floor(centre)), vec2i(0), vec2i(size) - 1);
+  let rec = textureLoad(gbuf_surface, min(vec2u(p), textureDimensions(gbuf_surface) - 1u), 0);
+  let base = 4u + id.x * 8u;
+  results[base] = pack_unorm(textureLoad(gx_color, p, 0));
+  results[base + 1u] = rec.x;
+  results[base + 2u] = rec.y;
+  results[base + 3u] = rec.z;
+  results[base + 4u] = rec.w;
+}
+)";
+
+struct UnlitCheckSlot {
+  wgpu::Buffer readback;
+  std::atomic_uint32_t armedFrame = UINT32_MAX;
+  bool copied = false;
+  u32 copiedFrame = 0;
+  bool mapRequested = false;
+  std::atomic<ProbeResult> result = ProbeResult::Pending;
+  std::vector<u32> values;
+};
+
+struct UnlitCheckPass {
+  PassId id = aurora::render::InvalidPass;
+  std::atomic_uint32_t encodes = 0;
+  // Main thread only
+  bool waitedForPipelines = false;
+  std::vector<UnlitProbe> probes;
+  uint64_t bytes = 0;
+  wgpu::Buffer output;
+  wgpu::Buffer probeBuffer;
+  wgpu::BindGroupLayout layout;
+  wgpu::BindGroup group;
+  // Render worker only
+  wgpu::ComputePipeline pipeline;
+  wgpu::BindGroupLayout passLayout;
+  std::array<UnlitCheckSlot, 2> slots;
+  std::mutex mutex;
+};
+
+UnlitCheckPass sUnlit;
+
+void declare_unlit_check(PassBuilder& builder, void*) {
+  builder.use(aurora::render::resource::GxColor, Access::Sampled, aurora::render::Missing::DisablePass);
+  builder.use(aurora::render::resource::Surface, Access::Sampled, aurora::render::Missing::DisablePass);
+  builder.side_effect();
+}
+
+void encode_unlit_check(PassContext& ctx, void* userdata) {
+  auto& check = *static_cast<UnlitCheckPass*>(userdata);
+  check.encodes.fetch_add(1, std::memory_order_relaxed);
+  if (!check.pipeline || check.passLayout.Get() != ctx.pass_layout().Get()) {
+    const std::string code{UnlitCheckWgsl};
+    const wgpu::ShaderSourceWGSL wgsl{wgpu::ShaderSourceWGSL::Init{.code = code.c_str()}};
+    const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl, .label = "demo.unlit_check"};
+    const std::array<wgpu::BindGroupLayout, 3> layouts{ctx.frame_layout(), ctx.pass_layout(), check.layout};
+    const wgpu::PipelineLayoutDescriptor layoutDescriptor{
+        .label = "demo.unlit_check",
+        .bindGroupLayoutCount = layouts.size(),
+        .bindGroupLayouts = layouts.data(),
+    };
+    const wgpu::ComputePipelineDescriptor descriptor{
+        .label = "demo.unlit_check",
+        .layout = ctx.device().CreatePipelineLayout(&layoutDescriptor),
+        .compute = {.module = ctx.device().CreateShaderModule(&moduleDescriptor), .entryPoint = "cs_main"},
+    };
+    check.pipeline = ctx.device().CreateComputePipeline(&descriptor);
+    check.passLayout = ctx.pass_layout();
+  }
+  const wgpu::ComputePassEncoder compute = ctx.begin_compute();
+  if (!compute) {
+    return;
+  }
+  compute.SetPipeline(check.pipeline);
+  compute.SetBindGroup(2, check.group);
+  compute.DispatchWorkgroups((static_cast<u32>(check.probes.size()) + 63) / 64);
+  compute.End();
+  for (UnlitCheckSlot& slot : check.slots) {
+    if (!slot.copied && ctx.frame() >= slot.armedFrame.load(std::memory_order_acquire)) {
+      ctx.encoder().CopyBufferToBuffer(check.output, 0, slot.readback, 0, check.bytes);
+      slot.copied = true;
+      slot.copiedFrame = ctx.frame();
+      break;
+    }
+  }
+}
+
+void unlit_check_mapped(UnlitCheckSlot& slot, uint64_t bytes, wgpu::MapAsyncStatus status) {
+  if (status != wgpu::MapAsyncStatus::Success) {
+    slot.result.store(ProbeResult::Failed, std::memory_order_release);
+    return;
+  }
+  const auto* mapped = static_cast<const u32*>(slot.readback.GetConstMappedRange(0, bytes));
+  if (mapped != nullptr) {
+    std::lock_guard lock{sUnlit.mutex};
+    slot.values.assign(mapped, mapped + bytes / sizeof(u32));
+  }
+  slot.readback.Unmap();
+  slot.result.store(mapped != nullptr ? ProbeResult::Ready : ProbeResult::Failed, std::memory_order_release);
+}
+
+void unlit_check_submitted(u32 frame, void* userdata) {
+  auto& check = *static_cast<UnlitCheckPass*>(userdata);
+  for (UnlitCheckSlot& slot : check.slots) {
+    if (!slot.copied || slot.mapRequested || frame != slot.copiedFrame) {
+      continue;
+    }
+    slot.mapRequested = true;
+    const uint64_t bytes = check.bytes;
+    slot.readback.MapAsync(
+        wgpu::MapMode::Read, 0, bytes, wgpu::CallbackMode::AllowSpontaneous,
+        [&slot, bytes](wgpu::MapAsyncStatus status, wgpu::StringView) { unlit_check_mapped(slot, bytes, status); });
+  }
+}
+
+bool register_unlit_check(std::string& error) {
+  sUnlit.probes = unlit_probes();
+  if (sUnlit.probes.empty()) {
+    error = "demo.unlit_check has no probes on screen";
+    return false;
+  }
+  sUnlit.bytes = (UnlitHeaderWords + sUnlit.probes.size() * UnlitSampleWords) * sizeof(u32);
+  const wgpu::Device device = aurora::gfx::device();
+  const auto buffer = [&](const char* label, wgpu::BufferUsage usage, uint64_t size) {
+    const wgpu::BufferDescriptor descriptor{.label = label, .usage = usage, .size = size};
+    return device.CreateBuffer(&descriptor);
+  };
+  sUnlit.output =
+      buffer("demo.unlit_check output", wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc, sUnlit.bytes);
+  for (UnlitCheckSlot& slot : sUnlit.slots) {
+    slot.readback =
+        buffer("demo.unlit_check readback", wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst, sUnlit.bytes);
+  }
+  const uint64_t probeBytes = sUnlit.probes.size() * sizeof(UnlitProbe);
+  sUnlit.probeBuffer =
+      buffer("demo.unlit_check probes", wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, probeBytes);
+  device.GetQueue().WriteBuffer(sUnlit.probeBuffer, 0, sUnlit.probes.data(), probeBytes);
+  const std::array layoutEntries{
+      wgpu::BindGroupLayoutEntry{
+          .binding = 0,
+          .visibility = wgpu::ShaderStage::Compute,
+          .buffer = {.type = wgpu::BufferBindingType::Storage},
+      },
+      wgpu::BindGroupLayoutEntry{
+          .binding = 1,
+          .visibility = wgpu::ShaderStage::Compute,
+          .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage},
+      },
+  };
+  const wgpu::BindGroupLayoutDescriptor layoutDescriptor{
+      .label = "demo.unlit_check",
+      .entryCount = layoutEntries.size(),
+      .entries = layoutEntries.data(),
+  };
+  sUnlit.layout = device.CreateBindGroupLayout(&layoutDescriptor);
+  const std::array groupEntries{
+      wgpu::BindGroupEntry{.binding = 0, .buffer = sUnlit.output, .size = sUnlit.bytes},
+      wgpu::BindGroupEntry{.binding = 1, .buffer = sUnlit.probeBuffer, .size = probeBytes},
+  };
+  const wgpu::BindGroupDescriptor groupDescriptor{
+      .label = "demo.unlit_check",
+      .layout = sUnlit.layout,
+      .entryCount = groupEntries.size(),
+      .entries = groupEntries.data(),
+  };
+  sUnlit.group = device.CreateBindGroup(&groupDescriptor);
+  sUnlit.id = aurora::render::register_pass({
+      .name = "demo.unlit_check",
+      .stage = aurora::render::Stage::PrePost,
+      .kind = aurora::render::PassKind::Compute,
+      .declare = declare_unlit_check,
+      .encode = encode_unlit_check,
+      .afterSubmit = unlit_check_submitted,
+      .userdata = &sUnlit,
+  });
+  if (sUnlit.id == aurora::render::InvalidPass) {
+    error = "register_pass refused demo.unlit_check";
+    return false;
+  }
+  return true;
+}
+
+void update_unlit_check(u32 frame) {
+  if (sUnlit.id == aurora::render::InvalidPass) {
+    return;
+  }
+  // Draws whose pipeline is still compiling are skipped, so the ground must be compiled before the first read
+  if (frame >= UnlitPipelineWaitFrame && !std::exchange(sUnlit.waitedForPipelines, true)) {
+    wait_for_pipelines();
+  }
+  const std::array<u32, 2> frames{UnlitCheckFirstFrame, UnlitCheckSecondFrame};
+  for (size_t i = 0; i < frames.size(); ++i) {
+    if (frame == frames[i]) {
+      sUnlit.slots[i].armedFrame.store(aurora::gfx::current_frame(), std::memory_order_release);
+    }
+  }
+}
+
 void update_fwd_env_check(u32 frame) {
   if (sFwdEnv.id == aurora::render::InvalidPass || frame < FwdEnvCheckFrame ||
       sFwdEnv.armedFrame.load(std::memory_order_relaxed) != UINT32_MAX) {
@@ -1568,6 +1796,9 @@ bool register_graph_passes(const GraphPassOptions& options, std::string& error) 
   if (options.aoCheck && !register_ao_check(error)) {
     return false;
   }
+  if (options.unlitCheck && !register_unlit_check(error)) {
+    return false;
+  }
   if (options.fwdEnvCheck && !register_fwd_env_check(error)) {
     return false;
   }
@@ -1579,6 +1810,7 @@ bool register_graph_passes(const GraphPassOptions& options, std::string& error) 
 void update_graph_passes(u32 frame) {
   update_cull_passes(frame);
   update_fwd_env_check(frame);
+  update_unlit_check(frame);
   if (sProbe.id != aurora::render::InvalidPass && frame >= DepthCheckFrame &&
       sProbe.armedFrame.load(std::memory_order_relaxed) == UINT32_MAX) {
     // Draws whose pipeline is still compiling are skipped, so depth read before they finish misses part of the scene
@@ -1649,6 +1881,13 @@ void finish_graph_passes() {
   const bool motion = waiting(sMotion.id, sMotion.encodes, sMotion.armedFrame);
   const bool fog = waiting(sFog.id, sFog.encodes, sFog.armedFrame);
   const bool fwdEnv = waiting(sFwdEnv.id, sFwdEnv.encodes, sFwdEnv.armedFrame);
+  const auto unlitPending = [] {
+    return sUnlit.id != aurora::render::InvalidPass && sUnlit.encodes.load(std::memory_order_relaxed) != 0 &&
+           std::ranges::any_of(sUnlit.slots, [](const UnlitCheckSlot& slot) {
+             return slot.armedFrame.load(std::memory_order_relaxed) != UINT32_MAX &&
+                    slot.result.load(std::memory_order_acquire) == ProbeResult::Pending;
+           });
+  };
   const auto aoPending = [] {
     return sAo.statsState.load(std::memory_order_acquire) != AoSlotState::Free ||
            std::ranges::any_of(sAo.slots, [](const AoCheckSlot& slot) {
@@ -1659,7 +1898,7 @@ void finish_graph_passes() {
   while (((depth && sProbe.result.load(std::memory_order_acquire) == ProbeResult::Pending) ||
           (motion && sMotion.result.load(std::memory_order_acquire) == ProbeResult::Pending) ||
           (fog && sFog.result.load(std::memory_order_acquire) == ProbeResult::Pending) ||
-          (fwdEnv && sFwdEnv.result.load(std::memory_order_acquire) == ProbeResult::Pending) ||
+          (fwdEnv && sFwdEnv.result.load(std::memory_order_acquire) == ProbeResult::Pending) || unlitPending() ||
           (sAo.id != aurora::render::InvalidPass && aoPending())) &&
          std::chrono::steady_clock::now() < deadline) {
     aurora::gfx::synchronize();
@@ -1714,6 +1953,32 @@ GraphPassReport graph_pass_report() {
       }
     }
   }
+  if (sUnlit.id != aurora::render::InvalidPass) {
+    report.unlit.encodes = sUnlit.encodes.load(std::memory_order_relaxed);
+    report.unlit.ready = std::ranges::all_of(sUnlit.slots, [](const UnlitCheckSlot& slot) {
+      return slot.result.load(std::memory_order_acquire) == ProbeResult::Ready;
+    });
+    std::lock_guard lock{sUnlit.mutex};
+    for (size_t s = 0; s < sUnlit.slots.size() && report.unlit.ready; ++s) {
+      const std::vector<u32>& words = sUnlit.slots[s].values;
+      if (words.size() < UnlitHeaderWords || words[2] != 1) {
+        report.unlit.ready = false;
+        break;
+      }
+      report.unlit.width = words[0];
+      report.unlit.height = words[1];
+      std::vector<UnlitSample>& samples = s == 0 ? report.unlit.before : report.unlit.after;
+      for (size_t i = 0; i < sUnlit.probes.size(); ++i) {
+        const size_t base = UnlitHeaderWords + i * UnlitSampleWords;
+        if (base + UnlitSampleWords > words.size()) {
+          break;
+        }
+        samples.push_back({.cls = sUnlit.probes[i].cls,
+                           .color = words[base],
+                           .surface = {words[base + 1], words[base + 2], words[base + 3], words[base + 4]}});
+      }
+    }
+  }
   if (sAo.id != aurora::render::InvalidPass) {
     std::lock_guard lock{sAo.mutex};
     report.ao = {
@@ -1736,10 +2001,11 @@ void unregister_graph_passes() {
   if (!cull && sVignette.id == aurora::render::InvalidPass && sProbe.id == aurora::render::InvalidPass &&
       sMotion.id == aurora::render::InvalidPass && sMotionView.id == aurora::render::InvalidPass &&
       sFog.id == aurora::render::InvalidPass && sAo.id == aurora::render::InvalidPass &&
-      sFwdEnv.id == aurora::render::InvalidPass) {
+      sFwdEnv.id == aurora::render::InvalidPass && sUnlit.id == aurora::render::InvalidPass) {
     return;
   }
-  for (PassId* id : {&sVignette.id, &sProbe.id, &sMotion.id, &sMotionView.id, &sFog.id, &sAo.id, &sFwdEnv.id}) {
+  for (PassId* id :
+       {&sVignette.id, &sProbe.id, &sMotion.id, &sMotionView.id, &sFog.id, &sAo.id, &sFwdEnv.id, &sUnlit.id}) {
     if (*id != aurora::render::InvalidPass) {
       aurora::render::unregister_pass(*id);
       *id = aurora::render::InvalidPass;
@@ -1793,6 +2059,16 @@ void unregister_graph_passes() {
   sFwdEnv.readback = {};
   sFwdEnv.output = {};
   sFwdEnv.waitedForPipelines = false;
+  sUnlit.pipeline = {};
+  sUnlit.passLayout = {};
+  sUnlit.group = {};
+  sUnlit.layout = {};
+  sUnlit.probeBuffer = {};
+  sUnlit.output = {};
+  for (UnlitCheckSlot& slot : sUnlit.slots) {
+    slot.readback = {};
+  }
+  sUnlit.waitedForPipelines = false;
 }
 
 } // namespace render_demo

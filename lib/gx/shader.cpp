@@ -9,6 +9,9 @@
 #include "hex_wgsl.hpp"
 #include "render_ext.hpp"
 #include "shader_info.hpp"
+#include "surface_pack.hpp"
+#include "surface_wgsl.hpp"
+#include "unlit_plan.hpp"
 
 #include <dolphin/gx/GXEnum.h>
 
@@ -847,7 +850,7 @@ absl::flat_hash_set<gfx::ShaderRef> s_seenShaders;
 HashType shader_hash(const ShaderConfig& config, DstAlphaMode dstAlphaMode, const ShaderTargets& targets) noexcept {
   auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(targets.normal, xxh3_hash(config)));
   for (const uint32_t target :
-       {targets.debugId, targets.motion, targets.reactive, targets.gbufferNormal, targets.fog}) {
+       {targets.debugId, targets.motion, targets.reactive, targets.gbufferNormal, targets.fog, targets.surface}) {
     if (target != UINT32_MAX) {
       hash = xxh3_hash(target, hash);
     }
@@ -864,6 +867,25 @@ struct OutputMember {
   std::string declaration;
   std::string assignment;
 };
+
+constexpr float UnlitDefaultRoughness = 0.85f;
+constexpr u32 UnlitCategoryShift = 16;
+
+struct UnlitPass {
+  u16 scaleDivide = 0;
+};
+
+struct TevNormalized {
+  bool color = false;
+  bool alpha = false;
+};
+
+std::string replace_all(std::string text, std::string_view from, std::string_view to) {
+  for (size_t pos = text.find(from); pos != std::string::npos; pos = text.find(from, pos + to.size())) {
+    text.replace(pos, from.size(), to);
+  }
+  return text;
+}
 } // namespace
 
 std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlphaMode,
@@ -1078,60 +1100,69 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
   std::string fragmentFn;
 
   static std::array regName{"prev"sv, "tevreg0"sv, "tevreg1"sv, "tevreg2"sv};
-  std::array<bool, MaxTevRegs> colorNormalized{};
-  std::array<bool, MaxTevRegs> alphaNormalized{};
-  for (u32 idx = 0; idx < config.tevStageCount; ++idx) {
-    const auto& stage = config.tevStages[idx];
-    const auto color_arg = [&](GXTevColorArg arg) {
-      auto value = color_arg_reg(arg, idx, config, stage);
-      if (tev_color_arg_is_normalized(arg, colorNormalized, alphaNormalized)) {
-        return fmt::format("vec3f({})", value);
-      }
-      return fmt::format("tev_overflow_vec3f({})", value);
+  const auto emit_tev_stages = [&](std::string& out, const UnlitPass* unlitPass) -> TevNormalized {
+    std::array<bool, MaxTevRegs> colorNormalized{};
+    std::array<bool, MaxTevRegs> alphaNormalized{};
+    const auto reg = [unlitPass](std::string value) {
+      return unlitPass != nullptr ? replace_all(std::move(value), "ubuf.kcolor"sv, "upk"sv) : value;
     };
-    const bool alphaCompareColor =
-        stage.alphaOp.op >= GX_TEV_COMP_R8_GT && stage.alphaOp.op <= GX_TEV_COMP_BGR24_EQ;
-    // Packed alpha comparisons use color A/B from before this stage writes its color result.
-    if (alphaCompareColor) {
-      fragmentFn += fmt::format("\n    let tev_cmp_a{0} = {1};\n    let tev_cmp_b{0} = {2};", idx,
-                                color_arg(stage.colorPass.a), color_arg(stage.colorPass.b));
-    }
-    {
-      std::string_view outReg = regName[stage.colorOp.outReg];
-      std::string op = tev_color_op(stage.colorOp.op, tev_bias(stage.colorOp.bias), tev_scale(stage.colorOp.scale),
-                                    stage.colorOp.clamp, color_arg(stage.colorPass.a), color_arg(stage.colorPass.b),
-                                    color_arg(stage.colorPass.c), color_arg_reg(stage.colorPass.d, idx, config, stage));
-      fragmentFn += fmt::format("\n    // TEV stage {2}\n    {0} = vec4f({1}, {0}.a);", outReg, op, idx);
-      colorNormalized[stage.colorOp.outReg] = stage.colorOp.clamp;
-    }
-    {
-      const auto alpha_arg = [&](GXTevAlphaArg arg) {
-        auto value = alpha_arg_reg(arg, idx, config, stage);
-        if (tev_alpha_arg_is_normalized(arg, alphaNormalized)) {
-          return value;
+    const std::string_view label = unlitPass != nullptr ? "Unlit"sv : "TEV"sv;
+    for (u32 idx = 0; idx < config.tevStageCount; ++idx) {
+      const auto& stage = config.tevStages[idx];
+      const auto color_arg = [&](GXTevColorArg arg) {
+        auto value = reg(color_arg_reg(arg, idx, config, stage));
+        if (tev_color_arg_is_normalized(arg, colorNormalized, alphaNormalized)) {
+          return fmt::format("vec3f({})", value);
         }
-        return fmt::format("tev_overflow_f32({})", value);
+        return fmt::format("tev_overflow_vec3f({})", value);
       };
-      std::string_view outReg = regName[stage.alphaOp.outReg];
-      std::string op = tev_alpha_op(
-          stage.alphaOp.op, tev_bias(stage.alphaOp.bias), tev_scale(stage.alphaOp.scale), stage.alphaOp.clamp,
-          alphaCompareColor ? fmt::format("tev_cmp_a{}", idx) : alpha_arg(stage.alphaPass.a),
-          alphaCompareColor ? fmt::format("tev_cmp_b{}", idx) : alpha_arg(stage.alphaPass.b),
-          alpha_arg(stage.alphaPass.c), alpha_arg_reg(stage.alphaPass.d, idx, config, stage));
-      fragmentFn += fmt::format("\n    {0}.a = {1};", outReg, op);
-      alphaNormalized[stage.alphaOp.outReg] = stage.alphaOp.clamp;
+      const bool alphaCompareColor = stage.alphaOp.op >= GX_TEV_COMP_R8_GT && stage.alphaOp.op <= GX_TEV_COMP_BGR24_EQ;
+      // Packed alpha comparisons use color A/B from before this stage writes its color result.
+      if (alphaCompareColor) {
+        out += fmt::format("\n    let tev_cmp_a{0} = {1};\n    let tev_cmp_b{0} = {2};", idx,
+                           color_arg(stage.colorPass.a), color_arg(stage.colorPass.b));
+      }
+      {
+        std::string_view outReg = regName[stage.colorOp.outReg];
+        const bool divided = unlitPass != nullptr && (unlitPass->scaleDivide >> idx & 1u) != 0;
+        std::string op = tev_color_op(
+            stage.colorOp.op, tev_bias(stage.colorOp.bias), tev_scale(divided ? GX_CS_SCALE_1 : stage.colorOp.scale),
+            stage.colorOp.clamp, color_arg(stage.colorPass.a), color_arg(stage.colorPass.b),
+            color_arg(stage.colorPass.c), reg(color_arg_reg(stage.colorPass.d, idx, config, stage)));
+        out += fmt::format("\n    // {3} stage {2}\n    {0} = vec4f({1}, {0}.a);", outReg, op, idx, label);
+        colorNormalized[stage.colorOp.outReg] = stage.colorOp.clamp;
+      }
+      {
+        const auto alpha_arg = [&](GXTevAlphaArg arg) {
+          auto value = reg(alpha_arg_reg(arg, idx, config, stage));
+          if (tev_alpha_arg_is_normalized(arg, alphaNormalized)) {
+            return value;
+          }
+          return fmt::format("tev_overflow_f32({})", value);
+        };
+        std::string_view outReg = regName[stage.alphaOp.outReg];
+        std::string op = tev_alpha_op(
+            stage.alphaOp.op, tev_bias(stage.alphaOp.bias), tev_scale(stage.alphaOp.scale), stage.alphaOp.clamp,
+            alphaCompareColor ? fmt::format("tev_cmp_a{}", idx) : alpha_arg(stage.alphaPass.a),
+            alphaCompareColor ? fmt::format("tev_cmp_b{}", idx) : alpha_arg(stage.alphaPass.b),
+            alpha_arg(stage.alphaPass.c), reg(alpha_arg_reg(stage.alphaPass.d, idx, config, stage)));
+        out += fmt::format("\n    {0}.a = {1};", outReg, op);
+        alphaNormalized[stage.alphaOp.outReg] = stage.alphaOp.clamp;
+      }
     }
-  }
 
-  const auto& lastStage = config.tevStages[config.tevStageCount - 1];
-  const bool prevColorNormalized = colorNormalized[lastStage.colorOp.outReg];
-  const bool prevAlphaNormalized = alphaNormalized[lastStage.alphaOp.outReg];
-  if (lastStage.colorOp.outReg != 0) {
-    fragmentFn += fmt::format("\n    prev = vec4f({0}.rgb, prev.a);", regName[lastStage.colorOp.outReg]);
-  }
-  if (lastStage.alphaOp.outReg != 0) {
-    fragmentFn += fmt::format("\n    prev.a = {0}.a;", regName[lastStage.alphaOp.outReg]);
-  }
+    const auto& lastStage = config.tevStages[config.tevStageCount - 1];
+    if (lastStage.colorOp.outReg != 0) {
+      out += fmt::format("\n    prev = vec4f({0}.rgb, prev.a);", regName[lastStage.colorOp.outReg]);
+    }
+    if (lastStage.alphaOp.outReg != 0) {
+      out += fmt::format("\n    prev.a = {0}.a;", regName[lastStage.alphaOp.outReg]);
+    }
+    return {colorNormalized[lastStage.colorOp.outReg], alphaNormalized[lastStage.alphaOp.outReg]};
+  };
+  const TevNormalized litNormalized = emit_tev_stages(fragmentFn, nullptr);
+  const bool prevColorNormalized = litNormalized.color;
+  const bool prevAlphaNormalized = litNormalized.alpha;
   const bool fwdEnv = uses_forward_env(config, targets);
   // Unclamped TEV colour wraps after fog, so AO would land before the wrap
   const bool fwdAo = fwdEnv && tev_colour_clamped(config);
@@ -1737,6 +1768,27 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
         render_ext::RecordFlagJitter, frameWord + render_ext::FrameMotionJitterWord);
   }
 
+  const bool unlitText = uses_unlit(config, info, targets);
+  const unlit::Plan unlitPlan = unlitText ? unlit::plan(config) : unlit::Plan{};
+  if (unlitText) {
+    for (u32 i = 0; i < MaxColorChannels / 2; ++i) {
+      if ((info.unlitRawVtx >> i & 1u) != 0) {
+        vtxOutAttrs += fmt::format("\n    @location({}) ccv{}: vec3f,", vtxOutIdx++, i);
+        vtxXfrAttrs +=
+            fmt::format("\n    out.ccv{} = {}.rgb;", i, vtx_attr(config, static_cast<GXAttr>(GX_VA_CLR0 + i)));
+      }
+    }
+    uniformPre +=
+        "\nfn gx_tev_pol(v: vec4f, reg: u32, loc: u32) -> vec4f {"
+        "\n    if (loc == 0u) {"
+        "\n        return v;"
+        "\n    }"
+        "\n    let sel = (vec4u(load_word(&abuf, loc) >> (4u * reg)) & vec4u(1u, 2u, 4u, 8u)) != vec4u(0u);"
+        "\n    return select(v, unpack4x8unorm(load_word(&abuf, loc + 1u + reg)), sel);"
+        "\n}";
+    append_surface_pack(uniformPre);
+  }
+
   CHECK(vtxOutIdx <= info.varyings, "GX shader emits {} inter-stage locations, planned {}", vtxOutIdx, info.varyings);
   std::string fragmentOutput;
   std::string_view fragmentOutputType = "@location(0) vec4f"sv;
@@ -1784,6 +1836,86 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
                                          "(min(u32(round(clamp(fogZ, 0.0, 1.0) * 127.0)), 127u) << 1u) | {}u);",
                                          lock)
                            : "\n    out.fog = vec4u(0u);"s});
+  }
+  if (uses_surface(targets)) {
+    std::string assignment = "\n    out.surface = vec4u(0u);"s;
+    if (unlitText) {
+      std::string inner = fmt::format("\n    let upol = gx_record_word({}u);", render_ext::DrawRecordTevPolicyWord);
+      if (unlitPlan.rewrite[0] == unlit::RewriteVertex || unlitPlan.rewrite[1] == unlit::RewriteVertex) {
+        inner += fmt::format("\n    let uvc = (gx_record_word({}u) >> {}u) & 3u;", render_ext::DrawRecordFlagsWord,
+                             render_ext::RecordVertexColorShift);
+      }
+      inner += info.loadsTevReg.test(0) ? "\n    var prev = ubuf.tevprev;"sv : "\n    var prev: vec4f;"sv;
+      for (int i = 1; i < info.loadsTevReg.size(); ++i) {
+        if (info.loadsTevReg.test(i)) {
+          inner += fmt::format("\n    var tevreg{0} = gx_tev_pol(ubuf.tevreg{0}, {0}u, upol);", i - 1);
+        } else if (info.writesTevReg.test(i)) {
+          inner += fmt::format("\n    var tevreg{0}: vec4f;", i - 1);
+        }
+      }
+      for (int i = 0; i < info.sampledKColors.size(); ++i) {
+        if (info.sampledKColors.test(i)) {
+          inner += fmt::format("\n    let upk{0} = gx_tev_pol(ubuf.kcolor{0}, {1}u, upol);", i, 3 + i);
+        }
+      }
+      for (u32 i = 0; i < MaxColorChannels / 2; ++i) {
+        if (!info.sampledColorChannels.test(i)) {
+          continue;
+        }
+        switch (unlitPlan.rewrite[i]) {
+        case unlit::RewriteMaterial:
+          inner += fmt::format("\n    var rast{0} = vec4f(ubuf.cc{0}_mat.rgb, in.cc{0}.a);", i);
+          break;
+        case unlit::RewriteVertex:
+          inner +=
+              (unlitPlan.rawVtx >> i & 1u) != 0
+                  ? fmt::format("\n    var rast{0} = vec4f(select(in.ccv{0}, vec3f(1.0), uvc != 0u), in.cc{0}.a);", i)
+                  : fmt::format("\n    var rast{0} = vec4f(select(vec3f(0.0), vec3f(1.0), uvc != 0u), in.cc{0}.a);", i);
+          break;
+        case unlit::RewriteZero:
+          inner += fmt::format("\n    var rast{0} = vec4f(vec3f(0.0), in.cc{0}.a);", i);
+          break;
+        default:
+          break;
+        }
+      }
+      for (u32 i = 0; i < config.tevStageCount; ++i) {
+        const auto& stage = config.tevStages[i];
+        if (!uses_texture_sample(stage) || stage.texMapId > GX_TEXMAP7) {
+          continue;
+        }
+        const u32 map = 1u << stage.texMapId;
+        if (((unlitPlan.neutralOne | unlitPlan.neutralZero) & map) != 0) {
+          inner +=
+              fmt::format("\n    let sampled{} = vec4f({});", i, (unlitPlan.neutralOne & map) != 0 ? "1.0" : "0.0");
+        }
+      }
+      const UnlitPass pass{.scaleDivide = unlitPlan.scaleDivide};
+      const TevNormalized unlitNormalized = emit_tev_stages(inner, &pass);
+      inner +=
+          unlitNormalized.color ? "\n    unlit_rgb = prev.rgb;"sv : "\n    unlit_rgb = tev_overflow_vec3f(prev.rgb);"sv;
+      const std::string unlitFlag =
+          unlitPlan.verdict == unlit::Verdict::Passthrough
+              ? fmt::format("{}u", surface::Unlit)
+              : fmt::format("select(0u, {0}u, (urec & {0}u) != 0u)", render_ext::RecordFlagUnlit);
+      assignment = fmt::format(
+          "\n    // Unlit TEV (SP1 rules v1): no fog, lit alpha kept, only unlit_rgb leaves the block"
+          "\n    var unlit_rgb: vec3f;"
+          "\n    {{{0}"
+          "\n    }}"
+          "\n    let urec = gx_record_word({1}u);"
+          "\n    let urx = (urec >> {2}u) & 3u;"
+          "\n    let uflags = select(0u, {3}u, urx == 2u) | select(0u, {4}u, urx == 1u) | {5} | "
+          "select(0u, {6}u, ((urec >> {7}u) & 3u) == 1u);"
+          "\n    out.surface = gx_surface_pack(unlit_rgb, 1.0, {8:.2f}, 0.0, {9}u, uflags, vec3f(0.0), "
+          "(urec >> {10}u) & 0xffu, vec3f(0.0));",
+          replace_all(std::move(inner), "\n", "\n    "), render_ext::DrawRecordFlagsWord,
+          render_ext::DrawRecordReceiverShift, surface::CloudReceiver, surface::NoShadowReceive, unlitFlag,
+          surface::BakedLight, render_ext::RecordVertexColorShift, UnlitDefaultRoughness, surface::ClassDefault,
+          UnlitCategoryShift);
+    }
+    members.push_back(
+        {targets.surface, fmt::format("    @location({}) surface: vec4u,\n", targets.surface), std::move(assignment)});
   }
   if (!members.empty()) {
     std::ranges::stable_sort(members, {}, &OutputMember::location);
@@ -2202,6 +2334,8 @@ ShaderTargets shader_targets(const gfx::RenderTargetLayout& layout) noexcept {
       targets.reactive = i;
     } else if (layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::Fog) {
       targets.fog = i;
+    } else if (layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::Surface) {
+      targets.surface = i;
     }
   }
   if (gfx::layout_has_gbuffer(layout)) {
@@ -2210,6 +2344,12 @@ ShaderTargets shader_targets(const gfx::RenderTargetLayout& layout) noexcept {
   targets.fwdEnv = gfx::layout_has_gbuffer(layout);
   return targets;
 }
+
+namespace testing {
+uint64_t shader_hash(const ShaderConfig& config, DstAlphaMode dstAlphaMode, const ShaderTargets& targets) noexcept {
+  return gx::shader_hash(config, dstAlphaMode, targets);
+}
+} // namespace testing
 
 std::string receiver_alpha_wgsl() {
   return fmt::format(

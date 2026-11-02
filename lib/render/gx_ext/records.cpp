@@ -1,12 +1,16 @@
 #include "records.hpp"
 #include "fwd_env.hpp"
+#include "unlit.hpp"
 
 #include "../hints.hpp"
 #include "../scene/classifier.hpp"
 #include "../scene/motion.hpp"
 #include "../../gfx/recording.hpp"
 #include "../../gfx/scene_targets.hpp"
+#include "../../gx/gx.hpp"
 #include "../../logging.hpp"
+
+#include <dolphin/gx/GXAurora.h>
 
 #include <cstring>
 #include <utility>
@@ -20,6 +24,9 @@ struct Counters {
   uint64_t reused = 0;
   uint64_t dropped = 0;
   uint64_t screenAo = 0;
+  uint64_t pbrRecords = 0;
+  uint64_t policyBlocks = 0;
+  uint64_t blendedInWindow = 0;
   std::array<uint64_t, 4> codes{};
 };
 
@@ -27,6 +34,7 @@ struct Counters {
 bool g_active = false;
 bool g_gbuffer = false;
 bool g_debugId = false;
+bool g_surface = false;
 Stats g_totals;
 bool g_dropWarned = false;
 
@@ -35,6 +43,8 @@ Counters g_frame;
 uint32_t g_frameLoc = 0;
 DrawRecord g_last;
 uint32_t g_lastLoc = 0;
+AuroraTevPolicy g_lastPolicy{};
+uint32_t g_lastPolicyLoc = 0;
 
 gfx::Range default_push(std::span<const uint8_t> bytes) noexcept { return gfx::push_storage_packed(bytes); }
 
@@ -45,12 +55,41 @@ std::span<const uint8_t> bytes_of(const T& value) noexcept {
   return {reinterpret_cast<const uint8_t*>(&value), sizeof(T)};
 }
 
+uint32_t locator(gfx::Range range) noexcept { return range.size == 0 ? 0 : range.offset / 4u; }
+
 bool in_window(const scene::DrawClass& cls) noexcept {
   return cls.key.window == scene::Window::Opaque && !cls.offscreen;
 }
 
+bool pbr_eligible(const scene::DrawClass& cls) noexcept {
+  constexpr uint32_t NotPbr = scene::category::NoPbr | scene::category::Water | scene::category::ScreenRead |
+                              scene::category::Particle | scene::category::Ui | scene::category::Sky |
+                              scene::category::FakeShadow | scene::category::Overlay;
+  return g_surface && cls.kind == scene::Kind::MainOpaque && in_window(cls) && (cls.key.categories & NotPbr) == 0;
+}
+
 uint32_t draw_inputs(const scene::DrawClass& cls) noexcept {
-  return (in_window(cls) ? InWindow : 0u) | (in_forward_window(cls) ? ForwardWindow : 0u);
+  return (in_window(cls) ? InWindow : 0u) | (in_forward_window(cls) ? ForwardWindow : 0u) |
+         (pbr_eligible(cls) ? PbrEligible : 0u);
+}
+
+uint32_t policy_block(const scene::DrawClass& cls) noexcept {
+  if (cls.key.tevPolicy == 0 || !unlit::policy_enabled()) {
+    return 0;
+  }
+  AuroraTevPolicy policy{.mask = cls.key.tevPolicy};
+  static_assert(sizeof(policy.neutral) == sizeof(cls.key.tevNeutral));
+  std::memcpy(policy.neutral, cls.key.tevNeutral.data(), sizeof(policy.neutral));
+  if (g_lastPolicyLoc != 0 && std::memcmp(&policy, &g_lastPolicy, sizeof(policy)) == 0) {
+    return g_lastPolicyLoc;
+  }
+  const uint32_t loc = locator(g_push(bytes_of(policy)));
+  if (loc != 0) {
+    g_lastPolicy = policy;
+    g_lastPolicyLoc = loc;
+    ++g_frame.policyBlocks;
+  }
+  return loc;
 }
 
 uint32_t receiver_code(const scene::DrawClass& cls) noexcept {
@@ -84,7 +123,6 @@ bool has_debug_id(const gfx::RenderTargetLayout& layout) noexcept {
   return false;
 }
 
-uint32_t locator(gfx::Range range) noexcept { return range.size == 0 ? 0 : range.offset / 4u; }
 
 bool ensure_frame() noexcept {
   if (g_frameLoc != 0) {
@@ -109,6 +147,9 @@ void fold() noexcept {
   g_totals.reused += frame.reused;
   g_totals.dropped += frame.dropped;
   g_totals.screenAo += frame.screenAo;
+  g_totals.pbrRecords += frame.pbrRecords;
+  g_totals.policyBlocks += frame.policyBlocks;
+  g_totals.blendedInWindow += frame.blendedInWindow;
   for (size_t i = 0; i < frame.codes.size(); ++i) {
     g_totals.codes[i] += frame.codes[i];
   }
@@ -121,6 +162,8 @@ void reset_frame() noexcept {
   g_frameLoc = 0;
   g_last = {};
   g_lastLoc = 0;
+  g_lastPolicy = {};
+  g_lastPolicyLoc = 0;
   gx::render_ext::g_drawInputs = 0;
 }
 } // namespace
@@ -133,6 +176,8 @@ void apply_frame_state(const detail::FrameState&) noexcept {
   g_debugId = has_debug_id(layout);
   g_gbuffer = hints && gfx::layout_has_gbuffer(layout);
   g_active = hints && (g_gbuffer || g_debugId);
+  const gfx::LayoutWarm* warm = gfx::layout_warm();
+  g_surface = hints && (gfx::layout_has_surface(layout) || (warm != nullptr && gfx::layout_has_surface(warm->pending)));
   reset_frame();
 }
 
@@ -155,6 +200,7 @@ void shutdown() noexcept {
   g_active = false;
   g_gbuffer = false;
   g_debugId = false;
+  g_surface = false;
   g_totals = {};
   g_dropWarned = false;
   reset_frame();
@@ -165,9 +211,13 @@ bool on_route(const scene::DrawClass& cls) noexcept {
   return g_active;
 }
 
-void stamp(gx::DrawData& draw, const gx::PipelineConfig& config, const scene::DrawClass& cls) noexcept {
+void stamp(gx::DrawData& draw, const gx::PipelineConfig& config, const gx::ShaderInfo& info,
+           const scene::DrawClass& cls) noexcept {
   if (!g_active) {
     return;
+  }
+  if (g_surface && cls.kind == scene::Kind::MainBlended && in_window(cls)) {
+    ++g_frame.blendedInWindow;
   }
   const scene::motion::DrawMotion motion = scene::motion::draw_motion(draw, config, cls);
   if (draw.instanceCount == 0 || cls.offscreen || (cls.key.window >= scene::Window::Post && !g_debugId)) {
@@ -184,6 +234,12 @@ void stamp(gx::DrawData& draw, const gx::PipelineConfig& config, const scene::Dr
   if (cls.key.object.valid) {
     record.objectLo = static_cast<uint32_t>(cls.key.object.id);
     record.objectHi = static_cast<uint32_t>(cls.key.object.id >> 32);
+  }
+  if (config.shaderConfig.ext.output == 2) {
+    record.flags |= unlit::vertex_policy(config, info, cls) << flag::VertexColorShift |
+                    (unlit::unlit_flag(config, info, cls) ? flag::Unlit : 0u);
+    record.tevPolicyOff = policy_block(cls);
+    ++g_frame.pbrRecords;
   }
   if (!g_debugId && g_lastLoc != 0 && std::memcmp(&record, &g_last, sizeof(DrawRecord)) == 0) {
     draw.immediateData._pad = g_lastLoc;
@@ -232,6 +288,8 @@ void set_active(bool active, bool gbuffer, bool debugId) noexcept {
   g_debugId = debugId;
   reset_frame();
 }
+
+void set_surface(bool surface) noexcept { g_surface = surface; }
 
 void set_push(PushFn push) noexcept { g_push = push != nullptr ? push : &default_push; }
 

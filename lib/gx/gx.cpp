@@ -398,6 +398,9 @@ color_target_states(const PipelineConfig& config, const gfx::RenderTargetLayout&
       writes = reactive != ReactiveWrite::None;
     } else if (i == targets.fog) {
       writes = writesFog;
+    } else if (i == targets.surface) {
+      // Motion's rule; every non-PBR winner writes class 0, so it is never shaded as PBR
+      writes = writesDepth || (options.colorUpdate && opaque);
     }
     colorTargets[i] = {
         .format = layout.colorAttachments[i].format,

@@ -22,6 +22,7 @@ struct SceneOptions {
   bool fogBands = false;
   bool aoCheck = false;
   bool fwdEnvCheck = false;
+  bool unlitCheck = false;
 };
 
 struct SceneCamera {
@@ -47,6 +48,13 @@ struct FwdEnvProbe {
 };
 static_assert(sizeof(FwdEnvProbe) == 16);
 
+struct UnlitProbe {
+  f32 ndc[2];
+  UnlitProbeClass cls;
+  u32 pad;
+};
+static_assert(sizeof(UnlitProbe) == 16);
+
 struct FogResolveCounts {
   u32 checked = 0;
   u32 live = 0;
@@ -61,6 +69,7 @@ std::vector<AoProbe> ao_check_probes();
 std::vector<std::array<f32, 2>> ao_trail_probes(u32 frame);
 std::vector<FwdEnvProbe> fwd_env_probes();
 FwdEnvExpect fwd_env_expect() noexcept;
+std::vector<UnlitProbe> unlit_probes();
 FogResolveCounts fog_resolve_counts() noexcept;
 uint32_t gpu_uploads_per_frame(const SceneOptions& options) noexcept;
 bool init_scene();

@@ -10,6 +10,7 @@
 #include "gx/pipeline.hpp"
 #include "gx/render_ext.hpp"
 #include "gx/shader_info.hpp"
+#include "gx/unlit_plan.hpp"
 
 #include <algorithm>
 #include <array>
@@ -18,6 +19,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <span>
 #include <string>
@@ -238,6 +240,10 @@ TEST_F(GxShaderExtTest, NonStochasticExtLeavesTextUnchanged) {
   EXPECT_EQ(wgsl(other), expected);
   EXPECT_EQ(wgsl(with_mask(legacy, 0b1000)), expected);
   EXPECT_EQ(build_shader_info(other).uniformSize, build_shader_info(legacy).uniformSize);
+  ShaderConfig output2 = legacy;
+  output2.ext = {.output = 2, .velocity = 1, .layer0 = 2};
+  EXPECT_EQ(wgsl(output2), expected);
+  EXPECT_EQ(build_shader_info(output2).uniformSize, build_shader_info(legacy).uniformSize);
 }
 
 TEST_F(GxShaderExtTest, EligibleMapUsesHexSampling) {
@@ -301,6 +307,13 @@ TEST_F(GxShaderExtTest, UniformIsLegacyPrefix) {
   ASSERT_EQ(extBytes.size(), legacyBytes.size() + 32);
   EXPECT_TRUE(std::equal(legacyBytes.begin(), legacyBytes.end(), extBytes.begin()));
   EXPECT_EQ(build_shader_info(ext).uniformSize, gfx::align_uniform(static_cast<uint32_t>(extBytes.size())));
+  ShaderConfig output2 = legacy;
+  output2.attrs[GX_VA_NRM] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32};
+  ShaderConfig marked = output2;
+  marked.ext.output = 2;
+  ASSERT_TRUE(build_shader_info(marked).unlitPlanned);
+  EXPECT_EQ(build_shader_info(marked).uniformSize, build_shader_info(output2).uniformSize);
+  EXPECT_EQ(testing::uniform_bytes(build_shader_info(marked)), testing::uniform_bytes(build_shader_info(output2)));
 }
 
 TEST_F(GxShaderExtTest, BudgetDropsEligibility) {
@@ -482,6 +495,15 @@ size_t check_varyings(std::span<const corpus::Entry> entries) {
       EXPECT_EQ(locations, varying_count(marker, gbuffer)) << entry.label << " receiver normal";
       EXPECT_LE(locations, planned) << entry.label << " receiver normal";
       maxLocations = std::max(maxLocations, locations);
+      ShaderConfig unlit = config;
+      unlit.ext.output = 2;
+      const ShaderTargets pbr{.motion = 2, .reactive = 3, .gbufferNormal = 1, .fog = 4, .surface = 5};
+      const u32 unlitPlanned = build_shader_info(unlit).varyings;
+      EXPECT_LE(unlitPlanned, MaxGxVaryings) << entry.label << " output 2";
+      const size_t unlitLocations = location_count(build_shader_source(unlit, mode, pbr));
+      EXPECT_EQ(unlitLocations, varying_count(unlit, pbr)) << entry.label << " output 2";
+      EXPECT_LE(unlitLocations, unlitPlanned) << entry.label << " output 2";
+      maxLocations = std::max(maxLocations, unlitLocations);
     }
   }
   return maxLocations;
@@ -725,8 +747,8 @@ TEST_F(GxShaderExtTest, OutputRowsAdmittedOnlyUnderGbufferLayouts) {
                            gfx::compose_scene_layout({.normal = true, .debugId = true}, base), offscreen};
   const std::array with{gbuffer, gfx::compose_scene_layout({.gbuffer = true, .debugId = true}, base)};
   const std::array plain{RenderExtConfig{}, RenderExtConfig{.stochasticMask = 0b101}, RenderExtConfig{.pom = 1}};
-  const std::array marked{RenderExtConfig{.output = 1}, RenderExtConfig{.output = 2}, RenderExtConfig{.velocity = 1},
-                          RenderExtConfig{.fwdEnv = 1}, RenderExtConfig{.output = 1, .stochasticMask = 1}};
+  const std::array marked{RenderExtConfig{.output = 1}, RenderExtConfig{.velocity = 1}, RenderExtConfig{.fwdEnv = 1},
+                          RenderExtConfig{.output = 1, .stochasticMask = 1}};
   for (const RenderExtConfig& ext : plain) {
     EXPECT_FALSE(render_ext::needs_gbuffer(ext));
     for (const auto& layout : without) {
@@ -755,6 +777,27 @@ TEST_F(GxShaderExtTest, OutputRowsAdmittedOnlyUnderGbufferLayouts) {
   }
   for (const auto& layout : without) {
     EXPECT_FALSE(shader_targets(layout).fwdEnv) << layout.colorAttachmentCount;
+  }
+  const std::array surface{gfx::compose_scene_layout({.gbuffer = true, .surface = true}, base),
+                           gfx::compose_scene_layout({.gbuffer = true, .surface = true, .debugId = true}, base)};
+  for (const RenderExtConfig& ext : {RenderExtConfig{.output = 2}, RenderExtConfig{.output = 2, .layer0 = 1}}) {
+    EXPECT_TRUE(render_ext::needs_gbuffer(ext));
+    for (const auto& layout : without) {
+      EXPECT_FALSE(render_ext::output_admitted(ext, layout)) << layout.colorAttachmentCount;
+    }
+    for (const auto& layout : with) {
+      EXPECT_FALSE(render_ext::output_admitted(ext, layout)) << layout.colorAttachmentCount;
+    }
+    for (const auto& layout : surface) {
+      EXPECT_TRUE(render_ext::output_admitted(ext, layout)) << layout.colorAttachmentCount;
+    }
+  }
+  for (const auto& layout : surface) {
+    EXPECT_TRUE(render_ext::output_admitted(RenderExtConfig{.output = 1}, layout));
+    EXPECT_NE(shader_targets(layout).surface, UINT32_MAX);
+  }
+  for (const auto& layout : with) {
+    EXPECT_EQ(shader_targets(layout).surface, UINT32_MAX);
   }
 }
 
@@ -1022,6 +1065,325 @@ TEST_F(GxShaderExtTest, FwdEnvPredicateMatchesText) {
       }
     }
   }
+}
+constexpr ShaderTargets PbrTargets{.motion = 2, .reactive = 3, .gbufferNormal = 1, .fog = 4, .surface = 5};
+constexpr ShaderTargets PbrIdTargets{
+    .debugId = 6, .motion = 2, .reactive = 3, .gbufferNormal = 1, .fog = 4, .surface = 5};
+constexpr std::string_view UnlitBlock =
+    "// Unlit TEV (SP1 rules v1): no fog, lit alpha kept, only unlit_rgb leaves the block";
+constexpr std::string_view SurfaceZero = "out.surface = vec4u(0u);";
+
+ColorChannelConfig lit_channel(GXColorSrc matSrc, GXAttnFn attnFn = GX_AF_SPOT) {
+  return {.matSrc = matSrc, .ambSrc = GX_SRC_REG, .diffFn = GX_DF_CLAMP, .attnFn = attnFn, .lightingEnabled = true};
+}
+
+ShaderConfig unlit_base(GXColorSrc matSrc = GX_SRC_REG) {
+  ShaderConfig config{};
+  config.attrs[GX_VA_POS] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32};
+  config.attrs[GX_VA_NRM] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32};
+  config.attrs[GX_VA_CLR0] = {.attrType = GX_DIRECT, .cnt = 4, .compType = GX_RGBA8};
+  config.attrs[GX_VA_TEX0] = {.attrType = GX_DIRECT, .cnt = 2, .compType = GX_F32};
+  config.attrs[GX_VA_TEX1] = {.attrType = GX_DIRECT, .cnt = 2, .compType = GX_F32};
+  config.tcgs[0] = {.type = GX_TG_MTX2x4, .src = GX_TG_TEX0};
+  config.tcgs[1] = {.type = GX_TG_MTX2x4, .src = GX_TG_TEX1};
+  config.colorChannels[GX_COLOR0] = lit_channel(matSrc);
+  config.colorChannels[GX_ALPHA0] = {.matSrc = GX_SRC_VTX};
+  return config;
+}
+
+TevStage unlit_tev(GXTevColorArg a, GXTevColorArg b, GXTevColorArg c, GXTevColorArg d, u32 map = 0, u32 coord = 0) {
+  TevStage stage;
+  stage.colorPass = {a, b, c, d};
+  stage.texMapId = static_cast<GXTexMapID>(map);
+  stage.texCoordId = map == GX_TEXMAP_NULL ? GX_TEXCOORD_NULL : static_cast<GXTexCoordID>(coord);
+  stage.channelId = GX_COLOR0A0;
+  return stage;
+}
+
+ShaderConfig staged(ShaderConfig config, std::initializer_list<TevStage> stages, u8 output = 2) {
+  u32 n = 0;
+  for (const TevStage& stage : stages) {
+    config.tevStages[n++] = stage;
+  }
+  config.tevStageCount = n;
+  config.ext.output = output;
+  return config;
+}
+
+ShaderConfig modulate(u8 output = 2) {
+  return staged(unlit_base(), {unlit_tev(GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASC, GX_CC_ZERO)}, output);
+}
+
+ShaderConfig ma00_like(u8 output = 2) {
+  TevStage cloud = unlit_tev(GX_CC_ZERO, GX_CC_ONE, GX_CC_KONST, GX_CC_TEXC, 1, 1);
+  cloud.kcSel = GX_TEV_KCSEL_K1_R;
+  cloud.colorOp.outReg = GX_TEVREG2;
+  cloud.channelId = GX_COLOR_ZERO;
+  TevStage light = unlit_tev(GX_CC_KONST, GX_CC_C2, GX_CC_CPREV, GX_CC_C0, GX_TEXMAP_NULL);
+  light.colorOp.scale = GX_CS_SCALE_4;
+  light.kcSel = GX_TEV_KCSEL_K0;
+  light.channelId = GX_COLOR_ZERO;
+  TevStage base = unlit_tev(GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASC, GX_CC_ZERO);
+  base.alphaPass = {GX_CA_ZERO, GX_CA_RASA, GX_CA_TEXA, GX_CA_ZERO};
+  ShaderConfig config = staged(unlit_base(GX_SRC_VTX), {base, cloud, light}, output);
+  config.tcgs[1] = {.type = GX_TG_MTX3x4, .src = GX_TG_POS, .mtx = GX_TEXMTX1};
+  return config;
+}
+
+std::string fs_body(const std::string& text) {
+  const size_t begin = text.find("fn fs_main(");
+  return begin == std::string::npos ? std::string{} : text.substr(begin);
+}
+
+std::string unlit_block(const std::string& text) {
+  const size_t begin = text.find(UnlitBlock);
+  const size_t end = text.find("out.surface = gx_surface_pack(", begin);
+  return begin == std::string::npos || end == std::string::npos ? std::string{} : text.substr(begin, end - begin);
+}
+
+TEST_F(GxShaderExtTest, UnlitNeedsSurfaceAndMotionTargets) {
+  const ShaderConfig config = modulate();
+  const ShaderInfo info = build_shader_info(config);
+  ASSERT_TRUE(info.unlitPlanned);
+  ASSERT_TRUE(info.unlitAdmitted);
+  EXPECT_TRUE(uses_unlit(config, info, PbrTargets));
+  EXPECT_TRUE(uses_unlit(config, info, PbrIdTargets));
+  const std::string text = build_shader_source(config, DstAlphaMode::None, PbrTargets);
+  EXPECT_EQ(count(text, UnlitBlock), 1u);
+  EXPECT_NE(fragment_output(text).find("@location(5) surface: vec4u,"), std::string::npos);
+  EXPECT_NE(text.find("fn gx_surface_pack("), std::string::npos);
+  EXPECT_NE(text.find("fn gx_tev_pol("), std::string::npos);
+  EXPECT_EQ(text.find(SurfaceZero), std::string::npos);
+
+  ShaderTargets noMotion = PbrTargets;
+  noMotion.motion = UINT32_MAX;
+  EXPECT_FALSE(uses_unlit(config, info, noMotion));
+  const std::string zero = build_shader_source(config, DstAlphaMode::None, noMotion);
+  EXPECT_EQ(zero.find(UnlitBlock), std::string::npos);
+  EXPECT_EQ(count(zero, SurfaceZero), 1u);
+  EXPECT_EQ(zero.find("fn gx_tev_pol("), std::string::npos);
+
+  for (const ShaderTargets& targets : {GbufferTargets, ShaderTargets{}, ShaderTargets{.normal = 1}}) {
+    EXPECT_FALSE(uses_unlit(config, info, targets));
+    const std::string plain = build_shader_source(config, DstAlphaMode::None, targets);
+    EXPECT_EQ(plain.find("surface"), std::string::npos);
+    EXPECT_EQ(plain, build_shader_source(modulate(1), DstAlphaMode::None, targets));
+  }
+  EXPECT_FALSE(uses_unlit(modulate(1), build_shader_info(modulate(1)), PbrTargets));
+}
+
+TEST_F(GxShaderExtTest, UnlitLitPathIsPrefix) {
+  for (const ShaderConfig& config : {modulate(), ma00_like()}) {
+    ShaderConfig twin = config;
+    twin.ext.output = 1;
+    for (const ShaderTargets& targets : {PbrTargets, PbrIdTargets}) {
+      for (const auto mode : {DstAlphaMode::None, DstAlphaMode::Replace}) {
+        const std::string unlit = build_shader_source(config, mode, targets);
+        const std::string lit = build_shader_source(twin, mode, targets);
+        const std::string unlitBody = fs_body(unlit);
+        const std::string litBody = fs_body(lit);
+        const size_t split = litBody.find("\n    out.surface = vec4u(0u);");
+        ASSERT_NE(split, std::string::npos);
+        EXPECT_EQ(unlitBody.substr(0, split), litBody.substr(0, split));
+        EXPECT_EQ(unlitBody.compare(split, UnlitBlock.size() + 5, "\n    " + std::string{UnlitBlock}), 0);
+        EXPECT_EQ(fragment_output(unlit), fragment_output(lit));
+        const std::string litOut = vertex_output(lit);
+        const std::string unlitOut = vertex_output(unlit);
+        EXPECT_EQ(unlitOut.substr(0, litOut.size()), litOut);
+      }
+    }
+  }
+  const std::string vertexColour = build_shader_source(ma00_like(), DstAlphaMode::None, PbrTargets);
+  const std::string out = vertex_output(vertexColour);
+  EXPECT_EQ(out.substr(out.rfind("@location(")), "@location(6) ccv0: vec3f,\n");
+  EXPECT_EQ(count(vertexColour, "out.ccv0 = in_clr0.rgb;"), 1u);
+}
+
+TEST_F(GxShaderExtTest, UnlitDividesScaleStages) {
+  const ShaderConfig config = ma00_like();
+  ASSERT_EQ(unlit::plan(config).scaleDivide, 0b100u);
+  const std::string text = build_shader_source(config, DstAlphaMode::None, PbrTargets);
+  const std::string block = unlit_block(text);
+  ASSERT_FALSE(block.empty());
+  const size_t litStage = text.find("// TEV stage 2");
+  ASSERT_NE(litStage, std::string::npos);
+  EXPECT_NE(text.substr(litStage, text.find('\n', text.find('\n', litStage) + 1) - litStage).find(" * 4.0"),
+            std::string::npos);
+  const size_t unlitStage = block.find("// Unlit stage 2");
+  ASSERT_NE(unlitStage, std::string::npos);
+  EXPECT_EQ(block.find(" * 4.0"), std::string::npos);
+  EXPECT_EQ(count(block, "// Unlit stage "), 3u);
+  EXPECT_NE(block.find("unlit_rgb = prev.rgb;"), std::string::npos);
+}
+
+TEST_F(GxShaderExtTest, UnlitKonstUsesPolicyLocals) {
+  const std::string text = build_shader_source(ma00_like(), DstAlphaMode::None, PbrTargets);
+  const std::string block = unlit_block(text);
+  ASSERT_FALSE(block.empty());
+  EXPECT_NE(block.find("let upol = gx_record_word(7u);"), std::string::npos);
+  EXPECT_NE(block.find("let upk0 = gx_tev_pol(ubuf.kcolor0, 3u, upol);"), std::string::npos);
+  EXPECT_NE(block.find("let upk1 = gx_tev_pol(ubuf.kcolor1, 4u, upol);"), std::string::npos);
+  EXPECT_NE(block.find("var tevreg0 = gx_tev_pol(ubuf.tevreg0, 0u, upol);"), std::string::npos);
+  EXPECT_NE(block.find("var tevreg2: vec4f;"), std::string::npos);
+  EXPECT_NE(block.find("vec3f(upk1.r)"), std::string::npos);
+  EXPECT_NE(block.find("vec3f(upk0.rgb)"), std::string::npos);
+  EXPECT_EQ(count(block, "ubuf.kcolor"), 2u);
+  const std::string lit = text.substr(0, text.find(UnlitBlock));
+  EXPECT_NE(lit.find("vec3f(ubuf.kcolor1.r)"), std::string::npos);
+  EXPECT_EQ(lit.find("upk"), std::string::npos);
+}
+
+TEST_F(GxShaderExtTest, UnlitRastFollowsRules) {
+  const std::string r1 = unlit_block(build_shader_source(modulate(), DstAlphaMode::None, PbrTargets));
+  EXPECT_NE(r1.find("var rast0 = vec4f(ubuf.cc0_mat.rgb, in.cc0.a);"), std::string::npos);
+  EXPECT_EQ(r1.find("uvc"), std::string::npos);
+
+  const std::string r2 = unlit_block(build_shader_source(ma00_like(), DstAlphaMode::None, PbrTargets));
+  EXPECT_NE(r2.find("let uvc = (gx_record_word(1u) >> 3u) & 3u;"), std::string::npos);
+  EXPECT_NE(r2.find("var rast0 = vec4f(select(in.ccv0, vec3f(1.0), uvc != 0u), in.cc0.a);"), std::string::npos);
+
+  ShaderConfig mixed =
+      staged(unlit_base(), {unlit_tev(GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASC, GX_CC_ZERO),
+                            unlit_tev(GX_CC_ZERO, GX_CC_RASC, GX_CC_ONE, GX_CC_CPREV, GX_TEXMAP_NULL)});
+  mixed.tevStages[1].channelId = GX_COLOR1A1;
+  mixed.colorChannels[GX_COLOR1] = lit_channel(GX_SRC_REG, GX_AF_SPEC);
+  ASSERT_EQ(unlit::plan(mixed).rewrite[1], unlit::RewriteZero);
+  const std::string r4 = unlit_block(build_shader_source(mixed, DstAlphaMode::None, PbrTargets));
+  EXPECT_NE(r4.find("var rast1 = vec4f(vec3f(0.0), in.cc1.a);"), std::string::npos);
+  EXPECT_NE(r4.find("var rast0 = vec4f(ubuf.cc0_mat.rgb, in.cc0.a);"), std::string::npos);
+
+  ShaderConfig neutral = staged(unlit_base(), {unlit_tev(GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASC, GX_CC_ZERO),
+                                               unlit_tev(GX_CC_ZERO, GX_CC_CPREV, GX_CC_TEXC, GX_CC_ZERO, 1, 1)});
+  neutral.tcgs[1] = {.type = GX_TG_MTX2x4, .src = GX_TG_NRM, .mtx = GX_TEXMTX0};
+  ASSERT_EQ(unlit::plan(neutral).neutralOne, 0b10u);
+  const std::string r7 = unlit_block(build_shader_source(neutral, DstAlphaMode::None, PbrTargets));
+  EXPECT_NE(r7.find("let sampled1 = vec4f(1.0);"), std::string::npos);
+  EXPECT_EQ(r7.find("let sampled0 ="), std::string::npos);
+
+  ShaderConfig swapped = staged(unlit_base(), {unlit_tev(GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASA, GX_CC_ZERO)});
+  swapped.tevSwapTable[1] = {GX_CH_RED, GX_CH_GREEN, GX_CH_BLUE, GX_CH_RED};
+  swapped.tevStages[0].tevSwapRas = GX_TEV_SWAP1;
+  ASSERT_TRUE(unlit::plan(swapped).pass());
+  ASSERT_EQ(unlit::plan(swapped).rewrite[0], unlit::RewriteMaterial);
+  const std::string text = build_shader_source(swapped, DstAlphaMode::None, PbrTargets);
+  const std::string swap = unlit_block(text);
+  EXPECT_NE(swap.find("var rast0 = vec4f(ubuf.cc0_mat.rgb, in.cc0.a);"), std::string::npos);
+  EXPECT_NE(swap.find("vec3f(rast0.r)"), std::string::npos);
+}
+
+TEST_F(GxShaderExtTest, SurfaceWrittenAsLayoutProperty) {
+  ShaderConfig failing = staged(unlit_base(), {unlit_tev(GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASA, GX_CC_ZERO)});
+  failing.colorChannels[GX_ALPHA0] = lit_channel(GX_SRC_REG);
+  ASSERT_FALSE(unlit::plan(failing).pass());
+  ShaderConfig noNormal = modulate();
+  noNormal.attrs[GX_VA_NRM] = {};
+  ASSERT_FALSE(build_shader_info(noNormal).unlitAdmitted);
+  for (const ShaderConfig& config : {modulate(0), modulate(1), failing, noNormal}) {
+    for (const ShaderTargets& targets : {PbrTargets, PbrIdTargets}) {
+      const std::string text = build_shader_source(config, DstAlphaMode::None, targets);
+      EXPECT_EQ(count(text, SurfaceZero), 1u) << int{config.ext.output};
+      EXPECT_NE(fragment_output(text).find("@location(5) surface: vec4u,"), std::string::npos);
+      EXPECT_EQ(text.find(UnlitBlock), std::string::npos);
+      EXPECT_EQ(text.find("ccv"), std::string::npos);
+    }
+  }
+  const std::string ids = build_shader_source(modulate(), DstAlphaMode::None, PbrIdTargets);
+  EXPECT_LT(ids.find("out.surface = gx_surface_pack("), ids.find("out.debug_id = imm._pad;"));
+  for (const ShaderConfig& config : {modulate(0), modulate(1), modulate(), ma00_like(), failing}) {
+    for (const ShaderTargets& targets : {GbufferTargets, ShaderTargets{}, ShaderTargets{.normal = 1, .debugId = 2}}) {
+      const std::string text = build_shader_source(config, DstAlphaMode::None, targets);
+      EXPECT_EQ(text.find("surface"), std::string::npos);
+      ShaderConfig marker = config;
+      marker.ext.output = std::min<u8>(marker.ext.output, 1);
+      EXPECT_EQ(text, build_shader_source(marker, DstAlphaMode::None, targets));
+    }
+  }
+}
+
+TEST_F(GxShaderExtTest, SurfaceHashOnlyWhenTargetPresent) {
+  ShaderTargets base = PbrTargets;
+  base.surface = UINT32_MAX;
+  for (const ShaderConfig& config : {modulate(0), modulate(1), modulate()}) {
+    EXPECT_NE(testing::shader_hash(config, DstAlphaMode::None, PbrTargets),
+              testing::shader_hash(config, DstAlphaMode::None, base));
+    EXPECT_EQ(testing::shader_hash(config, DstAlphaMode::None, GbufferTargets),
+              testing::shader_hash(config, DstAlphaMode::None,
+                                   ShaderTargets{.motion = 2, .reactive = 3, .gbufferNormal = 1}));
+  }
+  EXPECT_NE(testing::shader_hash(modulate(1), DstAlphaMode::None, PbrTargets),
+            testing::shader_hash(modulate(), DstAlphaMode::None, PbrTargets));
+}
+
+ShaderConfig crowded(u32 texgens) {
+  ShaderConfig config = unlit_base(GX_SRC_VTX);
+  config.attrs[GX_VA_CLR1] = {.attrType = GX_DIRECT, .cnt = 4, .compType = GX_RGBA8};
+  config.colorChannels[GX_COLOR1] = lit_channel(GX_SRC_VTX);
+  config.colorChannels[GX_ALPHA1] = {.matSrc = GX_SRC_VTX};
+  for (u32 i = 0; i < texgens; ++i) {
+    config.attrs[GX_VA_TEX0 + i] = {.attrType = GX_DIRECT, .cnt = 2, .compType = GX_F32};
+    config.tcgs[i] = {.type = GX_TG_MTX3x4, .src = static_cast<GXTexGenSrc>(GX_TG_TEX0 + i)};
+    config.tevStages[i] =
+        unlit_tev(GX_CC_ZERO, i == 0 ? GX_CC_TEXC : GX_CC_CPREV, i == 0 ? GX_CC_RASC : GX_CC_TEXC, GX_CC_ZERO, i, i);
+  }
+  config.tevStages[texgens] = unlit_tev(GX_CC_ZERO, GX_CC_RASC, GX_CC_ONE, GX_CC_CPREV, GX_TEXMAP_NULL);
+  config.tevStages[texgens].channelId = GX_COLOR1A1;
+  config.tevStageCount = texgens + 1;
+  config.ext.output = 2;
+  return config;
+}
+
+TEST_F(GxShaderExtTest, UnlitVaryingDropRule) {
+  const ShaderConfig full = crowded(MaxTexCoord);
+  ASSERT_EQ(unlit::plan(full).rawVtx, 0b11u);
+  const ShaderInfo fullInfo = build_shader_info(full);
+  EXPECT_EQ(fullInfo.varyings, 13u);
+  EXPECT_FALSE(fullInfo.unlitAdmitted);
+  EXPECT_FALSE(unlit_facts(full, fullInfo).admitted);
+  const std::string fullText = build_shader_source(full, DstAlphaMode::None, PbrTargets);
+  EXPECT_EQ(count(fullText, SurfaceZero), 1u);
+  EXPECT_EQ(location_count(fullText), varying_count(full, PbrTargets));
+
+  const ShaderConfig roomy = crowded(MaxTexCoord - 1);
+  const ShaderInfo roomyInfo = build_shader_info(roomy);
+  EXPECT_TRUE(roomyInfo.unlitAdmitted);
+  EXPECT_EQ(roomyInfo.varyings, MaxGxVaryings);
+  const std::string roomyText = build_shader_source(roomy, DstAlphaMode::None, PbrTargets);
+  EXPECT_EQ(location_count(roomyText), MaxGxVaryings);
+  EXPECT_EQ(varying_count(roomy, PbrTargets), MaxGxVaryings);
+  EXPECT_EQ(count(vertex_output(roomyText), "ccv"), 2u);
+}
+
+TEST_F(GxShaderExtTest, UnlitFactsMatchAcrossOutputs) {
+  for (const ShaderConfig& base : {modulate(), ma00_like(), crowded(MaxTexCoord), crowded(MaxTexCoord - 1)}) {
+    const ShaderInfo planned = build_shader_info(base);
+    ASSERT_TRUE(planned.unlitPlanned);
+    const UnlitFacts expected = unlit_facts(base, planned);
+    for (const u8 output : {u8{0}, u8{1}}) {
+      ShaderConfig other = base;
+      other.ext.output = output;
+      const ShaderInfo info = build_shader_info(other);
+      EXPECT_FALSE(info.unlitPlanned);
+      const UnlitFacts facts = unlit_facts(other, info);
+      EXPECT_EQ(facts.admitted, expected.admitted);
+      EXPECT_EQ(facts.rawVtx, expected.rawVtx);
+      EXPECT_EQ(facts.layerStages, expected.layerStages);
+      EXPECT_EQ(facts.verdict, expected.verdict);
+    }
+  }
+}
+
+TEST_F(GxShaderExtTest, NormalizeDemotesOutput2WithFwdEnv) {
+  const uint64_t before = render_ext::g_stats.fwdEnvDemotions.load();
+  const ShaderInfo info{};
+  EXPECT_EQ(render_ext::normalize({.output = 2, .fwdEnv = 1}, info).output, 1u);
+  EXPECT_EQ(render_ext::g_stats.fwdEnvDemotions.load(), before + 1);
+  EXPECT_EQ(render_ext::normalize({.output = 2}, info).output, 2u);
+  EXPECT_EQ(render_ext::normalize({.output = 1, .fwdEnv = 1}, info).output, 1u);
+  EXPECT_EQ(render_ext::g_stats.fwdEnvDemotions.load(), before + 1);
+  PipelineConfig config{};
+  config.shaderConfig.ext = {.output = 2, .stochasticMask = 3, .layer0 = 1};
+  const PipelineConfig twin = render_ext::output1_config(config);
+  EXPECT_TRUE(twin.shaderConfig.ext == (RenderExtConfig{.output = 1, .stochasticMask = 3, .layer0 = 1}));
 }
 } // namespace
 } // namespace aurora::gx

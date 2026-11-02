@@ -5,6 +5,7 @@
 #include "gfx/pipeline_cache.hpp"
 #include "gfx/scene_targets.hpp"
 #include "gx/pipeline.hpp"
+#include "gx/render_ext.hpp"
 #include "internal.hpp"
 #include "webgpu/gpu.hpp"
 
@@ -475,6 +476,38 @@ TEST(PipelineCacheLayouts, CreatesRunInTheirLayoutScope) {
   shutdown_pipeline_cache();
   EXPECT_EQ(g_createLayouts, (std::vector{gbuffer.key, legacy.key}));
   EXPECT_EQ(webgpu::current_cache_layout(), 0u);
+}
+
+TEST_F(SceneLayoutWarmTest, WarmOutput2PairsWithOutput1Twin) {
+  g_createLayouts.clear();
+  shutdown_pipeline_cache();
+  const RenderTargetLayout pbr = compose_scene_layout({.gbuffer = true, .surface = true}, test_base());
+  gx::PipelineConfig config{};
+  config.shaderConfig.ext.output = 2;
+  const testing::CreateHooks saved = testing::set_create_hooks({.gx = &record_gx_create});
+  set_blocking_pipelines(true);
+  const PipelineRef twin = find_pipeline(gx::render_ext::output1_config(config), pbr);
+  set_blocking_pipelines(false);
+  testing::set_create_hooks(saved);
+  ASSERT_EQ(g_createLayouts.size(), 1u);
+  ASSERT_EQ(pipeline_state(twin), PipelineState::Failed);
+
+  testing::begin_warm(pbr, 1);
+  warm_scene_variant(config);
+  testing::WarmTally tally = testing::warm_tally();
+  EXPECT_EQ(tally.pairs, 1u);
+  EXPECT_EQ(tally.progress.total, 2u);
+  EXPECT_EQ(tally.progress.failed, 1u);
+  EXPECT_EQ(tally.hardFailed, 0u);
+
+  gx::PipelineConfig marker = config;
+  marker.shaderConfig.ext.output = 1;
+  marker.dstAlpha = 7;
+  warm_scene_variant(marker);
+  tally = testing::warm_tally();
+  EXPECT_EQ(tally.pairs, 2u);
+  EXPECT_EQ(tally.progress.total, 4u);
+  EXPECT_EQ(tally.progress.failed, 1u);
 }
 } // namespace
 } // namespace aurora::gfx

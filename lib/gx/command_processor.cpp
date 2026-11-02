@@ -147,6 +147,8 @@ struct FogRangeLutEntry {
 constexpr size_t MaxFogRangeLuts = 32;
 std::vector<FogRangeLutEntry> sFogRangeLuts;
 
+enum class PbrStandIn : u8 { None, Output1, Output0 };
+
 struct DrawCache {
   uint64_t targetLayoutKey = 0;
   PipelineConfig config{};
@@ -158,6 +160,9 @@ struct DrawCache {
   gfx::PipelineRef fallbackRef{};
   uint64_t extEpoch = 0;
   bool extWaiting = false;
+  bool twinTried = false;
+  PbrStandIn pipelineStandIn = PbrStandIn::None;
+  PbrStandIn fallbackStandIn = PbrStandIn::None;
   u32 extInputs = 0;
   GXBindGroups bindGroups{};
   uint64_t bindGeneration = 0;
@@ -766,6 +771,43 @@ static bool binds_generated_mips(const ShaderInfo& info) noexcept {
   return false;
 }
 
+static void probe_fallback(DrawCache& cache) noexcept {
+  const gfx::RenderTargetLayout layout = gfx::get_render_target_layout();
+  if (cache.config.shaderConfig.ext.output == 2 && !cache.twinTried) {
+    cache.fallbackRef = gfx::ready_pipeline(render_ext::output1_config(cache.config), layout);
+    if (cache.fallbackRef != 0) {
+      cache.fallbackStandIn = PbrStandIn::Output1;
+      return;
+    }
+  }
+  cache.fallbackRef = gfx::ready_pipeline(render_ext::fallback_config(cache.config), layout);
+  cache.fallbackStandIn = PbrStandIn::Output0;
+}
+
+static void fail_variant(DrawCache& cache, uint64_t epoch) noexcept {
+  note_failed_variant();
+  if (cache.config.shaderConfig.ext.output == 2 && !cache.twinTried) {
+    cache.twinTried = true;
+    cache.pipelineRef = gfx::pipeline_ref(render_ext::output1_config(cache.config));
+    cache.pipelineStandIn = PbrStandIn::Output1;
+    switch (gfx::pipeline_state(cache.pipelineRef)) {
+    case gfx::PipelineState::Ready:
+      bump(render_ext::g_stats.pbrTwinAdopted);
+      return;
+    case gfx::PipelineState::Pending:
+      cache.extWaiting = true;
+      cache.extEpoch = epoch;
+      probe_fallback(cache);
+      return;
+    case gfx::PipelineState::Failed:
+      note_failed_variant();
+      break;
+    }
+  }
+  cache.pipelineRef = gfx::pipeline_ref(render_ext::fallback_config(cache.config));
+  cache.pipelineStandIn = PbrStandIn::Output0;
+}
+
 static RenderExtConfig drop_unsafe_binds(RenderExtConfig ext) noexcept {
   for (u32 i = 0; i < MaxTextures; ++i) {
     if ((ext.stochasticMask >> i & 1u) != 0 && !render_ext::stochastic_bind_ok(g_gxState.textures[i])) {
@@ -899,20 +941,20 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     cache.hasPipeline = true;
     cache.fallbackRef = 0;
     cache.extWaiting = false;
+    cache.twinTried = false;
+    cache.pipelineStandIn = PbrStandIn::None;
     if (cache.config.shaderConfig.ext != RenderExtConfig{}) {
       const uint64_t epoch = gfx::pipeline_epoch();
       switch (gfx::pipeline_state(cache.pipelineRef)) {
       case gfx::PipelineState::Ready:
         break;
       case gfx::PipelineState::Failed:
-        cache.pipelineRef = gfx::pipeline_ref(render_ext::fallback_config(cache.config));
-        note_failed_variant();
+        fail_variant(cache, epoch);
         break;
       case gfx::PipelineState::Pending:
         cache.extWaiting = true;
         cache.extEpoch = epoch;
-        cache.fallbackRef =
-            gfx::ready_pipeline(render_ext::fallback_config(cache.config), gfx::get_render_target_layout());
+        probe_fallback(cache);
         break;
       }
     }
@@ -971,16 +1013,23 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
         cache.extWaiting = false;
         cache.fallbackRef = 0;
         if (pipelineState == gfx::PipelineState::Failed) {
-          cache.pipelineRef = gfx::pipeline_ref(render_ext::fallback_config(cache.config));
-          note_failed_variant();
+          fail_variant(cache, epoch);
+        } else if (cache.twinTried) {
+          bump(render_ext::g_stats.pbrTwinAdopted);
         }
       } else if (cache.fallbackRef == 0) {
-        cache.fallbackRef =
-            gfx::ready_pipeline(render_ext::fallback_config(cache.config), gfx::get_render_target_layout());
+        probe_fallback(cache);
       }
     }
     if (cache.extWaiting) {
       bump(cache.fallbackRef != 0 ? render_ext::g_stats.fallbackDraws : render_ext::g_stats.pendingDraws);
+    }
+  }
+  if (cache.config.shaderConfig.ext.output == 2) {
+    const PbrStandIn standIn = cache.fallbackRef != 0 ? cache.fallbackStandIn : cache.pipelineStandIn;
+    if (standIn != PbrStandIn::None) {
+      bump(standIn == PbrStandIn::Output1 ? render_ext::g_stats.pbrFallbackOutput1
+                                          : render_ext::g_stats.pbrFallbackOutput0);
     }
   }
   cache.lastDrawFmt = fmt;

@@ -10,6 +10,7 @@
 namespace aurora::gx {
 struct DrawData;
 struct PipelineConfig;
+struct ShaderInfo;
 } // namespace aurora::gx
 
 namespace aurora::render::detail {
@@ -37,6 +38,7 @@ struct DrawRecord {
 };
 static_assert(sizeof(DrawRecord) == gx::render_ext::DrawRecordWords * sizeof(uint32_t));
 static_assert(offsetof(DrawRecord, flags) == gx::render_ext::DrawRecordFlagsWord * sizeof(uint32_t));
+static_assert(offsetof(DrawRecord, tevPolicyOff) == gx::render_ext::DrawRecordTevPolicyWord * sizeof(uint32_t));
 
 namespace flag {
 inline constexpr uint32_t MotionSourceMask = 3u << 0;
@@ -56,6 +58,8 @@ inline constexpr uint32_t CategoryShift = 16;
 inline constexpr uint32_t CategoryMask = 0xFFu << CategoryShift;
 } // namespace flag
 static_assert(flag::ScreenAo == gx::render_ext::RecordFlagScreenAo);
+static_assert(flag::VertexColorShift == gx::render_ext::RecordVertexColorShift);
+static_assert(flag::Unlit == gx::render_ext::RecordFlagUnlit);
 
 struct FrameRecord {
   uint32_t frameSeq = 0;
@@ -76,6 +80,9 @@ struct Stats {
   uint64_t reused = 0;
   uint64_t dropped = 0;
   uint64_t screenAo = 0;
+  uint64_t pbrRecords = 0;
+  uint64_t policyBlocks = 0;
+  uint64_t blendedInWindow = 0;
   std::array<uint64_t, 4> codes{};
 };
 
@@ -84,6 +91,7 @@ enum DrawInput : uint32_t {
   InWindow = 1u << 0,
   // Main colour writers between OPAQUE_DONE and PRE_POST get the group-3 forward environment
   ForwardWindow = 1u << 2,
+  PbrEligible = 1u << 3,
 };
 
 using PushFn = gfx::Range (*)(std::span<const uint8_t> bytes) noexcept;
@@ -98,11 +106,13 @@ void shutdown() noexcept;
 
 // FIFO thread
 bool on_route(const scene::DrawClass& cls) noexcept;
-void stamp(gx::DrawData& draw, const gx::PipelineConfig& config, const scene::DrawClass& cls) noexcept;
+void stamp(gx::DrawData& draw, const gx::PipelineConfig& config, const gx::ShaderInfo& info,
+           const scene::DrawClass& cls) noexcept;
 bool set_camera_frame(const scene::motion::MotionFrame& frame) noexcept;
 
 namespace testing {
 void set_active(bool active, bool gbuffer, bool debugId) noexcept;
+void set_surface(bool surface) noexcept;
 void set_push(PushFn push) noexcept;
 void reset() noexcept;
 } // namespace testing

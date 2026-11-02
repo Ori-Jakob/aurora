@@ -63,6 +63,12 @@ constexpr u32 GroundCells = 16;
 constexpr f32 GroundCellSize = 5.f;
 constexpr f32 GroundExtent = GroundCells * GroundCellSize / 2.f;
 constexpr u32 AoCheckClock = 0;
+constexpr u64 UnlitControlObject = 0x400;
+constexpr f32 UnlitControlX0 = 14.f;
+constexpr f32 UnlitControlX1 = 20.f;
+constexpr f32 UnlitControlZ0 = -11.f;
+constexpr f32 UnlitControlZ1 = -7.f;
+constexpr GXColor UnlitDimSun{60, 56, 48, 255};
 constexpr size_t AoCreaseBox = 2;
 
 struct Slab {
@@ -242,7 +248,7 @@ Vec to_view(const Mtx view, const Vec& world) {
   return out;
 }
 
-Lights setup_lights(const Mtx view, f32 t) {
+Lights setup_lights(const Mtx view, f32 t, bool dimSun) {
   Lights lights{};
   // Only the spot light sets a direction; the others must not load stack garbage into XF
   GXLightObj light{};
@@ -252,7 +258,7 @@ Lights setup_lights(const Mtx view, f32 t) {
   C_VECNormalize(&sunDir, &sunDir);
   lights.positions[0] = Vec{-sunDir.x * 1e5f, -sunDir.y * 1e5f, -sunDir.z * 1e5f};
   // Dim enough that the point and spot lights still read on sunlit ground
-  lights.colors[0] = GXColor{150, 140, 120, 255};
+  lights.colors[0] = dimSun ? UnlitDimSun : GXColor{150, 140, 120, 255};
   const Vec sunView = to_view(view, lights.positions[0]);
   GXInitLightPos(&light, sunView.x, sunView.y, sunView.z);
   GXInitLightColor(&light, lights.colors[0]);
@@ -505,6 +511,29 @@ void draw_water(const Mtx view) {
 
   GXSetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
   GXSetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
+}
+
+void draw_unlit_control(const Mtx view) {
+  set_ground_format();
+  GXLoadTexObj(&sGroundTexObj, GX_TEXMAP0);
+  GXSetNumTevStages(1);
+  GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
+  GXSetTevOp(GX_TEVSTAGE0, GX_MODULATE);
+  set_lit_channel(GX_SRC_REG);
+  load_matrices(view, GX_PNMTX0);
+  GXSetCurrentMtx(GX_PNMTX0);
+  GXSetCullMode(GX_CULL_BACK);
+  GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+  const f32 corners[4][2] = {{UnlitControlX0, UnlitControlZ0},
+                             {UnlitControlX1, UnlitControlZ0},
+                             {UnlitControlX1, UnlitControlZ1},
+                             {UnlitControlX0, UnlitControlZ1}};
+  for (const auto& [x, z] : corners) {
+    GXPosition3f32(x, 0.02f, z);
+    GXNormal3f32(0.f, 1.f, 0.f);
+    GXTexCoord2f32(x / GroundCellSize, z / GroundCellSize);
+  }
+  GXEnd();
 }
 
 // Sets every piece of state it draws with and restores blend and Z, so the depth probe and the next frame see M2 state
@@ -947,13 +976,35 @@ FwdEnvExpect fwd_env_expect() noexcept {
   };
 }
 
+std::vector<UnlitProbe> unlit_probes() {
+  const SceneCamera camera = scene_camera(AoCheckClock);
+  std::vector<UnlitProbe> probes;
+  const auto add = [&](UnlitProbeClass cls, const Vec& world) {
+    const std::array<f32, 2> ndc = project(camera, world);
+    if (std::abs(ndc[0]) < 0.95f && std::abs(ndc[1]) < 0.95f) {
+      probes.push_back({.ndc = {ndc[0], ndc[1]}, .cls = cls});
+    }
+  };
+  for (const f32 x : {14.f, 17.f, 20.f}) {
+    for (const f32 z : {-3.f, 0.5f, 3.f, 6.f}) {
+      add(UnlitProbeClass::Ground, {x, 0.f, z});
+    }
+  }
+  for (const f32 x : {15.5f, 17.f, 18.5f}) {
+    for (const f32 z : {-10.f, -9.f, -8.f}) {
+      add(UnlitProbeClass::Control, {x, 0.02f, z});
+    }
+  }
+  return probes;
+}
+
 FogResolveCounts fog_resolve_counts() noexcept { return sFogResolves; }
 
 void draw_scene(u32 frame, const SceneOptions& options) {
   // Not gated on hints_enabled() so the off capture proves emitters add only hint bytes; real producers do gate on it
   set_hint_emission(options.hints);
   upload_gpu_arrays(options);
-  const u32 clock = options.aoCheck || options.fwdEnvCheck ? AoCheckClock : frame;
+  const u32 clock = options.aoCheck || options.fwdEnvCheck || options.unlitCheck ? AoCheckClock : frame;
   const f32 t = static_cast<f32>(clock) / 60.f;
   const SceneCamera camera = scene_camera(clock);
   GXSetCopyClear(ClearColor, GX_MAX_Z24);
@@ -967,7 +1018,7 @@ void draw_scene(u32 frame, const SceneOptions& options) {
   const Point3d& target = camera.target;
 
   set_fog(Fog);
-  const Lights lights = setup_lights(view, t);
+  const Lights lights = setup_lights(view, t, options.unlitCheck && frame >= UnlitSunFrame);
   // Every frame-level hint goes out before SCENE_BEGIN, where aurora freezes the frame's values
   emit_frame_hints(clock, view, projection, lights);
   hint_stage(AURORA_STAGE_SCENE_BEGIN);
@@ -992,6 +1043,11 @@ void draw_scene(u32 frame, const SceneOptions& options) {
   }
   if (options.fwdEnvCheck) {
     draw_fwd_env_walls(view);
+  }
+  if (options.unlitCheck) {
+    begin_object(UnlitControlObject, AURORA_CAT_STATIC | AURORA_CAT_TERRAIN | AURORA_CAT_NO_PBR, AURORA_OBJ_IMMOBILE);
+    draw_unlit_control(view);
+    end_object();
   }
 
   Mtx bones[TentacleBones];
