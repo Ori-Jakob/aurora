@@ -472,6 +472,14 @@ TEST_F(RenderApiTest, UnbuiltGBufferBlocksBaseFeatures) {
   EXPECT_EQ(evaluate_support(Feature::Ao, 0, Settings{}, env(caps, aoOnly)), unsupported(Reason::NotImplemented));
 }
 
+TEST_F(RenderApiTest, AoNotBuiltBeforeComposite) {
+  const Caps caps = full_caps();
+  const BuiltOptions& built = detail::default_built_options();
+  EXPECT_EQ(evaluate_support(Feature::Ao, static_cast<uint8_t>(Quality::High), Settings{}, env(caps, built)),
+            unsupported(Reason::NotImplemented));
+  EXPECT_EQ(clamp_settings({.ao = Quality::High}, env(caps, built)).ao, Quality::Off);
+}
+
 TEST_F(RenderApiTest, DependencyReasons) {
   const Caps caps = full_caps();
   const BuiltOptions all = built_all();

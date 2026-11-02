@@ -9,6 +9,7 @@
 #include "jobs.hpp"
 #include "settings.hpp"
 #include "shaders.hpp"
+#include "ao/ao.hpp"
 #include "debug/debug.hpp"
 #include "debug/views.hpp"
 #include "geometry/compact.hpp"
@@ -97,6 +98,7 @@ void initialize() {
   compact::initialize();
   hzb::initialize();
   taa::initialize();
+  ao::initialize();
   upscale::initialize();
   systems::initialize();
   debug::initialize();
@@ -130,6 +132,7 @@ void shutdown() noexcept {
   shaders::shutdown();
   jobs::shutdown();
   hzb::shutdown();
+  ao::shutdown();
   taa::shutdown();
   upscale::shutdown();
   native::shutdown();
@@ -150,6 +153,7 @@ void on_worker_frame_begin([[maybe_unused]] uint64_t frameId, [[maybe_unused]] c
   bind_cache_tick(frameId);
   compact::worker_frame_begin(frameId);
   hzb::worker_tick(frameId);
+  ao::worker_tick(frameId);
   taa::worker_tick(frameId);
   systems::tick_worker(frameId);
   native_worker_frame_begin();

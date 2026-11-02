@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "render_depth_device.hpp"
 #include "render_hzb_reference.hpp"
 #include "render_test_device.hpp"
 
@@ -46,6 +47,7 @@
 namespace aurora::render::detail {
 namespace {
 namespace ref = aurora::test::hzb;
+using aurora::test::scene_depth;
 using wgpu::TextureFormat;
 using wgpu::TextureSampleType;
 
@@ -411,13 +413,6 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 }
 )";
 
-constexpr std::string_view DepthFillWgsl = R"(
-@vertex
-fn vs(@location(0) point: vec3f) -> @builtin(position) vec4f {
-  return vec4f(point, 1.0);
-}
-)";
-
 constexpr std::string_view GeometryWgsl = R"(
 @group(0) @binding(0) var<uniform> clip_from_world: mat4x4f;
 
@@ -504,27 +499,6 @@ protected:
     std::shared_ptr<CompiledGraph> graph = compile_graph(inputs);
     prepare_graph_bindings(*graph, {.caps = &caps(), .env = &inputs.env, .sceneDepth = source});
     return graph;
-  }
-
-  [[nodiscard]] wgpu::Texture make_depth(uint32_t width, uint32_t height) const {
-    const wgpu::TextureDescriptor descriptor{
-        .usage =
-            wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc,
-        .size = {width, height, 1},
-        .format = TextureFormat::Depth32Float,
-    };
-    return m_device->device.CreateTexture(&descriptor);
-  }
-
-  static std::shared_ptr<const SceneDepth> scene_depth(const wgpu::Texture& texture) {
-    auto depth = std::make_shared<SceneDepth>();
-    depth->source = DepthSource::Direct;
-    depth->sampledTexture = texture;
-    const wgpu::TextureViewDescriptor view{.aspect = wgpu::TextureAspect::DepthOnly};
-    depth->sampled = texture.CreateView(&view);
-    depth->sampledFormat = texture.GetFormat();
-    depth->size = {texture.GetWidth(), texture.GetHeight(), 1};
-    return depth;
   }
 
   [[nodiscard]] wgpu::Buffer make_buffer(wgpu::BufferUsage usage, uint64_t size, const void* data = nullptr) const {
@@ -638,62 +612,6 @@ protected:
     ASSERT_EQ(shaders::wait({id}, PipelineWaitNs), shaders::PipelineStatus::Ready) << pass;
   }
 
-  void fill_depth(const wgpu::Texture& texture, std::span<const float> values) const {
-    const wgpu::Device& device = m_device->device;
-    const std::string code{DepthFillWgsl};
-    const wgpu::ShaderSourceWGSL wgsl{wgpu::ShaderSourceWGSL::Init{.code = code.c_str()}};
-    const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl};
-    const wgpu::ShaderModule module = device.CreateShaderModule(&moduleDescriptor);
-    const uint32_t width = texture.GetWidth();
-    const uint32_t height = texture.GetHeight();
-    std::vector<float> points;
-    points.reserve(values.size() * 3);
-    for (uint32_t y = 0; y < height; ++y) {
-      for (uint32_t x = 0; x < width; ++x) {
-        points.push_back(static_cast<float>((x + 0.5) / width * 2.0 - 1.0));
-        points.push_back(static_cast<float>(1.0 - (y + 0.5) / height * 2.0));
-        points.push_back(values[size_t{y} * width + x]);
-      }
-    }
-    const wgpu::VertexAttribute attribute{.format = wgpu::VertexFormat::Float32x3, .offset = 0, .shaderLocation = 0};
-    const wgpu::VertexBufferLayout vertexLayout{
-        .stepMode = wgpu::VertexStepMode::Vertex, .arrayStride = 12, .attributeCount = 1, .attributes = &attribute};
-    const wgpu::DepthStencilState depthState{
-        .format = TextureFormat::Depth32Float,
-        .depthWriteEnabled = wgpu::OptionalBool::True,
-        .depthCompare = wgpu::CompareFunction::Always,
-    };
-    const wgpu::RenderPipelineDescriptor pipelineDescriptor{
-        .vertex = {.module = module, .entryPoint = "vs", .bufferCount = 1, .buffers = &vertexLayout},
-        .primitive = {.topology = wgpu::PrimitiveTopology::PointList},
-        .depthStencil = &depthState,
-    };
-    const wgpu::RenderPipeline pipeline = device.CreateRenderPipeline(&pipelineDescriptor);
-    const wgpu::Buffer buffer = make_buffer(wgpu::BufferUsage::Vertex, points.size() * sizeof(float), points.data());
-    const wgpu::RenderPassDepthStencilAttachment attachment{
-        .view = texture.CreateView(),
-        .depthLoadOp = wgpu::LoadOp::Clear,
-        .depthStoreOp = wgpu::StoreOp::Store,
-        .depthClearValue = 0.f,
-    };
-    const wgpu::RenderPassDescriptor passDescriptor{.depthStencilAttachment = &attachment};
-    const wgpu::CommandEncoder encoder = device.CreateCommandEncoder();
-    const wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&passDescriptor);
-    pass.SetPipeline(pipeline);
-    pass.SetVertexBuffer(0, buffer);
-    pass.Draw(static_cast<uint32_t>(values.size()));
-    pass.End();
-    const wgpu::CommandBuffer commands = encoder.Finish();
-    EXPECT_TRUE(test::submit_and_wait(*m_device, commands));
-    const std::vector<float> stored = test::read_texture_mip(*m_device, texture, 0);
-    ASSERT_EQ(stored.size(), values.size());
-    size_t bad = 0;
-    for (size_t i = 0; i < stored.size(); ++i) {
-      bad += std::bit_cast<uint32_t>(stored[i]) != std::bit_cast<uint32_t>(values[i]) ? 1 : 0;
-    }
-    EXPECT_EQ(bad, 0u) << "the depth fill did not store every value exactly";
-  }
-
   void expect_pyramid(const wgpu::Texture& texture, const ref::CpuPyramid& want, std::string_view what) const {
     ASSERT_TRUE(texture) << what;
     ASSERT_EQ(texture.GetMipLevelCount(), want.level_count()) << what;
@@ -743,7 +661,7 @@ protected:
       const auto graph = compile(descs);
       wait_ready(*graph, hzb::OpaquePass);
       const FrameState state{.graph = graph};
-      const auto depth = scene_depth(make_depth(width, height));
+      const auto depth = scene_depth(test::make_depth(*m_device, width, height));
       const uint32_t levels = pyramid_levels(width, height);
       EXPECT_EQ(run(state, 1, depth), std::nullopt);
       EXPECT_EQ(hzb::testing::counters().dispatches, levels);
@@ -777,7 +695,7 @@ TEST_F(HzbGraph, CulledWithoutConsumer) {
   }
   EXPECT_TRUE(graph->slots.slots.empty());
   const FrameState state{.graph = graph};
-  EXPECT_EQ(run(state, 1, scene_depth(make_depth(64, 64))), std::nullopt);
+  EXPECT_EQ(run(state, 1, scene_depth(test::make_depth(*m_device, 64, 64))), std::nullopt);
   EXPECT_EQ(hzb::testing::counters().dispatches, 0u);
   EXPECT_EQ(shaders::stats().ready + shaders::stats().pending + shaders::stats().failed, 0u);
 }
@@ -876,11 +794,11 @@ TEST_F(HzbGraph, PendingPipelineGivesConsumerDummy) {
   EXPECT_EQ(shaders::status({id}), shaders::PipelineStatus::Pending);
   const FrameState state{.graph = graph};
   const NodeId readerNode = graph->find_node("t.cull");
-  const StageData stage = build_opaque(state, 1, scene_depth(make_depth(64, 64)));
+  const StageData stage = build_opaque(state, 1, scene_depth(test::make_depth(*m_device, 64, 64)));
   EXPECT_FALSE(stage.is_enabled(graph->nodes[node].programIndex));
   EXPECT_TRUE(stage.is_enabled(graph->nodes[readerNode].programIndex));
   EXPECT_TRUE(stage.dummy_bound(graph->node_uses(readerNode)[0].stageUse));
-  EXPECT_EQ(run(state, 2, scene_depth(make_depth(64, 64))), std::nullopt);
+  EXPECT_EQ(run(state, 2, scene_depth(test::make_depth(*m_device, 64, 64))), std::nullopt);
   EXPECT_EQ(hzb::testing::counters().dispatches, 0u);
   EXPECT_EQ(consumer.calls, 1);
   release = true;
@@ -898,11 +816,11 @@ TEST_F(HzbGraph, UnrequestedPipelineGivesConsumerDummy) {
   EXPECT_FALSE(pass_pipelines_ready(graph->nodes[node]));
   const FrameState state{.graph = graph};
   const NodeId readerNode = graph->find_node("t.cull");
-  const StageData stage = build_opaque(state, 1, scene_depth(make_depth(64, 64)));
+  const StageData stage = build_opaque(state, 1, scene_depth(test::make_depth(*m_device, 64, 64)));
   EXPECT_FALSE(stage.is_enabled(graph->nodes[node].programIndex));
   EXPECT_TRUE(stage.is_enabled(graph->nodes[readerNode].programIndex));
   EXPECT_TRUE(stage.dummy_bound(graph->node_uses(readerNode)[0].stageUse));
-  EXPECT_EQ(run(state, 2, scene_depth(make_depth(64, 64))), std::nullopt);
+  EXPECT_EQ(run(state, 2, scene_depth(test::make_depth(*m_device, 64, 64))), std::nullopt);
   EXPECT_EQ(hzb::testing::counters().dispatches, 0u);
   EXPECT_EQ(consumer.calls, 1);
 }
@@ -967,8 +885,8 @@ TEST_F(HzbGpu, PyramidMatchesCpuBitExact) {
       const std::vector descs{hzb::opaque_pass_desc(), desc_of(capture)};
       const auto graph = compile(descs);
       wait_ready(*graph, hzb::OpaquePass);
-      const wgpu::Texture depth = make_depth(width, height);
-      fill_depth(depth, values);
+      const wgpu::Texture depth = test::make_depth(*m_device, width, height);
+      test::fill_depth(*m_device, depth, values);
       const FrameState state{.graph = graph};
       EXPECT_EQ(run(state, 1, scene_depth(depth)), std::nullopt);
       expect_pyramid(fromDepth, want, "Depth32Float source");
@@ -1055,8 +973,8 @@ TEST_F(HzbGpu, QueryMatchesCpuBitExact) {
     const auto graph = compile(descs);
     wait_ready(*graph, hzb::OpaquePass);
     wait_ready(*graph, "t.cull");
-    const wgpu::Texture depth = make_depth(width, height);
-    fill_depth(depth, values);
+    const wgpu::Texture depth = test::make_depth(*m_device, width, height);
+    test::fill_depth(*m_device, depth, values);
     const FrameState state{.graph = graph};
     EXPECT_EQ(run(state, 1, scene_depth(depth)), std::nullopt);
     const std::vector<uint32_t> got =
@@ -1337,7 +1255,7 @@ TEST_F(HzbGpu, NeverCullsVisibleBox) {
         bind_extra(paramsBuffer, boxBuffer, verdicts);
         m_count = count;
 
-        const wgpu::Texture depth = make_depth(width, height);
+        const wgpu::Texture depth = test::make_depth(*m_device, width, height);
         const auto geometry_group = [&](const wgpu::RenderPipeline& pipeline) {
           const wgpu::BindGroupEntry entry{.binding = 0, .buffer = matrixBuffer};
           const wgpu::BindGroupDescriptor descriptor{
@@ -1480,8 +1398,8 @@ TEST_F(HzbGpu, Bench) {
     const std::vector descs{hzb::opaque_pass_desc(), desc_of(consumer)};
     const auto graph = compile(descs);
     wait_ready(*graph, hzb::OpaquePass);
-    const wgpu::Texture depth = make_depth(width, height);
-    fill_depth(depth, std::vector<float>(size_t{width} * height, 0.5f));
+    const wgpu::Texture depth = test::make_depth(*m_device, width, height);
+    test::fill_depth(*m_device, depth, std::vector<float>(size_t{width} * height, 0.5f));
     const auto sceneDepth = scene_depth(depth);
     const FrameState state{.graph = graph};
     const wgpu::QuerySetDescriptor queryDescriptor{.type = wgpu::QueryType::Timestamp, .count = 2};

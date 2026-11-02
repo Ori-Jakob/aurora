@@ -17,6 +17,10 @@ target_sources(aurora_gx PRIVATE
 )
 if (AURORA_ENABLE_RENDER)
     target_sources(aurora_gx PRIVATE
+        lib/render/ao/ao.cpp
+        lib/render/ao/ao.hpp
+        lib/render/ao/hiz.cpp
+        lib/render/ao/hiz.hpp
         lib/render/debug/capture.cpp
         lib/render/debug/capture.hpp
         lib/render/debug/class_view.cpp
@@ -155,6 +159,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/shaders.cpp
         lib/render/shaders.hpp
         lib/render/shaders_embed.hpp
+        lib/render/stage_camera.cpp
+        lib/render/stage_camera.hpp
         lib/render/systems/dispatch.cpp
         lib/render/systems/dispatch.hpp
         lib/render/systems/systems.cpp

@@ -15,6 +15,7 @@
 #include "../webgpu/caps.hpp"
 
 #if AURORA_ENABLE_RENDER
+#include "ao/ao.hpp"
 #include "debug/debug.hpp"
 #include "gx_ext/ext_provider.hpp"
 #include "hints.hpp"
@@ -520,7 +521,21 @@ Settings with_env_overrides(Settings settings) noexcept {
     settings.upscaler = env.upscaler->upscaler;
     settings.upscalerQuality = env.upscaler->quality.value_or(settings.upscalerQuality);
   }
+#if AURORA_ENABLE_RENDER
+  if (const std::optional<Quality> ao = ao::env_ao_request()) {
+    settings.ao = *ao;
+  }
+#endif
   return settings;
+}
+
+// AURORA_RENDER_AO builds AO for development before the composite exists, as AURORA_RENDER_GBUFFER forced tier B in M7
+BuiltOptions support_built(const BuiltOptions& built) noexcept {
+#if AURORA_ENABLE_RENDER
+  return ao::with_dev_built(built, ao::env_ao_request());
+#else
+  return built;
+#endif
 }
 
 bool latch_gbuffer_want(uint32_t msaaSamples) {
@@ -897,8 +912,8 @@ Settings clamp_settings(const Settings& requested, const SupportEnv& env) noexce
 
 Settings submit_request(const Settings& requested) {
   std::lock_guard lock{g_requestMutex};
-  Settings preview = clamp_settings(with_env_overrides(requested),
-                                    {caps(), g_msaaSamples, g_built, module_enabled(), &g_upscalerProbe});
+  Settings preview = clamp_settings(with_env_overrides(requested), {caps(), g_msaaSamples, support_built(g_built),
+                                                                    module_enabled(), &g_upscalerProbe});
   g_lastRequest = requested;
   g_pending = requested;
   g_supportContext = preview;
@@ -912,7 +927,7 @@ FeatureSupport current_support(Feature feature, uint8_t option, const Settings* 
   Settings supportContext;
   {
     std::lock_guard lock{g_requestMutex};
-    built = g_built;
+    built = support_built(g_built);
     upscalers = g_upscalerProbe;
     msaaSamples = g_msaaSamples;
     if (context == nullptr) {
@@ -941,7 +956,7 @@ void reset_settings_state(uint32_t msaaSamples) noexcept {
     std::lock_guard lock{g_requestMutex};
     g_msaaSamples = msaaSamples;
     result = clamp_settings(with_env_overrides(g_lastRequest),
-                            {caps(), msaaSamples, g_built, module_enabled(), &g_upscalerProbe});
+                            {caps(), msaaSamples, support_built(g_built), module_enabled(), &g_upscalerProbe});
     g_supportContext = result;
     g_pending.reset();
     g_heldRequest.reset();
@@ -989,7 +1004,7 @@ std::shared_ptr<const FrameState> latch_frame() {
     if (std::exchange(g_reclamp, false) && !request) {
       request = g_lastRequest;
     }
-    built = g_built;
+    built = support_built(g_built);
     upscalers = g_upscalerProbe;
     msaaSamples = g_msaaSamples;
     const SupportEnv env{caps(), msaaSamples, built, module_enabled(), &upscalers};
@@ -1080,6 +1095,7 @@ std::shared_ptr<const FrameState> latch_frame() {
     taa::on_latch(latched_settings(), graph.get());
   }
   upscale::latch_graph(latched_settings(), graph.get());
+  ao::on_latch(latched_settings(), graph.get());
   latch_pass_params();
   inspectorOpen = g_graphEnvironment.inspectorOpen;
 #endif
