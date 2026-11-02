@@ -44,6 +44,29 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+//
+// The sharpening follows RCAS from AMD FidelityFX FSR 1.0 (GPUOpen-Effects/FidelityFX-FSR), which carries this
+// notice:
+//
+// Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
 
 //#import aurora/frame
 //#import aurora/rcas
@@ -67,9 +90,13 @@ struct TaaParams {
 
 override MIN_BLEND: f32 = 0.1;
 override MOVING_SAMPLES: f32 = 8.0;
+override BLURRED_SAMPLES: f32 = 4.0;
 override CLIP_SCALE: f32 = 1.5;
 override FALLBACK_BLUR: f32 = 0.25;
 override SHARPEN_SAMPLES: f32 = 4.0;
+override MOTION_SHARPEN: f32 = 1.4;
+override OVERSHOOT_SPAN: f32 = 0.5;
+override OVERSHOOT_LIMIT: f32 = 0.007843138;
 
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
@@ -109,6 +136,13 @@ fn clip_towards_aabb_center(history: vec3f, box_min: vec3f, box_max: vec3f) -> v
     return center + offset / units;
   }
   return history;
+}
+
+// 0 when a reprojection lands on texel centres, 1 halfway between them, where Catmull-Rom softens the history most
+fn resample_blur(position: vec2f) -> f32 {
+  let t = fract(position - 0.5);
+  let spread = 4.0 * t * (1.0 - t);
+  return spread.x + spread.y - spread.x * spread.y;
 }
 
 fn sample_history(uv: vec2f) -> vec3f {
@@ -187,7 +221,9 @@ fn fs_resolve(@builtin(position) frag: vec4f) -> @location(0) vec4f {
       clip_towards_aabb_center(rgb_to_ycocg(history), min(mean - deviation, own), max(mean + deviation, own)));
 
   let still = all(abs(shift) * 0.5 * size < vec2f(0.01));
-  let next = select(min(samples + 1.0, MOVING_SAMPLES), samples + 1.0, still);
+  // Each moving frame resamples the whole history again, so a lossy resample keeps fewer old frames in it
+  let cap = mix(MOVING_SAMPLES, BLURRED_SAMPLES, resample_blur(prev_position));
+  let next = select(min(samples + 1.0, cap), samples + 1.0, still);
   let reactive = saturate(load_clamped(scene_reactive, pixel).r);
   let blend = max(max(1.0 / next, MIN_BLEND), reactive);
   let resolved = select(mix(history, current, blend), current, blend >= 1.0);
@@ -198,8 +234,37 @@ fn fs_resolve(@builtin(position) frag: vec4f) -> @location(0) vec4f {
 @fragment
 fn fs_apply(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   let pixel = vec2i(floor(frag.xy));
+  let centre = load_clamped(history_tex, pixel);
+  let e = centre.rgb;
   // Young pixels are still close to one raw frame, which full-strength RCAS pushes past the scene's own range
-  let samples = load_clamped(history_tex, pixel).a;
-  let strength = min(taa_params.sharpness, 1.0) * saturate((samples - 1.0) / (SHARPEN_SAMPLES - 1.0));
-  return vec4f(rcas_sharpen(history_tex, pixel, strength), 0.0);
+  let confidence = saturate((centre.a - 1.0) / (SHARPEN_SAMPLES - 1.0));
+  let motion = load_clamped(scene_motion, pixel).xy;
+  let known = finite2(motion) && all(abs(motion) < vec2f(2.0));
+  let shift = select(vec2f(0.0), motion * vec2f(0.5, -0.5) * vec2f(textureDimensions(history_tex)), known);
+  // RCAS gives back what this frame's history resample took, so moving detail keeps its still sharpness
+  let still = all(abs(shift) < vec2f(0.01));
+  let boost = 1.0 + MOTION_SHARPEN * select(resample_blur(frag.xy - shift), 0.0, still);
+  let base_strength = min(taa_params.sharpness, 1.0) * confidence;
+  let strength = min(taa_params.sharpness * boost, 1.0) * confidence;
+  if (!(strength > 0.0)) {
+    return vec4f(e, 0.0);
+  }
+  let b = load_clamped(history_tex, pixel + vec2i(0, -1)).rgb;
+  let d = load_clamped(history_tex, pixel + vec2i(-1, 0)).rgb;
+  let f = load_clamped(history_tex, pixel + vec2i(1, 0)).rgb;
+  let h = load_clamped(history_tex, pixel + vec2i(0, 1)).rgb;
+  let mn4 = min(min(b, d), min(f, h));
+  let mx4 = max(max(b, d), max(f, h));
+  let hit_min = min(mn4, e) / max(4.0 * mx4, vec3f(0.00001));
+  let hit_max = (1.0 - max(mx4, e)) / min(4.0 * mn4 - 4.0, vec3f(-0.00001));
+  let limit = max(-RCAS_LIMIT, min(max3(max(-hit_min, hit_max)), 0.0));
+  let base_lobe = limit * base_strength;
+  let lobe = limit * strength;
+  let base = (base_lobe * (b + d + f + h) + e) / (4.0 * base_lobe + 1.0);
+  let color = (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
+  // The motion share may restore lost detail but not ring past the local range by more than a few codes
+  let lo = min(mn4, e);
+  let hi = max(mx4, e);
+  let margin = min(OVERSHOOT_SPAN * (hi - lo), vec3f(OVERSHOOT_LIMIT));
+  return vec4f(saturate(clamp(color, min(lo - margin, base), max(hi + margin, base))), 0.0);
 }

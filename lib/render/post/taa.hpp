@@ -18,9 +18,13 @@ inline constexpr wgpu::TextureFormat HistoryFormat = wgpu::TextureFormat::RGBA16
 inline constexpr uint64_t RetainFrames = 8;
 inline constexpr float MinBlend = 0.1f;
 inline constexpr float MovingSamples = 8.f;
+inline constexpr float BlurredSamples = 4.f;
 inline constexpr float ClipScale = 1.5f;
 inline constexpr float FallbackBlur = 0.25f;
 inline constexpr float SharpenSamples = 4.f;
+inline constexpr float MotionSharpen = 1.4f;
+inline constexpr float OvershootSpan = 0.5f;
+inline constexpr float OvershootLimit = 2.f / 255.f;
 
 struct Params {
   float sharpness = 0.f;

@@ -27,13 +27,19 @@ constexpr uint32_t SourceGroupIndex = 2;
 constexpr size_t CacheCapacity = 6;
 constexpr uint64_t LayoutSalt = 0x5441412D53524331ull;
 constexpr std::array<std::string_view, 1> ResetDefines{"TAA_RESET"};
-constexpr std::array<shaders::Constant, 4> ResolveConstants{{
+constexpr std::array<shaders::Constant, 5> ResolveConstants{{
     {"MIN_BLEND", MinBlend},
     {"MOVING_SAMPLES", MovingSamples},
     {"CLIP_SCALE", ClipScale},
     {"FALLBACK_BLUR", FallbackBlur},
+    {"BLURRED_SAMPLES", BlurredSamples},
 }};
-constexpr std::array<shaders::Constant, 1> ApplyConstants{{{"SHARPEN_SAMPLES", SharpenSamples}}};
+constexpr std::array<shaders::Constant, 4> ApplyConstants{{
+    {"SHARPEN_SAMPLES", SharpenSamples},
+    {"MOTION_SHARPEN", MotionSharpen},
+    {"OVERSHOOT_SPAN", OvershootSpan},
+    {"OVERSHOOT_LIMIT", OvershootLimit},
+}};
 constexpr wgpu::ColorWriteMask RgbMask =
     wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue;
 

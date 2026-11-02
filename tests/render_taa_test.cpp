@@ -39,6 +39,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <numbers>
 #include <optional>
 #include <random>
 #include <span>
@@ -179,7 +180,7 @@ TEST(TaaRules, ResolveTargetIsHistoryFormat) {
 TEST(TaaRules, ResolveConstantsComeFromHeader) {
   EXPECT_TRUE(taa::testing::resolve_desc(true).constants.empty());
   const shaders::RenderPipelineDesc desc = taa::testing::resolve_desc(false);
-  ASSERT_EQ(desc.constants.size(), 4u);
+  ASSERT_EQ(desc.constants.size(), 5u);
   EXPECT_EQ(desc.constants[0].name, "MIN_BLEND");
   EXPECT_EQ(desc.constants[0].value, double{taa::MinBlend});
   EXPECT_EQ(desc.constants[1].name, "MOVING_SAMPLES");
@@ -188,11 +189,21 @@ TEST(TaaRules, ResolveConstantsComeFromHeader) {
   EXPECT_EQ(desc.constants[2].value, double{taa::ClipScale});
   EXPECT_EQ(desc.constants[3].name, "FALLBACK_BLUR");
   EXPECT_EQ(desc.constants[3].value, double{taa::FallbackBlur});
+  EXPECT_EQ(desc.constants[4].name, "BLURRED_SAMPLES");
+  EXPECT_EQ(desc.constants[4].value, double{taa::BlurredSamples});
   EXPECT_LT(taa::MovingSamples, 1.f / taa::MinBlend);
+  EXPECT_GE(taa::BlurredSamples, 1.f);
+  EXPECT_LE(taa::BlurredSamples, taa::MovingSamples);
   const shaders::RenderPipelineDesc apply = taa::testing::apply_desc(TextureFormat::BGRA8Unorm);
-  ASSERT_EQ(apply.constants.size(), 1u);
+  ASSERT_EQ(apply.constants.size(), 4u);
   EXPECT_EQ(apply.constants[0].name, "SHARPEN_SAMPLES");
   EXPECT_EQ(apply.constants[0].value, double{taa::SharpenSamples});
+  EXPECT_EQ(apply.constants[1].name, "MOTION_SHARPEN");
+  EXPECT_EQ(apply.constants[1].value, double{taa::MotionSharpen});
+  EXPECT_EQ(apply.constants[2].name, "OVERSHOOT_SPAN");
+  EXPECT_EQ(apply.constants[2].value, double{taa::OvershootSpan});
+  EXPECT_EQ(apply.constants[3].name, "OVERSHOOT_LIMIT");
+  EXPECT_EQ(apply.constants[3].value, double{taa::OvershootLimit});
   EXPECT_GT(taa::SharpenSamples, 1.f);
   EXPECT_LE(taa::SharpenSamples, taa::MovingSamples);
 }
@@ -1132,19 +1143,70 @@ TEST_F(TaaGpu, StepChangeUnderZeroMotionIsClipped) {
 TEST_F(TaaGpu, MotionCapsSampleCount) {
   start(0.f);
   const std::vector<Rgba> input = flat({120, 120, 120, 255});
-  const float moving = 0.1f / static_cast<float>(Width);
+  const auto most_samples = [this] {
+    float most = 0.f;
+    for (const auto& texel : read_history()) {
+      most = std::max(most, texel[3]);
+    }
+    return most;
+  };
+  // Whole-texel motion resamples nothing, half-texel motion lands every tap halfway between texels
+  const float texel = 2.f / static_cast<float>(Width);
   for (int i = 0; i < 20; ++i) {
-    frame(input, moving, 0.f);
+    frame(input, texel, 0.f);
   }
-  float most = 0.f;
-  for (const auto& texel : read_history()) {
-    most = std::max(most, texel[3]);
+  EXPECT_EQ(most_samples(), taa::MovingSamples);
+  for (int i = 0; i < 20; ++i) {
+    frame(input, 0.5f * texel, 0.f);
   }
-  EXPECT_EQ(most, taa::MovingSamples);
+  EXPECT_EQ(most_samples(), taa::BlurredSamples);
   for (int i = 0; i < 20; ++i) {
     frame(input);
   }
   EXPECT_GT(read_history()[size_t{24} * Width + 32][3], taa::MovingSamples);
+}
+
+TEST_F(TaaGpu, MovingDetailKeepsStillSharpness) {
+  // A 4 px grating sliding half a texel per frame is the worst case for the Catmull-Rom history resample
+  const auto grating = [](double offset) {
+    return image([offset](uint32_t x, uint32_t) {
+      const double wave = 60.0 * std::sin((static_cast<double>(x) - offset) * std::numbers::pi / 2.0);
+      const auto v = static_cast<uint8_t>(std::lround(128.0 + wave));
+      return Rgba{v, v, v, 255};
+    });
+  };
+  const auto contrast = [](const std::vector<Rgba>& pixels) {
+    double sum = 0.0;
+    double squares = 0.0;
+    double count = 0.0;
+    for (uint32_t y = 8; y + 8 < Height; ++y) {
+      for (uint32_t x = 8; x + 8 < Width; ++x) {
+        const double v = pixels[size_t{y} * Width + x].r;
+        sum += v;
+        squares += v * v;
+        count += 1.0;
+      }
+    }
+    return std::sqrt(squares / count - (sum / count) * (sum / count));
+  };
+  const float sharpness = Settings{}.taaSharpness;
+  start(sharpness);
+  std::vector<Rgba> still;
+  for (int i = 0; i < 24; ++i) {
+    still = frame(grating(0.0));
+  }
+  reset_module_state();
+  taa::initialize();
+  m_frame = 0;
+  start(sharpness);
+  std::vector<Rgba> moving;
+  for (int i = 0; i < 24; ++i) {
+    moving = frame(grating(0.5 * i), 1.f / static_cast<float>(Width), 0.f);
+  }
+  // A fixed 8-sample cap kept 0.57 here; the range limit stops the grating's own peaks rising, so 1 is out of reach
+  const double ratio = contrast(moving) / contrast(still);
+  EXPECT_GT(ratio, 0.7);
+  EXPECT_LT(ratio, 1.1);
 }
 
 TEST_F(TaaGpu, ResetConvergesToEightPhaseMean) {
