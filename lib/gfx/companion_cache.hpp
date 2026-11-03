@@ -50,6 +50,12 @@ struct Stats {
   uint64_t rejectedBc = 0;
   uint64_t evicted = 0;
   uint64_t syncLoads = 0;
+  uint64_t repaired = 0;
+  uint64_t repairedMat = 0;
+  uint64_t repairedNrm = 0;
+  uint64_t repairedOrm = 0;
+  uint64_t repairedColour = 0;
+  uint64_t truncated = 0;
 };
 
 void set_deviceless(bool deviceless) noexcept;

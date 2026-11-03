@@ -21,6 +21,8 @@ namespace aurora::gfx::companion_cache {
 namespace {
 constexpr Module Log{"aurora::gfx::companions"};
 
+using texture_replacement::ChainReport;
+using texture_replacement::ChainVerdict;
 using texture_replacement::CompanionLoadError;
 using texture_replacement::CompanionRole;
 using texture_replacement::CompanionRoleCount;
@@ -45,6 +47,7 @@ struct Completion {
   uint64_t session = 0;
   std::optional<ConvertedTexture> texture;
   CompanionLoadError error = CompanionLoadError::None;
+  ChainReport chain;
 };
 
 std::mutex s_completionMutex;
@@ -107,8 +110,20 @@ TextureHandle upload(CompanionRole role, const ConvertedTexture& texture) noexce
   return handle;
 }
 
-bool finish(RoleSlot& slot, CompanionRole role, std::optional<ConvertedTexture> texture,
-            CompanionLoadError error) noexcept {
+void count_chain(CompanionRole role, const ChainReport& chain) noexcept {
+  if (chain.repaired) {
+    ++s_stats.repaired;
+    s_stats.repairedMat += role == CompanionRole::Mat ? 1 : 0;
+    s_stats.repairedNrm += role == CompanionRole::Nrm ? 1 : 0;
+    s_stats.repairedOrm += role == CompanionRole::Orm ? 1 : 0;
+    s_stats.repairedColour += role == CompanionRole::Albedo || role == CompanionRole::Emit ? 1 : 0;
+  } else if (chain.verdict == ChainVerdict::Clamped || chain.verdict == ChainVerdict::Invalid) {
+    ++s_stats.truncated;
+  }
+}
+
+bool finish(RoleSlot& slot, CompanionRole role, std::optional<ConvertedTexture> texture, CompanionLoadError error,
+            const ChainReport& chain) noexcept {
   if (!texture.has_value()) {
     slot.state = RoleState::Failed;
     ++s_stats.rejected;
@@ -123,6 +138,7 @@ bool finish(RoleSlot& slot, CompanionRole role, std::optional<ConvertedTexture> 
   s_stats.loadedBytes += slot.bytes;
   s_stats.loadedEmit += role == CompanionRole::Emit ? 1 : 0;
   s_stats.loadedDelight += role == CompanionRole::Delight ? 1 : 0;
+  count_chain(role, chain);
   return true;
 }
 
@@ -133,9 +149,10 @@ void load_now(uint32_t set, CompanionRole role, RoleSlot& slot) noexcept {
     return;
   }
   CompanionLoadError error = CompanionLoadError::None;
-  auto texture = texture_replacement::load_companion(role, file->path, &error);
+  ChainReport chain;
+  auto texture = texture_replacement::load_companion(role, file->path, &error, &chain);
   ++s_stats.syncLoads;
-  finish(slot, role, std::move(texture), error);
+  finish(slot, role, std::move(texture), error, chain);
 }
 
 void queue_load(uint32_t set, CompanionRole role, RoleSlot& slot) noexcept {
@@ -152,7 +169,8 @@ void queue_load(uint32_t set, CompanionRole role, RoleSlot& slot) noexcept {
   texture_replacement::queue_companion_task([set, role, path = std::move(file->path), generation = s_generation,
                                              session = s_session.load(std::memory_order_relaxed)] {
     CompanionLoadError error = CompanionLoadError::None;
-    auto texture = texture_replacement::load_companion(role, path, &error);
+    ChainReport chain;
+    auto texture = texture_replacement::load_companion(role, path, &error, &chain);
     {
       std::lock_guard lock{s_completionMutex};
       s_completions.push_back({
@@ -162,6 +180,7 @@ void queue_load(uint32_t set, CompanionRole role, RoleSlot& slot) noexcept {
           .session = session,
           .texture = std::move(texture),
           .error = error,
+          .chain = chain,
       });
       if (s_inFlight != 0) {
         --s_inFlight;
@@ -237,7 +256,7 @@ void process() noexcept {
     if (slot.state != RoleState::Pending) {
       continue;
     }
-    landed |= finish(slot, completion.role, std::move(completion.texture), completion.error);
+    landed |= finish(slot, completion.role, std::move(completion.texture), completion.error, completion.chain);
   }
   if (landed) {
     s_epoch.fetch_add(1, std::memory_order_release);
@@ -255,10 +274,11 @@ void shutdown() noexcept {
   if (s_stats.sets != 0) {
     Log.info(
         "Companions: sets {}, loaded {} ({:.1f} MB; emit {}, delight {}), rejected {} (D7 {}, BC {}), evicted {}, "
-        "sync loads {}",
+        "sync loads {}, repaired {} (mat {}, nrm {}, orm {}, colour {}), truncated {}",
         s_stats.sets, s_stats.loaded, static_cast<double>(s_stats.loadedBytes) / (1024.0 * 1024.0), s_stats.loadedEmit,
         s_stats.loadedDelight, s_stats.rejected, s_stats.rejectedFormat, s_stats.rejectedBc, s_stats.evicted,
-        s_stats.syncLoads);
+        s_stats.syncLoads, s_stats.repaired, s_stats.repairedMat, s_stats.repairedNrm, s_stats.repairedOrm,
+        s_stats.repairedColour, s_stats.truncated);
   }
   s_session.fetch_add(1, std::memory_order_relaxed);
   {

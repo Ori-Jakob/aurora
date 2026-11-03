@@ -195,7 +195,8 @@ void set_manifest_companions(std::span<const ManifestCompanion> companions);
 bool has_companions() noexcept;
 bool synchronous_loads() noexcept;
 std::optional<ConvertedTexture> load_companion(CompanionRole role, const std::filesystem::path& path,
-                                               CompanionLoadError* error = nullptr) noexcept;
+                                               CompanionLoadError* error = nullptr,
+                                               ChainReport* chain = nullptr) noexcept;
 void queue_companion_task(std::function<void()> task);
 
 namespace testing {

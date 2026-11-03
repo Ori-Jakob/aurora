@@ -5,8 +5,8 @@
 #include "../gx/gx.hpp"
 #include "../gx/texture.hpp"
 #include "../internal.hpp"
-#if AURORA_ENABLE_RENDER
 #include "../render/material/mip_repair.hpp"
+#if AURORA_ENABLE_RENDER
 #include "../render/material/registry.hpp"
 #endif
 #include "../thread.hpp"
@@ -637,21 +637,30 @@ struct MipPolicy {
   bool repair = false;
   bool generate = false;
   bool generationAllowed = true;
+  render::material::MipFilter filter = render::material::MipFilter::Colour;
 };
 
-bool is_arbitrary_mip_name(std::string_view name) noexcept {
+bool is_arbitrary_mip_name(std::string_view name, bool companion) noexcept {
   const size_t slash = name.find_last_of("/\\");
   const size_t start = slash == std::string_view::npos ? 0 : slash + 1;
   size_t dot = name.rfind('.');
   if (dot == std::string_view::npos || dot < start) {
     dot = name.size();
   }
+  if (companion && dot > start) {
+    // A companion's role sits between its key and the extension, so _arb ends the part before the role
+    const size_t roleDot = name.rfind('.', dot - 1);
+    if (roleDot != std::string_view::npos && roleDot >= start) {
+      dot = roleDot;
+    }
+  }
   return name.substr(start, dot - start).ends_with("_arb");
 }
 
-bool chain_repairable(wgpu::TextureFormat format, const gfx::ConvertedTexture& last, std::string_view name) noexcept {
+bool chain_repairable(wgpu::TextureFormat format, const gfx::ConvertedTexture& last, std::string_view name,
+                      bool companion) noexcept {
   const uint64_t texels = uint64_t{last.width} * last.height;
-  if (texels <= 1 || is_arbitrary_mip_name(name)) {
+  if (texels <= 1 || is_arbitrary_mip_name(name, companion)) {
     return false;
   }
 #if AURORA_ENABLE_RENDER
@@ -664,6 +673,7 @@ bool chain_repairable(wgpu::TextureFormat format, const gfx::ConvertedTexture& l
 
 std::optional<gfx::ConvertedTexture> rebuild_mip_chain(const gfx::ConvertedTexture& base,
                                                        std::span<const gfx::ConvertedTexture> kept,
+                                                       render::material::MipFilter filter,
                                                        ChainReport& report) noexcept {
 #if AURORA_ENABLE_RENDER
   const gfx::ConvertedTexture& last = kept.empty() ? base : kept.back();
@@ -673,6 +683,7 @@ std::optional<gfx::ConvertedTexture> rebuild_mip_chain(const gfx::ConvertedTextu
       .width = last.width,
       .height = last.height,
       .level = {last.data.data(), last.data.size()},
+      .filter = filter,
   });
   const auto micros =
       std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
@@ -719,6 +730,7 @@ std::optional<gfx::ConvertedTexture> rebuild_mip_chain(const gfx::ConvertedTextu
 #else
   static_cast<void>(base);
   static_cast<void>(kept);
+  static_cast<void>(filter);
   static_cast<void>(report);
   return std::nullopt;
 #endif
@@ -834,13 +846,14 @@ std::optional<gfx::ConvertedTexture> load_encoded_replacement(Source&& src, MipP
   }
   report.verdict = verdict;
   report.keptLevels = level_count_u8(keptLevels);
-  const bool repairableChain = chain_repairable(base->format, more.empty() ? *base : more.back(), src.name());
+  const bool repairableChain =
+      chain_repairable(base->format, more.empty() ? *base : more.back(), src.name(), role.has_value());
   report.repairable = (verdict == ChainVerdict::Clamped || verdict == ChainVerdict::Invalid) && repairableChain;
   report.generatable = (verdict == ChainVerdict::Mipless || verdict == ChainVerdict::Short) &&
                        policy.generationAllowed && repairableChain;
   const bool repair = policy.repair && report.repairable;
   if (repair || (policy.generate && report.generatable)) {
-    if (auto rebuilt = rebuild_mip_chain(*base, more, report); rebuilt.has_value()) {
+    if (auto rebuilt = rebuild_mip_chain(*base, more, policy.filter, report); rebuilt.has_value()) {
       if (repair) {
         report.repaired = true;
         Log.debug("texture_replacement: rebuilt {} mips for {} in {} us", report.generatedLevels, src.name(),
@@ -2488,8 +2501,23 @@ bool has_companions() noexcept {
 
 bool synchronous_loads() noexcept { return s_synchronousLoads.load(std::memory_order_relaxed); }
 
+namespace {
+render::material::MipFilter companion_mip_filter(CompanionRole role) noexcept {
+  switch (role) {
+  case CompanionRole::Orm:
+    return render::material::MipFilter::Linear;
+  case CompanionRole::Mat:
+    return render::material::MipFilter::MatNormal;
+  case CompanionRole::Nrm:
+    return render::material::MipFilter::NormalRg;
+  default:
+    return render::material::MipFilter::Colour;
+  }
+}
+} // namespace
+
 std::optional<ConvertedTexture> load_companion(CompanionRole role, const std::filesystem::path& path,
-                                               CompanionLoadError* error) noexcept {
+                                               CompanionLoadError* error, ChainReport* chain) noexcept {
   const auto fail = [error](CompanionLoadError reason) noexcept -> std::optional<ConvertedTexture> {
     if (error != nullptr) {
       *error = reason;
@@ -2504,8 +2532,12 @@ std::optional<ConvertedTexture> load_companion(CompanionRole role, const std::fi
   }
   ChainReport report;
   bool rejected = false;
-  auto texture =
-      load_encoded_replacement(CompanionFileSource{.path = path}, MipPolicy{.repair = false}, report, role, &rejected);
+  auto texture = load_encoded_replacement(CompanionFileSource{.path = path},
+                                          MipPolicy{.repair = true, .filter = companion_mip_filter(role)}, report, role,
+                                          &rejected);
+  if (chain != nullptr) {
+    *chain = report;
+  }
   if (!texture.has_value()) {
     return fail(rejected ? CompanionLoadError::Format : CompanionLoadError::Failed);
   }

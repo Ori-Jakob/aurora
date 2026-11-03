@@ -2292,34 +2292,135 @@ TEST_F(CompanionLoadTest, AlbedoCompanionIsSrgbOthersLinear) {
   static_assert(companion_storage_format(CompanionRole::Albedo, Format::BC4RUnorm) == Format::BC4RUnorm);
 }
 
-TEST_F(CompanionLoadTest, CompanionChainsTruncateNotRepair) {
-  set_mip_repair(true);
-  const auto level0 = test_pixels(16, 16, 1);
-  const auto level1 = test_pixels(8, 8, 2);
-  const auto level2 = test_pixels(8, 8, 3);
-  const auto companion = write_bytes(stem_a(".mat.dds"), rgba8_dds(16, 16, level0));
-  write_bytes(stem_a("_mip1.mat.dds"), rgba8_dds(8, 8, level1));
-  write_bytes(stem_a("_mip2.mat.dds"), rgba8_dds(8, 8, level2));
-  write_bytes(stem_a("_mip3.mat.dds"), rgba8_dds(8, 8, level2));
-  const auto base = write_bytes("tex1_16x16_000000000000e002_6.dds", rgba8_dds(16, 16, level0));
-  write_bytes("tex1_16x16_000000000000e002_6_mip1.dds", rgba8_dds(8, 8, level1));
-  write_bytes("tex1_16x16_000000000000e002_6_mip2.dds", rgba8_dds(8, 8, level2));
-  write_bytes("tex1_16x16_000000000000e002_6_mip3.dds", rgba8_dds(8, 8, level2));
+TEST_F(TextureReplacementStreaming, CompanionChainsRepairByRole) {
+  const BcCapsGuard caps{true};
+  set_mip_repair(false);
+  const auto clamped_chain = [this](const std::string& stem, std::string_view suffix,
+                                    const std::array<std::vector<uint8_t>, 3>& files) {
+    for (size_t level = 0; level < files.size(); ++level) {
+      const auto name = level == 0 ? fmt::format("{}{}", stem, suffix) : fmt::format("{}_mip{}{}", stem, level, suffix);
+      write_file(name, {reinterpret_cast<const char*>(files[level].data()), files[level].size()});
+    }
+    return m_root / fmt::format("{}{}", stem, suffix);
+  };
+  const auto block_chain = [](uint32_t code, Format format) {
+    return std::array{make_dds(code, format, 16, 16, 1, 1), make_dds(code, format, 8, 8, 1, 2),
+                      make_dds(code, format, 8, 8, 1, 3)};
+  };
+  const uint32_t full = mip_repair_built() ? 5u : 2u;
+  const std::string stem{StemA};
 
-  const auto loaded = load_companion(CompanionRole::Mat, companion);
-  ASSERT_TRUE(loaded.has_value());
-  EXPECT_EQ(loaded->format, Format::RGBA8Unorm);
-  EXPECT_EQ(loaded->mips, 2u);
-  EXPECT_TRUE(holds_bytes(*loaded, joined({&level0, &level1})));
+  const auto bc7 = block_chain(98, Format::BC7RGBAUnorm);
+  const auto base = clamped_chain("tex1_16x16_000000000000e002_6", ".dds", bc7);
+  const auto truncatedBase = testing::load_replacement_file(base, false);
+  ASSERT_TRUE(truncatedBase.has_value());
+  EXPECT_EQ(truncatedBase->mips, 2u);
+  EXPECT_TRUE(holds_bytes(*truncatedBase, payload({&bc7[0], &bc7[1]})));
+  const auto colourBase = testing::load_replacement_file(base, true);
+  ASSERT_TRUE(colourBase.has_value());
 
-  ChainReport report;
-  const auto repaired = testing::load_replacement_file(base, true, &report);
-  ASSERT_TRUE(repaired.has_value());
-  EXPECT_EQ(report.verdict, ChainVerdict::Clamped);
-  if (mip_repair_built()) {
-    EXPECT_TRUE(report.repaired);
-    EXPECT_EQ(repaired->mips, 5u);
+  const auto bytes_of = [](const ConvertedTexture& texture) {
+    return std::vector<uint8_t>(texture.data.data(), texture.data.data() + texture.data.size());
+  };
+  std::array<std::optional<ConvertedTexture>, CompanionRoleCount> loaded;
+  std::array<ChainReport, CompanionRoleCount> chains;
+  const auto load = [&](CompanionRole role, const std::filesystem::path& path) {
+    const auto index = static_cast<size_t>(role);
+    loaded[index] = load_companion(role, path, nullptr, &chains[index]);
+    ASSERT_TRUE(loaded[index].has_value()) << companion_role_name(role);
+    EXPECT_EQ(chains[index].verdict, ChainVerdict::Clamped) << companion_role_name(role);
+  };
+  for (const auto role : {CompanionRole::Albedo, CompanionRole::Emit, CompanionRole::Orm}) {
+    ASSERT_NO_FATAL_FAILURE(load(role, clamped_chain(stem, fmt::format(".{}.dds", companion_role_name(role)), bc7)));
+    const auto& texture = *loaded[static_cast<size_t>(role)];
+    EXPECT_EQ(texture.mips, full) << companion_role_name(role);
+    EXPECT_EQ(chains[static_cast<size_t>(role)].repaired, mip_repair_built()) << companion_role_name(role);
+    const auto kept = payload({&bc7[0], &bc7[1]});
+    EXPECT_TRUE(std::equal(kept.begin(), kept.end(), texture.data.data())) << companion_role_name(role);
   }
+  const auto& albedo = *loaded[static_cast<size_t>(CompanionRole::Albedo)];
+  EXPECT_EQ(bytes_of(albedo), bytes_of(*colourBase));
+  EXPECT_EQ(bytes_of(*loaded[static_cast<size_t>(CompanionRole::Emit)]), bytes_of(albedo));
+  if (mip_repair_built()) {
+    EXPECT_NE(bytes_of(*loaded[static_cast<size_t>(CompanionRole::Orm)]), bytes_of(albedo));
+  }
+
+  std::vector<uint8_t> normals(8 * 8 * 4);
+  for (uint32_t i = 0; i < 64; ++i) {
+    const bool odd = ((i % 8 + i / 8) & 1) != 0;
+    normals[i * 4 + 0] = odd ? 10 : 250;
+    normals[i * 4 + 1] = odd ? 204 : 128;
+    normals[i * 4 + 2] = 90;
+    normals[i * 4 + 3] = odd ? 128 : 204;
+  }
+  ASSERT_NO_FATAL_FAILURE(load(
+      CompanionRole::Mat,
+      clamped_chain(stem, ".mat.dds",
+                    {rgba8_dds(16, 16, test_pixels(16, 16, 1)), rgba8_dds(8, 8, normals), rgba8_dds(8, 8, normals)})));
+  const auto& mat = *loaded[static_cast<size_t>(CompanionRole::Mat)];
+  EXPECT_EQ(mat.mips, full);
+  if (mip_repair_built()) {
+    const size_t offset = calc_texture_size(mat.format, 16, 16, 2);
+    for (uint32_t i = 0; i < 16; ++i) {
+      SCOPED_TRACE(i);
+      // Unit vectors average to 170 on both axes, where a box over the codes gives 166
+      EXPECT_NEAR(mat.data.data()[offset + i * 4 + 3], 170, 1);
+      EXPECT_NEAR(mat.data.data()[offset + i * 4 + 1], 170, 1);
+      EXPECT_NEAR(mat.data.data()[offset + i * 4 + 0], 130, 1);
+      EXPECT_EQ(mat.data.data()[offset + i * 4 + 2], 90);
+    }
+  }
+
+  ASSERT_NO_FATAL_FAILURE(
+      load(CompanionRole::Nrm, clamped_chain(stem, ".nrm.dds", block_chain(83, Format::BC5RGUnorm))));
+  ASSERT_NO_FATAL_FAILURE(
+      load(CompanionRole::Delight, clamped_chain(stem, ".delight.dds", block_chain(80, Format::BC4RUnorm))));
+  for (const auto role : {CompanionRole::Nrm, CompanionRole::Delight}) {
+    EXPECT_EQ(loaded[static_cast<size_t>(role)]->mips, 2u) << companion_role_name(role);
+    EXPECT_FALSE(chains[static_cast<size_t>(role)].repairable) << companion_role_name(role);
+  }
+
+  ChainReport arb;
+  const auto arbitrary =
+      load_companion(CompanionRole::Orm, clamped_chain(stem + "_arb", ".orm.dds", bc7), nullptr, &arb);
+  ASSERT_TRUE(arbitrary.has_value());
+  EXPECT_EQ(arbitrary->mips, 2u);
+  EXPECT_FALSE(arb.repairable);
+}
+
+TEST_F(CompanionLoadTest, CompanionStatsCountRepairsByRole) {
+  set_synchronous_loads(true);
+  struct Chain {
+    std::string_view role;
+    uint32_t code;
+    Format format;
+  };
+  for (const auto& [role, code, format] :
+       {Chain{"albedo", 98, Format::BC7RGBAUnorm}, Chain{"mat", 98, Format::BC7RGBAUnorm},
+        Chain{"orm", 98, Format::BC7RGBAUnorm}, Chain{"nrm", 83, Format::BC5RGUnorm}}) {
+    write_bytes(stem_a(fmt::format(".{}.dds", role)), make_dds(code, format, 16, 16, 1, 1));
+    write_bytes(stem_a(fmt::format("_mip1.{}.dds", role)), make_dds(code, format, 8, 8, 1, 2));
+    write_bytes(stem_a(fmt::format("_mip2.{}.dds", role)), make_dds(code, format, 8, 8, 1, 3));
+  }
+  const auto group = texture::load_replacement_directory(m_root);
+  const auto set = companion_set(KeyA);
+  ASSERT_NE(set.id, 0u);
+
+  std::array<WGPUTextureView, companion_cache::ViewSlotCount> views{};
+  const auto first = static_cast<uint8_t>(view_bit(CompanionRole::Albedo) | view_bit(CompanionRole::Mat) |
+                                          view_bit(CompanionRole::Orm));
+  EXPECT_EQ(companion_cache::views(set.id, first, views), first);
+  EXPECT_EQ(companion_cache::views(set.id, view_bit(CompanionRole::Nrm), views), view_bit(CompanionRole::Nrm));
+  const auto stats = companion_cache::testing::stats();
+  EXPECT_EQ(stats.loaded, 4u);
+  const uint64_t repaired = mip_repair_built() ? 1 : 0;
+  EXPECT_EQ(stats.repaired, 3 * repaired);
+  EXPECT_EQ(stats.repairedColour, repaired);
+  EXPECT_EQ(stats.repairedMat, repaired);
+  EXPECT_EQ(stats.repairedOrm, repaired);
+  EXPECT_EQ(stats.repairedNrm, 0u);
+  EXPECT_EQ(stats.truncated, 4 - 3 * repaired);
+  texture::unregister_replacements(group);
 }
 
 TEST_F(CompanionLoadTest, CompanionSetEmptyUnderBypassAndDropsOnGeneration) {

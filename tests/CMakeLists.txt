@@ -237,7 +237,8 @@ if (AURORA_ENABLE_GX)
     gtest_main
   )
   if (AURORA_ENABLE_RENDER)
-    target_sources(material_contract_tests PRIVATE material_registry_test.cpp material_user_layer_test.cpp)
+    target_sources(material_contract_tests PRIVATE material_mip_repair_test.cpp material_registry_test.cpp
+      material_user_layer_test.cpp)
     target_link_libraries(material_contract_tests PRIVATE yyjson::yyjson)
   endif ()
   aurora_copy_runtime_dlls(material_contract_tests)

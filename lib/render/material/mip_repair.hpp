@@ -8,11 +8,15 @@
 #include <optional>
 
 namespace aurora::render::material {
+// A box over packed x/y codes is not the mean direction, so the normal filters average unit vectors
+enum class MipFilter : uint8_t { Colour, Linear, MatNormal, NormalRg };
+
 struct MipTailRequest {
   wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
   // the last standard level, kept verbatim by the caller
   uint32_t width = 0, height = 0;
   ArrayRef<uint8_t> level;
+  MipFilter filter = MipFilter::Colour;
 };
 
 // covers the GZ2 maximum of 7,225,344
