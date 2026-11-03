@@ -5,6 +5,7 @@
 
 #include "gfx/resources.hpp"
 #include "gx/hints.hpp"
+#include "gx/surface_pack.hpp"
 #include "render/ao/ao.hpp"
 #include "render/ao/upsample.hpp"
 #include "render/debug/views.hpp"
@@ -24,6 +25,7 @@
 #include "render/shaders.hpp"
 #include "render/stage.hpp"
 #include "render/stage_data.hpp"
+#include "webgpu/caps.hpp"
 #include "webgpu/gpu.hpp"
 
 #include <algorithm>
@@ -78,6 +80,14 @@ std::shared_ptr<const SceneHints> camera_hints(bool camera = true) {
 Settings ao_settings(Quality quality = Quality::High) {
   Settings settings;
   settings.ao = quality;
+  return settings;
+}
+
+Settings pbr_settings(float legacyBlend, Quality ao = Quality::Off) {
+  Settings settings;
+  settings.ao = ao;
+  settings.pbr = true;
+  settings.legacyBlend = legacyBlend;
   return settings;
 }
 
@@ -168,9 +178,14 @@ bool pass_enabled(const CompiledGraph& graph, const StageData& stage, std::strin
 
 TEST(CompositeRules, ParamsAreSixteenBytes) {
   EXPECT_EQ(sizeof(composite::Params), 16u);
+  EXPECT_EQ(offsetof(composite::Params, legacyBlend), 4u);
   EXPECT_LE(sizeof(composite::Params), MaxPassParamsSize);
   EXPECT_EQ(composite::FlagIdentity, 1u);
   EXPECT_EQ(composite::FlagNoFog, 2u);
+  EXPECT_EQ(composite::FlagPbr, 4u);
+  const composite::Params params;
+  EXPECT_EQ(params.flags, 0u);
+  EXPECT_EQ(params.legacyBlend, 0.f);
 }
 
 TEST(CompositeRules, TargetIsRgbOnlyInEfbFormat) {
@@ -187,12 +202,19 @@ TEST(CompositeRules, TargetIsRgbOnlyInEfbFormat) {
   }
 }
 
-TEST(CompositeRules, WantedFollowsAoOnly) {
+TEST(CompositeRules, WantedFollowsAoOrPbr) {
   EXPECT_FALSE(composite::wanted(Settings{}));
   EXPECT_FALSE(composite::wanted({.taa = true}));
   EXPECT_FALSE(composite::wanted({.upscaler = Upscaler::Fsr}));
+  EXPECT_FALSE(composite::ao_wanted(Settings{}));
   for (const Quality quality : {Quality::Low, Quality::Medium, Quality::High, Quality::Ultra}) {
     EXPECT_TRUE(composite::wanted(ao_settings(quality)));
+    EXPECT_TRUE(composite::ao_wanted(ao_settings(quality)));
+    EXPECT_TRUE(composite::ao_wanted(pbr_settings(0.f, quality)));
+  }
+  for (const float lb : {0.f, 0.5f, 1.f}) {
+    EXPECT_TRUE(composite::wanted(pbr_settings(lb)));
+    EXPECT_FALSE(composite::ao_wanted(pbr_settings(lb)));
   }
 }
 
@@ -226,6 +248,7 @@ TEST(CompositeRules, InputTableIsAppendOnly) {
   EXPECT_EQ(composite::BindFog, 1u);
   EXPECT_EQ(composite::BindNormal, 2u);
   EXPECT_EQ(composite::BindAo, 3u);
+  EXPECT_EQ(composite::BindSurface, 4u);
   EXPECT_EQ(composite::LegacyTex, "legacyTex");
   EXPECT_EQ(composite::CopyPass, "legacy.copy");
   EXPECT_EQ(composite::Pass, "composite.main");
@@ -300,6 +323,101 @@ TEST(CompositeRules, MirrorBoundOnFoggedInputs) {
   EXPECT_NE(composite::testing::legacy_ao(legacy, std::array<float, 3>{}, 0, 0.25f, 1.f), legacy);
 }
 
+TEST(CompositeRules, PbrActiveTruthTable) {
+  const bool identity = composite::identity_forced();
+  for (const bool pbr : {false, true}) {
+    for (const float lb : {0.f, 0.5f, 0.999f, 1.f}) {
+      Settings settings;
+      settings.pbr = pbr;
+      settings.legacyBlend = lb;
+      EXPECT_EQ(composite::pbr_term_wanted(settings), pbr && lb < 1.f && !identity) << lb;
+      for (const bool live : {false, true}) {
+        for (const bool surfaceLive : {false, true}) {
+          for (const bool classView : {false, true}) {
+            const bool want = live && surfaceLive && pbr && lb < 1.f && !identity && !classView;
+            EXPECT_EQ(composite::testing::pbr_active_for(live, surfaceLive, classView, settings), want)
+                << pbr << " " << lb << " " << live << surfaceLive << classView;
+          }
+        }
+      }
+    }
+  }
+}
+
+struct MirrorInput {
+  std::array<float, 3> l{};
+  std::array<float, 3> fc{};
+  uint32_t q7 = 0;
+  float ao = 1.f;
+  float alpha = 1.f;
+  std::array<uint8_t, 3> albedo{};
+};
+
+MirrorInput random_input(std::mt19937& rng, int i) {
+  std::uniform_int_distribution<int> byte(0, 255);
+  constexpr std::array<float, 4> Alphas{0.f, 1.f / 3.f, 2.f / 3.f, 1.f};
+  const auto b = [&] { return static_cast<uint8_t>(byte(rng)); };
+  MirrorInput in;
+  for (size_t c = 0; c < 3; ++c) {
+    in.l[c] = b() / 255.f;
+    in.fc[c] = b() / 255.f;
+    in.albedo[c] = b();
+  }
+  in.q7 = static_cast<uint32_t>(byte(rng) % 128);
+  in.ao = b() / 255.f;
+  in.alpha = Alphas[static_cast<size_t>(i) % Alphas.size()];
+  return in;
+}
+
+TEST(CompositeRules, PbrMirrorBlendOneIsLegacyBits) {
+  std::mt19937 rng{0xB1E7u};
+  for (int i = 0; i < 4000; ++i) {
+    const MirrorInput in = random_input(rng, i);
+    const std::array<float, 3> legacy = composite::testing::legacy_ao(in.l, in.fc, in.q7, in.ao, in.alpha);
+    const auto cls = static_cast<uint32_t>(1 + i % 254);
+    ASSERT_EQ(composite::testing::legacy_pbr(in.l, in.fc, in.q7, in.ao, in.alpha, in.albedo, cls, 1.f), legacy) << i;
+    const float lb = static_cast<float>(i % 3) / 2.f;
+    ASSERT_EQ(composite::testing::legacy_pbr(in.l, in.fc, in.q7, in.ao, in.alpha, in.albedo, 0, lb), legacy) << i;
+  }
+}
+
+TEST(CompositeRules, PbrMirrorBlendZeroIsFoggedAlbedo) {
+  std::mt19937 rng{0xA1BEu};
+  size_t fogged = 0;
+  size_t bad = 0;
+  for (int i = 0; i < 4000; ++i) {
+    const MirrorInput in = random_input(rng, i);
+    const std::array<float, 3> out =
+        composite::testing::legacy_pbr(in.l, in.fc, in.q7, in.ao, in.alpha, in.albedo, 1, 0.f);
+    const float q = static_cast<float>(in.q7) / 127.f;
+    const bool receiver = in.alpha > 0.f;
+    const float a = receiver && in.ao < 1.f ? in.ao : 1.f;
+    bool guard = false;
+    for (size_t c = 0; c < 3; ++c) {
+      guard |= in.l[c] - q * in.fc[c] < -2.f / 255.f;
+    }
+    if (guard) {
+      ASSERT_EQ(out, in.l) << i;
+      ++bad;
+      continue;
+    }
+    bool all = true;
+    for (size_t c = 0; c < 3; ++c) {
+      const float s = in.l[c] - q * in.fc[c];
+      const float base = (1.f - q) * std::clamp(in.albedo[c] / 255.f * a, 0.f, 1.f);
+      ASSERT_NEAR(out[c], in.l[c] - std::max(s, 0.f) + base, 1e-5f) << i;
+      if (s >= 0.f) {
+        ASSERT_NEAR(out[c], q * in.fc[c] + base, 1e-5f) << i;
+      } else {
+        all = false;
+      }
+    }
+    fogged += all ? 1 : 0;
+  }
+  EXPECT_GT(fogged, 1000u);
+  EXPECT_GT(bad, 0u);
+}
+
 class CompositeDeviceTest : public ::testing::Test {
 protected:
   bool open(const test::TestDeviceOptions& options) {
@@ -372,11 +490,33 @@ protected:
     ASSERT_TRUE(webgpu::set_gbuffer(true));
   }
 
+  static bool use_pbr_tier() {
+    render::Caps c = render::caps();
+    c.limits.maxColorAttachmentBytesPerSample = 128;
+    webgpu::set_caps(c);
+    return webgpu::set_scene_tier(webgpu::SceneTier::Pbr);
+  }
+
+  static composite::Params latched_params(const CompiledGraph& graph) {
+    composite::Params params;
+    const std::span<const std::byte> bytes = latched_pass_params(graph.nodes[graph.find_node(composite::Pass)].id);
+    EXPECT_EQ(bytes.size(), sizeof(params));
+    std::memcpy(&params, bytes.data(), std::min(bytes.size(), sizeof(params)));
+    return params;
+  }
+
+  static bool same_params(const composite::Params& a, const composite::Params& b) {
+    return std::memcmp(&a, &b, sizeof(a)) == 0;
+  }
+
   [[nodiscard]] std::shared_ptr<CompiledGraph> compile(const Settings& settings) {
     m_settings = settings;
     m_env = gather_graph_environment();
     if (m_sceneSize) {
       m_env.sceneSize = *m_sceneSize;
+    }
+    if (m_envEdit) {
+      m_envEdit(m_env);
     }
     std::shared_ptr<CompiledGraph> graph =
         compile_graph(m_settings, caps(), m_env, {.sceneDepthSource = DepthSource::Direct});
@@ -474,6 +614,7 @@ protected:
   Settings m_settings;
   GraphEnvironment m_env;
   std::optional<GraphExtent> m_sceneSize;
+  std::function<void(GraphEnvironment&)> m_envEdit;
   std::shared_ptr<const SceneHints> m_hints;
   wgpu::Texture m_depth;
 };
@@ -514,25 +655,30 @@ protected:
     EXPECT_EQ(composite::testing::counters().copies, 0u);
   }
 
-  void encode_sizes() {
+  void encode_sizes(bool pbr = false) {
     for (const auto [width, height] :
          {std::pair{1u, 1u}, std::pair{61u, 37u}, std::pair{1280u, 720u}, std::pair{4779u, 9u}}) {
       SCOPED_TRACE(std::to_string(width) + "x" + std::to_string(height));
       ASSERT_NO_FATAL_FAILURE(use_globals({width, height, 1}));
       make_depth();
+      if (pbr) {
+        ASSERT_TRUE(use_pbr_tier());
+      }
       for (const uint32_t flags : {0u, uint32_t{composite::FlagIdentity}, uint32_t{composite::FlagNoFog}}) {
         composite::testing::reset();
         composite::testing::set_camera_override(m_hints);
         composite::testing::set_flags(flags);
         StubAo stub;
         const PassId stubId = register_pass(stub_ao_desc(stub));
-        const auto graph = live_graph(ao_settings());
+        const auto graph = live_graph(pbr ? pbr_settings(0.f, Quality::High) : ao_settings());
         ASSERT_TRUE(composite::live());
+        EXPECT_EQ(composite::surface_bound(*graph), pbr);
         const FrameState state{.graph = graph};
         EXPECT_EQ(run(state, 1), std::nullopt);
         EXPECT_EQ(run(state, 2), std::nullopt);
         EXPECT_EQ(composite::testing::counters().copies, 2u);
         EXPECT_EQ(composite::testing::counters().draws, 2u);
+        EXPECT_EQ(composite::testing::counters().pbrDraws, pbr && !composite::identity_forced() ? 2u : 0u);
         EXPECT_EQ(composite::testing::counters().skippedMismatch, 0u);
         EXPECT_EQ(stub.calls, 2);
         unregister_pass(stubId);
@@ -618,25 +764,263 @@ TEST_F(CompositeGraph, OrderCopyAoComposite) {
   EXPECT_EQ(graph->nodes[graph->find_node(composite::CopyPass)].order, 0u);
 }
 
-TEST_F(CompositeGraph, BindingOrderLegacyFogNormalAo) {
+TEST_F(CompositeGraph, BindingOrderLegacyFogNormalAoSurface) {
   StubAo stub;
   register_pass(stub_ao_desc(stub));
   const auto graph = compile(ao_settings());
   const NodeId node = graph->find_node(composite::Pass);
   ASSERT_EQ(graph->nodes[node].status, CullReason::None);
   const auto uses = graph->node_uses(node);
-  ASSERT_EQ(uses.size(), 5u);
-  const std::array<std::string_view, 5> names{composite::LegacyTex, resource::Fog, resource::GxNormal,
-                                              resource::AoFinal, resource::GxColor};
+  ASSERT_EQ(uses.size(), 6u);
+  const std::array<std::string_view, 6> names{composite::LegacyTex, resource::Fog,     resource::GxNormal,
+                                              resource::AoFinal,    resource::Surface, resource::GxColor};
   for (size_t i = 0; i < names.size(); ++i) {
     EXPECT_EQ(graph->resources[uses[i].resource].name, names[i]) << i;
-    EXPECT_EQ(uses[i].access, i < 4 ? Access::Sampled : Access::ColorRMW) << i;
+    EXPECT_EQ(uses[i].access, i < 5 ? Access::Sampled : Access::ColorRMW) << i;
     if (i < 4) {
       EXPECT_EQ(uses[i].missing, Missing::DisablePass) << i;
     }
   }
   EXPECT_EQ(uses[composite::BindFog].options.sampleType, wgpu::TextureSampleType::Uint);
+  EXPECT_EQ(uses[composite::BindSurface].missing, Missing::BindDummyBlack);
+  EXPECT_EQ(uses[composite::BindSurface].options.sampleType, wgpu::TextureSampleType::Uint);
   EXPECT_EQ(graph->nodes[node].paramsSize, sizeof(composite::Params));
+}
+
+TEST_F(CompositeGraph, SurfaceBindsBlackDummyUnderTierB) {
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  const auto base = compile(ao_settings());
+  const NodeId node = base->find_node(composite::Pass);
+  ASSERT_EQ(base->nodes[node].status, CullReason::None);
+  EXPECT_TRUE(base->node_uses(node)[composite::BindSurface].staticDummy);
+  EXPECT_FALSE(composite::surface_bound(*base));
+  EXPECT_TRUE(composite::ao_produced(*base));
+  EXPECT_EQ(composite::check_contract(*base), std::nullopt);
+  ASSERT_TRUE(use_pbr_tier());
+  const auto pbr = compile(ao_settings());
+  const NodeId pbrNode = pbr->find_node(composite::Pass);
+  ASSERT_EQ(pbr->nodes[pbrNode].status, CullReason::None);
+  EXPECT_FALSE(pbr->node_uses(pbrNode)[composite::BindSurface].staticDummy);
+  EXPECT_TRUE(composite::surface_bound(*pbr));
+  EXPECT_EQ(composite::check_contract(*pbr), std::nullopt);
+  EXPECT_EQ(base->bindingPlans[node].layoutHash, pbr->bindingPlans[pbrNode].layoutHash);
+}
+
+TEST_F(CompositeGraph, PbrOffKeepsAoDisablePass) {
+  ASSERT_TRUE(use_pbr_tier());
+  const auto missing = compile(ao_settings());
+  EXPECT_NE(missing->nodes[missing->find_node(composite::Pass)].status, CullReason::None);
+  EXPECT_NE(missing->nodes[missing->find_node(composite::CopyPass)].status, CullReason::None);
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  const auto graph = live_graph(ao_settings());
+  const NodeId node = graph->find_node(composite::Pass);
+  EXPECT_EQ(graph->node_uses(node)[composite::BindAo].missing, Missing::DisablePass);
+  EXPECT_TRUE(composite::ao_produced(*graph));
+  EXPECT_TRUE(composite::surface_bound(*graph));
+  EXPECT_FALSE(composite::pbr_active());
+  EXPECT_EQ(latched_params(*graph).flags & composite::FlagPbr, 0u);
+  const FrameState state{.graph = graph};
+  expect_ran(*graph, build(state, 1), true);
+  stub.enabled = false;
+  expect_ran(*graph, build(state, 2), false);
+}
+
+TEST_F(CompositeGraph, PbrDeclaresWhiteAoDummy) {
+  ASSERT_TRUE(use_pbr_tier());
+  const auto graph = live_graph(pbr_settings(0.f));
+  const NodeId node = graph->find_node(composite::Pass);
+  ASSERT_EQ(graph->nodes[node].status, CullReason::None);
+  ASSERT_EQ(graph->nodes[graph->find_node(composite::CopyPass)].status, CullReason::None);
+  const CompiledUse& ao = graph->node_uses(node)[composite::BindAo];
+  EXPECT_EQ(ao.missing, Missing::BindDummyWhite);
+  EXPECT_TRUE(ao.staticDummy);
+  EXPECT_FALSE(composite::ao_produced(*graph));
+  EXPECT_TRUE(composite::surface_bound(*graph));
+  EXPECT_EQ(composite::check_contract(*graph), std::nullopt);
+  EXPECT_TRUE(composite::live());
+  EXPECT_TRUE(composite::ready(m_settings));
+  if (!composite::identity_forced()) {
+    EXPECT_TRUE(composite::pbr_active());
+    const composite::Params params = latched_params(*graph);
+    EXPECT_EQ(params.flags & composite::FlagPbr, composite::FlagPbr);
+    EXPECT_EQ(params.legacyBlend, 0.f);
+    const FrameState state{.graph = graph};
+    expect_ran(*graph, build(state, 1), true);
+  }
+  ASSERT_TRUE(webgpu::set_scene_tier(webgpu::SceneTier::Base));
+  const auto base = compile(pbr_settings(0.f));
+  EXPECT_NE(base->nodes[base->find_node(composite::Pass)].status, CullReason::None);
+}
+
+TEST_F(CompositeGraph, PbrWithoutAoProducerKeepsGameShadows) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  ASSERT_TRUE(use_pbr_tier());
+  const auto graph = live_graph(pbr_settings(0.f, Quality::High));
+  EXPECT_TRUE(composite::live());
+  EXPECT_TRUE(composite::ready(m_settings));
+  EXPECT_TRUE(composite::pbr_active());
+  EXPECT_FALSE(composite::ao_produced(*graph));
+  EXPECT_FALSE(composite::ao_gate(FrameState{.settings = m_settings, .graph = graph}));
+  EXPECT_FALSE(composite::ao_ready(m_settings));
+  EXPECT_TRUE(composite::ao_ready(pbr_settings(0.f)));
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  const auto withAo = live_graph(pbr_settings(0.f, Quality::High));
+  EXPECT_TRUE(composite::ao_produced(*withAo));
+  EXPECT_TRUE(composite::ao_gate(FrameState{.settings = m_settings, .graph = withAo}));
+  EXPECT_TRUE(composite::ao_ready(m_settings));
+}
+
+TEST_F(CompositeGraph, BlendOneWithoutAoRunsNothing) {
+  ASSERT_TRUE(use_pbr_tier());
+  const auto graph = live_graph(pbr_settings(1.f));
+  ASSERT_TRUE(composite::live());
+  EXPECT_FALSE(composite::pbr_active());
+  const composite::Params params = latched_params(*graph);
+  EXPECT_EQ(params.flags & composite::FlagPbr, 0u);
+  EXPECT_EQ(params.legacyBlend, 0.f);
+  const FrameState state{.graph = graph};
+  const StageData opaque = build(state, 1);
+  expect_ran(*graph, opaque, false);
+  EXPECT_FALSE(composite::enabled_this_frame(1));
+  EXPECT_FALSE(composite::pbr_applied(opaque));
+  EXPECT_EQ(composite::testing::counters().idleFrames, 1u);
+  EXPECT_EQ(run(state, 2), std::nullopt);
+  EXPECT_EQ(composite::testing::counters().copies, 0u);
+  EXPECT_EQ(composite::testing::counters().draws, 0u);
+  EXPECT_EQ(composite::testing::counters().idleFrames, 2u);
+}
+
+TEST_F(CompositeGraph, PbrParamsMatchPbrOffWhenInactive) {
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  const auto off = live_graph(ao_settings());
+  const composite::Params offParams = latched_params(*off);
+  ASSERT_TRUE(use_pbr_tier());
+  const auto on = live_graph(pbr_settings(1.f, Quality::High));
+  EXPECT_FALSE(composite::pbr_active());
+  EXPECT_TRUE(same_params(latched_params(*on), offParams));
+  m_settings.legacyBlend = 0.f;
+  m_settings.debugView = 1;
+  latch(on.get());
+  EXPECT_FALSE(composite::pbr_active());
+  EXPECT_TRUE(same_params(latched_params(*on), offParams));
+  m_settings.debugView = 0;
+  latch(on.get());
+  if (!composite::identity_forced()) {
+    EXPECT_TRUE(composite::pbr_active());
+    EXPECT_FALSE(same_params(latched_params(*on), offParams));
+  }
+  m_settings.legacyBlend = 1.f;
+  latch(on.get());
+  EXPECT_TRUE(same_params(latched_params(*on), offParams));
+}
+
+TEST_F(CompositeGraph, BlendChangeKeepsGraphHash) {
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  ASSERT_TRUE(use_pbr_tier());
+  const auto first = live_graph(pbr_settings(1.f, Quality::High));
+  const NodeId node = first->find_node(composite::Pass);
+  const shaders::PipelineStats before = shaders::stats();
+  for (const float lb : {0.5f, 0.f, 1.f}) {
+    const auto graph = live_graph(pbr_settings(lb, Quality::High));
+    EXPECT_EQ(graph->graphHash, first->graphHash) << lb;
+    EXPECT_EQ(graph->nodes[graph->find_node(composite::Pass)].pipelineIds, first->nodes[node].pipelineIds) << lb;
+    const shaders::PipelineStats now = shaders::stats();
+    EXPECT_EQ(now.ready + now.pending + now.failed, before.ready + before.pending + before.failed) << lb;
+    EXPECT_EQ(composite::pbr_active(), lb < 1.f && !composite::identity_forced()) << lb;
+  }
+}
+
+TEST_F(CompositeGraph, SurfaceContractMismatchRefuses) {
+  ASSERT_TRUE(use_pbr_tier());
+  m_envEdit = [](GraphEnvironment& env) {
+    env.gxFormats[static_cast<size_t>(GxResource::Surface)] = wgpu::TextureFormat::RGBA16Uint;
+  };
+  const auto graph = live_graph(pbr_settings(0.f));
+  ASSERT_EQ(graph->nodes[graph->find_node(composite::Pass)].status, CullReason::None);
+  const std::optional<std::string> reason = composite::check_contract(*graph);
+  ASSERT_TRUE(reason.has_value());
+  EXPECT_NE(reason->find(resource::Surface), std::string::npos) << *reason;
+  EXPECT_FALSE(composite::live());
+  EXPECT_FALSE(composite::ready(m_settings));
+  EXPECT_FALSE(composite::pbr_active());
+  EXPECT_EQ(composite::testing::counters().contractFailures, 1u);
+  const FrameState state{.graph = graph};
+  expect_ran(*graph, build(state, 1), false);
+}
+
+TEST_F(CompositeGraph, SurfaceFollowsSceneExtent) {
+  ASSERT_TRUE(use_pbr_tier());
+  m_sceneSize = GraphExtent{48, 40};
+  const auto graph = compile(pbr_settings(0.f));
+  const CompiledResource& surface = graph->resources[graph->find_resource(resource::Surface)];
+  EXPECT_EQ(surface.tex.format, wgpu::TextureFormat::RGBA32Uint);
+  EXPECT_EQ(surface.extent.width, 48u);
+  EXPECT_EQ(surface.extent.height, 40u);
+  EXPECT_TRUE(composite::surface_bound(*graph));
+  EXPECT_EQ(composite::check_contract(*graph), std::nullopt);
+}
+
+TEST_F(CompositeGraph, EncodeAcceptsOneTexelDummies) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  ASSERT_TRUE(use_pbr_tier());
+  const auto graph = live_graph(pbr_settings(0.f));
+  const FrameState state{.graph = graph};
+  EXPECT_EQ(run(state, 1), std::nullopt);
+  EXPECT_EQ(composite::testing::counters().draws, 1u);
+  EXPECT_EQ(composite::testing::counters().pbrDraws, 1u);
+  EXPECT_EQ(composite::testing::counters().skippedMismatch, 0u);
+  ASSERT_TRUE(webgpu::set_scene_tier(webgpu::SceneTier::Base));
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  const auto base = live_graph(ao_settings());
+  EXPECT_FALSE(composite::surface_bound(*base));
+  const FrameState baseState{.graph = base};
+  EXPECT_EQ(run(baseState, 2), std::nullopt);
+  EXPECT_EQ(composite::testing::counters().draws, 2u);
+  EXPECT_EQ(composite::testing::counters().pbrDraws, 1u);
+  EXPECT_EQ(composite::testing::counters().skippedMismatch, 0u);
+}
+
+TEST_F(CompositeGraph, PbrAppliedFollowsFinalMask) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  ASSERT_TRUE(use_pbr_tier());
+  const auto graph = live_graph(pbr_settings(0.f));
+  const FrameState state{.graph = graph};
+  uint64_t frame = 1;
+  EXPECT_TRUE(composite::pbr_applied(build(state, frame++)));
+  StageData other = build(state, frame++);
+  other.stage = Stage::PrePost;
+  EXPECT_FALSE(composite::pbr_applied(other));
+  composite::testing::set_camera_override(camera_hints(false));
+  EXPECT_FALSE(composite::pbr_applied(build(state, frame++)));
+  composite::testing::set_camera_override(m_hints);
+  m_settings.debugView = 1;
+  latch(graph.get());
+  EXPECT_FALSE(composite::pbr_applied(build(state, frame++)));
+  m_settings.debugView = 0;
+  m_settings.legacyBlend = 1.f;
+  latch(graph.get());
+  EXPECT_FALSE(composite::pbr_applied(build(state, frame++)));
+  m_settings.legacyBlend = 0.25f;
+  latch(graph.get());
+  EXPECT_TRUE(composite::pbr_applied(build(state, frame++)));
+  composite::testing::force_params(composite::Params{.flags = composite::FlagPbr, .legacyBlend = 1.f});
+  latch(graph.get());
+  EXPECT_TRUE(composite::pbr_applied(build(state, frame++)));
+  composite::testing::force_params(composite::Params{});
+  latch(graph.get());
+  EXPECT_FALSE(composite::pbr_applied(build(state, frame++)));
 }
 
 TEST_F(CompositeGraph, LegacyTexTakesEfbFormat) {
@@ -931,6 +1315,8 @@ TEST_F(CompositeGraph, EnabledThisFrameFalseUnderContractMismatch) {
 
 TEST_F(CompositeGraph, EncodesValidationClean) { encode_sizes(); }
 
+TEST_F(CompositeGraph, PbrEncodesValidationClean) { encode_sizes(true); }
+
 TEST_F(CompositeGraph, EncodesValidationCleanWithProductionToggles) {
   TearDown();
   m_started = false;
@@ -1050,6 +1436,16 @@ struct Pixel {
   std::array<uint8_t, 3> fc{};
   uint8_t q7 = 0;
   uint8_t ao = 255;
+  std::array<uint8_t, 3> albedo{};
+  uint8_t cls = 0;
+};
+
+struct PixelRun {
+  std::optional<uint32_t> flags;
+  Settings settings = ao_settings();
+  bool aoProducer = true;
+  std::optional<composite::Params> params;
+  uint32_t draws = 1;
 };
 
 Pixel control() { return {.color = {200, 180, 160, 255}, .code = 1, .fc = {}, .q7 = 0, .ao = 64}; }
@@ -1072,7 +1468,7 @@ protected:
   }
 
   wgpu::Texture upload(wgpu::TextureFormat format, uint32_t width, uint32_t height, const std::vector<uint32_t>& words,
-                       const char* label) const {
+                       const char* label, uint32_t texelBytes = 4) const {
     const wgpu::TextureDescriptor descriptor{
         .label = label,
         .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding |
@@ -1082,7 +1478,7 @@ protected:
     };
     const wgpu::Texture texture = m_device->device.CreateTexture(&descriptor);
     const wgpu::TexelCopyTextureInfo destination{.texture = texture};
-    const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = width * 4, .rowsPerImage = height};
+    const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = width * texelBytes, .rowsPerImage = height};
     const wgpu::Extent3D size{width, height, 1};
     m_device->queue.WriteTexture(&destination, words.data(), words.size() * 4, &layout, &size);
     return texture;
@@ -1126,11 +1522,22 @@ protected:
 
   std::vector<Rgba> composite_pixels(uint32_t width, uint32_t height, const std::vector<Pixel>& pixels,
                                      std::optional<uint32_t> flags = std::nullopt) {
+    return run_pixels(width, height, pixels, {.flags = flags});
+  }
+
+  std::vector<Rgba> run_pixels(uint32_t width, uint32_t height, const std::vector<Pixel>& pixels,
+                               const PixelRun& options) {
     if (webgpu::g_frameBuffer.size.width != width || webgpu::g_frameBuffer.size.height != height) {
       use_globals({width, height, 1});
       make_depth();
     }
-    composite::testing::set_flags(flags);
+    if (options.settings.pbr) {
+      EXPECT_TRUE(use_pbr_tier());
+    } else {
+      EXPECT_TRUE(webgpu::set_scene_tier(webgpu::SceneTier::Base));
+    }
+    composite::testing::set_flags(options.flags);
+    composite::testing::force_params(options.params);
     std::vector<uint32_t> color(pixels.size());
     std::vector<uint32_t> normal(pixels.size());
     std::vector<uint32_t> fog(pixels.size());
@@ -1148,6 +1555,17 @@ protected:
             wgpu::TextureFormat::RGB10A2Unorm);
     publish(webgpu::g_fogRecordBuffer, upload(wgpu::TextureFormat::RGBA8Uint, width, height, fog, "test fog"),
             wgpu::TextureFormat::RGBA8Uint);
+    if (options.settings.pbr) {
+      std::vector<uint32_t> surface(pixels.size() * 4, 0);
+      for (size_t i = 0; i < pixels.size(); ++i) {
+        const Pixel& p = pixels[i];
+        surface[i * 4] = uint32_t{p.albedo[0]} | uint32_t{p.albedo[1]} << 8 | uint32_t{p.albedo[2]} << 16 | 255u << 24;
+        surface[i * 4 + 1] = 217u | uint32_t{p.cls} << 16;
+      }
+      publish(webgpu::g_surfaceBuffer,
+              upload(wgpu::TextureFormat::RGBA32Uint, width, height, surface, "test surface", 16),
+              wgpu::TextureFormat::RGBA32Uint);
+    }
     StubAo stub;
     stub.rowBytes = (width * 4 + 255) & ~255u;
     std::vector<uint8_t> staged(size_t{stub.rowBytes} * height, 0);
@@ -1160,14 +1578,16 @@ protected:
                                             .size = staged.size()};
     stub.staging = m_device->device.CreateBuffer(&descriptor);
     m_device->queue.WriteBuffer(stub.staging, 0, staged.data(), staged.size());
-    const PassId stubId = register_pass(stub_ao_desc(stub));
+    const PassId stubId = options.aoProducer ? register_pass(stub_ao_desc(stub)) : InvalidPassId;
     const uint32_t draws = composite::testing::counters().draws;
-    const auto graph = live_graph(ao_settings());
+    const auto graph = live_graph(options.settings);
     EXPECT_TRUE(composite::live());
     const FrameState state{.graph = graph};
     EXPECT_EQ(run(state, ++m_frame), std::nullopt);
-    unregister_pass(stubId);
-    EXPECT_EQ(composite::testing::counters().draws, draws + 1);
+    if (stubId != InvalidPassId) {
+      unregister_pass(stubId);
+    }
+    EXPECT_EQ(composite::testing::counters().draws, draws + options.draws);
     EXPECT_EQ(composite::testing::counters().skippedMismatch, 0u);
     return read_color(width, height);
   }
@@ -1179,7 +1599,29 @@ protected:
     return {to_byte(out[0]), to_byte(out[1]), to_byte(out[2])};
   }
 
+  static std::array<int, 3> pbr_mirror(const Pixel& p, float legacyBlend) {
+    const std::array<float, 3> l{p.color.r / 255.f, p.color.g / 255.f, p.color.b / 255.f};
+    const std::array<float, 3> fc{p.fc[0] / 255.f, p.fc[1] / 255.f, p.fc[2] / 255.f};
+    const std::array<float, 3> out =
+        composite::testing::legacy_pbr(l, fc, p.q7, p.ao / 255.f, p.code / 3.f, p.albedo, p.cls, legacyBlend);
+    return {to_byte(out[0]), to_byte(out[1]), to_byte(out[2])};
+  }
+
+  static bool guard_tie(const Pixel& p) {
+    for (size_t c = 0; c < 3; ++c) {
+      const uint8_t l = c == 0 ? p.color.r : c == 1 ? p.color.g : p.color.b;
+      if (std::abs(static_cast<float>(l) - p.q7 / 127.f * p.fc[c] + 2.f) < 1e-3f) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   static bool same(const Rgba& a, const Rgba& b) { return a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a; }
+
+  static bool same_rgb(const Rgba& a, const std::array<int, 3>& b, int tolerance) {
+    return std::abs(a.r - b[0]) <= tolerance && std::abs(a.g - b[1]) <= tolerance && std::abs(a.b - b[2]) <= tolerance;
+  }
 
   uint64_t m_frame = 0;
 };
@@ -1393,6 +1835,222 @@ TEST_F(CompositeGpu, OddExtentCoversEdges) {
       ASSERT_LE(std::abs(out[i].b - want[2]), 1) << i;
       ASSERT_EQ(out[i].a, 255) << i;
     }
+  }
+}
+Pixel random_pixel(std::mt19937& rng, uint8_t cls) {
+  std::uniform_int_distribution<int> byte(0, 255);
+  const auto b = [&] { return static_cast<uint8_t>(byte(rng)); };
+  return Pixel{.color = {b(), b(), b(), 255},
+               .code = static_cast<uint8_t>(byte(rng) % 4),
+               .fc = {b(), b(), b()},
+               .q7 = static_cast<uint8_t>(byte(rng) % 128),
+               .ao = b(),
+               .albedo = {b(), b(), b()},
+               .cls = cls};
+}
+
+TEST_F(CompositeGpu, PbrBlendOneMatchesPbrOff) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  std::mt19937 rng{23};
+  std::uniform_int_distribution<int> byte(0, 255);
+  const auto b = [&] { return static_cast<uint8_t>(byte(rng)); };
+  const auto pixels = grid(64, 48, [&](uint32_t x, uint32_t y) {
+    if (x < 24) {
+      const auto l = static_cast<uint8_t>(x * 10 + 15);
+      return Pixel{.color = {l, static_cast<uint8_t>(y * 5 + 10), b(), 255},
+                   .code = 1,
+                   .fc = {b(), b(), b()},
+                   .q7 = static_cast<uint8_t>(y % 2 == 0 ? 0 : 64),
+                   .ao = 64,
+                   .albedo = {b(), b(), b()},
+                   .cls = 1};
+    }
+    if (x < 40) {
+      return Pixel{.color = {0, 0, 0, 255}, .code = 1, .q7 = 0, .ao = 255, .albedo = {255, 255, 255}, .cls = 1};
+    }
+    return control();
+  });
+  const auto region = [](size_t i) { return i % 64 < 24 ? 1 : i % 64 < 40 ? 2 : 0; };
+  const auto off = run_pixels(64, 48, pixels, {.settings = ao_settings()});
+  const uint32_t pbrDraws = composite::testing::counters().pbrDraws;
+  const auto on = run_pixels(64, 48, pixels,
+                             {.settings = pbr_settings(1.f, Quality::High),
+                              .params = composite::Params{.flags = composite::FlagPbr, .legacyBlend = 1.f}});
+  EXPECT_EQ(composite::testing::counters().pbrDraws, pbrDraws + 1);
+  size_t changed = 0;
+  for (size_t i = 0; i < on.size(); ++i) {
+    ASSERT_TRUE(same(on[i], off[i])) << i;
+    if (region(i) != 2) {
+      changed += same(on[i], pixels[i].color) ? 0 : 1;
+    }
+  }
+  EXPECT_GT(changed, on.size() / 3);
+  const auto near = run_pixels(64, 48, pixels, {.settings = pbr_settings(0.99f, Quality::High)});
+  const auto half = run_pixels(64, 48, pixels, {.settings = pbr_settings(0.5f, Quality::High)});
+  size_t halfChanged = 0;
+  for (size_t i = 0; i < near.size(); ++i) {
+    if (region(i) == 2) {
+      ASSERT_LE(std::abs(near[i].r - 3), 1) << i;
+      ASSERT_LE(std::abs(near[i].g - 3), 1) << i;
+    } else if (region(i) == 1) {
+      halfChanged += same(half[i], off[i]) ? 0 : 1;
+    } else {
+      ASSERT_TRUE(same(near[i], off[i])) << i;
+      ASSERT_TRUE(same(half[i], off[i])) << i;
+    }
+  }
+  EXPECT_GT(halfChanged, 0u);
+  const auto culled = run_pixels(64, 48, pixels, {.settings = pbr_settings(1.f), .aoProducer = false, .draws = 0});
+  for (size_t i = 0; i < culled.size(); ++i) {
+    ASSERT_TRUE(same(culled[i], pixels[i].color)) << i;
+  }
+}
+
+TEST_F(CompositeGpu, PbrBlendZeroMatchesMirror) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  std::mt19937 rng{29};
+  const auto pixels = grid(128, 128, [&](uint32_t x, uint32_t) { return random_pixel(rng, x % 4 == 0 ? 0 : 1); });
+  const auto out = run_pixels(128, 128, pixels, {.settings = pbr_settings(0.f, Quality::High)});
+  size_t changed = 0;
+  for (size_t i = 0; i < out.size(); ++i) {
+    if (guard_tie(pixels[i])) {
+      continue;
+    }
+    ASSERT_TRUE(same_rgb(out[i], pbr_mirror(pixels[i], 0.f), 1)) << i;
+    ASSERT_EQ(out[i].a, 255) << i;
+    changed += pixels[i].cls != 0 && !same(out[i], pixels[i].color) ? 1 : 0;
+  }
+  EXPECT_GT(changed, out.size() / 4);
+}
+
+TEST_F(CompositeGpu, PbrBlendHalfMatchesMirror) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  std::mt19937 rng{31};
+  const auto pixels = grid(128, 128, [&](uint32_t x, uint32_t) { return random_pixel(rng, x % 3 == 0 ? 0 : 1); });
+  const auto off = run_pixels(128, 128, pixels, {.settings = ao_settings()});
+  const auto out = run_pixels(128, 128, pixels, {.settings = pbr_settings(0.5f, Quality::High)});
+  size_t changed = 0;
+  for (size_t i = 0; i < out.size(); ++i) {
+    if (pixels[i].cls == 0) {
+      ASSERT_TRUE(same(out[i], off[i])) << i;
+      continue;
+    }
+    if (guard_tie(pixels[i])) {
+      continue;
+    }
+    ASSERT_TRUE(same_rgb(out[i], pbr_mirror(pixels[i], 0.5f), 1)) << i;
+    changed += same(out[i], off[i]) ? 0 : 1;
+  }
+  EXPECT_GT(changed, out.size() / 4);
+}
+
+TEST_F(CompositeGpu, ClassZeroKeepsLegacyBits) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  std::mt19937 rng{37};
+  const auto pixels = grid(64, 48, [&](uint32_t x, uint32_t) {
+    if (x < 8) {
+      Pixel p = control();
+      p.albedo = {10, 240, 10};
+      p.cls = 1;
+      return p;
+    }
+    return random_pixel(rng, 0);
+  });
+  const auto off = run_pixels(64, 48, pixels, {.settings = ao_settings()});
+  const auto out = run_pixels(64, 48, pixels, {.settings = pbr_settings(0.f, Quality::High)});
+  for (size_t i = 0; i < out.size(); ++i) {
+    if (pixels[i].cls == 0) {
+      ASSERT_TRUE(same(out[i], off[i])) << i;
+    } else {
+      ASSERT_FALSE(same(out[i], off[i])) << i;
+    }
+  }
+}
+
+TEST_F(CompositeGpu, PbrBadGuardKeepsL) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  const auto pixels = grid(64, 48, [](uint32_t x, uint32_t) {
+    Pixel p =
+        x < 8 ? control() : Pixel{.color = {60, 200, 200, 255}, .code = 1, .fc = {120, 0, 0}, .q7 = 127, .ao = 32};
+    p.albedo = {10, 240, 10};
+    p.cls = 1;
+    return p;
+  });
+  const auto out = run_pixels(64, 48, pixels, {.settings = pbr_settings(0.f, Quality::High)});
+  for (size_t i = 0; i < out.size(); ++i) {
+    if (pixels[i].q7 == 127) {
+      ASSERT_TRUE(same(out[i], pixels[i].color)) << i;
+    } else {
+      ASSERT_FALSE(same(out[i], pixels[i].color)) << i;
+    }
+  }
+}
+
+TEST_F(CompositeGpu, DummyLoadsClamp) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  std::mt19937 rng{41};
+  const auto pixels = grid(61, 37, [&](uint32_t x, uint32_t) {
+    Pixel p = random_pixel(rng, x % 5 == 0 ? 0 : 1);
+    p.ao = 255;
+    return p;
+  });
+  const auto out = run_pixels(61, 37, pixels, {.settings = pbr_settings(0.f), .aoProducer = false});
+  size_t changed = 0;
+  for (size_t i = 0; i < out.size(); ++i) {
+    if (pixels[i].cls == 0) {
+      ASSERT_TRUE(same(out[i], pixels[i].color)) << i;
+      continue;
+    }
+    if (guard_tie(pixels[i])) {
+      continue;
+    }
+    ASSERT_TRUE(same_rgb(out[i], pbr_mirror(pixels[i], 0.f), 1)) << i;
+    changed += same(out[i], pixels[i].color) ? 0 : 1;
+  }
+  EXPECT_GT(changed, out.size() / 4);
+}
+
+TEST_F(CompositeGpu, PbrLeavesEfbAlphaUntouched) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  const auto pixels = grid(64, 48, [](uint32_t x, uint32_t y) {
+    Pixel p = control();
+    p.color.a = static_cast<uint8_t>((y * 64 + x) & 0xFF);
+    p.albedo = {10, 240, 10};
+    p.cls = 1;
+    return p;
+  });
+  const auto out = run_pixels(64, 48, pixels, {.settings = pbr_settings(0.f, Quality::High)});
+  size_t changed = 0;
+  for (size_t i = 0; i < out.size(); ++i) {
+    ASSERT_EQ(out[i].a, pixels[i].color.a) << i;
+    changed += out[i].r != pixels[i].color.r ? 1 : 0;
+  }
+  EXPECT_EQ(changed, out.size());
+}
+
+TEST_F(CompositeGpu, IdentityForcedIgnoresPbr) {
+  std::mt19937 rng{43};
+  const auto pixels = grid(64, 48, [&](uint32_t, uint32_t) { return random_pixel(rng, 1); });
+  const auto out = run_pixels(
+      64, 48, pixels,
+      {.settings = pbr_settings(0.f, Quality::High),
+       .params = composite::Params{.flags = composite::FlagPbr | composite::FlagIdentity, .legacyBlend = 0.f}});
+  for (size_t i = 0; i < out.size(); ++i) {
+    ASSERT_TRUE(same(out[i], pixels[i].color)) << i;
   }
 }
 } // namespace

@@ -67,7 +67,8 @@ void publish_cache_size() noexcept {
 bool identity() noexcept { return g_identityOverride.value_or(detail::composite::identity_forced()); }
 
 bool publisher_wanted(const detail::PassSetup& setup) noexcept {
-  return detail::composite::declare_wanted(setup) && !identity();
+  // Forward AO follows the AO term alone; PBR widening the composite must not stamp or publish AO
+  return detail::composite::declare_wanted(setup) && detail::composite::ao_wanted(*setup.settings) && !identity();
 }
 
 void declare(detail::InternalPassBuilder& builder, const detail::PassSetup& setup, const void*) {
@@ -184,7 +185,7 @@ bool screen_ao_receiver(const scene::DrawClass& cls, const gx::PipelineConfig& c
 
 bool forward_ao_wanted(const Settings& settings, uint16_t debugView) noexcept {
   // Identity runs and class views must leave translucents untouched
-  return detail::composite::wanted(settings) && !identity() && debug::find_view(debugView) == nullptr;
+  return detail::composite::ao_wanted(settings) && !identity() && debug::find_view(debugView) == nullptr;
 }
 
 void apply_frame_state(const detail::FrameState& state) noexcept {

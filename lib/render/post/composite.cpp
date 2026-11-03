@@ -6,8 +6,10 @@
 #include "../frame_state.hpp"
 #include "../hints.hpp"
 #include "../pass_context.hpp"
+#include "../scene/overlay.hpp"
 #include "../stage_data.hpp"
 
+#include "../../gx/surface_pack.hpp"
 #include "../../internal.hpp"
 #include "../../logging.hpp"
 
@@ -17,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <iterator>
 #include <mutex>
 #include <span>
@@ -31,7 +34,8 @@ constexpr TexRef Legacy{BindLegacy};
 constexpr TexRef Fog{BindFog};
 constexpr TexRef Normal{BindNormal};
 constexpr TexRef AoFinal{BindAo};
-constexpr TexRef Color{BindAo + 1};
+constexpr TexRef SurfaceRec{BindSurface};
+constexpr TexRef Color{BindSurface + 1};
 constexpr uint64_t NoFrame = UINT64_MAX;
 constexpr wgpu::ColorWriteMask RgbMask =
     wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue;
@@ -40,6 +44,10 @@ struct LatchSlot {
   const CompiledGraph* graph = nullptr;
   bool live = false;
   bool classView = false;
+  bool surfaceLive = false;
+  bool aoProduced = false;
+  bool aoLive = false;
+  bool pbrActive = false;
   std::array<uint32_t, 1> ids{};
 };
 
@@ -49,6 +57,7 @@ std::mutex g_slotMutex;
 LatchSlot g_slot;
 std::shared_ptr<const SceneHints> g_cameraOverride;
 std::optional<uint32_t> g_flagsOverride;
+std::optional<Params> g_paramsOverride;
 bool g_contractWarned = false;
 
 std::atomic_uint64_t g_enabledFrame{NoFrame};
@@ -60,6 +69,8 @@ std::atomic_uint32_t g_skippedMismatch{0};
 std::atomic_uint32_t g_skippedNoScene{0};
 std::atomic_uint32_t g_skippedView{0};
 std::atomic_uint32_t g_contractFailures{0};
+std::atomic_uint32_t g_pbrDraws{0};
+std::atomic_uint32_t g_idleFrames{0};
 
 inline void bump(std::atomic_uint32_t& counter) noexcept {
   counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
@@ -95,6 +106,37 @@ bool node_live(const CompiledGraph& graph, std::string_view name) noexcept {
 
 bool same_extent(const wgpu::Extent3D& a, const wgpu::Extent3D& b) noexcept {
   return a.width == b.width && a.height == b.height;
+}
+
+const CompiledUse* composite_use(const CompiledGraph& graph, std::string_view resource) noexcept {
+  const NodeId node = graph.find_node(Pass);
+  const ResourceId id = graph.find_resource(resource);
+  if (node == InvalidNode || id == InvalidResource || graph.nodes[node].kind != NodeKind::Pass ||
+      graph.nodes[node].status != CullReason::None) {
+    return nullptr;
+  }
+  for (const CompiledUse& use : graph.node_uses(node)) {
+    if (use.resource == id) {
+      return &use;
+    }
+  }
+  return nullptr;
+}
+
+bool params_carry_pbr(std::span<const std::byte> bytes) noexcept {
+  Params params;
+  if (bytes.size() < sizeof(params)) {
+    return false;
+  }
+  std::memcpy(&params, bytes.data(), sizeof(params));
+  return (params.flags & FlagPbr) != 0;
+}
+
+bool ready_for(const LatchSlot& slot, const Settings& settings) noexcept {
+  if (!wanted(settings)) {
+    return true;
+  }
+  return slot.live && hints_enabled() && slot.ids[0] != 0 && shaders::pipelines_ready(slot.ids);
 }
 
 bool legacy_matches(const PassContext& ctx, TexRef color, TexRef legacy) {
@@ -153,12 +195,17 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
     return;
   }
   builder.after(phase::Composite);
+  const bool pbrDeclared = setup.settings->pbr && setup.gx_available(GxResource::Surface);
   // Without AO there is nothing to composite yet, so a frame without it culls this pass and the copy
   builder.use(LegacyTex, Access::Sampled, Missing::DisablePass);
   builder.use(resource::Fog, Access::Sampled,
               UseOptions{.missing = Missing::DisablePass, .sampleType = wgpu::TextureSampleType::Uint});
   builder.use(resource::GxNormal, Access::Sampled, Missing::DisablePass);
-  builder.use(resource::AoFinal, Access::Sampled, Missing::DisablePass);
+  // With PBR as a second producer a missing ao.final means no AO, not no composite
+  builder.use(resource::AoFinal, Access::Sampled, pbrDeclared ? Missing::BindDummyWhite : Missing::DisablePass);
+  // Always declared so tiers B and P share one layout; a black dummy reads class 0, a white Uint one would read 255
+  builder.use(resource::Surface, Access::Sampled,
+              UseOptions{.missing = Missing::BindDummyBlack, .sampleType = wgpu::TextureSampleType::Uint});
   builder.use(resource::GxColor, Access::ColorRMW);
 }
 
@@ -176,7 +223,12 @@ bool enabled(const StageData& stage, const void*) {
     bump(g_skippedNoScene);
     return false;
   }
-  // After this only a missing ao.final can cull the pass, and every later ao.final reader then sees it missing too
+  // At full legacy blend without AO nothing would change, so the copy and the composite do not run
+  if (!slot.aoLive && !slot.pbrActive) {
+    bump(g_idleFrames);
+    return false;
+  }
+  // With PBR declared a missing ao.final binds white, so later ao.final readers must accept the dummy
   if (shaders::pipelines_ready(slot.ids)) {
     g_enabledFrame.store(stage.frameId, std::memory_order_relaxed);
   }
@@ -198,9 +250,16 @@ void encode(PassContext& ctx, const void*) {
     encode_mismatch(ctx, Color, Legacy, LegacyTex);
     return;
   }
-  for (const auto& [ref, name] :
-       {std::pair{AoFinal, resource::AoFinal}, std::pair{Fog, resource::Fog}, std::pair{Normal, resource::GxNormal}}) {
+  for (const auto& [ref, name] : {std::pair{Fog, resource::Fog}, std::pair{Normal, resource::GxNormal}}) {
     if (!same_extent(ctx.extent(ref), ctx.extent(Color))) {
+      encode_mismatch(ctx, Color, ref, name);
+      return;
+    }
+  }
+  // White and black dummies are 1x1 and every load clamps, so they never fail the extent check
+  for (const auto& [ref, name] : {std::pair{AoFinal, resource::AoFinal}, std::pair{SurfaceRec, resource::Surface}}) {
+    const wgpu::Extent3D extent = ctx.extent(ref);
+    if (!same_extent(extent, ctx.extent(Color)) && (extent.width != 1 || extent.height != 1)) {
       encode_mismatch(ctx, Color, ref, name);
       return;
     }
@@ -217,14 +276,33 @@ void encode(PassContext& ctx, const void*) {
   pass.Draw(3);
   pass.End();
   bump(g_draws);
+  if (params_carry_pbr(ctx.params())) {
+    bump(g_pbrDraws);
+  }
 }
 
 bool m8_env_set() noexcept { return ao::env_ao_request().has_value() || identity_forced() || no_fog_forced(); }
 } // namespace
 
 bool wanted(const Settings& settings) noexcept {
-  // AO is the only composite producer in M8; later producers widen this one predicate
-  return settings.ao != Quality::Off;
+  // AO and PBR are the composite producers; later producers widen this one predicate
+  return settings.ao != Quality::Off || settings.pbr;
+}
+
+bool ao_wanted(const Settings& settings) noexcept { return settings.ao != Quality::Off; }
+
+bool pbr_term_wanted(const Settings& settings) noexcept {
+  return settings.pbr && settings.legacyBlend < 1.f && !identity_forced();
+}
+
+bool surface_bound(const CompiledGraph& graph) noexcept {
+  const CompiledUse* use = composite_use(graph, resource::Surface);
+  return use != nullptr && !use->staticDummy;
+}
+
+bool ao_produced(const CompiledGraph& graph) noexcept {
+  const CompiledUse* use = composite_use(graph, resource::AoFinal);
+  return use != nullptr && !use->staticDummy;
 }
 
 bool declare_wanted(const PassSetup& setup) noexcept {
@@ -247,18 +325,32 @@ std::optional<std::string> check_contract(const CompiledGraph& graph) {
   if (!node_live(graph, CopyPass)) {
     return fmt::format("{} is not compiled", CopyPass);
   }
+  const bool aoProduced = ao_produced(graph);
   const ResourceId legacyId = graph.find_resource(LegacyTex);
   const ResourceId aoId = graph.find_resource(resource::AoFinal);
-  if (legacyId == InvalidResource || aoId == InvalidResource) {
+  if (legacyId == InvalidResource || (aoProduced && aoId == InvalidResource)) {
     return fmt::format("{} or {} is missing", LegacyTex, resource::AoFinal);
   }
   const CompiledResource& legacy = graph.resources[legacyId];
-  const CompiledResource& ao = graph.resources[aoId];
-  if (ao.tex.format != AoFormat) {
-    return fmt::format("{} is {}, not {}", resource::AoFinal, magic_enum::enum_name(ao.tex.format),
+  if (aoProduced && graph.resources[aoId].tex.format != AoFormat) {
+    return fmt::format("{} is {}, not {}", resource::AoFinal, magic_enum::enum_name(graph.resources[aoId].tex.format),
                        magic_enum::enum_name(AoFormat));
   }
+  if (surface_bound(graph)) {
+    const CompiledResource& surface = graph.resources[graph.find_resource(resource::Surface)];
+    if (surface.tex.format != wgpu::TextureFormat::RGBA32Uint) {
+      return fmt::format("{} is {}, not {}", resource::Surface, magic_enum::enum_name(surface.tex.format),
+                         magic_enum::enum_name(wgpu::TextureFormat::RGBA32Uint));
+    }
+    if (!same_extent(surface.extent, legacy.extent)) {
+      return fmt::format("{} is {}x{} but {} is {}x{}", resource::Surface, surface.extent.width, surface.extent.height,
+                         LegacyTex, legacy.extent.width, legacy.extent.height);
+    }
+  }
   for (const std::string_view name : {resource::AoFinal, resource::Fog, resource::GxNormal}) {
+    if (name == resource::AoFinal && !aoProduced) {
+      continue;
+    }
     const ResourceId id = graph.find_resource(name);
     const wgpu::Extent3D extent = id != InvalidResource ? graph.resources[id].extent : wgpu::Extent3D{};
     if (!same_extent(extent, legacy.extent)) {
@@ -338,10 +430,12 @@ void initialize() {
     g_pass = register_pass(pass_desc());
   }
   fakeshadow::set_gate_source(fakeshadow::Gate::Ao, &ao_gate);
+  scene::overlay::set_pbr_applied_source(&pbr_applied);
 }
 
 void shutdown() noexcept {
   fakeshadow::set_gate_source(fakeshadow::Gate::Ao, nullptr);
+  scene::overlay::set_pbr_applied_source(nullptr);
   for (PassId* pass : {&g_copyPass, &g_pass}) {
     if (*pass != InvalidPassId) {
       unregister_pass(*pass);
@@ -359,23 +453,27 @@ void shutdown() noexcept {
   constexpr std::string_view Line =
       "Composite drew on {} frames ({} skipped for mismatched inputs, {} without a scene "
       "camera, {} under a class view, {} graphs refused)";
+  constexpr std::string_view PbrLine = "Composite PBR term ran on {} frames ({} idle at full legacy blend)";
   if (m8_env_set()) {
     Log.info(Line, c.draws, c.skippedMismatch, c.skippedNoScene, c.skippedView, c.contractFailures);
   } else {
     Log.debug(Line, c.draws, c.skippedMismatch, c.skippedNoScene, c.skippedView, c.contractFailures);
   }
+  if (m8_env_set() || c.pbrDraws != 0 || c.idleFrames != 0) {
+    Log.info(PbrLine, c.pbrDraws, c.idleFrames);
+  } else {
+    Log.debug(PbrLine, c.pbrDraws, c.idleFrames);
+  }
 }
 
 void on_latch(const PassSetup& latched, const CompiledGraph* graph) {
-  if (g_pass != InvalidPassId) {
-    const Params params{.flags = g_flagsOverride.value_or(params_flags(identity_forced(), nullptr) |
-                                                          (no_fog_forced() ? uint32_t{FlagNoFog} : 0u))};
-    set_pass_params(g_pass, std::as_bytes(std::span{&params, 1}));
-  }
-  std::lock_guard lock{g_slotMutex};
+  const Settings* settings = latched.settings;
+  std::unique_lock lock{g_slotMutex};
   if (graph != g_slot.graph) {
     g_slot.graph = graph;
     g_slot.live = false;
+    g_slot.surfaceLive = graph != nullptr && surface_bound(*graph);
+    g_slot.aoProduced = graph != nullptr && ao_produced(*graph);
     g_slot.ids = {};
     g_encodeMismatch.store(false, std::memory_order_relaxed);
     if (graph != nullptr) {
@@ -399,14 +497,50 @@ void on_latch(const PassSetup& latched, const CompiledGraph* graph) {
   }
   // The view the graph was compiled for, so the composite and TAA's declare never disagree
   g_slot.classView = debug::find_view(latched.debug_view()) != nullptr;
+  g_slot.aoLive = settings != nullptr && ao_wanted(*settings) && g_slot.aoProduced;
+  g_slot.pbrActive =
+      settings != nullptr && testing::pbr_active_for(g_slot.live, g_slot.surfaceLive, g_slot.classView, *settings);
+  const bool pbrActive = g_slot.pbrActive;
+  lock.unlock();
+  if (g_pass != InvalidPassId) {
+    Params params{.flags = g_flagsOverride.value_or(params_flags(identity_forced(), nullptr) |
+                                                    (no_fog_forced() ? uint32_t{FlagNoFog} : 0u))};
+    // legacyBlend reaches the shader only with the flag, so full legacy blend keeps PBR-off uniform bytes
+    if (pbrActive) {
+      params.flags |= FlagPbr;
+      params.legacyBlend = settings->legacyBlend;
+    }
+    params = g_paramsOverride.value_or(params);
+    set_pass_params(g_pass, std::as_bytes(std::span{&params, 1}));
+  }
 }
 
-bool ready(const Settings& settings) noexcept {
-  if (!wanted(settings)) {
-    return true;
-  }
+bool ready(const Settings& settings) noexcept { return ready_for(latched_slot(), settings); }
+
+bool ao_ready(const Settings& settings) noexcept {
   const LatchSlot slot = latched_slot();
-  return slot.live && hints_enabled() && slot.ids[0] != 0 && shaders::pipelines_ready(slot.ids);
+  // The composite can be live for PBR alone, so AO also needs its own producer
+  return ready_for(slot, settings) && (!ao_wanted(settings) || slot.aoProduced);
+}
+
+bool pbr_active() noexcept { return latched_slot().pbrActive; }
+
+bool pbr_applied(const StageData& opaqueDone) noexcept {
+  const CompiledGraph* graph = opaqueDone.frame != nullptr ? opaqueDone.frame->graph.get() : nullptr;
+  if (graph == nullptr || opaqueDone.stage != Stage::OpaqueDone) {
+    return false;
+  }
+  const NodeId node = graph->find_node(Pass);
+  if (node == InvalidNode || graph->nodes[node].programIndex == InvalidNode ||
+      !opaqueDone.is_enabled(graph->nodes[node].programIndex)) {
+    return false;
+  }
+  for (const StageBindings::Params& params : opaqueDone.bindings.params) {
+    if (params.node == node) {
+      return params_carry_pbr(std::span{params.bytes}.first(params.size));
+    }
+  }
+  return false;
 }
 
 bool live() noexcept { return latched_slot().live; }
@@ -417,8 +551,8 @@ bool identity_forced() noexcept { return ao::identity_forced(); }
 
 bool ao_gate(const FrameState& state) noexcept {
   const LatchSlot slot = latched_slot();
-  // Baked AO in textures is dropped only while real AO reaches the screen
-  return state.settings.ao != Quality::Off && slot.live && !slot.classView && !identity_forced() &&
+  // Baked AO is dropped only while a produced ao.final reaches the screen; PBR alone binds a white dummy and keeps it
+  return state.settings.ao != Quality::Off && slot.live && slot.aoProduced && !slot.classView && !identity_forced() &&
          ao::effective_strength() > 0.f;
 }
 
@@ -431,12 +565,15 @@ Counters counters() noexcept {
       .skippedNoScene = g_skippedNoScene.load(std::memory_order_relaxed),
       .skippedView = g_skippedView.load(std::memory_order_relaxed),
       .contractFailures = g_contractFailures.load(std::memory_order_relaxed),
+      .pbrDraws = g_pbrDraws.load(std::memory_order_relaxed),
+      .idleFrames = g_idleFrames.load(std::memory_order_relaxed),
   };
 }
 
 void reset() noexcept {
   g_cameraOverride.reset();
   g_flagsOverride.reset();
+  g_paramsOverride.reset();
   g_contractWarned = false;
   g_mismatchWarned.store(false, std::memory_order_relaxed);
   g_copies.store(0, std::memory_order_relaxed);
@@ -445,9 +582,17 @@ void reset() noexcept {
   g_skippedNoScene.store(0, std::memory_order_relaxed);
   g_skippedView.store(0, std::memory_order_relaxed);
   g_contractFailures.store(0, std::memory_order_relaxed);
+  g_pbrDraws.store(0, std::memory_order_relaxed);
+  g_idleFrames.store(0, std::memory_order_relaxed);
 }
 
 void set_flags(std::optional<uint32_t> flags) noexcept { g_flagsOverride = flags; }
+
+void force_params(std::optional<Params> params) noexcept { g_paramsOverride = params; }
+
+bool pbr_active_for(bool live, bool surfaceLive, bool classView, const Settings& settings) noexcept {
+  return live && surfaceLive && pbr_term_wanted(settings) && !classView;
+}
 
 void set_camera_override(std::shared_ptr<const SceneHints> hints) noexcept { g_cameraOverride = std::move(hints); }
 
@@ -464,6 +609,29 @@ std::array<float, 3> legacy_ao(std::array<float, 3> legacy, std::array<float, 3>
       return legacy;
     }
     out[i] = legacy[i] - std::max(s, 0.f) * (1.f - ao);
+  }
+  return out;
+}
+
+std::array<float, 3> legacy_pbr(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7, float ao,
+                                float normalAlpha, std::array<uint8_t, 3> albedo, uint32_t classId,
+                                float legacyBlend) noexcept {
+  if (classId == 0 || legacyBlend >= 1.f) {
+    return legacy_ao(legacy, fogColor, q7, ao, normalAlpha);
+  }
+  const bool receiver = std::round(std::clamp(normalAlpha, 0.f, 1.f) * 3.f) >= 1.f;
+  const float a = receiver && ao < 1.f ? ao : 1.f;
+  const float q = static_cast<float>(std::min(q7, 127u)) / 127.f;
+  std::array<float, 3> out{};
+  for (size_t i = 0; i < out.size(); ++i) {
+    const float s = legacy[i] - q * fogColor[i];
+    if (s < -2.f / 255.f) {
+      return legacy;
+    }
+    const float sp = std::max(s, 0.f);
+    const float p = (1.f - q) * std::clamp(gx::surface::unorm8_decode(albedo[i]) * a, 0.f, 1.f);
+    const float t = 1.f - legacyBlend;
+    out[i] = legacy[i] - sp + (sp * a * (1.f - t) + p * t);
   }
   return out;
 }

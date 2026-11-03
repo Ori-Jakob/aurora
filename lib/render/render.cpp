@@ -218,6 +218,15 @@ bool feature_ready(Feature feature) noexcept {
   if ((feature == Feature::Ao || feature == Feature::DeferredFog) && !detail::composite::ready(effective_settings())) {
     return false;
   }
+  // With PBR the composite can be live while ao.final is a dummy, so AO readiness needs a produced ao.final
+  if (feature == Feature::Ao && !detail::composite::ao_ready(effective_settings())) {
+    return false;
+  }
+  // PBR shows only through the PBR tier and the composite, so a refused switch or a pending pipeline keeps Applying
+  if (feature == Feature::Pbr &&
+      (webgpu::scene_tier() != webgpu::SceneTier::Pbr || !detail::composite::ready(effective_settings()))) {
+    return false;
+  }
 #endif
   return true;
 }

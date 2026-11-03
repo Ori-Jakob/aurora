@@ -983,6 +983,9 @@ TEST_F(RenderGxExt, ScreenAoFlagFollowsAoAndTier) {
   detail::FrameState overridden = ao_frame(Quality::High);
   overridden.debugView = 1;
   expect_off(overridden, "inspector class view");
+  detail::FrameState pbrOnly = ao_frame(Quality::Off);
+  pbrOnly.settings.pbr = true;
+  expect_off(pbrOnly, "pbr without ao");
   fwd_env::testing::set_identity_override(true);
   expect_off(ao_frame(Quality::High), "identity");
   fwd_env::testing::set_identity_override(std::nullopt);
@@ -1074,6 +1077,11 @@ TEST_F(RenderGxExt, FwdEnvPublisherSkipsWithoutAoOrTier) {
   ASSERT_NE(off.graph, nullptr);
   EXPECT_EQ(publisher_status(*off.graph), detail::CullReason::Skipped);
   EXPECT_FALSE(reads_ao(*off.graph));
+  Settings pbrOnly;
+  pbrOnly.pbr = true;
+  const PublisherGraph pbr = compile_publisher(pbrOnly);
+  EXPECT_EQ(publisher_status(*pbr.graph), detail::CullReason::Skipped);
+  EXPECT_FALSE(reads_ao(*pbr.graph));
   settings.ao = Quality::High;
   for (const detail::GxResource missing : {detail::GxResource::Fog, detail::GxResource::Normal}) {
     detail::GraphEnvironment env = tier_b_env();
@@ -1102,6 +1110,21 @@ TEST_F(RenderGxExt, FwdEnvPublisherSkipsUnderIdentity) {
   EXPECT_TRUE(fwd_env::forward_ao_wanted(settings, 0));
   EXPECT_FALSE(fwd_env::forward_ao_wanted(settings, 1));
   EXPECT_TRUE(fwd_env::forward_ao_wanted(settings, 16));
+}
+
+TEST_F(RenderGxExt, ForwardAoIgnoresPbr) {
+  fwd_env::testing::set_identity_override(false);
+  Settings settings;
+  settings.pbr = true;
+  EXPECT_TRUE(detail::composite::wanted(settings));
+  EXPECT_FALSE(detail::composite::ao_wanted(settings));
+  EXPECT_FALSE(fwd_env::forward_ao_wanted(settings, 0));
+  settings.ao = Quality::High;
+  EXPECT_TRUE(fwd_env::forward_ao_wanted(settings, 0));
+  settings.ao = Quality::Off;
+  settings.legacyBlend = 1.f;
+  EXPECT_FALSE(fwd_env::forward_ao_wanted(settings, 0));
+  fwd_env::testing::set_identity_override(std::nullopt);
 }
 
 TEST_F(RenderGxExt, FwdEnvPublisherSortsAfterComposite) {

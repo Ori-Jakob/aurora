@@ -557,7 +557,41 @@ TEST_F(RenderApiTest, DeferredFogFollowsComposite) {
   EXPECT_TRUE(feature_ready(Feature::DeferredFog));
   gfx::shutdown_pipeline_cache();
 }
+
+TEST_F(RenderApiTest, PbrReadyFollowsComposite) {
+  detail::testing::set_caps(full_caps());
+  detail::testing::set_built_options(Feature::Pbr, 1u << 1);
+  apply_settings({.pbr = true});
+  detail::latch_frame();
+  ASSERT_TRUE(feature_enabled(effective_settings(), Feature::Pbr));
+  EXPECT_NE(webgpu::scene_tier(), webgpu::SceneTier::Pbr);
+  EXPECT_FALSE(feature_ready(Feature::Pbr));
+  EXPECT_FALSE(feature_active(Feature::Pbr));
+  EXPECT_FALSE(detail::composite::ready(effective_settings()));
+  webgpu::g_graphicsConfig.gbuffer = true;
+  EXPECT_EQ(webgpu::scene_tier(), webgpu::SceneTier::Base);
+  EXPECT_FALSE(feature_ready(Feature::Pbr));
+  webgpu::g_graphicsConfig.surfaceBuffer = true;
+  EXPECT_EQ(webgpu::scene_tier(), webgpu::SceneTier::Pbr);
+  EXPECT_FALSE(feature_ready(Feature::Pbr));
+  webgpu::g_graphicsConfig.surfaceBuffer = false;
+  webgpu::g_graphicsConfig.gbuffer = false;
+
+  apply_settings({});
+  detail::latch_frame();
+  EXPECT_TRUE(feature_ready(Feature::Pbr));
+  gfx::shutdown_pipeline_cache();
+}
 #endif
+
+TEST_F(RenderApiTest, PbrStaysUnbuiltByDefault) {
+  const BuiltOptions& built = detail::default_built_options();
+  EXPECT_EQ(built[static_cast<size_t>(Feature::Pbr)], 0u);
+  Settings pbr;
+  pbr.pbr = true;
+  EXPECT_EQ(evaluate_support(Feature::Pbr, 0, pbr, env(full_caps(), built)), unsupported(Reason::NotImplemented));
+  EXPECT_FALSE(detail::clamp_settings(pbr, env(full_caps(), built)).pbr);
+}
 
 #if AURORA_ENABLE_RENDER
 TEST_F(RenderApiTest, AoReadyTracksPipelines) {
