@@ -594,6 +594,9 @@ struct ShaderInfo {
   u8 unlitRawVtx : 2 = 0;
   bool unlitPlanned : 1 = false;
   bool unlitAdmitted : 1 = false;
+  u8 unlitAmbient : 2 = 0;
+  u8 unlitAmbientChannel : 1 = 0;
+  bool unlitAmbientRaw : 1 = false;
   bool companionLane : 1 = false;
   bool companionFits : 1 = false;
 };

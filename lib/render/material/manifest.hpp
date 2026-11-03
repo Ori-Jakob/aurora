@@ -27,6 +27,7 @@ bool json_equal(yyjson_val* a, yyjson_val* b) noexcept;
 std::string pointer_join(std::string_view parent, std::string_view token);
 std::string_view embedded_schema(std::string_view name) noexcept;
 bool schema_ready() noexcept;
+bool match_class(std::string_view text) noexcept;
 
 namespace testing {
 bool match_schema_pattern(std::string_view source, std::string_view text, bool* bound) noexcept;

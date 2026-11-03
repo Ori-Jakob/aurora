@@ -8,6 +8,7 @@
 #include "render/module.hpp"
 #if AURORA_ENABLE_RENDER
 #include "render/geometry/compact.hpp"
+#include "render/material/classes.hpp"
 #include "render/post/composite.hpp"
 #endif
 #include "render/settings.hpp"
@@ -1387,5 +1388,22 @@ TEST_F(RenderApiTest, ModuleOffReportsBuildDisabled) {
   }
 }
 #endif
+
+TEST(RenderApi, RegisterMaterialClassLinksRenderOff) {
+#if AURORA_ENABLE_RENDER
+  material::classes::testing::reset();
+#endif
+  OpenPbrParams params;
+  params.coatWeight = 1.f;
+  register_material_class(200, "test/coat", params);
+  register_material_class(0, "test/coat", params);
+#if AURORA_ENABLE_RENDER
+  EXPECT_EQ(material::classes::stats().registered, 1u);
+  EXPECT_EQ(material::classes::stats().rejected, 1u);
+  material::classes::testing::reset();
+#endif
+  EXPECT_EQ(OpenPbrParams{}.specularRoughness, 0.85f);
+  EXPECT_FALSE(OpenPbrParams{}.geometryThinWalled);
+}
 } // namespace
 } // namespace aurora::render::test

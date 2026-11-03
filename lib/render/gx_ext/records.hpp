@@ -33,12 +33,13 @@ struct DrawRecord {
   uint32_t objectLo = 0;
   uint32_t objectHi = 0;
   uint32_t prevMtxOff = 0;
-  uint32_t materialOff0 = 0;
+  uint32_t material = 0;
   uint32_t materialOff1 = 0;
   uint32_t tevPolicyOff = 0;
 };
 static_assert(sizeof(DrawRecord) == gx::render_ext::DrawRecordWords * sizeof(uint32_t));
 static_assert(offsetof(DrawRecord, flags) == gx::render_ext::DrawRecordFlagsWord * sizeof(uint32_t));
+static_assert(offsetof(DrawRecord, material) == gx::render_ext::DrawRecordMaterialWord * sizeof(uint32_t));
 static_assert(offsetof(DrawRecord, tevPolicyOff) == gx::render_ext::DrawRecordTevPolicyWord * sizeof(uint32_t));
 
 namespace flag {
@@ -55,12 +56,14 @@ inline constexpr uint32_t ScreenShadow = 1u << 10;
 inline constexpr uint32_t ScreenAo = 1u << 11;
 inline constexpr uint32_t PrevProjFrame = 1u << 12;
 inline constexpr uint32_t Reactive = gx::render_ext::RecordFlagReactive;
+inline constexpr uint32_t BackFaceFlip = 1u << 14;
 inline constexpr uint32_t SurfaceSlotShift = gx::render_ext::RecordSurfaceSlotShift;
 inline constexpr uint32_t SurfaceSlotMask = gx::render_ext::RecordSurfaceSlotMask;
 } // namespace flag
 static_assert(flag::ScreenAo == gx::render_ext::RecordFlagScreenAo);
 static_assert(flag::VertexColorShift == gx::render_ext::RecordVertexColorShift);
 static_assert(flag::Unlit == gx::render_ext::RecordFlagUnlit);
+static_assert(flag::BackFaceFlip == gx::render_ext::RecordFlagBackFaceFlip);
 
 struct FrameRecord {
   uint32_t frameSeq = 0;
@@ -86,6 +89,14 @@ struct Stats {
   uint64_t blendedInWindow = 0;
   uint64_t surfaceSlots = 0;
   uint64_t categoryRecords = 0;
+  uint64_t classManifest = 0;
+  uint64_t classHint = 0;
+  uint64_t classDefault = 0;
+  uint64_t classNone = 0;
+  uint64_t twoSided = 0;
+  uint64_t cullFront = 0;
+  uint64_t mirrored = 0;
+  uint64_t paletteTwoSided = 0;
   std::array<uint64_t, 4> codes{};
 };
 
@@ -103,6 +114,7 @@ using PushFn = gfx::Range (*)(std::span<const uint8_t> bytes) noexcept;
 
 // Game thread, while the FIFO is idle
 void apply_frame_state(const detail::FrameState& state) noexcept;
+void set_back_face_flip(bool enabled) noexcept;
 [[nodiscard]] Stats stats() noexcept;
 [[nodiscard]] bool gbuffer() noexcept;
 void shutdown() noexcept;
@@ -114,10 +126,12 @@ bool on_route(const scene::DrawClass& cls) noexcept;
 void stamp(gx::DrawData& draw, const gx::PipelineConfig& config, const gx::ShaderInfo& info,
            const scene::DrawClass& cls) noexcept;
 bool set_camera_frame(const scene::motion::MotionFrame& frame) noexcept;
+[[nodiscard]] bool mirrored(const gx::DrawData& draw, const gx::PipelineConfig& config) noexcept;
 
 // Built from the sources v1's text used, so M9 content decodes to the same fields
 [[nodiscard]] gx::surface::Entry surface_entry(const gx::PipelineConfig& config, const gx::ShaderInfo& info,
-                                               uint32_t recordFlags, uint32_t categories) noexcept;
+                                               uint32_t recordFlags, uint32_t categories,
+                                               uint32_t materialWord) noexcept;
 
 namespace testing {
 void set_active(bool active, bool gbuffer, bool debugId) noexcept;

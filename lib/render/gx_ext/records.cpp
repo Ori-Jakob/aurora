@@ -10,6 +10,7 @@
 #include "../../gfx/recording.hpp"
 #include "../../gfx/scene_targets.hpp"
 #include "../../gx/gx.hpp"
+#include "../../gx/unlit_plan.hpp"
 #include "../../logging.hpp"
 
 #include <dolphin/gx/GXAurora.h>
@@ -20,6 +21,7 @@
 namespace aurora::render::gx_ext::records {
 namespace {
 constexpr Module Log{"aurora::render::gx_ext"};
+constexpr uint32_t PositionSlots = gx::MaxPnMtx + gx::MaxTexMtx;
 
 struct Counters {
   uint64_t records = 0;
@@ -31,11 +33,20 @@ struct Counters {
   uint64_t blendedInWindow = 0;
   uint64_t surfaceSlots = 0;
   uint64_t categoryRecords = 0;
+  uint64_t classManifest = 0;
+  uint64_t classHint = 0;
+  uint64_t classDefault = 0;
+  uint64_t classNone = 0;
+  uint64_t twoSided = 0;
+  uint64_t cullFront = 0;
+  uint64_t mirrored = 0;
+  uint64_t paletteTwoSided = 0;
   std::array<uint64_t, 4> codes{};
 };
 
 // Game thread, while the FIFO is idle
 bool g_active = false;
+bool g_backFaceFlip = false;
 bool g_gbuffer = false;
 bool g_debugId = false;
 bool g_surface = false;
@@ -157,12 +168,43 @@ void fold() noexcept {
   g_totals.blendedInWindow += frame.blendedInWindow;
   g_totals.surfaceSlots += frame.surfaceSlots;
   g_totals.categoryRecords += frame.categoryRecords;
+  g_totals.classManifest += frame.classManifest;
+  g_totals.classHint += frame.classHint;
+  g_totals.classDefault += frame.classDefault;
+  g_totals.classNone += frame.classNone;
+  g_totals.twoSided += frame.twoSided;
+  g_totals.cullFront += frame.cullFront;
+  g_totals.mirrored += frame.mirrored;
+  g_totals.paletteTwoSided += frame.paletteTwoSided;
   for (size_t i = 0; i < frame.codes.size(); ++i) {
     g_totals.codes[i] += frame.codes[i];
   }
   if (frame.dropped != 0 && !std::exchange(g_dropWarned, true)) {
     Log.warn("Render records: {} draws went without a record because the frame's storage was full", frame.dropped);
   }
+}
+
+double det3(const Mat3x4<float>& m) noexcept {
+  const std::array<const Vec4<float>*, 3> rows{&m.m0, &m.m1, &m.m2};
+  const auto e = [&rows](size_t r, size_t c) { return static_cast<double>((*rows[r])[c]); };
+  return e(0, 0) * (e(1, 1) * e(2, 2) - e(1, 2) * e(2, 1)) - e(0, 1) * (e(1, 0) * e(2, 2) - e(1, 2) * e(2, 0)) +
+         e(0, 2) * (e(1, 0) * e(2, 1) - e(1, 1) * e(2, 0));
+}
+
+void count_material(Counters& counters, const unlit::DrawMaterial& dm, GXCullMode cull) noexcept {
+  using material::classes::Source;
+  const uint32_t cls = (dm.word >> 16) & 0xFFu;
+  if (cls == material::classes::None) {
+    ++counters.classNone;
+  } else if (dm.source == Source::Hint) {
+    ++counters.classHint;
+  } else if (dm.source == Source::Default) {
+    ++counters.classDefault;
+  } else {
+    ++counters.classManifest;
+  }
+  counters.twoSided += (dm.word & gx::render_ext::MaterialWordTwoSided) != 0 ? 1 : 0;
+  counters.cullFront += cull == GX_CULL_FRONT ? 1 : 0;
 }
 
 void reset_frame() noexcept {
@@ -189,6 +231,8 @@ void apply_frame_state(const detail::FrameState&) noexcept {
   reset_frame();
 }
 
+void set_back_face_flip(bool enabled) noexcept { g_backFaceFlip = enabled; }
+
 Stats stats() noexcept { return g_totals; }
 
 bool in_forward_window(const scene::DrawClass& cls) noexcept {
@@ -209,6 +253,7 @@ void shutdown() noexcept {
   }
   surface_table::shutdown();
   g_active = false;
+  g_backFaceFlip = false;
   g_gbuffer = false;
   g_debugId = false;
   g_surface = false;
@@ -247,12 +292,17 @@ void stamp(gx::DrawData& draw, const gx::PipelineConfig& config, const gx::Shade
     record.objectHi = static_cast<uint32_t>(cls.key.object.id >> 32);
   }
   if (config.shaderConfig.ext.output == 2) {
-    record.flags |= unlit::vertex_policy(config, info, cls) << flag::VertexColorShift |
-                    (unlit::unlit_flag(config, info, cls) ? flag::Unlit : 0u);
+    const unlit::DrawMaterial dm = unlit::draw_material(config, info, cls);
+    const bool flip = g_backFaceFlip && config.cullMode == GX_CULL_NONE &&
+                      (dm.word & gx::render_ext::MaterialWordTwoSided) != 0 && !mirrored(draw, config);
+    record.flags |=
+        dm.vertexPolicy << flag::VertexColorShift | (dm.unlit ? flag::Unlit : 0u) | (flip ? flag::BackFaceFlip : 0u);
     record.tevPolicyOff = policy_block(cls);
+    record.material = dm.word;
+    count_material(g_frame, dm, config.cullMode);
     // Only admitted text writes the record; any other output-2 pipeline writes slot 0
     if (info.unlitAdmitted) {
-      const gx::surface::Entry entry = surface_entry(config, info, record.flags, cls.key.categories);
+      const gx::surface::Entry entry = surface_entry(config, info, record.flags, cls.key.categories, dm.word);
       const uint32_t slot = surface_table::slot_for(entry);
       record.flags |= slot << flag::SurfaceSlotShift;
       g_frame.surfaceSlots += slot != 0 ? 1 : 0;
@@ -279,19 +329,41 @@ void stamp(gx::DrawData& draw, const gx::PipelineConfig& config, const gx::Shade
 }
 
 gx::surface::Entry surface_entry(const gx::PipelineConfig& config, const gx::ShaderInfo& info, uint32_t recordFlags,
-                                 uint32_t categories) noexcept {
+                                 uint32_t categories, uint32_t materialWord) noexcept {
   namespace surface = gx::surface;
   const uint32_t code = (recordFlags & flag::ReceiverMask) >> flag::ReceiverShift;
   const bool passthrough = static_cast<gx::unlit::Verdict>(info.unlitVerdict) == gx::unlit::Verdict::Passthrough;
   uint32_t flags = (code == 2 ? surface::CloudReceiver : 0u) | (code == 1 ? surface::NoShadowReceive : 0u);
   flags |= passthrough || (recordFlags & flag::Unlit) != 0 ? surface::Unlit : 0u;
   flags |= ((recordFlags & flag::VertexColorMask) >> flag::VertexColorShift) == 1 ? surface::BakedLight : 0u;
-  surface::Fields fields{.classId = surface::ClassDefault,
+  flags |= (materialWord & gx::render_ext::MaterialWordFlagMask) >> 24;
+  surface::Fields fields{.classId = static_cast<uint8_t>((materialWord >> 16) & 0xFFu),
                          .flags = static_cast<uint8_t>(flags),
                          .category = scene::receiver_category::compress(categories)};
-  const uint32_t extBits =
-      config.shaderConfig.ext.surfaceExt != 0 ? surface::EntryExtAmbient | surface::EntryExtEmissive : 0u;
-  return surface::pack_entry(fields, extBits);
+  const bool keyed = config.shaderConfig.ext.surfaceExt != 0;
+  if (!keyed && (materialWord & gx::render_ext::MaterialWordAmbient) != 0) {
+    const gx::unlit::Ambient ambient = gx::unlit::ambient_of(config.shaderConfig, info);
+    if (ambient.source == gx::unlit::AmbientSource::Register) {
+      const Vec4<float>& reg = gx::g_gxState.colorChannelState[ambient.channel].ambColor;
+      fields.ambient = {reg[0], reg[1], reg[2]};
+    }
+  }
+  return surface::pack_entry(fields, keyed ? surface::EntryExtAmbient | surface::EntryExtEmissive : 0u);
+}
+
+bool mirrored(const gx::DrawData& draw, const gx::PipelineConfig& config) noexcept {
+  if (config.shaderConfig.attrs[GX_VA_PNMTXIDX].attrType != GX_NONE) {
+    ++g_frame.paletteTwoSided;
+    return false;
+  }
+  const uint32_t slot = draw.immediateData.currentPnMtx;
+  // Mirrored transforms reverse winding while normals stay outward, so front_facing would invert them
+  const bool flipped = slot >= PositionSlots || det3(slot < gx::MaxPnMtx ? gx::g_gxState.pnMtx[slot].pos
+                                                                         : gx::g_gxState.texMtxs[slot - gx::MaxPnMtx]) *
+                                                        gx::g_gxState.proj[0][0] * gx::g_gxState.proj[1][1] <
+                                                    0.0;
+  g_frame.mirrored += flipped ? 1 : 0;
+  return flipped;
 }
 
 bool set_camera_frame(const scene::motion::MotionFrame& frame) noexcept {

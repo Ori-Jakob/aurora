@@ -35,6 +35,7 @@ struct Options {
   bool unlitCheck = false;
   bool companionCheck = false;
   bool overlayCheck = false;
+  bool classCheck = false;
   bool hints = true;
 
   bool checkHints = false;

@@ -64,6 +64,25 @@ struct MaterialRecord {
 static_assert(sizeof(MaterialRecord) == 32);
 static_assert(std::is_trivially_copyable_v<MaterialRecord>);
 
+enum ScalarBit : uint8_t {
+  ScalarRoughness = 1u << 0,
+  ScalarMetalness = 1u << 1,
+  ScalarNormalStrength = 1u << 2,
+  ScalarNormalFlipY = 1u << 3,
+};
+
+struct MaterialScalars {
+  float roughness = 0.f;
+  float metalness = 0.f;
+  float normalStrength = 0.f;
+  uint8_t set = 0;
+  bool normalFlipY = false;
+
+  bool operator==(const MaterialScalars&) const = default;
+};
+
+MaterialScalars decode_scalars(yyjson_val* entry) noexcept;
+
 struct KeyTable {
   std::vector<texture::TextureSourceKey> keys;
   std::vector<std::string> names;
@@ -86,6 +105,7 @@ struct Snapshot {
   uint64_t bindEpoch = 0;
   std::shared_ptr<const KeyTable> keyTable;
   std::vector<MaterialRecord> records;
+  std::vector<MaterialScalars> scalars;
   std::vector<yyjson_val*> entries;
   std::vector<std::array<uint32_t, MapRoleCount>> mapSupplier;
   std::vector<std::string> classes;
@@ -100,6 +120,7 @@ struct Snapshot {
 
   uint16_t find(const texture::TextureSourceKey& key) const noexcept;
   const MaterialRecord& record(uint32_t id) const noexcept;
+  const MaterialScalars& scalars_of(uint32_t id) const noexcept;
   bool live(uint32_t id) const noexcept;
   const texture::TextureSourceKey* key(uint32_t id) const noexcept;
   std::string_view key_name(uint32_t id) const noexcept;

@@ -450,6 +450,10 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     info.unlitRawVtx = plan.rawVtx;
     info.unlitLayerStages = plan.layerStages;
     info.unlitAdmitted = unlit::admitted(plan, config, base);
+    const unlit::Ambient ambient = unlit::ambient_channel(config, plan);
+    info.unlitAmbient = static_cast<u8>(ambient.source);
+    info.unlitAmbientChannel = ambient.channel;
+    info.unlitAmbientRaw = ambient.rawVertex;
     if (info.unlitAdmitted) {
       info.varyings = static_cast<u8>(base + unlit::raw_vertex_varyings(plan));
     }

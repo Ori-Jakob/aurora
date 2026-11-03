@@ -217,6 +217,55 @@ struct CompanionCheckSummary {
   f32 minTilt = 0.f;
 };
 
+inline constexpr u32 ClassPipelineWaitFrame = 4;
+inline constexpr u32 ClassCheckFirstFrame = 18;
+inline constexpr u32 ClassEditFrame = 20;
+inline constexpr u32 ClassCheckSecondFrame = 30;
+inline constexpr u32 ClassBlendOneFrame = 31;
+inline constexpr u32 ClassCheckThirdFrame = 38;
+inline constexpr u32 ClassPhaseCount = 3;
+inline constexpr u8 ClassHintRegistered = 200;
+inline constexpr u8 ClassHintUnregistered = 210;
+inline constexpr u8 ClassHintFoliage = 7;
+inline constexpr std::array<u8, 3> ClassAmbient{64, 128, 191};
+inline constexpr std::array<u8, 3> ClassVertex{128, 128, 128};
+inline constexpr std::array<u8, 3> ClassChannel1Vertex{200, 100, 50};
+inline constexpr u32 ClassEditedRoughness = 128;
+
+enum class ClassQuad : u32 {
+  Plain,
+  Rock,
+  Scalars,
+  FakeShadow,
+  Lava,
+  Dry,
+  Hint,
+  UnregisteredHint,
+  RockHint,
+  BackFace,
+  CullFront,
+  Mirrored,
+  Foliage,
+  Player,
+  Ambient,
+  Channel1,
+  Count,
+};
+
+enum class ClassPhase : u32 { First, Edited, BlendOne };
+
+struct ClassSample {
+  ClassQuad quad = ClassQuad::Plain;
+  std::array<f32, 4> normal{};
+  std::array<u32, 4> surface{};
+};
+
+struct ClassCheckSummary {
+  u32 probes = 0;
+  u32 failures = 0;
+  std::string first;
+};
+
 VignetteParams vignette_params(u32 frame) noexcept;
 bool is_unknown_anchor_warning(AuroraLogLevel level, std::string_view module, std::string_view message) noexcept;
 std::optional<std::string> check_depth_probe(std::span<const f32, 4> values, bool reversedZ);
@@ -230,4 +279,7 @@ std::optional<std::string> check_unlit(const UnlitCheckSummary& summary);
 CompanionCheckSummary summarize_companions(std::span<const std::vector<CompanionSample>, CompanionPhaseCount> phases,
                                            const CompanionAxes& axes);
 std::optional<std::string> check_companions(const CompanionCheckSummary& summary);
+ClassCheckSummary summarize_classes(std::span<const std::vector<ClassSample>, ClassPhaseCount> phases,
+                                    bool bakedVertex);
+std::optional<std::string> check_classes(const ClassCheckSummary& summary);
 } // namespace render_demo

@@ -1,6 +1,7 @@
 #include "material_contract_check.hpp"
 
 #include "io.hpp"
+#include "render/material/classes.hpp"
 #include "render/material/gx_lookup.hpp"
 #include "render/material/manifest.hpp"
 #include "render/material/registry.hpp"
@@ -11,10 +12,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -1407,6 +1410,326 @@ TEST_F(MaterialRegistryTest, GxLookupFindsRegisteredKey) {
   EXPECT_EQ(texture::material_hits(paletteKey), paletteHits + 2);
   EXPECT_EQ(texture::material_hits(texture::format_material_key(*palettedB)), paletteHits + 2);
   EXPECT_EQ(texture::material_hits("tex1_8x8_not_a_key"), 0u);
+}
+
+TEST_F(MaterialRegistryTest, ScalarsDecoded) {
+  const std::string text = manifest_with(
+      R"("tex1_16x16_000000000000a001_14":{"roughness":0.25,"metalness":1,"normalStrength":2.5,"normalFlipY":true},)"
+      R"("tex1_16x16_000000000000a002_14":{"metalness":0},"tex1_16x16_000000000000d001_$_9":{"normalFlipY":false})");
+  ASSERT_EQ(add(text).status, MaterialManifestStatus::Accepted);
+  const auto snap = material::snapshot();
+  ASSERT_EQ(snap->scalars.size(), snap->records.size());
+  const material::MaterialScalars& a = snap->scalars_of(find_id(KeyA));
+  EXPECT_EQ(a, (material::MaterialScalars{.roughness = 0.25f,
+                                          .metalness = 1.f,
+                                          .normalStrength = 2.5f,
+                                          .set = material::ScalarRoughness | material::ScalarMetalness |
+                                                 material::ScalarNormalStrength | material::ScalarNormalFlipY,
+                                          .normalFlipY = true}));
+  EXPECT_EQ(snap->scalars_of(find_id(KeyB)), (material::MaterialScalars{.set = material::ScalarMetalness}));
+  texture::TextureSourceKey palette = key_of(KeyPalette);
+  palette.tlutHash = 0x1234;
+  EXPECT_EQ(snap->scalars_of(snap->find(palette)), (material::MaterialScalars{.set = material::ScalarNormalFlipY}));
+  EXPECT_EQ(snap->scalars_of(0), material::MaterialScalars{});
+  EXPECT_EQ(snap->scalars_of(70000), material::MaterialScalars{});
+  EXPECT_EQ(snap->record(find_id(KeyA)).summary, 0u);
+}
+
+namespace classes = material::classes;
+using render::OpenPbrParams;
+
+class MaterialClasses : public MaterialRegistryTest {
+protected:
+  void SetUp() override {
+    MaterialRegistryTest::SetUp();
+    classes::testing::reset();
+  }
+
+  void TearDown() override {
+    classes::testing::reset();
+    MaterialRegistryTest::TearDown();
+  }
+
+  static void latch() {
+    material::latch();
+    classes::apply_frame_state(*material::latched_snapshot());
+  }
+
+  static uint32_t word(uint16_t classId, uint16_t rough, uint16_t metal, uint8_t hint,
+                       classes::Source* source = nullptr) {
+    const std::array<uint16_t, classes::FieldCount> ids{classId, rough, metal};
+    classes::Source out{};
+    const uint32_t value = classes::material_word(ids.data(), hint, 0, GX_CULL_BACK, false, out);
+    if (source != nullptr) {
+      *source = out;
+    }
+    return value;
+  }
+
+  static uint8_t class_of(uint32_t value) { return static_cast<uint8_t>((value >> 16) & 0xFFu); }
+};
+
+TEST_F(MaterialClasses, BuiltInTableIsAppendOnly) {
+  constexpr std::array<std::string_view, 8> Names{"default",     "ground/grass", "ground/dirt",   "ground/rock",
+                                                  "ground/sand", "ground/snow",  "foliage/grass", "water/edge"};
+  const auto builtIn = classes::built_ins();
+  ASSERT_EQ(builtIn.size(), Names.size());
+  for (size_t i = 0; i < Names.size(); ++i) {
+    EXPECT_EQ(builtIn[i].id, i + 1);
+    EXPECT_EQ(builtIn[i].name, Names[i]);
+    EXPECT_EQ(classes::resolve(Names[i]), i + 1);
+  }
+  EXPECT_EQ(builtIn[0].params, OpenPbrParams{});
+  constexpr std::array<float, 8> Roughness{0.85f, 0.9f, 0.9f, 0.8f, 0.95f, 0.6f, 0.55f, 0.3f};
+  for (size_t i = 0; i < Names.size(); ++i) {
+    EXPECT_EQ(builtIn[i].params.specularRoughness, Roughness[i]) << Names[i];
+    EXPECT_EQ(builtIn[i].params.baseMetalness, 0.f) << Names[i];
+  }
+  for (size_t i = 1; i < 6; ++i) {
+    EXPECT_EQ(builtIn[i].params.baseDiffuseRoughness, 0.5f) << Names[i];
+  }
+  const OpenPbrParams& foliage = builtIn[6].params;
+  EXPECT_TRUE(foliage.geometryThinWalled && foliage.twoSided && foliage.noSsr);
+  EXPECT_EQ(foliage.thinWalledWrap, 0.5f);
+  EXPECT_EQ(foliage.subsurfaceWeight, 0.f);
+  EXPECT_EQ(classes::default_word(true), 0x800100D9u);
+  EXPECT_EQ(word(0, 0, 0, 0), 0x800100D9u);
+  EXPECT_EQ(classes::FirstAurora, 9u);
+  EXPECT_EQ(classes::FirstGame, 128u);
+  EXPECT_EQ(classes::Reserved, 255u);
+}
+
+TEST_F(MaterialClasses, FixtureClassNamesResolve) {
+  EXPECT_EQ(classes::resolve("ground/grass"), 2u);
+  EXPECT_EQ(classes::resolve("ground/dirt"), 3u);
+  EXPECT_EQ(classes::resolve("ground/rock"), 4u);
+  EXPECT_EQ(classes::resolve("ground/sand"), 5u);
+  EXPECT_EQ(classes::resolve("water/edge"), 8u);
+  EXPECT_EQ(classes::resolve("fake_shadow"), 0u);
+  EXPECT_EQ(classes::resolve("Ground Grass"), 1u);
+  EXPECT_FALSE(material::match_class("Ground Grass"));
+  const std::string text = manifest_with(
+      R"("tex1_16x16_000000000000a001_14":{"class":"fake_shadow"},"tex1_16x16_000000000000a002_14":{"class":"ground/sand"})");
+  ASSERT_EQ(add(text).status, MaterialManifestStatus::Accepted);
+  latch();
+  EXPECT_EQ(classes::supplied(find_id(KeyA)), classes::FieldClass);
+  EXPECT_EQ(classes::manifest_class(find_id(KeyA)), 0u);
+  EXPECT_EQ(classes::manifest_class(find_id(KeyB)), 5u);
+  EXPECT_EQ(word(find_id(KeyA), 0, 0, 0), 0u);
+  EXPECT_EQ(class_of(word(find_id(KeyB), 0, 0, 0)), 5u);
+}
+
+TEST_F(MaterialClasses, UnknownNameFallsBackByPrefixThenDefault) {
+  EXPECT_EQ(classes::resolve("ground/grass/dry"), 2u);
+  EXPECT_EQ(classes::resolve("ground/grass/dry/tall"), 2u);
+  EXPECT_EQ(classes::resolve("ground/lava"), 1u);
+  EXPECT_EQ(classes::resolve("ground"), 1u);
+  EXPECT_EQ(classes::resolve("fake_shadow/soft"), 0u);
+  const std::string text = manifest_with(
+      R"("tex1_16x16_000000000000a001_14":{"class":"ground/lava"},"tex1_16x16_000000000000a002_14":{"class":"ground/lava"})");
+  ASSERT_EQ(add(text).status, MaterialManifestStatus::Accepted);
+  latch();
+  EXPECT_EQ(classes::manifest_class(find_id(KeyA)), 1u);
+  latch();
+  EXPECT_EQ(classes::stats().unknownNames, 1u);
+}
+
+TEST_F(MaterialClasses, RegisterRejectsReservedRangeAndDuplicates) {
+  for (const uint8_t id : {uint8_t{0}, uint8_t{1}, uint8_t{255}}) {
+    EXPECT_FALSE(classes::register_class(id, "game/stone", {})) << int{id};
+  }
+  EXPECT_FALSE(classes::register_class(9, "game/stone", {}));
+  EXPECT_FALSE(classes::register_class(2, "ground/dirt", {}));
+  EXPECT_TRUE(classes::register_class(2, "ground/grass", {}));
+  EXPECT_FALSE(classes::register_class(128, "Game Stone", {}));
+  EXPECT_FALSE(classes::register_class(128, std::string(65, 'a'), {}));
+  EXPECT_FALSE(classes::register_class(128, "fake_shadow", {}));
+  EXPECT_FALSE(classes::register_class(128, "ground/rock", {}));
+  EXPECT_TRUE(classes::register_class(128, "game/stone", {}));
+  EXPECT_FALSE(classes::register_class(129, "game/stone", {}));
+  EXPECT_FALSE(classes::register_class(128, "game/brick", {}));
+  OpenPbrParams shiny;
+  shiny.specularRoughness = 0.2f;
+  EXPECT_TRUE(classes::register_class(128, "game/stone", shiny));
+  EXPECT_TRUE(classes::register_class(254, std::string(64, 'a'), {}));
+  const classes::Stats stats = classes::stats();
+  EXPECT_EQ(stats.builtIn, 8u);
+  EXPECT_EQ(stats.registered, 4u);
+  EXPECT_EQ(stats.rejected, 11u);
+  latch();
+  EXPECT_EQ(classes::params(128).specularRoughness, 0.2f);
+}
+
+TEST_F(MaterialClasses, RegisterTakesEffectAtLatch) {
+  const uint64_t before = classes::epoch();
+  const std::shared_ptr<const classes::GpuRows> rows = classes::gpu_rows();
+  ASSERT_TRUE(classes::register_class(200, "test/coat", {}));
+  EXPECT_FALSE(classes::present(200));
+  EXPECT_EQ(class_of(word(0, 0, 0, 200)), 1u);
+  EXPECT_EQ(classes::epoch(), before);
+  EXPECT_EQ(classes::gpu_rows(), rows);
+  latch();
+  EXPECT_TRUE(classes::present(200));
+  EXPECT_EQ(classes::epoch(), before + 1);
+  EXPECT_NE(classes::gpu_rows(), rows);
+  EXPECT_EQ(class_of(word(0, 0, 0, 200)), 200u);
+  latch();
+  EXPECT_EQ(classes::epoch(), before + 1);
+  OpenPbrParams coat;
+  coat.coatWeight = 1.f;
+  ASSERT_TRUE(classes::register_class(200, "test/coat", coat));
+  latch();
+  EXPECT_EQ(classes::epoch(), before + 2);
+  EXPECT_EQ((*classes::gpu_rows())[200].v[7], 1.f);
+  EXPECT_EQ(classes::stats().unregisteredHints, 1u);
+}
+
+TEST_F(MaterialClasses, RegistryRenumberingKeepsTableIds) {
+  const std::string first = manifest_with(R"("tex1_16x16_000000000000a002_14":{"class":"water/edge"})");
+  ASSERT_EQ(add(first).status, MaterialManifestStatus::Accepted);
+  latch();
+  const uint16_t edge = find_id(KeyB);
+  const uint16_t registryId = material::latched_snapshot()->record(edge).classId;
+  EXPECT_EQ(classes::manifest_class(edge), 8u);
+  const std::string second = manifest_with(R"("tex1_16x16_000000000000a001_14":{"class":"ground/dirt"})");
+  ASSERT_EQ(add(second, MaterialLayer::Pack, "second").status, MaterialManifestStatus::Accepted);
+  latch();
+  EXPECT_NE(material::latched_snapshot()->record(edge).classId, registryId);
+  EXPECT_EQ(classes::manifest_class(edge), 8u);
+  EXPECT_EQ(classes::manifest_class(find_id(KeyA)), 3u);
+}
+
+TEST_F(MaterialClasses, PrecedenceForceManifestHintDefault) {
+  ASSERT_TRUE(classes::register_class(200, "test/coat", {}));
+  const std::string text = manifest_with(R"("tex1_16x16_000000000000a001_14":{"class":"ground/rock"})");
+  ASSERT_EQ(add(text).status, MaterialManifestStatus::Accepted);
+  latch();
+  const uint16_t rock = find_id(KeyA);
+  classes::Source source{};
+  EXPECT_EQ(class_of(word(rock, 0, 0, 200, &source)), 4u);
+  EXPECT_EQ(source, classes::Source::Manifest);
+  EXPECT_EQ(class_of(word(0, 0, 0, 200, &source)), 200u);
+  EXPECT_EQ(source, classes::Source::Hint);
+  EXPECT_EQ(class_of(word(0, 0, 0, 7, &source)), 7u);
+  EXPECT_EQ(class_of(word(0, 0, 0, 201, &source)), 1u);
+  EXPECT_EQ(source, classes::Source::Hint);
+  EXPECT_EQ(class_of(word(0, 0, 0, 255, &source)), 1u);
+  EXPECT_EQ(class_of(word(0, 0, 0, 0, &source)), 1u);
+  EXPECT_EQ(source, classes::Source::Default);
+  classes::set_force("ground/sand");
+  latch();
+  EXPECT_EQ(class_of(word(rock, 0, 0, 200, &source)), 5u);
+  EXPECT_EQ(source, classes::Source::Force);
+  classes::set_force("fake_shadow");
+  latch();
+  EXPECT_EQ(word(rock, 0, 0, 200, &source), 0u);
+  classes::set_force("");
+  latch();
+  EXPECT_EQ(class_of(word(rock, 0, 0, 200, &source)), 4u);
+  EXPECT_EQ(classes::stats().unregisteredHints, 2u);
+}
+
+TEST_F(MaterialClasses, GpuRowsLayout) {
+  OpenPbrParams p;
+  p.specularColor = {0.1f, 0.2f, 0.3f};
+  p.specularWeight = 0.4f;
+  p.coatColor = {0.5f, 0.6f, 0.7f};
+  p.coatWeight = 0.8f;
+  p.fuzzColor = {0.11f, 0.12f, 0.13f};
+  p.fuzzWeight = 0.14f;
+  p.subsurfaceColor = {0.21f, 0.22f, 0.23f};
+  p.subsurfaceWeight = 0.24f;
+  p.emissionColor = {0.31f, 0.32f, 0.33f};
+  p.emissionScale = 3.5f;
+  p.specularIor = 1.4f;
+  p.coatIor = 1.7f;
+  p.coatRoughness = 0.41f;
+  p.coatDarkening = 0.42f;
+  p.baseDiffuseRoughness = 0.51f;
+  p.fuzzRoughness = 0.52f;
+  p.subsurfaceScatterAnisotropy = -0.53f;
+  p.baseWeight = 0.54f;
+  p.specularRoughness = 0.61f;
+  p.baseMetalness = 0.62f;
+  p.geometryThinWalled = true;
+  p.noSsr = true;
+  p.thinWalledWrap = 0.63f;
+  const classes::GpuRow row = classes::gpu_row(p);
+  const std::array<float, 32> expected{0.1f,
+                                       0.2f,
+                                       0.3f,
+                                       0.4f,
+                                       0.5f,
+                                       0.6f,
+                                       0.7f,
+                                       0.8f,
+                                       0.11f,
+                                       0.12f,
+                                       0.13f,
+                                       0.14f,
+                                       0.21f,
+                                       0.22f,
+                                       0.23f,
+                                       0.24f,
+                                       0.31f,
+                                       0.32f,
+                                       0.33f,
+                                       3.5f,
+                                       1.4f,
+                                       1.7f,
+                                       0.41f,
+                                       0.42f,
+                                       0.51f,
+                                       0.52f,
+                                       -0.53f,
+                                       0.54f,
+                                       0.61f,
+                                       0.62f,
+                                       std::bit_cast<float>(5u),
+                                       0.63f};
+  EXPECT_EQ(row.v, expected);
+  EXPECT_EQ(std::bit_cast<uint32_t>(classes::gpu_row(classes::built_ins()[6].params).v[30]),
+            classes::RowThin | classes::RowTwoSided | classes::RowNoSsr);
+  ASSERT_TRUE(classes::register_class(200, "test/row", p));
+  latch();
+  const classes::GpuRows& rows = *classes::gpu_rows();
+  const classes::GpuRow defaultRow = classes::gpu_row(OpenPbrParams{});
+  EXPECT_EQ(rows[1], defaultRow);
+  EXPECT_EQ(rows[0], defaultRow);
+  EXPECT_EQ(rows[255], defaultRow);
+  EXPECT_EQ(rows[9], defaultRow);
+  EXPECT_EQ(rows[201], defaultRow);
+  EXPECT_EQ(rows[200], row);
+  EXPECT_EQ(rows[4], classes::gpu_row(classes::built_ins()[3].params));
+}
+
+TEST_F(MaterialClasses, ParamsSanitised) {
+  constexpr float NaN = std::numeric_limits<float>::quiet_NaN();
+  OpenPbrParams p;
+  p.baseWeight = 2.f;
+  p.specularRoughness = NaN;
+  p.specularColor = {-1.f, NaN, 4.f};
+  p.specularIor = 0.5f;
+  p.coatIor = 9.f;
+  p.subsurfaceScatterAnisotropy = -3.f;
+  p.emissionScale = std::numeric_limits<float>::infinity();
+  p.thinWalledWrap = 1.5f;
+  p.fuzzRoughness = -0.5f;
+  const OpenPbrParams s = classes::sanitised(p);
+  EXPECT_EQ(s.baseWeight, 1.f);
+  EXPECT_EQ(s.specularRoughness, 0.85f);
+  EXPECT_EQ(s.specularColor, (std::array<float, 3>{0.f, 1.f, 1.f}));
+  EXPECT_EQ(s.specularIor, 1.f);
+  EXPECT_EQ(s.coatIor, 3.f);
+  EXPECT_EQ(s.subsurfaceScatterAnisotropy, -1.f);
+  EXPECT_EQ(s.emissionScale, 1.f);
+  EXPECT_EQ(s.thinWalledWrap, 1.f);
+  EXPECT_EQ(s.fuzzRoughness, 0.f);
+  EXPECT_EQ(classes::sanitised(OpenPbrParams{}), OpenPbrParams{});
+  ASSERT_TRUE(classes::register_class(130, "test/clamped", p));
+  latch();
+  EXPECT_EQ(classes::params(130), s);
+  EXPECT_EQ(word(0, 0, 0, 130) & 0xFFu, 217u);
 }
 } // namespace
 } // namespace aurora::test

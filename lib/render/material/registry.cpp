@@ -456,7 +456,27 @@ MaterialRecord decode_record(yyjson_val* entry, uint16_t id, const std::map<std:
   }
   return record;
 }
+} // namespace
 
+MaterialScalars decode_scalars(yyjson_val* entry) noexcept {
+  MaterialScalars scalars;
+  const auto read = [&](std::string_view field, ScalarBit bit, float& out) {
+    if (yyjson_val* value = member(entry, field); yyjson_is_num(value)) {
+      out = static_cast<float>(yyjson_get_num(value));
+      scalars.set |= bit;
+    }
+  };
+  read("roughness", ScalarRoughness, scalars.roughness);
+  read("metalness", ScalarMetalness, scalars.metalness);
+  read("normalStrength", ScalarNormalStrength, scalars.normalStrength);
+  if (yyjson_val* flip = member(entry, "normalFlipY"); yyjson_is_bool(flip)) {
+    scalars.normalFlipY = yyjson_get_bool(flip);
+    scalars.set |= ScalarNormalFlipY;
+  }
+  return scalars;
+}
+
+namespace {
 struct Built {
   std::shared_ptr<Snapshot> snapshot;
   bool bindChanged = false;
@@ -493,6 +513,7 @@ Built build_full(State& s, MergeOutput& merged, std::vector<Contributor> contrib
   const size_t idCount = s.keyTable->keys.size();
   next->keyTable = s.keyTable;
   next->records.resize(idCount);
+  next->scalars.resize(idCount);
   next->entries.resize(idCount);
   next->mapSupplier = suppliers_by_id(s, merged.materials, idCount);
   next->mergedText = std::move(merged.text);
@@ -530,6 +551,7 @@ Built build_full(State& s, MergeOutput& merged, std::vector<Contributor> contrib
   for (const auto& [id, entry] : live) {
     const MaterialRecord record = decode_record(entry, id, classIds);
     next->records[id] = record;
+    next->scalars[id] = decode_scalars(entry);
     next->entries[id] = entry;
     index->ids.emplace(s.keyTable->keys[id], id);
     for (uint32_t bit = 0; bit < 32; ++bit) {
@@ -892,6 +914,11 @@ uint16_t Snapshot::find(const texture::TextureSourceKey& key) const noexcept {
 const MaterialRecord& Snapshot::record(uint32_t id) const noexcept {
   static constexpr MaterialRecord Empty{};
   return id < records.size() ? records[id] : Empty;
+}
+
+const MaterialScalars& Snapshot::scalars_of(uint32_t id) const noexcept {
+  static constexpr MaterialScalars Empty{};
+  return id < scalars.size() ? scalars[id] : Empty;
 }
 
 bool Snapshot::live(uint32_t id) const noexcept { return id != 0 && id < records.size() && records[id].id != 0; }

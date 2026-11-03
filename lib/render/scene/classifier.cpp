@@ -219,7 +219,7 @@ bool Classifier::stage(Stage stage) noexcept {
 void Classifier::material(uint32_t materialClass) noexcept {
   Entry& entry = innermost();
   entry.hasMaterial = true;
-  entry.materialClass = static_cast<uint8_t>(materialClass & 0xFF);
+  entry.materialClass = static_cast<uint8_t>(std::min(materialClass, 255u));
   m_keyDirty = true;
 }
 

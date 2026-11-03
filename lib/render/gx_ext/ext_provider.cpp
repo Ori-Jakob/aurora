@@ -4,6 +4,7 @@
 #include "unlit.hpp"
 
 #include "../frame_state.hpp"
+#include "../material/classes.hpp"
 #include "../material/registry.hpp"
 #include "../post/composite.hpp"
 #include "../settings.hpp"
@@ -156,6 +157,7 @@ gx::RenderExtConfig derive(void*, const gx::PipelineConfig& config, const gx::Sh
     if (ext.output == 1 && gfx::layout_has_surface(layout) &&
         unlit::output2(config, info, gx::render_ext::g_drawInputs)) {
       ext.output = 2;
+      ext.surfaceExt = unlit::surface_ext(config, info, gx::render_ext::g_drawInputs) ? 1 : 0;
       ext.layer0 = layer0_for(config, info);
       if (ext.layer0 != 0) {
         g_layerDraws.fetch_add(1, std::memory_order_relaxed);
@@ -201,6 +203,7 @@ void apply_companions(const detail::FrameState& state) noexcept {
   if (gx::render_ext::set_companion_gates(gates)) {
     gx::texture::invalidate_bindings();
   }
+  records::set_back_face_flip(gates.normals && unlit::classes_enabled());
   if (consumer && g_snapshot != nullptr && !g_warnedManifestMaps) {
     uint32_t mapped = 0;
     for (uint32_t role = 0; role < ManifestMapRoleCount; ++role) {
@@ -232,6 +235,7 @@ void apply_frame_state(const detail::FrameState& state) noexcept {
   if (generationChanged) {
     g_snapshot = std::move(latched);
   }
+  material::classes::apply_frame_state(*g_snapshot);
   const bool force = g_testForce || g_env == EnvMode::All;
   const bool gateOpen = g_env == EnvMode::On || (state.settings.stochasticTiling && state.settings.textureMaterials);
   const bool want = force || (gateOpen && g_snapshot->summaryCount[0] != 0);
@@ -249,6 +253,7 @@ void shutdown() noexcept {
   }
   unlit::shutdown();
   records::shutdown();
+  material::classes::shutdown();
   gx::render_ext::set_hooks(nullptr);
   gx::render_ext::set_companion_gates({});
   g_snapshot.reset();

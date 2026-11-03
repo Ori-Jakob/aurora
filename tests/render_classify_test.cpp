@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <set>
 #include <string_view>
+#include <utility>
 
 namespace aurora::render::scene {
 namespace {
@@ -324,12 +325,20 @@ TEST_F(RenderClassify, MaterialAndTevPolicyFollowInnermost) {
   classifier.material(0x1234);
   const DrawClass& inside = classifier.route(main_draw());
   EXPECT_EQ(inside.key.tevPolicy, 0x10u);
-  EXPECT_EQ(inside.key.materialClass, 0x34u);
+  EXPECT_EQ(inside.key.materialClass, 255u);
   classifier.object_end();
   const DrawClass& after = classifier.route(main_draw());
   EXPECT_EQ(after.key.tevPolicy, 0u);
   EXPECT_EQ(after.key.materialClass, 7u);
   EXPECT_EQ(stats().tevPolicyDraws, 1u);
+}
+
+TEST_F(RenderClassify, HintIdsAbove254AreUnregistered) {
+  for (const auto [hint, expected] : {std::pair{254u, 254u}, std::pair{255u, 255u}, std::pair{0x101u, 255u},
+                                      std::pair{0x1FFu, 255u}, std::pair{0xFFFFFFFFu, 255u}, std::pair{1u, 1u}}) {
+    classifier.material(hint);
+    EXPECT_EQ(classifier.route(main_draw()).key.materialClass, expected) << hint;
+  }
 }
 
 TEST_F(RenderClassify, TevPolicyKeepsNeutrals) {

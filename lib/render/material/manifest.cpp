@@ -76,6 +76,7 @@ bool match_grass_type_name(std::string_view text) noexcept {
 }
 
 bool match_sha256(std::string_view text) noexcept { return text.size() == 64 && all_of(text, is_lower_hex); }
+} // namespace
 
 bool match_class(std::string_view text) noexcept {
   size_t start = 0;
@@ -93,6 +94,7 @@ bool match_class(std::string_view text) noexcept {
   }
 }
 
+namespace {
 bool match_texture_wildcard(std::string_view text) noexcept {
   if (!text.starts_with("tex1_")) {
     return false;

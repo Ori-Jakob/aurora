@@ -1202,6 +1202,23 @@ std::string unlit_block(const std::string& text) {
   return begin == std::string::npos || end == std::string::npos ? std::string{} : text.substr(begin, end - begin);
 }
 
+constexpr std::string_view FrontFacing = ", @builtin(front_facing) gx_ff: bool";
+constexpr std::string_view FlipLet = "\n    let uflip = !gx_ff && (gx_record_word(1u) & 0x4000u) != 0u;";
+
+std::string without(std::string text, std::string_view needle, std::string_view with = {}) {
+  for (size_t pos = text.find(needle); pos != std::string::npos; pos = text.find(needle, pos + with.size())) {
+    text.replace(pos, needle.size(), with);
+  }
+  return text;
+}
+
+std::string without_flip(std::string text) {
+  text = without(std::move(text), FrontFacing);
+  text = without(std::move(text), FlipLet);
+  text = without(std::move(text), "select(unit_nrm, -unit_nrm, uflip)", "unit_nrm");
+  return without(std::move(text), "select(mapped_nrm, -mapped_nrm, uflip)", "mapped_nrm");
+}
+
 TEST_F(GxShaderExtTest, UnlitNeedsSurfaceAndMotionTargets) {
   const ShaderConfig config = modulate();
   const ShaderInfo info = build_shader_info(config);
@@ -1239,7 +1256,7 @@ TEST_F(GxShaderExtTest, UnlitLitPathIsPrefix) {
     twin.ext.output = 1;
     for (const ShaderTargets& targets : {PbrTargets, PbrIdTargets}) {
       for (const auto mode : {DstAlphaMode::None, DstAlphaMode::Replace}) {
-        const std::string unlit = build_shader_source(config, mode, targets);
+        const std::string unlit = without_flip(build_shader_source(config, mode, targets));
         const std::string lit = build_shader_source(twin, mode, targets);
         const std::string unlitBody = fs_body(unlit);
         const std::string litBody = fs_body(lit);
@@ -1555,12 +1572,15 @@ TEST_F(GxShaderExtTest, CompanionNormalSelectKeepsLegacyExpression) {
   const std::string plain = companion_text(base);
   const std::string text = companion_text(layered(base));
   constexpr std::string_view Alpha = "gbuffer_rx_alpha(imm._pad, nrm_len_sq)";
-  const std::string legacy = fmt::format("out.normal = vec4f(unit_nrm * 0.5 + 0.5, {});", Alpha);
+  const std::string legacy =
+      fmt::format("out.normal = vec4f(select(unit_nrm, -unit_nrm, uflip) * 0.5 + 0.5, {});", Alpha);
   EXPECT_EQ(count(plain, legacy), 1u);
   EXPECT_EQ(count(text, legacy), 0u);
-  EXPECT_EQ(count(text, fmt::format("let legacy_normal = vec4f(unit_nrm * 0.5 + 0.5, {});", Alpha)), 1u);
-  EXPECT_EQ(count(text, fmt::format("out.normal = select(legacy_normal, vec4f(mapped_nrm * 0.5 + 0.5, {}), "
-                                    "use_mapped);",
+  EXPECT_EQ(
+      count(text, fmt::format("let legacy_normal = vec4f(select(unit_nrm, -unit_nrm, uflip) * 0.5 + 0.5, {});", Alpha)),
+      1u);
+  EXPECT_EQ(count(text, fmt::format("out.normal = select(legacy_normal, vec4f(select(mapped_nrm, -mapped_nrm, uflip) "
+                                    "* 0.5 + 0.5, {}), use_mapped);",
                                     Alpha)),
             1u);
   EXPECT_NE(text.find("ubuf.mat0.y > 0.0 && (u32(ubuf.mat0.x) & 6u) != 0u && ubuf.proj[3].w == 0.0"),
@@ -1630,11 +1650,12 @@ TEST_F(GxShaderExtTest, AlbedoSubstitutesOnlyLayerPair) {
   EXPECT_TRUE(substituted(3));
   const std::string lit = text.substr(0, text.find(UnlitBlock));
   EXPECT_EQ(lit.find("cmp_alb.rgb"), std::string::npos);
-  EXPECT_NE(text.find("out.surface = gx_surface_pack(unlit_rgb, select(1.0, cmp_orm.r, uorm), select(0.85, cmp_orm.g, "
-                      "uorm), select(0.0, cmp_orm.b, uorm), "),
+  EXPECT_NE(text.find("out.surface = gx_surface_pack(unlit_rgb, select(1.0, cmp_orm.r, uorm), select(urough, "
+                      "cmp_orm.g * select(1.0, urough, (umat & 0x1000000u) != 0u), uorm), select(umetal, cmp_orm.b * "
+                      "select(1.0, umetal, (umat & 0x2000000u) != 0u), uorm), "),
             std::string::npos);
   const std::string plain = companion_text(modulate());
-  EXPECT_NE(plain.find("out.surface = gx_surface_pack(unlit_rgb, 1.0, 0.85, 0.0, "), std::string::npos);
+  EXPECT_NE(plain.find("out.surface = gx_surface_pack(unlit_rgb, 1.0, urough, umetal, "), std::string::npos);
 }
 
 TEST_F(GxShaderExtTest, CompanionPredicateLeavesTwinAndFallbackLegacy) {
@@ -1657,6 +1678,108 @@ TEST_F(GxShaderExtTest, CompanionPredicateLeavesTwinAndFallbackLegacy) {
       pipeline, gfx::compose_scene_layout({.gbuffer = true, .surface = true}, layout_base()));
   EXPECT_EQ(fallback.shaderConfig.ext.layer0, 0u);
   EXPECT_FALSE(uses_companions(fallback.shaderConfig, build_shader_info(fallback.shaderConfig), PbrTargets));
+}
+
+ShaderConfig keyed(ShaderConfig config) {
+  config.ext.surfaceExt = 1;
+  return config;
+}
+
+std::string surface_ext_member(const std::string& text) {
+  const size_t begin = text.find("out.surface_ext = ");
+  const size_t end = text.find(';', begin);
+  return begin == std::string::npos || end == std::string::npos ? std::string{} : text.substr(begin, end - begin + 1);
+}
+
+TEST_F(GxShaderExtTest, AmbientExtOnlyForVertexOrBaked) {
+  ShaderConfig vertexAmbient = ma00_like();
+  vertexAmbient.colorChannels[GX_COLOR0].ambSrc = GX_SRC_VTX;
+  ASSERT_EQ(unlit::ambient_of(vertexAmbient, build_shader_info(vertexAmbient)).source, unlit::AmbientSource::Vertex);
+  ASSERT_EQ(unlit::ambient_of(ma00_like(), build_shader_info(ma00_like())).source, unlit::AmbientSource::Register);
+  ASSERT_TRUE(unlit::ambient_of(ma00_like(), build_shader_info(ma00_like())).rawVertex);
+  ASSERT_FALSE(unlit::ambient_of(modulate(), build_shader_info(modulate())).rawVertex);
+
+  const std::string baked = build_shader_source(keyed(ma00_like()), DstAlphaMode::None, PbrTargets);
+  EXPECT_EQ(surface_ext_member(baked),
+            "out.surface_ext = gx_surface_ext_pack(select(vec3f(0.0), ubuf.cc0_amb.rgb * select(vec3f(1.0), in.ccv0, "
+            "((gx_record_word(1u) >> 3u) & 3u) == 1u), (umat & 0x80000000u) != 0u), vec3f(0.0));");
+  const std::string vertex = build_shader_source(keyed(vertexAmbient), DstAlphaMode::None, PbrTargets);
+  EXPECT_EQ(surface_ext_member(vertex),
+            "out.surface_ext = gx_surface_ext_pack(select(vec3f(0.0), in.ccv0 * select(vec3f(1.0), in.ccv0, "
+            "((gx_record_word(1u) >> 3u) & 3u) == 1u), (umat & 0x80000000u) != 0u), vec3f(0.0));");
+  EXPECT_EQ(surface_ext_member(build_shader_source(keyed(modulate()), DstAlphaMode::None, PbrTargets)),
+            "out.surface_ext = gx_surface_ext_pack(select(vec3f(0.0), ubuf.cc0_amb.rgb, (umat & 0x80000000u) != 0u), "
+            "vec3f(0.0));");
+  for (const ShaderConfig& config : {modulate(), ma00_like(), vertexAmbient}) {
+    for (const ShaderTargets& targets : {PbrTargets, PbrIdTargets}) {
+      const std::string plain = build_shader_source(config, DstAlphaMode::None, targets);
+      EXPECT_EQ(plain.find("out.surface_ext"), std::string::npos);
+      EXPECT_EQ(plain.find("surface_ext:"), std::string::npos);
+      EXPECT_EQ(plain.find("_amb.rgb"), std::string::npos);
+    }
+  }
+}
+
+TEST_F(GxShaderExtTest, MaterialWordAddsNoVaryings) {
+  ShaderConfig vertexAmbient = ma00_like();
+  vertexAmbient.colorChannels[GX_COLOR0].ambSrc = GX_SRC_VTX;
+  for (const ShaderConfig& config : {modulate(), ma00_like(), vertexAmbient, crowded(MaxTexCoord - 1)}) {
+    ASSERT_TRUE(build_shader_info(config).unlitAdmitted);
+    ShaderConfig twin = config;
+    twin.ext.output = 1;
+    for (const ShaderTargets& targets : {PbrTargets, PbrIdTargets}) {
+      const std::string text = build_shader_source(config, DstAlphaMode::None, targets);
+      const std::string keyedText = build_shader_source(keyed(config), DstAlphaMode::None, targets);
+      EXPECT_NE(text.find("let umat = gx_record_word(5u);"), std::string::npos);
+      EXPECT_EQ(vertex_output(keyedText), vertex_output(text));
+      EXPECT_EQ(location_count(text), varying_count(config, targets));
+      EXPECT_EQ(location_count(keyedText), varying_count(keyed(config), targets));
+      EXPECT_EQ(varying_count(keyed(config), targets), varying_count(config, targets));
+      EXPECT_EQ(build_shader_info(keyed(config)).varyings, build_shader_info(config).varyings);
+      EXPECT_EQ(build_shader_info(config).uniformSize, build_shader_info(twin).uniformSize);
+      EXPECT_EQ(uniform_struct(text), uniform_struct(build_shader_source(twin, DstAlphaMode::None, targets)));
+    }
+  }
+}
+
+TEST_F(GxShaderExtTest, BackFaceFlipOnlyInOutput2Text) {
+  for (const ShaderConfig& config : {modulate(), ma00_like(), layered(modulate())}) {
+    for (const ShaderTargets& targets : {PbrTargets, PbrIdTargets}) {
+      const std::string text = build_shader_source(config, DstAlphaMode::None, targets);
+      EXPECT_EQ(count(text, FrontFacing), 1u);
+      EXPECT_EQ(count(text, FlipLet), 1u);
+      EXPECT_NE(fs_body(text).find(std::string{"fn fs_main(in: VertexOutput"} + std::string{FrontFacing} + ")"),
+                std::string::npos);
+    }
+    for (const u8 output : {u8{0}, u8{1}}) {
+      for (const ShaderTargets& targets : {PbrTargets, PbrIdTargets, GbufferTargets, ShaderTargets{}}) {
+        const std::string text = build_shader_source(with_output(config, output), DstAlphaMode::None, targets);
+        EXPECT_EQ(text.find("gx_ff"), std::string::npos) << int{output};
+        EXPECT_EQ(text.find("uflip"), std::string::npos) << int{output};
+      }
+    }
+    ShaderTargets noMotion = PbrTargets;
+    noMotion.motion = UINT32_MAX;
+    EXPECT_EQ(build_shader_source(config, DstAlphaMode::None, noMotion).find("gx_ff"), std::string::npos);
+  }
+}
+
+TEST_F(GxShaderExtTest, LegacyAndBaseTextUnchanged) {
+  size_t checked = 0;
+  for (const corpus::Entry& entry : corpus::generate_synthetic()) {
+    ShaderConfig config = corpus::decode(entry.record);
+    for (const u8 output : {u8{0}, u8{1}}) {
+      config.ext = {.output = output};
+      for (const ShaderTargets& targets : {ShaderTargets{}, ShaderTargets{.normal = 1}, GbufferTargets, PbrTargets}) {
+        const std::string text = build_shader_source(config, DstAlphaMode::None, targets);
+        for (const std::string_view token : {"umat", "urough", "gx_ff", "uflip", "_amb.rgb, (umat"}) {
+          EXPECT_EQ(text.find(token), std::string::npos) << token;
+        }
+        ++checked;
+      }
+    }
+  }
+  EXPECT_GT(checked, 0u);
 }
 
 TEST_F(GxShaderExtTest, CompanionWithForwardEnvironmentIsRefused) {

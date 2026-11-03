@@ -2,6 +2,7 @@
 
 #include <aurora/render_caps.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -280,4 +281,39 @@ struct DrawRouteCounters {
 };
 
 DrawRouteCounters draw_route_counters() noexcept;
+
+// M10
+struct OpenPbrParams {
+  float baseWeight = 1.f;
+  float baseMetalness = 0.f;
+  float baseDiffuseRoughness = 0.f;
+  float specularWeight = 1.f;
+  std::array<float, 3> specularColor{1.f, 1.f, 1.f};
+  // Used where no orm map or manifest value exists; 0.85 is aurora's default, not OpenPBR's 0.3
+  float specularRoughness = 0.85f;
+  float specularIor = 1.5f;
+  float coatWeight = 0.f;
+  std::array<float, 3> coatColor{1.f, 1.f, 1.f};
+  float coatRoughness = 0.f;
+  float coatIor = 1.6f;
+  float coatDarkening = 1.f;
+  float fuzzWeight = 0.f;
+  std::array<float, 3> fuzzColor{1.f, 1.f, 1.f};
+  float fuzzRoughness = 0.5f;
+  float subsurfaceWeight = 0.f;
+  std::array<float, 3> subsurfaceColor{0.8f, 0.8f, 0.8f};
+  float subsurfaceScatterAnisotropy = 0.f;
+  std::array<float, 3> emissionColor{1.f, 1.f, 1.f};
+  // Multiplies the emit map in legacy-white units; OpenPBR's emission_luminance is in nits
+  float emissionScale = 1.f;
+  bool geometryThinWalled = false;
+  // Diffuse wrap for thin-walled surfaces, 0 to 1; OpenPBR has no such parameter
+  float thinWalledWrap = 0.f;
+  bool twoSided = false, noSsr = false;
+
+  bool operator==(const OpenPbrParams&) const = default;
+};
+
+// Game thread; takes effect at the next frame latch. Ids 128-254; 2-127 only to retune the built-in of the same name
+void register_material_class(uint8_t id, std::string_view name, const OpenPbrParams& params);
 } // namespace aurora::render

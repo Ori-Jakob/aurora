@@ -15,6 +15,7 @@
 #include <aurora/gpu_systems.hpp>
 #include <aurora/render.hpp>
 #include <aurora/render_caps.hpp>
+#include <aurora/texture.hpp>
 #include <aurora/trace.hpp>
 #include <dolphin/gx.h>
 #include <SDL3/SDL_stdinc.h>
@@ -59,14 +60,20 @@ enum ExitCode : int {
   ExitUnlitCheck = 15,
   ExitCompanionCheck = 16,
   ExitOverlayCheck = 17,
+  ExitClassCheck = 18,
 };
 
 std::atomic_uint32_t g_errorCount = 0;
 std::atomic_uint32_t g_anchorWarnings = 0;
+std::atomic_uint32_t g_unknownClassLines = 0;
 
 void log_callback(AuroraLogLevel level, const char* module, const char* message, unsigned int len) {
   if (render_demo::is_unknown_anchor_warning(level, module != nullptr ? module : "", {message, len})) {
     g_anchorWarnings.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (level == LOG_WARNING && module != nullptr && std::string_view{module} == "aurora::render::material" &&
+      std::string_view{message, len}.find("\"ground/lava\"") != std::string_view::npos) {
+    g_unknownClassLines.fetch_add(1, std::memory_order_relaxed);
   }
   const char* levelStr = "INFO";
   FILE* out = stdout;
@@ -295,6 +302,90 @@ UnlitOutcome unlit_outcome(const render_demo::UnlitCheckReport& report, bool nul
     outcome.failure = "check readback did not complete";
   } else {
     outcome.failure = render_demo::check_unlit(outcome.summary);
+  }
+  return outcome;
+}
+
+struct ClassRun {
+  std::string setupError;
+  aurora::texture::MaterialManifestRegistration manifest;
+  uint32_t createdAtEdit = 0;
+  uint32_t createdAfterEdit = 0;
+};
+
+aurora::render::OpenPbrParams class_params(int kind) {
+  aurora::render::OpenPbrParams params;
+  switch (kind) {
+  case 0:
+    params.coatWeight = 1.f;
+    params.coatRoughness = 0.1f;
+    break;
+  case 1:
+    params.baseMetalness = 1.f;
+    params.specularRoughness = 0.3f;
+    break;
+  case 2:
+    params.fuzzWeight = 1.f;
+    break;
+  default:
+    params.geometryThinWalled = true;
+    params.thinWalledWrap = 0.5f;
+    params.twoSided = true;
+    break;
+  }
+  return params;
+}
+
+void start_class_check(ClassRun& run) {
+  constexpr std::array<std::string_view, 4> Names{"test/coat", "test/metal", "test/fuzz", "test/thin"};
+  for (int i = 0; i < 4; ++i) {
+    aurora::render::register_material_class(static_cast<uint8_t>(render_demo::ClassHintRegistered + i), Names[i],
+                                            class_params(i));
+  }
+  const std::string text = render_demo::class_manifest(false);
+  run.manifest = aurora::texture::register_material_manifest(
+      text, {.layer = aurora::texture::MaterialLayer::User, .label = "render_demo class check"});
+  if (text.empty() || run.manifest.status != aurora::texture::MaterialManifestStatus::Accepted) {
+    run.setupError = "the class check manifest was not accepted";
+  }
+}
+
+void edit_class_check(ClassRun& run) {
+  run.createdAtEdit = aurora_get_stats()->createdPipelines;
+  aurora::render::OpenPbrParams coat = class_params(0);
+  coat.coatWeight = 0.5f;
+  aurora::render::register_material_class(render_demo::ClassHintRegistered, "test/coat", coat);
+  if (aurora::texture::update_material_manifest(run.manifest, render_demo::class_manifest(true)) !=
+      aurora::texture::MaterialManifestStatus::Accepted) {
+    run.setupError = "the edited class check manifest was not accepted";
+  }
+}
+
+struct ClassOutcome {
+  render_demo::ClassCheckSummary summary;
+  std::optional<std::string> failure;
+};
+
+ClassOutcome class_outcome(const render_demo::ClassCheckReport& report, const ClassRun& run, bool nullBackend) {
+  const char* vertexColor = SDL_getenv("AURORA_RENDER_VERTEX_COLOR");
+  const bool baked = vertexColor != nullptr && std::string_view{vertexColor} == "baked";
+  ClassOutcome outcome{.summary = render_demo::summarize_classes(report.phases, baked)};
+  const uint32_t compiles = run.createdAfterEdit - run.createdAtEdit;
+  const uint32_t unknownLines = g_unknownClassLines.load(std::memory_order_relaxed);
+  if (!run.setupError.empty()) {
+    outcome.failure = run.setupError;
+  } else if (unknownLines != 1) {
+    outcome.failure = "ground/lava logged " + std::to_string(unknownLines) + " unknown-class lines, expected 1";
+  } else if (nullBackend) {
+    return outcome;
+  } else if (report.encodes == 0) {
+    outcome.failure = "debug.surface_v1 or gx.normal never reached demo.class_check";
+  } else if (!report.ready) {
+    outcome.failure = "check readback did not complete";
+  } else if (compiles != 0) {
+    outcome.failure = "the class and manifest edit compiled " + std::to_string(compiles) + " pipelines";
+  } else {
+    outcome.failure = render_demo::check_classes(outcome.summary);
   }
   return outcome;
 }
@@ -811,6 +902,9 @@ int main(int argc, char* argv[]) {
     // Deferral arms only on a G-buffer layout, which the demo's own settings never request
     SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_GBUFFER", "on", false);
   }
+  if (options.classCheck) {
+    SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_PBR", "on", false);
+  }
 
   AuroraConfig config{};
   config.appName = "render_demo";
@@ -859,7 +953,8 @@ int main(int argc, char* argv[]) {
                                          .fwdEnvCheck = options.fwdEnvCheck,
                                          .unlitCheck = options.unlitCheck,
                                          .companionCheck = options.companionCheck,
-                                         .overlayCheck = options.overlayCheck};
+                                         .overlayCheck = options.overlayCheck,
+                                         .classCheck = options.classCheck};
   bool decodingChanged = false;
 
   GXInit(nullptr, 0);
@@ -882,7 +977,8 @@ int main(int argc, char* argv[]) {
                                                                    .fwdEnvCheck = options.fwdEnvCheck,
                                                                    .unlitCheck = options.unlitCheck,
                                                                    .companionCheck = options.companionCheck,
-                                                                   .overlayCheck = options.overlayCheck},
+                                                                   .overlayCheck = options.overlayCheck,
+                                                                   .classCheck = options.classCheck},
                                                                   graphError)) {
     std::fprintf(stderr, "render_demo: render graph setup failed: %s\n", graphError.c_str());
     render_demo::shutdown_scene();
@@ -894,6 +990,13 @@ int main(int argc, char* argv[]) {
   CompanionRun companionRun;
   if (options.companionCheck) {
     render_demo::prepare_companion_loads();
+  }
+  ClassRun classRun;
+  if (options.classCheck) {
+    start_class_check(classRun);
+    aurora::render::Settings settings = aurora::render::effective_settings();
+    settings.legacyBlend = 0.f;
+    aurora::render::apply_settings(settings);
   }
   if (options.overlayCheck) {
     aurora::gfx::detail::testing::keep_frame_shapes(true);
@@ -959,6 +1062,17 @@ int main(int argc, char* argv[]) {
         companionRun.loadedMat = render_demo::companion_counts().loaded;
       }
     }
+    if (options.classCheck && classRun.setupError.empty()) {
+      if (frame == render_demo::ClassEditFrame) {
+        edit_class_check(classRun);
+      } else if (frame == render_demo::ClassCheckSecondFrame) {
+        classRun.createdAfterEdit = aurora_get_stats()->createdPipelines;
+      } else if (frame == render_demo::ClassBlendOneFrame) {
+        aurora::render::Settings settings = aurora::render::effective_settings();
+        settings.legacyBlend = 1.f;
+        aurora::render::apply_settings(settings);
+      }
+    }
     // Params set before aurora_begin_frame apply to the frame it begins
     render_demo::update_graph_passes(frame);
     if (exiting || paused || !aurora_begin_frame()) {
@@ -984,6 +1098,9 @@ int main(int argc, char* argv[]) {
   if (options.companionCheck) {
     companionRun.companionSkips = render_demo::companion_counts().companionSkips;
     render_demo::release_companion_fixtures();
+  }
+  if (options.classCheck) {
+    aurora::texture::unregister_material_manifest(classRun.manifest);
   }
   const aurora::gfx::OverlayStats overlayStats = aurora::gfx::overlay_stats();
   const OverlayShape overlayShape =
@@ -1131,6 +1248,19 @@ int main(int argc, char* argv[]) {
         c.matFailures, c.blendOneMismatches, c.ormFailures, c.albedoFailures, graphReport.companion.width,
         graphReport.companion.height);
   }
+  const ClassOutcome classOutcome =
+      options.classCheck ? class_outcome(graphReport.classes, classRun, info.backend == BACKEND_NULL) : ClassOutcome{};
+  if (options.classCheck) {
+    const std::string status = classOutcome.failure           ? "FAILED: " + *classOutcome.failure
+                               : info.backend == BACKEND_NULL ? std::string{"skipped (null backend)"}
+                                                              : std::string{"passed"};
+    std::printf(
+        "render_demo: class check %s: %u probes over %u phases, %u failed, edit compiled %u pipelines, "
+        "unknown-class lines %u at %ux%u\n",
+        status.c_str(), classOutcome.summary.probes, render_demo::ClassPhaseCount, classOutcome.summary.failures,
+        classRun.createdAfterEdit - classRun.createdAtEdit, g_unknownClassLines.load(std::memory_order_relaxed),
+        graphReport.classes.width, graphReport.classes.height);
+  }
   const char* overlayEnv = SDL_getenv("AURORA_RENDER_OVERLAY_DEFER");
   const std::string_view overlayMode = overlayEnv != nullptr ? overlayEnv : "unset";
   const std::optional<std::string> overlayFailure =
@@ -1229,6 +1359,9 @@ int main(int argc, char* argv[]) {
   }
   if (overlayFailure) {
     return ExitOverlayCheck;
+  }
+  if (classOutcome.failure) {
+    return ExitClassCheck;
   }
 
   if (cullFailure) {

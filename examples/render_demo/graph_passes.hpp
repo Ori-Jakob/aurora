@@ -72,6 +72,14 @@ struct CompanionCheckReport {
   std::array<std::vector<CompanionSample>, CompanionPhaseCount> phases;
 };
 
+struct ClassCheckReport {
+  u32 encodes = 0;
+  bool ready = false;
+  u32 width = 0;
+  u32 height = 0;
+  std::array<std::vector<ClassSample>, ClassPhaseCount> phases;
+};
+
 enum OverlaySample : u32 { OverlayOpaqueDone30, OverlayPrePost30, OverlayPrePost32, OverlaySampleCount };
 
 struct OverlayCheckReport {
@@ -99,6 +107,7 @@ struct GraphPassOptions {
   bool unlitCheck = false;
   bool companionCheck = false;
   bool overlayCheck = false;
+  bool classCheck = false;
 };
 
 struct GraphPassReport {
@@ -119,6 +128,7 @@ struct GraphPassReport {
   UnlitCheckReport unlit;
   CompanionCheckReport companion;
   OverlayCheckReport overlay;
+  ClassCheckReport classes;
 };
 
 bool pipelines_compiling() noexcept;

@@ -17,6 +17,7 @@
 #include "gx/shader_info.hpp"
 #include "gx/surface_pack.hpp"
 #include "gx/surface_wgsl.hpp"
+#include "render/gx_ext/records.hpp"
 #include "render/shaders_embed.hpp"
 #include "webgpu/gpu.hpp"
 
@@ -2309,6 +2310,20 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   RecordProperty("cases", static_cast<int>(Cases));
 }
 
+std::string without(std::string text, std::string_view needle, std::string_view with = {}) {
+  for (size_t pos = text.find(needle); pos != std::string::npos; pos = text.find(needle, pos + with.size())) {
+    text.replace(pos, needle.size(), with);
+  }
+  return text;
+}
+
+std::string without_flip(std::string text) {
+  text = without(std::move(text), ", @builtin(front_facing) gx_ff: bool");
+  text = without(std::move(text), "\n    let uflip = !gx_ff && (gx_record_word(1u) & 0x4000u) != 0u;");
+  text = without(std::move(text), "select(unit_nrm, -unit_nrm, uflip)", "unit_nrm");
+  return without(std::move(text), "select(mapped_nrm, -mapped_nrm, uflip)", "mapped_nrm");
+}
+
 TEST_F(GxShaderExtDevice, UnlitKeepsColourPath) {
   const auto backend = hardware_backend();
   if (!backend) {
@@ -2336,7 +2351,7 @@ TEST_F(GxShaderExtDevice, UnlitKeepsColourPath) {
       const gfx::RenderTargetLayout layout = pbr_layout(debugId);
       const ShaderTargets targets = shader_targets(layout);
       ASSERT_TRUE(uses_unlit(unlit, info, targets));
-      const std::string unlitText = build_shader_source(unlit, DstAlphaMode::None, targets);
+      const std::string unlitText = without_flip(build_shader_source(unlit, DstAlphaMode::None, targets));
       const std::string twinText = build_shader_source(twin, DstAlphaMode::None, targets);
       const size_t body = twinText.find("fn fs_main(");
       const size_t split = twinText.find("\n    out.surface = vec4u(0u);", body);
@@ -2685,6 +2700,8 @@ struct Out {
 };
 var<private> in: In;
 var<private> imm: Imm;
+var<private> gx_ff: bool;
+fn gx_record_word(k: u32) -> u32 { return 0u; }
 fn gbuffer_rx_alpha(rec: u32, len_sq: f32) -> f32 {
   return select(0.0, 1.0, len_sq > 1e-10);
 }
@@ -2791,6 +2808,448 @@ TEST_F(GxShaderExtDevice, CompanionOrthoKeepsLegacyNormal) {
   const auto out = run_normal_member(*m_device, ortho, 1.f);
   ASSERT_TRUE(out.has_value());
   EXPECT_EQ(mapped_normals(*out), 0u);
+}
+
+ShaderConfig unlit_lit(GXColorSrc matSrc, GXColorSrc ambSrc) {
+  ShaderConfig c{};
+  c.attrs[GX_VA_POS] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32};
+  c.attrs[GX_VA_NRM] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32};
+  c.attrs[GX_VA_CLR0] = {.attrType = GX_DIRECT, .cnt = 4, .compType = GX_RGBA8};
+  c.attrs[GX_VA_TEX0] = {.attrType = GX_DIRECT, .cnt = 2, .compType = GX_F32};
+  c.tcgs[0] = {.type = GX_TG_MTX2x4, .src = GX_TG_TEX0};
+  c.colorChannels[GX_COLOR0] = {
+      .matSrc = matSrc, .ambSrc = ambSrc, .diffFn = GX_DF_CLAMP, .attnFn = GX_AF_SPOT, .lightingEnabled = true};
+  c.colorChannels[GX_ALPHA0] = {.matSrc = GX_SRC_REG};
+  c.tevStages[0].colorPass = {GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASC, GX_CC_ZERO};
+  c.tevStages[0].texMapId = GX_TEXMAP0;
+  c.tevStages[0].texCoordId = GX_TEXCOORD0;
+  c.tevStages[0].channelId = GX_COLOR0A0;
+  c.tevStageCount = 1;
+  c.ext = {.output = 2};
+  return c;
+}
+
+std::string member_between(const std::string& text, std::string_view begin, std::string_view end) {
+  const size_t from = text.find(begin);
+  const size_t to = text.find(end, from);
+  if (from == std::string::npos || to == std::string::npos) {
+    ADD_FAILURE() << "no member between \"" << begin << "\" and \"" << end << "\" in\n" << text;
+    return {};
+  }
+  return text.substr(from, to + end.size() - from);
+}
+
+std::string record_harness(const std::string& member, std::string_view body) {
+  std::string lib;
+  append_surface_pack(lib);
+  return lib + R"(
+@group(0) @binding(0) var<storage, read_write> out_words: array<u32>;
+@group(0) @binding(1) var<storage, read> in_words: array<u32>;
+struct In {
+  ccv0: vec3f,
+};
+struct U {
+  cc0_amb: vec4f,
+};
+struct Out {
+  surface: vec4u,
+  surface_ext: vec4u,
+};
+var<private> in: In;
+var<private> ubuf: U;
+var<private> rec: array<u32, 8>;
+var<private> pad: u32;
+fn gx_record_word(k: u32) -> u32 { return select(0u, rec[k], pad != 0u); }
+fn in_f32(i: u32) -> f32 { return bitcast<f32>(in_words[i]); }
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  let i = id.x * 8u;
+  pad = in_words[i];
+  rec[1] = in_words[i + 1u];
+  rec[5] = in_words[i + 2u];
+  in.ccv0 = vec3f(in_f32(i + 3u), in_f32(i + 4u), in_f32(i + 5u));
+  ubuf.cc0_amb = vec4f(in_f32(i + 6u), in_f32(i + 6u), in_f32(i + 7u), 1.0);
+  let unlit_rgb = vec3f(0.5, 0.25, 1.0);
+  var out: Out;
+)" + member +
+         std::string{body} + "\n}\n";
+}
+
+constexpr std::string_view RecordOut = R"(
+  out_words[id.x * 4u] = out.surface.x;
+  out_words[id.x * 4u + 1u] = out.surface.y;
+  out_words[id.x * 4u + 2u] = out.surface.z;
+  out_words[id.x * 4u + 3u] = out.surface.w;)";
+
+std::optional<std::vector<surface::Words>> run_record_member(test::TestDevice& device,
+                                                             std::span<const std::array<uint32_t, 3>> cases) {
+  const std::string text =
+      build_shader_source(unlit_lit(GX_SRC_REG, GX_SRC_REG), DstAlphaMode::None, shader_targets(pbr_layout(false)));
+  const std::string member = member_between(text, "\n    let uslot = ", "uslot);");
+  if (member.empty()) {
+    return std::nullopt;
+  }
+  std::vector<uint32_t> input;
+  for (const auto& [pad, flags, word] : cases) {
+    input.insert(input.end(), {pad, flags, word, 0u, 0u, 0u, 0u, 0u});
+  }
+  const auto out =
+      run_word_compute(device, record_harness(member, RecordOut), static_cast<uint32_t>(cases.size()), 4, input);
+  if (!out) {
+    return std::nullopt;
+  }
+  std::vector<surface::Words> records;
+  for (size_t i = 0; i < cases.size(); ++i) {
+    records.push_back(
+        surface::join({static_cast<uint16_t>((*out)[i * 4]), static_cast<uint16_t>((*out)[i * 4 + 1]),
+                       static_cast<uint16_t>((*out)[i * 4 + 2]), static_cast<uint16_t>((*out)[i * 4 + 3])}));
+  }
+  return records;
+}
+
+TEST_F(GxShaderExtDevice, UnlitMaterialWordRoundTrips) {
+  const auto backend = hardware_backend();
+  if (!backend) {
+    GTEST_SKIP() << "AURORA_TEST_BACKEND names no hardware backend";
+  }
+  if (!start({.backend = *backend, .core = true, .allowCpu = false}, false)) {
+    GTEST_SKIP() << "no adapter";
+  }
+  std::vector<std::array<uint32_t, 3>> cases;
+  for (uint32_t i = 0; i < 65536; ++i) {
+    const uint32_t slot = 64 + (i % 4032);
+    const uint32_t word = i | ((i * 7u) & 0xFFu) << 16 | (i & 0x1Fu) << 24 | 0x80000000u;
+    cases.push_back({1u, slot << render_ext::RecordSurfaceSlotShift | 0x3Fu, word});
+  }
+  const auto records = run_record_member(*m_device, cases);
+  ASSERT_TRUE(records.has_value());
+  size_t mismatches = 0;
+  for (size_t i = 0; i < cases.size(); ++i) {
+    const surface::Words& got = (*records)[i];
+    const bool ok = (got[1] & 0xFFFFu) == (cases[i][2] & 0xFFFFu) &&
+                    surface::record_slot(got) == cases[i][1] >> render_ext::RecordSurfaceSlotShift &&
+                    got[0] == surface::pack_unorm4(0.5f, 0.25f, 1.f, 1.f);
+    if (!ok && mismatches++ < 8) {
+      ADD_FAILURE() << "word " << std::hex << cases[i][2] << " packed " << got[0] << " " << got[1];
+    }
+  }
+  EXPECT_EQ(mismatches, 0u);
+}
+
+TEST_F(GxShaderExtDevice, DroppedRecordReadsClassZero) {
+  const auto backend = hardware_backend();
+  if (!backend) {
+    GTEST_SKIP() << "AURORA_TEST_BACKEND names no hardware backend";
+  }
+  if (!start({.backend = *backend, .core = true, .allowCpu = false}, false)) {
+    GTEST_SKIP() << "no adapter";
+  }
+  std::vector<std::array<uint32_t, 3>> cases(64, {0u, 0xFFFFFFFFu, 0xFFFFFFFFu});
+  const auto records = run_record_member(*m_device, cases);
+  ASSERT_TRUE(records.has_value());
+  const surface::Entry first{surface::ClassDefault, 0, 0, 0};
+  for (const surface::Words& record : *records) {
+    EXPECT_EQ(surface::record_slot(record), 0u);
+    EXPECT_EQ(record[1] & 0xFFFFu, 0u);
+    const surface::Entry& entry = surface::record_slot(record) == 0 ? surface::Entry{} : first;
+    EXPECT_EQ(surface::decode(record, entry, {}).classId, surface::ClassNone);
+    EXPECT_EQ(surface::expand_v1(record, entry, {})[1] >> 16, 0u);
+  }
+}
+
+TEST_F(GxShaderExtDevice, AmbientSelectionValidatesChannelCombos) {
+  ASSERT_TRUE(start({.backend = wgpu::BackendType::Null, .core = true}, false));
+  const auto channel = [](uint32_t bits) {
+    return ColorChannelConfig{.matSrc = (bits & 2u) != 0 ? GX_SRC_VTX : GX_SRC_REG,
+                              .ambSrc = (bits & 4u) != 0 ? GX_SRC_VTX : GX_SRC_REG,
+                              .diffFn = GX_DF_CLAMP,
+                              .attnFn = GX_AF_SPOT,
+                              .lightingEnabled = (bits & 1u) != 0};
+  };
+  size_t admitted = 0;
+  size_t keyedTexts = 0;
+  for (uint32_t combo = 0; combo < 256; ++combo) {
+    ShaderConfig config = unlit_lit(GX_SRC_REG, GX_SRC_REG);
+    config.colorChannels[GX_COLOR0] = channel(combo & 7u);
+    config.colorChannels[GX_COLOR1] = channel((combo >> 4) & 7u);
+    config.attrs[GX_VA_CLR0] =
+        (combo & 8u) != 0 ? AttrConfig{.attrType = GX_DIRECT, .cnt = 4, .compType = GX_RGBA8} : AttrConfig{};
+    config.attrs[GX_VA_CLR1] =
+        (combo & 0x80u) != 0 ? AttrConfig{.attrType = GX_DIRECT, .cnt = 4, .compType = GX_RGBA8} : AttrConfig{};
+    TevStage& second = config.tevStages[1];
+    second.colorPass = {GX_CC_ZERO, GX_CC_CPREV, GX_CC_RASC, GX_CC_ZERO};
+    second.texMapId = GX_TEXMAP_NULL;
+    second.texCoordId = GX_TEXCOORD_NULL;
+    second.channelId = GX_COLOR1A1;
+    config.tevStageCount = 2;
+    const ShaderInfo info = build_shader_info(config);
+    if (!info.unlitAdmitted) {
+      continue;
+    }
+    ++admitted;
+    for (const bool keyed : {false, true}) {
+      ShaderConfig variant = config;
+      variant.ext.surfaceExt = keyed ? 1 : 0;
+      for (const bool debugId : {false, true}) {
+        const std::string text = build_shader_source(variant, DstAlphaMode::None, shader_targets(pbr_layout(debugId)));
+        const auto error = module_error(*m_device, text);
+        EXPECT_FALSE(error.has_value()) << "combo " << combo << " keyed " << keyed << "\n"
+                                        << error.value_or("") << "\n"
+                                        << text;
+        keyedTexts += keyed ? 1 : 0;
+      }
+    }
+  }
+  EXPECT_GT(admitted, 16u);
+  EXPECT_GT(keyedTexts, 0u);
+  RecordProperty("admitted", static_cast<int>(admitted));
+}
+
+TEST_F(GxShaderExtDevice, SurfaceAmbientMatchesRegister) {
+  const auto backend = hardware_backend();
+  if (!backend) {
+    GTEST_SKIP() << "AURORA_TEST_BACKEND names no hardware backend";
+  }
+  if (!start({.backend = *backend, .core = true, .allowCpu = false}, false)) {
+    GTEST_SKIP() << "no adapter";
+  }
+  const ShaderTargets targets = shader_targets(pbr_layout(false));
+  struct Case {
+    ShaderConfig config;
+    bool baked;
+  };
+  ShaderConfig registerVertex = unlit_lit(GX_SRC_VTX, GX_SRC_REG);
+  ShaderConfig vertexAmbient = unlit_lit(GX_SRC_VTX, GX_SRC_VTX);
+  registerVertex.ext.surfaceExt = 1;
+  vertexAmbient.ext.surfaceExt = 1;
+  const std::array<float, 3> vtx{0.25f, 0.5f, 0.75f};
+  const std::array<float, 2> reg{64.f / 255.f, 191.f / 255.f};
+  for (const auto& [config, baked] : {Case{registerVertex, true}, Case{registerVertex, false},
+                                      Case{vertexAmbient, true}, Case{vertexAmbient, false}}) {
+    const std::string text = build_shader_source(config, DstAlphaMode::None, targets);
+    const std::string member =
+        member_between(text, "\n    let uslot = ", "uslot);") + member_between(text, "\n    out.surface_ext = ", ";");
+    ASSERT_FALSE(member.empty());
+    const std::string body = R"(
+  out_words[id.x * 4u] = out.surface_ext.x;
+  out_words[id.x * 4u + 1u] = out.surface_ext.y;
+  out_words[id.x * 4u + 2u] = out.surface_ext.z;
+  out_words[id.x * 4u + 3u] = out.surface_ext.w;)";
+    std::vector<uint32_t> input;
+    for (uint32_t i = 0; i < 64; ++i) {
+      const uint32_t word = (i & 1u) != 0 ? render_ext::MaterialWordAmbient | 0x100D9u : 0x100D9u;
+      const uint32_t flags = (baked ? 1u : 0u) << render_ext::RecordVertexColorShift;
+      input.insert(input.end(),
+                   {1u, flags, word, std::bit_cast<uint32_t>(vtx[0]), std::bit_cast<uint32_t>(vtx[1]),
+                    std::bit_cast<uint32_t>(vtx[2]), std::bit_cast<uint32_t>(reg[0]), std::bit_cast<uint32_t>(reg[1])});
+    }
+    const std::string harness = record_harness(member, body);
+    const auto out = run_word_compute(*m_device, harness, 64, 4, input);
+    ASSERT_TRUE(out.has_value());
+    const bool vertex = config.colorChannels[GX_COLOR0].ambSrc == GX_SRC_VTX;
+    std::array<float, 3> ambient = vertex ? vtx : std::array{reg[0], reg[0], reg[1]};
+    for (size_t c = 0; c < 3 && baked; ++c) {
+      ambient[c] *= vtx[c];
+    }
+    for (uint32_t i = 0; i < 64; ++i) {
+      const surface::Words ext =
+          surface::join({static_cast<uint16_t>((*out)[i * 4]), static_cast<uint16_t>((*out)[i * 4 + 1]),
+                         static_cast<uint16_t>((*out)[i * 4 + 2]), static_cast<uint16_t>((*out)[i * 4 + 3])});
+      const surface::Fields fields{.ambient = (i & 1u) != 0 ? ambient : std::array<float, 3>{}};
+      EXPECT_EQ(ext[0], surface::pack_ext(fields)[0]) << "vertex " << vertex << " baked " << baked << " i " << i;
+      EXPECT_EQ(ext[1], 0u);
+    }
+  }
+
+  const std::string_view library = render_library("aurora/surface");
+  ASSERT_FALSE(library.empty());
+  const std::string expand = std::string{library} + R"(
+@group(0) @binding(0) var<storage, read_write> out_words: array<u32>;
+@group(0) @binding(1) var<storage, read> in_words: array<u32>;
+
+fn in_vec(i: u32) -> vec4u {
+  return vec4u(in_words[i], in_words[i + 1u], in_words[i + 2u], in_words[i + 3u]);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  let i = id.x * 12u;
+  let x = gbuf_surface_v1_expand(in_vec(i), in_vec(i + 4u), in_vec(i + 8u));
+  out_words[id.x * 4u] = x.x;
+  out_words[id.x * 4u + 1u] = x.y;
+  out_words[id.x * 4u + 2u] = x.z;
+  out_words[id.x * 4u + 3u] = x.w;
+}
+)";
+  const PipelineConfig pipeline = pipeline_for(unlit_lit(GX_SRC_REG, GX_SRC_REG));
+  const ShaderInfo info = build_shader_info(pipeline.shaderConfig);
+  std::vector<uint32_t> input;
+  std::vector<std::array<uint8_t, 3>> expected;
+  std::mt19937 rng{11};
+  std::uniform_int_distribution<uint32_t> byte{0, 255};
+  for (uint32_t i = 0; i < 64; ++i) {
+    const std::array<uint8_t, 3> code{static_cast<uint8_t>(byte(rng)), static_cast<uint8_t>(byte(rng)),
+                                      static_cast<uint8_t>(byte(rng))};
+    g_gxState.colorChannelState[0].ambColor = {code[0] / 255.f, code[1] / 255.f, code[2] / 255.f, 1.f};
+    const surface::Entry entry =
+        render::gx_ext::records::surface_entry(pipeline, info, 0, 0, render_ext::MaterialWordAmbient | 0x100D9u);
+    const surface::Channels rec = surface::split({0x80808080u, 0x004000D9u});
+    input.insert(input.end(), {rec[0], rec[1], rec[2], rec[3], entry[0], entry[1], entry[2], entry[3], 0, 0, 0, 0});
+    expected.push_back(code);
+  }
+  g_gxState = {};
+  const auto out = run_word_compute(*m_device, expand, 64, 4, input);
+  ASSERT_TRUE(out.has_value());
+  for (uint32_t i = 0; i < 64; ++i) {
+    const uint32_t z = (*out)[i * 4 + 2];
+    EXPECT_EQ(z & 0xFFu, expected[i][0]) << i;
+    EXPECT_EQ((z >> 8) & 0xFFu, expected[i][1]) << i;
+    EXPECT_EQ((z >> 16) & 0xFFu, expected[i][2]) << i;
+  }
+}
+
+TEST_F(GxShaderExtDevice, TwoSidedBackFaceNormalFacesViewer) {
+  const auto backend = hardware_backend();
+  if (!backend) {
+    GTEST_SKIP() << "AURORA_TEST_BACKEND names no hardware backend";
+  }
+  if (!start({.backend = *backend, .core = true, .allowCpu = false}, false)) {
+    GTEST_SKIP() << "no adapter";
+  }
+  const std::string text =
+      build_shader_source(unlit_lit(GX_SRC_REG, GX_SRC_REG), DstAlphaMode::None, shader_targets(pbr_layout(false)));
+  ASSERT_NE(text.find("@builtin(front_facing) gx_ff: bool"), std::string::npos);
+  const std::string member = member_between(text, "\n    let nrm_len_sq = ", "nrm_len_sq));");
+  ASSERT_NE(member.find("let uflip = !gx_ff"), std::string::npos);
+
+  constexpr uint32_t Width = 4;
+  PipelineConfig config = pipeline_for(unlit_lit(GX_SRC_REG, GX_SRC_REG));
+  config.cullMode = GX_CULL_NONE;
+  std::array<uint32_t, Width> flags{};
+  const Mat3x4<float> identity{{1.f, 0.f, 0.f, 0.f}, {0.f, 1.f, 0.f, 0.f}, {0.f, 0.f, 1.f, 0.f}};
+  for (uint32_t x = 0; x < Width; ++x) {
+    g_gxState = {};
+    g_gxState.pnMtx[0].pos = identity;
+    g_gxState.proj[0][0] = 1.f;
+    g_gxState.proj[1][1] = 1.f;
+    if (x == 2) {
+      g_gxState.pnMtx[0].pos.m0[0] = -1.f;
+    } else if (x == 3) {
+      g_gxState.proj[0][0] = -1.f;
+    }
+    DrawData draw{};
+    flags[x] = render::gx_ext::records::mirrored(draw, config) ? 0u : render_ext::RecordFlagBackFaceFlip;
+  }
+  g_gxState = {};
+  EXPECT_EQ(flags, (std::array<uint32_t, Width>{render_ext::RecordFlagBackFaceFlip, render_ext::RecordFlagBackFaceFlip,
+                                                0u, 0u}));
+
+  const std::string shader = "@group(0) @binding(0) var<storage, read> flags: array<u32>;\n" + receiver_alpha_wgsl() +
+                             R"(
+struct Imm {
+  _pad: u32,
+};
+struct In {
+  mv_nrm: vec3f,
+};
+struct Out {
+  normal: vec4f,
+};
+var<private> imm: Imm;
+var<private> rec_flags: u32;
+var<private> abuf: array<u32, 1>;
+fn gx_record_word(k: u32) -> u32 { return select(0u, rec_flags, k == 1u); }
+
+struct VsOut {
+  @builtin(position) pos: vec4f,
+  @location(0) mv_nrm: vec3f,
+  @location(1) @interpolate(flat) column: u32,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) v: u32) -> VsOut {
+  let column = v / 3u;
+  let corner = v % 3u;
+  let left = -1.0 + 0.5 * f32(column);
+  var p = vec2f(left, -1.0);
+  if (corner == 1u) {
+    p = vec2f(left, 1.0);
+  } else if (corner == 2u) {
+    p = vec2f(left + 1.0, -1.0);
+  }
+  if (column != 0u && corner != 0u) {
+    p = select(vec2f(left, 1.0), vec2f(left + 1.0, -1.0), corner == 1u);
+  }
+  var out: VsOut;
+  out.pos = vec4f(p, 0.5, 1.0);
+  out.mv_nrm = select(vec3f(0.0, 0.0, -1.0), vec3f(0.0, 0.0, 1.0), column == 0u);
+  out.column = column;
+  return out;
+}
+
+@fragment
+fn fs_main(v: VsOut, @builtin(front_facing) gx_ff: bool) -> @location(0) vec4f {
+  var in: In;
+  in.mv_nrm = v.mv_nrm;
+  imm._pad = 0u;
+  rec_flags = flags[v.column];
+  var out: Out;)" + member + R"(
+  return vec4f(out.normal.xyz, select(0.0, 1.0, gx_ff));
+}
+)";
+  const wgpu::BufferDescriptor bufferDescriptor{.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                                                .size = sizeof(flags)};
+  const wgpu::Buffer flagBuffer = m_device->device.CreateBuffer(&bufferDescriptor);
+  m_device->queue.WriteBuffer(flagBuffer, 0, flags.data(), sizeof(flags));
+  const wgpu::TextureDescriptor textureDescriptor{
+      .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc,
+      .size = {Width, 1, 1},
+      .format = wgpu::TextureFormat::RGB10A2Unorm,
+  };
+  const wgpu::Texture target = m_device->device.CreateTexture(&textureDescriptor);
+  const wgpu::ShaderSourceWGSL wgsl{wgpu::ShaderSourceWGSL::Init{.code = shader.c_str()}};
+  const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl};
+  const wgpu::ShaderModule module = m_device->device.CreateShaderModule(&moduleDescriptor);
+  const wgpu::ColorTargetState colorTarget{.format = wgpu::TextureFormat::RGB10A2Unorm};
+  const wgpu::FragmentState fragment{
+      .module = module, .entryPoint = "fs_main", .targetCount = 1, .targets = &colorTarget};
+  const wgpu::RenderPipelineDescriptor pipelineDescriptor{
+      .vertex = {.module = module, .entryPoint = "vs_main"},
+      .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList,
+                    .frontFace = wgpu::FrontFace::CW,
+                    .cullMode = wgpu::CullMode::None},
+      .fragment = &fragment,
+  };
+  const wgpu::RenderPipeline renderPipeline = m_device->device.CreateRenderPipeline(&pipelineDescriptor);
+  const wgpu::BindGroupEntry entry{.binding = 0, .buffer = flagBuffer, .size = sizeof(flags)};
+  const wgpu::BindGroupDescriptor groupDescriptor{
+      .layout = renderPipeline.GetBindGroupLayout(0), .entryCount = 1, .entries = &entry};
+  const wgpu::BindGroup group = m_device->device.CreateBindGroup(&groupDescriptor);
+  const wgpu::RenderPassColorAttachment attachment{
+      .view = target.CreateView(),
+      .loadOp = wgpu::LoadOp::Clear,
+      .storeOp = wgpu::StoreOp::Store,
+      .clearValue = {0.0, 0.0, 0.0, 0.0},
+  };
+  const wgpu::RenderPassDescriptor passDescriptor{.colorAttachmentCount = 1, .colorAttachments = &attachment};
+  const wgpu::CommandEncoder encoder = m_device->device.CreateCommandEncoder();
+  const wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&passDescriptor);
+  pass.SetPipeline(renderPipeline);
+  pass.SetBindGroup(0, group);
+  pass.Draw(3 * Width);
+  pass.End();
+  const wgpu::CommandBuffer commands = encoder.Finish();
+  m_device->queue.Submit(1, &commands);
+
+  const std::vector<float> texels = test::read_texture_mip(*m_device, target, 0);
+  ASSERT_EQ(texels.size(), Width);
+  constexpr std::array<bool, Width> FacesViewer{true, true, false, false};
+  for (uint32_t x = 0; x < Width; ++x) {
+    const uint32_t bits = std::bit_cast<uint32_t>(texels[x]);
+    EXPECT_EQ(bits >> 30, x == 0 ? 3u : 0u) << "front_facing at column " << x;
+    EXPECT_EQ(((bits >> 20) & 0x3FFu) > 512u, FacesViewer[x]) << "normal z at column " << x;
+  }
 }
 } // namespace
 } // namespace aurora::gx

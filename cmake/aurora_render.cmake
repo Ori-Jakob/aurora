@@ -94,6 +94,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/json.hpp
         lib/render/lighting/clusters.cpp
         lib/render/lighting/clusters.hpp
+        lib/render/material/classes.cpp
+        lib/render/material/classes.hpp
         lib/render/material/gx_lookup.cpp
         lib/render/material/gx_lookup.hpp
         lib/render/material/key_text.hpp

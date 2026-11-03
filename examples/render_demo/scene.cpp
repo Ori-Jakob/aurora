@@ -4,8 +4,10 @@
 #include "procedural.hpp"
 
 #include <aurora/gpu_systems.hpp>
+#include <aurora/texture.hpp>
 #include <dolphin/gx.h>
 #include <dolphin/mtx.h>
+#include <fmt/format.h>
 
 #include <algorithm>
 #include <array>
@@ -82,6 +84,13 @@ constexpr Vec OverlayQuadCentre{0.9f, 0.75f, -3.f};
 constexpr f32 OverlayQuadHalf = 0.3f;
 constexpr Vec OverlayBoxCentre{1.2f, 1.f, -4.f};
 constexpr f32 OverlayBoxHalf = 0.8f;
+constexpr u64 ClassObjectBase = 0x700;
+constexpr f32 ClassQuadZ = -3.f;
+constexpr f32 ClassQuadHalf = 0.12f;
+constexpr u32 ClassTextureSize = 4;
+constexpr std::array<u8, 3> ClassWhite{255, 255, 255};
+
+enum ClassTexture : u32 { TexPlain, TexRock, TexScalars, TexFake, TexLava, TexDry, TexWhite, ClassTextureCount };
 
 struct Slab {
   Vec centre;
@@ -158,6 +167,8 @@ std::vector<u8> sGroundTexture;
 GXTexObj sGroundTexObj;
 std::vector<std::vector<SkinnedVertex>> sTentacle;
 FogResolveCounts sFogResolves;
+std::array<std::vector<u8>, ClassTextureCount> sClassTextures;
+std::array<GXTexObj, ClassTextureCount> sClassTexObjs{};
 
 // aurora has no GXMatrixIndex1x8; the FIFO byte is identical
 void emit_matrix_index(u8 index) { GXParam1u8(index); }
@@ -737,6 +748,167 @@ void draw_overlay_check() {
   set_fog(Fog);
 }
 
+std::vector<u8> class_texture(u32 index) {
+  std::vector<u8> data(ClassTextureSize * ClassTextureSize * 4);
+  const bool white = index == TexWhite;
+  const auto shade = [&](u32 step) { return white ? u8{255} : static_cast<u8>(40 + step * index); };
+  for (u32 i = 0; i < ClassTextureSize * ClassTextureSize; ++i) {
+    data[i * 2] = 255;
+    data[i * 2 + 1] = shade(30);
+    data[32 + i * 2] = shade(20);
+    data[32 + i * 2 + 1] = shade(10);
+  }
+  return data;
+}
+
+Vec class_centre(ClassQuad quad) noexcept {
+  const auto i = static_cast<u32>(quad);
+  return {-1.5f + static_cast<f32>(i % 4), 0.9f - 0.6f * static_cast<f32>(i / 4), ClassQuadZ};
+}
+
+void set_class_format() {
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  GXSetVtxDesc(GX_VA_NRM, GX_DIRECT);
+  GXSetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+  GXSetVtxDesc(GX_VA_CLR1, GX_DIRECT);
+  GXSetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT2, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  GXSetVtxAttrFmt(GX_VTXFMT2, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
+  GXSetVtxAttrFmt(GX_VTXFMT2, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+  GXSetVtxAttrFmt(GX_VTXFMT2, GX_VA_CLR1, GX_CLR_RGBA, GX_RGBA8, 0);
+  GXSetVtxAttrFmt(GX_VTXFMT2, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+  GXSetNumTexGens(1);
+  GXSetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
+}
+
+void class_quad(const Vec& centre, bool front, std::array<u8, 3> colour) {
+  constexpr f32 Front[4][2] = {{-1.f, -1.f}, {-1.f, 1.f}, {1.f, 1.f}, {1.f, -1.f}};
+  constexpr f32 Back[4][2] = {{-1.f, -1.f}, {1.f, -1.f}, {1.f, 1.f}, {-1.f, 1.f}};
+  const auto& corners = front ? Front : Back;
+  GXBegin(GX_QUADS, GX_VTXFMT2, 4);
+  for (const auto& [x, y] : corners) {
+    GXPosition3f32(centre.x + x * ClassQuadHalf, centre.y + y * ClassQuadHalf, centre.z);
+    GXNormal3f32(0.f, 0.f, front ? 1.f : -1.f);
+    GXColor4u8(colour[0], colour[1], colour[2], 255);
+    GXColor4u8(ClassChannel1Vertex[0], ClassChannel1Vertex[1], ClassChannel1Vertex[2], 255);
+    GXTexCoord2f32(0.5f * (x + 1.f), 0.5f * (y + 1.f));
+  }
+  GXEnd();
+}
+
+void draw_class_quads() {
+  set_class_format();
+  GXSetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+  GXSetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
+  for (u32 i = 0; i < static_cast<u32>(ClassQuad::Count); ++i) {
+    const auto quad = static_cast<ClassQuad>(i);
+    const Vec centre = class_centre(quad);
+    u32 categories = AURORA_CAT_STATIC;
+    u32 flags = 0;
+    u8 hint = 0;
+    u32 texture = TexPlain;
+    GXCullMode cull = GX_CULL_BACK;
+    bool front = true;
+    bool mirrored = false;
+    GXColorSrc matSrc = GX_SRC_REG;
+    GXColor ambient = AmbientColor;
+    bool channel1 = false;
+    switch (quad) {
+    case ClassQuad::Rock:
+      texture = TexRock;
+      break;
+    case ClassQuad::Scalars:
+      texture = TexScalars;
+      break;
+    case ClassQuad::FakeShadow:
+      texture = TexFake;
+      break;
+    case ClassQuad::Lava:
+      texture = TexLava;
+      break;
+    case ClassQuad::Dry:
+      texture = TexDry;
+      break;
+    case ClassQuad::Hint:
+      hint = ClassHintRegistered;
+      break;
+    case ClassQuad::UnregisteredHint:
+      hint = ClassHintUnregistered;
+      break;
+    case ClassQuad::RockHint:
+      texture = TexRock;
+      hint = ClassHintRegistered;
+      break;
+    case ClassQuad::BackFace:
+      cull = GX_CULL_NONE;
+      front = false;
+      break;
+    case ClassQuad::CullFront:
+      cull = GX_CULL_FRONT;
+      front = false;
+      hint = ClassHintFoliage;
+      flags = AURORA_OBJ_DOUBLE_SIDED;
+      break;
+    case ClassQuad::Mirrored:
+      cull = GX_CULL_NONE;
+      mirrored = true;
+      break;
+    case ClassQuad::Foliage:
+      hint = ClassHintFoliage;
+      break;
+    case ClassQuad::Player:
+      categories = AURORA_CAT_DYNAMIC | AURORA_CAT_PLAYER;
+      break;
+    case ClassQuad::Ambient:
+      matSrc = GX_SRC_VTX;
+      ambient = {ClassAmbient[0], ClassAmbient[1], ClassAmbient[2], 255};
+      break;
+    case ClassQuad::Channel1:
+      ambient = {ClassAmbient[0], ClassAmbient[1], ClassAmbient[2], 255};
+      channel1 = true;
+      texture = TexWhite;
+      break;
+    default:
+      break;
+    }
+    begin_object(ClassObjectBase + i, categories, flags);
+    if (hint != 0) {
+      hint_material(hint);
+    }
+    GXLoadTexObj(&sClassTexObjs[texture], GX_TEXMAP0);
+    GXSetNumChans(channel1 ? 2 : 1);
+    GXSetChanCtrl(GX_COLOR0, GX_ENABLE, GX_SRC_REG, matSrc, GX_LIGHT_NULL, GX_DF_CLAMP, GX_AF_NONE);
+    GXSetChanCtrl(GX_ALPHA0, GX_DISABLE, GX_SRC_REG, GX_SRC_REG, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
+    GXSetChanAmbColor(GX_COLOR0A0, ambient);
+    GXSetChanMatColor(GX_COLOR0A0, White);
+    GXSetNumTevStages(channel1 ? 2 : 1);
+    GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
+    GXSetTevOp(GX_TEVSTAGE0, GX_MODULATE);
+    if (channel1) {
+      GXSetChanCtrl(GX_COLOR1, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
+      GXSetChanCtrl(GX_ALPHA1, GX_DISABLE, GX_SRC_REG, GX_SRC_REG, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
+      GXSetTevOrder(GX_TEVSTAGE1, GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR1A1);
+      GXSetTevColorIn(GX_TEVSTAGE1, GX_CC_ZERO, GX_CC_CPREV, GX_CC_RASC, GX_CC_ZERO);
+      GXSetTevAlphaIn(GX_TEVSTAGE1, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
+      GXSetTevColorOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+      GXSetTevAlphaOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+    }
+    Mtx model;
+    C_MTXIdentity(model);
+    if (mirrored) {
+      model[0][0] = -1.f;
+      model[0][3] = 2.f * centre.x;
+    }
+    load_matrices(model, GX_PNMTX0);
+    GXSetCurrentMtx(GX_PNMTX0);
+    GXSetCullMode(cull);
+    class_quad(centre, front, quad == ClassQuad::Ambient ? ClassVertex : ClassWhite);
+    end_object();
+  }
+  GXSetCullMode(GX_CULL_BACK);
+}
+
 void emit_frame_hints(u32 frame, const Mtx view, const Mtx44 projection, const Lights& lights) {
   if (!hint_emission()) {
     return;
@@ -845,6 +1017,12 @@ bool init_scene() {
   GXInitTexObjLOD(&sGroundTexObj, GX_LIN_MIP_LIN, GX_LINEAR, 0.f, static_cast<f32>(GroundMipCount - 1), 0.f, GX_FALSE,
                   GX_TRUE, GX_ANISO_4);
   sTentacle = make_tentacle(GX_PNMTX1);
+  for (u32 i = 0; i < ClassTextureCount; ++i) {
+    sClassTextures[i] = class_texture(i);
+    GXInitTexObj(&sClassTexObjs[i], sClassTextures[i].data(), ClassTextureSize, ClassTextureSize, GX_TF_RGBA8, GX_CLAMP,
+                 GX_CLAMP, GX_FALSE);
+    GXInitTexObjLOD(&sClassTexObjs[i], GX_NEAR, GX_NEAR, 0.f, 0.f, 0.f, GX_FALSE, GX_FALSE, GX_ANISO_1);
+  }
   record_box_display_list();
   return sBoxDisplayListSize != 0;
 }
@@ -1104,6 +1282,35 @@ CompanionAxes companion_axes() noexcept {
   return {.x = axis({1.f, 0.f, 0.f}), .z = axis({0.f, 0.f, 1.f})};
 }
 
+std::vector<ClassProbe> class_probes() {
+  SceneCamera camera = scene_camera(AoCheckClock);
+  C_MTXIdentity(camera.view);
+  std::vector<ClassProbe> probes;
+  for (u32 i = 0; i < static_cast<u32>(ClassQuad::Count); ++i) {
+    const std::array<f32, 2> ndc = project(camera, class_centre(static_cast<ClassQuad>(i)));
+    if (std::abs(ndc[0]) < 0.95f && std::abs(ndc[1]) < 0.95f) {
+      probes.push_back({.ndc = {ndc[0], ndc[1]}, .quad = static_cast<ClassQuad>(i)});
+    }
+  }
+  return probes;
+}
+
+std::string class_manifest(bool edited) {
+  std::array<std::string, ClassTextureCount> keys;
+  for (u32 i = 0; i < ClassTextureCount; ++i) {
+    const auto key =
+        aurora::texture::compute_source_key(GX_TF_RGBA8, ClassTextureSize, ClassTextureSize, sClassTextures[i]);
+    if (!key) {
+      return {};
+    }
+    keys[i] = fmt::format("tex1_{}x{}_{:016x}_{}", key->width, key->height, key->textureHash, key->format);
+  }
+  return fmt::format(
+      R"({{"version":1,"materials":{{"{}":{{"class":"ground/rock"{}}},"{}":{{"roughness":0.25,"metalness":1}},)"
+      R"("{}":{{"class":"fake_shadow"}},"{}":{{"class":"ground/lava"}},"{}":{{"class":"ground/grass/dry"}}}}}})",
+      keys[TexRock], edited ? R"(,"roughness":0.5)" : "", keys[TexScalars], keys[TexFake], keys[TexLava], keys[TexDry]);
+}
+
 std::span<const u8> ground_texture_base() noexcept {
   return {sGroundTexture.data(), std::min<size_t>(sGroundTexture.size(), GroundTextureSize * GroundTextureSize * 4)};
 }
@@ -1125,10 +1332,10 @@ void draw_scene(u32 frame, const SceneOptions& options) {
   // Not gated on hints_enabled() so the off capture proves emitters add only hint bytes; real producers do gate on it
   set_hint_emission(options.hints);
   upload_gpu_arrays(options);
-  const u32 clock =
-      options.aoCheck || options.fwdEnvCheck || options.unlitCheck || options.companionCheck || options.overlayCheck
-          ? AoCheckClock
-          : frame;
+  const u32 clock = options.aoCheck || options.fwdEnvCheck || options.unlitCheck || options.companionCheck ||
+                            options.overlayCheck || options.classCheck
+                        ? AoCheckClock
+                        : frame;
   const f32 t = static_cast<f32>(clock) / 60.f;
   const SceneCamera camera = scene_camera(clock);
   GXSetCopyClear(ClearColor, GX_MAX_Z24);
@@ -1193,6 +1400,9 @@ void draw_scene(u32 frame, const SceneOptions& options) {
   if (options.overlayCheck) {
     draw_overlay_check();
   }
+  if (options.classCheck) {
+    draw_class_quads();
+  }
   // Without the marker the deferred quad never reaches a replay, so this frame must put it back in place
   if (!options.overlayCheck || frame != OverlayLateFrame) {
     hint_stage(AURORA_STAGE_OPAQUE_DONE);
@@ -1224,6 +1434,10 @@ void shutdown_scene() {
   sBoxPositions = aurora::render::gpu::InvalidHandle;
   GXDestroyTexObj(&sGroundTexObj);
   sGroundTexture = {};
+  for (u32 i = 0; i < ClassTextureCount; ++i) {
+    GXDestroyTexObj(&sClassTexObjs[i]);
+    sClassTextures[i] = {};
+  }
   sTentacle = {};
   sBoxDisplayListSize = 0;
 }

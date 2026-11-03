@@ -16,6 +16,7 @@
 #include "render/gx_ext/surface_table.hpp"
 #include "render/gx_ext/unlit.hpp"
 #include "render/hints.hpp"
+#include "render/material/classes.hpp"
 #include "render/material/registry.hpp"
 #include "render/post/composite.hpp"
 #include "render/scene/classifier.hpp"
@@ -308,7 +309,7 @@ TEST_F(RenderGxExt, RecordsStampNonEmptyCommands) {
   EXPECT_EQ(record.objectLo, 0x9ABCDEF0u);
   EXPECT_EQ(record.objectHi, 0x12345678u);
   EXPECT_EQ(record.prevMtxOff, 0u);
-  EXPECT_EQ(record.materialOff0, 0u);
+  EXPECT_EQ(record.material, 0u);
   EXPECT_EQ(record.materialOff1, 0u);
   EXPECT_EQ(record.tevPolicyOff, 0u);
 
@@ -1318,13 +1319,16 @@ TEST_F(RenderGxExt, RecordBitsOnlyOnOutput2) {
   for (const uint8_t output : {uint8_t{0}, uint8_t{1}}) {
     const records::DrawRecord record = stamped(with_output(pbr_writer(), output), cls);
     EXPECT_EQ(record.flags & (records::flag::VertexColorMask | records::flag::Unlit), 0u) << int{output};
+    EXPECT_EQ(record.flags >> 14, 0u) << int{output};
     EXPECT_EQ(record.tevPolicyOff, 0u) << int{output};
+    EXPECT_EQ(record.material, 0u) << int{output};
   }
   const records::DrawRecord record = stamped(with_output(pbr_writer(), 2), cls);
   EXPECT_EQ((record.flags & records::flag::VertexColorMask) >> records::flag::VertexColorShift, 1u);
   EXPECT_NE(record.flags & records::flag::Unlit, 0u);
+  EXPECT_EQ(record.flags & (records::flag::SurfaceSlotMask | records::flag::BackFaceFlip), 0u);
   EXPECT_NE(record.tevPolicyOff, 0u);
-  EXPECT_EQ(record.materialOff0, 0u);
+  EXPECT_EQ(record.material, material::classes::default_word(true) | gx::render_ext::MaterialWordTwoSided);
   EXPECT_EQ(record.materialOff1, 0u);
   apply_frame_state(frame(false, false));
   EXPECT_EQ(records::stats().pbrRecords, 1u);
@@ -1357,9 +1361,10 @@ TEST_F(RenderGxExt, SurfaceTableDedupesEntries) {
   ASSERT_EQ(table->size(), surface_table::StaticSlots + 2);
   EXPECT_EQ((*table)[0], surface_table::Entry{});
   constexpr uint32_t StaticByte = 0x01u << 16;
+  constexpr uint32_t TwoSided = uint32_t{gx::surface::TwoSided} << 8;
   EXPECT_EQ((*table)[surface_table::StaticSlots],
-            (surface_table::Entry{gx::surface::ClassDefault | StaticByte, 0, 0, 0}));
-  const uint32_t flags = gx::surface::Unlit | gx::surface::BakedLight;
+            (surface_table::Entry{gx::surface::ClassDefault | TwoSided | StaticByte, 0, 0, 0}));
+  const uint32_t flags = gx::surface::Unlit | gx::surface::BakedLight | gx::surface::TwoSided;
   EXPECT_EQ((*table)[surface_table::StaticSlots + 1],
             (surface_table::Entry{gx::surface::ClassDefault | (flags << 8) | StaticByte, 0, 0, 0}));
   apply_frame_state(frame(false, false));
@@ -1371,19 +1376,21 @@ TEST_F(RenderGxExt, SurfaceTableEntryFollowsReceiverAndKey) {
   const gx::PipelineConfig config = with_output(pbr_writer(), 2);
   const gx::ShaderInfo info = gx::build_shader_info(config.shaderConfig);
   using records::flag::ReceiverShift;
-  EXPECT_EQ(records::surface_entry(config, info, 2u << ReceiverShift, 0)[0],
+  constexpr uint32_t Word = material::classes::default_word(true);
+  EXPECT_EQ(records::surface_entry(config, info, 2u << ReceiverShift, 0, Word)[0],
             Default | (gx::surface::CloudReceiver << 8));
-  EXPECT_EQ(records::surface_entry(config, info, 1u << ReceiverShift, 0)[0],
+  EXPECT_EQ(records::surface_entry(config, info, 1u << ReceiverShift, 0, Word)[0],
             Default | (gx::surface::NoShadowReceive << 8));
-  EXPECT_EQ(records::surface_entry(config, info, 3u << ReceiverShift, 0)[0], Default);
-  EXPECT_EQ(records::surface_entry(config, info, records::flag::Unlit, 0)[0], Default | (gx::surface::Unlit << 8));
-  EXPECT_EQ(records::surface_entry(config, info, 2u << records::flag::VertexColorShift, 0)[0], Default);
+  EXPECT_EQ(records::surface_entry(config, info, 3u << ReceiverShift, 0, Word)[0], Default);
+  EXPECT_EQ(records::surface_entry(config, info, records::flag::Unlit, 0, Word)[0],
+            Default | (gx::surface::Unlit << 8));
+  EXPECT_EQ(records::surface_entry(config, info, 2u << records::flag::VertexColorShift, 0, Word)[0], Default);
   gx::PipelineConfig keyed = config;
   keyed.shaderConfig.ext.surfaceExt = 1;
-  EXPECT_EQ(records::surface_entry(keyed, info, 0, 0)[0],
+  EXPECT_EQ(records::surface_entry(keyed, info, 0, 0, Word)[0],
             Default | gx::surface::EntryExtAmbient | gx::surface::EntryExtEmissive);
-  EXPECT_EQ(records::surface_entry(config, info, 0, cat::Dynamic | cat::Player)[0], Default | (0x82u << 16));
-  EXPECT_EQ(records::surface_entry(config, info, 0, cat::Static | cat::Terrain | cat::Emissive)[0],
+  EXPECT_EQ(records::surface_entry(config, info, 0, cat::Dynamic | cat::Player, Word)[0], Default | (0x82u << 16));
+  EXPECT_EQ(records::surface_entry(config, info, 0, cat::Static | cat::Terrain | cat::Emissive, Word)[0],
             Default | (0x09u << 16));
 }
 
@@ -1724,6 +1731,328 @@ TEST_F(RenderGxExt, NormalsOffAtBlendOne) {
   apply_frame_state(pbr_state(0.f));
   EXPECT_FALSE(gx::render_ext::g_companionGates.normals);
   EXPECT_FALSE(gx::render_ext::g_companionGates.materials);
+}
+
+constexpr uint32_t DefaultWord = material::classes::default_word(true);
+constexpr uint32_t TwoSidedBit = gx::render_ext::MaterialWordTwoSided;
+
+gx::PipelineConfig culled(gx::PipelineConfig config, GXCullMode cull) {
+  config.cullMode = cull;
+  return config;
+}
+
+unlit::DrawMaterial material_of(const gx::PipelineConfig& config, const scene::DrawClass& cls) {
+  return unlit::draw_material(config, gx::build_shader_info(config.shaderConfig), cls);
+}
+
+scene::DrawClass hinted(uint8_t hint, uint32_t flags = 0) {
+  scene::DrawClass cls = main_opaque();
+  cls.key.materialClass = hint;
+  cls.key.flags = flags;
+  return cls;
+}
+
+void flip_frame() {
+  records::testing::set_push(&FakeStorage::push);
+  records::testing::set_active(true, true, false);
+  records::testing::set_surface(true);
+  records::set_back_face_flip(true);
+}
+
+bool flipped(const records::DrawRecord& record) { return (record.flags & records::flag::BackFaceFlip) != 0; }
+
+gx::PipelineConfig ma00_writer() {
+  gx::PipelineConfig config = pbr_writer();
+  config.shaderConfig.attrs[GX_VA_CLR0] = {.attrType = GX_DIRECT, .cnt = 4, .compType = GX_RGBA8};
+  config.shaderConfig.colorChannels[GX_COLOR0].matSrc = GX_SRC_VTX;
+  return config;
+}
+
+TEST_F(RenderGxExt, MaterialWordOnlyOnOutput2) {
+  records::testing::set_push(&FakeStorage::push);
+  records::testing::set_active(true, true, false);
+  records::testing::set_surface(true);
+  for (const uint8_t output : {uint8_t{0}, uint8_t{1}}) {
+    EXPECT_EQ(stamped(with_output(pbr_writer(), output), main_opaque()).material, 0u) << int{output};
+  }
+  EXPECT_EQ(stamped(with_output(pbr_writer(), 2), main_opaque()).material, DefaultWord | TwoSidedBit);
+  EXPECT_EQ(stamped(culled(with_output(pbr_writer(), 2), GX_CULL_BACK), main_opaque()).material, DefaultWord);
+  EXPECT_EQ(DefaultWord, 0x800100D9u);
+  EXPECT_EQ(material::classes::default_word(false), 0x000100D9u);
+}
+
+TEST_F(RenderGxExt, TwoSidedFromCullNoneObjectOrClass) {
+  const gx::PipelineConfig config = with_output(pbr_writer(), 2);
+  EXPECT_NE(material_of(config, main_opaque()).word & TwoSidedBit, 0u);
+  const gx::PipelineConfig back = culled(config, GX_CULL_BACK);
+  EXPECT_EQ(material_of(back, main_opaque()).word, DefaultWord);
+  EXPECT_EQ(material_of(back, hinted(0, scene::object_flag::DoubleSided)).word, DefaultWord | TwoSidedBit);
+  const uint32_t foliage = material_of(back, hinted(7)).word;
+  EXPECT_EQ((foliage >> 16) & 0xFFu, 7u);
+  EXPECT_EQ(foliage & gx::render_ext::MaterialWordFlagMask,
+            uint32_t{gx::surface::ThinTranslucent | gx::surface::TwoSided | gx::surface::NoSsr} << 24);
+  EXPECT_EQ(foliage & 0xFFu, gx::surface::unorm8(0.55f));
+}
+
+TEST_F(RenderGxExt, CullFrontWithTwoSidedClassNotFlagged) {
+  flip_frame();
+  const gx::PipelineConfig front = culled(with_output(pbr_writer(), 2), GX_CULL_FRONT);
+  const scene::DrawClass cls = hinted(7, scene::object_flag::DoubleSided);
+  const uint32_t word = material_of(front, cls).word;
+  EXPECT_EQ(word & TwoSidedBit, 0u);
+  EXPECT_NE(word & (uint32_t{gx::surface::ThinTranslucent} << 24), 0u);
+  const records::DrawRecord record = stamped(front, cls);
+  EXPECT_FALSE(flipped(record));
+  EXPECT_EQ(record.material, word);
+  apply_frame_state(frame(false, false));
+  EXPECT_EQ(records::stats().cullFront, 1u);
+  EXPECT_EQ(records::stats().twoSided, 0u);
+}
+
+TEST_F(RenderGxExt, BackFaceFlipOnlyCullNone) {
+  flip_frame();
+  EXPECT_TRUE(flipped(stamped(with_output(pbr_writer(), 2), main_opaque())));
+  const records::DrawRecord back =
+      stamped(culled(with_output(pbr_writer(), 2), GX_CULL_BACK), hinted(0, scene::object_flag::DoubleSided));
+  EXPECT_NE(back.material & TwoSidedBit, 0u);
+  EXPECT_FALSE(flipped(back));
+  for (const uint8_t output : {uint8_t{0}, uint8_t{1}}) {
+    EXPECT_FALSE(flipped(stamped(with_output(pbr_writer(), output), main_opaque()))) << int{output};
+  }
+  apply_frame_state(frame(false, false));
+  EXPECT_EQ(records::stats().twoSided, 2u);
+}
+
+TEST_F(RenderGxExt, MirroredCullNoneNotFlipped) {
+  flip_frame();
+  const gx::PipelineConfig config = with_output(pbr_writer(), 2);
+  gx::g_gxState.proj[0][0] = 1.f;
+  gx::g_gxState.proj[1][1] = 1.f;
+  gx::g_gxState.pnMtx[0].pos = {{1.f, 0.f, 0.f, 0.f}, {0.f, 1.f, 0.f, 0.f}, {0.f, 0.f, 1.f, 0.f}};
+  EXPECT_TRUE(flipped(stamped(config, main_opaque())));
+  gx::g_gxState.pnMtx[0].pos.m0[0] = -1.f;
+  EXPECT_FALSE(flipped(stamped(config, main_opaque())));
+  gx::g_gxState.pnMtx[0].pos.m0[0] = 1.f;
+  gx::g_gxState.proj[1][1] = -1.f;
+  EXPECT_FALSE(flipped(stamped(config, main_opaque())));
+  gx::g_gxState.proj[0][0] = -1.f;
+  EXPECT_TRUE(flipped(stamped(config, main_opaque())));
+  gx::DrawData draw{};
+  draw.immediateData.currentPnMtx = gx::MaxPnMtx + gx::MaxTexMtx;
+  EXPECT_TRUE(records::mirrored(draw, config));
+  draw.immediateData.currentPnMtx = gx::MaxPnMtx;
+  gx::g_gxState.texMtxs[0] = {{-1.f, 0.f, 0.f, 0.f}, {0.f, 1.f, 0.f, 0.f}, {0.f, 0.f, 1.f, 0.f}};
+  EXPECT_TRUE(records::mirrored(draw, config));
+  gx::g_gxState.proj[0][0] = 1.f;
+  EXPECT_FALSE(records::mirrored(draw, config));
+  apply_frame_state(frame(false, false));
+  EXPECT_EQ(records::stats().mirrored, 4u);
+}
+
+TEST_F(RenderGxExt, PaletteTwoSidedCounted) {
+  flip_frame();
+  gx::PipelineConfig config = with_output(pbr_writer(), 2);
+  config.shaderConfig.attrs[GX_VA_PNMTXIDX] = {.attrType = GX_DIRECT, .cnt = 1, .compType = GX_U8};
+  gx::g_gxState.proj[0][0] = -1.f;
+  gx::g_gxState.proj[1][1] = 1.f;
+  EXPECT_TRUE(flipped(stamped(config, main_opaque())));
+  apply_frame_state(frame(false, false));
+  EXPECT_EQ(records::stats().paletteTwoSided, 1u);
+  EXPECT_EQ(records::stats().mirrored, 0u);
+}
+
+TEST_F(RenderGxExt, BackFaceFlipOnlyUnderNormalsGate) {
+  const ScopedTargets targets;
+  const ScopedHints hints;
+  webgpu::g_graphicsConfig.gbuffer = true;
+  webgpu::g_graphicsConfig.surfaceBuffer = true;
+  records::testing::set_push(&FakeStorage::push);
+  const auto flips = [] {
+    records::testing::set_active(true, true, false);
+    records::testing::set_surface(true);
+    return flipped(stamped(with_output(pbr_writer(), 2), main_opaque()));
+  };
+  apply_frame_state(pbr_state(0.f));
+  EXPECT_TRUE(flips());
+  apply_frame_state(pbr_state(1.f));
+  EXPECT_FALSE(flips());
+  apply_frame_state(frame(false, false));
+  EXPECT_FALSE(flips());
+  SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_MATERIAL_CLASSES", "off", true);
+  unlit::testing::reset();
+  apply_frame_state(pbr_state(0.f));
+  EXPECT_FALSE(flips());
+  SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_MATERIAL_CLASSES");
+  unlit::testing::reset();
+  apply_frame_state(pbr_state(0.f));
+  EXPECT_TRUE(flips());
+}
+
+constexpr std::string_view ScalarKey = "tex1_16x16_000000000000a001_14";
+
+TEST_F(RenderGxExt, ManifestFactorBitsOnlyWhenSet) {
+  add(R"({"version":1,"materials":{"tex1_16x16_000000000000a001_14":{"class":"ground/rock","roughness":0.25,)"
+      R"("metalness":1},"tex1_16x16_000000000000a004_14":{"class":"ground/rock"}}})");
+  apply_frame_state(frame(false, false));
+  const gx::PipelineConfig config = culled(with_output(pbr_writer(), 2), GX_CULL_BACK);
+  gx::g_gxState.textures[0].material = material_ref(ScalarKey);
+  const unlit::DrawMaterial scalars = material_of(config, main_opaque());
+  EXPECT_EQ(scalars.source, material::classes::Source::Manifest);
+  EXPECT_EQ(scalars.word, 64u | 255u << 8 | 4u << 16 | gx::render_ext::MaterialWordRoughnessFactor |
+                              gx::render_ext::MaterialWordMetalnessFactor | gx::render_ext::MaterialWordAmbient);
+  gx::g_gxState.textures[0].material = material_ref(PlainKey);
+  EXPECT_EQ(material_of(config, main_opaque()).word, 204u | 4u << 16 | gx::render_ext::MaterialWordAmbient);
+  gx::g_gxState.textures[0].material = {};
+  EXPECT_EQ(material_of(config, main_opaque()).word, DefaultWord);
+}
+
+TEST_F(RenderGxExt, ClassesOffMatchesW1Word) {
+  SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_MATERIAL_CLASSES", "off", true);
+  unlit::testing::reset();
+  apply_frame_state(frame(false, false));
+  surface_table::testing::reset();
+  flip_frame();
+  surface_table::begin_frame(true);
+  gx::g_gxState.colorChannelState[0].ambColor = {0.25f, 0.5f, 0.75f, 1.f};
+  for (const scene::DrawClass& cls : {main_opaque(), hinted(7, scene::object_flag::DoubleSided)}) {
+    const records::DrawRecord record = stamped(with_output(pbr_writer(), 2), cls);
+    EXPECT_EQ(record.material, material::classes::default_word(false));
+    EXPECT_FALSE(flipped(record));
+    EXPECT_EQ((*surface_table::snapshot())[surface_slot(record)],
+              (surface_table::Entry{gx::surface::ClassDefault | (0x09u << 16), 0, 0, 0}));
+  }
+  EXPECT_FALSE(unlit::surface_ext(with_output(ma00_writer(), 2), gx::build_shader_info(ma00_writer().shaderConfig),
+                                  records::BakedVertex));
+  SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_MATERIAL_CLASSES");
+  unlit::testing::reset();
+}
+
+TEST_F(RenderGxExt, ForceClassOverridesAll) {
+  add(Plain);
+  ASSERT_TRUE(material::classes::register_class(200, "test/coat", {}));
+  SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_MATERIAL_CLASSES", "force:ground/rock", true);
+  unlit::testing::reset();
+  apply_frame_state(frame(false, false));
+  const gx::PipelineConfig config = culled(with_output(pbr_writer(), 2), GX_CULL_BACK);
+  gx::g_gxState.textures[0].material = material_ref(PlainKey);
+  for (const scene::DrawClass& cls : {main_opaque(), hinted(200), hinted(0)}) {
+    const unlit::DrawMaterial dm = material_of(config, cls);
+    EXPECT_EQ((dm.word >> 16) & 0xFFu, 4u);
+    EXPECT_EQ(dm.source, material::classes::Source::Force);
+  }
+  SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_MATERIAL_CLASSES");
+  testing::reset();
+  add(Plain);
+  ASSERT_TRUE(material::classes::register_class(200, "test/coat", {}));
+  apply_frame_state(frame(false, false));
+  gx::g_gxState.textures[0].material = material_ref(PlainKey);
+  EXPECT_EQ((material_of(config, hinted(200)).word >> 16) & 0xFFu, 2u);
+  gx::g_gxState.textures[0].material = {};
+  EXPECT_EQ((material_of(config, hinted(200)).word >> 16) & 0xFFu, 200u);
+  EXPECT_EQ((material_of(config, hinted(201)).word >> 16) & 0xFFu, 1u);
+  EXPECT_EQ(material_of(config, hinted(201)).source, material::classes::Source::Hint);
+}
+
+TEST_F(RenderGxExt, SurfaceTableReadsMaterialWord) {
+  const gx::PipelineConfig config = with_output(pbr_writer(), 2);
+  const gx::ShaderInfo info = gx::build_shader_info(config.shaderConfig);
+  const uint32_t foliage = 0x8u | 7u << 16 | uint32_t{0x1Cu} << 24 | gx::render_ext::MaterialWordAmbient;
+  const surface_table::Entry entry = records::surface_entry(config, info, records::flag::Unlit, 0, foliage);
+  EXPECT_EQ(entry[0] & 0xFFu, 7u);
+  EXPECT_EQ((entry[0] >> 8) & 0xFFu, 0x1Cu | gx::surface::Unlit);
+  EXPECT_EQ(records::surface_entry(config, info, 0, 0, 0)[0] & 0xFFu, 0u);
+  surface_table::testing::reset();
+  surface_table::begin_frame(true);
+  EXPECT_EQ(surface_table::slot_for(records::surface_entry(config, info, 0, 0, 0)), 0u);
+  EXPECT_EQ(surface_table::slot_for(entry), surface_table::StaticSlots);
+}
+
+TEST_F(RenderGxExt, SurfaceTableAmbientFromChannelRegister) {
+  const gx::PipelineConfig config = with_output(pbr_writer(), 2);
+  const gx::ShaderInfo info = gx::build_shader_info(config.shaderConfig);
+  gx::g_gxState.colorChannelState[0].ambColor = {64.f / 255.f, 128.f / 255.f, 191.f / 255.f, 1.f};
+  gx::g_gxState.colorChannelState[1].ambColor = {1.f, 1.f, 1.f, 1.f};
+  EXPECT_EQ(records::surface_entry(config, info, 0, 0, DefaultWord)[1], 0xBF8040u);
+  EXPECT_EQ(records::surface_entry(config, info, 0, 0, material::classes::default_word(false))[1], 0u);
+  gx::PipelineConfig keyedConfig = config;
+  keyedConfig.shaderConfig.ext.surfaceExt = 1;
+  EXPECT_EQ(records::surface_entry(keyedConfig, info, 0, 0, DefaultWord)[1], 0u);
+  gx::PipelineConfig unknown = config;
+  unknown.shaderConfig.colorChannels[GX_COLOR0].ambSrc = GX_SRC_VTX;
+  EXPECT_EQ(records::surface_entry(unknown, gx::build_shader_info(unknown.shaderConfig), 0, 0, DefaultWord)[1], 0u);
+}
+
+TEST_F(RenderGxExt, SurfaceTableAmbientSkipsUnlitChannel) {
+  gx::PipelineConfig config = with_output(pbr_writer(), 2);
+  gx::ShaderConfig& shader = config.shaderConfig;
+  shader.attrs[GX_VA_CLR0] = {.attrType = GX_DIRECT, .cnt = 4, .compType = GX_RGBA8};
+  shader.colorChannels[GX_COLOR0] = {.matSrc = GX_SRC_VTX};
+  shader.colorChannels[GX_COLOR1] = shader.colorChannels[GX_ALPHA0];
+  shader.colorChannels[GX_COLOR1] = {
+      .matSrc = GX_SRC_REG, .ambSrc = GX_SRC_REG, .diffFn = GX_DF_CLAMP, .attnFn = GX_AF_SPOT, .lightingEnabled = true};
+  gx::TevStage& lit = shader.tevStages[1];
+  lit.colorPass = {GX_CC_ZERO, GX_CC_CPREV, GX_CC_RASC, GX_CC_ZERO};
+  lit.texMapId = GX_TEXMAP_NULL;
+  lit.texCoordId = GX_TEXCOORD_NULL;
+  lit.channelId = GX_COLOR1A1;
+  shader.tevStageCount = 2;
+  const gx::ShaderInfo info = gx::build_shader_info(shader);
+  ASSERT_TRUE(info.unlitAdmitted);
+  const gx::unlit::Ambient ambient = gx::unlit::ambient_of(shader, info);
+  ASSERT_EQ(ambient.source, gx::unlit::AmbientSource::Register);
+  EXPECT_EQ(ambient.channel, 1u);
+  gx::g_gxState.colorChannelState[0].ambColor = {1.f, 1.f, 1.f, 1.f};
+  gx::g_gxState.colorChannelState[1].ambColor = {64.f / 255.f, 128.f / 255.f, 191.f / 255.f, 1.f};
+  EXPECT_EQ(records::surface_entry(config, info, 0, 0, DefaultWord)[1], 0xBF8040u);
+}
+
+TEST_F(RenderGxExt, SurfaceTableBakedLightAmbientTimesVertex) {
+  const ScopedTargets targets;
+  const ScopedHints hints;
+  pbr_frame();
+  const gx::PipelineConfig config = ma00_writer();
+  const gx::ShaderInfo info = gx::build_shader_info(config.shaderConfig);
+  const gfx::RenderTargetLayout layout = pbr_layout();
+  const auto derived = [&](const scene::DrawClass& cls) {
+    records::on_route(cls);
+    gx::render_ext::StochasticLanes lanes{};
+    const gx::render_ext::Hooks* hooks = gx::render_ext::hooks();
+    return hooks->derive(hooks->userData, config, info, layout, lanes);
+  };
+  scene::DrawClass tint = main_opaque();
+  scene::DrawClass baked = main_opaque();
+  baked.key.flags = scene::object_flag::BakedVertexLight;
+  const gx::RenderExtConfig tintExt = derived(tint);
+  const gx::RenderExtConfig bakedExt = derived(baked);
+  ASSERT_EQ(tintExt.output, 2u);
+  ASSERT_EQ(bakedExt.output, 2u);
+  EXPECT_EQ(tintExt.surfaceExt, 0u);
+  EXPECT_EQ(bakedExt.surfaceExt, 1u);
+  gx::PipelineConfig modulateWriter = pbr_writer();
+  EXPECT_EQ(derived(baked).surfaceExt, 1u);
+  records::on_route(baked);
+  EXPECT_FALSE(unlit::surface_ext(modulateWriter, gx::build_shader_info(modulateWriter.shaderConfig),
+                                  gx::render_ext::g_drawInputs));
+
+  surface_table::testing::reset();
+  surface_table::begin_frame(true);
+  records::testing::set_push(&FakeStorage::push);
+  gx::g_gxState.colorChannelState[0].ambColor = {64.f / 255.f, 128.f / 255.f, 191.f / 255.f, 1.f};
+  gx::PipelineConfig tintConfig = config;
+  tintConfig.shaderConfig.ext = tintExt;
+  gx::PipelineConfig bakedConfig = config;
+  bakedConfig.shaderConfig.ext = bakedExt;
+  const records::DrawRecord tintRecord = stamped(tintConfig, tint);
+  const records::DrawRecord bakedRecord = stamped(bakedConfig, baked);
+  const std::shared_ptr<const surface_table::Table> table = surface_table::snapshot();
+  ASSERT_NE(table, nullptr);
+  const surface_table::Entry& tintEntry = (*table)[surface_slot(tintRecord)];
+  const surface_table::Entry& bakedEntry = (*table)[surface_slot(bakedRecord)];
+  EXPECT_EQ(tintEntry[1], 0xBF8040u);
+  EXPECT_EQ(tintEntry[0] & gx::surface::EntryExtAmbient, 0u);
+  EXPECT_EQ(bakedEntry[1], 0u);
+  EXPECT_NE(bakedEntry[0] & gx::surface::EntryExtAmbient, 0u);
+  EXPECT_NE((bakedEntry[0] >> 8) & gx::surface::BakedLight, 0u);
 }
 } // namespace
 } // namespace aurora::render::gx_ext

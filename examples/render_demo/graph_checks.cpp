@@ -329,6 +329,118 @@ std::optional<std::string> check_unlit(const UnlitCheckSummary& summary) {
   return std::nullopt;
 }
 
+ClassCheckSummary summarize_classes(std::span<const std::vector<ClassSample>, ClassPhaseCount> phases,
+                                    bool bakedVertex) {
+  ClassCheckSummary summary;
+  const auto fail = [&summary](const ClassSample& s, u32 phase, std::string_view what) {
+    if (summary.failures++ == 0) {
+      char text[256];
+      std::snprintf(text, sizeof(text), "quad %u phase %u: %.*s (v1 %08x %08x %08x %08x, normal z %.3f)",
+                    static_cast<u32>(s.quad), phase, static_cast<int>(what.size()), what.data(), s.surface[0],
+                    s.surface[1], s.surface[2], s.surface[3], static_cast<double>(s.normal[2] * 2.f - 1.f));
+      summary.first = text;
+    }
+  };
+  const auto byte3 = [](u32 word) { return std::array<u8, 3>{u8(word), u8(word >> 8), u8(word >> 16)}; };
+  const auto product = [](std::array<u8, 3> a, std::array<u8, 3> b) {
+    std::array<u8, 3> out{};
+    for (size_t c = 0; c < 3; ++c) {
+      const f32 v = (static_cast<f32>(a[c]) / 255.f) * (static_cast<f32>(b[c]) / 255.f);
+      out[c] = static_cast<u8>(static_cast<u32>(0.5f + 255.f * v));
+    }
+    return out;
+  };
+  for (u32 phase = 0; phase < ClassPhaseCount; ++phase) {
+    for (const ClassSample& s : phases[phase]) {
+      ++summary.probes;
+      const u32 cls = (s.surface[1] >> 16) & 0xFFu;
+      const u32 flags = s.surface[1] >> 24;
+      const u32 rough = s.surface[1] & 0xFFu;
+      const u32 metal = (s.surface[1] >> 8) & 0xFFu;
+      const bool facing = s.normal[2] * 2.f - 1.f > 0.5f;
+      const bool away = s.normal[2] * 2.f - 1.f < -0.5f;
+      const auto expect = [&](bool ok, std::string_view what) {
+        if (!ok) {
+          fail(s, phase, what);
+        }
+      };
+      switch (s.quad) {
+      case ClassQuad::Plain:
+        expect(cls == 1 && rough == UnlitRoughness && metal == 0, "no manifest entry is not 1/217/0");
+        break;
+      case ClassQuad::Rock:
+        expect(cls == 4 && rough == (phase == 0 ? 204u : ClassEditedRoughness), "ground/rock class or roughness");
+        break;
+      case ClassQuad::Scalars:
+        expect(cls == 1 && rough == 64 && metal == 255, "manifest scalars 0.25 / 1 are not 64 / 255");
+        break;
+      case ClassQuad::FakeShadow:
+        expect(cls == 0, "fake_shadow is not class 0");
+        break;
+      case ClassQuad::Lava:
+        expect(cls == 1, "ground/lava does not fall back to 1");
+        break;
+      case ClassQuad::Dry:
+        expect(cls == 2, "ground/grass/dry does not resolve to 2");
+        break;
+      case ClassQuad::Hint:
+        expect(cls == ClassHintRegistered, "the registered hint is not its class");
+        break;
+      case ClassQuad::UnregisteredHint:
+        expect(cls == 1, "an unregistered hint is not class 1");
+        break;
+      case ClassQuad::RockHint:
+        expect(cls == 4, "the manifest class does not beat the hint");
+        break;
+      case ClassQuad::BackFace:
+        expect((flags & 0x08u) != 0, "a cull-none quad is not TWO_SIDED");
+        expect(phase == static_cast<u32>(ClassPhase::BlendOne) ? away : facing,
+               phase == static_cast<u32>(ClassPhase::BlendOne) ? "blend 1 flipped the back face"
+                                                               : "the back face normal does not face the camera");
+        break;
+      case ClassQuad::CullFront:
+        expect((flags & 0x1Cu) == 0x14u, "a cull-front foliage quad is TWO_SIDED or lost its class flags");
+        expect(away, "a cull-front quad was flipped");
+        break;
+      case ClassQuad::Mirrored:
+        expect((flags & 0x08u) != 0 && facing, "a mirrored cull-none quad was flipped");
+        break;
+      case ClassQuad::Foliage:
+        expect((flags & 0x1Cu) == 0x1Cu, "foliage/grass does not set b2, b3 and b4");
+        break;
+      case ClassQuad::Player:
+        expect(s.surface[2] >> 24 == 0x82u, "DYNAMIC|PLAYER is not category 0x82");
+        break;
+      case ClassQuad::Ambient:
+        expect(byte3(s.surface[2]) == (bakedVertex ? product(ClassAmbient, ClassVertex) : ClassAmbient),
+               "the ambient register did not reach z");
+        break;
+      case ClassQuad::Channel1:
+        expect(byte3(s.surface[2]) == ClassAmbient, "z did not come from channel 0");
+        expect(byte3(s.surface[0]) == ClassChannel1Vertex, "x lost channel 1's vertex colour");
+        break;
+      case ClassQuad::Count:
+        break;
+      }
+    }
+  }
+  return summary;
+}
+
+std::optional<std::string> check_classes(const ClassCheckSummary& summary) {
+  char text[320];
+  if (summary.probes != static_cast<u32>(ClassQuad::Count) * ClassPhaseCount) {
+    std::snprintf(text, sizeof(text), "%u class probes read, %u expected", summary.probes,
+                  static_cast<u32>(ClassQuad::Count) * ClassPhaseCount);
+    return std::string{text};
+  }
+  if (summary.failures != 0) {
+    std::snprintf(text, sizeof(text), "%u class probes failed; first %s", summary.failures, summary.first.c_str());
+    return std::string{text};
+  }
+  return std::nullopt;
+}
+
 CompanionCheckSummary summarize_companions(std::span<const std::vector<CompanionSample>, CompanionPhaseCount> phases,
                                            const CompanionAxes& axes) {
   CompanionCheckSummary summary{.minTilt = 1.f};

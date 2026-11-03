@@ -40,6 +40,7 @@ enum Demotion : uint8_t {
 bool g_envRead = false;
 bool g_disabled = false;
 bool g_policyOff = false;
+bool g_classesOff = false;
 int g_vertexOverride = -1;
 
 // FIFO thread
@@ -58,6 +59,16 @@ void read_env() noexcept {
       value != nullptr && std::string_view{value} == "off") {
     Log.warn("AURORA_RENDER_UNLIT_POLICY=off: TEV register policies are ignored by the unlit pass");
     g_policyOff = true;
+  }
+  if (const char* value = SDL_getenv("AURORA_RENDER_MATERIAL_CLASSES"); value != nullptr) {
+    const std::string_view mode{value};
+    if (mode == "off") {
+      Log.warn("AURORA_RENDER_MATERIAL_CLASSES=off: every PBR draw takes the default class with no ambient or flip");
+      g_classesOff = true;
+    } else if (mode.starts_with("force:")) {
+      Log.warn("AURORA_RENDER_MATERIAL_CLASSES={}: every PBR draw takes class {}", mode, mode.substr(6));
+      material::classes::set_force(mode.substr(6));
+    }
   }
   if (const char* value = SDL_getenv("AURORA_RENDER_VERTEX_COLOR"); value != nullptr) {
     const std::string_view mode{value};
@@ -102,6 +113,49 @@ void note_config(const gx::ShaderConfig& config, const gx::UnlitFacts& facts) no
   }
 }
 
+struct LayerWalk {
+  uint32_t vertexPolicy = 0;
+  bool unlit = false;
+  std::array<uint16_t, material::classes::FieldCount> ids{};
+};
+
+uint32_t layer_maps(const gx::ShaderConfig& config, const gx::ShaderInfo& info) noexcept;
+
+LayerWalk walk_layers(const gx::PipelineConfig& config, const gx::ShaderInfo& info, bool bakedObject) noexcept {
+  const gx::ShaderConfig& shader = config.shaderConfig;
+  const uint32_t maps = layer_maps(shader, info);
+  LayerWalk walk;
+  bool policySet = false;
+  for (u32 s = 0; s < shader.tevStageCount && s < gx::MaxTevStages; ++s) {
+    const u32 map = shader.tevStages[s].texMapId;
+    if (map > GX_TEXMAP7 || (maps >> map & 1u) == 0) {
+      continue;
+    }
+    const gfx::TextureMaterialRef& ref = gx::g_gxState.textures[map].material;
+    if (const uint32_t vc = material::vertex_color(ref.flags); vc != 0 && !policySet) {
+      walk.vertexPolicy = vc - 1;
+      policySet = true;
+    }
+    walk.unlit = walk.unlit || (ref.flags & material::Unlit) != 0;
+    if (ref.id == 0) {
+      continue;
+    }
+    const uint8_t fields = material::classes::supplied(ref.id);
+    for (size_t f = 0; f < walk.ids.size(); ++f) {
+      if (walk.ids[f] == 0 && (fields >> f & 1u) != 0) {
+        walk.ids[f] = static_cast<uint16_t>(ref.id);
+      }
+    }
+  }
+  if (!policySet) {
+    walk.vertexPolicy = bakedObject ? 1 : 0;
+  }
+  if (g_vertexOverride >= 0) {
+    walk.vertexPolicy = static_cast<uint32_t>(g_vertexOverride);
+  }
+  return walk;
+}
+
 uint32_t layer_maps(const gx::ShaderConfig& config, const gx::ShaderInfo& info) noexcept {
   const uint16_t stages = gx::unlit_facts(config, info).layerStages;
   uint32_t maps = 0;
@@ -142,38 +196,45 @@ bool output2(const gx::PipelineConfig& config, const gx::ShaderInfo& info, uint3
   return true;
 }
 
+DrawMaterial draw_material(const gx::PipelineConfig& config, const gx::ShaderInfo& info,
+                           const scene::DrawClass& cls) noexcept {
+  const LayerWalk walk = walk_layers(config, info, (cls.key.flags & scene::object_flag::BakedVertexLight) != 0);
+  DrawMaterial out{.vertexPolicy = walk.vertexPolicy,
+                   .unlit = walk.unlit || (cls.key.categories & scene::category::Emissive) != 0};
+  if (g_classesOff) {
+    out.word = material::classes::default_word(false);
+    return out;
+  }
+  out.word =
+      material::classes::material_word(walk.ids.data(), cls.key.materialClass, cls.key.categories, config.cullMode,
+                                       (cls.key.flags & scene::object_flag::DoubleSided) != 0, out.source);
+  return out;
+}
+
+bool surface_ext(const gx::PipelineConfig& config, const gx::ShaderInfo& info, uint32_t inputs) noexcept {
+  if (g_classesOff) {
+    return false;
+  }
+  const gx::unlit::Ambient ambient = gx::unlit::ambient_of(config.shaderConfig, info);
+  if (ambient.source == gx::unlit::AmbientSource::Vertex) {
+    return true;
+  }
+  return ambient.source == gx::unlit::AmbientSource::Register && ambient.rawVertex &&
+         walk_layers(config, info, (inputs & records::BakedVertex) != 0).vertexPolicy == 1;
+}
+
 uint32_t vertex_policy(const gx::PipelineConfig& config, const gx::ShaderInfo& info,
                        const scene::DrawClass& cls) noexcept {
-  if (g_vertexOverride >= 0) {
-    return static_cast<uint32_t>(g_vertexOverride);
-  }
-  const uint32_t maps = layer_maps(config.shaderConfig, info);
-  for (u32 s = 0; s < config.shaderConfig.tevStageCount && s < gx::MaxTevStages; ++s) {
-    const u32 map = config.shaderConfig.tevStages[s].texMapId;
-    if (map > GX_TEXMAP7 || (maps >> map & 1u) == 0) {
-      continue;
-    }
-    if (const uint32_t vc = material::vertex_color(gx::g_gxState.textures[map].material.flags); vc != 0) {
-      return vc - 1;
-    }
-  }
-  return (cls.key.flags & scene::object_flag::BakedVertexLight) != 0 ? 1 : 0;
+  return walk_layers(config, info, (cls.key.flags & scene::object_flag::BakedVertexLight) != 0).vertexPolicy;
 }
 
 bool unlit_flag(const gx::PipelineConfig& config, const gx::ShaderInfo& info, const scene::DrawClass& cls) noexcept {
-  if ((cls.key.categories & scene::category::Emissive) != 0) {
-    return true;
-  }
-  const uint32_t maps = layer_maps(config.shaderConfig, info);
-  for (u32 map = 0; map < gx::MaxTextures; ++map) {
-    if ((maps >> map & 1u) != 0 && (gx::g_gxState.textures[map].material.flags & material::Unlit) != 0) {
-      return true;
-    }
-  }
-  return false;
+  return (cls.key.categories & scene::category::Emissive) != 0 || walk_layers(config, info, false).unlit;
 }
 
 bool policy_enabled() noexcept { return !g_policyOff; }
+
+bool classes_enabled() noexcept { return !g_classesOff; }
 
 void apply_frame_state(const detail::FrameState&) noexcept {
   if (!std::exchange(g_envRead, true)) {
@@ -200,13 +261,17 @@ void shutdown() noexcept {
         "Unlit TEV: output-2 draws {}, configs {} pass / {} fail (passthrough {}, linear {}, scale {}, spec-only "
         "{}, other {}, nonlinear {}, light texgen {}), demoted (verdict {}, varyings {}, NoPbr {}, EFB copy {}, "
         "no NRM {}, lines {}, blended {}), fallback output 1 {} / output 0 {}, twin adopted {}, policy blocks {}, "
-        "fwdEnv demotions {}, in-window blended main draws {}",
+        "fwdEnv demotions {}, in-window blended main draws {}, classes manifest {} / hint {} / default {} / none {}, "
+        "two-sided {}, cull-front {}, mirrored {}, palette two-sided {}, ambient unknown {} configs",
         recordStats.pbrRecords, passed, configs - passed, v(Verdict::Passthrough), v(Verdict::Linear),
         v(Verdict::Scale), v(Verdict::FailSpecOnly), v(Verdict::FailOther), v(Verdict::FailNonlinear),
         v(Verdict::FailLightTexgen), d(DemoteVerdict), d(DemoteVaryings), d(DemoteNoPbr), d(DemoteEfbCopy),
         d(DemoteNoNrm), d(DemoteLines), d(DemoteBlended), stats.pbrFallbackOutput1.load(std::memory_order_relaxed),
         stats.pbrFallbackOutput0.load(std::memory_order_relaxed), stats.pbrTwinAdopted.load(std::memory_order_relaxed),
-        recordStats.policyBlocks, stats.fwdEnvDemotions.load(std::memory_order_relaxed), recordStats.blendedInWindow);
+        recordStats.policyBlocks, stats.fwdEnvDemotions.load(std::memory_order_relaxed), recordStats.blendedInWindow,
+        recordStats.classManifest, recordStats.classHint, recordStats.classDefault, recordStats.classNone,
+        recordStats.twoSided, recordStats.cullFront, recordStats.mirrored, recordStats.paletteTwoSided,
+        stats.pbrAmbientUnknown.load(std::memory_order_relaxed));
   }
   testing::reset();
 }
@@ -223,6 +288,7 @@ void reset() noexcept {
   g_envRead = false;
   g_disabled = false;
   g_policyOff = false;
+  g_classesOff = false;
   g_vertexOverride = -1;
 }
 } // namespace testing

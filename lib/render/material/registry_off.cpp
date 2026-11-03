@@ -2,6 +2,8 @@
 
 #include "../../logging.hpp"
 
+#include <aurora/render.hpp>
+
 #include <atomic>
 
 namespace aurora::texture {
@@ -64,3 +66,17 @@ MaterialUsage material_usage() { return {}; }
 
 uint64_t material_hits(std::string_view) { return 0; }
 } // namespace aurora::texture
+
+namespace aurora::render {
+namespace {
+constexpr Module Log{"aurora::render::material"};
+
+std::atomic_bool g_classesWarned{false};
+} // namespace
+
+void register_material_class(uint8_t, std::string_view, const OpenPbrParams&) {
+  if (!g_classesWarned.exchange(true)) {
+    Log.warn("Material classes need aurora built with AURORA_ENABLE_RENDER");
+  }
+}
+} // namespace aurora::render

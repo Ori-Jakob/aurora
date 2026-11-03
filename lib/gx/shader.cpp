@@ -868,8 +868,6 @@ struct OutputMember {
   std::string assignment;
 };
 
-constexpr float UnlitDefaultRoughness = 0.85f;
-
 struct UnlitPass {
   u16 scaleDivide = 0;
 };
@@ -884,6 +882,28 @@ std::string replace_all(std::string text, std::string_view from, std::string_vie
     text.replace(pos, from.size(), to);
   }
   return text;
+}
+
+std::string surface_ext_ambient(const ShaderConfig& config, const ShaderInfo& info) {
+  const unlit::Ambient ambient = unlit::ambient_of(config, info);
+  const u32 c = ambient.channel;
+  const bool raw = (info.unlitRawVtx >> c & 1u) != 0;
+  const ColorChannelConfig& channel = config.colorChannels[c];
+  std::string value;
+  if (ambient.source == unlit::AmbientSource::Register && channel.lightingEnabled && channel.ambSrc == GX_SRC_REG &&
+      info.sampledColorChannels.test(c)) {
+    value = fmt::format("ubuf.cc{}_amb.rgb", c);
+  } else if (ambient.source == unlit::AmbientSource::Vertex && raw) {
+    value = fmt::format("in.ccv{}", c);
+  } else {
+    render_ext::g_stats.pbrAmbientUnknown.fetch_add(1, std::memory_order_relaxed);
+    return "vec3f(0.0)";
+  }
+  if (ambient.rawVertex && raw) {
+    value += fmt::format(" * select(vec3f(1.0), in.ccv{}, ((gx_record_word({}u) >> {}u) & 3u) == 1u)", c,
+                         render_ext::DrawRecordFlagsWord, render_ext::RecordVertexColorShift);
+  }
+  return fmt::format("select(vec3f(0.0), {}, (umat & {:#x}u) != 0u)", value, render_ext::MaterialWordAmbient);
 }
 
 bool direct_stage(const TevStage& stage) noexcept {
@@ -1872,6 +1892,14 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
   }
 
   CHECK(vtxOutIdx <= info.varyings, "GX shader emits {} inter-stage locations, planned {}", vtxOutIdx, info.varyings);
+  const bool backFaceText = unlitText && useNormalTarget;
+  const std::string flipLet = backFaceText
+                                  ? fmt::format("\n    let uflip = !gx_ff && (gx_record_word({}u) & {:#x}u) != 0u;",
+                                                render_ext::DrawRecordFlagsWord, render_ext::RecordFlagBackFaceFlip)
+                                  : std::string{};
+  const auto flipped = [backFaceText](std::string_view n) {
+    return backFaceText ? fmt::format("select({0}, -{0}, uflip)", n) : std::string{n};
+  };
   std::string fragmentOutput;
   std::string_view fragmentOutputType = "@location(0) vec4f"sv;
   std::string fragmentReturn = "\n    return prev;"s;
@@ -1882,22 +1910,22 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     std::string assignment =
         useNormalTarget ? fmt::format(
                               "\n    let nrm_len_sq = dot(in.mv_nrm, in.mv_nrm);"
-                              "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm), nrm_len_sq > 1e-10);"
-                              "\n    out.normal = vec4f(unit_nrm * 0.5 + 0.5, {});",
-                              alpha)
+                              "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm), nrm_len_sq > 1e-10);{}"
+                              "\n    out.normal = vec4f({} * 0.5 + 0.5, {});",
+                              flipLet, flipped("unit_nrm"), alpha)
                         : "\n    out.normal = vec4f(0.5, 0.5, 0.5, 0.0);"s;
     if (useNormalTarget && companionText) {
       assignment = fmt::format(
           "\n    let nrm_len_sq = dot(in.mv_nrm, in.mv_nrm);"
-          "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm), nrm_len_sq > 1e-10);"
-          "\n    let legacy_normal = vec4f(unit_nrm * 0.5 + 0.5, {0});"
+          "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm), nrm_len_sq > 1e-10);{1}"
+          "\n    let legacy_normal = vec4f({2} * 0.5 + 0.5, {0});"
           "\n    // Perspective only: mo_cur carries clip xyw, so an orthographic view depth is not recoverable"
           "\n    let use_mapped = ubuf.mat0.y > 0.0 && (u32(ubuf.mat0.x) & 6u) != 0u && ubuf.proj[3].w == 0.0 && "
           "nrm_len_sq > 1e-10;"
           "\n    let mapped_nrm = gx_perturb(unit_nrm, cmp_dp1, cmp_dp2, cmp_duv1, cmp_duv2, "
           "gx_companion_tangent(cmp_nrm, ubuf.mat0));"
-          "\n    out.normal = select(legacy_normal, vec4f(mapped_nrm * 0.5 + 0.5, {0}), use_mapped);",
-          alpha);
+          "\n    out.normal = select(legacy_normal, vec4f({3} * 0.5 + 0.5, {0}), use_mapped);",
+          alpha, flipLet, flipped("unit_nrm"), flipped("mapped_nrm"));
     }
     if (useNormalTarget && receiverNormal) {
       uniformPre += "\n" + receiver_alpha_wgsl();
@@ -1995,6 +2023,9 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
       const TevNormalized unlitNormalized = emit_tev_stages(inner, &pass);
       inner +=
           unlitNormalized.color ? "\n    unlit_rgb = prev.rgb;"sv : "\n    unlit_rgb = tev_overflow_vec3f(prev.rgb);"sv;
+      if (unlit::ambient_of(config, info).source == unlit::AmbientSource::Unknown) {
+        render_ext::g_stats.pbrAmbientUnknown.fetch_add(1, std::memory_order_relaxed);
+      }
       // Class, flags, category, ambient and emission sit in the draw's table entry, so the record carries a slot
       assignment = fmt::format(
           "\n    // Unlit TEV (SP1 rules v1): no fog, lit alpha kept, only unlit_rgb leaves the block"
@@ -2002,21 +2033,30 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
           "\n    {{{0}"
           "\n    }}"
           "\n    let uslot = (gx_record_word({1}u) >> {2}u) & {3}u;"
-          "{4}"
-          "\n    out.surface = gx_surface_pack(unlit_rgb, {5}, {6}, {7}, uslot);",
+          "\n    let umat = gx_record_word({4}u);"
+          "\n    let urough = f32(umat & 0xffu) * bitcast<f32>(0x3b808081u);"
+          "\n    let umetal = f32((umat >> 8u) & 0xffu) * bitcast<f32>(0x3b808081u);"
+          "{5}"
+          "\n    out.surface = gx_surface_pack(unlit_rgb, {6}, {7}, {8}, uslot);",
           replace_all(std::move(inner), "\n", "\n    "), render_ext::DrawRecordFlagsWord,
           render_ext::RecordSurfaceSlotShift, (1u << render_ext::RecordSurfaceSlotBits) - 1u,
+          render_ext::DrawRecordMaterialWord,
           companionText ? "\n    let uorm = (u32(ubuf.mat0.x) & 8u) != 0u;"sv : ""sv,
           companionText ? "select(1.0, cmp_orm.r, uorm)"sv : "1.0"sv,
-          companionText ? fmt::format("select({:.2f}, cmp_orm.g, uorm)", UnlitDefaultRoughness)
-                        : fmt::format("{:.2f}", UnlitDefaultRoughness),
-          companionText ? "select(0.0, cmp_orm.b, uorm)"sv : "0.0"sv);
+          companionText ? fmt::format("select(urough, cmp_orm.g * select(1.0, urough, (umat & {:#x}u) != 0u), uorm)",
+                                      render_ext::MaterialWordRoughnessFactor)
+                        : "urough"s,
+          companionText ? fmt::format("select(umetal, cmp_orm.b * select(1.0, umetal, (umat & {:#x}u) != 0u), uorm)",
+                                      render_ext::MaterialWordMetalnessFactor)
+                        : "umetal"s);
     }
     members.push_back(
         {targets.surface, fmt::format("    @location({}) surface: vec4u,\n", targets.surface), std::move(assignment)});
     if (uses_surface_ext(config, info, targets)) {
+      CHECK(targets.surface < targets.surfaceExt, "SurfaceExt reads the material word Surface's member loads");
       members.push_back({targets.surfaceExt, fmt::format("    @location({}) surface_ext: vec4u,\n", targets.surfaceExt),
-                         "\n    out.surface_ext = gx_surface_ext_pack(vec3f(0.0), vec3f(0.0));"s});
+                         fmt::format("\n    out.surface_ext = gx_surface_ext_pack({}, vec3f(0.0));",
+                                     surface_ext_ambient(config, info))});
     }
   }
   if (!members.empty()) {
@@ -2042,8 +2082,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     fragmentReturn = "\n    return FragmentOutput(vec4f(prev.rgb, 1.0), prev);";
   }
 
-  auto shaderSource =
-      fmt::format(R"""(
+  auto shaderSource = fmt::format(R"""(
 fn bswap32(v: u32, le: bool) -> u32 {{
   if (le) {{
     return v;
@@ -2408,11 +2447,12 @@ fn vs_main(
 
 {9}
 @fragment
-fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
+fn fs_main(in: VertexOutput{12}) -> {10} {{{6}{5}{11}
 }}
 )""",
-                  uniBufAttrs, texBindings, vtxOutAttrs, vtxInAttrs, vtxXfrAttrs, fragmentFn, fragmentFnPre,
-                  vtxXfrAttrsPre, uniformPre, fragmentOutput, fragmentOutputType, fragmentReturn);
+                                  uniBufAttrs, texBindings, vtxOutAttrs, vtxInAttrs, vtxXfrAttrs, fragmentFn,
+                                  fragmentFnPre, vtxXfrAttrsPre, uniformPre, fragmentOutput, fragmentOutputType,
+                                  fragmentReturn, backFaceText ? ", @builtin(front_facing) gx_ff: bool"sv : ""sv);
   if (dstAlphaMode == DstAlphaMode::DualSource) {
     shaderSource.insert(0, "enable dual_source_blending;\n");
   }

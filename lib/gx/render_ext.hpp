@@ -104,6 +104,12 @@ inline constexpr u32 DrawRecordWords = 8;
 inline constexpr u32 DrawRecordFlagsWord = 1;
 inline constexpr u32 DrawRecordReceiverShift = 6;
 inline constexpr u32 DrawRecordPrevMtxWord = 4;
+inline constexpr u32 DrawRecordMaterialWord = 5;
+inline constexpr u32 MaterialWordRoughnessFactor = 1u << 24;
+inline constexpr u32 MaterialWordMetalnessFactor = 1u << 25;
+inline constexpr u32 MaterialWordFlagMask = 0x1Cu << 24;
+inline constexpr u32 MaterialWordTwoSided = 0x8u << 24;
+inline constexpr u32 MaterialWordAmbient = 1u << 31;
 inline constexpr u32 MotionSourceMask = 3u;
 inline constexpr u32 MotionSourceNone = 0;
 inline constexpr u32 MotionSourceCamera = 1;
@@ -117,6 +123,7 @@ inline constexpr u32 DrawRecordTevPolicyWord = 7;
 inline constexpr u32 RecordFlagScreenAo = 1u << 11;
 inline constexpr u32 RecordFlagPrevProjFrame = 1u << 12;
 inline constexpr u32 RecordFlagReactive = 1u << 13;
+inline constexpr u32 RecordFlagBackFaceFlip = 1u << 14;
 // Twelve bits cover the Surface table and keep record bits 28-31 free
 inline constexpr u32 RecordSurfaceSlotShift = 16;
 inline constexpr u32 RecordSurfaceSlotBits = 12;
@@ -144,6 +151,7 @@ struct Stats {
   std::atomic_uint64_t pbrFallbackOutput0{0};
   std::atomic_uint64_t pbrTwinAdopted{0};
   std::atomic_uint64_t fwdEnvDemotions{0};
+  std::atomic_uint64_t pbrAmbientUnknown{0};
 };
 inline Stats g_stats;
 

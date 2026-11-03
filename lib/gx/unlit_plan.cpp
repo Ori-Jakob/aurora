@@ -397,6 +397,34 @@ bool admitted(const Plan& p, const ShaderConfig& config, uint32_t baseVaryings) 
 
 uint32_t raw_vertex_varyings(const Plan& p) noexcept { return static_cast<uint32_t>(std::popcount(p.rawVtx)); }
 
+Ambient ambient_channel(const ShaderConfig& config, const Plan& p) noexcept {
+  // Only lit channels carry an ambient; unlit channels keep their colour in the albedo
+  for (uint8_t c = 0; c < 2; ++c) {
+    const ColorChannelConfig& channel = config.colorChannels[c];
+    if ((p.rewrite[c] != RewriteMaterial && p.rewrite[c] != RewriteVertex) || !channel.lightingEnabled) {
+      continue;
+    }
+    const bool raw = (p.rawVtx >> c & 1u) != 0;
+    AmbientSource source = AmbientSource::Unknown;
+    if (channel.ambSrc == GX_SRC_REG) {
+      source = AmbientSource::Register;
+    } else if (channel.ambSrc == GX_SRC_VTX && raw) {
+      source = AmbientSource::Vertex;
+    }
+    return {.source = source, .channel = c, .rawVertex = raw && p.rewrite[c] == RewriteVertex};
+  }
+  return {};
+}
+
+Ambient ambient_of(const ShaderConfig& config, const ShaderInfo& info) noexcept {
+  if (info.unlitPlanned) {
+    return {.source = static_cast<AmbientSource>(info.unlitAmbient),
+            .channel = static_cast<uint8_t>(info.unlitAmbientChannel),
+            .rawVertex = info.unlitAmbientRaw};
+  }
+  return ambient_channel(config, plan(config));
+}
+
 std::string_view verdict_name(Verdict verdict) noexcept {
   switch (verdict) {
   case Verdict::Passthrough:

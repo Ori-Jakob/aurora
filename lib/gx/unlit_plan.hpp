@@ -36,9 +36,21 @@ struct Plan {
 };
 static_assert(std::is_trivially_copyable_v<Plan> && sizeof(Plan) <= 16);
 
+enum class AmbientSource : uint8_t { None, Register, Vertex, Unknown };
+
+struct Ambient {
+  AmbientSource source = AmbientSource::None;
+  uint8_t channel = 0;
+  bool rawVertex = false;
+
+  bool operator==(const Ambient&) const = default;
+};
+
 Plan analyse(const ShaderConfig& config) noexcept;
 Plan plan(const ShaderConfig& config) noexcept;
 bool admitted(const Plan& p, const ShaderConfig& config, uint32_t baseVaryings) noexcept;
 uint32_t raw_vertex_varyings(const Plan& p) noexcept;
+Ambient ambient_channel(const ShaderConfig& config, const Plan& p) noexcept;
+Ambient ambient_of(const ShaderConfig& config, const ShaderInfo& info) noexcept;
 std::string_view verdict_name(Verdict verdict) noexcept;
 } // namespace aurora::gx::unlit

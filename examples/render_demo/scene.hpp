@@ -10,6 +10,7 @@
 #include <array>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace render_demo {
@@ -29,6 +30,7 @@ struct SceneOptions {
   bool unlitCheck = false;
   bool companionCheck = false;
   bool overlayCheck = false;
+  bool classCheck = false;
 };
 
 struct OverlayColors {
@@ -73,6 +75,13 @@ struct CompanionProbe {
 };
 static_assert(sizeof(CompanionProbe) == 16);
 
+struct ClassProbe {
+  f32 ndc[2];
+  ClassQuad quad;
+  u32 pad;
+};
+static_assert(sizeof(ClassProbe) == 16);
+
 struct FogResolveCounts {
   u32 checked = 0;
   u32 live = 0;
@@ -90,6 +99,8 @@ FwdEnvExpect fwd_env_expect() noexcept;
 std::vector<UnlitProbe> unlit_probes();
 std::vector<CompanionProbe> companion_probes();
 CompanionAxes companion_axes() noexcept;
+std::vector<ClassProbe> class_probes();
+std::string class_manifest(bool edited);
 std::span<const u8> ground_texture_base() noexcept;
 std::array<f32, 2> overlay_probe() noexcept;
 OverlayColors overlay_colors() noexcept;
