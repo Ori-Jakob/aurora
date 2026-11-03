@@ -20,6 +20,7 @@
 #include "gx_ext/ext_provider.hpp"
 #include "hints.hpp"
 #include "lighting/clusters.hpp"
+#include "lighting/deferred.hpp"
 #include "post/composite.hpp"
 #include "post/taa.hpp"
 #include "post/upscale/upscale.hpp"
@@ -1246,6 +1247,7 @@ std::shared_ptr<const FrameState> latch_frame() {
       .settings = &latched_settings(), .caps = &caps(), .env = &g_graphEnvironment, .sceneDepth = g_sceneDepthSource};
   ao::on_latch(latched, graph.get());
   lighting::clusters::on_latch(latched, graph.get());
+  lighting::deferred::on_latch(latched, graph.get());
   composite::on_latch(latched, graph.get());
   latch_pass_params();
   inspectorOpen = g_graphEnvironment.inspectorOpen;

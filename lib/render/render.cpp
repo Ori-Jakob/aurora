@@ -19,6 +19,8 @@
 #include "gx_ext/fwd_env.hpp"
 #include "gx_ext/surface_table.hpp"
 #include "lighting/clusters.hpp"
+#include "lighting/deferred.hpp"
+#include "lighting/openpbr.hpp"
 #include "material/gx_lookup.hpp"
 #include "native/native.hpp"
 #include "post/composite.hpp"
@@ -106,6 +108,8 @@ void initialize() {
   ao::initialize();
   composite::initialize();
   lighting::clusters::initialize();
+  lighting::openpbr::initialize();
+  lighting::deferred::initialize();
   gx_ext::fwd_env::initialize();
   gx_ext::surface_table::initialize();
   debug::surface_expand::initialize();
@@ -145,6 +149,8 @@ void shutdown() noexcept {
   shaders::shutdown();
   jobs::shutdown();
   hzb::shutdown();
+  lighting::deferred::shutdown();
+  lighting::openpbr::shutdown();
   lighting::clusters::shutdown();
   composite::shutdown();
   ao::shutdown();
@@ -233,7 +239,8 @@ bool feature_ready(Feature feature) noexcept {
   }
   // PBR shows only through the PBR tier and the composite, so a refused switch or a pending pipeline keeps Applying
   if (feature == Feature::Pbr &&
-      (webgpu::scene_tier() != webgpu::SceneTier::Pbr || !detail::composite::ready(effective_settings()))) {
+      (webgpu::scene_tier() != webgpu::SceneTier::Pbr || !detail::composite::ready(effective_settings()) ||
+       !detail::lighting::ready(effective_settings()))) {
     return false;
   }
 #endif

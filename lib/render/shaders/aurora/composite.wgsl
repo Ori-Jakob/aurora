@@ -1,9 +1,9 @@
 // Shared by composite.main and later checks; later terms append fields and must keep identity exact
 //#import aurora/gbuffer
+//#import aurora/srgb
 
 const COMPOSITE_FLAG_IDENTITY: u32 = 1u;
 const COMPOSITE_FLAG_NO_FOG: u32 = 2u;
-// M9 preview: base colour in stored space until M10 brings scene.hdr, exposure and a tonemapper
 const COMPOSITE_FLAG_PBR: u32 = 4u;
 const COMPOSITE_PBR_EXPOSURE: f32 = 1.0;
 
@@ -34,8 +34,9 @@ fn composite_texel(p: vec2i, dims: vec2u) -> vec2i {
   return min(p, vec2i(dims) - vec2i(1));
 }
 
+// Interim encode until W4 brings exposure and a tonemapper
 fn composite_pbr_tonemap(x: vec3f) -> vec3f {
-  return saturate(x);
+  return linear_to_srgb(x);
 }
 
 fn composite_eval(l: vec3f, rec: GbufFog, t: CompositeTerms) -> CompositeEval {

@@ -299,6 +299,36 @@ if (AURORA_ENABLE_GX)
     set_target_properties(aurora_bccodec PROPERTIES FOLDER "extern")
   endif ()
 
+  if (AURORA_ENABLE_RENDER AND NOT TARGET aurora_openpbr_data)
+    message(STATUS "aurora: Fetching openpbr-bsdf tables")
+    # Apache-2.0 tables only (rev3 impl/data); the LTC table reproduces tizian/ltc-sheen, also Apache-2.0
+    set(_openpbr_url https://raw.githubusercontent.com/adobe/openpbr-bsdf/c91aad1d1ce1693e803f039d7c92c2965c4eb013)
+    set(_openpbr_dir ${FETCHCONTENT_BASE_DIR}/aurora_openpbr_data)
+    foreach (_openpbr_file IN ITEMS
+        "LICENSE|c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        "impl/data/openpbr_ideal_dielectric_energy_complement_data.h|b08f87b170b0626125eca105c1fad8e3cbd87354c8e46ba483d6af4cd4e8156b"
+        "impl/data/openpbr_ideal_dielectric_avg_energy_complement_data.h|d42d6580784ba6f526718316a7b22a2841fe9adb66431d9e45ce17de47a60c9f"
+        "impl/data/openpbr_ideal_dielectric_reflection_ratio_data.h|0e33dfac38f34ce63d5634274d5c4a9f55f6903e00daa769e54c3a652e0411af"
+        "impl/data/openpbr_opaque_dielectric_energy_complement_data.h|383dbcfab0d9225a1b3db70f1f6ba0339022e647e8508b33b6ea93ba82f96f62"
+        "impl/data/openpbr_opaque_dielectric_avg_energy_complement_data.h|3f6680bd36335be29066938b675c8b01d2e2bc746bd8f8da9e7808a1cfea13d5"
+        "impl/data/openpbr_ideal_metal_energy_complement_data.h|0def1514b15ae8c923c976f756340b7eabb41561496311b3ce96dbeb57ea2c02"
+        "impl/data/openpbr_ideal_metal_avg_energy_complement_data.h|b5a03cd9870f963ddf87cb2ec3d9c21c2a8217d605b64a26512f230ae89205ea"
+        "impl/data/openpbr_ltc_data.h|83a2d1be837b130836b28870df378e0160acb6d2eee5aefa56bf3f2f13353b94")
+      string(REPLACE "|" ";" _openpbr_file "${_openpbr_file}")
+      list(GET _openpbr_file 0 _openpbr_source)
+      list(GET _openpbr_file 1 _openpbr_hash)
+      get_filename_component(_openpbr_name "${_openpbr_source}" NAME)
+      file(DOWNLOAD "${_openpbr_url}/${_openpbr_source}" "${_openpbr_dir}/${_openpbr_name}"
+        EXPECTED_HASH SHA256=${_openpbr_hash} STATUS _openpbr_status)
+      list(GET _openpbr_status 0 _openpbr_code)
+      if (NOT _openpbr_code EQUAL 0)
+        message(FATAL_ERROR "aurora: failed to download ${_openpbr_url}/${_openpbr_source}: ${_openpbr_status}")
+      endif ()
+    endforeach ()
+    add_library(aurora_openpbr_data INTERFACE)
+    target_include_directories(aurora_openpbr_data SYSTEM INTERFACE ${_openpbr_dir})
+  endif ()
+
   if (AURORA_CACHE_USE_ZSTD)
     aurora_find_package_global(zstd CONFIG QUIET)
     if (NOT TARGET zstd::libzstd)

@@ -29,7 +29,7 @@ inline constexpr std::string_view NoFogEnv = "AURORA_RENDER_COMPOSITE_NOFOG";
 inline constexpr wgpu::TextureFormat AoFormat = wgpu::TextureFormat::RGBA8Unorm;
 
 // Bindings follow declaration order, so later terms append and never renumber
-enum Binding : uint32_t { BindLegacy = 0, BindFog = 1, BindNormal = 2, BindAo = 3, BindSurface = 4 };
+enum Binding : uint32_t { BindLegacy = 0, BindFog = 1, BindNormal = 2, BindAo = 3, BindSurface = 4, BindHdr = 5 };
 
 enum ParamFlags : uint32_t {
   FlagIdentity = 1u << 0,
@@ -49,6 +49,7 @@ static_assert(sizeof(Params) == 16 && offsetof(Params, legacyBlend) == 4);
 [[nodiscard]] bool ao_wanted(const Settings& settings) noexcept;
 [[nodiscard]] bool pbr_term_wanted(const Settings& settings) noexcept;
 [[nodiscard]] bool surface_bound(const CompiledGraph& graph) noexcept;
+[[nodiscard]] bool hdr_produced(const CompiledGraph& graph) noexcept;
 [[nodiscard]] bool ao_produced(const CompiledGraph& graph) noexcept;
 [[nodiscard]] bool declare_wanted(const PassSetup& setup) noexcept;
 [[nodiscard]] uint32_t params_flags(bool identity, const char* noFog) noexcept;
@@ -79,17 +80,18 @@ struct Counters {
   uint32_t contractFailures = 0;
   uint32_t pbrDraws = 0;
   uint32_t idleFrames = 0;
+  uint32_t hdrDraws = 0;
 };
 Counters counters() noexcept;
 void reset() noexcept;
 void set_flags(std::optional<uint32_t> flags) noexcept;
 void force_params(std::optional<Params> params) noexcept;
 void set_camera_override(std::shared_ptr<const SceneHints> hints) noexcept;
-[[nodiscard]] bool pbr_active_for(bool live, bool surfaceLive, bool classView, const Settings& settings) noexcept;
+[[nodiscard]] bool pbr_active_for(bool live, bool hdrLive, bool classView, const Settings& settings) noexcept;
 [[nodiscard]] std::array<float, 3> legacy_ao(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7,
                                              float ao, float normalAlpha) noexcept;
-[[nodiscard]] std::array<float, 3> legacy_pbr(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7,
-                                              float ao, float normalAlpha, std::array<uint8_t, 3> albedo, uint32_t slot,
-                                              float legacyBlend) noexcept;
+[[nodiscard]] std::array<float, 3> legacy_pbr_hdr(std::array<float, 3> legacy, std::array<float, 3> fogColor,
+                                                  uint32_t q7, float ao, float normalAlpha, std::array<float, 4> hdr,
+                                                  float legacyBlend) noexcept;
 } // namespace testing
 } // namespace aurora::render::detail::composite

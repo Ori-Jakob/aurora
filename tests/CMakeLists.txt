@@ -411,7 +411,7 @@ if (AURORA_ENABLE_GX)
       render_hzb_test.cpp render_hzb_reference.cpp render_gpu_systems_test.cpp render_taa_test.cpp
       render_upscale_test.cpp render_upscale_gpu_test.cpp render_native_test.cpp gfx_stream_spill_test.cpp
       render_ao_test.cpp render_ao_reference.cpp render_depth_device.cpp render_composite_test.cpp
-      render_lighting_test.cpp render_lighting_reference.cpp)
+      render_lighting_test.cpp render_lighting_reference.cpp render_openpbr_test.cpp)
     target_include_directories(render_gpu_tests PRIVATE ../include ../lib)
     target_compile_definitions(render_gpu_tests PRIVATE AURORA TARGET_PC=1 AURORA_ENABLE_RENDER=1
       AURORA_ENABLE_NATIVE_D3D12=$<BOOL:${AURORA_ENABLE_NATIVE_D3D12}> AURORA_ENABLE_XESS=$<BOOL:${AURORA_ENABLE_XESS}>
@@ -419,7 +419,8 @@ if (AURORA_ENABLE_GX)
     if (AURORA_ENABLE_XESS)
       target_include_directories(render_gpu_tests SYSTEM PRIVATE "${AURORA_XESS_INCLUDE_DIR}")
     endif ()
-    target_link_libraries(render_gpu_tests PRIVATE aurora::gx aurora::vi absl::flat_hash_map gtest gtest_main)
+    target_link_libraries(render_gpu_tests PRIVATE aurora::gx aurora::vi absl::flat_hash_map gtest gtest_main
+      yyjson::yyjson)
     if (AURORA_ENABLE_DLSS)
       target_link_libraries(render_gpu_tests PRIVATE aurora::ngx)
     endif ()

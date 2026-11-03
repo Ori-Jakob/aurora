@@ -1,5 +1,4 @@
 //#import aurora/composite
-//#import aurora/surface
 
 struct CompositeParams {
   flags: u32,
@@ -15,6 +14,7 @@ struct CompositeParams {
 @group(1) @binding(2) var scene_normal: texture_2d<f32>;
 @group(1) @binding(3) var ao_final: texture_2d<f32>;
 @group(1) @binding(4) var surface_tex: texture_2d<u32>;
+@group(1) @binding(5) var scene_hdr: texture_2d<f32>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
@@ -34,13 +34,13 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   if (a < 1.0 && gbuf_receiver_code(textureLoad(scene_normal, p, 0).a) >= 1u) {
     t.ao = a;
   }
-  // Slot 0 is every non-PBR, failed or cleared pixel, so they keep the legacy path
   if ((composite_params.flags & (COMPOSITE_FLAG_PBR | COMPOSITE_FLAG_IDENTITY)) == COMPOSITE_FLAG_PBR) {
-    let surf = gbuf_surface_fetch(surface_tex, vec2u(p));
-    if (gbuf_surface_is_pbr(surf)) {
+    let hdr = textureLoad(scene_hdr, composite_texel(p, textureDimensions(scene_hdr)), 0);
+    // H already carries AO on indirect light; alpha 0 (dummy, unlit, class 0) keeps the legacy line
+    if (hdr.a >= 0.5) {
       t.pbr = true;
       t.lb = composite_params.legacy_blend;
-      t.h = gbuf_surface_albedo(surf) * t.ao;
+      t.h = hdr.rgb;
     }
   }
   if (composite_is_identity(t)) {
