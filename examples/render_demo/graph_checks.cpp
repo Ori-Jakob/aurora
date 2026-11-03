@@ -441,14 +441,59 @@ std::optional<std::string> check_classes(const ClassCheckSummary& summary) {
   return std::nullopt;
 }
 
+namespace {
+f32 unpack_ufloat(u32 bits, u32 mantissaBits) {
+  const u32 m = bits & ((1u << mantissaBits) - 1u);
+  const int e = static_cast<int>(bits >> mantissaBits);
+  const f32 frac = static_cast<f32>(m) / static_cast<f32>(1u << mantissaBits);
+  return e == 0 ? std::ldexp(frac, -14) : std::ldexp(1.f + frac, e - 15);
+}
+
+std::array<f32, 3> unpack_r11g11b10(u32 w) {
+  return {unpack_ufloat(w & 0x7FFu, 6), unpack_ufloat((w >> 11) & 0x7FFu, 6), unpack_ufloat(w >> 22, 5)};
+}
+} // namespace
+
+std::array<int, 3> companion_delight_expected(u32 albedo, u8 delight) noexcept {
+  const auto decode = [](double c) { return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4); };
+  const auto encode = [](double c) { return c <= 0.0031308 ? c * 12.92 : 1.055 * std::pow(c, 1.0 / 2.4) - 0.055; };
+  std::array<double, 3> c{};
+  for (size_t i = 0; i < 3; ++i) {
+    c[i] = decode(static_cast<double>((albedo >> (8 * i)) & 0xFFu) / 255.0);
+  }
+  const double l = std::cbrt(0.4122214708 * c[0] + 0.5363325363 * c[1] + 0.0514459929 * c[2]);
+  const double m = std::cbrt(0.2119034982 * c[0] + 0.6806995451 * c[1] + 0.1073969566 * c[2]);
+  const double s = std::cbrt(0.0883024619 * c[0] + 0.2817188376 * c[1] + 0.6299787005 * c[2]);
+  const double k = std::exp2(-(static_cast<double>(delight) / 255.0 - 0.5) * 8.0);
+  const double lk = (0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s) * k;
+  const double a = 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s;
+  const double b = 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s;
+  const auto cube = [](double v) { return v * v * v; };
+  const double l3 = cube(lk + 0.3963377774 * a + 0.2158037573 * b);
+  const double m3 = cube(lk - 0.1055613458 * a - 0.0638541728 * b);
+  const double s3 = cube(lk - 0.0894841775 * a - 1.2914855480 * b);
+  const std::array<double, 3> out{4.0767416621 * l3 - 3.3077115913 * m3 + 0.2309699292 * s3,
+                                  -1.2684380046 * l3 + 2.6097574011 * m3 - 0.3413193965 * s3,
+                                  -0.0041960863 * l3 - 0.7034186147 * m3 + 1.7076147010 * s3};
+  std::array<int, 3> codes{};
+  for (size_t i = 0; i < 3; ++i) {
+    codes[i] = static_cast<int>(std::lround(encode(std::clamp(out[i], 0.0, 1.0)) * 255.0));
+  }
+  return codes;
+}
+
 CompanionCheckSummary summarize_companions(std::span<const std::vector<CompanionSample>, CompanionPhaseCount> phases,
-                                           const CompanionAxes& axes) {
+                                           const CompanionAxes& axes, bool delight) {
   CompanionCheckSummary summary{.minTilt = 1.f};
   const auto& bare = phases[static_cast<size_t>(CompanionPhase::Bare)];
   const auto& mapped = phases[static_cast<size_t>(CompanionPhase::Mapped)];
   const auto& blendOne = phases[static_cast<size_t>(CompanionPhase::BlendOne)];
   const auto& mat = phases[static_cast<size_t>(CompanionPhase::Mat)];
-  const size_t n = std::min({bare.size(), mapped.size(), blendOne.size(), mat.size()});
+  const auto& scalars = phases[static_cast<size_t>(CompanionPhase::Scalars)];
+  const auto& emit = phases[static_cast<size_t>(CompanionPhase::Emit)];
+  const auto& manifest = phases[static_cast<size_t>(CompanionPhase::Manifest)];
+  const size_t n =
+      std::min({bare.size(), mapped.size(), blendOne.size(), mat.size(), scalars.size(), emit.size(), manifest.size()});
   summary.probes = static_cast<u32>(n);
   const auto decode = [](const std::array<f32, 4>& v) {
     return std::array<f32, 3>{v[0] * 2.f - 1.f, v[1] * 2.f - 1.f, v[2] * 2.f - 1.f};
@@ -497,6 +542,38 @@ CompanionCheckSummary summarize_companions(std::span<const std::vector<Companion
     if ((x & 0xFFFFFFu) == (b.surface[0] & 0xFFFFFFu) || (uHigh ? red < 150 : red > 110)) {
       ++summary.albedoFailures;
     }
+    // A stronger manifest normal tilts further along u, and flipping Y turns the v tilt around
+    const f32 sx = tilt(scalars[i], b, axes.x);
+    const f32 sz = tilt(scalars[i], b, axes.z);
+    if (sx * mx <= 0.f || std::abs(sx) < std::abs(mx) * 1.5f || sz * mz >= 0.f) {
+      ++summary.scalarFailures;
+    }
+    const auto light = unpack_r11g11b10(emit[i].surface[3]);
+    if (!(light[0] > 0.f && light[1] >= light[0] * 0.2f && light[1] <= light[0] * 0.5f && light[2] <= light[1])) {
+      ++summary.emitFailures;
+    }
+    summary.emitLeaks += b.surface[3] != 0 || mapped[i].surface[3] != 0 ? 1 : 0;
+    const u32 albedo = emit[i].surface[0];
+    if (delight) {
+      const std::array<int, 3> want = companion_delight_expected(b.surface[0], CompanionDelightCode);
+      int error = 0;
+      for (size_t c = 0; c < 3; ++c) {
+        error = std::max(error, std::abs(byte(albedo, static_cast<u32>(8 * c)) - want[c]));
+      }
+      summary.maxDelightError = std::max(summary.maxDelightError, error);
+      summary.delightFailures +=
+          error > CompanionDelightLsb || (albedo & 0xFFFFFFu) == (b.surface[0] & 0xFFFFFFu) ? 1 : 0;
+    } else {
+      summary.delightFailures += (albedo & 0xFFFFFFu) != (b.surface[0] & 0xFFFFFFu) ? 1 : 0;
+    }
+    // The manifest nrm is uniform, so it tilts every probe toward +u where the found one tilts by cell
+    if (tilt(manifest[i], b, axes.x) * (b.quad == 1 ? -1.f : 1.f) < CompanionTiltMin) {
+      ++summary.manifestNrmFailures;
+    }
+    const int scaled = static_cast<int>(std::lround(rough * std::lround(CompanionManifestRoughness * 255.f) / 255.0));
+    if (std::abs(byte(manifest[i].surface[1], 0) - scaled) > 1) {
+      ++summary.manifestRoughFailures;
+    }
   }
   if (n == 0) {
     summary.minTilt = 0.f;
@@ -530,6 +607,26 @@ std::optional<std::string> check_companions(const CompanionCheckSummary& summary
   if (summary.ormFailures != 0 || summary.albedoFailures != 0) {
     std::snprintf(text, sizeof(text), "%u probes miss the orm values and %u the albedo companion", summary.ormFailures,
                   summary.albedoFailures);
+    return std::string{text};
+  }
+  if (summary.scalarFailures != 0) {
+    std::snprintf(text, sizeof(text), "%u probes ignore the manifest normal strength or Y flip",
+                  summary.scalarFailures);
+    return std::string{text};
+  }
+  if (summary.emitFailures != 0 || summary.emitLeaks != 0) {
+    std::snprintf(text, sizeof(text), "%u probes miss the emit map in Surface w and %u draws without one write it",
+                  summary.emitFailures, summary.emitLeaks);
+    return std::string{text};
+  }
+  if (summary.delightFailures != 0) {
+    std::snprintf(text, sizeof(text), "%u probes miss the delight expectation (worst %d LSB)", summary.delightFailures,
+                  summary.maxDelightError);
+    return std::string{text};
+  }
+  if (summary.manifestNrmFailures != 0 || summary.manifestRoughFailures != 0) {
+    std::snprintf(text, sizeof(text), "%u probes miss the manifest nrm map and %u its roughness over orm",
+                  summary.manifestNrmFailures, summary.manifestRoughFailures);
     return std::string{text};
   }
   return std::nullopt;

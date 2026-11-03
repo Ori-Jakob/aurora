@@ -834,7 +834,12 @@ static bool build_companion_binds(DrawCache& cache) noexcept {
   const render_ext::CompanionGates& gates = render_ext::g_companionGates;
   u8 wanted = 0;
   if (gates.materials) {
-    wanted |= material.companionRoles & (role_bit(Role::Albedo) | role_bit(Role::Nrm) | role_bit(Role::Orm));
+    wanted |= material.companionRoles &
+              (role_bit(Role::Albedo) | role_bit(Role::Nrm) | role_bit(Role::Orm) | role_bit(Role::Emit));
+  }
+  // Delight scales the base texture, so an albedo map that replaces it leaves nothing to scale
+  if (gates.materials && gates.delight && (material.companionRoles & role_bit(Role::Albedo)) == 0) {
+    wanted |= material.companionRoles & role_bit(Role::Delight);
   }
   if (gates.matMaps && (wanted & role_bit(Role::Nrm)) == 0) {
     wanted |= material.companionRoles & role_bit(Role::Mat);
@@ -850,18 +855,17 @@ static bool build_companion_binds(DrawCache& cache) noexcept {
     bits |= render_ext::LaneMat;
   }
   bits |= (loaded & role_bit(Role::Orm)) != 0 ? render_ext::LaneOrm : 0u;
-  float strength = 0.f;
-  if (gates.normals) {
-    strength = (bits & render_ext::LaneNrm) != 0   ? render_ext::NrmNormalStrength
-               : (bits & render_ext::LaneMat) != 0 ? render_ext::MatNormalStrength
-                                                   : 0.f;
+  bits |= (loaded & role_bit(Role::Emit)) != 0 ? render_ext::LaneEmit : 0u;
+  bits |= (loaded & role_bit(Role::Delight)) != 0 ? render_ext::LaneDelight : 0u;
+  render_ext::CompanionLane lane = render_ext::companion_lane(bits, gates);
+  if (const auto* hooks = render_ext::hooks(); hooks != nullptr && hooks->companion_params != nullptr) {
+    lane = hooks->companion_params(hooks->userData, material, lane);
   }
-  const float ySign = (bits & render_ext::LaneMat) != 0 ? render_ext::MatNormalYSign : 1.f;
   cache.bindGroups.companionBindGroup =
       build_companion_bind_group(cache.shaderInfo, cache.baseLevelBinds, static_cast<u8>(map), views)
           .companionBindGroup;
   cache.companionEpoch = gfx::companion_cache::epoch();
-  return render_ext::store_companion_lane({.v = {static_cast<float>(bits), strength, ySign, 0.f}});
+  return render_ext::store_companion_lane(lane);
 }
 
 static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, gfx::Range idxRange,

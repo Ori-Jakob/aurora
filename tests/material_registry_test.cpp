@@ -1,5 +1,7 @@
 #include "material_contract_check.hpp"
 
+#include "gfx/texture_replacement.hpp"
+#include "internal.hpp"
 #include "io.hpp"
 #include "render/material/classes.hpp"
 #include "render/material/gx_lookup.hpp"
@@ -17,6 +19,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -1433,6 +1436,121 @@ TEST_F(MaterialRegistryTest, ScalarsDecoded) {
   EXPECT_EQ(snap->scalars_of(0), material::MaterialScalars{});
   EXPECT_EQ(snap->scalars_of(70000), material::MaterialScalars{});
   EXPECT_EQ(snap->record(find_id(KeyA)).summary, 0u);
+}
+
+std::mutex g_lookupLogMutex;
+std::vector<std::string> g_lookupWarnings;
+
+void capture_lookup_log(AuroraLogLevel level, const char*, const char* message, unsigned int len) {
+  if (level == LOG_WARNING) {
+    std::lock_guard lock{g_lookupLogMutex};
+    g_lookupWarnings.emplace_back(message, len);
+  }
+}
+
+class MaterialGxLookup : public MaterialRegistryTest {
+protected:
+  void SetUp() override {
+    MaterialRegistryTest::SetUp();
+    m_dir = std::filesystem::temp_directory_path() /
+            fmt::format("aurora-gx-lookup-{}", std::chrono::steady_clock::now().time_since_epoch().count());
+    std::filesystem::create_directories(m_dir);
+    m_savedLog = g_config.logCallback;
+    g_config.logCallback = &capture_lookup_log;
+    {
+      std::lock_guard lock{g_lookupLogMutex};
+      g_lookupWarnings.clear();
+    }
+    material::testing::reset_map_warning();
+    material::install_gx_lookup();
+  }
+
+  void TearDown() override {
+    material::remove_gx_lookup();
+    g_config.logCallback = m_savedLog;
+    std::error_code ec;
+    std::filesystem::remove_all(m_dir, ec);
+    MaterialRegistryTest::TearDown();
+  }
+
+  std::filesystem::path write(const std::filesystem::path& relative, std::string_view text) const {
+    const std::filesystem::path path = m_dir / relative;
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream{path, std::ios::binary}.write(text.data(), static_cast<std::streamsize>(text.size()));
+    return path;
+  }
+
+  static size_t warnings(std::string_view text) {
+    std::lock_guard lock{g_lookupLogMutex};
+    return static_cast<size_t>(std::count_if(g_lookupWarnings.begin(), g_lookupWarnings.end(),
+                                             [&](const std::string& line) { return line.find(text) != line.npos; }));
+  }
+
+  static std::optional<std::filesystem::path> map_of(std::string_view key,
+                                                     gfx::texture_replacement::CompanionRole role) {
+    const auto found = gfx::texture_replacement::find_companion(key_of(key), role);
+    return found ? std::optional{found->path} : std::nullopt;
+  }
+
+  std::filesystem::path m_dir;
+  AuroraLogCallback m_savedLog = nullptr;
+};
+
+constexpr std::string_view KeyMapB = "tex1_16x16_000000000000b001_14";
+
+TEST_F(MaterialGxLookup, TextManifestMapsSkippedOnce) {
+  using gfx::texture_replacement::CompanionRole;
+  ASSERT_EQ(add(manifest_with(R"("tex1_16x16_000000000000a001_14":{"maps":{"nrm":"a.nrm.dds"}})"), MaterialLayer::Pack,
+                "text one", 0, m_dir.string())
+                .status,
+            MaterialManifestStatus::Accepted);
+  EXPECT_FALSE(map_of(KeyA, CompanionRole::Nrm).has_value());
+  ASSERT_EQ(add(manifest_with(R"("tex1_16x16_000000000000b001_14":{"maps":{"emit":"b.emit.dds"}})"), MaterialLayer::Mod,
+                "text two")
+                .status,
+            MaterialManifestStatus::Accepted);
+  EXPECT_FALSE(map_of(KeyMapB, CompanionRole::Emit).has_value());
+  EXPECT_FALSE(gfx::texture_replacement::has_companions());
+  EXPECT_EQ(warnings("only file manifests supply maps"), 1u);
+
+  const auto file =
+      write("pack/materials.json", manifest_with(R"("tex1_16x16_000000000000a001_14":{"maps":{"orm":"a.orm.dds"}})"));
+  ASSERT_EQ(texture::load_material_manifest(file).status, MaterialManifestStatus::Accepted);
+  EXPECT_EQ(map_of(KeyA, CompanionRole::Orm), m_dir / "pack" / "a.orm.dds");
+  EXPECT_FALSE(map_of(KeyA, CompanionRole::Nrm).has_value());
+  EXPECT_EQ(warnings("only file manifests supply maps"), 1u);
+}
+
+TEST_F(MaterialGxLookup, ManifestMapPathsJoinSupplierBase) {
+  using gfx::texture_replacement::CompanionRole;
+  const auto one = write("one/materials.json",
+                         manifest_with(R"("tex1_16x16_000000000000a001_14":{"maps":{"nrm":"maps/a.nrm.dds"}})"));
+  const auto two = write("two/materials.json",
+                         manifest_with(R"("tex1_16x16_000000000000a001_14":{"maps":{"orm":"a.orm.dds"}},)"
+                                       R"("tex1_16x16_000000000000b001_14":{"maps":{"albedo":"x/b.albedo.dds"}})"));
+  const std::string base = (m_dir / "base").string();
+  const auto first = texture::load_material_manifest(one, {.layer = MaterialLayer::Pack});
+  const auto second = texture::load_material_manifest(two, {.layer = MaterialLayer::Mod, .base = base});
+  ASSERT_EQ(first.status, MaterialManifestStatus::Accepted);
+  ASSERT_EQ(second.status, MaterialManifestStatus::Accepted);
+  EXPECT_EQ(map_of(KeyA, CompanionRole::Nrm), m_dir / "one" / "maps" / "a.nrm.dds");
+  EXPECT_EQ(map_of(KeyA, CompanionRole::Orm), m_dir / "base" / "a.orm.dds");
+  EXPECT_EQ(map_of(KeyMapB, CompanionRole::Albedo), m_dir / "base" / "x" / "b.albedo.dds");
+  const auto set = gfx::texture_replacement::companion_set(key_of(KeyA));
+  EXPECT_EQ(set.roles,
+            (1u << static_cast<uint32_t>(CompanionRole::Nrm)) | (1u << static_cast<uint32_t>(CompanionRole::Orm)));
+
+  const auto over =
+      write("three/materials.json", manifest_with(R"("tex1_16x16_000000000000a001_14":{"maps":{"nrm":"z.nrm.dds"}})"));
+  const auto third = texture::load_material_manifest(over, {.layer = MaterialLayer::User});
+  ASSERT_EQ(third.status, MaterialManifestStatus::Accepted);
+  EXPECT_EQ(map_of(KeyA, CompanionRole::Nrm), m_dir / "three" / "z.nrm.dds");
+  texture::unregister_material_manifest(third);
+  EXPECT_EQ(map_of(KeyA, CompanionRole::Nrm), m_dir / "one" / "maps" / "a.nrm.dds");
+  texture::unregister_material_manifest(first);
+  EXPECT_FALSE(map_of(KeyA, CompanionRole::Nrm).has_value());
+  material::remove_gx_lookup();
+  EXPECT_FALSE(gfx::texture_replacement::has_companions());
 }
 
 namespace classes = material::classes;

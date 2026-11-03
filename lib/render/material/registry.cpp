@@ -585,7 +585,8 @@ std::vector<Contributor> collect_contributors(const State& s) {
   std::vector<Contributor> out;
   out.reserve(order.size());
   for (const Registration* entry : order) {
-    out.push_back({entry->id, entry->label, entry->base, entry->layer, entry->priority, entry->sequence, entry->doc});
+    out.push_back({entry->id, entry->label, entry->base, entry->layer, entry->priority, entry->sequence, entry->doc,
+                   entry->source == Source::File});
   }
   return out;
 }

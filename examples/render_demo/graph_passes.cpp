@@ -3,6 +3,8 @@
 #include "graph_checks.hpp"
 #include "scene.hpp"
 
+#include "render/shaders.hpp"
+
 #include <aurora/gfx.h>
 #include <aurora/gfx.hpp>
 #include <aurora/render_graph.hpp>
@@ -261,6 +263,11 @@ void wait_for_pipelines() {
   const auto deadline = std::chrono::steady_clock::now() + PipelineWait;
   while (pipelines_compiling() && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  // Graph passes compile on their own queue and drop out of every frame until ready, the probes included
+  const auto left = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - std::chrono::steady_clock::now());
+  if (left.count() > 0) {
+    aurora::render::shaders::wait_idle(static_cast<uint64_t>(left.count()));
   }
 }
 
@@ -2211,11 +2218,13 @@ void update_companion_check(u32 frame) {
     return;
   }
   // Draws whose pipeline is still compiling are skipped, and each phase brings new companion pipelines
-  if (frame == CompanionPipelineWaitFrame || frame == CompanionMappedWaitFrame || frame == CompanionMatWaitFrame) {
+  if (frame == CompanionPipelineWaitFrame || frame == CompanionMappedWaitFrame || frame == CompanionMatWaitFrame ||
+      frame == CompanionScalarWaitFrame || frame == CompanionEmitWaitFrame || frame == CompanionManifestWaitFrame) {
     wait_for_pipelines();
   }
-  const std::array<u32, CompanionPhaseCount> frames{CompanionBareFrame, CompanionMappedFrame,
-                                                    CompanionBlendOneProbeFrame, CompanionMatProbeFrame};
+  const std::array<u32, CompanionPhaseCount> frames{
+      CompanionBareFrame,        CompanionMappedFrame,    CompanionBlendOneProbeFrame, CompanionMatProbeFrame,
+      CompanionScalarProbeFrame, CompanionEmitProbeFrame, CompanionManifestProbeFrame};
   for (size_t i = 0; i < frames.size(); ++i) {
     if (frame == frames[i]) {
       sCompanion.slots[i].armedFrame.store(aurora::gfx::current_frame(), std::memory_order_release);

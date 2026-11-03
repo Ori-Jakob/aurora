@@ -54,6 +54,8 @@ inline constexpr u32 LaneAlbedo = 1;
 inline constexpr u32 LaneNrm = 2;
 inline constexpr u32 LaneMat = 4;
 inline constexpr u32 LaneOrm = 8;
+inline constexpr u32 LaneEmit = 16;
+inline constexpr u32 LaneDelight = 32;
 inline constexpr float MatNormalYSign = -1.f;
 inline constexpr float MatNormalStrength = 0.5f;
 inline constexpr float NrmNormalStrength = 1.f;
@@ -71,6 +73,7 @@ struct CompanionGates {
   bool materials = false;
   bool matMaps = false;
   bool normals = false;
+  bool delight = false;
 
   bool operator==(const CompanionGates&) const = default;
 };
@@ -84,10 +87,23 @@ inline bool set_companion_gates(const CompanionGates& gates) noexcept {
   return true;
 }
 
+// Manifest scalars are render-module data, so the core knows only each role's default
+inline CompanionLane companion_lane(u32 bits, const CompanionGates& gates) noexcept {
+  float strength = 0.f;
+  if (gates.normals) {
+    strength = (bits & LaneNrm) != 0 ? NrmNormalStrength : (bits & LaneMat) != 0 ? MatNormalStrength : 0.f;
+  }
+  const float ySign = (bits & LaneMat) != 0 ? MatNormalYSign : 1.f;
+  return {.v = {static_cast<float>(bits), strength, ySign, 0.f}};
+}
+
 // The FIFO also derives for a pending layout, so derive only writes lanes and keeps output bits to G-buffer layouts
 struct Hooks {
   RenderExtConfig (*derive)(void* userData, const PipelineConfig& config, const ShaderInfo& info,
                             const gfx::RenderTargetLayout& layout, StochasticLanes& lanes) noexcept = nullptr;
+  // Scalars are uniform data, so a manifest edit changes the lane and never a pipeline
+  CompanionLane (*companion_params)(void* userData, const gfx::TextureMaterialRef& material,
+                                    const CompanionLane& lane) noexcept = nullptr;
   void* userData = nullptr;
 };
 

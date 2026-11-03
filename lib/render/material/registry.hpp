@@ -96,6 +96,8 @@ struct Contributor {
   int32_t priority = 0;
   uint64_t sequence = 0;
   std::shared_ptr<const json::Doc> doc;
+  // Map paths resolve against a directory only a file-backed manifest has
+  bool file = false;
 };
 
 struct KeyIndex;

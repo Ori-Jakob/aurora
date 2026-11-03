@@ -38,16 +38,17 @@ bool g_testForce = false;
 bool g_envRead = false;
 EnvMode g_env = EnvMode::Unset;
 bool g_companionsOff = false;
-bool g_warnedManifestMaps = false;
+bool g_delight = false;
 std::optional<bool> g_companionSupport;
 std::atomic_uint64_t g_layerDraws{0};
 
+using gfx::companion_cache::role_bit;
+using gfx::texture_replacement::CompanionRole;
+
 constexpr uint32_t CompanionSampledTextures = 16;
-constexpr uint32_t ManifestMapRoleCount = 7;
-constexpr uint8_t LayerRoles = gfx::companion_cache::role_bit(gfx::texture_replacement::CompanionRole::Albedo) |
-                               gfx::companion_cache::role_bit(gfx::texture_replacement::CompanionRole::Nrm) |
-                               gfx::companion_cache::role_bit(gfx::texture_replacement::CompanionRole::Orm) |
-                               gfx::companion_cache::role_bit(gfx::texture_replacement::CompanionRole::Mat);
+constexpr uint8_t LayerRoles = role_bit(CompanionRole::Albedo) | role_bit(CompanionRole::Nrm) |
+                               role_bit(CompanionRole::Orm) | role_bit(CompanionRole::Mat) |
+                               role_bit(CompanionRole::Emit);
 
 EnvMode read_env() noexcept {
   const char* value = SDL_getenv("AURORA_RENDER_STOCHASTIC");
@@ -130,18 +131,25 @@ uint8_t layer0_for(const gx::PipelineConfig& config, const gx::ShaderInfo& info)
   }
   const gx::ShaderConfig& shader = config.shaderConfig;
   const uint16_t stages = gx::unlit_facts(shader, info).layerStages;
+  const uint8_t roles = LayerRoles | (g_delight ? role_bit(CompanionRole::Delight) : uint8_t{0});
   for (u32 s = 0; s < shader.tevStageCount && s < gx::MaxTevStages; ++s) {
     const u32 map = shader.tevStages[s].texMapId;
     if ((stages >> s & 1u) == 0 || map > GX_TEXMAP7) {
       continue;
     }
     const gfx::TextureBind& bind = gx::g_gxState.textures[map];
-    if ((bind.material.companionRoles & LayerRoles) == 0 || (bind.ref != nullptr && bind.ref->attachmentTextureView)) {
+    if ((bind.material.companionRoles & roles) == 0 || (bind.ref != nullptr && bind.ref->attachmentTextureView)) {
       continue;
     }
     return static_cast<uint8_t>(map + 1);
   }
   return 0;
+}
+
+// Indexed, never resident: the key must not depend on when the map finishes loading
+bool emit_indexed(uint8_t layer0) noexcept {
+  return layer0 != 0 &&
+         (gx::g_gxState.textures[layer0 - 1u].material.companionRoles & role_bit(CompanionRole::Emit)) != 0;
 }
 
 gx::RenderExtConfig derive(void*, const gx::PipelineConfig& config, const gx::ShaderInfo& info,
@@ -157,8 +165,9 @@ gx::RenderExtConfig derive(void*, const gx::PipelineConfig& config, const gx::Sh
     if (ext.output == 1 && gfx::layout_has_surface(layout) &&
         unlit::output2(config, info, gx::render_ext::g_drawInputs)) {
       ext.output = 2;
-      ext.surfaceExt = unlit::surface_ext(config, info, gx::render_ext::g_drawInputs) ? 1 : 0;
       ext.layer0 = layer0_for(config, info);
+      ext.surfaceExt =
+          unlit::surface_ext(config, info, gx::render_ext::g_drawInputs) || emit_indexed(ext.layer0) ? 1 : 0;
       if (ext.layer0 != 0) {
         g_layerDraws.fetch_add(1, std::memory_order_relaxed);
       }
@@ -167,7 +176,29 @@ gx::RenderExtConfig derive(void*, const gx::PipelineConfig& config, const gx::Sh
   return ext;
 }
 
-const gx::render_ext::Hooks kHooks{.derive = &derive};
+gx::render_ext::CompanionLane companion_params(void*, const gfx::TextureMaterialRef& material,
+                                               const gx::render_ext::CompanionLane& lane) noexcept {
+  gx::render_ext::CompanionLane out = lane;
+  const u32 bits = static_cast<u32>(lane.v[0]);
+  if (!gx::render_ext::g_companionGates.normals || (bits & (gx::render_ext::LaneNrm | gx::render_ext::LaneMat)) == 0) {
+    out.v[1] = 0.f;
+    return out;
+  }
+  const material::Snapshot* snapshot = g_snapshot.get();
+  if (snapshot == nullptr || material.id == 0) {
+    return out;
+  }
+  const material::MaterialScalars& scalars = snapshot->scalars_of(material.id);
+  if ((scalars.set & material::ScalarNormalStrength) != 0) {
+    out.v[1] = scalars.normalStrength;
+  }
+  if ((scalars.set & material::ScalarNormalFlipY) != 0 && scalars.normalFlipY) {
+    out.v[2] = -out.v[2];
+  }
+  return out;
+}
+
+const gx::render_ext::Hooks kHooks{.derive = &derive, .companion_params = &companion_params};
 
 void set_active(bool active, bool force) noexcept {
   g_active = active;
@@ -185,7 +216,7 @@ uint8_t fwd_env_for(const gx::PipelineConfig& c, bool forwardWindow) noexcept {
 }
 
 namespace {
-void apply_companions(const detail::FrameState& state) noexcept {
+void apply_companions(const detail::FrameState& state, bool generationChanged) noexcept {
   const gfx::LayoutWarm* warm = gfx::layout_warm();
   const bool surface = gfx::layout_has_surface(gfx::scene_render_target_layout()) ||
                        (warm != nullptr && gfx::layout_has_surface(warm->pending));
@@ -198,22 +229,14 @@ void apply_companions(const detail::FrameState& state) noexcept {
         .materials = s.textureMaterials,
         .matMaps = (s.textureMaterials && s.legacyMatMaps) || detail::mat_maps_env(),
         .normals = s.legacyBlend < 1.f && !detail::composite::identity_forced(),
+        .delight = s.textureMaterials && g_delight,
     };
   }
-  if (gx::render_ext::set_companion_gates(gates)) {
+  // A scalar edit keeps every material id, so only a rebind rebuilds the lanes that carry it
+  if (gx::render_ext::set_companion_gates(gates) || (consumer && generationChanged)) {
     gx::texture::invalidate_bindings();
   }
   records::set_back_face_flip(gates.normals && unlit::classes_enabled());
-  if (consumer && g_snapshot != nullptr && !g_warnedManifestMaps) {
-    uint32_t mapped = 0;
-    for (uint32_t role = 0; role < ManifestMapRoleCount; ++role) {
-      mapped += g_snapshot->summaryCount[material::MapRoleShift + role];
-    }
-    if (mapped != 0) {
-      g_warnedManifestMaps = true;
-      Log.warn("Material manifests name {} map role(s); only companion files are sampled for now", mapped);
-    }
-  }
 }
 } // namespace
 
@@ -229,6 +252,12 @@ void apply_frame_state(const detail::FrameState& state) noexcept {
       Log.warn("AURORA_RENDER_COMPANIONS=off: no draw samples companion material maps");
       g_companionsOff = true;
     }
+    if (const char* value = SDL_getenv("AURORA_RENDER_DELIGHT"); value != nullptr && std::string_view{value} == "on") {
+      Log.warn(
+          "AURORA_RENDER_DELIGHT=on: delight maps scale Oklab L; the colour space is provisional until the "
+          "P-track's first S3 sample");
+      g_delight = true;
+    }
   }
   std::shared_ptr<const material::Snapshot> latched = material::latched_snapshot();
   const bool generationChanged = g_snapshot == nullptr || latched->generation != g_snapshot->generation;
@@ -239,10 +268,11 @@ void apply_frame_state(const detail::FrameState& state) noexcept {
   const bool force = g_testForce || g_env == EnvMode::All;
   const bool gateOpen = g_env == EnvMode::On || (state.settings.stochasticTiling && state.settings.textureMaterials);
   const bool want = force || (gateOpen && g_snapshot->summaryCount[0] != 0);
-  if (want != g_active || force != g_force || (want && generationChanged)) {
+  const bool activeChanged = want != g_active || force != g_force || (want && generationChanged);
+  if (activeChanged) {
     set_active(want, force);
   }
-  apply_companions(state);
+  apply_companions(state, generationChanged && !activeChanged);
   gx::render_ext::set_hooks(g_active || records::gbuffer() || gfx::gbuffer_live_or_pending() ? &kHooks : nullptr);
 }
 
@@ -275,7 +305,7 @@ void reset() noexcept {
   g_envRead = false;
   g_env = EnvMode::Unset;
   g_companionsOff = false;
-  g_warnedManifestMaps = false;
+  g_delight = false;
   g_companionSupport.reset();
   g_layerDraws.store(0, std::memory_order_relaxed);
   gx::texture::set_companion_consumer(false);

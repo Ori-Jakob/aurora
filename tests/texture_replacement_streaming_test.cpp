@@ -883,6 +883,106 @@ TEST_F(CompanionScanTest, GroupUnregisterIgnoresPointerAndStaleIds) {
   EXPECT_EQ(companion_roles(KeyA), 0u);
 }
 
+class TextureReplacementStreaming : public CompanionScanTest {
+protected:
+  void TearDown() override {
+    set_manifest_companions({});
+    CompanionScanTest::TearDown();
+  }
+
+  std::filesystem::path manifest_map(std::string_view name) const { return m_base / "manifest" / name; }
+};
+
+constexpr texture::TextureSourceKey KeyB{.textureHash = 0xb001, .width = 16, .height = 16, .format = 14};
+
+TEST_F(TextureReplacementStreaming, ManifestCompanionWinsPerRole) {
+  write_file(stem_a(".nrm.dds"));
+  const auto orm = write_file(stem_a(".orm.dds"));
+  const auto group = texture::load_replacement_directory(m_root, {.priority = 1000});
+  ASSERT_EQ(group.companions.size(), 2u);
+  const uint64_t generation = companion_generation();
+  const std::array maps{
+      ManifestCompanion{.key = KeyA, .role = CompanionRole::Nrm, .path = manifest_map("a.nrm.dds")},
+      ManifestCompanion{.key = KeyB, .role = CompanionRole::Albedo, .path = manifest_map("b.albedo.dds")},
+  };
+  set_manifest_companions(maps);
+  EXPECT_EQ(companion_generation(), generation + 1);
+  ASSERT_TRUE(find_companion(KeyA, CompanionRole::Nrm).has_value());
+  EXPECT_EQ(find_companion(KeyA, CompanionRole::Nrm)->path, manifest_map("a.nrm.dds"));
+  ASSERT_TRUE(find_companion(KeyA, CompanionRole::Orm).has_value());
+  EXPECT_EQ(find_companion(KeyA, CompanionRole::Orm)->path, orm);
+  EXPECT_EQ(companion_roles(KeyA), role_bit(CompanionRole::Nrm) | role_bit(CompanionRole::Orm));
+  const CompanionSet set = companion_set(KeyA);
+  ASSERT_NE(set.id, 0u);
+  ASSERT_TRUE(companion_file(set.id, CompanionRole::Nrm).has_value());
+  EXPECT_EQ(companion_file(set.id, CompanionRole::Nrm)->path, manifest_map("a.nrm.dds"));
+  EXPECT_EQ(companion_roles(KeyB), role_bit(CompanionRole::Albedo));
+
+  set_manifest_companions(maps);
+  EXPECT_EQ(companion_generation(), generation + 1);
+  texture::unregister_replacements(group);
+  EXPECT_EQ(companion_roles(KeyA), role_bit(CompanionRole::Nrm));
+  EXPECT_EQ(find_companion(KeyA, CompanionRole::Nrm)->path, manifest_map("a.nrm.dds"));
+}
+
+TEST_F(TextureReplacementStreaming, ManifestCompanionsFollowBypass) {
+  const std::array maps{
+      ManifestCompanion{.key = KeyA, .role = CompanionRole::Emit, .path = manifest_map("a.emit.dds")}};
+  set_manifest_companions(maps);
+  ASSERT_TRUE(has_companions());
+  set_bypass(true);
+  EXPECT_FALSE(has_companions());
+  EXPECT_EQ(companion_roles(KeyA), 0u);
+  EXPECT_EQ(companion_set(KeyA).id, 0u);
+  EXPECT_FALSE(find_companion(KeyA, CompanionRole::Emit).has_value());
+  set_bypass(false);
+  EXPECT_TRUE(has_companions());
+  EXPECT_EQ(companion_roles(KeyA), role_bit(CompanionRole::Emit));
+  ASSERT_TRUE(find_companion(KeyA, CompanionRole::Emit).has_value());
+  EXPECT_EQ(find_companion(KeyA, CompanionRole::Emit)->path, manifest_map("a.emit.dds"));
+}
+
+TEST_F(TextureReplacementStreaming, ManifestCompanionSetReplacesPrevious) {
+  const std::array first{
+      ManifestCompanion{.key = KeyA, .role = CompanionRole::Nrm, .path = manifest_map("a.nrm.dds")},
+      ManifestCompanion{.key = KeyA, .role = CompanionRole::Orm, .path = manifest_map("a.orm.dds")},
+  };
+  const std::array second{
+      ManifestCompanion{.key = KeyB, .role = CompanionRole::Delight, .path = manifest_map("b.delight.dds")}};
+  const uint64_t generation = companion_generation();
+  set_manifest_companions(first);
+  EXPECT_EQ(companion_roles(KeyA), role_bit(CompanionRole::Nrm) | role_bit(CompanionRole::Orm));
+  set_manifest_companions(second);
+  EXPECT_EQ(companion_generation(), generation + 2);
+  EXPECT_EQ(companion_roles(KeyA), 0u);
+  EXPECT_EQ(companion_set(KeyA).id, 0u);
+  EXPECT_EQ(companion_roles(KeyB), role_bit(CompanionRole::Delight));
+  set_manifest_companions({});
+  EXPECT_EQ(companion_generation(), generation + 3);
+  EXPECT_FALSE(has_companions());
+  set_manifest_companions({});
+  EXPECT_EQ(companion_generation(), generation + 3);
+}
+
+TEST_F(TextureReplacementStreaming, ManifestCompanionsSurviveClear) {
+  write_file(stem_a(".albedo.dds"));
+  const auto group = texture::load_replacement_directory(m_root);
+  ASSERT_EQ(group.companions.size(), 1u);
+  const std::array maps{ManifestCompanion{.key = KeyA, .role = CompanionRole::Nrm, .path = manifest_map("a.nrm.dds")}};
+  set_manifest_companions(maps);
+  const uint64_t generation = companion_generation();
+  texture::clear_replacements();
+  EXPECT_GT(companion_generation(), generation);
+  EXPECT_EQ(companion_roles(KeyA), role_bit(CompanionRole::Nrm));
+  const CompanionSet set = companion_set(KeyA);
+  ASSERT_NE(set.id, 0u);
+  ASSERT_TRUE(companion_file(set.id, CompanionRole::Nrm).has_value());
+  EXPECT_EQ(companion_file(set.id, CompanionRole::Nrm)->path, manifest_map("a.nrm.dds"));
+  set_manifest_companions({});
+  EXPECT_EQ(companion_roles(KeyA), 0u);
+  EXPECT_FALSE(has_companions());
+}
+
 TEST_F(CompanionScanTest, CompanionMipNameKeepsRoleLast) {
   EXPECT_EQ(companion_mip_filename("MATERIALMAPS/" + stem_a(".nrm.dds"), 3), "MATERIALMAPS/" + stem_a("_mip3.nrm.dds"));
   EXPECT_EQ(companion_mip_filename("C:\\pack.v2\\" + stem_a(".mat.dds"), 1), "C:\\pack.v2\\" + stem_a("_mip1.mat.dds"));

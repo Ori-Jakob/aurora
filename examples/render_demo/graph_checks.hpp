@@ -185,13 +185,27 @@ inline constexpr u32 CompanionBlendOneProbeFrame = 38;
 inline constexpr u32 CompanionMatFrame = 39;
 inline constexpr u32 CompanionMatWaitFrame = 43;
 inline constexpr u32 CompanionMatProbeFrame = 52;
-inline constexpr u32 CompanionPhaseCount = 4;
+inline constexpr u32 CompanionScalarFrame = 53;
+inline constexpr u32 CompanionScalarWaitFrame = 56;
+inline constexpr u32 CompanionScalarProbeFrame = 62;
+inline constexpr u32 CompanionEmitFrame = 63;
+inline constexpr u32 CompanionEmitWaitFrame = 67;
+inline constexpr u32 CompanionEmitProbeFrame = 76;
+inline constexpr u32 CompanionManifestFrame = 77;
+inline constexpr u32 CompanionManifestWaitFrame = 81;
+inline constexpr u32 CompanionManifestProbeFrame = 90;
+inline constexpr u32 CompanionPhaseCount = 7;
 inline constexpr u32 CompanionNrmRoles = 3;
 inline constexpr u32 CompanionMatRoles = 1;
 inline constexpr f32 CompanionTiltMin = 0.05f;
 inline constexpr f32 CompanionBareTolerance = 2e-3f;
+inline constexpr u8 CompanionDelightCode = 144;
+inline constexpr u8 CompanionTiltNrmCode = 224;
+inline constexpr f32 CompanionNormalStrength = 2.f;
+inline constexpr f32 CompanionManifestRoughness = 0.5f;
+inline constexpr int CompanionDelightLsb = 2;
 
-enum class CompanionPhase : u32 { Bare, Mapped, BlendOne, Mat };
+enum class CompanionPhase : u32 { Bare, Mapped, BlendOne, Mat, Scalars, Emit, Manifest };
 
 struct CompanionSample {
   u32 quad = 0;
@@ -215,6 +229,13 @@ struct CompanionCheckSummary {
   u32 ormFailures = 0;
   u32 albedoFailures = 0;
   f32 minTilt = 0.f;
+  u32 scalarFailures = 0;
+  u32 emitFailures = 0;
+  u32 emitLeaks = 0;
+  u32 delightFailures = 0;
+  int maxDelightError = 0;
+  u32 manifestNrmFailures = 0;
+  u32 manifestRoughFailures = 0;
 };
 
 inline constexpr u32 ClassPipelineWaitFrame = 4;
@@ -277,7 +298,8 @@ std::optional<std::string> check_fwd_env(const FwdEnvSummary& summary);
 UnlitCheckSummary summarize_unlit(std::span<const UnlitSample> before, std::span<const UnlitSample> after);
 std::optional<std::string> check_unlit(const UnlitCheckSummary& summary);
 CompanionCheckSummary summarize_companions(std::span<const std::vector<CompanionSample>, CompanionPhaseCount> phases,
-                                           const CompanionAxes& axes);
+                                           const CompanionAxes& axes, bool delight);
+std::array<int, 3> companion_delight_expected(u32 albedo, u8 delight) noexcept;
 std::optional<std::string> check_companions(const CompanionCheckSummary& summary);
 ClassCheckSummary summarize_classes(std::span<const std::vector<ClassSample>, ClassPhaseCount> phases,
                                     bool bakedVertex);

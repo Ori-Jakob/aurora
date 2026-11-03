@@ -2,6 +2,7 @@
 
 #include "gx_shader_corpus.hpp"
 
+#include "gfx/companion_cache.hpp"
 #include "gfx/frame_packet.hpp"
 #include "gfx/recording.hpp"
 #include "gfx/resources.hpp"
@@ -1640,7 +1641,7 @@ TEST_F(GxShaderExtTest, AlbedoSubstitutesOnlyLayerPair) {
   const std::string block = unlit_block(text);
   ASSERT_FALSE(block.empty());
   const auto substituted = [&](u32 stage) {
-    return block.find(fmt::format("let sampled{0} = select(sampled{0}, vec4f(gx_linear_to_srgb(cmp_alb.rgb), "
+    return block.find(fmt::format("let sampled{0} = select(delit{0}, vec4f(gx_linear_to_srgb(cmp_alb.rgb), "
                                   "sampled{0}.a), (u32(ubuf.mat0.x) & 1u) != 0u);",
                                   stage)) != std::string::npos;
   };
@@ -1718,6 +1719,62 @@ TEST_F(GxShaderExtTest, AmbientExtOnlyForVertexOrBaked) {
       EXPECT_EQ(plain.find("_amb.rgb"), std::string::npos);
     }
   }
+}
+
+TEST_F(GxShaderExtTest, EmitGatedByLaneBit) {
+  const ShaderConfig config = keyed(layered(modulate()));
+  for (const ShaderTargets& targets : {PbrTargets, PbrIdTargets}) {
+    const std::string text = companion_text(config, targets);
+    EXPECT_EQ(count(text, "@group(2) @binding(19)\nvar ctex_emit: texture_2d<f32>;"), 1u);
+    EXPECT_EQ(count(text, "textureSampleBias(ctex_emit, tex0_samp, tex0_uv, ubuf.tex0_size_bias.z)"), 1u);
+    EXPECT_EQ(surface_ext_member(text),
+              "out.surface_ext = gx_surface_ext_pack(select(vec3f(0.0), ubuf.cc0_amb.rgb, (umat & 0x80000000u) != 0u), "
+              "select(vec3f(0.0), cmp_emit.rgb, (u32(ubuf.mat0.x) & 16u) != 0u));");
+    const std::string body = fs_body(text);
+    EXPECT_LT(body.find("let cmp_emit = "), body.find("discard"));
+  }
+  for (const ShaderConfig& other : {layered(modulate()), keyed(modulate())}) {
+    const std::string text = companion_text(other);
+    EXPECT_EQ(text.find("ctex_emit"), std::string::npos);
+    EXPECT_EQ(text.find("cmp_emit"), std::string::npos);
+  }
+  EXPECT_EQ(surface_ext_member(companion_text(keyed(modulate()))),
+            "out.surface_ext = gx_surface_ext_pack(select(vec3f(0.0), ubuf.cc0_amb.rgb, (umat & 0x80000000u) != 0u), "
+            "vec3f(0.0));");
+}
+
+TEST_F(GxShaderExtTest, DelightSharesAlbedoSlot) {
+  using gfx::texture_replacement::CompanionRole;
+  static_assert(gfx::companion_cache::view_slot(CompanionRole::Delight) ==
+                gfx::companion_cache::view_slot(CompanionRole::Albedo));
+  const std::string text = companion_text(layered(modulate()));
+  const std::string block = unlit_block(text);
+  EXPECT_EQ(count(block, "gx_companion_delight(sampled0.rgb, cmp_alb.r)"), 1u);
+  for (u32 binding = MaxTextures * 2 + 3; binding < MaxTextures * 2 + 8; ++binding) {
+    EXPECT_EQ(text.find(fmt::format("@group(2) @binding({})", binding)), std::string::npos) << binding;
+  }
+  EXPECT_EQ(count(text, "fn gx_companion_delight("), 1u);
+  EXPECT_EQ(count(text, "fn gx_srgb_to_linear("), 1u);
+  const std::string lit = text.substr(0, text.find(UnlitBlock));
+  EXPECT_EQ(lit.find("gx_companion_delight(sampled"), std::string::npos);
+  EXPECT_EQ(companion_text(modulate()).find("gx_companion_delight"), std::string::npos);
+}
+
+TEST_F(GxShaderExtTest, AlbedoSupersedesDelight) {
+  const std::string block = unlit_block(companion_text(layered(modulate())));
+  const size_t delit = block.find("var delit0 = sampled0;");
+  const size_t branch = block.find("if ((u32(ubuf.mat0.x) & 32u) != 0u) {", delit);
+  const size_t scaled =
+      block.find("delit0 = vec4f(gx_companion_delight(sampled0.rgb, cmp_alb.r), sampled0.a);", branch);
+  const size_t albedo = block.find(
+      "let sampled0 = select(delit0, vec4f(gx_linear_to_srgb(cmp_alb.rgb), sampled0.a), "
+      "(u32(ubuf.mat0.x) & 1u) != 0u);",
+      scaled);
+  ASSERT_NE(delit, std::string::npos);
+  ASSERT_NE(branch, std::string::npos);
+  ASSERT_NE(scaled, std::string::npos);
+  EXPECT_NE(albedo, std::string::npos);
+  EXPECT_EQ(count(block, "gx_companion_delight("), 1u);
 }
 
 TEST_F(GxShaderExtTest, MaterialWordAddsNoVaryings) {

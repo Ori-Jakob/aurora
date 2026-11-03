@@ -3251,5 +3251,182 @@ fn fs_main(v: VsOut, @builtin(front_facing) gx_ff: bool) -> @location(0) vec4f {
     EXPECT_EQ(((bits >> 20) & 0x3FFu) > 512u, FacesViewer[x]) << "normal z at column " << x;
   }
 }
+
+double srgb_decode(double c) { return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4); }
+double srgb_encode(double c) { return c <= 0.0031308 ? c * 12.92 : 1.055 * std::pow(c, 1.0 / 2.4) - 0.055; }
+
+V3 linear_to_oklab(const V3& c) {
+  const V3 lms{std::cbrt(0.4122214708 * c[0] + 0.5363325363 * c[1] + 0.0514459929 * c[2]),
+               std::cbrt(0.2119034982 * c[0] + 0.6806995451 * c[1] + 0.1073969566 * c[2]),
+               std::cbrt(0.0883024619 * c[0] + 0.2817188376 * c[1] + 0.6299787005 * c[2])};
+  return {0.2104542553 * lms[0] + 0.7936177850 * lms[1] - 0.0040720468 * lms[2],
+          1.9779984951 * lms[0] - 2.4285922050 * lms[1] + 0.4505937099 * lms[2],
+          0.0259040371 * lms[0] + 0.7827717662 * lms[1] - 0.8086757660 * lms[2]};
+}
+
+V3 oklab_to_linear(const V3& lab) {
+  const auto cube = [](double v) { return v * v * v; };
+  const double l = cube(lab[0] + 0.3963377774 * lab[1] + 0.2158037573 * lab[2]);
+  const double m = cube(lab[0] - 0.1055613458 * lab[1] - 0.0638541728 * lab[2]);
+  const double s = cube(lab[0] - 0.0894841775 * lab[1] - 1.2914855480 * lab[2]);
+  return {4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+          -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+          -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s};
+}
+
+double delight_gain(double d) { return std::exp2(-(d - 0.5) * 8.0); }
+
+TEST_F(GxShaderExtDevice, CompanionDelightMatchesOklabRatio) {
+  const auto backend = hardware_backend();
+  if (!backend) {
+    GTEST_SKIP() << "AURORA_TEST_BACKEND names no hardware backend";
+  }
+  if (!start({.backend = *backend, .core = true, .allowCpu = false}, false)) {
+    GTEST_SKIP() << "no adapter";
+  }
+  const std::string text = companion_harness(R"(
+  let c = in_vec4(i);
+  out_vec4(o, vec4f(gx_companion_delight(c.rgb, c.w), 0.0));)");
+  std::vector<uint32_t> input;
+  push_floats(input, gx_perspective());
+  push_floats(input, std::array{32.f, 0.f, 1.f, 0.f});
+  std::mt19937 rng{19};
+  std::uniform_int_distribution<int> code{0, 255};
+  constexpr std::array<int, 6> Delight{96, 112, 128, 144, 160, 200};
+  std::vector<std::array<double, 4>> cases;
+  for (uint32_t c = 0; c < 64; ++c) {
+    const std::array<double, 4> v{code(rng) / 255.0, code(rng) / 255.0, code(rng) / 255.0,
+                                  Delight[c % Delight.size()] / 255.0};
+    cases.push_back(v);
+    push_floats(input, std::array{static_cast<float>(v[0]), static_cast<float>(v[1]), static_cast<float>(v[2]),
+                                  static_cast<float>(v[3])});
+    input.resize(input.size() + 28, 0u);
+  }
+  const auto out = run_word_compute(*m_device, text, 64, 16, input);
+  ASSERT_TRUE(out.has_value());
+  size_t failures = 0;
+  size_t ratios = 0;
+  for (size_t c = 0; c < cases.size(); ++c) {
+    const V3 linear{srgb_decode(cases[c][0]), srgb_decode(cases[c][1]), srgb_decode(cases[c][2])};
+    const V3 lab = linear_to_oklab(linear);
+    const double k = delight_gain(cases[c][3]);
+    const V3 scaled = oklab_to_linear({lab[0] * k, lab[1], lab[2]});
+    V3 got{};
+    for (size_t ch = 0; ch < 3; ++ch) {
+      got[ch] = std::bit_cast<float>((*out)[c * 16 + ch]);
+      const double want = srgb_encode(std::clamp(scaled[ch], 0.0, 1.0));
+      if (std::abs(std::lround(got[ch] * 255.0) - std::lround(want * 255.0)) > 2 && failures++ < 8) {
+        ADD_FAILURE() << "case " << c << " channel " << ch << ": " << got[ch] * 255.0 << " want " << want * 255.0;
+      }
+    }
+    const bool clipped = std::any_of(scaled.begin(), scaled.end(), [](double v) { return v < 1e-3 || v > 0.999; });
+    if (clipped || lab[0] < 0.05) {
+      continue;
+    }
+    const double ratio = linear_to_oklab({srgb_decode(got[0]), srgb_decode(got[1]), srgb_decode(got[2])})[0] / lab[0];
+    ++ratios;
+    EXPECT_NEAR(ratio / k, 1.0, 5e-3) << "case " << c;
+  }
+  EXPECT_EQ(failures, 0u);
+  EXPECT_GT(ratios, 8u);
+}
+
+TEST_F(GxShaderExtDevice, EmitReachesSurfaceW) {
+  const auto backend = hardware_backend();
+  if (!backend) {
+    GTEST_SKIP() << "AURORA_TEST_BACKEND names no hardware backend";
+  }
+  if (!start({.backend = *backend, .core = true, .allowCpu = false}, false)) {
+    GTEST_SKIP() << "no adapter";
+  }
+  ShaderConfig config = unlit_lit(GX_SRC_REG, GX_SRC_REG);
+  config.ext.layer0 = 1;
+  config.ext.surfaceExt = 1;
+  const ShaderTargets targets = shader_targets(pbr_layout(false));
+  const ShaderInfo info = build_shader_info(config);
+  ASSERT_TRUE(uses_companions(config, info, targets));
+  ASSERT_TRUE(uses_surface_ext(config, info, targets));
+  const std::string text = build_shader_source(config, DstAlphaMode::None, targets);
+  ASSERT_NE(text.find("@group(2) @binding(19)\nvar ctex_emit: texture_2d<f32>;"), std::string::npos);
+  const std::string member =
+      member_between(text, "\n    let uslot = ", "uslot);") + member_between(text, "\n    out.surface_ext = ", ";");
+  ASSERT_FALSE(member.empty());
+  std::string harness;
+  append_surface_pack(harness);
+  harness += R"(
+@group(0) @binding(0) var<storage, read_write> out_words: array<u32>;
+@group(0) @binding(1) var<storage, read> in_words: array<u32>;
+struct U {
+  cc0_amb: vec4f,
+  mat0: vec4f,
+};
+struct Out {
+  surface: vec4u,
+  surface_ext: vec4u,
+};
+var<private> ubuf: U;
+var<private> rec: array<u32, 8>;
+var<private> cmp_orm: vec4f;
+var<private> cmp_emit: vec4f;
+fn gx_record_word(k: u32) -> u32 { return rec[k]; }
+fn in_f32(i: u32) -> f32 { return bitcast<f32>(in_words[i]); }
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  let i = id.x * 8u;
+  rec[5] = in_words[i];
+  ubuf.mat0 = vec4f(f32(in_words[i + 1u]), 0.0, 1.0, 0.0);
+  ubuf.cc0_amb = vec4f(in_f32(i + 2u), in_f32(i + 2u), in_f32(i + 2u), 1.0);
+  cmp_orm = vec4f(1.0);
+  cmp_emit = vec4f(in_f32(i + 3u), in_f32(i + 4u), in_f32(i + 5u), 1.0);
+  let unlit_rgb = vec3f(0.5, 0.25, 1.0);
+  var out: Out;
+)" + member + R"(
+  out_words[id.x * 4u] = out.surface_ext.x;
+  out_words[id.x * 4u + 1u] = out.surface_ext.y;
+  out_words[id.x * 4u + 2u] = out.surface_ext.z;
+  out_words[id.x * 4u + 3u] = out.surface_ext.w;
+}
+)";
+  constexpr std::array<float, 8> Emit{0.f, 0.125f, 0.25f, 0.5f, 1.f, 1.5f, 2.f, 3.5f};
+  constexpr std::array<uint32_t, 4> Lanes{0u, render_ext::LaneEmit, render_ext::LaneEmit | render_ext::LaneAlbedo,
+                                          render_ext::LaneNrm | render_ext::LaneOrm};
+  constexpr float Ambient = 64.f / 255.f;
+  struct Case {
+    uint32_t word, lane;
+    std::array<float, 3> emit;
+  };
+  std::vector<Case> cases;
+  std::vector<uint32_t> input;
+  for (uint32_t c = 0; c < 64; ++c) {
+    const Case value{
+        .word = (c & 1u) != 0 ? render_ext::MaterialWordAmbient | 0x100D9u : 0x100D9u,
+        .lane = Lanes[(c >> 1) % Lanes.size()],
+        .emit = {Emit[c % Emit.size()], Emit[(c / 3) % Emit.size()], Emit[(c / 5) % Emit.size()]},
+    };
+    cases.push_back(value);
+    input.insert(input.end(),
+                 {value.word, value.lane, std::bit_cast<uint32_t>(Ambient), std::bit_cast<uint32_t>(value.emit[0]),
+                  std::bit_cast<uint32_t>(value.emit[1]), std::bit_cast<uint32_t>(value.emit[2]), 0u, 0u});
+  }
+  const auto out = run_word_compute(*m_device, harness, 64, 4, input);
+  ASSERT_TRUE(out.has_value());
+  size_t emitted = 0;
+  for (size_t c = 0; c < cases.size(); ++c) {
+    const surface::Words ext =
+        surface::join({static_cast<uint16_t>((*out)[c * 4]), static_cast<uint16_t>((*out)[c * 4 + 1]),
+                       static_cast<uint16_t>((*out)[c * 4 + 2]), static_cast<uint16_t>((*out)[c * 4 + 3])});
+    const bool lit = (cases[c].lane & render_ext::LaneEmit) != 0;
+    const surface::Fields fields{
+        .ambient = (cases[c].word & render_ext::MaterialWordAmbient) != 0 ? std::array{Ambient, Ambient, Ambient}
+                                                                          : std::array<float, 3>{},
+        .emissive = lit ? cases[c].emit : std::array<float, 3>{},
+    };
+    EXPECT_EQ(ext[0], surface::pack_ext(fields)[0]) << "case " << c;
+    EXPECT_EQ(ext[1], surface::pack_ext(fields)[1]) << "case " << c;
+    emitted += lit && ext[1] != 0 ? 1 : 0;
+  }
+  EXPECT_GT(emitted, 16u);
+}
 } // namespace
 } // namespace aurora::gx

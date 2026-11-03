@@ -121,6 +121,8 @@ bool finish(RoleSlot& slot, CompanionRole role, std::optional<ConvertedTexture> 
   slot.state = RoleState::Loaded;
   ++s_stats.loaded;
   s_stats.loadedBytes += slot.bytes;
+  s_stats.loadedEmit += role == CompanionRole::Emit ? 1 : 0;
+  s_stats.loadedDelight += role == CompanionRole::Delight ? 1 : 0;
   return true;
 }
 
@@ -179,6 +181,9 @@ uint8_t views(uint32_t set, uint8_t wanted, std::array<WGPUTextureView, ViewSlot
   sync_generation();
   if ((wanted & role_bit(CompanionRole::Nrm)) != 0) {
     wanted &= static_cast<uint8_t>(~role_bit(CompanionRole::Mat));
+  }
+  if ((wanted & role_bit(CompanionRole::Albedo)) != 0) {
+    wanted &= static_cast<uint8_t>(~role_bit(CompanionRole::Delight));
   }
   const auto [it, inserted] = s_sets.try_emplace(set);
   s_stats.sets += inserted ? 1 : 0;
@@ -248,9 +253,12 @@ uint64_t epoch() noexcept { return s_epoch.load(std::memory_order_acquire); }
 
 void shutdown() noexcept {
   if (s_stats.sets != 0) {
-    Log.info("Companions: sets {}, loaded {} ({:.1f} MB), rejected {} (D7 {}, BC {}), evicted {}, sync loads {}",
-             s_stats.sets, s_stats.loaded, static_cast<double>(s_stats.loadedBytes) / (1024.0 * 1024.0),
-             s_stats.rejected, s_stats.rejectedFormat, s_stats.rejectedBc, s_stats.evicted, s_stats.syncLoads);
+    Log.info(
+        "Companions: sets {}, loaded {} ({:.1f} MB; emit {}, delight {}), rejected {} (D7 {}, BC {}), evicted {}, "
+        "sync loads {}",
+        s_stats.sets, s_stats.loaded, static_cast<double>(s_stats.loadedBytes) / (1024.0 * 1024.0), s_stats.loadedEmit,
+        s_stats.loadedDelight, s_stats.rejected, s_stats.rejectedFormat, s_stats.rejectedBc, s_stats.evicted,
+        s_stats.syncLoads);
   }
   s_session.fetch_add(1, std::memory_order_relaxed);
   {

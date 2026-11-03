@@ -17,6 +17,7 @@
 #include "render/gx_ext/unlit.hpp"
 #include "render/hints.hpp"
 #include "render/material/classes.hpp"
+#include "render/material/gx_lookup.hpp"
 #include "render/material/registry.hpp"
 #include "render/post/composite.hpp"
 #include "render/scene/classifier.hpp"
@@ -1731,6 +1732,149 @@ TEST_F(RenderGxExt, NormalsOffAtBlendOne) {
   apply_frame_state(pbr_state(0.f));
   EXPECT_FALSE(gx::render_ext::g_companionGates.normals);
   EXPECT_FALSE(gx::render_ext::g_companionGates.materials);
+}
+
+constexpr uint8_t AlbedoRole = 1u << 0;
+constexpr uint8_t DelightRole = 1u << 1;
+constexpr uint8_t EmitRole = 1u << 4;
+
+gx::RenderExtConfig pbr_ext(const gx::PipelineConfig& config, const gfx::RenderTargetLayout& layout) {
+  const gx::render_ext::Hooks* hooks = gx::render_ext::hooks();
+  EXPECT_NE(hooks, nullptr);
+  gx::render_ext::StochasticLanes lanes{};
+  return hooks != nullptr
+             ? hooks->derive(hooks->userData, config, gx::build_shader_info(config.shaderConfig), layout, lanes)
+             : gx::RenderExtConfig{};
+}
+
+gx::render_ext::CompanionLane params_lane(const gfx::TextureMaterialRef& material, u32 bits) {
+  const gx::render_ext::Hooks* hooks = gx::render_ext::hooks();
+  EXPECT_TRUE(hooks != nullptr && hooks->companion_params != nullptr);
+  const gx::render_ext::CompanionLane lane = gx::render_ext::companion_lane(bits, gx::render_ext::g_companionGates);
+  return hooks != nullptr && hooks->companion_params != nullptr
+             ? hooks->companion_params(hooks->userData, material, lane)
+             : lane;
+}
+
+void consumed_frame(float legacyBlend = 0.f) {
+  webgpu::g_graphicsConfig.gbuffer = true;
+  webgpu::g_graphicsConfig.surfaceBuffer = true;
+  apply_frame_state(pbr_state(legacyBlend));
+}
+
+TEST_F(RenderGxExt, Layer0PicksEmitRole) {
+  const CompanionScope scope;
+  const gfx::RenderTargetLayout pbr = pbr_layout();
+  ASSERT_EQ(pbr_ext(pbr_writer(), pbr).surfaceExt, 0u);
+  gx::g_gxState.textures[0].material = {.companionSet = 3, .companionRoles = EmitRole};
+  gx::RenderExtConfig ext = pbr_ext(pbr_writer(), pbr);
+  EXPECT_EQ(ext.layer0, 1u);
+  EXPECT_EQ(ext.surfaceExt, 1u);
+  gx::g_gxState.textures[0].material.companionRoles = NrmRole;
+  ext = pbr_ext(pbr_writer(), pbr);
+  EXPECT_EQ(ext.layer0, 1u);
+  EXPECT_EQ(ext.surfaceExt, 0u);
+  gx::g_gxState.textures[0].material.companionRoles = NrmRole | EmitRole;
+  for (const detail::FrameState& state : {pbr_state(0.f), pbr_state(1.f), pbr_state(0.5f, false)}) {
+    apply_frame_state(state);
+    records::on_route(main_opaque());
+    EXPECT_EQ(pbr_ext(pbr_writer(), pbr).surfaceExt, 1u);
+  }
+  EXPECT_EQ(pbr_ext(pbr_writer(), scene_layout(true)).surfaceExt, 0u);
+}
+
+TEST_F(RenderGxExt, DelightRoleOnlyUnderDevEnv) {
+  const gfx::RenderTargetLayout pbr = pbr_layout();
+  {
+    const CompanionScope scope;
+    gx::g_gxState.textures[0].material = {.companionSet = 3, .companionRoles = DelightRole};
+    EXPECT_EQ(pbr_layer(pbr_writer(), pbr), 0u);
+    consumed_frame();
+    EXPECT_TRUE(gx::render_ext::g_companionGates.materials);
+    EXPECT_FALSE(gx::render_ext::g_companionGates.delight);
+  }
+  SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_DELIGHT", "on", true);
+  testing::reset();
+  {
+    const CompanionScope scope;
+    gx::g_gxState.textures[0].material = {.companionSet = 3, .companionRoles = DelightRole};
+    EXPECT_EQ(pbr_layer(pbr_writer(), pbr), 1u);
+    EXPECT_EQ(pbr_ext(pbr_writer(), pbr).surfaceExt, 0u);
+    consumed_frame();
+    EXPECT_TRUE(gx::render_ext::g_companionGates.delight);
+    apply_frame_state(pbr_state(0.f, false));
+    EXPECT_FALSE(gx::render_ext::g_companionGates.delight);
+    records::on_route(main_opaque());
+    gx::g_gxState.textures[0].material.companionRoles = DelightRole | AlbedoRole;
+    EXPECT_EQ(pbr_layer(pbr_writer(), pbr), 1u);
+  }
+  SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_DELIGHT");
+  testing::reset();
+}
+
+TEST_F(RenderGxExt, ScalarEditRebuildsLaneOnGeneration) {
+  const ScopedTargets targets;
+  const ScopedHints hints;
+  add(R"({ "version": 1, "materials": { "tex1_16x16_000000000000a001_14": { "normalStrength": 2 } } })");
+  consumed_frame();
+  const texture::TextureSourceKey key{.textureHash = 0xa001, .width = 16, .height = 16, .format = 14};
+  const gfx::TextureMaterialRef ref = material::testing::gx_find(key);
+  ASSERT_NE(ref.id, 0u);
+  EXPECT_FLOAT_EQ(params_lane(ref, gx::render_ext::LaneNrm).v[1], 2.f);
+  const uint64_t generation = gx::texture::current_bind_generation();
+  consumed_frame();
+  EXPECT_EQ(gx::texture::current_bind_generation(), generation);
+
+  const uint64_t bindEpoch = material::snapshot()->bindEpoch;
+  add(R"({ "version": 1, "materials": { "tex1_16x16_000000000000a001_14": { "normalStrength": 3 } } })");
+  ASSERT_EQ(material::snapshot()->bindEpoch, bindEpoch);
+  EXPECT_EQ(material::testing::gx_find(key), ref);
+  consumed_frame();
+  EXPECT_EQ(gx::texture::current_bind_generation(), generation + 1);
+  EXPECT_FLOAT_EQ(params_lane(ref, gx::render_ext::LaneNrm).v[1], 3.f);
+
+  add(R"({ "version": 1, "materials": { "tex1_16x16_000000000000a001_14": { "normalStrength": 1 } } })");
+  webgpu::g_graphicsConfig.surfaceBuffer = false;
+  const uint64_t unconsumed = gx::texture::current_bind_generation();
+  apply_frame_state(pbr_state(0.f));
+  apply_frame_state(pbr_state(0.f));
+  const uint64_t settled = gx::texture::current_bind_generation();
+  add(R"({ "version": 1, "materials": { "tex1_16x16_000000000000a001_14": { "normalStrength": 4 } } })");
+  apply_frame_state(pbr_state(0.f));
+  EXPECT_EQ(gx::texture::current_bind_generation(), settled);
+  EXPECT_GE(settled, unconsumed);
+}
+
+TEST_F(RenderGxExt, NormalScalarsReplaceRoleDefault) {
+  const ScopedTargets targets;
+  const ScopedHints hints;
+  consumed_frame();
+  using gx::render_ext::LaneAlbedo;
+  using gx::render_ext::LaneMat;
+  using gx::render_ext::LaneNrm;
+  const gfx::TextureMaterialRef none{};
+  EXPECT_EQ(params_lane(none, LaneNrm).v, (Vec4<float>{2.f, 1.f, 1.f, 0.f}));
+  EXPECT_EQ(params_lane(none, LaneMat).v, (Vec4<float>{4.f, 0.5f, -1.f, 0.f}));
+  EXPECT_EQ(params_lane(none, LaneAlbedo).v[1], 0.f);
+
+  add(R"({ "version": 1, "materials": { "tex1_16x16_000000000000a001_14": { "normalStrength": 2, )"
+      R"("normalFlipY": true }, "tex1_16x16_000000000000a002_14": { "normalFlipY": false } } })");
+  consumed_frame();
+  const gfx::TextureMaterialRef scaled =
+      material::testing::gx_find({.textureHash = 0xa001, .width = 16, .height = 16, .format = 14});
+  const gfx::TextureMaterialRef unflipped =
+      material::testing::gx_find({.textureHash = 0xa002, .width = 16, .height = 16, .format = 14});
+  ASSERT_NE(scaled.id, 0u);
+  ASSERT_NE(unflipped.id, 0u);
+  EXPECT_EQ(params_lane(scaled, LaneNrm | gx::render_ext::LaneOrm).v, (Vec4<float>{10.f, 2.f, -1.f, 0.f}));
+  EXPECT_EQ(params_lane(scaled, LaneMat).v, (Vec4<float>{4.f, 2.f, 1.f, 0.f}));
+  EXPECT_EQ(params_lane(scaled, LaneAlbedo).v[1], 0.f);
+  EXPECT_EQ(params_lane(unflipped, LaneMat).v, (Vec4<float>{4.f, 0.5f, -1.f, 0.f}));
+
+  consumed_frame(1.f);
+  ASSERT_FALSE(gx::render_ext::g_companionGates.normals);
+  EXPECT_EQ(params_lane(scaled, LaneNrm).v[1], 0.f);
+  EXPECT_EQ(params_lane(none, LaneMat).v[1], 0.f);
 }
 
 constexpr uint32_t DefaultWord = material::classes::default_word(true);

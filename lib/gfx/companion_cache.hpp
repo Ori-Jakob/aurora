@@ -14,6 +14,8 @@ constexpr uint64_t EvictAfterFrames = 1800;
 constexpr int32_t view_slot(texture_replacement::CompanionRole role) noexcept {
   switch (role) {
   case texture_replacement::CompanionRole::Albedo:
+  // Delight loads only without an albedo map, so the two share a slot
+  case texture_replacement::CompanionRole::Delight:
     return 0;
   case texture_replacement::CompanionRole::Nrm:
   case texture_replacement::CompanionRole::Mat:
@@ -41,6 +43,8 @@ struct Stats {
   uint64_t sets = 0;
   uint64_t loaded = 0;
   uint64_t loadedBytes = 0;
+  uint64_t loadedEmit = 0;
+  uint64_t loadedDelight = 0;
   uint64_t rejected = 0;
   uint64_t rejectedFormat = 0;
   uint64_t rejectedBc = 0;

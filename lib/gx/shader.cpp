@@ -939,6 +939,32 @@ fn gx_linear_to_srgb(c: vec3f) -> vec3f {
     let hi = 1.055 * pow(max(c, vec3f(0.0)), vec3f(1.0 / 2.4)) - 0.055;
     return select(hi, c * 12.92, c <= vec3f(0.0031308));
 }
+fn gx_srgb_to_linear(c: vec3f) -> vec3f {
+    let hi = pow((max(c, vec3f(0.0)) + 0.055) / 1.055, vec3f(2.4));
+    return select(hi, c / 12.92, c <= vec3f(0.04045));
+}
+fn gx_linear_to_oklab(c: vec3f) -> vec3f {
+    let lms = c * mat3x3f(vec3f(0.4122214708, 0.5363325363, 0.0514459929),
+                          vec3f(0.2119034982, 0.6806995451, 0.1073969566),
+                          vec3f(0.0883024619, 0.2817188376, 0.6299787005));
+    return pow(max(lms, vec3f(0.0)), vec3f(1.0 / 3.0)) * mat3x3f(vec3f(0.2104542553, 0.7936177850, -0.0040720468),
+                                                                 vec3f(1.9779984951, -2.4285922050, 0.4505937099),
+                                                                 vec3f(0.0259040371, 0.7827717662, -0.8086757660));
+}
+fn gx_oklab_to_linear(lab: vec3f) -> vec3f {
+    let l = lab * mat3x3f(vec3f(1.0, 0.3963377774, 0.2158037573),
+                          vec3f(1.0, -0.1055613458, -0.0638541728),
+                          vec3f(1.0, -0.0894841775, -1.2914855480));
+    return (l * l * l) * mat3x3f(vec3f(4.0767416621, -3.3077115913, 0.2309699292),
+                                 vec3f(-1.2684380046, 2.6097574011, -0.3413193965),
+                                 vec3f(-0.0041960863, -0.7034186147, 1.7076147010));
+}
+// Provisional: S3 works on Oklab low-frequency L (rev3.md:1371); pinned by the first S3 sample
+fn gx_companion_delight(c: vec3f, d: f32) -> vec3f {
+    let lab = gx_linear_to_oklab(gx_srgb_to_linear(c));
+    let k = exp2(-(d - 0.5) * 8.0);
+    return gx_linear_to_srgb(saturate(gx_oklab_to_linear(vec3f(lab.x * k, lab.yz))));
+}
 fn gx_view_pos(c: vec3f) -> vec3f {
     let z = -c.z;
     return vec3f((c.x - ubuf.proj[0].z * z - ubuf.proj[0].w) / ubuf.proj[0].x,
@@ -982,6 +1008,8 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
   const bool companionText = uses_companions(config, info, targets);
   const CompanionSite companion = companionText ? companion_site(config, info) : CompanionSite{};
   CHECK(!companionText || targets.motion != UINT32_MAX, "companion text needs the clip position varying");
+  // Emission has only the SurfaceExt word to go to, so unkeyed companion text never samples it
+  const bool emitText = companionText && uses_surface_ext(config, info, targets);
   if (EnableDebugPrints && !s_seenShaders.contains(hash)) {
     s_seenShaders.insert(hash);
 
@@ -1646,13 +1674,17 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     fragmentFnPre += fmt::format(
         "\n    let cmp_alb = textureSampleBias(ctex_alb, tex{0}_samp, tex{1}_uv, ubuf.tex{0}_size_bias.z);"
         "\n    let cmp_nrm = textureSampleBias(ctex_nrm, tex{0}_samp, tex{1}_uv, ubuf.tex{0}_size_bias.z);"
-        "\n    let cmp_orm = textureSampleBias(ctex_orm, tex{0}_samp, tex{1}_uv, ubuf.tex{0}_size_bias.z);"
+        "\n    let cmp_orm = textureSampleBias(ctex_orm, tex{0}_samp, tex{1}_uv, ubuf.tex{0}_size_bias.z);{2}"
         "\n    let cmp_p = gx_view_pos(in.mo_cur);"
         "\n    let cmp_dp1 = dpdx(cmp_p);"
         "\n    let cmp_dp2 = dpdy(cmp_p);"
         "\n    let cmp_duv1 = dpdx(tex{1}_uv);"
         "\n    let cmp_duv2 = dpdy(tex{1}_uv);",
-        companion.map, companion.coord);
+        companion.map, companion.coord,
+        emitText ? fmt::format("\n    let cmp_emit = textureSampleBias(ctex_emit, tex{0}_samp, tex{1}_uv, "
+                               "ubuf.tex{0}_size_bias.z);",
+                               companion.map, companion.coord)
+                 : std::string{});
     uniformPre += CompanionWgsl;
   }
   if (info.usesPTTexMtx.any()) {
@@ -1768,6 +1800,9 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
         "\n@group(2) @binding({1})\nvar ctex_nrm: texture_2d<f32>;"
         "\n@group(2) @binding({2})\nvar ctex_orm: texture_2d<f32>;",
         MaxTextures * 2, MaxTextures * 2 + 1, MaxTextures * 2 + 2);
+    if (emitText) {
+      texBindings += fmt::format("\n@group(2) @binding({})\nvar ctex_emit: texture_2d<f32>;", MaxTextures * 2 + 3);
+    }
   }
   if (!prevColorNormalized && !prevAlphaNormalized) {
     fragmentFn += "\n    prev = tev_overflow_vec4f(prev);";
@@ -2013,10 +2048,15 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
               fmt::format("\n    let sampled{} = vec4f({});", i, (unlitPlan.neutralOne & map) != 0 ? "1.0" : "0.0");
         } else if (companionText && stage.texMapId == companion.map && stage.texCoordId == companion.coord &&
                    direct_stage(stage) && !info.stochasticTextures.test(stage.texMapId)) {
+          // The lane is uniform, so the branch keeps the Oklab work off every draw without a delight map
           inner += fmt::format(
-              "\n    let sampled{0} = select(sampled{0}, vec4f(gx_linear_to_srgb(cmp_alb.rgb), "
-              "sampled{0}.a), (u32(ubuf.mat0.x) & 1u) != 0u);",
-              i);
+              "\n    var delit{0} = sampled{0};"
+              "\n    if ((u32(ubuf.mat0.x) & {1}u) != 0u) {{"
+              "\n        delit{0} = vec4f(gx_companion_delight(sampled{0}.rgb, cmp_alb.r), sampled{0}.a);"
+              "\n    }}"
+              "\n    let sampled{0} = select(delit{0}, vec4f(gx_linear_to_srgb(cmp_alb.rgb), sampled{0}.a), "
+              "(u32(ubuf.mat0.x) & {2}u) != 0u);",
+              i, render_ext::LaneDelight, render_ext::LaneAlbedo);
         }
       }
       const UnlitPass pass{.scaleDivide = unlitPlan.scaleDivide};
@@ -2054,9 +2094,13 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
         {targets.surface, fmt::format("    @location({}) surface: vec4u,\n", targets.surface), std::move(assignment)});
     if (uses_surface_ext(config, info, targets)) {
       CHECK(targets.surface < targets.surfaceExt, "SurfaceExt reads the material word Surface's member loads");
-      members.push_back({targets.surfaceExt, fmt::format("    @location({}) surface_ext: vec4u,\n", targets.surfaceExt),
-                         fmt::format("\n    out.surface_ext = gx_surface_ext_pack({}, vec3f(0.0));",
-                                     surface_ext_ambient(config, info))});
+      members.push_back(
+          {targets.surfaceExt, fmt::format("    @location({}) surface_ext: vec4u,\n", targets.surfaceExt),
+           fmt::format("\n    out.surface_ext = gx_surface_ext_pack({}, {});", surface_ext_ambient(config, info),
+                       emitText ? fmt::format("select(vec3f(0.0), cmp_emit.rgb, (u32(ubuf.mat0.x) & {}u) "
+                                              "!= 0u)",
+                                              render_ext::LaneEmit)
+                                : "vec3f(0.0)"s)});
     }
   }
   if (!members.empty()) {

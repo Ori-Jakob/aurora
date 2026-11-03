@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -128,6 +130,16 @@ struct CompanionSet {
   uint8_t roles = 0;
 };
 
+struct ManifestCompanion {
+  texture::TextureSourceKey key;
+  CompanionRole role = CompanionRole::Albedo;
+  std::filesystem::path path;
+
+  bool operator==(const ManifestCompanion&) const = default;
+};
+// A manifest names its maps explicitly, so they outrank every map found by file name
+inline constexpr int32_t ManifestCompanionPriority = std::numeric_limits<int32_t>::max();
+
 enum class CompanionLoadError : uint8_t { None, Failed, Format, NoBc };
 
 constexpr bool companion_role_accepts(CompanionRole role, wgpu::TextureFormat format) noexcept {
@@ -178,6 +190,8 @@ uint32_t companion_roles(const texture::TextureSourceKey& key) noexcept;
 uint64_t companion_generation() noexcept;
 CompanionSet companion_set(const texture::TextureSourceKey& key) noexcept;
 std::optional<CompanionFile> companion_file(uint32_t set, CompanionRole role);
+// The material registry owns these entries, not a replacement group, so they survive clear_replacements
+void set_manifest_companions(std::span<const ManifestCompanion> companions);
 bool has_companions() noexcept;
 bool synchronous_loads() noexcept;
 std::optional<ConvertedTexture> load_companion(CompanionRole role, const std::filesystem::path& path,

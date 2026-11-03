@@ -194,6 +194,8 @@ absl::flat_hash_map<TextureSourceKey, CompanionSlots, SourceKeyHash> s_companion
 absl::flat_hash_map<uint32_t, TextureSourceKey> s_companionKeysById;
 uint32_t s_nextCompanionSetId = 1;
 std::atomic<uint64_t> s_companionGeneration{0};
+std::vector<gfx::texture_replacement::ManifestCompanion> s_manifestCompanions;
+std::vector<uint64_t> s_manifestCompanionIds;
 std::atomic_bool s_warnedCompanionBc{false};
 
 std::mutex s_jobMutex;
@@ -1538,6 +1540,25 @@ bool unregister_replacement_locked(const ReplacementRegistration& registration,
   return true;
 }
 
+void insert_manifest_companions_locked() {
+  s_manifestCompanionIds.clear();
+  for (const auto& companion : s_manifestCompanions) {
+    auto& slots = s_companionsByKey[companion.key];
+    if (slots.id == 0) {
+      slots.id = s_nextCompanionSetId++;
+      s_companionKeysById[slots.id] = companion.key;
+    }
+    const uint64_t id = s_nextRegistrationId++;
+    slots.roles[static_cast<size_t>(companion.role)].push_back({
+        .id = id,
+        .priority = gfx::texture_replacement::ManifestCompanionPriority,
+        .sequence = s_nextSequence++,
+        .path = companion.path,
+    });
+    s_manifestCompanionIds.push_back(id);
+  }
+}
+
 void clear_replacement_runtime_state_locked(std::vector<std::shared_ptr<VirtualReadState>>& waitStates) noexcept {
   for (const auto& [_, entries] : s_entriesByKey) {
     for (const auto& entry : entries) {
@@ -1557,6 +1578,7 @@ void clear_replacement_runtime_state_locked(std::vector<std::shared_ptr<VirtualR
     s_companionKeysById.clear();
     s_companionGeneration.fetch_add(1, std::memory_order_relaxed);
   }
+  insert_manifest_companions_locked();
 }
 
 bool is_source_key(const ReplacementKey& key) noexcept { return std::holds_alternative<TextureSourceKey>(key); }
@@ -2441,6 +2463,19 @@ std::optional<CompanionFile> companion_file(uint32_t set, CompanionRole role) {
     return std::nullopt;
   }
   return CompanionFile{.id = selected->id, .path = selected->path};
+}
+
+void set_manifest_companions(std::span<const ManifestCompanion> companions) {
+  std::lock_guard lk(s_registryMutex);
+  if (std::ranges::equal(companions, s_manifestCompanions)) {
+    return;
+  }
+  for (size_t i = 0; i < s_manifestCompanionIds.size(); ++i) {
+    erase_companion_locked(s_manifestCompanions[i].key, s_manifestCompanionIds[i]);
+  }
+  s_manifestCompanions.assign(companions.begin(), companions.end());
+  insert_manifest_companions_locked();
+  s_companionGeneration.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool has_companions() noexcept {

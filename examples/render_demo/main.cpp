@@ -395,7 +395,16 @@ struct CompanionRun {
   uint64_t loadedMapped = 0;
   uint64_t loadedMat = 0;
   uint64_t companionSkips = 0;
+  uint32_t createdAtScalars = 0;
+  uint32_t createdAfterScalars = 0;
+  render_demo::CompanionCounts emit;
+  uint64_t loadedManifest = 0;
 };
+
+bool delight_env() {
+  const char* value = SDL_getenv("AURORA_RENDER_DELIGHT");
+  return value != nullptr && std::string_view{value} == "on";
+}
 
 struct CompanionOutcome {
   render_demo::CompanionCheckSummary summary;
@@ -404,7 +413,8 @@ struct CompanionOutcome {
 
 CompanionOutcome companion_outcome(const render_demo::CompanionCheckReport& report, const CompanionRun& run,
                                    bool nullBackend) {
-  CompanionOutcome outcome{.summary = render_demo::summarize_companions(report.phases, render_demo::companion_axes())};
+  CompanionOutcome outcome{
+      .summary = render_demo::summarize_companions(report.phases, render_demo::companion_axes(), delight_env())};
   if (!run.setupError.empty()) {
     outcome.failure = run.setupError;
     return outcome;
@@ -413,9 +423,14 @@ CompanionOutcome companion_outcome(const render_demo::CompanionCheckReport& repo
   if (nullBackend) {
     return outcome;
   }
+  const uint32_t compiles = run.createdAfterScalars - run.createdAtScalars;
   if (run.loadedMapped < render_demo::CompanionNrmRoles ||
-      run.loadedMat < run.loadedMapped + render_demo::CompanionMatRoles) {
+      run.loadedMat < run.loadedMapped + render_demo::CompanionMatRoles || run.emit.emit == 0 ||
+      (run.emit.delight != 0) != delight_env() ||
+      run.loadedManifest < run.emit.loaded + render_demo::CompanionNrmRoles) {
     outcome.failure = "companion maps were not resident at their probe frames";
+  } else if (compiles != 0) {
+    outcome.failure = "the manifest normal scalars compiled " + std::to_string(compiles) + " pipelines";
   } else if (run.companionSkips != 0) {
     outcome.failure = "companion draws were skipped for want of a companion group";
   } else if (report.encodes == 0) {
@@ -1048,18 +1063,36 @@ int main(int argc, char* argv[]) {
         settings.legacyBlend = blend;
         aurora::render::apply_settings(settings);
       };
+      const std::span<const u8> ground = render_demo::ground_texture_base();
       if (frame == render_demo::CompanionLoadFrame || frame == render_demo::CompanionMatFrame) {
         const bool mat = frame == render_demo::CompanionMatFrame;
         if (mat) {
           set_blend(0.f);
         }
-        render_demo::load_companion_fixtures(mat, render_demo::ground_texture_base(), companionRun.setupError);
+        render_demo::load_companion_fixtures(mat ? render_demo::CompanionFixture::Mat
+                                                 : render_demo::CompanionFixture::Nrm,
+                                             ground, companionRun.setupError);
       } else if (frame == render_demo::CompanionBlendOneFrame) {
         set_blend(1.f);
       } else if (frame == render_demo::CompanionMappedFrame) {
         companionRun.loadedMapped = render_demo::companion_counts().loaded;
       } else if (frame == render_demo::CompanionMatProbeFrame) {
         companionRun.loadedMat = render_demo::companion_counts().loaded;
+      } else if (frame == render_demo::CompanionScalarFrame) {
+        companionRun.createdAtScalars = aurora_get_stats()->createdPipelines;
+        render_demo::set_companion_manifest(false, ground, companionRun.setupError);
+      } else if (frame == render_demo::CompanionScalarProbeFrame) {
+        companionRun.createdAfterScalars = aurora_get_stats()->createdPipelines;
+      } else if (frame == render_demo::CompanionEmitFrame) {
+        render_demo::load_companion_fixtures(render_demo::CompanionFixture::Emit, ground, companionRun.setupError);
+      } else if (frame == render_demo::CompanionEmitProbeFrame) {
+        companionRun.emit = render_demo::companion_counts();
+      } else if (frame == render_demo::CompanionManifestFrame) {
+        if (render_demo::load_companion_fixtures(render_demo::CompanionFixture::Nrm, ground, companionRun.setupError)) {
+          render_demo::set_companion_manifest(true, ground, companionRun.setupError);
+        }
+      } else if (frame == render_demo::CompanionManifestProbeFrame) {
+        companionRun.loadedManifest = render_demo::companion_counts().loaded;
       }
     }
     if (options.classCheck && classRun.setupError.empty()) {
@@ -1240,13 +1273,17 @@ int main(int argc, char* argv[]) {
     std::printf(
         "render_demo: companion check %s: %u probes, loaded %llu / wanted %u, then %llu / wanted %u, "
         "companion skips %llu; off-geometric %u, C1 tilt off %u (min %.3f), .mat tilt off %u, blend-one "
-        "changes %u, orm off %u, albedo off %u at %ux%u\n",
+        "changes %u, orm off %u, albedo off %u; scalars off %u (compiled %u), emit off %u (leaks %u, loaded "
+        "%llu), delight %s off %u (worst %d LSB, loaded %llu), manifest nrm off %u, roughness off %u at %ux%u\n",
         status.c_str(), c.probes, static_cast<unsigned long long>(companionRun.loadedMapped),
         render_demo::CompanionNrmRoles, static_cast<unsigned long long>(companionRun.loadedMat),
         render_demo::CompanionNrmRoles + render_demo::CompanionMatRoles,
         static_cast<unsigned long long>(companionRun.companionSkips), c.bareMismatches, c.tiltFailures, c.minTilt,
-        c.matFailures, c.blendOneMismatches, c.ormFailures, c.albedoFailures, graphReport.companion.width,
-        graphReport.companion.height);
+        c.matFailures, c.blendOneMismatches, c.ormFailures, c.albedoFailures, c.scalarFailures,
+        companionRun.createdAfterScalars - companionRun.createdAtScalars, c.emitFailures, c.emitLeaks,
+        static_cast<unsigned long long>(companionRun.emit.emit), delight_env() ? "on" : "off", c.delightFailures,
+        c.maxDelightError, static_cast<unsigned long long>(companionRun.emit.delight), c.manifestNrmFailures,
+        c.manifestRoughFailures, graphReport.companion.width, graphReport.companion.height);
   }
   const ClassOutcome classOutcome =
       options.classCheck ? class_outcome(graphReport.classes, classRun, info.backend == BACKEND_NULL) : ClassOutcome{};

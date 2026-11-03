@@ -10,5 +10,6 @@ void remove_gx_lookup() noexcept;
 
 namespace testing {
 gfx::TextureMaterialRef gx_find(const texture::TextureSourceKey& key) noexcept;
+void reset_map_warning() noexcept;
 } // namespace testing
 } // namespace aurora::render::material
