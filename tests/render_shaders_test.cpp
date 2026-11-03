@@ -434,6 +434,19 @@ TEST_F(RenderShaders, DeferredLayeredVariantCompiles) {
   EXPECT_TRUE(validate_module(lighting::openpbr::Library, {}, error)) << error;
 }
 
+TEST_F(RenderShaders, DeferredSubgroupWalkVariantCompiles) {
+  namespace lighting = detail::lighting;
+  if (!lighting::deferred::subgroup_walk(implicit_defines())) {
+    GTEST_SKIP() << "the device has no Subgroups";
+  }
+  const std::array<std::string_view, 1> walk{lighting::deferred::SubgroupWalkDefine};
+  const std::array<std::string_view, 2> layered{lighting::deferred::SubgroupWalkDefine,
+                                                lighting::openpbr::LayeredDefine};
+  std::string error;
+  EXPECT_TRUE(validate_module(lighting::deferred::Shader, walk, error)) << error;
+  EXPECT_TRUE(validate_module(lighting::deferred::Shader, layered, error)) << error;
+}
+
 TEST_F(RenderShaders, GbufViewUintVariantCompiles) {
   const std::array<std::string_view, 1> defines{"SOURCE_UINT"};
   std::string error;

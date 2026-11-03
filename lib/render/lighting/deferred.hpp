@@ -43,6 +43,7 @@ inline constexpr uint32_t WorkgroupSize = 8;
 inline constexpr float HdrMax = 65504.f;
 inline constexpr uint32_t LayeredPipeline = 0;
 inline constexpr uint32_t BasePipeline = 1;
+inline constexpr std::string_view SubgroupWalkDefine = "DEFERRED_SUBGROUP_WALK";
 
 // Later milestones append bindings 14 and up and never renumber these
 enum Binding : uint32_t {
@@ -92,6 +93,8 @@ void fill_params(const SceneHints* hints, bool surfaceAmbient, Mode mode, Params
 // Render worker; without a table any class can reach the pass
 [[nodiscard]] bool needs_layered(const std::vector<std::array<uint32_t, 4>>* table,
                                  const std::bitset<256>& layeredClasses) noexcept;
+// The shader library reports the device's Subgroups feature as the implicit AURORA_SUBGROUPS define
+[[nodiscard]] bool subgroup_walk(std::span<const std::string_view> implicitDefines) noexcept;
 PassDesc pass_desc();
 void initialize();
 void shutdown() noexcept;
@@ -113,6 +116,7 @@ void set_hints_override(std::shared_ptr<const SceneHints> hints) noexcept;
 void set_mode(std::optional<Mode> mode) noexcept;
 void force_enabled(std::optional<bool> enabled) noexcept;
 void force_layered(std::optional<bool> layered) noexcept;
+void force_subgroup_walk(std::optional<bool> walk) noexcept;
 
 using Vec3 = std::array<double, 3>;
 

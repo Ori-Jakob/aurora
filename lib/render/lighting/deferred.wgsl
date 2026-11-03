@@ -6,6 +6,12 @@
 //#import aurora/srgb
 //#import aurora/surface
 
+//#if DEFERRED_SUBGROUP_WALK
+enable subgroups;
+// The broadcast runs past the early returns, where every lane still running holds the same group union
+diagnostic(off, subgroup_uniformity);
+//#endif
+
 struct DeferredParams {
   camera: StageCamera,
   ambient: vec3f,
@@ -29,9 +35,9 @@ const DEFERRED_HDR_MAX: f32 = 65504.0;
 @group(1) @binding(1) var scene_normal: texture_2d<f32>;
 @group(1) @binding(2) var scene_depth: texture_2d<f32>;
 @group(1) @binding(3) var ao_final: texture_2d<f32>;
-@group(1) @binding(4) var<storage, read> light_list: LightList;
+@group(1) @binding(4) var<uniform> light_list: LightList;
 @group(1) @binding(5) var<storage, read> light_grid: array<u32>;
-@group(1) @binding(6) var<storage, read> light_classes: array<ClassParams>;
+@group(1) @binding(6) var<uniform> light_classes: array<ClassParams, 256>;
 @group(1) @binding(7) var light_lut3d: texture_3d<f32>;
 @group(1) @binding(8) var light_lut2d: texture_2d_array<f32>;
 @group(1) @binding(9) var scene_hdr: texture_storage_2d<rgba16float, write>;
@@ -120,10 +126,6 @@ fn shade(@builtin(global_invocation_id) id: vec3u, @builtin(local_invocation_ind
     }
   }
   workgroupBarrier();
-  var union_words = array<u32, 8>();
-  for (var w = 0u; w < LIGHT_MASK_WORDS; w++) {
-    union_words[w] = atomicLoad(&deferred_union[w]);
-  }
   if (!inside) {
     return;
   }
@@ -151,7 +153,7 @@ fn shade(@builtin(global_invocation_id) id: vec3u, @builtin(local_invocation_ind
     surface.base_color = vec3f(1.0);
     surface.metalness = select(0.0, 1.0, mode == DEFERRED_MODE_FURNACE_METAL);
   }
-  let row = light_classes[min(cls, arrayLength(&light_classes) - 1u)];
+  let row = light_classes[min(cls, 255u)];
   let p = openpbr_prepare(surface, row, n, v, light_lut3d, light_lut2d, linear_clamp);
   // The AO-off dummy is 1x1, so the load clamps
   var ao = 1.0;
@@ -186,8 +188,14 @@ fn shade(@builtin(global_invocation_id) id: vec3u, @builtin(local_invocation_ind
       }
       deferred_add_light(&h, p, l, to_light, 1.0, pos);
     }
+    // The union is read in place: D3D12 compiles a private copy of it to per-thread stack memory
     for (var w = 0u; w < counts.words; w++) {
-      var bits = union_words[w];
+//#if DEFERRED_SUBGROUP_WALK
+      // Saying the union is uniform, as it is, lets the compiler walk the lights on its scalar path
+      var bits = subgroupBroadcastFirst(atomicLoad(&deferred_union[w]));
+//#else
+      var bits = atomicLoad(&deferred_union[w]);
+//#endif
       if (w == counts.locals / 32u) {
         bits &= (1u << (counts.locals % 32u)) - 1u;
       }

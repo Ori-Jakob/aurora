@@ -582,6 +582,15 @@ TEST(DeferredParams, LayoutReservesViewToWorld) {
   EXPECT_EQ(deferred::parse_mode("Grey"), std::nullopt);
 }
 
+TEST(DeferredPipelines, SubgroupWalkNeedsSubgroups) {
+  constexpr std::array<std::string_view, 0> none{};
+  constexpr std::array<std::string_view, 2> core{"AURORA_CORE", "AURORA_F16"};
+  constexpr std::array<std::string_view, 3> subgroups{"AURORA_CORE", "AURORA_F16", "AURORA_SUBGROUPS"};
+  EXPECT_FALSE(deferred::subgroup_walk(none));
+  EXPECT_FALSE(deferred::subgroup_walk(core));
+  EXPECT_TRUE(deferred::subgroup_walk(subgroups));
+}
+
 TEST(DeferredMirror, FalloffFollowsDeclaredCurve) {
   for (const float p : {0.f, 1.f, 1.5f, 2.f}) {
     for (const float radius : {2015.f, 7555.f}) {
@@ -1096,6 +1105,8 @@ TEST_F(LightDeferredGraph, DeclaresOnPbrSurface) {
   EXPECT_EQ(uses[deferred::BindAo].missing, Missing::BindDummyWhite);
   EXPECT_EQ(uses[deferred::BindSurfaceExt].missing, Missing::BindDummyBlack);
   EXPECT_EQ(uses[deferred::BindHdr].access, Access::StorageWrite);
+  EXPECT_EQ(uses[deferred::BindList].access, Access::Uniform);
+  EXPECT_EQ(uses[deferred::BindClasses].access, Access::Uniform);
   const CompiledResource& hdr = graph->resources[graph->find_resource(resource::SceneHdr)];
   EXPECT_EQ(hdr.tex.format, wgpu::TextureFormat::RGBA16Float);
   EXPECT_EQ(hdr.extent.width, 64u);
@@ -1515,6 +1526,35 @@ TEST_F(LightDeferredGpu, BaseVariantMatchesLayered) {
   size_t different = 0;
   for (size_t i = 0; i < base.size(); ++i) {
     different += base[i] != layered[i] ? 1 : 0;
+  }
+  EXPECT_EQ(different, 0u);
+}
+
+TEST_F(LightDeferredGpu, SubgroupWalkMatchesFallback) {
+  if (!deferred::subgroup_walk(shaders::implicit_defines())) {
+    GTEST_SKIP() << "the device has no Subgroups";
+  }
+  std::mt19937 rng{0x5B6Fu};
+  auto hints = scene_hints(mixed_lights());
+  hints->present |= SceneHasEnvironment;
+  hints->environment.value.ambientColor[0] = 0.3f;
+  hints->environment.value.ambientColor[1] = 0.35f;
+  hints->environment.value.ambientColor[2] = 0.4f;
+  set_hints(hints);
+  std::vector<GpuPixel> pixels(size_t{96} * 64);
+  for (GpuPixel& p : pixels) {
+    p = random_gpu_pixel(rng);
+  }
+  static_cast<void>(stage_pixels(96, 64, pixels));
+  deferred::testing::force_enabled(true);
+  deferred::testing::force_subgroup_walk(false);
+  const auto fallback = run_hdr(pbr_settings());
+  deferred::testing::force_subgroup_walk(true);
+  const auto walked = run_hdr(pbr_settings(), 2);
+  ASSERT_EQ(walked.size(), fallback.size());
+  size_t different = 0;
+  for (size_t i = 0; i < walked.size(); ++i) {
+    different += walked[i] != fallback[i] ? 1 : 0;
   }
   EXPECT_EQ(different, 0u);
 }

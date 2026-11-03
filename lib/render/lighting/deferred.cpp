@@ -51,7 +51,7 @@ namespace {
 constexpr Module Log{"aurora::render::lighting"};
 constexpr TexRef HdrRef{BindHdr};
 constexpr double Pi = std::numbers::pi;
-constexpr std::array<std::string_view, 1> LayeredDefines{openpbr::LayeredDefine};
+constexpr std::array<std::string_view, 2> WalkDefines{SubgroupWalkDefine, openpbr::LayeredDefine};
 
 struct LatchSlot {
   bool live = false;
@@ -66,6 +66,7 @@ std::shared_ptr<const SceneHints> g_hintsOverride;
 std::optional<Mode> g_modeOverride;
 std::optional<bool> g_forceEnabled;
 std::optional<bool> g_forceLayered;
+std::optional<bool> g_forceSubgroupWalk;
 std::atomic_uint32_t g_ran{0};
 std::atomic_uint32_t g_armed{0};
 std::atomic_uint32_t g_identity{0};
@@ -163,9 +164,10 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
   builder.use(resource::GxDepth, Access::Sampled,
               UseOptions{.missing = Missing::DisablePass, .sampleType = wgpu::TextureSampleType::UnfilterableFloat});
   builder.use(resource::AoFinal, Access::Sampled, Missing::BindDummyWhite);
-  builder.use_buffer(clusters::List, Access::StorageRead, Missing::DisablePass);
+  // Every lane reads the same light at once, which the constant cache serves far faster than a storage load
+  builder.use_buffer(clusters::List, Access::Uniform, Missing::DisablePass);
   builder.use_buffer(clusters::Grid, Access::StorageRead, Missing::DisablePass);
-  builder.import_persistent(openpbr::Classes, openpbr::classes_handle(), Access::StorageRead);
+  builder.import_persistent(openpbr::Classes, openpbr::classes_handle(), Access::Uniform);
   builder.import_persistent_texture(openpbr::Lut3d, openpbr::lut3d_handle(), openpbr::lut3d_desc(), Access::Sampled);
   builder.import_persistent_texture(openpbr::Lut2d, openpbr::lut2d_handle(), openpbr::lut2d_desc(), Access::Sampled);
   builder.create(resource::SceneHdr,
@@ -183,11 +185,13 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
 }
 
 void request_pipelines(const PipelineSetup& setup, const void*, std::span<uint32_t, MaxPassPipelines> ids) {
+  const bool walk = g_forceSubgroupWalk.value_or(subgroup_walk(shaders::implicit_defines()));
+  const std::span<const std::string_view> defines{WalkDefines};
   ids[LayeredPipeline] = shaders::request_compute({
                                                       .label = "light.deferred",
                                                       .shader = Shader,
                                                       .entryPoint = "shade",
-                                                      .defines = LayeredDefines,
+                                                      .defines = walk ? defines : defines.subspan(1),
                                                       .layout = setup.layout,
                                                       .layoutKey = setup.layoutHash,
                                                   })
@@ -197,6 +201,7 @@ void request_pipelines(const PipelineSetup& setup, const void*, std::span<uint32
                                                    .label = "light.deferred base",
                                                    .shader = Shader,
                                                    .entryPoint = "shade",
+                                                   .defines = defines.first(walk ? 1 : 0),
                                                    .layout = setup.layout,
                                                    .layoutKey = setup.layoutHash,
                                                })
@@ -313,6 +318,10 @@ bool needs_layered(const std::vector<std::array<uint32_t, 4>>* table, const std:
   });
 }
 
+bool subgroup_walk(std::span<const std::string_view> implicitDefines) noexcept {
+  return std::ranges::find(implicitDefines, std::string_view{"AURORA_SUBGROUPS"}) != implicitDefines.end();
+}
+
 PassDesc pass_desc() {
   return {
       .name = std::string{Pass},
@@ -389,6 +398,7 @@ void reset() noexcept {
   g_modeOverride.reset();
   g_forceEnabled.reset();
   g_forceLayered.reset();
+  g_forceSubgroupWalk.reset();
   lighting::testing::set_ready_override(std::nullopt);
   for (std::atomic_uint32_t* counter :
        {&g_ran, &g_armed, &g_identity, &g_noLights, &g_notResident, &g_pending, &g_base}) {
@@ -403,6 +413,8 @@ void set_mode(std::optional<Mode> mode) noexcept { g_modeOverride = mode; }
 void force_enabled(std::optional<bool> enabled) noexcept { g_forceEnabled = enabled; }
 
 void force_layered(std::optional<bool> layered) noexcept { g_forceLayered = layered; }
+
+void force_subgroup_walk(std::optional<bool> walk) noexcept { g_forceSubgroupWalk = walk; }
 
 double attenuation(const clusters::GpuLight& light, double distance) noexcept {
   const double r = light.v0[3];

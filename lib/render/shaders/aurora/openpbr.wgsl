@@ -41,6 +41,7 @@ struct OpenPbrPrepared {
   v: vec3f,
   mu_v: f32,
   alpha: f32,
+  g1_v: f32,
   alpha_index: f32,
   eta: f32,
   ior_index: f32,
@@ -253,6 +254,7 @@ fn openpbr_prepare(s: OpenPbrSurface, cls: ClassParams, n: vec3f, v: vec3f, lut3
   p.mu_v = max(dot(n, v), OPENPBR_MIN_MU_V);
   let roughness = clamp(s.roughness, OPENPBR_MIN_ROUGHNESS, 1.0);
   p.alpha = roughness * roughness;
+  p.g1_v = openpbr_smith_g1(p.mu_v, p.alpha);
   let spec_colour = cls.specular.rgb;
   let spec_weight = cls.specular.w;
   let sss_weight = cls.subsurface.w;
@@ -363,9 +365,13 @@ fn openpbr_eval_light(p: OpenPbrPrepared, l: vec3f, specular: bool, lut3d: textu
   let nh = max(dot(p.n, h), 0.0);
   let vh = max(dot(p.v, h), 0.0);
   if (specular && nl > 0.0) {
-    let k = openpbr_ggx_d(nh, p.alpha) * openpbr_smith_g1(p.mu_v, p.alpha) * openpbr_smith_g1(nl, p.alpha) *
-            OPENPBR_PI / (4.0 * p.mu_v);
-    out += (p.spec_tint * openpbr_fresnel(p.eta, vh) + openpbr_f82(p.metal_f0, p.metal_tint, vh) * p.metal_weight) * k;
+    let k = openpbr_ggx_d(nh, p.alpha) * p.g1_v * openpbr_smith_g1(nl, p.alpha) * OPENPBR_PI / (4.0 * p.mu_v);
+    var lobes = p.spec_tint * openpbr_fresnel(p.eta, vh);
+    // IEEE-strict compiles must keep f82 * 0, so dielectrics skip the metal term; adding +0 left the sum unchanged
+    if (p.metal_weight > 0.0) {
+      lobes += openpbr_f82(p.metal_f0, p.metal_tint, vh) * p.metal_weight;
+    }
+    out += lobes * k;
     if (p.metal_weight > 0.0 && p.alpha >= OPENPBR_MIN_ALPHA_ENERGY_LOSS) {
       let ecm_l = openpbr_lut2d(lut2d, smp, nl * OPENPBR_TABLE_MAX, p.alpha_index, OPENPBR_LAYER_METAL).r;
       out += p.metal_ms * (min(p.ecm_v * ecm_l / p.ecm_avg, 1.0 / nl) * nl);

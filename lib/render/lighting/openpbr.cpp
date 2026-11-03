@@ -440,7 +440,7 @@ void initialize() {
   g_lut2d = device.CreateTexture(&layers);
   const wgpu::BufferDescriptor buffer{
       .label = "light.classes",
-      .usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+      .usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst,
       .size = ClassBytes,
   };
   g_classBuffer = device.CreateBuffer(&buffer);
