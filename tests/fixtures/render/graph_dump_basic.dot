@@ -1,5 +1,5 @@
 digraph render_graph {
-  label="0xb1243e7db832f305";
+  label="0x1af829e885f9d9ef";
   rankdir=LR;
   node [shape=box];
   subgraph cluster_0 {
@@ -65,6 +65,7 @@ digraph render_graph {
   n2 -> n19 [label="Waw gbuf.motion"];
   n2 -> n19 [label="Waw gbuf.reactive"];
   n2 -> n19 [label="Waw gbuf.surface"];
+  n2 -> n19 [label="Waw gbuf.surface_ext"];
   n2 -> n19 [label="Waw gx.depth"];
   n2 -> n19 [label="Waw gx.normal"];
   n3 -> n4;

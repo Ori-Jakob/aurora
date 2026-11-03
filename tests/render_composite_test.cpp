@@ -995,7 +995,7 @@ TEST_F(CompositeGraph, PbrReadyNeedsTheTierWhileTheCompositeIsReady) {
 TEST_F(CompositeGraph, SurfaceContractMismatchRefuses) {
   ASSERT_TRUE(use_pbr_tier());
   m_envEdit = [](GraphEnvironment& env) {
-    env.gxFormats[static_cast<size_t>(GxResource::Surface)] = wgpu::TextureFormat::RGBA16Uint;
+    env.gxFormats[static_cast<size_t>(GxResource::Surface)] = wgpu::TextureFormat::RGBA32Uint;
   };
   const auto graph = live_graph(pbr_settings(0.f));
   ASSERT_EQ(graph->nodes[graph->find_node(composite::Pass)].status, CullReason::None);
@@ -1015,7 +1015,7 @@ TEST_F(CompositeGraph, SurfaceFollowsSceneExtent) {
   m_sceneSize = GraphExtent{48, 40};
   const auto graph = compile(pbr_settings(0.f));
   const CompiledResource& surface = graph->resources[graph->find_resource(resource::Surface)];
-  EXPECT_EQ(surface.tex.format, wgpu::TextureFormat::RGBA32Uint);
+  EXPECT_EQ(surface.tex.format, wgpu::TextureFormat::RGBA16Uint);
   EXPECT_EQ(surface.extent.width, 48u);
   EXPECT_EQ(surface.extent.height, 40u);
   EXPECT_TRUE(composite::surface_bound(*graph));

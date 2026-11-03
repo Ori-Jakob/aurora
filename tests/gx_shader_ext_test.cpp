@@ -190,11 +190,20 @@ TEST_F(GxShaderExtTest, PersistedVersionTagsExtRows) {
   EXPECT_EQ(persisted_version(render_ext::legacy_config(config)), GXExtRowVersion);
 }
 
+gfx::SceneLayoutBase layout_base() {
+  return {.color = wgpu::TextureFormat::BGRA8Unorm, .depth = wgpu::TextureFormat::Depth32Float, .size = {64, 64, 1}};
+}
+
 TEST_F(GxShaderExtTest, FallbackConfigClearsOutputAndVelocity) {
+  const gfx::RenderTargetLayout base = gfx::compose_scene_layout({.gbuffer = true}, layout_base());
+  const gfx::RenderTargetLayout pbr = gfx::compose_scene_layout({.gbuffer = true, .surface = true}, layout_base());
   PipelineConfig config{};
-  config.shaderConfig.ext = {.output = 2, .velocity = 1, .pom = 1, .stochasticMask = 0b11, .layer0 = 1, .layer1 = 2};
-  EXPECT_TRUE(render_ext::fallback_config(config).shaderConfig.ext == RenderExtConfig{});
-  EXPECT_EQ(persisted_version(render_ext::fallback_config(config)), 14u);
+  config.shaderConfig.ext = {
+      .output = 2, .velocity = 1, .pom = 1, .surfaceExt = 1, .stochasticMask = 0b11, .layer0 = 1, .layer1 = 2};
+  EXPECT_TRUE(render_ext::fallback_config(config, base).shaderConfig.ext == RenderExtConfig{});
+  EXPECT_EQ(persisted_version(render_ext::fallback_config(config, base)), 14u);
+  EXPECT_TRUE(render_ext::fallback_config(config, pbr).shaderConfig.ext == RenderExtConfig{.surfaceReset = 1});
+  EXPECT_EQ(persisted_version(render_ext::fallback_config(config, pbr)), GXExtRowVersion);
   const RenderExtConfig legacy = render_ext::legacy_config(config).shaderConfig.ext;
   EXPECT_EQ(legacy.output, 2u);
   EXPECT_EQ(legacy.velocity, 1u);
@@ -202,21 +211,54 @@ TEST_F(GxShaderExtTest, FallbackConfigClearsOutputAndVelocity) {
   for (const RenderExtConfig ext : {RenderExtConfig{}, RenderExtConfig{.stochasticMask = 0b101},
                                     RenderExtConfig{.pom = 1, .layer0 = 3, .layer1 = 4}}) {
     config.shaderConfig.ext = ext;
-    const PipelineConfig fallback = render_ext::fallback_config(config);
-    const PipelineConfig expected = render_ext::legacy_config(config);
-    EXPECT_EQ(std::memcmp(&fallback, &expected, sizeof(PipelineConfig)), 0);
+    for (const gfx::RenderTargetLayout& layout : {base, pbr}) {
+      const PipelineConfig fallback = render_ext::fallback_config(config, layout);
+      const PipelineConfig expected = render_ext::legacy_config(config);
+      EXPECT_EQ(std::memcmp(&fallback, &expected, sizeof(PipelineConfig)), 0);
+    }
   }
 }
 
 TEST_F(GxShaderExtTest, FallbackConfigClearsFwdEnv) {
+  const gfx::RenderTargetLayout base = gfx::compose_scene_layout({.gbuffer = true}, layout_base());
+  const gfx::RenderTargetLayout pbr = gfx::compose_scene_layout({.gbuffer = true, .surface = true}, layout_base());
   PipelineConfig config{};
   config.shaderConfig.ext = {.output = 1, .fwdEnv = 1};
-  EXPECT_TRUE(render_ext::fallback_config(config).shaderConfig.ext == RenderExtConfig{});
-  EXPECT_EQ(persisted_version(render_ext::fallback_config(config)), 14u);
+  EXPECT_TRUE(render_ext::fallback_config(config, base).shaderConfig.ext == RenderExtConfig{});
+  EXPECT_EQ(persisted_version(render_ext::fallback_config(config, base)), 14u);
+  EXPECT_TRUE(render_ext::fallback_config(config, pbr).shaderConfig.ext == RenderExtConfig{.surfaceReset = 1});
   EXPECT_EQ(render_ext::legacy_config(config).shaderConfig.ext.fwdEnv, 1u);
   config.shaderConfig.ext = {.fwdEnv = 1};
   EXPECT_EQ(persisted_version(config), GXExtRowVersion);
-  EXPECT_EQ(persisted_version(render_ext::fallback_config(config)), 14u);
+  EXPECT_EQ(persisted_version(render_ext::fallback_config(config, pbr)), 14u);
+}
+
+TEST_F(GxShaderExtTest, StandInsDropTheExtKey) {
+  const gfx::RenderTargetLayout pbr = gfx::compose_scene_layout({.gbuffer = true, .surface = true}, layout_base());
+  PipelineConfig config{};
+  config.shaderConfig.ext = {.output = 2, .surfaceExt = 1};
+  EXPECT_TRUE(render_ext::output1_config(config).shaderConfig.ext == RenderExtConfig{.output = 1});
+  EXPECT_TRUE(render_ext::fallback_config(config, pbr).shaderConfig.ext == RenderExtConfig{.surfaceReset = 1});
+  const ShaderInfo info{};
+  for (const RenderExtConfig ext : {RenderExtConfig{.output = 1, .surfaceExt = 1}, RenderExtConfig{.surfaceReset = 1},
+                                    RenderExtConfig{.output = 2, .surfaceReset = 1}}) {
+    const RenderExtConfig normalized = render_ext::normalize(ext, info);
+    EXPECT_EQ(normalized.surfaceReset, 0u);
+    EXPECT_EQ(normalized.surfaceExt, 0u);
+  }
+  EXPECT_EQ(render_ext::normalize(RenderExtConfig{.output = 2, .surfaceExt = 1}, info).surfaceExt, 1u);
+}
+
+TEST_F(GxShaderExtTest, SurfaceBitsNeedTheSurfaceLayout) {
+  const gfx::RenderTargetLayout base = gfx::compose_scene_layout({.gbuffer = true}, layout_base());
+  const gfx::RenderTargetLayout pbr = gfx::compose_scene_layout({.gbuffer = true, .surface = true}, layout_base());
+  const gfx::RenderTargetLayout legacy = gfx::compose_scene_layout({}, layout_base());
+  for (const RenderExtConfig ext :
+       {RenderExtConfig{.surfaceReset = 1}, RenderExtConfig{.output = 2, .surfaceExt = 1}}) {
+    EXPECT_FALSE(render_ext::output_admitted(ext, legacy));
+    EXPECT_FALSE(render_ext::output_admitted(ext, base));
+    EXPECT_TRUE(render_ext::output_admitted(ext, pbr));
+  }
 }
 
 TEST_F(GxShaderExtTest, NormalizeKeepsOnlyEligibleStochastic) {
@@ -1084,9 +1126,10 @@ TEST_F(GxShaderExtTest, FwdEnvPredicateMatchesText) {
     }
   }
 }
-constexpr ShaderTargets PbrTargets{.motion = 2, .reactive = 3, .gbufferNormal = 1, .fog = 4, .surface = 5};
+constexpr ShaderTargets PbrTargets{
+    .motion = 2, .reactive = 3, .gbufferNormal = 1, .fog = 4, .surface = 5, .surfaceExt = 6};
 constexpr ShaderTargets PbrIdTargets{
-    .debugId = 6, .motion = 2, .reactive = 3, .gbufferNormal = 1, .fog = 4, .surface = 5};
+    .debugId = 7, .motion = 2, .reactive = 3, .gbufferNormal = 1, .fog = 4, .surface = 5, .surfaceExt = 6};
 constexpr std::string_view UnlitBlock =
     "// Unlit TEV (SP1 rules v1): no fog, lit alpha kept, only unlit_rgb leaves the block";
 constexpr std::string_view SurfaceZero = "out.surface = vec4u(0u);";
@@ -1316,6 +1359,50 @@ TEST_F(GxShaderExtTest, SurfaceWrittenAsLayoutProperty) {
       EXPECT_EQ(text, build_shader_source(marker, DstAlphaMode::None, targets));
     }
   }
+}
+
+TEST_F(GxShaderExtTest, OutOfWindowDrawsLeaveSurface) {
+  const gfx::RenderTargetLayout pbr = gfx::compose_scene_layout({.gbuffer = true, .surface = true}, layout_base());
+  const ShaderTargets targets = shader_targets(pbr);
+  ASSERT_EQ(targets.surface, PbrTargets.surface);
+  ASSERT_EQ(targets.surfaceExt, PbrTargets.surfaceExt);
+  PipelineConfig base{};
+  base.depthCompare = true;
+  base.depthUpdate = true;
+  base.colorUpdate = true;
+  base.blendMode = GX_BM_NONE;
+  const PipelineOptions options{.colorUpdate = true, .depthUpdate = true};
+  const auto masks = [&](const ShaderConfig& shader) {
+    PipelineConfig config = base;
+    config.shaderConfig = shader;
+    const auto states = color_target_states(config, pbr, options);
+    return std::pair{states[targets.surface].writeMask, states[targets.surfaceExt].writeMask};
+  };
+  using wgpu::ColorWriteMask;
+  ShaderConfig reset = modulate(0);
+  reset.ext.surfaceReset = 1;
+  EXPECT_EQ(masks(modulate(0)), std::pair(ColorWriteMask::None, ColorWriteMask::None));
+  EXPECT_EQ(masks(reset), std::pair(ColorWriteMask::All, ColorWriteMask::None));
+  EXPECT_EQ(masks(modulate(1)), std::pair(ColorWriteMask::All, ColorWriteMask::None));
+  EXPECT_EQ(masks(modulate()), std::pair(ColorWriteMask::All, ColorWriteMask::None));
+  ShaderConfig keyed = modulate();
+  keyed.ext.surfaceExt = 1;
+  EXPECT_EQ(masks(keyed), std::pair(ColorWriteMask::All, ColorWriteMask::All));
+  base.depthCompare = false;
+  base.blendMode = GX_BM_BLEND;
+  base.blendFacSrc = GX_BL_SRCALPHA;
+  base.blendFacDst = GX_BL_INVSRCALPHA;
+  EXPECT_EQ(masks(keyed), std::pair(ColorWriteMask::None, ColorWriteMask::None));
+
+  // The stand-in's text is ext 0's, so only its write mask differs
+  EXPECT_EQ(build_shader_source(reset, DstAlphaMode::None, PbrTargets),
+            build_shader_source(modulate(0), DstAlphaMode::None, PbrTargets));
+  const std::string keyedText = build_shader_source(keyed, DstAlphaMode::None, PbrTargets);
+  EXPECT_NE(fragment_output(keyedText).find("@location(6) surface_ext: vec4u,"), std::string::npos);
+  EXPECT_EQ(count(keyedText, "out.surface_ext = gx_surface_ext_pack("), 1u);
+  EXPECT_EQ(build_shader_source(modulate(), DstAlphaMode::None, PbrTargets).find("out.surface_ext"), std::string::npos);
+  EXPECT_NE(keyedText.find("let uslot = (gx_record_word(1u) >> 16u) & 4095u;"), std::string::npos);
+  EXPECT_EQ(keyedText.find("let uflags"), std::string::npos);
 }
 
 TEST_F(GxShaderExtTest, SurfaceHashOnlyWhenTargetPresent) {
@@ -1566,7 +1653,8 @@ TEST_F(GxShaderExtTest, CompanionPredicateLeavesTwinAndFallbackLegacy) {
   const PipelineConfig twin = render_ext::output1_config(pipeline);
   EXPECT_EQ(twin.shaderConfig.ext.layer0, 0u);
   EXPECT_FALSE(uses_companions(twin.shaderConfig, build_shader_info(twin.shaderConfig), PbrTargets));
-  const PipelineConfig fallback = render_ext::fallback_config(pipeline);
+  const PipelineConfig fallback = render_ext::fallback_config(
+      pipeline, gfx::compose_scene_layout({.gbuffer = true, .surface = true}, layout_base()));
   EXPECT_EQ(fallback.shaderConfig.ext.layer0, 0u);
   EXPECT_FALSE(uses_companions(fallback.shaderConfig, build_shader_info(fallback.shaderConfig), PbrTargets));
 }

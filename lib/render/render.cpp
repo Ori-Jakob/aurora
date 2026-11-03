@@ -11,11 +11,13 @@
 #include "shaders.hpp"
 #include "ao/ao.hpp"
 #include "debug/debug.hpp"
+#include "debug/surface_expand.hpp"
 #include "debug/views.hpp"
 #include "geometry/compact.hpp"
 #include "geometry/hzb.hpp"
 #include "gx_ext/ext_provider.hpp"
 #include "gx_ext/fwd_env.hpp"
+#include "gx_ext/surface_table.hpp"
 #include "material/gx_lookup.hpp"
 #include "native/native.hpp"
 #include "post/composite.hpp"
@@ -103,6 +105,8 @@ void initialize() {
   ao::initialize();
   composite::initialize();
   gx_ext::fwd_env::initialize();
+  gx_ext::surface_table::initialize();
+  debug::surface_expand::initialize();
   upscale::initialize();
   systems::initialize();
   debug::initialize();
@@ -126,6 +130,8 @@ void shutdown() noexcept {
   material::remove_gx_lookup();
   clear_after_frame_callbacks();
   remove_hints();
+  debug::surface_expand::shutdown();
+  gx_ext::surface_table::unregister_passes();
   gx_ext::fwd_env::shutdown();
   gx_ext::shutdown();
   scene::motion::shutdown();

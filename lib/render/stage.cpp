@@ -11,6 +11,7 @@
 
 #if AURORA_ENABLE_RENDER
 #include "debug/debug.hpp"
+#include "gx_ext/surface_table.hpp"
 #include "hints.hpp"
 #include "history_reset.hpp"
 #include "shaders.hpp"
@@ -96,6 +97,9 @@ bool build_stage_data(StageData& stage) {
   stage.passCount = passCount;
 #if AURORA_ENABLE_RENDER
   stage.sceneHints = scene_hints();
+  if (stage.stage == Stage::OpaqueDone) {
+    stage.surfaceTable = gx_ext::surface_table::snapshot();
+  }
   // Frames without a scene camera (logos, loads) legitimately send no scene markers
   const bool sceneFrame = stage.sceneHints->has(SceneHasMainCamera);
 #else

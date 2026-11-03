@@ -173,9 +173,9 @@ TEST_F(RenderViews, GbufViewTableFollowsClassRange) {
       continue;
     }
     EXPECT_TRUE(targetModes.insert(view.mode).second) << view.name;
-    EXPECT_EQ(view.uintSource, view.resource == "gbuf.fog" || view.resource == "gbuf.surface") << view.name;
+    EXPECT_EQ(view.uintSource, view.resource == "gbuf.fog" || view.resource == resource::SurfaceV1) << view.name;
     const bool gx = view.resource.starts_with("gbuf.") || view.resource.starts_with("gx.");
-    EXPECT_EQ(gx, view.id <= 22 || view.id >= 30) << view.name;
+    EXPECT_EQ(gx, view.id <= 22) << view.name;
     EXPECT_EQ(gx, detail::find_gx_resource(view.resource).has_value()) << view.name;
     if (gx && view.id <= 22) {
       EXPECT_EQ(view.mode, static_cast<uint32_t>(view.id - FirstGbufView));
@@ -266,7 +266,7 @@ TEST_F(RenderViews, SurfaceRowsAppendFrom30) {
     ASSERT_NE(view, nullptr) << row.id;
     EXPECT_EQ(view->name, row.name);
     EXPECT_EQ(view->label, row.label) << row.name;
-    EXPECT_EQ(view->resource, "gbuf.surface") << row.name;
+    EXPECT_EQ(view->resource, resource::SurfaceV1) << row.name;
     EXPECT_EQ(view->anchor, "phase.composite") << row.name;
     EXPECT_EQ(view->stage, Stage::OpaqueDone) << row.name;
     EXPECT_EQ(view->kind, GbufViewKind::Target) << row.name;

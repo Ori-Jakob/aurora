@@ -42,7 +42,7 @@ fn surface_class_color(id: u32) -> vec3f {
 }
 
 fn surface_view_color(uv: vec2f) -> vec3f {
-  let s = gbuf_surface_decode(gbuf_surface_fetch(view_source, view_texel_uv(textureDimensions(view_source), uv)));
+  let s = gbuf_surface_v1_decode(gbuf_surface_fetch(view_source, view_texel_uv(textureDimensions(view_source), uv)));
   switch VIEW_MODE {
     case 10u: {
       return select(s.albedo, VIEW_GREY, s.class_id == GBUF_SURFACE_CLASS_NONE);

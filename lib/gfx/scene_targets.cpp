@@ -95,13 +95,14 @@ RenderTargetLayout compose_scene_layout(const SceneTargetFlags& flags, const Sce
     append_target(layout, ColorAttachmentSemantic::Normal, webgpu::NormalBufferFormat, base.size);
   }
   if (gbuffer) {
-    // Fixed order keeps the WebGPU byte cost at 8, 16, 20, 21, 25, and 44 with Surface
+    // Fixed order keeps the WebGPU byte cost at 8, 16, 20, 21, 25, and 42 with Surface
     append_target(layout, ColorAttachmentSemantic::Motion, webgpu::MotionBufferFormat, base.size);
     append_target(layout, ColorAttachmentSemantic::Reactive, webgpu::ReactiveBufferFormat, base.size);
     append_target(layout, ColorAttachmentSemantic::Fog, webgpu::FogRecordFormat, base.size);
   }
   if (flags.surface) {
     append_target(layout, ColorAttachmentSemantic::Surface, webgpu::SurfaceBufferFormat, base.size);
+    append_target(layout, ColorAttachmentSemantic::SurfaceExt, webgpu::SurfaceExtBufferFormat, base.size);
   }
   // Last, so later targets go before it and the base layout stays a prefix
   if (flags.debugId) {
@@ -326,8 +327,9 @@ void warm_scene_variant(const gx::PipelineConfig& config) {
   g_warmSet.seen.insert(key);
   WarmPair pair{.variant = warm_pipeline(config, warm->pending)};
   // The output-1 twin clears the surface class, so it is the better stand-in and costs no extra compile
-  const gx::PipelineConfig fallback = config.shaderConfig.ext.output == 2 ? gx::render_ext::output1_config(config)
-                                                                          : gx::render_ext::fallback_config(config);
+  const gx::PipelineConfig fallback = config.shaderConfig.ext.output == 2
+                                          ? gx::render_ext::output1_config(config)
+                                          : gx::render_ext::fallback_config(config, warm->pending);
   if (std::memcmp(&fallback, &config, sizeof(config)) != 0) {
     pair.fallback = warm_pipeline(fallback, warm->pending);
   }

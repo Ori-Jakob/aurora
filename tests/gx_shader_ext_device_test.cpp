@@ -786,7 +786,7 @@ TEST_F(GxShaderExtDevice, FwdEnvPipelinesValidate) {
     }
     clamped += tev_colour_clamped(config) ? 1 : 0;
     EXPECT_EQ(create_pipeline(variants[0], scene_layout()).group3, 0u);
-    EXPECT_EQ(create_pipeline(render_ext::fallback_config(variants[0]), layout).group3, 0u);
+    EXPECT_EQ(create_pipeline(render_ext::fallback_config(variants[0], layout), layout).group3, 0u);
   }
   EXPECT_GT(clamped, 0u);
   EXPECT_EQ(gbuffer_pipeline_failures(), failures);
@@ -1824,7 +1824,17 @@ TEST_F(GxShaderExtDevice, PbrLayoutPipelinesValidate) {
         EXPECT_TRUE(created([&] {
           return static_cast<bool>(create_pipeline(pipeline_for(with_output(configs[i], 1)), pbr).main);
         })) << i;
-        ++built;
+        ShaderConfig reset = configs[i];
+        reset.ext.surfaceReset = 1;
+        ShaderConfig keyed = with_output(configs[i], 2);
+        keyed.ext.surfaceExt = 1;
+        for (const ShaderConfig& config : {reset, keyed}) {
+          for (const gfx::RenderTargetLayout* layout : {&pbr, &ids}) {
+            EXPECT_TRUE(created([&] { return static_cast<bool>(create_pipeline(pipeline_for(config), *layout).main); }))
+                << i;
+          }
+        }
+        built += 5;
       }
     }
     build_clears(pbr);
@@ -1952,9 +1962,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
                       in_f32(i + 5u), in_words[i + 6u], in_words[i + 7u],
                       vec3f(in_f32(i + 8u), in_f32(i + 9u), in_f32(i + 10u)), in_words[i + 11u],
                       vec3f(in_f32(i + 12u), in_f32(i + 13u), in_f32(i + 14u)));
-  let p = gbuf_surface_pack(s);
+  let p = gbuf_surface_v1_pack(s);
   let rec = vec4u(in_words[i + 16u], in_words[i + 17u], in_words[i + 18u], in_words[i + 19u]);
-  let d = gbuf_surface_decode(rec);
+  let d = gbuf_surface_v1_decode(rec);
+  let hot = vec4u(rec.x & 0xffffu, rec.x >> 16u, rec.y & 0xffffu, rec.y >> 16u);
   out_words[i + 0u] = p.x;
   out_words[i + 1u] = p.y;
   out_words[i + 2u] = p.z;
@@ -1974,9 +1985,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   out_words[i + 16u] = bitcast<u32>(d.emissive.x);
   out_words[i + 17u] = bitcast<u32>(d.emissive.y);
   out_words[i + 18u] = bitcast<u32>(d.emissive.z);
-  let albedoSame = all(bitcast<vec3u>(gbuf_surface_albedo(rec)) == bitcast<vec3u>(d.albedo));
-  out_words[i + 19u] = select(0u, 1u, gbuf_surface_is_pbr(rec)) | select(0u, 2u, albedoSame) |
-                       (gbuf_surface_class(rec) << 8u);
+  let albedoSame = all(bitcast<vec3u>(gbuf_surface_albedo(hot)) == bitcast<vec3u>(d.albedo));
+  out_words[i + 19u] = select(0u, 1u, gbuf_surface_is_pbr(hot)) | select(0u, 2u, albedoSame) |
+                       (gbuf_surface_slot(hot) << 8u);
 }
 )";
   const std::vector<SurfaceCase> cases = surface_cases();
@@ -2014,7 +2025,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
                                            bits(d.roughness),   bits(d.metalness),   d.classId,          d.flags,
                                            bits(d.ambient[0]),  bits(d.ambient[1]),  bits(d.ambient[2]), d.category,
                                            bits(d.emissive[0]), bits(d.emissive[1]), bits(d.emissive[2])};
-    const uint32_t accessors = (d.classId != 0 ? 1u : 0u) | 2u | (uint32_t{d.classId} << 8);
+    const uint32_t slot = c.record[1] >> surface::SlotShift;
+    const uint32_t accessors = (slot != 0 ? 1u : 0u) | 2u | (slot << 8);
     const bool same = std::equal(decoded.begin(), decoded.end(), w + 4) && w[19] == accessors;
     if (!same && decodeMismatches++ < 8) {
       ADD_FAILURE() << "decode case " << i;
@@ -2117,55 +2129,184 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let rgb = vec3f(in_f32(i), in_f32(i + 1u), in_f32(i + 2u));
   let ambient = vec3f(in_f32(i + 8u), in_f32(i + 9u), in_f32(i + 10u));
   let emissive = vec3f(in_f32(i + 12u), in_f32(i + 13u), in_f32(i + 14u));
-  let g = gx_surface_pack(rgb, in_f32(i + 3u), in_f32(i + 4u), in_f32(i + 5u), in_words[i + 6u], in_words[i + 7u],
-                          ambient, in_words[i + 11u], emissive);
-  let r = gbuf_surface_pack(GbufSurface(rgb, in_f32(i + 3u), in_f32(i + 4u), in_f32(i + 5u), in_words[i + 6u],
-                                        in_words[i + 7u], ambient, in_words[i + 11u], emissive));
+  let g = gx_surface_pack(rgb, in_f32(i + 3u), in_f32(i + 4u), in_f32(i + 5u), in_words[i + 6u]);
+  let e = gx_surface_ext_pack(ambient, emissive);
+  let entry = vec4u(in_words[i + 15u] | (in_words[i + 7u] << 8u) | (in_words[i + 11u] << 16u) | 0x3000000u, 0u, 0u,
+                    0u);
+  let x = gbuf_surface_v1_expand(g, entry, e);
+  let r = gbuf_surface_v1_pack(GbufSurface(rgb, in_f32(i + 3u), in_f32(i + 4u), in_f32(i + 5u), in_words[i + 15u],
+                                           in_words[i + 7u], ambient, in_words[i + 11u], emissive));
   out_words[i + 0u] = g.x;
   out_words[i + 1u] = g.y;
   out_words[i + 2u] = g.z;
   out_words[i + 3u] = g.w;
-  out_words[i + 4u] = r.x;
-  out_words[i + 5u] = r.y;
-  out_words[i + 6u] = r.z;
-  out_words[i + 7u] = r.w;
+  out_words[i + 4u] = e.x;
+  out_words[i + 5u] = e.y;
+  out_words[i + 6u] = e.z;
+  out_words[i + 7u] = e.w;
+  out_words[i + 8u] = x.x;
+  out_words[i + 9u] = x.y;
+  out_words[i + 10u] = x.z;
+  out_words[i + 11u] = x.w;
+  out_words[i + 12u] = r.x;
+  out_words[i + 13u] = r.y;
+  out_words[i + 14u] = r.z;
+  out_words[i + 15u] = r.w;
 }
 )";
   const std::vector<SurfaceCase> cases = surface_cases();
   ASSERT_EQ(cases.size() % 64, 0u);
   const auto bits = [](float value) { return std::bit_cast<uint32_t>(value); };
+  const auto slot_of = [](size_t i) { return static_cast<uint32_t>((i * 2654435761u) >> 16); };
   std::vector<uint32_t> input;
-  for (const SurfaceCase& c : cases) {
-    const surface::Fields& f = c.fields;
+  for (size_t i = 0; i < cases.size(); ++i) {
+    const surface::Fields& f = cases[i].fields;
     const std::array<uint32_t, Fields> row{bits(f.albedo[0]),   bits(f.albedo[1]),   bits(f.albedo[2]),   bits(f.ao),
-                                           bits(f.roughness),   bits(f.metalness),   f.classId,           f.flags,
+                                           bits(f.roughness),   bits(f.metalness),   slot_of(i),          f.flags,
                                            bits(f.ambient[0]),  bits(f.ambient[1]),  bits(f.ambient[2]),  f.category,
-                                           bits(f.emissive[0]), bits(f.emissive[1]), bits(f.emissive[2]), 0u};
+                                           bits(f.emissive[0]), bits(f.emissive[1]), bits(f.emissive[2]), f.classId};
     input.insert(input.end(), row.begin(), row.end());
   }
   const auto out = run_word_compute(*m_device, text, static_cast<uint32_t>(cases.size()), Fields, input);
   ASSERT_TRUE(out.has_value());
   size_t mismatches = 0;
-  size_t copyMismatches = 0;
+  size_t expandMismatches = 0;
   for (size_t i = 0; i < cases.size(); ++i) {
     const uint32_t* w = &(*out)[i * Fields];
-    const std::array<uint32_t, 4> expected = surface::pack(cases[i].fields);
+    const surface::Words record = surface::pack_record(cases[i].fields, slot_of(i));
+    const surface::Words ext = surface::pack_ext(cases[i].fields);
+    const auto joined = [&](size_t k) {
+      return surface::join({static_cast<uint16_t>(w[k]), static_cast<uint16_t>(w[k + 1]),
+                            static_cast<uint16_t>(w[k + 2]), static_cast<uint16_t>(w[k + 3])});
+    };
+    const bool channels = std::all_of(w, w + 8, [](uint32_t c) { return c <= 0xFFFFu; });
+    const surface::Words g = joined(0);
+    const surface::Words e = joined(4);
     const bool tie = cases[i].tieTolerant;
-    const bool packed = unorm_bytes_match(w[0], expected[0], 0xF, tie) &&
-                        unorm_bytes_match(w[1], expected[1], 0x3, tie) &&
-                        unorm_bytes_match(w[2], expected[2], 0x7, tie) && w[3] == expected[3];
+    const bool packed = channels && unorm_bytes_match(g[0], record[0], 0xF, tie) &&
+                        unorm_bytes_match(g[1], record[1], 0x3, tie) && unorm_bytes_match(e[0], ext[0], 0x7, tie) &&
+                        e[1] == ext[1];
     if (!packed && mismatches++ < 8) {
-      ADD_FAILURE() << "generator pack case " << i << std::hex << ": " << w[0] << " " << w[1] << " " << w[2] << " "
-                    << w[3] << " expected " << expected[0] << " " << expected[1] << " " << expected[2] << " "
-                    << expected[3];
+      ADD_FAILURE() << "generator pack case " << i << std::hex << ": " << g[0] << " " << g[1] << " " << e[0] << " "
+                    << e[1] << " expected " << record[0] << " " << record[1] << " " << ext[0] << " " << ext[1];
     }
-    if (!std::equal(w, w + 4, w + 4) && copyMismatches++ < 8) {
-      ADD_FAILURE() << "generator and library differ at case " << i;
+    if (!std::equal(w + 8, w + 12, w + 12) && expandMismatches++ < 8) {
+      ADD_FAILURE() << "expanded generator words and library v1 words differ at case " << i;
     }
   }
   EXPECT_EQ(mismatches, 0u);
-  EXPECT_EQ(copyMismatches, 0u);
+  EXPECT_EQ(expandMismatches, 0u);
   RecordProperty("cases", static_cast<int>(cases.size()));
+}
+
+TEST_F(GxShaderExtDevice, SurfaceV2DecodeMatchesMirror) {
+  const auto backend = hardware_backend();
+  if (!backend) {
+    GTEST_SKIP() << "AURORA_TEST_BACKEND names no hardware backend";
+  }
+  if (!start({.backend = *backend, .core = true, .allowCpu = false}, false)) {
+    GTEST_SKIP() << "no adapter";
+  }
+  const std::string_view library = render_library("aurora/surface");
+  ASSERT_FALSE(library.empty());
+  constexpr uint32_t Fields = 20;
+  const std::string text = std::string{library} + R"(
+@group(0) @binding(0) var<storage, read_write> out_words: array<u32>;
+@group(0) @binding(1) var<storage, read> in_words: array<u32>;
+
+fn in_vec(i: u32) -> vec4u {
+  return vec4u(in_words[i], in_words[i + 1u], in_words[i + 2u], in_words[i + 3u]);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  let i = id.x * 20u;
+  let rec = in_vec(i);
+  let entry = in_vec(i + 4u);
+  let ext = in_vec(i + 8u);
+  let d = gbuf_surface_decode(rec, entry, ext);
+  let x = gbuf_surface_v1_expand(rec, entry, ext);
+  out_words[i + 0u] = bitcast<u32>(d.albedo.x);
+  out_words[i + 1u] = bitcast<u32>(d.albedo.y);
+  out_words[i + 2u] = bitcast<u32>(d.albedo.z);
+  out_words[i + 3u] = bitcast<u32>(d.ao);
+  out_words[i + 4u] = bitcast<u32>(d.roughness);
+  out_words[i + 5u] = bitcast<u32>(d.metalness);
+  out_words[i + 6u] = d.class_id;
+  out_words[i + 7u] = d.flags;
+  out_words[i + 8u] = bitcast<u32>(d.ambient.x);
+  out_words[i + 9u] = bitcast<u32>(d.ambient.y);
+  out_words[i + 10u] = bitcast<u32>(d.ambient.z);
+  out_words[i + 11u] = d.category;
+  out_words[i + 12u] = bitcast<u32>(d.emissive.x);
+  out_words[i + 13u] = bitcast<u32>(d.emissive.y);
+  out_words[i + 14u] = bitcast<u32>(d.emissive.z);
+  out_words[i + 15u] = x.x;
+  out_words[i + 16u] = x.y;
+  out_words[i + 17u] = x.z;
+  out_words[i + 18u] = x.w;
+  let accessors = vec3f(gbuf_surface_ao(rec), gbuf_surface_roughness(rec), gbuf_surface_metalness(rec));
+  out_words[i + 19u] = select(0u, 1u, all(accessors == vec3f(d.ao, d.roughness, d.metalness))) |
+                       select(0u, 2u, gbuf_surface_reads_ext(entry)) |
+                       (gbuf_surface_entry_index(gbuf_surface_slot(rec), 4096u) << 8u);
+}
+)";
+  std::mt19937 rng{0x7u};
+  std::uniform_int_distribution<uint32_t> word;
+  std::vector<uint32_t> input;
+  std::vector<std::array<surface::Words, 2>> hot;
+  std::vector<surface::Entry> entries;
+  constexpr uint32_t Cases = 4160;
+  for (uint32_t i = 0; i < Cases; ++i) {
+    const surface::Words rec{word(rng), word(rng)};
+    const surface::Words ext{word(rng), word(rng)};
+    const surface::Entry entry{word(rng), word(rng), word(rng), word(rng)};
+    const surface::Channels r = surface::split(rec);
+    const surface::Channels e = surface::split(ext);
+    const std::array<uint32_t, Fields> row{r[0], r[1], r[2], r[3], entry[0], entry[1], entry[2], entry[3], e[0], e[1],
+                                           e[2], e[3], 0,    0,    0,        0,        0,        0,        0,    0};
+    input.insert(input.end(), row.begin(), row.end());
+    hot.push_back({rec, ext});
+    entries.push_back(entry);
+  }
+  const auto out = run_word_compute(*m_device, text, Cases, Fields, input);
+  ASSERT_TRUE(out.has_value());
+  const auto bits = [](float value) { return std::bit_cast<uint32_t>(value); };
+  size_t mismatches = 0;
+  for (uint32_t i = 0; i < Cases; ++i) {
+    const uint32_t* w = &(*out)[i * Fields];
+    const surface::Words& rec = hot[i][0];
+    const surface::Words& ext = hot[i][1];
+    const surface::Fields d = surface::decode(rec, entries[i], ext);
+    const std::array<uint32_t, 4> v1 = surface::expand_v1(rec, entries[i], ext);
+    const uint32_t slot = surface::record_slot(rec);
+    const bool readsExt = (entries[i][0] & (surface::EntryExtAmbient | surface::EntryExtEmissive)) != 0;
+    const std::array<uint32_t, Fields> expected{bits(d.albedo[0]),
+                                                bits(d.albedo[1]),
+                                                bits(d.albedo[2]),
+                                                bits(d.ao),
+                                                bits(d.roughness),
+                                                bits(d.metalness),
+                                                d.classId,
+                                                d.flags,
+                                                bits(d.ambient[0]),
+                                                bits(d.ambient[1]),
+                                                bits(d.ambient[2]),
+                                                d.category,
+                                                bits(d.emissive[0]),
+                                                bits(d.emissive[1]),
+                                                bits(d.emissive[2]),
+                                                v1[0],
+                                                v1[1],
+                                                v1[2],
+                                                v1[3],
+                                                1u | (readsExt ? 2u : 0u) | ((slot < 4096 ? slot : 0u) << 8)};
+    if (!std::equal(expected.begin(), expected.end(), w) && mismatches++ < 8) {
+      ADD_FAILURE() << "v2 decode case " << i;
+    }
+  }
+  EXPECT_EQ(mismatches, 0u);
+  RecordProperty("cases", static_cast<int>(Cases));
 }
 
 TEST_F(GxShaderExtDevice, UnlitKeepsColourPath) {
@@ -2309,7 +2450,7 @@ TEST_F(GxShaderExtDevice, CompanionPipelinesValidate) {
         m_device->device.PushErrorScope(wgpu::ErrorFilter::Validation);
         const gfx::CompiledPipeline pipeline = create_pipeline(companion, layout);
         const gfx::CompiledPipeline twin = create_pipeline(render_ext::output1_config(companion), layout);
-        const gfx::CompiledPipeline fallback = create_pipeline(render_ext::fallback_config(companion), layout);
+        const gfx::CompiledPipeline fallback = create_pipeline(render_ext::fallback_config(companion, layout), layout);
         PipelineConfig prepass = companion;
         prepass.dstAlpha = 0x80;
         prepass.blendMode = GX_BM_BLEND;

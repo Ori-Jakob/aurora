@@ -783,7 +783,7 @@ static void probe_fallback(DrawCache& cache) noexcept {
       return;
     }
   }
-  cache.fallbackRef = gfx::ready_pipeline(render_ext::fallback_config(cache.config), layout);
+  cache.fallbackRef = gfx::ready_pipeline(render_ext::fallback_config(cache.config, layout), layout);
   cache.fallbackStandIn = PbrStandIn::Output0;
 }
 
@@ -807,7 +807,7 @@ static void fail_variant(DrawCache& cache, uint64_t epoch) noexcept {
       break;
     }
   }
-  cache.pipelineRef = gfx::pipeline_ref(render_ext::fallback_config(cache.config));
+  cache.pipelineRef = gfx::pipeline_ref(render_ext::fallback_config(cache.config, gfx::get_render_target_layout()));
   cache.pipelineStandIn = PbrStandIn::Output0;
 }
 

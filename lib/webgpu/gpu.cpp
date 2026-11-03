@@ -54,6 +54,7 @@ TextureWithSampler g_motionBuffer;
 TextureWithSampler g_reactiveBuffer;
 TextureWithSampler g_fogRecordBuffer;
 TextureWithSampler g_surfaceBuffer;
+TextureWithSampler g_surfaceExtBuffer;
 static TextureWithSampler g_sceneColor;
 static TextureWithSampler g_sceneDepth;
 static wgpu::Extent3D g_sceneRequest{0, 0, 1};
@@ -634,8 +635,9 @@ static void create_gbuffer_targets(uint32_t width, uint32_t height) {
   g_fogRecordBuffer = create_scene_target("Scene fog records", FogRecordFormat, width, height);
 }
 
-static TextureWithSampler create_surface_texture(uint32_t width, uint32_t height) {
-  return create_scene_target("Scene surfaces", SurfaceBufferFormat, width, height);
+static void create_surface_targets(uint32_t width, uint32_t height) {
+  g_surfaceBuffer = create_scene_target("Scene surfaces", SurfaceBufferFormat, width, height);
+  g_surfaceExtBuffer = create_scene_target("Scene surface extras", SurfaceExtBufferFormat, width, height);
 }
 
 bool scene_targets_supported() noexcept {
@@ -661,7 +663,7 @@ static void create_scene_size_targets() {
     create_gbuffer_targets(scene.width, scene.height);
   }
   if (g_graphicsConfig.surfaceBuffer) {
-    g_surfaceBuffer = create_surface_texture(scene.width, scene.height);
+    create_surface_targets(scene.width, scene.height);
   }
   if (g_graphicsConfig.debugIdBuffer) {
     g_debugIdBuffer = create_debug_id_texture(scene.width, scene.height);
@@ -755,7 +757,12 @@ bool set_scene_tier(SceneTier tier) {
       g_normalBuffer = {};
     }
   }
-  g_surfaceBuffer = tier == SceneTier::Pbr ? create_surface_texture(scene.width, scene.height) : TextureWithSampler{};
+  if (tier == SceneTier::Pbr) {
+    create_surface_targets(scene.width, scene.height);
+  } else {
+    g_surfaceBuffer = {};
+    g_surfaceExtBuffer = {};
+  }
   g_graphicsConfig.gbuffer = tier != SceneTier::Legacy;
   g_graphicsConfig.surfaceBuffer = tier == SceneTier::Pbr;
   return true;
@@ -1426,6 +1433,7 @@ void shutdown() {
   g_fogRecordBuffer = {};
   g_graphicsConfig.gbuffer = false;
   g_surfaceBuffer = {};
+  g_surfaceExtBuffer = {};
   g_graphicsConfig.surfaceBuffer = false;
   g_queue = {};
   g_surface = {};

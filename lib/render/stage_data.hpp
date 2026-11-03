@@ -41,6 +41,8 @@ struct StageData {
   StageBindings bindings;
   std::shared_ptr<const SceneDepth> sceneDepth;
   std::shared_ptr<const SceneHints> sceneHints;
+  // Taken at OpaqueDone, when every output-2 draw of the frame has its slot
+  std::shared_ptr<const std::vector<std::array<uint32_t, 4>>> surfaceTable;
 
   [[nodiscard]] bool is_enabled(uint32_t index) const noexcept {
     return index < passCount && ((enabled[index / 64] >> (index % 64)) & 1u) != 0;

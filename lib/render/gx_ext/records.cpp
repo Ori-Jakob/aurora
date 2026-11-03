@@ -1,5 +1,6 @@
 #include "records.hpp"
 #include "fwd_env.hpp"
+#include "surface_table.hpp"
 #include "unlit.hpp"
 
 #include "../hints.hpp"
@@ -27,6 +28,7 @@ struct Counters {
   uint64_t pbrRecords = 0;
   uint64_t policyBlocks = 0;
   uint64_t blendedInWindow = 0;
+  uint64_t surfaceSlots = 0;
   std::array<uint64_t, 4> codes{};
 };
 
@@ -70,7 +72,8 @@ bool pbr_eligible(const scene::DrawClass& cls) noexcept {
 
 uint32_t draw_inputs(const scene::DrawClass& cls) noexcept {
   return (in_window(cls) ? InWindow : 0u) | (in_forward_window(cls) ? ForwardWindow : 0u) |
-         (pbr_eligible(cls) ? PbrEligible : 0u);
+         (pbr_eligible(cls) ? PbrEligible : 0u) |
+         ((cls.key.flags & scene::object_flag::BakedVertexLight) != 0 ? BakedVertex : 0u);
 }
 
 uint32_t policy_block(const scene::DrawClass& cls) noexcept {
@@ -150,6 +153,7 @@ void fold() noexcept {
   g_totals.pbrRecords += frame.pbrRecords;
   g_totals.policyBlocks += frame.policyBlocks;
   g_totals.blendedInWindow += frame.blendedInWindow;
+  g_totals.surfaceSlots += frame.surfaceSlots;
   for (size_t i = 0; i < frame.codes.size(); ++i) {
     g_totals.codes[i] += frame.codes[i];
   }
@@ -178,6 +182,7 @@ void apply_frame_state(const detail::FrameState&) noexcept {
   g_active = hints && (g_gbuffer || g_debugId);
   const gfx::LayoutWarm* warm = gfx::layout_warm();
   g_surface = hints && (gfx::layout_has_surface(layout) || (warm != nullptr && gfx::layout_has_surface(warm->pending)));
+  surface_table::begin_frame(g_active && g_surface);
   reset_frame();
 }
 
@@ -193,10 +198,13 @@ void shutdown() noexcept {
   fold();
   if (g_totals.records != 0) {
     const auto& codes = g_totals.codes;
-    Log.info("Render records: {} draws, {} reused, {} dropped over {} frames, codes {}/{}/{}/{}, screen AO {}",
-             g_totals.records, g_totals.reused, g_totals.dropped, g_totals.frames, codes[0], codes[1], codes[2],
-             codes[3], g_totals.screenAo);
+    Log.info(
+        "Render records: {} draws, {} reused, {} dropped over {} frames, codes {}/{}/{}/{}, screen AO {}, "
+        "surface slots {}",
+        g_totals.records, g_totals.reused, g_totals.dropped, g_totals.frames, codes[0], codes[1], codes[2], codes[3],
+        g_totals.screenAo, g_totals.surfaceSlots);
   }
+  surface_table::shutdown();
   g_active = false;
   g_gbuffer = false;
   g_debugId = false;
@@ -239,6 +247,12 @@ void stamp(gx::DrawData& draw, const gx::PipelineConfig& config, const gx::Shade
     record.flags |= unlit::vertex_policy(config, info, cls) << flag::VertexColorShift |
                     (unlit::unlit_flag(config, info, cls) ? flag::Unlit : 0u);
     record.tevPolicyOff = policy_block(cls);
+    // Only admitted text writes the record; any other output-2 pipeline writes slot 0
+    if (info.unlitAdmitted) {
+      const uint32_t slot = surface_table::slot_for(surface_entry(config, info, record.flags));
+      record.flags |= slot << flag::SurfaceSlotShift;
+      g_frame.surfaceSlots += slot != 0 ? 1 : 0;
+    }
     ++g_frame.pbrRecords;
   }
   if (!g_debugId && g_lastLoc != 0 && std::memcmp(&record, &g_last, sizeof(DrawRecord)) == 0) {
@@ -257,6 +271,20 @@ void stamp(gx::DrawData& draw, const gx::PipelineConfig& config, const gx::Shade
   draw.immediateData._pad = loc;
   ++g_frame.records;
   count_code(g_frame, record);
+}
+
+gx::surface::Entry surface_entry(const gx::PipelineConfig& config, const gx::ShaderInfo& info,
+                                 uint32_t recordFlags) noexcept {
+  namespace surface = gx::surface;
+  const uint32_t code = (recordFlags & flag::ReceiverMask) >> flag::ReceiverShift;
+  const bool passthrough = static_cast<gx::unlit::Verdict>(info.unlitVerdict) == gx::unlit::Verdict::Passthrough;
+  uint32_t flags = (code == 2 ? surface::CloudReceiver : 0u) | (code == 1 ? surface::NoShadowReceive : 0u);
+  flags |= passthrough || (recordFlags & flag::Unlit) != 0 ? surface::Unlit : 0u;
+  flags |= ((recordFlags & flag::VertexColorMask) >> flag::VertexColorShift) == 1 ? surface::BakedLight : 0u;
+  surface::Fields fields{.classId = surface::ClassDefault, .flags = static_cast<uint8_t>(flags)};
+  const uint32_t extBits =
+      config.shaderConfig.ext.surfaceExt != 0 ? surface::EntryExtAmbient | surface::EntryExtEmissive : 0u;
+  return surface::pack_entry(fields, extBits);
 }
 
 bool set_camera_frame(const scene::motion::MotionFrame& frame) noexcept {

@@ -86,11 +86,17 @@ std::string_view semantic_name(gfx::ColorAttachmentSemantic semantic) noexcept {
     return "Fog record";
   case gfx::ColorAttachmentSemantic::Surface:
     return "Surface";
+  case gfx::ColorAttachmentSemantic::SurfaceExt:
+    return "Surface ext";
   }
   return "Unknown";
 }
 
 bool input_present(std::string_view name) noexcept {
+  // The expand pass rebuilds v1 words from Surface, so it exists exactly when Surface does
+  if (name == resource::SurfaceV1) {
+    return webgpu::g_graphicsConfig.surfaceBuffer;
+  }
   const std::optional<detail::GxResource> gx = detail::find_gx_resource(name);
   if (!gx) {
     return false;
@@ -105,6 +111,7 @@ bool input_present(std::string_view name) noexcept {
   case detail::GxResource::Fog:
     return webgpu::g_graphicsConfig.gbuffer;
   case detail::GxResource::Surface:
+  case detail::GxResource::SurfaceExt:
     return webgpu::g_graphicsConfig.surfaceBuffer;
   default:
     return false;
@@ -174,7 +181,7 @@ std::optional<std::string> view_blocked(const GbufView& view, const detail::Fram
     }
     return "needs the G-buffer";
   }
-  if (detail::find_gx_resource(view.resource)) {
+  if (detail::find_gx_resource(view.resource) || view.resource == resource::SurfaceV1) {
     if (input_present(view.resource)) {
       return std::nullopt;
     }

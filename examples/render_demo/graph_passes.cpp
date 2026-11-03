@@ -1580,7 +1580,7 @@ UnlitCheckPass sUnlit;
 
 void declare_unlit_check(PassBuilder& builder, void*) {
   builder.use(aurora::render::resource::GxColor, Access::Sampled, aurora::render::Missing::DisablePass);
-  builder.use(aurora::render::resource::Surface, Access::Sampled, aurora::render::Missing::DisablePass);
+  builder.use(aurora::render::resource::SurfaceV1, Access::Sampled, aurora::render::Missing::DisablePass);
   builder.side_effect();
 }
 
@@ -2032,7 +2032,7 @@ CompanionCheckPass sCompanion;
 
 void declare_companion_check(PassBuilder& builder, void*) {
   builder.use(aurora::render::resource::GxNormal, Access::Sampled, aurora::render::Missing::DisablePass);
-  builder.use(aurora::render::resource::Surface, Access::Sampled, aurora::render::Missing::DisablePass);
+  builder.use(aurora::render::resource::SurfaceV1, Access::Sampled, aurora::render::Missing::DisablePass);
   builder.side_effect();
 }
 

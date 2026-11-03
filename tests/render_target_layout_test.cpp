@@ -305,14 +305,17 @@ TEST(RenderTargetLayoutTest, SceneLayoutComposesBaseGBuffer) {
 TEST(RenderTargetLayoutTest, SceneLayoutComposesPbrSurface) {
   static_assert(static_cast<uint8_t>(ColorAttachmentSemantic::Fog) == 6);
   static_assert(static_cast<uint8_t>(ColorAttachmentSemantic::Surface) == 7);
+  static_assert(static_cast<uint8_t>(ColorAttachmentSemantic::SurfaceExt) == 8);
   const RenderTargetLayout pbr = compose_scene_layout({.gbuffer = true, .surface = true}, TestBase);
-  ASSERT_EQ(pbr.colorAttachmentCount, 6u);
+  ASSERT_EQ(pbr.colorAttachmentCount, 7u);
   constexpr std::array Semantics{ColorAttachmentSemantic::SceneColor, ColorAttachmentSemantic::Normal,
                                  ColorAttachmentSemantic::Motion,     ColorAttachmentSemantic::Reactive,
-                                 ColorAttachmentSemantic::Fog,        ColorAttachmentSemantic::Surface};
+                                 ColorAttachmentSemantic::Fog,        ColorAttachmentSemantic::Surface,
+                                 ColorAttachmentSemantic::SurfaceExt};
   constexpr std::array Formats{wgpu::TextureFormat::RGBA8Unorm, wgpu::TextureFormat::RGB10A2Unorm,
                                wgpu::TextureFormat::RG16Float,  wgpu::TextureFormat::R8Unorm,
-                               wgpu::TextureFormat::RGBA8Uint,  wgpu::TextureFormat::RGBA32Uint};
+                               wgpu::TextureFormat::RGBA8Uint,  wgpu::TextureFormat::RGBA16Uint,
+                               wgpu::TextureFormat::RGBA16Uint};
   for (uint32_t i = 0; i < Semantics.size(); ++i) {
     EXPECT_EQ(pbr.colorAttachments[i].semantic, Semantics[i]) << i;
     EXPECT_EQ(pbr.colorAttachments[i].format, Formats[i]) << i;
@@ -326,9 +329,10 @@ TEST(RenderTargetLayoutTest, SceneLayoutComposesPbrSurface) {
   EXPECT_EQ(compose_scene_layout({.normal = true, .gbuffer = true, .surface = true}, TestBase).key, pbr.key);
 
   const RenderTargetLayout ids = compose_scene_layout({.gbuffer = true, .surface = true, .debugId = true}, TestBase);
-  ASSERT_EQ(ids.colorAttachmentCount, 7u);
+  ASSERT_EQ(ids.colorAttachmentCount, 8u);
   EXPECT_EQ(ids.colorAttachments[5].semantic, ColorAttachmentSemantic::Surface);
-  EXPECT_EQ(ids.colorAttachments[6].semantic, ColorAttachmentSemantic::DebugId);
+  EXPECT_EQ(ids.colorAttachments[6].semantic, ColorAttachmentSemantic::SurfaceExt);
+  EXPECT_EQ(ids.colorAttachments[7].semantic, ColorAttachmentSemantic::DebugId);
   EXPECT_EQ(pipeline_base_layout(ids).key, pbr.key);
 
   const RenderTargetLayout gbuffer = compose_scene_layout({.gbuffer = true}, TestBase);
@@ -383,11 +387,56 @@ TEST(RenderTargetLayoutTest, PbrShaderTargetsMatchBase) {
   EXPECT_EQ(gx::shader_targets(compose_scene_layout({.gbuffer = true, .debugId = true}, TestBase)).debugId, 5u);
   EXPECT_EQ(
       gx::shader_targets(compose_scene_layout({.gbuffer = true, .surface = true, .debugId = true}, TestBase)).debugId,
-      6u);
+      7u);
+  EXPECT_EQ(pbr.surface, 5u);
+  EXPECT_EQ(pbr.surfaceExt, 6u);
+  EXPECT_EQ(base.surfaceExt, UINT32_MAX);
 }
 
 uint32_t ufloat_code(uint32_t word, uint32_t channel) noexcept {
   return channel == 2 ? word >> 22 : (word >> (11 * channel)) & 0x7FFu;
+}
+
+TEST(SurfaceV2, MirrorRoundTrips) {
+  namespace s = gx::surface;
+  static_assert(s::LayoutVersion == 2);
+  std::mt19937 rng{0x2u};
+  std::uniform_int_distribution<uint32_t> byte{0, 255};
+  std::uniform_int_distribution<uint32_t> word;
+  for (uint32_t i = 0; i < 4160; ++i) {
+    const auto u = [&] { return s::unorm8_decode(byte(rng)); };
+    s::Fields f{.albedo = {u(), u(), u()},
+                .ao = u(),
+                .roughness = u(),
+                .metalness = u(),
+                .classId = static_cast<uint8_t>(byte(rng)),
+                .flags = static_cast<uint8_t>(byte(rng)),
+                .ambient = {u(), u(), u()},
+                .category = static_cast<uint8_t>(byte(rng)),
+                .emissive = s::unpack_r11g11b10(word(rng))};
+    const uint32_t slot = word(rng) & s::SlotMax;
+    const uint32_t extBits = (i & 1 ? s::EntryExtAmbient : 0u) | (i & 2 ? s::EntryExtEmissive : 0u);
+    const s::Words record = s::pack_record(f, slot);
+    EXPECT_EQ(s::join(s::split(record)), record);
+    EXPECT_EQ(s::record_slot(record), slot);
+    const s::Fields d = s::decode(record, s::pack_entry(f, extBits), s::pack_ext(f));
+    EXPECT_EQ(s::pack(d), s::pack(f)) << i;
+    EXPECT_EQ(s::expand_v1(record, s::pack_entry(f, extBits), s::pack_ext(f)), s::pack(f)) << i;
+  }
+}
+
+TEST(SurfaceV2, EntryBitsAreFrozen) {
+  namespace s = gx::surface;
+  const s::Fields f{
+      .classId = 0x12, .flags = 0x34, .ambient = {1.f, 0.f, 1.f}, .category = 0x56, .emissive = {1.f, 0.f, 0.f}};
+  EXPECT_EQ(s::pack_entry(f, s::EntryExtAmbient), (s::Entry{0x01563412u, 0x00FF00FFu, 0x3C0u, 0}));
+  EXPECT_EQ(s::pack_entry(f, ~0u)[0], 0x03563412u);
+  EXPECT_EQ(s::split({0x44332211u, 0x88776655u}), (s::Channels{0x2211, 0x4433, 0x6655, 0x8877}));
+  EXPECT_EQ(s::pack_record({.roughness = 1.f, .metalness = 0.f}, 0x1234)[1], 0x123400FFu);
+  const s::Words ext{0x00102030u, 0x3C0u};
+  const s::Entry withAmbient{s::ClassDefault | s::EntryExtAmbient, 0x00ABCDEFu, 0, 0};
+  EXPECT_EQ(s::pack(s::decode({}, withAmbient, ext))[2], 0x00102030u);
+  EXPECT_EQ(s::pack(s::decode({}, {s::ClassDefault, 0x00ABCDEFu, 0, 0}, ext))[2], 0x00ABCDEFu);
 }
 
 TEST(RenderTargetLayoutTest, SurfaceMirrorRoundTrips) {

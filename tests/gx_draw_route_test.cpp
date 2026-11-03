@@ -1841,7 +1841,7 @@ TEST_F(GXDrawRouteTest, FwdEnvVariantWarmsForPendingLayout) {
   ASSERT_EQ(gfx::g_testWarmedConfigs.size(), 1u);
   const aurora::gx::PipelineConfig& variant = gfx::g_testWarmedConfigs.front();
   EXPECT_EQ(variant.shaderConfig.ext.fwdEnv, 1u);
-  EXPECT_TRUE(render_ext::fallback_config(variant).shaderConfig.ext == RenderExtConfig{});
+  EXPECT_TRUE(render_ext::fallback_config(variant, warm.pending).shaderConfig.ext == RenderExtConfig{});
   EXPECT_EQ(gfx::g_testLastLookupExt.fwdEnv, 0u);
   expect_same_draw(warmed, plain);
 

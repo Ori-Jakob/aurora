@@ -24,6 +24,8 @@ enum class ColorAttachmentSemantic : uint8_t {
   Fog,
   // PBR tier record; appended so every earlier layout key stays as it was
   Surface,
+  // Kept apart from Surface, so draws without per-pixel ambient or emission never pay for its write
+  SurfaceExt,
 };
 
 struct ColorAttachmentLayout {

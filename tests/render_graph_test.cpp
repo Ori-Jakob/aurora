@@ -289,14 +289,16 @@ TEST_F(RenderGraph, PhasesAreFrozen) {
 
 TEST_F(RenderGraph, GxResourcesAreFrozen) {
   constexpr std::array<std::string_view, GxResourceCount> Expected{
-      "gx.color", "gx.depth", "gx.normal", "gbuf.motion", "gbuf.reactive", "gbuf.fog", "gbuf.surface", "gbuf.debug_id",
+      "gx.color", "gx.depth",     "gx.normal",     "gbuf.motion",      "gbuf.reactive",
+      "gbuf.fog", "gbuf.surface", "gbuf.debug_id", "gbuf.surface_ext",
   };
   for (size_t i = 0; i < Expected.size(); ++i) {
     EXPECT_EQ(gx_resource_name(static_cast<GxResource>(i)), Expected[i]);
     EXPECT_EQ(find_gx_resource(Expected[i]), static_cast<GxResource>(i));
   }
   EXPECT_EQ(find_gx_resource("gbuf.fog"), GxResource::Fog);
-  EXPECT_EQ(gx_fixed_format(GxResource::Surface), wgpu::TextureFormat::RGBA32Uint);
+  EXPECT_EQ(gx_fixed_format(GxResource::Surface), wgpu::TextureFormat::RGBA16Uint);
+  EXPECT_EQ(gx_fixed_format(GxResource::SurfaceExt), wgpu::TextureFormat::RGBA16Uint);
   EXPECT_EQ(gx_fixed_format(GxResource::Color), wgpu::TextureFormat::Undefined);
 }
 
@@ -1429,7 +1431,7 @@ std::vector<TestPass> golden_passes() {
 }
 
 // Recorded from the first passing run; a change here means the hash serialization changed and its tag must be bumped
-constexpr uint64_t kGoldenGraphHash = 13004159072905762061ull;
+constexpr uint64_t kGoldenGraphHash = 6290564012259563900ull;
 
 TEST_F(RenderGraph, GraphHashGolden) {
   const auto graph = compile(golden_passes());
@@ -1611,8 +1613,8 @@ TEST_F(RenderGraph, PlannedSetCompilesAcyclic) {
                                                   .storageBuffers = 2,
                                                   .uniformBuffers = FrameGroupCost.uniformBuffers}));
   EXPECT_EQ(composite.colorBytes, 16u);
-  EXPECT_EQ(node(graph, "vg.resolve").colorBytes, 40u);
-  EXPECT_EQ(node(graph, "grass.draw").colorBytes, 40u);
+  EXPECT_EQ(node(graph, "vg.resolve").colorBytes, 32u);
+  EXPECT_EQ(node(graph, "grass.draw").colorBytes, 32u);
 
   GraphLimits defaults = full_limits();
   defaults.vertex = defaults.fragment = defaults.compute = DefaultStageLimits;

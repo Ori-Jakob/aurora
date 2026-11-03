@@ -10,7 +10,7 @@
 
 namespace aurora::render::detail {
 inline constexpr uint32_t BaseTierColorBytes = 25;
-inline constexpr uint32_t PbrTierColorBytes = 44;
+inline constexpr uint32_t PbrTierColorBytes = 42;
 inline constexpr uint64_t HighVramBytes = 6ull << 30;
 
 enum class Tier : uint8_t { None, Base, Pbr };

@@ -47,6 +47,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/debug/pick.cpp
         lib/render/debug/pick.hpp
         lib/render/debug/scene_tab.cpp
+        lib/render/debug/surface_expand.cpp
+        lib/render/debug/surface_expand.hpp
         lib/render/debug/textures.cpp
         lib/render/debug/textures.hpp
         lib/render/debug/views.cpp
@@ -79,6 +81,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/gx_ext/fwd_env.hpp
         lib/render/gx_ext/records.cpp
         lib/render/gx_ext/records.hpp
+        lib/render/gx_ext/surface_table.cpp
+        lib/render/gx_ext/surface_table.hpp
         lib/render/gx_ext/unlit.cpp
         lib/render/gx_ext/unlit.hpp
         lib/render/hints.cpp

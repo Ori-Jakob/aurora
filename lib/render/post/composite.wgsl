@@ -34,10 +34,10 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   if (a < 1.0 && gbuf_receiver_code(textureLoad(scene_normal, p, 0).a) >= 1u) {
     t.ao = a;
   }
-  // Class 0 is every non-PBR, failed or cleared pixel, so they keep the legacy path
+  // Slot 0 is every non-PBR, failed or cleared pixel, so they keep the legacy path
   if ((composite_params.flags & (COMPOSITE_FLAG_PBR | COMPOSITE_FLAG_IDENTITY)) == COMPOSITE_FLAG_PBR) {
     let surf = gbuf_surface_fetch(surface_tex, vec2u(p));
-    if (gbuf_surface_class(surf) != 0u) {
+    if (gbuf_surface_is_pbr(surf)) {
       t.pbr = true;
       t.lb = composite_params.legacy_blend;
       t.h = gbuf_surface_albedo(surf) * t.ao;

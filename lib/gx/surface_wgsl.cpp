@@ -18,15 +18,19 @@ fn gx_ufloat_pack(x: f32, mantissa_bits: u32, max_code: u32) -> u32 {
     let code = (((bits >> 23u) - 112u) << mantissa_bits) | ((bits >> shift) & ((1u << mantissa_bits) - 1u));
     return min(code + ((bits >> (shift - 1u)) & 1u), max_code);
 }
-fn gx_surface_pack(rgb: vec3f, ao: f32, rough: f32, metal: f32, cls: u32, flags: u32, ambient: vec3f, category: u32,
-                   emissive: vec3f) -> vec4u {
+fn gx_surface_split(x: u32, y: u32) -> vec4u {
+    return vec4u(x & 0xffffu, x >> 16u, y & 0xffffu, y >> 16u);
+}
+fn gx_surface_pack(rgb: vec3f, ao: f32, rough: f32, metal: f32, slot: u32) -> vec4u {
     let x = pack4x8unorm(gx_unorm_safe(vec4f(rgb, ao)));
-    let y = pack4x8unorm(gx_unorm_safe(vec4f(rough, metal, 0.0, 0.0))) | ((cls & 0xffu) << 16u) |
-            ((flags & 0xffu) << 24u);
-    let z = (pack4x8unorm(gx_unorm_safe(vec4f(ambient, 0.0))) & 0xffffffu) | ((category & 0xffu) << 24u);
-    let w = gx_ufloat_pack(emissive.x, 6u, 0x7bfu) | (gx_ufloat_pack(emissive.y, 6u, 0x7bfu) << 11u) |
+    let y = (pack4x8unorm(gx_unorm_safe(vec4f(rough, metal, 0.0, 0.0))) & 0xffffu) | ((slot & 0xffffu) << 16u);
+    return gx_surface_split(x, y);
+}
+fn gx_surface_ext_pack(ambient: vec3f, emissive: vec3f) -> vec4u {
+    let x = pack4x8unorm(gx_unorm_safe(vec4f(ambient, 0.0))) & 0xffffffu;
+    let y = gx_ufloat_pack(emissive.x, 6u, 0x7bfu) | (gx_ufloat_pack(emissive.y, 6u, 0x7bfu) << 11u) |
             (gx_ufloat_pack(emissive.z, 5u, 0x3dfu) << 22u);
-    return vec4u(x, y, z, w);
+    return gx_surface_split(x, y);
 })";
 } // namespace
 

@@ -335,7 +335,8 @@ TEST_F(GfxRecordingTest, EfbPassCarriesSurfaceTarget) {
   webgpu::g_graphicsConfig.surfaceBuffer = true;
   constexpr std::array Semantics{ColorAttachmentSemantic::SceneColor, ColorAttachmentSemantic::Normal,
                                  ColorAttachmentSemantic::Motion,     ColorAttachmentSemantic::Reactive,
-                                 ColorAttachmentSemantic::Fog,        ColorAttachmentSemantic::Surface};
+                                 ColorAttachmentSemantic::Fog,        ColorAttachmentSemantic::Surface,
+                                 ColorAttachmentSemantic::SurfaceExt};
   const auto clears = [&] {
     std::vector<bool> out;
     const auto& pass = frame.renderPasses.back();
@@ -358,19 +359,20 @@ TEST_F(GfxRecordingTest, EfbPassCarriesSurfaceTarget) {
   for (uint32_t i = 0; i < Semantics.size(); ++i) {
     EXPECT_EQ(first.colorAttachments[i].semantic, Semantics[i]) << i;
   }
-  EXPECT_EQ(first.colorAttachments[5].format, wgpu::TextureFormat::RGBA32Uint);
-  EXPECT_EQ(clears(), (std::vector<bool>(6, true)));
+  EXPECT_EQ(first.colorAttachments[5].format, wgpu::TextureFormat::RGBA16Uint);
+  EXPECT_EQ(first.colorAttachments[6].format, wgpu::TextureFormat::RGBA16Uint);
+  EXPECT_EQ(clears(), (std::vector<bool>(7, true)));
 
   resolve(false, false, true);
-  EXPECT_EQ(clears(), (std::vector<bool>{false, true, true, false, false, true}));
+  EXPECT_EQ(clears(), (std::vector<bool>{false, true, true, false, false, true, false}));
   resolve(true, false, false);
-  EXPECT_EQ(clears(), (std::vector<bool>{false, false, false, true, true, true}));
+  EXPECT_EQ(clears(), (std::vector<bool>{false, false, false, true, true, true, false}));
   resolve(true, true, false);
-  EXPECT_EQ(clears(), (std::vector<bool>{true, false, false, true, true, true}));
+  EXPECT_EQ(clears(), (std::vector<bool>{true, false, false, true, true, true, false}));
   resolve(false, true, false);
-  EXPECT_EQ(clears(), (std::vector<bool>(6, false)));
+  EXPECT_EQ(clears(), (std::vector<bool>(7, false)));
   resolve(false, false, false);
-  EXPECT_EQ(clears(), (std::vector<bool>(6, false)));
+  EXPECT_EQ(clears(), (std::vector<bool>(7, false)));
 
   webgpu::g_frameBuffer.size = {640, 480, 1};
   next_frame();

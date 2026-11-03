@@ -73,6 +73,12 @@ struct PipelineOptions {
 constexpr bool writes_fog_record(const PipelineConfig& c, const PipelineOptions& o) noexcept {
   return c.shaderConfig.ext.output != 0 && o.colorUpdate && effectively_opaque(c);
 }
+// Readers run at OpaqueDone, so only the window's draws decide what they see
+constexpr bool writes_surface(const PipelineConfig& c, const PipelineOptions& o) noexcept {
+  const RenderExtConfig& ext = c.shaderConfig.ext;
+  return (ext.output != 0 || ext.surfaceReset != 0) &&
+         ((c.depthCompare && o.depthUpdate) || (o.colorUpdate && effectively_opaque(c)));
+}
 enum class ReactiveWrite : uint8_t { None, Clear, Raise };
 // A colour writer that replaces the pixel or writes depth leaves something TAA can track, so it clears coverage
 constexpr ReactiveWrite reactive_write(const PipelineConfig& c, const PipelineOptions& o) noexcept {

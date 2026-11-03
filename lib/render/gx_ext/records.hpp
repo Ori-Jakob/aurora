@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../gx/render_ext.hpp"
+#include "../../gx/surface_pack.hpp"
 
 #include <array>
 #include <cstddef>
@@ -54,8 +55,8 @@ inline constexpr uint32_t ScreenShadow = 1u << 10;
 inline constexpr uint32_t ScreenAo = 1u << 11;
 inline constexpr uint32_t PrevProjFrame = 1u << 12;
 inline constexpr uint32_t Reactive = gx::render_ext::RecordFlagReactive;
-inline constexpr uint32_t CategoryShift = 16;
-inline constexpr uint32_t CategoryMask = 0xFFu << CategoryShift;
+inline constexpr uint32_t SurfaceSlotShift = gx::render_ext::RecordSurfaceSlotShift;
+inline constexpr uint32_t SurfaceSlotMask = gx::render_ext::RecordSurfaceSlotMask;
 } // namespace flag
 static_assert(flag::ScreenAo == gx::render_ext::RecordFlagScreenAo);
 static_assert(flag::VertexColorShift == gx::render_ext::RecordVertexColorShift);
@@ -83,6 +84,7 @@ struct Stats {
   uint64_t pbrRecords = 0;
   uint64_t policyBlocks = 0;
   uint64_t blendedInWindow = 0;
+  uint64_t surfaceSlots = 0;
   std::array<uint64_t, 4> codes{};
 };
 
@@ -92,6 +94,8 @@ enum DrawInput : uint32_t {
   // Main colour writers between OPAQUE_DONE and PRE_POST get the group-3 forward environment
   ForwardWindow = 1u << 2,
   PbrEligible = 1u << 3,
+  // The vertex policy can follow this object flag, so a change must re-derive under the same GX state
+  BakedVertex = 1u << 4,
 };
 
 using PushFn = gfx::Range (*)(std::span<const uint8_t> bytes) noexcept;
@@ -109,6 +113,10 @@ bool on_route(const scene::DrawClass& cls) noexcept;
 void stamp(gx::DrawData& draw, const gx::PipelineConfig& config, const gx::ShaderInfo& info,
            const scene::DrawClass& cls) noexcept;
 bool set_camera_frame(const scene::motion::MotionFrame& frame) noexcept;
+
+// Built from the sources v1's text used, so M9 content decodes to the same fields
+[[nodiscard]] gx::surface::Entry surface_entry(const gx::PipelineConfig& config, const gx::ShaderInfo& info,
+                                               uint32_t recordFlags) noexcept;
 
 namespace testing {
 void set_active(bool active, bool gbuffer, bool debugId) noexcept;

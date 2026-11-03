@@ -1286,8 +1286,10 @@ TEST_F(GraphBindPbrDeviceTest, GxSurfaceBindsOnlyUnderPbr) {
   EXPECT_TRUE(webgpu::g_graphicsConfig.gbuffer);
   EXPECT_TRUE(webgpu::g_graphicsConfig.surfaceBuffer);
   expect_scene_sized(surface);
-  EXPECT_EQ(surface.texture.GetFormat(), TextureFormat::RGBA32Uint);
+  EXPECT_EQ(surface.texture.GetFormat(), TextureFormat::RGBA16Uint);
   EXPECT_EQ(surface.texture.GetFormat(), gx_fixed_format(GxResource::Surface));
+  expect_scene_sized(webgpu::g_surfaceExtBuffer);
+  EXPECT_EQ(webgpu::g_surfaceExtBuffer.texture.GetFormat(), gx_fixed_format(GxResource::SurfaceExt));
   EXPECT_EQ(surface.texture.GetSampleCount(), 1u);
   const wgpu::TextureUsage usage = surface.texture.GetUsage();
   EXPECT_EQ(usage,
@@ -1298,8 +1300,9 @@ TEST_F(GraphBindPbrDeviceTest, GxSurfaceBindsOnlyUnderPbr) {
 
   const auto index = static_cast<size_t>(GxResource::Surface);
   GraphInputs inputs = test_inputs();
-  EXPECT_EQ(inputs.env.gxFormats[index], TextureFormat::RGBA32Uint);
+  EXPECT_EQ(inputs.env.gxFormats[index], TextureFormat::RGBA16Uint);
   EXPECT_EQ(inputs.env.gxUsage[index], usage);
+  EXPECT_EQ(inputs.env.gxFormats[static_cast<size_t>(GxResource::SurfaceExt)], TextureFormat::RGBA16Uint);
   {
     std::vector<TestPass> passes = surface_read();
     const TestFrame frame{compile(passes, inputs)};
@@ -1363,7 +1366,8 @@ TEST_F(GraphBindPbrDeviceTest, SurfaceFollowsSceneSplit) {
   webgpu::set_scene_render_size(0, 0);
   ASSERT_EQ(webgpu::scene_extent().width, 64u);
   expect_scene_sized(webgpu::g_surfaceBuffer);
-  EXPECT_EQ(webgpu::g_surfaceBuffer.texture.GetFormat(), TextureFormat::RGBA32Uint);
+  expect_scene_sized(webgpu::g_surfaceExtBuffer);
+  EXPECT_EQ(webgpu::g_surfaceBuffer.texture.GetFormat(), TextureFormat::RGBA16Uint);
 }
 
 TEST_F(GraphBindPbrDeviceTest, SetSceneTierRefusesBelowBudget) {
@@ -1383,7 +1387,7 @@ TEST_F(GraphBindPbrDeviceTest, SetSceneTierRefusesBelowBudget) {
   EXPECT_EQ(webgpu::set_scene_tier(webgpu::SceneTier::Pbr), pbrFits);
   ASSERT_TRUE(webgpu::set_scene_tier(webgpu::SceneTier::Legacy));
 
-  for (const uint32_t budget : {32u, 43u}) {
+  for (const uint32_t budget : {32u, 41u}) {
     c.limits.maxColorAttachmentBytesPerSample = budget;
     webgpu::set_caps(c);
     EXPECT_FALSE(webgpu::scene_tier_supported(webgpu::SceneTier::Pbr)) << budget;

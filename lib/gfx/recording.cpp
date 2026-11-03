@@ -186,6 +186,9 @@ void set_efb_targets(RenderPass& pass, EfbMode mode) {
     case ColorAttachmentSemantic::Surface:
       target = &webgpu::g_surfaceBuffer;
       break;
+    case ColorAttachmentSemantic::SurfaceExt:
+      target = &webgpu::g_surfaceExtBuffer;
+      break;
     }
     color.size = target->size;
     color.view = target->view;

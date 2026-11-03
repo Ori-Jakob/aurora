@@ -391,6 +391,9 @@ color_target_states(const PipelineConfig& config, const gfx::RenderTargetLayout&
   const uint32_t normalTarget = normal_target(config.shaderConfig, targets);
   const bool opaque = effectively_opaque(config);
   const bool writesFog = writes_fog_record(config, options);
+  const bool writesSurface = writes_surface(config, options);
+  const bool writesSurfaceExt = writesSurface && config.shaderConfig.ext.surfaceExt != 0 &&
+                                uses_surface_ext(config.shaderConfig, build_shader_info(config.shaderConfig), targets);
   const ReactiveWrite reactive = reactive_write(config, options);
   std::array<wgpu::ColorTargetState, gfx::MaxColorAttachments> colorTargets{};
   for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
@@ -404,8 +407,9 @@ color_target_states(const PipelineConfig& config, const gfx::RenderTargetLayout&
     } else if (i == targets.fog) {
       writes = writesFog;
     } else if (i == targets.surface) {
-      // Motion's rule; every non-PBR winner writes class 0, so it is never shaded as PBR
-      writes = writesDepth || (options.colorUpdate && opaque);
+      writes = writesSurface;
+    } else if (i == targets.surfaceExt) {
+      writes = writesSurfaceExt;
     }
     colorTargets[i] = {
         .format = layout.colorAttachments[i].format,

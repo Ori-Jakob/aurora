@@ -108,12 +108,15 @@ inline constexpr std::array<GbufView, 19> GbufViews{{
                DecompMode::Multiply),
     {28, "ao.raw", "AO: raw visibility", "ao.raw", "phase.ao", Stage::OpaqueDone, 8, false},
     {29, "ao.hiz", "AO: view depth (mip 0)", "ao.hiz", "phase.ao", Stage::OpaqueDone, 9, false},
-    {30, "gbuf.surface.albedo", "Surface: base colour", "gbuf.surface", "phase.composite", Stage::OpaqueDone, 10, true},
-    {31, "gbuf.surface.material", "Surface: roughness, metalness, occlusion", "gbuf.surface", "phase.composite",
+    {30, "gbuf.surface.albedo", "Surface: base colour", "debug.surface_v1", "phase.composite", Stage::OpaqueDone, 10,
+     true},
+    {31, "gbuf.surface.material", "Surface: roughness, metalness, occlusion", "debug.surface_v1", "phase.composite",
      Stage::OpaqueDone, 11, true},
-    {32, "gbuf.surface.class", "Surface: class", "gbuf.surface", "phase.composite", Stage::OpaqueDone, 12, true},
-    {33, "gbuf.surface.ambient", "Surface: ambient", "gbuf.surface", "phase.composite", Stage::OpaqueDone, 13, true},
-    {34, "gbuf.surface.emissive", "Surface: emissive", "gbuf.surface", "phase.composite", Stage::OpaqueDone, 14, true},
+    {32, "gbuf.surface.class", "Surface: class", "debug.surface_v1", "phase.composite", Stage::OpaqueDone, 12, true},
+    {33, "gbuf.surface.ambient", "Surface: ambient", "debug.surface_v1", "phase.composite", Stage::OpaqueDone, 13,
+     true},
+    {34, "gbuf.surface.emissive", "Surface: emissive", "debug.surface_v1", "phase.composite", Stage::OpaqueDone, 14,
+     true},
 }};
 
 struct ViewSelection {

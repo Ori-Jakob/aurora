@@ -2,7 +2,7 @@
   "schema": "aurora.render.graph",
   "version": 1,
   "compiled": true,
-  "graphHash": "0xb1243e7db832f305",
+  "graphHash": "0x1af829e885f9d9ef",
   "sceneDepth": "direct",
   "stages": [
     {
@@ -89,6 +89,10 @@
         {
           "resource": "gbuf.debug_id",
           "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.surface_ext",
+          "access": "ColorRMW"
         }
       ]
     },
@@ -155,6 +159,10 @@
         },
         {
           "resource": "gbuf.debug_id",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.surface_ext",
           "access": "ColorRMW"
         }
       ]
@@ -507,6 +515,10 @@
         {
           "resource": "gbuf.debug_id",
           "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.surface_ext",
+          "access": "ColorRMW"
         }
       ]
     },
@@ -627,6 +639,10 @@
         {
           "resource": "gbuf.debug_id",
           "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.surface_ext",
+          "access": "ColorRMW"
         }
       ]
     },
@@ -728,6 +744,10 @@
         {
           "resource": "gbuf.debug_id",
           "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.surface_ext",
+          "access": "ColorRMW"
         }
       ]
     },
@@ -795,6 +815,10 @@
         {
           "resource": "gbuf.debug_id",
           "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.surface_ext",
+          "access": "ColorRMW"
         }
       ]
     },
@@ -861,6 +885,10 @@
         },
         {
           "resource": "gbuf.debug_id",
+          "access": "ColorRMW"
+        },
+        {
+          "resource": "gbuf.surface_ext",
           "access": "ColorRMW"
         }
       ]
@@ -981,7 +1009,7 @@
       "name": "gbuf.surface",
       "kind": "Gx",
       "type": "texture",
-      "format": "RGBA32Uint",
+      "format": "RGBA16Uint",
       "size": "Efb",
       "width": 2560,
       "height": 1440,
@@ -991,7 +1019,26 @@
       "usage": [
         "RenderAttachment"
       ],
-      "bytes": 58982400,
+      "bytes": 29491200,
+      "slot": null,
+      "firstPass": 0,
+      "lastPass": 31
+    },
+    {
+      "name": "gbuf.surface_ext",
+      "kind": "Gx",
+      "type": "texture",
+      "format": "RGBA16Uint",
+      "size": "Efb",
+      "width": 2560,
+      "height": 1440,
+      "depthOrLayers": 1,
+      "mips": 1,
+      "samples": 1,
+      "usage": [
+        "RenderAttachment"
+      ],
+      "bytes": 29491200,
       "slot": null,
       "firstPass": 0,
       "lastPass": 31
@@ -1192,6 +1239,12 @@
       "to": 19,
       "kind": "Waw",
       "resource": "gbuf.surface"
+    },
+    {
+      "from": 2,
+      "to": 19,
+      "kind": "Waw",
+      "resource": "gbuf.surface_ext"
     },
     {
       "from": 2,

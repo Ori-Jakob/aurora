@@ -12,6 +12,7 @@
 #include "../../gx/surface_pack.hpp"
 #include "../../internal.hpp"
 #include "../../logging.hpp"
+#include "../../webgpu/gpu.hpp"
 
 #include <SDL3/SDL_stdinc.h>
 #include <magic_enum.hpp>
@@ -203,7 +204,7 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
   builder.use(resource::GxNormal, Access::Sampled, Missing::DisablePass);
   // With PBR as a second producer a missing ao.final means no AO, not no composite
   builder.use(resource::AoFinal, Access::Sampled, pbrDeclared ? Missing::BindDummyWhite : Missing::DisablePass);
-  // Always declared so tiers B and P share one layout; a black dummy reads class 0, a white Uint one would read 255
+  // Always declared so tiers B and P share one layout; a black dummy reads slot 0, a white Uint one would not
   builder.use(resource::Surface, Access::Sampled,
               UseOptions{.missing = Missing::BindDummyBlack, .sampleType = wgpu::TextureSampleType::Uint});
   builder.use(resource::GxColor, Access::ColorRMW);
@@ -338,9 +339,9 @@ std::optional<std::string> check_contract(const CompiledGraph& graph) {
   }
   if (surface_bound(graph)) {
     const CompiledResource& surface = graph.resources[graph.find_resource(resource::Surface)];
-    if (surface.tex.format != wgpu::TextureFormat::RGBA32Uint) {
+    if (surface.tex.format != webgpu::SurfaceBufferFormat) {
       return fmt::format("{} is {}, not {}", resource::Surface, magic_enum::enum_name(surface.tex.format),
-                         magic_enum::enum_name(wgpu::TextureFormat::RGBA32Uint));
+                         magic_enum::enum_name(webgpu::SurfaceBufferFormat));
     }
     if (!same_extent(surface.extent, legacy.extent)) {
       return fmt::format("{} is {}x{} but {} is {}x{}", resource::Surface, surface.extent.width, surface.extent.height,
@@ -614,9 +615,9 @@ std::array<float, 3> legacy_ao(std::array<float, 3> legacy, std::array<float, 3>
 }
 
 std::array<float, 3> legacy_pbr(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7, float ao,
-                                float normalAlpha, std::array<uint8_t, 3> albedo, uint32_t classId,
+                                float normalAlpha, std::array<uint8_t, 3> albedo, uint32_t slot,
                                 float legacyBlend) noexcept {
-  if (classId == 0 || legacyBlend >= 1.f) {
+  if (slot == 0 || legacyBlend >= 1.f) {
     return legacy_ao(legacy, fogColor, q7, ao, normalAlpha);
   }
   const bool receiver = std::round(std::clamp(normalAlpha, 0.f, 1.f) * 3.f) >= 1.f;

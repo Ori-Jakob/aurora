@@ -89,7 +89,7 @@ void set_camera_override(std::shared_ptr<const SceneHints> hints) noexcept;
 [[nodiscard]] std::array<float, 3> legacy_ao(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7,
                                              float ao, float normalAlpha) noexcept;
 [[nodiscard]] std::array<float, 3> legacy_pbr(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7,
-                                              float ao, float normalAlpha, std::array<uint8_t, 3> albedo,
-                                              uint32_t classId, float legacyBlend) noexcept;
+                                              float ao, float normalAlpha, std::array<uint8_t, 3> albedo, uint32_t slot,
+                                              float legacyBlend) noexcept;
 } // namespace testing
 } // namespace aurora::render::detail::composite

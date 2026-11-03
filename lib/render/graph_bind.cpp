@@ -435,6 +435,10 @@ bool resolve_gx_surface(const StageData&, Access access, GxBinding& out) {
   return bind_gx_target(webgpu::g_surfaceBuffer, webgpu::g_graphicsConfig.surfaceBuffer, access, out);
 }
 
+bool resolve_gx_surface_ext(const StageData&, Access access, GxBinding& out) {
+  return bind_gx_target(webgpu::g_surfaceExtBuffer, webgpu::g_graphicsConfig.surfaceBuffer, access, out);
+}
+
 GxResolveFn gx_resolver(GxResource resource) noexcept {
   const auto index = static_cast<size_t>(resource);
   if (index >= GxResourceCount) {
@@ -456,6 +460,8 @@ GxResolveFn gx_resolver(GxResource resource) noexcept {
     return &resolve_gx_fog;
   case GxResource::Surface:
     return &resolve_gx_surface;
+  case GxResource::SurfaceExt:
+    return &resolve_gx_surface_ext;
   default:
     return nullptr;
   }

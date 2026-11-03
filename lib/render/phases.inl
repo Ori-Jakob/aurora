@@ -36,6 +36,7 @@ AURORA_RENDER_GX(Normal, "gx.normal", RGB10A2Unorm)
 AURORA_RENDER_GX(Motion, "gbuf.motion", RG16Float)
 AURORA_RENDER_GX(Reactive, "gbuf.reactive", R8Unorm)
 AURORA_RENDER_GX(Fog, "gbuf.fog", RGBA8Uint)
-AURORA_RENDER_GX(Surface, "gbuf.surface", RGBA32Uint)
+AURORA_RENDER_GX(Surface, "gbuf.surface", RGBA16Uint)
 AURORA_RENDER_GX(DebugId, "gbuf.debug_id", R32Uint)
+AURORA_RENDER_GX(SurfaceExt, "gbuf.surface_ext", RGBA16Uint)
 #endif

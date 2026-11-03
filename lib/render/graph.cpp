@@ -52,7 +52,7 @@ constexpr std::array GxRows{
 #undef AURORA_RENDER_GX
 };
 static_assert(GxRows.size() == GxResourceCount);
-static_assert(static_cast<size_t>(GxResource::DebugId) + 1 == GxResourceCount);
+static_assert(static_cast<size_t>(GxResource::SurfaceExt) + 1 == GxResourceCount);
 
 struct ChainRange {
   uint16_t first = 0;
@@ -447,6 +447,7 @@ constexpr std::array ContractResources{
     ContractResource{resource::Reactive, SampledOnly},
     ContractResource{resource::Fog, SampledOnly},
     ContractResource{resource::Surface, SampledOnly},
+    ContractResource{resource::SurfaceV1, SampledOnly},
     ContractResource{resource::AoFinal, SampledOnly},
     ContractResource{resource::SceneHdr, SampledOnly},
     ContractResource{resource::SunVisibility, SampledOnly},

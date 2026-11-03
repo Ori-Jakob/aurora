@@ -9,7 +9,6 @@
 #include "hex_wgsl.hpp"
 #include "render_ext.hpp"
 #include "shader_info.hpp"
-#include "surface_pack.hpp"
 #include "surface_wgsl.hpp"
 #include "unlit_plan.hpp"
 
@@ -850,8 +849,8 @@ absl::flat_hash_set<gfx::ShaderRef> s_seenShaders;
 
 HashType shader_hash(const ShaderConfig& config, DstAlphaMode dstAlphaMode, const ShaderTargets& targets) noexcept {
   auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(targets.normal, xxh3_hash(config)));
-  for (const uint32_t target :
-       {targets.debugId, targets.motion, targets.reactive, targets.gbufferNormal, targets.fog, targets.surface}) {
+  for (const uint32_t target : {targets.debugId, targets.motion, targets.reactive, targets.gbufferNormal, targets.fog,
+                                targets.surface, targets.surfaceExt}) {
     if (target != UINT32_MAX) {
       hash = xxh3_hash(target, hash);
     }
@@ -870,7 +869,6 @@ struct OutputMember {
 };
 
 constexpr float UnlitDefaultRoughness = 0.85f;
-constexpr u32 UnlitCategoryShift = 16;
 
 struct UnlitPass {
   u16 scaleDivide = 0;
@@ -1997,34 +1995,29 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
       const TevNormalized unlitNormalized = emit_tev_stages(inner, &pass);
       inner +=
           unlitNormalized.color ? "\n    unlit_rgb = prev.rgb;"sv : "\n    unlit_rgb = tev_overflow_vec3f(prev.rgb);"sv;
-      const std::string unlitFlag =
-          unlitPlan.verdict == unlit::Verdict::Passthrough
-              ? fmt::format("{}u", surface::Unlit)
-              : fmt::format("select(0u, {0}u, (urec & {0}u) != 0u)", render_ext::RecordFlagUnlit);
+      // Class, flags, category, ambient and emission sit in the draw's table entry, so the record carries a slot
       assignment = fmt::format(
           "\n    // Unlit TEV (SP1 rules v1): no fog, lit alpha kept, only unlit_rgb leaves the block"
           "\n    var unlit_rgb: vec3f;"
           "\n    {{{0}"
           "\n    }}"
-          "\n    let urec = gx_record_word({1}u);"
-          "\n    let urx = (urec >> {2}u) & 3u;"
-          "\n    let uflags = select(0u, {3}u, urx == 2u) | select(0u, {4}u, urx == 1u) | {5} | "
-          "select(0u, {6}u, ((urec >> {7}u) & 3u) == 1u);"
-          "{11}"
-          "\n    out.surface = gx_surface_pack(unlit_rgb, {12}, {8}, {13}, {9}u, uflags, vec3f(0.0), "
-          "(urec >> {10}u) & 0xffu, vec3f(0.0));",
+          "\n    let uslot = (gx_record_word({1}u) >> {2}u) & {3}u;"
+          "{4}"
+          "\n    out.surface = gx_surface_pack(unlit_rgb, {5}, {6}, {7}, uslot);",
           replace_all(std::move(inner), "\n", "\n    "), render_ext::DrawRecordFlagsWord,
-          render_ext::DrawRecordReceiverShift, surface::CloudReceiver, surface::NoShadowReceive, unlitFlag,
-          surface::BakedLight, render_ext::RecordVertexColorShift,
-          companionText ? fmt::format("select({:.2f}, cmp_orm.g, uorm)", UnlitDefaultRoughness)
-                        : fmt::format("{:.2f}", UnlitDefaultRoughness),
-          surface::ClassDefault, UnlitCategoryShift,
+          render_ext::RecordSurfaceSlotShift, (1u << render_ext::RecordSurfaceSlotBits) - 1u,
           companionText ? "\n    let uorm = (u32(ubuf.mat0.x) & 8u) != 0u;"sv : ""sv,
           companionText ? "select(1.0, cmp_orm.r, uorm)"sv : "1.0"sv,
+          companionText ? fmt::format("select({:.2f}, cmp_orm.g, uorm)", UnlitDefaultRoughness)
+                        : fmt::format("{:.2f}", UnlitDefaultRoughness),
           companionText ? "select(0.0, cmp_orm.b, uorm)"sv : "0.0"sv);
     }
     members.push_back(
         {targets.surface, fmt::format("    @location({}) surface: vec4u,\n", targets.surface), std::move(assignment)});
+    if (uses_surface_ext(config, info, targets)) {
+      members.push_back({targets.surfaceExt, fmt::format("    @location({}) surface_ext: vec4u,\n", targets.surfaceExt),
+                         "\n    out.surface_ext = gx_surface_ext_pack(vec3f(0.0), vec3f(0.0));"s});
+    }
   }
   if (!members.empty()) {
     std::ranges::stable_sort(members, {}, &OutputMember::location);
@@ -2445,6 +2438,8 @@ ShaderTargets shader_targets(const gfx::RenderTargetLayout& layout) noexcept {
       targets.fog = i;
     } else if (layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::Surface) {
       targets.surface = i;
+    } else if (layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::SurfaceExt) {
+      targets.surfaceExt = i;
     }
   }
   if (gfx::layout_has_gbuffer(layout)) {

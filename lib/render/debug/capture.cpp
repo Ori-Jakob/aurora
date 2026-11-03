@@ -125,6 +125,7 @@ uint32_t bytes_per_pixel(wgpu::TextureFormat format) noexcept {
   case wgpu::TextureFormat::R32Float:
     return 4;
   case wgpu::TextureFormat::RGBA16Float:
+  case wgpu::TextureFormat::RGBA16Uint:
     return 8;
   case wgpu::TextureFormat::RGBA32Uint:
     return 16;
@@ -828,6 +829,9 @@ std::vector<uint8_t> preview_rgba(const Capture& capture) {
     case wgpu::TextureFormat::R32Uint:
     case wgpu::TextureFormat::RGBA32Uint:
       rgb = {in[0], in[bpp == 4 ? 1 : 4], in[bpp == 4 ? 2 : 8]};
+      break;
+    case wgpu::TextureFormat::RGBA16Uint:
+      rgb = {in[0], in[1], in[2]};
       break;
     case wgpu::TextureFormat::R32Float: {
       const uint8_t v = unorm8(std::bit_cast<float>(load_u32(in)));

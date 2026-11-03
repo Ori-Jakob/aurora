@@ -13,6 +13,7 @@
 #include "render/gx_ext/ext_provider.hpp"
 #include "render/gx_ext/fwd_env.hpp"
 #include "render/gx_ext/records.hpp"
+#include "render/gx_ext/surface_table.hpp"
 #include "render/gx_ext/unlit.hpp"
 #include "render/hints.hpp"
 #include "render/material/registry.hpp"
@@ -1328,6 +1329,115 @@ TEST_F(RenderGxExt, RecordBitsOnlyOnOutput2) {
   apply_frame_state(frame(false, false));
   EXPECT_EQ(records::stats().pbrRecords, 1u);
   EXPECT_EQ(records::stats().policyBlocks, 1u);
+}
+
+uint32_t surface_slot(const records::DrawRecord& record) {
+  return (record.flags & records::flag::SurfaceSlotMask) >> records::flag::SurfaceSlotShift;
+}
+
+TEST_F(RenderGxExt, SurfaceTableDedupesEntries) {
+  surface_table::testing::reset();
+  records::testing::set_push(&FakeStorage::push);
+  records::testing::set_active(true, true, false);
+  records::testing::set_surface(true);
+  surface_table::begin_frame(true);
+  const gx::PipelineConfig config = with_output(pbr_writer(), 2);
+  const records::DrawRecord first = stamped(config, main_opaque(cat::Static, 5));
+  EXPECT_EQ(surface_slot(first), surface_table::StaticSlots);
+  EXPECT_EQ(surface_slot(stamped(config, main_opaque(cat::Static, 6))), surface_table::StaticSlots);
+  scene::DrawClass baked = main_opaque(cat::Static | cat::Emissive, 7);
+  baked.key.flags = scene::object_flag::BakedVertexLight;
+  EXPECT_EQ(surface_slot(stamped(config, baked)), surface_table::StaticSlots + 1);
+  EXPECT_EQ(surface_slot(stamped(config, main_opaque(cat::Static, 8))), surface_table::StaticSlots);
+  EXPECT_EQ(surface_slot(stamped(with_output(pbr_writer(), 1), main_opaque(cat::Static, 9))), 0u);
+  EXPECT_EQ(first.flags & ~(records::flag::SurfaceSlotMask | 0xFFFFu), 0u);
+
+  const std::shared_ptr<const surface_table::Table> table = surface_table::snapshot();
+  ASSERT_NE(table, nullptr);
+  ASSERT_EQ(table->size(), surface_table::StaticSlots + 2);
+  EXPECT_EQ((*table)[0], surface_table::Entry{});
+  EXPECT_EQ((*table)[surface_table::StaticSlots], (surface_table::Entry{gx::surface::ClassDefault, 0, 0, 0}));
+  const uint32_t flags = gx::surface::Unlit | gx::surface::BakedLight;
+  EXPECT_EQ((*table)[surface_table::StaticSlots + 1],
+            (surface_table::Entry{gx::surface::ClassDefault | (flags << 8), 0, 0, 0}));
+  apply_frame_state(frame(false, false));
+  EXPECT_EQ(records::stats().surfaceSlots, 4u);
+}
+
+TEST_F(RenderGxExt, SurfaceTableEntryFollowsReceiverAndKey) {
+  constexpr uint32_t Default = gx::surface::ClassDefault;
+  const gx::PipelineConfig config = with_output(pbr_writer(), 2);
+  const gx::ShaderInfo info = gx::build_shader_info(config.shaderConfig);
+  using records::flag::ReceiverShift;
+  EXPECT_EQ(records::surface_entry(config, info, 2u << ReceiverShift)[0], Default | (gx::surface::CloudReceiver << 8));
+  EXPECT_EQ(records::surface_entry(config, info, 1u << ReceiverShift)[0],
+            Default | (gx::surface::NoShadowReceive << 8));
+  EXPECT_EQ(records::surface_entry(config, info, 3u << ReceiverShift)[0], Default);
+  EXPECT_EQ(records::surface_entry(config, info, records::flag::Unlit)[0], Default | (gx::surface::Unlit << 8));
+  EXPECT_EQ(records::surface_entry(config, info, 2u << records::flag::VertexColorShift)[0], Default);
+  gx::PipelineConfig keyed = config;
+  keyed.shaderConfig.ext.surfaceExt = 1;
+  EXPECT_EQ(records::surface_entry(keyed, info, 0)[0],
+            Default | gx::surface::EntryExtAmbient | gx::surface::EntryExtEmissive);
+}
+
+TEST_F(RenderGxExt, SurfaceTableOverflowTakesSlotZero) {
+  surface_table::testing::reset();
+  surface_table::begin_frame(true);
+  constexpr uint32_t Fifo = surface_table::Capacity - surface_table::StaticSlots;
+  for (uint32_t i = 0; i < Fifo; ++i) {
+    ASSERT_EQ(surface_table::slot_for({gx::surface::ClassDefault, i, 0, 0}), surface_table::StaticSlots + i);
+  }
+  EXPECT_EQ(surface_table::slot_for({gx::surface::ClassDefault, Fifo, 0, 0}), 0u);
+  EXPECT_EQ(surface_table::slot_for({gx::surface::ClassDefault, 3, 0, 0}), surface_table::StaticSlots + 3);
+  EXPECT_EQ(surface_table::snapshot()->size(), surface_table::Capacity);
+  surface_table::begin_frame(true);
+  EXPECT_EQ(surface_table::stats().overflow, 1u);
+  EXPECT_EQ(surface_table::stats().maxEntries, Fifo);
+  EXPECT_EQ(surface_table::slot_for({gx::surface::ClassDefault, Fifo, 0, 0}), surface_table::StaticSlots);
+}
+
+TEST_F(RenderGxExt, SurfaceTableNeverSlotsClassZero) {
+  surface_table::testing::reset();
+  surface_table::begin_frame(true);
+  EXPECT_EQ(surface_table::slot_for({0, 0x123456, 0, 0}), 0u);
+  EXPECT_EQ(surface_table::slot_for(surface_table::Entry{}), 0u);
+  surface_table::begin_frame(false);
+  EXPECT_EQ(surface_table::slot_for({gx::surface::ClassDefault, 0, 0, 0}), 0u);
+  EXPECT_EQ(surface_table::snapshot(), nullptr);
+}
+
+TEST_F(RenderGxExt, SurfaceTableStaticSlotsComeFirst) {
+  surface_table::testing::reset();
+  const surface_table::Entry grass{2, 0, 0, 0};
+  const uint32_t slot = surface_table::reserve(grass);
+  EXPECT_EQ(slot, 1u);
+  EXPECT_EQ(surface_table::reserve({3, 0, 0, 0}), 2u);
+  surface_table::release(2);
+  EXPECT_EQ(surface_table::reserve({4, 0, 0, 0}), 2u);
+  surface_table::begin_frame(true);
+  EXPECT_EQ(surface_table::slot_for({gx::surface::ClassDefault, 0, 0, 0}), surface_table::StaticSlots);
+  const std::shared_ptr<const surface_table::Table> table = surface_table::snapshot();
+  ASSERT_NE(table, nullptr);
+  EXPECT_EQ((*table)[slot], grass);
+  EXPECT_EQ((*table)[2], (surface_table::Entry{4, 0, 0, 0}));
+  EXPECT_EQ((*table)[3], surface_table::Entry{});
+  surface_table::update(slot, {5, 0, 0, 0});
+  surface_table::begin_frame(true);
+  EXPECT_EQ((*surface_table::snapshot())[slot], (surface_table::Entry{5, 0, 0, 0}));
+  surface_table::testing::reset();
+}
+
+TEST_F(RenderGxExt, BakedVertexFlagReachesDrawInputs) {
+  const ScopedTargets targets;
+  const ScopedHints hints;
+  pbr_frame();
+  scene::DrawClass cls = main_opaque();
+  records::on_route(cls);
+  EXPECT_EQ(gx::render_ext::g_drawInputs & records::BakedVertex, 0u);
+  cls.key.flags = scene::object_flag::BakedVertexLight;
+  records::on_route(cls);
+  EXPECT_NE(gx::render_ext::g_drawInputs & records::BakedVertex, 0u);
 }
 
 TEST_F(RenderGxExt, TevPolicyBlockCarriesNeutralsAndDedupes) {

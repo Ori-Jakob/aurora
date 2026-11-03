@@ -21,9 +21,10 @@ inline constexpr wgpu::TextureFormat DebugIdBufferFormat = wgpu::TextureFormat::
 inline constexpr wgpu::TextureFormat MotionBufferFormat = wgpu::TextureFormat::RG16Float;
 inline constexpr wgpu::TextureFormat ReactiveBufferFormat = wgpu::TextureFormat::R8Unorm;
 inline constexpr wgpu::TextureFormat FogRecordFormat = wgpu::TextureFormat::RGBA8Uint;
-inline constexpr wgpu::TextureFormat SurfaceBufferFormat = wgpu::TextureFormat::RGBA32Uint;
+inline constexpr wgpu::TextureFormat SurfaceBufferFormat = wgpu::TextureFormat::RGBA16Uint;
+inline constexpr wgpu::TextureFormat SurfaceExtBufferFormat = wgpu::TextureFormat::RGBA16Uint;
 inline constexpr uint32_t BaseSceneColorBytes = 25;
-inline constexpr uint32_t PbrSceneColorBytes = 44;
+inline constexpr uint32_t PbrSceneColorBytes = 42;
 enum class SceneTier : uint8_t { Legacy, Base, Pbr };
 
 struct GraphicsConfig {
@@ -74,6 +75,7 @@ extern TextureWithSampler g_motionBuffer;
 extern TextureWithSampler g_reactiveBuffer;
 extern TextureWithSampler g_fogRecordBuffer;
 extern TextureWithSampler g_surfaceBuffer;
+extern TextureWithSampler g_surfaceExtBuffer;
 extern wgpu::RenderPipeline g_CopyPipeline;
 extern wgpu::RenderPipeline g_CopyPremultipliedAlphaPipeline;
 extern wgpu::BindGroup g_CopyBindGroup;

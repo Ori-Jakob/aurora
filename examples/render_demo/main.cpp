@@ -290,7 +290,7 @@ UnlitOutcome unlit_outcome(const render_demo::UnlitCheckReport& report, bool nul
     return outcome;
   }
   if (report.encodes == 0) {
-    outcome.failure = "gbuf.surface never reached demo.unlit_check";
+    outcome.failure = "debug.surface_v1 never reached demo.unlit_check";
   } else if (!report.ready || report.before.empty() || report.after.empty()) {
     outcome.failure = "check readback did not complete";
   } else {
@@ -328,7 +328,7 @@ CompanionOutcome companion_outcome(const render_demo::CompanionCheckReport& repo
   } else if (run.companionSkips != 0) {
     outcome.failure = "companion draws were skipped for want of a companion group";
   } else if (report.encodes == 0) {
-    outcome.failure = "gx.normal and gbuf.surface never reached demo.companion_probe";
+    outcome.failure = "gx.normal and debug.surface_v1 never reached demo.companion_probe";
   } else if (!report.ready) {
     outcome.failure = "check readback did not complete";
   } else {

@@ -46,7 +46,7 @@ enum class GxResource : uint8_t {
 #include "phases.inl"
 #undef AURORA_RENDER_GX
 };
-inline constexpr size_t GxResourceCount = 8;
+inline constexpr size_t GxResourceCount = 9;
 inline constexpr size_t ChainNodeCount = 28;
 
 // Public phase names and stage scheduling both rely on these rows following Stage order

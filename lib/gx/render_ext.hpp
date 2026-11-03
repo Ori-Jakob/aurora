@@ -117,6 +117,10 @@ inline constexpr u32 DrawRecordTevPolicyWord = 7;
 inline constexpr u32 RecordFlagScreenAo = 1u << 11;
 inline constexpr u32 RecordFlagPrevProjFrame = 1u << 12;
 inline constexpr u32 RecordFlagReactive = 1u << 13;
+// Twelve bits cover the Surface table and keep record bits 28-31 free
+inline constexpr u32 RecordSurfaceSlotShift = 16;
+inline constexpr u32 RecordSurfaceSlotBits = 12;
+inline constexpr u32 RecordSurfaceSlotMask = ((1u << RecordSurfaceSlotBits) - 1u) << RecordSurfaceSlotShift;
 inline constexpr u32 FrameMotionWord = 4;
 inline constexpr u32 FrameMotionJitterWord = 0;
 inline constexpr u32 FrameMotionValidWord = 2;
@@ -153,7 +157,10 @@ inline RenderExtConfig normalize(RenderExtConfig ext, const ShaderInfo& info) no
     ext.layer0 = 0;
     ext.layer1 = 0;
     ext.pom = 0;
+    ext.surfaceExt = 0;
   }
+  // Only fallback_config sets it, so a derived config never carries it
+  ext.surfaceReset = 0;
   if (ext.layer0 != 0) {
     const u32 map = ext.layer0 - 1u;
     if (map >= MaxTextures || !info.sampledTextures.test(map) || info.sampledIndTextures.test(map) ||
@@ -184,11 +191,15 @@ inline PipelineConfig legacy_config(const PipelineConfig& config) noexcept {
 }
 
 // Draws as plain GX under the same layout; later milestones clear their own output bits here too
-inline PipelineConfig fallback_config(const PipelineConfig& config) noexcept {
+inline PipelineConfig fallback_config(const PipelineConfig& config, const gfx::RenderTargetLayout& layout) noexcept {
   PipelineConfig fallback = legacy_config(config);
+  // An in-window stand-in must still zero Surface, or its pixels would keep the record of the draw below
+  fallback.shaderConfig.ext.surfaceReset =
+      config.shaderConfig.ext.output != 0 && gfx::layout_has_surface(layout) ? 1 : 0;
   fallback.shaderConfig.ext.output = 0;
   fallback.shaderConfig.ext.velocity = 0;
   fallback.shaderConfig.ext.fwdEnv = 0;
+  fallback.shaderConfig.ext.surfaceExt = 0;
   return fallback;
 }
 
@@ -201,6 +212,7 @@ inline PipelineConfig output1_config(const PipelineConfig& config) noexcept {
   twin.shaderConfig.ext.layer0 = 0;
   twin.shaderConfig.ext.layer1 = 0;
   twin.shaderConfig.ext.pom = 0;
+  twin.shaderConfig.ext.surfaceExt = 0;
   return twin;
 }
 
@@ -210,7 +222,10 @@ inline bool needs_gbuffer(const RenderExtConfig& ext) noexcept {
 
 // Output bits mean something only under the M7 targets; elsewhere their text and targets are the ext-0 pipeline's
 inline bool output_admitted(const RenderExtConfig& ext, const gfx::RenderTargetLayout& layout) noexcept {
-  return !needs_gbuffer(ext) ||
-         (gfx::layout_has_gbuffer(layout) && (ext.output != 2 || gfx::layout_has_surface(layout)));
+  const bool surface = ext.output == 2 || ext.surfaceReset != 0 || ext.surfaceExt != 0;
+  if (surface && !gfx::layout_has_surface(layout)) {
+    return false;
+  }
+  return !needs_gbuffer(ext) || gfx::layout_has_gbuffer(layout);
 }
 } // namespace aurora::gx::render_ext

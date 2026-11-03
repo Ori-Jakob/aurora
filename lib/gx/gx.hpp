@@ -522,7 +522,9 @@ struct RenderExtConfig {
   u8 tessFetch : 1 = 0;
   u8 pom : 1 = 0;
   u8 fwdEnv : 1 = 0;
-  u8 pad0 : 2 = 0;
+  // Set only by fallback_config, so an in-window stand-in still zeroes Surface
+  u8 surfaceReset : 1 = 0;
+  u8 surfaceExt : 1 = 0;
   u8 stochasticMask = 0;
   u8 layer0 = 0;
   u8 layer1 = 0;
@@ -620,6 +622,7 @@ struct ShaderTargets {
   uint32_t gbufferNormal = UINT32_MAX;
   uint32_t fog = UINT32_MAX;
   uint32_t surface = UINT32_MAX;
+  uint32_t surfaceExt = UINT32_MAX;
   // Group-3 forward environment; a layout property, so the 3-argument form never has it
   bool fwdEnv = false;
 };
@@ -631,6 +634,10 @@ inline bool uses_surface(const ShaderTargets& t) noexcept { return t.surface != 
 // Text, varyings, write mask and derive all key on this, so they never disagree
 inline bool uses_unlit(const ShaderConfig& c, const ShaderInfo& info, const ShaderTargets& t) noexcept {
   return c.ext.output == 2 && uses_surface(t) && t.motion != UINT32_MAX && info.unlitAdmitted;
+}
+// Text and write mask key on this, so a keyed fragment always writes both Surface targets
+inline bool uses_surface_ext(const ShaderConfig& c, const ShaderInfo& info, const ShaderTargets& t) noexcept {
+  return c.ext.surfaceExt != 0 && t.surfaceExt != UINT32_MAX && uses_unlit(c, info, t);
 }
 // Text, pipeline layout and the group-2 kind all key on this
 inline bool uses_companions(const ShaderConfig& c, const ShaderInfo& info, const ShaderTargets& t) noexcept {
