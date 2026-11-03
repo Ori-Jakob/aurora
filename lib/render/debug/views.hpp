@@ -90,7 +90,7 @@ struct GbufView {
 }
 
 // Target rows snapshot one scene target and decomposition rows decode several; both replace RGB before the HUD
-inline constexpr std::array<GbufView, 20> GbufViews{{
+inline constexpr std::array<GbufView, 22> GbufViews{{
     {16, "gbuf.motion", "G-buffer: motion", "gbuf.motion", "phase.post_taa", Stage::PrePost, 0, false},
     {17, "gbuf.reactive", "G-buffer: reactive", "gbuf.reactive", "phase.post_taa", Stage::PrePost, 1, false},
     {18, "gbuf.fog", "Fog record: weight", "gbuf.fog", "phase.composite", Stage::OpaqueDone, 2, true},
@@ -119,6 +119,10 @@ inline constexpr std::array<GbufView, 20> GbufViews{{
     {34, "gbuf.surface.emissive", "Surface: emissive", "debug.surface_v1", "phase.composite", Stage::OpaqueDone, 14,
      true},
     {36, "light.heatmap", "Lights: lights per cluster", "light.heatmap", "phase.composite", Stage::OpaqueDone, 5,
+     false},
+    {37, "sky.probe", "Sky probe: radiance, filtered, irradiance", "sky.probe.view", "phase.composite",
+     Stage::OpaqueDone, 5, false},
+    {38, "sky.probe.mask", "Sky probe: sky-test mask", "sky.probe.view", "phase.composite", Stage::OpaqueDone, 5,
      false},
 }};
 

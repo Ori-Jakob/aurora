@@ -259,6 +259,8 @@ bool identity_collecting() noexcept {
 
 ViewCounts& view_counts() noexcept { return g_classifier.stats().view; }
 
+uint32_t sky_draws() noexcept { return g_classifier.stats().kinds[static_cast<size_t>(Kind::Sky)]; }
+
 void on_camera(const gx::hints::Camera& camera) noexcept { g_classifier.camera(static_cast<Role>(camera.role)); }
 
 void on_object_begin(const gx::hints::ObjectBegin& object) noexcept {

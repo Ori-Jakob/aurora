@@ -13,6 +13,7 @@
 #include "render/geometry/indirect.hpp"
 #include "render/graph_layout.hpp"
 #include "render/jobs.hpp"
+#include "render/lighting/sky_probe.hpp"
 #include "render/shader_resolve.hpp"
 #include "render/shaders.hpp"
 #include "render/systems/dispatch.hpp"
@@ -22,7 +23,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -1385,6 +1388,110 @@ TEST(RenderShadersGpu, CopyKernelShortInput) {
 }
 
 // render_demo --bench-indirect drives the device from the main thread before the first latch
+constexpr std::string_view SkyLibraryWgsl = R"(//#import aurora/sky
+@group(0) @binding(0) var<storage, read_write> io: array<f32>;
+
+fn io_vec4(base: u32) -> vec4f {
+  return vec4f(io[base], io[base + 1u], io[base + 2u], io[base + 3u]);
+}
+
+@compute @workgroup_size(16)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  var sh: SkySh9;
+  for (var i = 0u; i < 9u; i++) {
+    sh.c[i] = io_vec4(i * 4u);
+  }
+  sh.info = io_vec4(36u);
+  sh.amb = io_vec4(40u);
+  for (var r = 0u; r < 3u; r++) {
+    sh.rot[r] = io_vec4(44u + r * 4u);
+  }
+  let base = 64u + id.x * 8u;
+  let n = vec3f(io[base], io[base + 1u], io[base + 2u]);
+  let a = vec3f(io[base + 3u], io[base + 4u], io[base + 5u]);
+  let e = sky_env_irradiance(sh, n, a, io[base + 6u] > 0.5);
+  let s = sky_pixel_scale(sh, a);
+  let out = 256u + id.x * 8u;
+  io[out] = e.x;
+  io[out + 1u] = e.y;
+  io[out + 2u] = e.z;
+  io[out + 3u] = s.x;
+  io[out + 4u] = s.y;
+  io[out + 5u] = s.z;
+  io[out + 6u] = dot(sky_oct_decode(sky_oct_encode(n)), n);
+  io[out + 7u] = select(0.0, 1.0, sky_sh9_valid(sh));
+}
+)";
+
+TEST(RenderShadersGpu, SkyLibraryMatchesCpu) {
+  namespace sky = detail::lighting::sky_probe;
+  GpuReadback gpu;
+  if (!gpu.start()) {
+    GTEST_SKIP() << "no adapter";
+  }
+  if (gpu.device->adapterInfo.backendType == wgpu::BackendType::Null) {
+    GTEST_SKIP() << "the null backend runs no shaders";
+  }
+  ASSERT_TRUE(register_source("test/sky_library", SkyLibraryWgsl));
+  const PipelineId id = request_compute({.shader = "test/sky_library"});
+  ASSERT_EQ(wait(id, WaitNs), PipelineStatus::Ready);
+  constexpr uint32_t Cases = 16;
+  constexpr uint64_t Size = 384 * sizeof(float);
+  sky::testing::Sh sh{};
+  std::vector<float> io(384, 0.f);
+  for (size_t i = 0; i < 9; ++i) {
+    for (size_t c = 0; c < 3; ++c) {
+      const float value = i == 0 ? 2.f + 0.3f * c : 0.4f * std::sin(1.7f * i + c);
+      io[i * 4 + c] = value;
+      sh[i][c] = value;
+    }
+  }
+  io[36] = 1.f;
+  const std::array<float, 3> amb{0.2f, 0.05f, 0.0004f};
+  std::copy_n(amb.data(), 3, io.data() + 40);
+  const sky::testing::Vec3 probeAmb{amb[0], amb[1], amb[2]};
+  std::vector<sky::testing::Vec3> normals(Cases);
+  std::vector<sky::testing::Vec3> ambients(Cases);
+  for (uint32_t i = 0; i < Cases; ++i) {
+    const double t = 0.7 * i;
+    const sky::testing::Vec3 raw{std::sin(t), std::cos(1.3 * t), std::sin(0.4 * t + 1.0) - 0.2};
+    const double l = std::sqrt(raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]);
+    normals[i] = {raw[0] / l, raw[1] / l, raw[2] / l};
+    ambients[i] = {0.05 + 0.04 * i, 0.6 - 0.03 * i, 0.01 * i};
+    for (size_t c = 0; c < 3; ++c) {
+      io[64 + i * 8 + c] = static_cast<float>(normals[i][c]);
+      io[64 + i * 8 + 3 + c] = static_cast<float>(ambients[i][c]);
+    }
+  }
+  const wgpu::ComputePipeline pipeline = compute_pipeline(id);
+  for (const sky::Mode mode : {sky::Mode::Raw, sky::Mode::Pixel, sky::Mode::PixelFlat}) {
+    for (const bool baked : {false, true}) {
+      SCOPED_TRACE(std::to_string(static_cast<int>(mode)) + (baked ? " baked" : ""));
+      io[43] = static_cast<float>(mode);
+      for (uint32_t i = 0; i < Cases; ++i) {
+        io[64 + i * 8 + 6] = baked ? 1.f : 0.f;
+      }
+      const wgpu::Buffer buffer =
+          gpu.buffer(Size, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst);
+      gpu.device->queue.WriteBuffer(buffer, 0, io.data(), Size);
+      const std::array groups{gpu.group(pipeline, 0, buffer, Size)};
+      const std::vector<uint32_t> words = gpu.run(pipeline, groups, 1, buffer, Size);
+      ASSERT_EQ(words.size(), 384u);
+      for (uint32_t i = 0; i < Cases; ++i) {
+        const sky::testing::Vec3 e = sky::testing::env_irradiance(mode, sh, probeAmb, normals[i], ambients[i], baked);
+        const sky::testing::Vec3 s = sky::testing::pixel_scale(mode, probeAmb, ambients[i]);
+        const auto got = [&](size_t k) { return static_cast<double>(std::bit_cast<float>(words[256 + i * 8 + k])); };
+        for (size_t c = 0; c < 3; ++c) {
+          EXPECT_NEAR(got(c), e[c], 1e-5 * std::max(1.0, std::abs(e[c]))) << i << " irradiance " << c;
+          EXPECT_NEAR(got(3 + c), s[c], 1e-5 * std::max(1.0, s[c])) << i << " scale " << c;
+        }
+        EXPECT_NEAR(got(6), 1.0, 1e-6) << i;
+        EXPECT_EQ(got(7), 1.0) << i;
+      }
+    }
+  }
+}
+
 TEST_F(RenderShaders, ModuleInitRequestsNoPipelines) {
   gfx::detail::testing::create_compute_layouts();
   compact::initialize();

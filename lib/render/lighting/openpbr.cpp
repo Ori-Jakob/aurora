@@ -195,6 +195,30 @@ Vec3 coat_passage(const Prepared& p, double c) noexcept {
   return out;
 }
 
+double radical_inverse(uint32_t bits) noexcept {
+  bits = (bits << 16u) | (bits >> 16u);
+  bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+  bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+  bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+  bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+  return bits * 0x1p-32;
+}
+
+// White F0 and tint keep the EC table's albedo exactly, so the metal furnace does not move with the DFG's sampling
+Vec3 metal_single_scatter(const Vec3& f0, const Vec3& tint, const std::array<double, 4>& metal) noexcept {
+  const double white = 1.0 - metal[0];
+  if (std::min({f0[0], f0[1], f0[2], tint[0], tint[1], tint[2]}) >= 1.0) {
+    return splat(white);
+  }
+  const Vec3 b = f82_b(f0, tint);
+  const double sum = std::max(metal[1] + metal[2], MinAverage);
+  Vec3 out{};
+  for (size_t i = 0; i < 3; ++i) {
+    out[i] = white * std::clamp((f0[i] * metal[1] + metal[2] - b[i] * metal[3]) / sum, 0.0, 1.0);
+  }
+  return out;
+}
+
 double opaque_ec(const Tables& t, double mu, double alpha, double eta) {
   return extrapolate(sample_lut3d(t, cos_index(mu), alpha_index(alpha), ior_index(eta))[1], eta);
 }
@@ -274,7 +298,13 @@ Tables build_tables() {
       averages[1] = to_half(unorm(data::IdealDielectricReflectionRatio[i]));
       averages[2] = to_half(unorm(data::OpaqueDielectricAverageEc[i]));
       averages[3] = to_half(unorm(data::IdealMetalAverageEc[x]));
-      out.lut2d[LayerMetal * Layer + i * Lut2dChannels] = to_half(unorm(data::IdealMetalEc[i]));
+      uint16_t* metal = out.lut2d.data() + LayerMetal * Layer + i * Lut2dChannels;
+      metal[0] = to_half(unorm(data::IdealMetalEc[i]));
+      const double root = y / TableMax;
+      const std::array<double, 3> split = dfg(x / TableMax, root * root);
+      for (size_t c = 0; c < split.size(); ++c) {
+        metal[c + 1] = to_half(static_cast<float>(split[c]));
+      }
       // openpbr_fuzz_lobe.h: #define ltcFlatIndex(row, column) ((row) * OpenPBR_LTCTableSize + (column))
       uint16_t* ltc = out.lut2d.data() + LayerLtc * Layer + i * Lut2dChannels;
       ltc[0] = to_half(data::Ltc[i].a);
@@ -283,6 +313,41 @@ Tables build_tables() {
     }
   }
   return out;
+}
+
+std::array<double, 3> dfg(double muV, double alpha) noexcept {
+  const double mu = std::clamp(muV, MinMuV, 1.0);
+  const Vec3 v{std::sqrt(1.0 - mu * mu), 0.0, mu};
+  // Visible-normal sampling: with separable Smith masking each sample's weight is just G1 at the light
+  const Vec3 vh = normalize(Vec3{alpha * v[0], alpha * v[1], v[2]});
+  const double lensq = vh[0] * vh[0] + vh[1] * vh[1];
+  const Vec3 t1 = lensq > 0.0 ? Vec3{-vh[1] / std::sqrt(lensq), vh[0] / std::sqrt(lensq), 0.0} : Vec3{1.0, 0.0, 0.0};
+  const Vec3 t2 = cross(vh, t1);
+  std::array<double, 3> sum{};
+  for (uint32_t i = 0; i < DfgSamples; ++i) {
+    const double r = std::sqrt((i + 0.5) / DfgSamples);
+    const double phi = 2.0 * Pi * radical_inverse(i);
+    const double s = 0.5 * (1.0 + vh[2]);
+    const double p1 = r * std::cos(phi);
+    const double p2 = (1.0 - s) * std::sqrt(std::max(0.0, 1.0 - p1 * p1)) + s * r * std::sin(phi);
+    const Vec3 nh = t1 * p1 + t2 * p2 + vh * std::sqrt(std::max(0.0, 1.0 - p1 * p1 - p2 * p2));
+    const Vec3 h = normalize(Vec3{alpha * nh[0], alpha * nh[1], std::max(0.0, nh[2])});
+    const double c = dot(v, h);
+    const double nl = 2.0 * c * h[2] - mu;
+    if (nl <= 0.0 || c <= 0.0) {
+      continue;
+    }
+    const double weight = smith_g1(nl, alpha);
+    const double m = 1.0 - c;
+    const double m5 = std::pow(m, 5.0);
+    sum[0] += (1.0 - m5) * weight;
+    sum[1] += m5 * weight;
+    sum[2] += c * m5 * m * weight;
+  }
+  for (double& value : sum) {
+    value /= DfgSamples;
+  }
+  return sum;
 }
 
 double ior_index(double ior) noexcept {
@@ -474,9 +539,12 @@ Prepared prepare(const Tables& t, const material::classes::GpuRow& row, const Su
   p.metalTint = specColour;
   const Vec3 favg = f82_average(base, specColour);
   p.metalMs = favg * favg * p.metalWeight;
+  Vec3 metalSs{};
   if (p.metalWeight > 0.0) {
-    p.ecmV = sample_lut2d(t, cos_index(p.muV), ai, LayerMetal)[0];
+    const std::array<double, 4> metal = sample_lut2d(t, cos_index(p.muV), ai, LayerMetal);
+    p.ecmV = metal[0];
     p.ecmAvg = std::max(averages[3], MinAverage);
+    metalSs = metal_single_scatter(p.metalF0, p.metalTint, metal);
   }
   p.thin = (flags & material::classes::RowThin) != 0;
   if (p.thin) {
@@ -488,8 +556,7 @@ Prepared prepare(const Tables& t, const material::classes::GpuRow& row, const Su
   }
   p.sigma = r[24];
   Vec3 ambientDiffuse = (eon_albedo(p.diffuse, p.sigma, p.muV) + p.transmit) * p.ecV;
-  Vec3 ambientSpecular = p.specTint * (1.0 - p.ecV) +
-                         f82(p.metalF0, p.metalTint, p.muV) * (p.metalWeight * (1.0 - p.ecmV)) +
+  Vec3 ambientSpecular = p.specTint * (1.0 - p.ecV) + metalSs * p.metalWeight +
                          (p.alpha >= MinAlphaWithEnergyLoss ? p.metalMs * p.ecmV : splat(0.0));
   p.coatWeight = coatWeight;
   if (coatWeight > 0.0) {

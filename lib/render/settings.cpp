@@ -21,6 +21,7 @@
 #include "hints.hpp"
 #include "lighting/clusters.hpp"
 #include "lighting/deferred.hpp"
+#include "lighting/sky_probe.hpp"
 #include "post/composite.hpp"
 #include "post/taa.hpp"
 #include "post/upscale/upscale.hpp"
@@ -1248,6 +1249,8 @@ std::shared_ptr<const FrameState> latch_frame() {
   ao::on_latch(latched, graph.get());
   lighting::clusters::on_latch(latched, graph.get());
   lighting::deferred::on_latch(latched, graph.get());
+  // Producers latch before the composite, which gates its PBR term on them
+  lighting::sky_probe::on_latch(latched, graph.get());
   composite::on_latch(latched, graph.get());
   latch_pass_params();
   inspectorOpen = g_graphEnvironment.inspectorOpen;

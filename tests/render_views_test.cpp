@@ -174,7 +174,7 @@ TEST_F(RenderViews, GbufViewTableFollowsClassRange) {
       EXPECT_TRUE(view.name.starts_with("composite.")) << view.name;
       continue;
     }
-    if (view.resource.starts_with("light.")) {
+    if (view.resource.starts_with("light.") || view.resource.starts_with("sky.")) {
       EXPECT_EQ(view.mode, 5u) << view.name;
       continue;
     }
@@ -187,7 +187,7 @@ TEST_F(RenderViews, GbufViewTableFollowsClassRange) {
       EXPECT_EQ(view.mode, static_cast<uint32_t>(view.id - FirstGbufView));
     }
   }
-  EXPECT_EQ(expected, 37u);
+  EXPECT_EQ(expected, 39u);
   EXPECT_EQ(targetModes, (std::set<uint32_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}));
   EXPECT_EQ(find_gbuf_view(LastReservedClassView), nullptr);
   EXPECT_EQ(find_gbuf_view(35), nullptr);
@@ -315,6 +315,37 @@ TEST_F(RenderViews, LightRowsNeedPbr) {
   GbufView sky = *view;
   sky.resource = "sky.probe";
   EXPECT_EQ(view_blocked(sky, &frame), "needs PBR Lighting");
+}
+
+TEST_F(RenderViews, SkyProbeRowsNeedPbr) {
+  const GbufView* probe = find_gbuf_view(37);
+  const GbufView* mask = find_gbuf_view(38);
+  ASSERT_NE(probe, nullptr);
+  ASSERT_NE(mask, nullptr);
+  EXPECT_EQ(probe->name, "sky.probe");
+  EXPECT_EQ(probe->label, "Sky probe: radiance, filtered, irradiance");
+  EXPECT_EQ(mask->name, "sky.probe.mask");
+  EXPECT_EQ(mask->label, "Sky probe: sky-test mask");
+  for (const GbufView* view : {probe, mask}) {
+    EXPECT_EQ(view->resource, "sky.probe.view");
+    EXPECT_EQ(view->anchor, "phase.composite");
+    EXPECT_EQ(view->stage, Stage::OpaqueDone);
+    EXPECT_EQ(view->mode, 5u);
+    EXPECT_FALSE(view->uintSource);
+    EXPECT_EQ(view->kind, GbufViewKind::Target);
+    EXPECT_EQ(find_view(view->id), nullptr);
+    EXPECT_EQ(view_blocked(*view, nullptr), "needs PBR Lighting");
+  }
+  EXPECT_EQ(parse_view("sky.probe")->id, 37u);
+  EXPECT_EQ(parse_view("probe")->id, 37u);
+  EXPECT_EQ(parse_view("sky.probe.mask")->id, 38u);
+  EXPECT_EQ(parse_view("probe.mask")->id, 38u);
+  auto graph = std::make_shared<detail::CompiledGraph>();
+  detail::FrameState frame{.settings = Settings{.pbr = true}, .graph = graph};
+  graph->sceneDepthSource = DepthSource::Direct;
+  EXPECT_EQ(view_blocked(*mask, &frame), std::nullopt);
+  graph->sceneDepthSource = DepthSource::Copy;
+  EXPECT_EQ(view_blocked(*mask, &frame), "needs readable scene depth");
 }
 
 TEST_F(RenderViews, ShortNamesAreUnique) {

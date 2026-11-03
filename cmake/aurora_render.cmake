@@ -99,6 +99,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/lighting/openpbr.cpp
         lib/render/lighting/openpbr.hpp
         lib/render/lighting/openpbr_data.cpp
+        lib/render/lighting/sky_probe.cpp
+        lib/render/lighting/sky_probe.hpp
         lib/render/material/classes.cpp
         lib/render/material/classes.hpp
         lib/render/material/gx_lookup.cpp

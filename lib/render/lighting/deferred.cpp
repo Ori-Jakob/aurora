@@ -1,6 +1,7 @@
 #include "deferred.hpp"
 
 #include "openpbr.hpp"
+#include "sky_probe.hpp"
 
 #include "../ao/ao.hpp"
 #include "../frame_state.hpp"
@@ -25,7 +26,10 @@
 #include <utility>
 
 namespace aurora::render::detail::lighting {
-bool ready(const Settings& settings) noexcept { return clusters::ready(settings) && deferred::ready(settings); }
+// A declared probe joins Applying..., so the first lit frames already have sky light
+bool ready(const Settings& settings) noexcept {
+  return clusters::ready(settings) && deferred::ready(settings) && sky_probe::ready(settings);
+}
 } // namespace aurora::render::detail::lighting
 
 namespace aurora::render::detail::lighting::deferred {
@@ -156,6 +160,9 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
   builder.use(resource::SurfaceExt, Access::Sampled,
               UseOptions{.missing = Missing::BindDummyBlack, .sampleType = wgpu::TextureSampleType::Uint});
   builder.use_buffer(resource::SurfaceTable, Access::StorageRead, UseOptions{.missing = Missing::DisablePass});
+  builder.use(sky_probe::Probe, Access::Sampled, Missing::BindDummyBlack);
+  builder.use_buffer(sky_probe::Sh9, Access::Uniform,
+                     UseOptions{.missing = Missing::BindDummyBlack, .dummySize = sky_probe::Sh9Bytes});
 }
 
 void request_pipelines(const PipelineSetup& setup, const void*, std::span<uint32_t, MaxPassPipelines> ids) {
@@ -225,6 +232,7 @@ std::array<float, 3> srgb_to_linear(const float (&stored)[3]) noexcept {
 void fill_params(const SceneHints* hints, bool surfaceAmbient, Mode mode, Params& out) noexcept {
   out = {};
   fill_stage_camera(hints, out.camera);
+  fill_view_rotation(hints, out.viewToWorld);
   if (hints != nullptr && hints->has(SceneHasEnvironment)) {
     const std::array<float, 3> ambient = srgb_to_linear(hints->environment.value.ambientColor);
     std::ranges::copy(ambient, out.ambient);

@@ -21,6 +21,7 @@
 #include "lighting/clusters.hpp"
 #include "lighting/deferred.hpp"
 #include "lighting/openpbr.hpp"
+#include "lighting/sky_probe.hpp"
 #include "material/gx_lookup.hpp"
 #include "native/native.hpp"
 #include "post/composite.hpp"
@@ -110,6 +111,7 @@ void initialize() {
   lighting::clusters::initialize();
   lighting::openpbr::initialize();
   lighting::deferred::initialize();
+  lighting::sky_probe::initialize();
   gx_ext::fwd_env::initialize();
   gx_ext::surface_table::initialize();
   debug::surface_expand::initialize();
@@ -149,6 +151,7 @@ void shutdown() noexcept {
   shaders::shutdown();
   jobs::shutdown();
   hzb::shutdown();
+  lighting::sky_probe::shutdown();
   lighting::deferred::shutdown();
   lighting::openpbr::shutdown();
   lighting::clusters::shutdown();
@@ -177,6 +180,7 @@ void on_worker_frame_begin([[maybe_unused]] uint64_t frameId, [[maybe_unused]] c
   // Before any pass of the frame publishes, so no frame reuses last frame's textures
   gx_ext::fwd_env::worker_frame_begin(frameId);
   ao::worker_tick(frameId);
+  lighting::sky_probe::worker_tick(frameId);
   taa::worker_tick(frameId);
   systems::tick_worker(frameId);
   native_worker_frame_begin();

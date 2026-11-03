@@ -163,6 +163,16 @@ fn openpbr_f82_average(f0: vec3f, tint: vec3f) -> vec3f {
   return saturate(f0 + (1.0 - f0) / 21.0 - openpbr_f82_b(f0, tint) / 126.0);
 }
 
+// White F0 and tint keep the EC table's albedo exactly, so the metal furnace does not move with the DFG's sampling
+fn openpbr_metal_single_scatter(f0: vec3f, tint: vec3f, metal: vec4f) -> vec3f {
+  let white = 1.0 - metal.r;
+  if (all(f0 >= vec3f(1.0)) && all(tint >= vec3f(1.0))) {
+    return vec3f(white);
+  }
+  let tinted = f0 * metal.g + metal.b - openpbr_f82_b(f0, tint) * metal.a;
+  return white * saturate(tinted / max(metal.g + metal.b, OPENPBR_MIN_AVERAGE));
+}
+
 // Opaque EC tables stop at IOR 2.5; beyond it OpenPBR scales toward zero with F0
 fn openpbr_extrapolate(value: f32, eta: f32) -> f32 {
   if (eta > OPENPBR_IOR_MAX || eta < 1.0 / OPENPBR_IOR_MAX) {
@@ -264,9 +274,12 @@ fn openpbr_prepare(s: OpenPbrSurface, cls: ClassParams, n: vec3f, v: vec3f, lut3
   let favg = openpbr_f82_average(base, spec_colour);
   p.metal_ms = favg * favg * p.metal_weight;
   p.ecm_avg = 1.0;
+  var metal_ss = vec3f(0.0);
   if (p.metal_weight > 0.0) {
-    p.ecm_v = openpbr_lut2d(lut2d, smp, p.mu_v * OPENPBR_TABLE_MAX, p.alpha_index, OPENPBR_LAYER_METAL).r;
+    let metal = openpbr_lut2d(lut2d, smp, p.mu_v * OPENPBR_TABLE_MAX, p.alpha_index, OPENPBR_LAYER_METAL);
+    p.ecm_v = metal.r;
     p.ecm_avg = max(averages.a, OPENPBR_MIN_AVERAGE);
+    metal_ss = openpbr_metal_single_scatter(p.metal_f0, p.metal_tint, metal);
   }
   p.thin = (flags & OPENPBR_ROW_THIN) != 0u;
   if (p.thin) {
@@ -278,8 +291,7 @@ fn openpbr_prepare(s: OpenPbrSurface, cls: ClassParams, n: vec3f, v: vec3f, lut3
   }
   p.sigma = cls.base.x;
   var ambient_diffuse = (openpbr_eon_albedo(p.diffuse, p.sigma, p.mu_v) + p.transmit) * p.ec_v;
-  var ambient_specular = p.spec_tint * (1.0 - p.ec_v) +
-                         openpbr_f82(p.metal_f0, p.metal_tint, p.mu_v) * (p.metal_weight * (1.0 - p.ecm_v));
+  var ambient_specular = p.spec_tint * (1.0 - p.ec_v) + metal_ss * p.metal_weight;
   if (p.alpha >= OPENPBR_MIN_ALPHA_ENERGY_LOSS) {
     ambient_specular += p.metal_ms * p.ecm_v;
   }

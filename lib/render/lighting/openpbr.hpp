@@ -64,6 +64,8 @@ struct Tables {
   std::vector<uint16_t> lut2d;
 };
 [[nodiscard]] Tables build_tables();
+inline constexpr uint32_t DfgSamples = 256;
+[[nodiscard]] std::array<double, 3> dfg(double muV, double alpha) noexcept;
 
 // Index-space coordinates of the pinned tables, before the texel-centre remap
 [[nodiscard]] double ior_index(double ior) noexcept;

@@ -27,6 +27,41 @@ bool fill_stage_camera(const SceneHints* hints, StageCamera& out) noexcept {
   return true;
 }
 
+bool fill_view_rotation(const SceneHints* hints, ViewRotation& out) noexcept {
+  out = {};
+  if (hints == nullptr || !hints->has(SceneHasMainCamera)) {
+    return false;
+  }
+  const Mat3x4<float>& view = hints->mainCamera.view;
+  double m[3][3] = {
+      {view.m0[0], view.m0[1], view.m0[2]},
+      {view.m1[0], view.m1[1], view.m1[2]},
+      {view.m2[0], view.m2[1], view.m2[2]},
+  };
+  // Game views can carry scale or shear, and the probe needs pure directions
+  for (int r = 0; r < 3; ++r) {
+    for (int k = 0; k < r; ++k) {
+      const double d = m[r][0] * m[k][0] + m[r][1] * m[k][1] + m[r][2] * m[k][2];
+      for (int c = 0; c < 3; ++c) {
+        m[r][c] -= d * m[k][c];
+      }
+    }
+    const double length = std::sqrt(m[r][0] * m[r][0] + m[r][1] * m[r][1] + m[r][2] * m[r][2]);
+    if (!std::isfinite(length) || length < 1e-9) {
+      return false;
+    }
+    for (int c = 0; c < 3; ++c) {
+      m[r][c] /= length;
+    }
+  }
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c) {
+      out.rows[r][c] = static_cast<float>(m[r][c]);
+    }
+  }
+  return true;
+}
+
 float units_per_metre(const SceneHints& hints) noexcept {
   const float value = hints.environment.value.unitsPerMeter;
   if (!hints.has(SceneHasEnvironment) || !std::isfinite(value) || value <= 0.f) {

@@ -36,7 +36,7 @@ inline constexpr wgpu::TextureFormat HdrFormat = wgpu::TextureFormat::RGBA16Floa
 inline constexpr uint32_t WorkgroupSize = 8;
 inline constexpr float HdrMax = 65504.f;
 
-// Later milestones append bindings 12 and up and never renumber these
+// Later milestones append bindings 14 and up and never renumber these
 enum Binding : uint32_t {
   BindSurface = 0,
   BindNormal = 1,
@@ -50,6 +50,8 @@ enum Binding : uint32_t {
   BindHdr = 9,
   BindSurfaceExt = 10,
   BindSurfaceTable = 11,
+  BindSkyProbe = 12,
+  BindSkySh9 = 13,
 };
 
 enum class Mode : uint32_t { Full = 0, Grey = 1, Direct = 2, Indirect = 3, Furnace = 4, FurnaceMetal = 5 };
@@ -64,8 +66,8 @@ struct Params {
   StageCamera camera;
   float ambient[3]{};
   uint32_t flags = 0;
-  // Reserved for the sky probe (W3), which needs world-space normals
-  float viewToWorld[12]{};
+  // The sky probe is stored over world directions, and shading runs in the view-forward frame
+  ViewRotation viewToWorld;
   uint32_t reserved[4]{};
 };
 static_assert(sizeof(Params) == 128 && sizeof(Params) <= MaxPassParamsSize);

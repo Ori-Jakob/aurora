@@ -26,6 +26,12 @@ struct StageCamera {
 };
 static_assert(sizeof(StageCamera) == 48);
 
+struct ViewRotation {
+  float rows[3][4]{};
+};
+static_assert(sizeof(ViewRotation) == 48);
+
 bool fill_stage_camera(const SceneHints* hints, StageCamera& out) noexcept;
+bool fill_view_rotation(const SceneHints* hints, ViewRotation& out) noexcept;
 float units_per_metre(const SceneHints& hints) noexcept;
 } // namespace aurora::render::detail

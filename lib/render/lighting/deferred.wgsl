@@ -2,6 +2,7 @@
 //#import aurora/gbuffer
 //#import aurora/lighting
 //#import aurora/openpbr
+//#import aurora/sky
 //#import aurora/srgb
 //#import aurora/surface
 
@@ -9,7 +10,7 @@ struct DeferredParams {
   camera: StageCamera,
   ambient: vec3f,
   flags: u32,
-  view_to_world: array<vec4f, 3>,
+  view_to_world: ViewRotation,
   reserved: vec4u,
 }
 
@@ -36,6 +37,8 @@ const DEFERRED_HDR_MAX: f32 = 65504.0;
 @group(1) @binding(9) var scene_hdr: texture_storage_2d<rgba16float, write>;
 @group(1) @binding(10) var surface_ext: texture_2d<u32>;
 @group(1) @binding(11) var<storage, read> surface_table: array<vec4u>;
+@group(1) @binding(12) var sky_probe: texture_2d<f32>;
+@group(1) @binding(13) var<uniform> sky_sh9: SkySh9;
 
 var<workgroup> deferred_union: array<atomic<u32>, 8>;
 
@@ -44,13 +47,21 @@ fn deferred_light_visibility(l: GpuLight, p: vec3f, n: vec3f) -> f32 {
   return 1.0;
 }
 
-// W3's probe and later M11 ssil.irr and M21 gi.irr replace this; nothing is ever added on top of it
-fn deferred_indirect_diffuse(a: vec3f, n: vec3f) -> vec3f {
-  return OPENPBR_PI * a;
+// M11 ssil.irr and M21 gi.irr replace this in their ranges; nothing is ever added on top of it
+fn deferred_indirect_diffuse(a: vec3f, n: vec3f, baked: bool) -> vec3f {
+  // The pixel's own legacy ambient sets the level and the probe adds direction, so actors and rooms keep their ambient
+  if (!sky_sh9_valid(sky_sh9)) {
+    return OPENPBR_PI * a;
+  }
+  return sky_env_irradiance(sky_sh9, camera_world_dir(deferred_params.view_to_world, n), a, baked);
 }
 
 fn deferred_indirect_specular(a: vec3f, n: vec3f, v: vec3f, roughness: f32) -> vec3f {
-  return a;
+  if (!sky_sh9_valid(sky_sh9)) {
+    return a;
+  }
+  let r = camera_world_dir(deferred_params.view_to_world, reflect(-v, n));
+  return sky_env_radiance(sky_probe, linear_clamp, sky_sh9, r, roughness, a);
 }
 
 fn deferred_texel(t: texture_2d<f32>, p: vec2u) -> vec4f {
@@ -156,7 +167,9 @@ fn shade(@builtin(global_invocation_id) id: vec3u, @builtin(local_invocation_ind
   }
   var h = vec3f(0.0);
   if (mode != DEFERRED_MODE_DIRECT) {
-    h = openpbr_eval_ambient(p, deferred_indirect_diffuse(a, n), deferred_indirect_specular(a, n, v, s.roughness)) * ao;
+    let baked = (flags & GBUF_SURFACE_FLAG_BAKED_LIGHT) != 0u;
+    h = openpbr_eval_ambient(p, deferred_indirect_diffuse(a, n, baked),
+                             deferred_indirect_specular(a, n, v, s.roughness)) * ao;
   }
   if (mode != DEFERRED_MODE_INDIRECT && !furnace) {
     let thin = (flags & GBUF_SURFACE_FLAG_THIN_TRANSLUCENT) != 0u;

@@ -19,6 +19,7 @@
 #include "render/lighting/clusters.hpp"
 #include "render/lighting/deferred.hpp"
 #include "render/lighting/openpbr.hpp"
+#include "render/lighting/sky_probe.hpp"
 #include "render/material/classes.hpp"
 #include "render/material/registry.hpp"
 #include "render/module.hpp"
@@ -264,6 +265,58 @@ TEST(OpenPbrTables, IdealMetalMatchesIntegration) {
   }
 }
 
+std::array<double, 3> dfg_integral(double mu, double alpha, int steps) {
+  const Vec3 n{0.0, 0.0, 1.0};
+  const Vec3 v = view_at(n, mu);
+  const double a2 = alpha * alpha;
+  const auto g1 = [&](double c) { return 2.0 * c / (c + std::sqrt(a2 + (1.0 - a2) * c * c)); };
+  std::array<double, 3> sum{};
+  const double dt = Pi / 2.0 / steps;
+  const double dp = 2.0 * Pi / (2 * steps);
+  for (int i = 0; i < steps; ++i) {
+    const double theta = (i + 0.5) * dt;
+    for (int j = 0; j < 2 * steps; ++j) {
+      const double phi = (j + 0.5) * dp;
+      const Vec3 l{std::sin(theta) * std::cos(phi), std::sin(theta) * std::sin(phi), std::cos(theta)};
+      const Vec3 h = normalized(add(v, l));
+      const double nh = h[2];
+      const double d = a2 / (Pi * std::pow(nh * nh * (a2 - 1.0) + 1.0, 2.0));
+      const double base = d * g1(mu) * g1(l[2]) / (4.0 * mu) * std::sin(theta) * dt * dp;
+      const double vh = std::clamp(dot(v, h), 0.0, 1.0);
+      const double m = 1.0 - vh;
+      const double m5 = std::pow(m, 5.0);
+      sum[0] += (1.0 - m5) * base;
+      sum[1] += m5 * base;
+      sum[2] += vh * m5 * m * base;
+    }
+  }
+  return sum;
+}
+
+TEST(OpenPbrTables, DfgMatchesIntegration) {
+  const openpbr::Tables& t = openpbr::testing::tables();
+  for (const uint32_t j : {8u, 12u, 16u, 24u, 31u}) {
+    for (const uint32_t i : {4u, 12u, 20u, 31u}) {
+      const double root = j / 31.0;
+      const double mu = i / 31.0;
+      const std::array<double, 4> texel = openpbr::sample_lut2d(t, i, j, openpbr::LayerMetal);
+      // The grid integral cannot resolve the sharpest lobe at grazing view; the EC table checks that texel instead
+      if (j > 8) {
+        const std::array<double, 3> want = dfg_integral(mu, root * root, 160);
+        for (size_t c = 0; c < 3; ++c) {
+          EXPECT_NEAR(texel[c + 1], want[c], 4e-3 + 1e-2 * want[c]) << j << "," << i << " term " << c;
+        }
+      }
+      EXPECT_NEAR(texel[1] + texel[2], 1.0 - texel[0], 1e-2) << j << "," << i;
+    }
+  }
+  const std::array<double, 3> mirror = openpbr::dfg(16.0 / 31.0, std::pow(16.0 / 31.0, 2.0));
+  const std::array<double, 4> texel = openpbr::sample_lut2d(t, 16.0, 16.0, openpbr::LayerMetal);
+  for (size_t c = 0; c < 3; ++c) {
+    EXPECT_NEAR(texel[c + 1], mirror[c], 1e-3) << c;
+  }
+}
+
 TEST(OpenPbrTables, OpaqueDielectricIorAxis) {
   const openpbr::Tables& t = openpbr::testing::tables();
   EXPECT_DOUBLE_EQ(openpbr::ior_index(1.0), 16.0);
@@ -495,6 +548,8 @@ TEST(DeferredParams, LayoutReservesViewToWorld) {
   EXPECT_EQ(deferred::FlagSurfaceAmbient, 1u);
   EXPECT_EQ(deferred::ModeShift, 1u);
   EXPECT_EQ(deferred::BindSurfaceTable, 11u);
+  EXPECT_EQ(deferred::BindSkyProbe, 12u);
+  EXPECT_EQ(deferred::BindSkySh9, 13u);
   EXPECT_EQ(deferred::parse_mode("furnace-metal"), deferred::Mode::FurnaceMetal);
   EXPECT_EQ(deferred::parse_mode("grey"), deferred::Mode::Grey);
   EXPECT_EQ(deferred::parse_mode("Grey"), std::nullopt);
@@ -1000,10 +1055,12 @@ TEST_F(LightDeferredGraph, DeclaresOnPbrSurface) {
   ASSERT_EQ(status(*graph, clusters::Pass), CullReason::None);
   const NodeId node = graph->find_node(deferred::Pass);
   const auto uses = graph->node_uses(node);
-  const std::array<std::string_view, 12> names{resource::Surface,  resource::GxNormal,   resource::GxDepth,
-                                               resource::AoFinal,  clusters::List,       clusters::Grid,
-                                               openpbr::Classes,   openpbr::Lut3d,       openpbr::Lut2d,
-                                               resource::SceneHdr, resource::SurfaceExt, resource::SurfaceTable};
+  const std::array<std::string_view, 14> names{
+      resource::Surface,          resource::GxNormal,      resource::GxDepth,
+      resource::AoFinal,          clusters::List,          clusters::Grid,
+      openpbr::Classes,           openpbr::Lut3d,          openpbr::Lut2d,
+      resource::SceneHdr,         resource::SurfaceExt,    resource::SurfaceTable,
+      lighting::sky_probe::Probe, lighting::sky_probe::Sh9};
   ASSERT_EQ(uses.size(), names.size());
   for (size_t i = 0; i < names.size(); ++i) {
     EXPECT_EQ(graph->resources[uses[i].resource].name, names[i]) << i;
@@ -1486,6 +1543,129 @@ TEST_F(LightDeferredGpu, AoDummyClamps) {
     for (size_t c = 0; c < 3; ++c) {
       ASSERT_NEAR(openpbr::from_half(hdr[i][c]), want.rgb[c], 2e-3 + 5e-3 * want.rgb[c]) << i;
     }
+  }
+}
+
+struct SkyStub {
+  lighting::sky_probe::Sh9Block block;
+  std::array<float, 4> probe{};
+};
+
+void declare_sky_stub(InternalPassBuilder& builder, const PassSetup&, const void*) {
+  builder.after(phase::Prepare);
+  builder.create(
+      lighting::sky_probe::Probe,
+      {.format = wgpu::TextureFormat::RGBA16Float, .sizeClass = SizeClass::Absolute, .width = 8, .height = 8},
+      Access::ColorWrite);
+  builder.create_buffer(lighting::sky_probe::Sh9, {.size = lighting::sky_probe::Sh9Bytes}, Access::CopyDst);
+}
+
+void encode_sky_stub(PassContext& ctx, const void* state) {
+  const auto& stub = *static_cast<const SkyStub*>(state);
+  const BufferView view = ctx.buffer(BufRef{1});
+  if (view.buffer) {
+    ctx.encoder().WriteBuffer(view.buffer, view.offset, reinterpret_cast<const uint8_t*>(&stub.block),
+                              sizeof(stub.block));
+  }
+  const std::array<ColorTarget, 1> colors{
+      {{.ref = TexRef{0}, .clear = wgpu::Color{stub.probe[0], stub.probe[1], stub.probe[2], 1.0}}}};
+  if (const wgpu::RenderPassEncoder pass = ctx.begin_render(colors, nullptr, "test.sky_stub")) {
+    pass.End();
+  }
+}
+
+PassDesc sky_stub_desc(const SkyStub& stub) {
+  return {
+      .name = "test.sky_stub",
+      .stage = Stage::OpaqueDone,
+      .kind = PassKind::Encoder,
+      .order = 4,
+      .declare = declare_sky_stub,
+      .encode = encode_sky_stub,
+      .state = &stub,
+  };
+}
+
+TEST_F(LightDeferredGpu, PerPixelAmbientScalesSkyLight) {
+  namespace sky = lighting::sky_probe;
+  SkyStub stub;
+  const std::array<std::array<float, 3>, 9> c{{{2.f, 2.2f, 2.4f},
+                                               {0.8f, 0.6f, 0.4f},
+                                               {0.1f, 0.f, -0.1f},
+                                               {0.2f, 0.1f, 0.f},
+                                               {0.f, 0.05f, 0.f},
+                                               {0.05f, 0.f, 0.f},
+                                               {-0.1f, -0.1f, -0.05f},
+                                               {0.f, 0.f, 0.03f},
+                                               {0.02f, 0.f, 0.f}}};
+  sky::testing::Sh sh{};
+  for (size_t i = 0; i < 9; ++i) {
+    for (size_t k = 0; k < 3; ++k) {
+      stub.block.c[i][k] = c[i][k];
+      sh[i][k] = c[i][k];
+    }
+  }
+  const std::array<float, 3> amb{0.2f, 0.25f, 0.3f};
+  std::copy_n(amb.data(), 3, stub.block.amb);
+  stub.block.amb[3] = 1.f;
+  stub.block.info[0] = stub.block.info[1] = stub.block.info[3] = 1.f;
+  stub.probe = {0.5f, 0.4f, 0.3f, 1.f};
+  set_hints(scene_hints({}));
+  std::vector<GpuPixel> pixels(3);
+  const Vec3 normal = normalized({0.3, 0.5, -0.8});
+  for (GpuPixel& p : pixels) {
+    p.normal = normal;
+    p.z = 800.0;
+  }
+  pixels[0].ambient = {100, 120, 140};
+  pixels[1].ambient = {50, 200, 30};
+  pixels[2].ambient = {90, 90, 90};
+  pixels[2].flags = gx::surface::BakedLight;
+  const std::vector<deferred::testing::Pixel> inputs = stage_pixels(3, 1, pixels);
+  const PassId stubId = register_pass(sky_stub_desc(stub));
+  deferred::testing::force_enabled(true);
+  deferred::testing::set_mode(deferred::Mode::Indirect);
+  const auto hdr = run_hdr(pbr_settings());
+  unregister_pass(stubId);
+  ASSERT_EQ(hdr.size(), 3u);
+  const Vec3 probeAmb{amb[0], amb[1], amb[2]};
+  std::array<Vec3, 3> got{};
+  std::array<Vec3, 3> unit{};
+  for (size_t i = 0; i < 3; ++i) {
+    const deferred::testing::Pixel& px = inputs[i];
+    const double distance = std::sqrt(dot(px.position, px.position));
+    const Vec3 v = scale(px.position, -1.0 / distance);
+    const Vec3 n = deferred::testing::bend_normal(px.normal, v);
+    openpbr::Surface surface{.roughness = px.roughness, .metalness = 0.0};
+    Vec3 a{};
+    for (size_t k = 0; k < 3; ++k) {
+      surface.baseColor[k] = sky::testing::srgb_to_linear(px.albedo[k]);
+      a[k] = sky::testing::srgb_to_linear(px.ambient[k]);
+      got[i][k] = openpbr::from_half(hdr[i][k]);
+    }
+    const openpbr::Prepared p = openpbr::prepare(openpbr::testing::tables(), class_rows()[1], surface, n, v);
+    const Vec3 world{n[0], n[1], -n[2]};
+    const bool baked = i == 2;
+    const Vec3 e = sky::testing::env_irradiance(sky::Mode::Pixel, sh, probeAmb, world, a, baked);
+    const Vec3 s = sky::testing::pixel_scale(sky::Mode::Pixel, probeAmb, a);
+    const Vec3 radiance{s[0] * stub.probe[0], s[1] * stub.probe[1], s[2] * stub.probe[2]};
+    const Vec3 want = openpbr::eval_ambient(p, e, radiance);
+    unit[i] =
+        openpbr::eval_ambient(p, sky::testing::sh_irradiance(sh, world), {stub.probe[0], stub.probe[1], stub.probe[2]});
+    for (size_t k = 0; k < 3; ++k) {
+      EXPECT_NEAR(got[i][k], want[k], 2e-3 + 5e-3 * want[k]) << i << " channel " << k;
+    }
+    if (baked) {
+      const Vec3 flat = openpbr::eval_ambient(p, scale(a, Pi), radiance);
+      for (size_t k = 0; k < 3; ++k) {
+        EXPECT_NEAR(got[i][k], flat[k], 2e-3 + 5e-3 * flat[k]) << "baked channel " << k;
+      }
+    }
+  }
+  for (size_t k = 0; k < 3; ++k) {
+    const double ratio = sky::testing::srgb_to_linear(pixels[0].ambient[k] / 255.0) /
+                         sky::testing::srgb_to_linear(pixels[1].ambient[k] / 255.0);
+    EXPECT_NEAR((got[0][k] / unit[0][k]) / (got[1][k] / unit[1][k]), ratio, 1.5e-3 * ratio) << k;
   }
 }
 
