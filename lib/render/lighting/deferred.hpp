@@ -8,12 +8,14 @@
 #include <webgpu/webgpu_cpp.h>
 
 #include <array>
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string_view>
+#include <vector>
 
 namespace aurora::render::material::classes {
 struct GpuRow;
@@ -39,6 +41,8 @@ inline constexpr std::string_view ModeEnv = "AURORA_RENDER_LIGHTING";
 inline constexpr wgpu::TextureFormat HdrFormat = wgpu::TextureFormat::RGBA16Float;
 inline constexpr uint32_t WorkgroupSize = 8;
 inline constexpr float HdrMax = 65504.f;
+inline constexpr uint32_t LayeredPipeline = 0;
+inline constexpr uint32_t BasePipeline = 1;
 
 // Later milestones append bindings 14 and up and never renumber these
 enum Binding : uint32_t {
@@ -85,6 +89,9 @@ void fill_params(const SceneHints* hints, bool surfaceAmbient, Mode mode, Params
 [[nodiscard]] bool frame_enabled(const StageData& stage) noexcept;
 [[nodiscard]] bool ready(const Settings& settings) noexcept;
 [[nodiscard]] bool ran(const StageData& opaqueDone) noexcept;
+// Render worker; without a table any class can reach the pass
+[[nodiscard]] bool needs_layered(const std::vector<std::array<uint32_t, 4>>* table,
+                                 const std::bitset<256>& layeredClasses) noexcept;
 PassDesc pass_desc();
 void initialize();
 void shutdown() noexcept;
@@ -98,12 +105,14 @@ struct Counters {
   uint32_t noLights = 0;
   uint32_t notResident = 0;
   uint32_t pending = 0;
+  uint32_t base = 0;
 };
 [[nodiscard]] Counters counters() noexcept;
 void reset() noexcept;
 void set_hints_override(std::shared_ptr<const SceneHints> hints) noexcept;
 void set_mode(std::optional<Mode> mode) noexcept;
 void force_enabled(std::optional<bool> enabled) noexcept;
+void force_layered(std::optional<bool> layered) noexcept;
 
 using Vec3 = std::array<double, 3>;
 

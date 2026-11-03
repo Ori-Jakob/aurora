@@ -51,6 +51,7 @@ namespace {
 constexpr Module Log{"aurora::render::lighting"};
 constexpr TexRef HdrRef{BindHdr};
 constexpr double Pi = std::numbers::pi;
+constexpr std::array<std::string_view, 1> LayeredDefines{openpbr::LayeredDefine};
 
 struct LatchSlot {
   bool live = false;
@@ -64,12 +65,14 @@ std::atomic_bool g_surfaceAmbient{true};
 std::shared_ptr<const SceneHints> g_hintsOverride;
 std::optional<Mode> g_modeOverride;
 std::optional<bool> g_forceEnabled;
+std::optional<bool> g_forceLayered;
 std::atomic_uint32_t g_ran{0};
 std::atomic_uint32_t g_armed{0};
 std::atomic_uint32_t g_identity{0};
 std::atomic_uint32_t g_noLights{0};
 std::atomic_uint32_t g_notResident{0};
 std::atomic_uint32_t g_pending{0};
+std::atomic_uint32_t g_base{0};
 
 inline void bump(std::atomic_uint32_t& counter) noexcept {
   counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
@@ -180,23 +183,36 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
 }
 
 void request_pipelines(const PipelineSetup& setup, const void*, std::span<uint32_t, MaxPassPipelines> ids) {
-  ids[0] = shaders::request_compute({
-                                        .label = "light.deferred",
-                                        .shader = Shader,
-                                        .entryPoint = "shade",
-                                        .layout = setup.layout,
-                                        .layoutKey = setup.layoutHash,
-                                    })
-               .value;
+  ids[LayeredPipeline] = shaders::request_compute({
+                                                      .label = "light.deferred",
+                                                      .shader = Shader,
+                                                      .entryPoint = "shade",
+                                                      .defines = LayeredDefines,
+                                                      .layout = setup.layout,
+                                                      .layoutKey = setup.layoutHash,
+                                                  })
+                             .value;
+  // Coat, fuzz and thin-wall state stays live through every light loop, so frames without those classes skip it
+  ids[BasePipeline] = shaders::request_compute({
+                                                   .label = "light.deferred base",
+                                                   .shader = Shader,
+                                                   .entryPoint = "shade",
+                                                   .layout = setup.layout,
+                                                   .layoutKey = setup.layoutHash,
+                                               })
+                          .value;
 }
 
 void encode(PassContext& ctx, const void*) {
-  const wgpu::ComputePipeline pipeline = shaders::compute_pipeline(ctx.pipeline(0));
+  openpbr::refresh_classes(ctx.encoder());
+  const bool layered =
+      g_forceLayered.value_or(needs_layered(ctx.stage_data().surfaceTable.get(), openpbr::uploaded_layered()));
+  const wgpu::ComputePipeline pipeline =
+      shaders::compute_pipeline(ctx.pipeline(layered ? LayeredPipeline : BasePipeline));
   const wgpu::Texture target = ctx.texture(HdrRef);
   if (!pipeline || !target) {
     return;
   }
-  openpbr::refresh_classes(ctx.encoder());
   const wgpu::ComputePassEncoder pass = ctx.begin_compute();
   if (!pass) {
     return;
@@ -206,6 +222,9 @@ void encode(PassContext& ctx, const void*) {
   pass.DispatchWorkgroups(groups(target.GetWidth()), groups(target.GetHeight()));
   pass.End();
   bump(g_ran);
+  if (!layered) {
+    bump(g_base);
+  }
   if (ao::identity_forced()) {
     bump(g_identity);
   }
@@ -284,6 +303,16 @@ bool ran(const StageData& opaqueDone) noexcept {
          opaqueDone.is_enabled(graph->nodes[node].programIndex);
 }
 
+bool needs_layered(const std::vector<std::array<uint32_t, 4>>* table, const std::bitset<256>& layeredClasses) noexcept {
+  if (table == nullptr) {
+    return true;
+  }
+  return std::ranges::any_of(*table, [&](const std::array<uint32_t, 4>& entry) {
+    const uint32_t cls = entry[0] & 0xFFu;
+    return cls != gx::surface::ClassNone && layeredClasses[cls];
+  });
+}
+
 PassDesc pass_desc() {
   return {
       .name = std::string{Pass},
@@ -319,13 +348,14 @@ void shutdown() noexcept {
   const testing::Counters c = testing::counters();
   constexpr std::string_view Line =
       "Render lighting: deferred ran on {} frames ({} armed, {} under identity, {} without "
-      "light hints, {} not resident, {} pipeline-pending)";
+      "light hints, {} not resident, {} pipeline-pending), {} without layered classes";
   if (c.ran != 0 || c.armed != 0) {
-    Log.info(Line, c.ran, c.armed, c.identity, c.noLights, c.notResident, c.pending);
+    Log.info(Line, c.ran, c.armed, c.identity, c.noLights, c.notResident, c.pending, c.base);
   } else {
-    Log.debug(Line, c.ran, c.armed, c.identity, c.noLights, c.notResident, c.pending);
+    Log.debug(Line, c.ran, c.armed, c.identity, c.noLights, c.notResident, c.pending, c.base);
   }
-  for (std::atomic_uint32_t* counter : {&g_ran, &g_armed, &g_identity, &g_noLights, &g_notResident, &g_pending}) {
+  for (std::atomic_uint32_t* counter :
+       {&g_ran, &g_armed, &g_identity, &g_noLights, &g_notResident, &g_pending, &g_base}) {
     counter->store(0, std::memory_order_relaxed);
   }
 }
@@ -350,6 +380,7 @@ Counters counters() noexcept {
       .noLights = g_noLights.load(std::memory_order_relaxed),
       .notResident = g_notResident.load(std::memory_order_relaxed),
       .pending = g_pending.load(std::memory_order_relaxed),
+      .base = g_base.load(std::memory_order_relaxed),
   };
 }
 
@@ -357,8 +388,10 @@ void reset() noexcept {
   g_hintsOverride.reset();
   g_modeOverride.reset();
   g_forceEnabled.reset();
+  g_forceLayered.reset();
   lighting::testing::set_ready_override(std::nullopt);
-  for (std::atomic_uint32_t* counter : {&g_ran, &g_armed, &g_identity, &g_noLights, &g_notResident, &g_pending}) {
+  for (std::atomic_uint32_t* counter :
+       {&g_ran, &g_armed, &g_identity, &g_noLights, &g_notResident, &g_pending, &g_base}) {
     counter->store(0, std::memory_order_relaxed);
   }
 }
@@ -368,6 +401,8 @@ void set_hints_override(std::shared_ptr<const SceneHints> hints) noexcept { g_hi
 void set_mode(std::optional<Mode> mode) noexcept { g_modeOverride = mode; }
 
 void force_enabled(std::optional<bool> enabled) noexcept { g_forceEnabled = enabled; }
+
+void force_layered(std::optional<bool> layered) noexcept { g_forceLayered = layered; }
 
 double attenuation(const clusters::GpuLight& light, double distance) noexcept {
   const double r = light.v0[3];

@@ -21,6 +21,7 @@ constexpr uint32_t Lut3dChannels = 2;
 
 std::atomic_bool g_resident{false};
 std::atomic_uint64_t g_uploadedEpoch{0};
+ClassSet g_uploadedLayered;
 PersistentHandle g_classesHandle;
 PersistentHandle g_lut3dHandle;
 PersistentHandle g_lut2dHandle;
@@ -462,6 +463,7 @@ void initialize() {
   const uint64_t epoch = material::classes::epoch();
   const std::shared_ptr<const material::classes::GpuRows> rows = material::classes::gpu_rows();
   queue.WriteBuffer(g_classBuffer, 0, rows->data(), ClassBytes);
+  g_uploadedLayered = layered_classes(*rows);
   g_uploadedEpoch.store(epoch, std::memory_order_relaxed);
 
   const wgpu::TextureViewDescriptor volumeView{.label = "light.lut3d", .dimension = wgpu::TextureViewDimension::e3D};
@@ -503,9 +505,25 @@ bool refresh_classes(const wgpu::CommandEncoder& encoder) {
   }
   const std::shared_ptr<const material::classes::GpuRows> rows = material::classes::gpu_rows();
   encoder.WriteBuffer(g_classBuffer, 0, reinterpret_cast<const uint8_t*>(rows->data()), ClassBytes);
+  g_uploadedLayered = layered_classes(*rows);
   g_uploadedEpoch.store(epoch, std::memory_order_relaxed);
   return true;
 }
+
+bool layered(const material::classes::GpuRow& row) noexcept {
+  const auto flags = std::bit_cast<uint32_t>(row.v[30]);
+  return row.v[7] > 0.f || row.v[11] > 0.f || (flags & material::classes::RowThin) != 0;
+}
+
+ClassSet layered_classes(const material::classes::GpuRows& rows) noexcept {
+  ClassSet out;
+  for (size_t id = 0; id < rows.size(); ++id) {
+    out[id] = layered(rows[id]);
+  }
+  return out;
+}
+
+ClassSet uploaded_layered() noexcept { return resident() ? g_uploadedLayered : ClassSet{}.set(); }
 
 Prepared prepare(const Tables& t, const material::classes::GpuRow& row, const Surface& s, const Vec3& n,
                  const Vec3& v) {

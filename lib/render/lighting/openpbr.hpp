@@ -7,6 +7,7 @@
 #include <webgpu/webgpu_cpp.h>
 
 #include <array>
+#include <bitset>
 #include <cstdint>
 #include <string_view>
 #include <vector>
@@ -16,6 +17,7 @@ inline constexpr std::string_view Classes = "light.classes";
 inline constexpr std::string_view Lut3d = "light.lut3d";
 inline constexpr std::string_view Lut2d = "light.lut2d";
 inline constexpr std::string_view Library = "aurora/openpbr";
+inline constexpr std::string_view LayeredDefine = "OPENPBR_LAYERED";
 
 inline constexpr uint32_t TableSize = 32;
 inline constexpr uint32_t Lut2dLayers = 3;
@@ -80,6 +82,13 @@ void shutdown() noexcept;
 [[nodiscard]] PersistentHandle lut2d_handle() noexcept;
 // Render worker; returns true when the rows were rewritten
 bool refresh_classes(const wgpu::CommandEncoder& encoder);
+
+using ClassSet = std::bitset<ClassRows>;
+// Coat, fuzz and thin walls are the lobes OPENPBR_LAYERED adds
+[[nodiscard]] bool layered(const material::classes::GpuRow& row) noexcept;
+[[nodiscard]] ClassSet layered_classes(const material::classes::GpuRows& rows) noexcept;
+// Render worker, after refresh_classes; every class while the tables are not resident
+[[nodiscard]] ClassSet uploaded_layered() noexcept;
 
 // Double mirror of aurora/openpbr, filtering the same f16 values in texel space
 using Vec3 = std::array<double, 3>;

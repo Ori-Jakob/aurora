@@ -13,6 +13,8 @@
 #include "render/geometry/indirect.hpp"
 #include "render/graph_layout.hpp"
 #include "render/jobs.hpp"
+#include "render/lighting/deferred.hpp"
+#include "render/lighting/openpbr.hpp"
 #include "render/lighting/sky_probe.hpp"
 #include "render/lighting/tonemap.hpp"
 #include "render/shader_resolve.hpp"
@@ -420,6 +422,16 @@ TEST_F(RenderShaders, LibraryShadersCompile) {
     std::string error;
     EXPECT_TRUE(validate_module(shader.id, {}, error)) << shader.id << ": " << error;
   }
+}
+
+TEST_F(RenderShaders, DeferredLayeredVariantCompiles) {
+  namespace lighting = detail::lighting;
+  const std::array<std::string_view, 1> layered{lighting::openpbr::LayeredDefine};
+  std::string error;
+  EXPECT_TRUE(validate_module(lighting::deferred::Shader, layered, error)) << error;
+  EXPECT_TRUE(validate_module(lighting::deferred::Shader, {}, error)) << error;
+  EXPECT_TRUE(validate_module(lighting::openpbr::Library, layered, error)) << error;
+  EXPECT_TRUE(validate_module(lighting::openpbr::Library, {}, error)) << error;
 }
 
 TEST_F(RenderShaders, GbufViewUintVariantCompiles) {

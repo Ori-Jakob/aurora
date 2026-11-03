@@ -503,6 +503,33 @@ TEST(OpenPbrClasses, DefaultsMatchClassRows) {
   EXPECT_EQ(sizeof(classes::GpuRow), openpbr::ClassBytes / openpbr::ClassRows);
 }
 
+TEST(OpenPbrClasses, LayeredRowsSelectTheLayeredVariant) {
+  classes::testing::reset();
+  const openpbr::ClassSet builtIn = openpbr::layered_classes(*classes::gpu_rows());
+  EXPECT_EQ(builtIn.count(), 1u);
+  EXPECT_TRUE(builtIn[7]);
+  EXPECT_FALSE(openpbr::layered(default_row()));
+  EXPECT_TRUE(openpbr::layered(classes::gpu_row(coat_params())));
+  EXPECT_TRUE(openpbr::layered(classes::gpu_row(fuzz_params())));
+  EXPECT_TRUE(openpbr::layered(classes::gpu_row(thin_params())));
+  OpenPbrParams subsurface;
+  subsurface.subsurfaceWeight = 0.5f;
+  EXPECT_FALSE(openpbr::layered(classes::gpu_row(subsurface)));
+
+  openpbr::ClassSet set = builtIn;
+  set[0] = true;
+  const auto entry = [](uint32_t cls, uint32_t flags = 0) {
+    return gx::surface::Entry{cls | flags << 8 | 0x09u << 16, 0, 0, 0};
+  };
+  EXPECT_TRUE(deferred::needs_layered(nullptr, set));
+  const std::vector<gx::surface::Entry> plain{gx::surface::Entry{}, entry(0), entry(1), entry(2), entry(8)};
+  EXPECT_FALSE(deferred::needs_layered(&plain, set));
+  std::vector<gx::surface::Entry> foliage = plain;
+  foliage.push_back(entry(7, gx::surface::Unlit));
+  EXPECT_TRUE(deferred::needs_layered(&foliage, set));
+  EXPECT_FALSE(deferred::needs_layered(&foliage, openpbr::ClassSet{}));
+}
+
 clusters::GpuLight prepared_light(const AuroraLight& light, const Mat3x4<float>& view) {
   SceneHints hints;
   hints.present = SceneHasMainCamera | SceneHasLights;
@@ -1461,6 +1488,37 @@ TEST_F(LightDeferredGpu, MatchesMirror) {
   RecordProperty("worst_relative", std::to_string(worst));
 }
 
+TEST_F(LightDeferredGpu, BaseVariantMatchesLayered) {
+  std::mt19937 rng{0xBA5Eu};
+  auto hints = scene_hints(mixed_lights());
+  hints->present |= SceneHasEnvironment;
+  hints->environment.value.ambientColor[0] = 0.3f;
+  hints->environment.value.ambientColor[1] = 0.35f;
+  hints->environment.value.ambientColor[2] = 0.4f;
+  set_hints(hints);
+  std::vector<GpuPixel> pixels(size_t{96} * 64);
+  for (GpuPixel& p : pixels) {
+    p = random_gpu_pixel(rng);
+    if (openpbr::layered(class_rows()[p.cls])) {
+      p.cls = classes::Default;
+    }
+  }
+  static_cast<void>(stage_pixels(96, 64, pixels));
+  deferred::testing::force_enabled(true);
+  deferred::testing::force_layered(true);
+  const auto layered = run_hdr(pbr_settings());
+  EXPECT_EQ(deferred::testing::counters().base, 0u);
+  deferred::testing::force_layered(false);
+  const auto base = run_hdr(pbr_settings(), 2);
+  EXPECT_EQ(deferred::testing::counters().base, 1u);
+  ASSERT_EQ(base.size(), layered.size());
+  size_t different = 0;
+  for (size_t i = 0; i < base.size(); ++i) {
+    different += base[i] != layered[i] ? 1 : 0;
+  }
+  EXPECT_EQ(different, 0u);
+}
+
 TEST_F(LightDeferredGpu, FurnaceSceneIsOne) {
   std::mt19937 rng{0xF00Du};
   std::uniform_real_distribution<double> unit(0.0, 1.0);
@@ -1876,10 +1934,13 @@ void declare_probe(InternalPassBuilder& builder, const PassSetup&, const void*) 
   builder.create_buffer(ProbeOut, {.size = uint64_t{ProbeCases} * 32}, Access::StorageWrite);
 }
 
+constexpr std::array<std::string_view, 1> ProbeDefines{openpbr::LayeredDefine};
+
 void request_probe(const PipelineSetup& setup, const void*, std::span<uint32_t, MaxPassPipelines> ids) {
   ids[0] = shaders::request_compute({.label = "t.probe",
                                      .shader = "test/openpbr_probe",
                                      .entryPoint = "probe",
+                                     .defines = ProbeDefines,
                                      .layout = setup.layout,
                                      .layoutKey = setup.layoutHash})
                .value;
