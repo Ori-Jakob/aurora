@@ -1,4 +1,5 @@
 #include "graph_api.hpp"
+#include "shaders.hpp"
 #include "stage.hpp"
 
 #include "../logging.hpp"
@@ -106,3 +107,8 @@ const wgpu::PipelineLayout& PassContext::pipeline_layout() const noexcept {
   return Empty;
 }
 } // namespace aurora::render
+
+namespace aurora::render::shaders {
+// Nothing compiles graph pipelines without the render module, so callers waiting on them return at once
+bool wait_idle(uint64_t) { return true; }
+} // namespace aurora::render::shaders
