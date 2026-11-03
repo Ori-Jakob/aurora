@@ -18,6 +18,7 @@
 #include "gx_ext/ext_provider.hpp"
 #include "gx_ext/fwd_env.hpp"
 #include "gx_ext/surface_table.hpp"
+#include "lighting/clusters.hpp"
 #include "material/gx_lookup.hpp"
 #include "native/native.hpp"
 #include "post/composite.hpp"
@@ -104,6 +105,7 @@ void initialize() {
   taa::initialize();
   ao::initialize();
   composite::initialize();
+  lighting::clusters::initialize();
   gx_ext::fwd_env::initialize();
   gx_ext::surface_table::initialize();
   debug::surface_expand::initialize();
@@ -143,6 +145,7 @@ void shutdown() noexcept {
   shaders::shutdown();
   jobs::shutdown();
   hzb::shutdown();
+  lighting::clusters::shutdown();
   composite::shutdown();
   ao::shutdown();
   taa::shutdown();

@@ -85,6 +85,7 @@ struct Stats {
   uint64_t policyBlocks = 0;
   uint64_t blendedInWindow = 0;
   uint64_t surfaceSlots = 0;
+  uint64_t categoryRecords = 0;
   std::array<uint64_t, 4> codes{};
 };
 
@@ -116,7 +117,7 @@ bool set_camera_frame(const scene::motion::MotionFrame& frame) noexcept;
 
 // Built from the sources v1's text used, so M9 content decodes to the same fields
 [[nodiscard]] gx::surface::Entry surface_entry(const gx::PipelineConfig& config, const gx::ShaderInfo& info,
-                                               uint32_t recordFlags) noexcept;
+                                               uint32_t recordFlags, uint32_t categories) noexcept;
 
 namespace testing {
 void set_active(bool active, bool gbuffer, bool debugId) noexcept;

@@ -7,6 +7,7 @@
 #include "render/debug/decomp_view.hpp"
 #include "render/debug/views.hpp"
 #include "render/frame_state.hpp"
+#include "render/graph.hpp"
 #include "render/scene/classify.hpp"
 
 #include <algorithm>
@@ -163,6 +164,7 @@ TEST_F(RenderViews, GbufViewTableFollowsClassRange) {
   uint16_t expected = FirstGbufView;
   std::set<uint32_t> targetModes;
   for (const GbufView& view : GbufViews) {
+    expected += expected == 35 ? 1 : 0;
     EXPECT_EQ(view.id, expected++);
     EXPECT_TRUE(names.insert(view.name).second) << view.name;
     EXPECT_EQ(find_gbuf_view(view.id), &view);
@@ -170,6 +172,10 @@ TEST_F(RenderViews, GbufViewTableFollowsClassRange) {
     if (view.kind == GbufViewKind::Decomposition) {
       EXPECT_FALSE(view.uintSource) << view.name;
       EXPECT_TRUE(view.name.starts_with("composite.")) << view.name;
+      continue;
+    }
+    if (view.resource.starts_with("light.")) {
+      EXPECT_EQ(view.mode, 5u) << view.name;
       continue;
     }
     EXPECT_TRUE(targetModes.insert(view.mode).second) << view.name;
@@ -181,7 +187,7 @@ TEST_F(RenderViews, GbufViewTableFollowsClassRange) {
       EXPECT_EQ(view.mode, static_cast<uint32_t>(view.id - FirstGbufView));
     }
   }
-  EXPECT_EQ(expected, 35u);
+  EXPECT_EQ(expected, 37u);
   EXPECT_EQ(targetModes, (std::set<uint32_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}));
   EXPECT_EQ(find_gbuf_view(LastReservedClassView), nullptr);
   EXPECT_EQ(find_gbuf_view(35), nullptr);
@@ -275,6 +281,40 @@ TEST_F(RenderViews, SurfaceRowsAppendFrom30) {
     EXPECT_EQ(parse_view(row.name)->id, row.id) << row.name;
   }
   EXPECT_EQ(parse_view("surface.class")->id, 32u);
+}
+
+TEST_F(RenderViews, LightRowsNeedPbr) {
+  const GbufView* view = find_gbuf_view(36);
+  ASSERT_NE(view, nullptr);
+  EXPECT_EQ(view->name, "light.heatmap");
+  EXPECT_EQ(view->label, "Lights: lights per cluster");
+  EXPECT_EQ(view->resource, "light.heatmap");
+  EXPECT_EQ(view->anchor, "phase.composite");
+  EXPECT_EQ(view->stage, Stage::OpaqueDone);
+  EXPECT_EQ(view->mode, 5u);
+  EXPECT_FALSE(view->uintSource);
+  EXPECT_EQ(view->kind, GbufViewKind::Target);
+  EXPECT_EQ(parse_view("light.heatmap")->id, 36u);
+  EXPECT_EQ(parse_view("heatmap")->id, 36u);
+  EXPECT_EQ(find_view(36), nullptr);
+
+  EXPECT_EQ(view_blocked(*view, nullptr), "needs PBR Lighting");
+  auto graph = std::make_shared<detail::CompiledGraph>();
+  detail::FrameState frame{.settings = Settings{.ao = Quality::High}, .graph = graph};
+  graph->sceneDepthSource = DepthSource::Direct;
+  EXPECT_EQ(view_blocked(*view, &frame), "needs PBR Lighting");
+  frame.settings.pbr = true;
+  EXPECT_EQ(view_blocked(*view, &frame), std::nullopt);
+  for (const DepthSource source : {DepthSource::Copy, DepthSource::Unavailable}) {
+    graph->sceneDepthSource = source;
+    EXPECT_EQ(view_blocked(*view, &frame), "needs readable scene depth");
+  }
+  const GbufView aoRow = *find_gbuf_view(23);
+  frame.settings.pbr = false;
+  EXPECT_NE(view_blocked(aoRow, &frame), "needs PBR Lighting");
+  GbufView sky = *view;
+  sky.resource = "sky.probe";
+  EXPECT_EQ(view_blocked(sky, &frame), "needs PBR Lighting");
 }
 
 TEST_F(RenderViews, ShortNamesAreUnique) {

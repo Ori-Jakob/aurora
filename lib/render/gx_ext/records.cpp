@@ -6,6 +6,7 @@
 #include "../hints.hpp"
 #include "../scene/classifier.hpp"
 #include "../scene/motion.hpp"
+#include "../scene/receiver_category.hpp"
 #include "../../gfx/recording.hpp"
 #include "../../gfx/scene_targets.hpp"
 #include "../../gx/gx.hpp"
@@ -29,6 +30,7 @@ struct Counters {
   uint64_t policyBlocks = 0;
   uint64_t blendedInWindow = 0;
   uint64_t surfaceSlots = 0;
+  uint64_t categoryRecords = 0;
   std::array<uint64_t, 4> codes{};
 };
 
@@ -154,6 +156,7 @@ void fold() noexcept {
   g_totals.policyBlocks += frame.policyBlocks;
   g_totals.blendedInWindow += frame.blendedInWindow;
   g_totals.surfaceSlots += frame.surfaceSlots;
+  g_totals.categoryRecords += frame.categoryRecords;
   for (size_t i = 0; i < frame.codes.size(); ++i) {
     g_totals.codes[i] += frame.codes[i];
   }
@@ -200,9 +203,9 @@ void shutdown() noexcept {
     const auto& codes = g_totals.codes;
     Log.info(
         "Render records: {} draws, {} reused, {} dropped over {} frames, codes {}/{}/{}/{}, screen AO {}, "
-        "surface slots {}",
+        "surface slots {}, category records {}",
         g_totals.records, g_totals.reused, g_totals.dropped, g_totals.frames, codes[0], codes[1], codes[2], codes[3],
-        g_totals.screenAo, g_totals.surfaceSlots);
+        g_totals.screenAo, g_totals.surfaceSlots, g_totals.categoryRecords);
   }
   surface_table::shutdown();
   g_active = false;
@@ -249,9 +252,11 @@ void stamp(gx::DrawData& draw, const gx::PipelineConfig& config, const gx::Shade
     record.tevPolicyOff = policy_block(cls);
     // Only admitted text writes the record; any other output-2 pipeline writes slot 0
     if (info.unlitAdmitted) {
-      const uint32_t slot = surface_table::slot_for(surface_entry(config, info, record.flags));
+      const gx::surface::Entry entry = surface_entry(config, info, record.flags, cls.key.categories);
+      const uint32_t slot = surface_table::slot_for(entry);
       record.flags |= slot << flag::SurfaceSlotShift;
       g_frame.surfaceSlots += slot != 0 ? 1 : 0;
+      g_frame.categoryRecords += slot != 0 && ((entry[0] >> 16) & 0xFFu) != 0 ? 1 : 0;
     }
     ++g_frame.pbrRecords;
   }
@@ -273,15 +278,17 @@ void stamp(gx::DrawData& draw, const gx::PipelineConfig& config, const gx::Shade
   count_code(g_frame, record);
 }
 
-gx::surface::Entry surface_entry(const gx::PipelineConfig& config, const gx::ShaderInfo& info,
-                                 uint32_t recordFlags) noexcept {
+gx::surface::Entry surface_entry(const gx::PipelineConfig& config, const gx::ShaderInfo& info, uint32_t recordFlags,
+                                 uint32_t categories) noexcept {
   namespace surface = gx::surface;
   const uint32_t code = (recordFlags & flag::ReceiverMask) >> flag::ReceiverShift;
   const bool passthrough = static_cast<gx::unlit::Verdict>(info.unlitVerdict) == gx::unlit::Verdict::Passthrough;
   uint32_t flags = (code == 2 ? surface::CloudReceiver : 0u) | (code == 1 ? surface::NoShadowReceive : 0u);
   flags |= passthrough || (recordFlags & flag::Unlit) != 0 ? surface::Unlit : 0u;
   flags |= ((recordFlags & flag::VertexColorMask) >> flag::VertexColorShift) == 1 ? surface::BakedLight : 0u;
-  surface::Fields fields{.classId = surface::ClassDefault, .flags = static_cast<uint8_t>(flags)};
+  surface::Fields fields{.classId = surface::ClassDefault,
+                         .flags = static_cast<uint8_t>(flags),
+                         .category = scene::receiver_category::compress(categories)};
   const uint32_t extBits =
       config.shaderConfig.ext.surfaceExt != 0 ? surface::EntryExtAmbient | surface::EntryExtEmissive : 0u;
   return surface::pack_entry(fields, extBits);

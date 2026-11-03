@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <string_view>
 
 namespace aurora::gx {
@@ -89,7 +90,7 @@ struct GbufView {
 }
 
 // Target rows snapshot one scene target and decomposition rows decode several; both replace RGB before the HUD
-inline constexpr std::array<GbufView, 19> GbufViews{{
+inline constexpr std::array<GbufView, 20> GbufViews{{
     {16, "gbuf.motion", "G-buffer: motion", "gbuf.motion", "phase.post_taa", Stage::PrePost, 0, false},
     {17, "gbuf.reactive", "G-buffer: reactive", "gbuf.reactive", "phase.post_taa", Stage::PrePost, 1, false},
     {18, "gbuf.fog", "Fog record: weight", "gbuf.fog", "phase.composite", Stage::OpaqueDone, 2, true},
@@ -117,6 +118,8 @@ inline constexpr std::array<GbufView, 19> GbufViews{{
      true},
     {34, "gbuf.surface.emissive", "Surface: emissive", "debug.surface_v1", "phase.composite", Stage::OpaqueDone, 14,
      true},
+    {36, "light.heatmap", "Lights: lights per cluster", "light.heatmap", "phase.composite", Stage::OpaqueDone, 5,
+     false},
 }};
 
 struct ViewSelection {
@@ -325,6 +328,7 @@ void initialize_classification();
 void shutdown_classification() noexcept;
 void draw_scene_tab();
 void draw_views_tab();
+[[nodiscard]] std::optional<std::string> view_blocked(const GbufView& view, const detail::FrameState* frame);
 void views_on_latch();
 [[nodiscard]] uint16_t selected_view_id(const Settings& settings) noexcept;
 

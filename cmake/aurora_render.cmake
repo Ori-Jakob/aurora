@@ -92,6 +92,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/jobs.cpp
         lib/render/jobs.hpp
         lib/render/json.hpp
+        lib/render/lighting/clusters.cpp
+        lib/render/lighting/clusters.hpp
         lib/render/material/gx_lookup.cpp
         lib/render/material/gx_lookup.hpp
         lib/render/material/key_text.hpp
@@ -174,6 +176,7 @@ if (AURORA_ENABLE_RENDER)
         lib/render/scene/motion.hpp
         lib/render/scene/overlay.cpp
         lib/render/scene/overlay.hpp
+        lib/render/scene/receiver_category.hpp
         lib/render/shader_resolve.cpp
         lib/render/shader_resolve.hpp
         lib/render/shaders.cpp

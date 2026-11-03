@@ -1356,10 +1356,12 @@ TEST_F(RenderGxExt, SurfaceTableDedupesEntries) {
   ASSERT_NE(table, nullptr);
   ASSERT_EQ(table->size(), surface_table::StaticSlots + 2);
   EXPECT_EQ((*table)[0], surface_table::Entry{});
-  EXPECT_EQ((*table)[surface_table::StaticSlots], (surface_table::Entry{gx::surface::ClassDefault, 0, 0, 0}));
+  constexpr uint32_t StaticByte = 0x01u << 16;
+  EXPECT_EQ((*table)[surface_table::StaticSlots],
+            (surface_table::Entry{gx::surface::ClassDefault | StaticByte, 0, 0, 0}));
   const uint32_t flags = gx::surface::Unlit | gx::surface::BakedLight;
   EXPECT_EQ((*table)[surface_table::StaticSlots + 1],
-            (surface_table::Entry{gx::surface::ClassDefault | (flags << 8), 0, 0, 0}));
+            (surface_table::Entry{gx::surface::ClassDefault | (flags << 8) | StaticByte, 0, 0, 0}));
   apply_frame_state(frame(false, false));
   EXPECT_EQ(records::stats().surfaceSlots, 4u);
 }
@@ -1369,16 +1371,52 @@ TEST_F(RenderGxExt, SurfaceTableEntryFollowsReceiverAndKey) {
   const gx::PipelineConfig config = with_output(pbr_writer(), 2);
   const gx::ShaderInfo info = gx::build_shader_info(config.shaderConfig);
   using records::flag::ReceiverShift;
-  EXPECT_EQ(records::surface_entry(config, info, 2u << ReceiverShift)[0], Default | (gx::surface::CloudReceiver << 8));
-  EXPECT_EQ(records::surface_entry(config, info, 1u << ReceiverShift)[0],
+  EXPECT_EQ(records::surface_entry(config, info, 2u << ReceiverShift, 0)[0],
+            Default | (gx::surface::CloudReceiver << 8));
+  EXPECT_EQ(records::surface_entry(config, info, 1u << ReceiverShift, 0)[0],
             Default | (gx::surface::NoShadowReceive << 8));
-  EXPECT_EQ(records::surface_entry(config, info, 3u << ReceiverShift)[0], Default);
-  EXPECT_EQ(records::surface_entry(config, info, records::flag::Unlit)[0], Default | (gx::surface::Unlit << 8));
-  EXPECT_EQ(records::surface_entry(config, info, 2u << records::flag::VertexColorShift)[0], Default);
+  EXPECT_EQ(records::surface_entry(config, info, 3u << ReceiverShift, 0)[0], Default);
+  EXPECT_EQ(records::surface_entry(config, info, records::flag::Unlit, 0)[0], Default | (gx::surface::Unlit << 8));
+  EXPECT_EQ(records::surface_entry(config, info, 2u << records::flag::VertexColorShift, 0)[0], Default);
   gx::PipelineConfig keyed = config;
   keyed.shaderConfig.ext.surfaceExt = 1;
-  EXPECT_EQ(records::surface_entry(keyed, info, 0)[0],
+  EXPECT_EQ(records::surface_entry(keyed, info, 0, 0)[0],
             Default | gx::surface::EntryExtAmbient | gx::surface::EntryExtEmissive);
+  EXPECT_EQ(records::surface_entry(config, info, 0, cat::Dynamic | cat::Player)[0], Default | (0x82u << 16));
+  EXPECT_EQ(records::surface_entry(config, info, 0, cat::Static | cat::Terrain | cat::Emissive)[0],
+            Default | (0x09u << 16));
+}
+
+TEST_F(RenderGxExt, SurfaceTableStampsCategoryOnOutput2Only) {
+  surface_table::testing::reset();
+  records::testing::set_push(&FakeStorage::push);
+  records::testing::set_active(true, true, false);
+  records::testing::set_surface(true);
+  surface_table::begin_frame(true);
+  const scene::DrawClass link = main_opaque(cat::Dynamic | cat::Player | cat::Skinned, 5);
+  const scene::DrawClass room = main_opaque(cat::Static | cat::Terrain, 6);
+  for (const uint8_t output : {uint8_t{0}, uint8_t{1}}) {
+    const records::DrawRecord record = stamped(with_output(pbr_writer(), output), link);
+    EXPECT_EQ(record.flags >> 16, 0u) << int{output};
+  }
+  const records::DrawRecord player = stamped(with_output(pbr_writer(), 2), link);
+  const records::DrawRecord terrain = stamped(with_output(pbr_writer(), 2), room);
+  ASSERT_NE(surface_slot(player), 0u);
+  ASSERT_NE(surface_slot(terrain), 0u);
+  EXPECT_NE(surface_slot(player), surface_slot(terrain));
+  for (const records::DrawRecord& record : {player, terrain}) {
+    EXPECT_EQ(record.flags & ~(records::flag::SurfaceSlotMask | 0xFFFFu), 0u);
+  }
+  const std::shared_ptr<const surface_table::Table> table = surface_table::snapshot();
+  ASSERT_NE(table, nullptr);
+  ASSERT_EQ(table->size(), surface_table::StaticSlots + 2);
+  const gx::surface::Words record{};
+  EXPECT_EQ(gx::surface::decode(record, (*table)[surface_slot(player)], {}).category, 0x86u);
+  EXPECT_EQ(gx::surface::decode(record, (*table)[surface_slot(terrain)], {}).category, 0x09u);
+  EXPECT_EQ(((*table)[surface_slot(player)][0] >> 16) & 0xFFu, 0x86u);
+  apply_frame_state(frame(false, false));
+  EXPECT_EQ(records::stats().categoryRecords, 2u);
+  EXPECT_EQ(records::stats().surfaceSlots, 2u);
 }
 
 TEST_F(RenderGxExt, SurfaceTableOverflowTakesSlotZero) {

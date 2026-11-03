@@ -7,6 +7,7 @@
 
 #include "../frame_state.hpp"
 #include "../graph.hpp"
+#include "../../gfx/recording.hpp"
 #include "../../gx/pipeline.hpp"
 #include "../../webgpu/gpu.hpp"
 
@@ -163,6 +164,7 @@ void draw_layout() {
     ImGui::TextColored(WarningColor, "G-buffer tier unavailable: %.*s", static_cast<int>(reason.size()), reason.data());
   }
 }
+} // namespace
 
 std::optional<std::string> view_blocked(const GbufView& view, const detail::FrameState* frame) {
   const Settings settings = frame != nullptr ? frame->settings : Settings{};
@@ -187,12 +189,25 @@ std::optional<std::string> view_blocked(const GbufView& view, const detail::Fram
     }
     return std::string{view.resource} + " is not in the scene layout";
   }
+  // Lighting rows are produced by PBR passes, not by AO
+  if (view.resource.starts_with("light.") || view.resource.starts_with("sky.")) {
+    if (!feature_enabled(settings, Feature::Pbr)) {
+      return "needs PBR Lighting";
+    }
+    const DepthSource depth = frame != nullptr && frame->graph != nullptr ? frame->graph->sceneDepthSource
+                                                                          : gfx::current_scene_depth_source();
+    if (depth != DepthSource::Direct) {
+      return "needs readable scene depth";
+    }
+    return std::nullopt;
+  }
   if (feature_enabled(settings, Feature::Ao)) {
     return std::nullopt;
   }
   return "needs Ambient Occlusion";
 }
 
+namespace {
 void draw_legend(std::span<const LegendEntry> entries) {
   ImGui::Indent();
   for (size_t i = 0; i < entries.size(); ++i) {
