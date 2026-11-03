@@ -69,6 +69,13 @@ bool gbuffer_wanted(const Settings& settings, const Caps& caps, uint32_t msaaSam
 ForceMode forced_gbuffer(ForceMode mode, uint64_t latchIndex) noexcept;
 BuiltOptions with_pbr_dev_built(BuiltOptions built, bool requested) noexcept;
 std::optional<float> parse_legacy_blend(std::string_view text) noexcept;
+struct ExposureOverride {
+  Exposure exposure = Exposure::MatchLegacy;
+  std::optional<float> bias;
+  bool operator==(const ExposureOverride&) const = default;
+};
+std::optional<ExposureOverride> parse_exposure_override(std::string_view text) noexcept;
+std::optional<Tonemap> parse_tonemap_override(std::string_view text) noexcept;
 bool mat_maps_env() noexcept;
 FeatureSupport evaluate_support(Feature feature, uint8_t option, const Settings& context,
                                 const SupportEnv& env) noexcept;

@@ -96,11 +96,14 @@ if (AURORA_ENABLE_RENDER)
         lib/render/lighting/clusters.hpp
         lib/render/lighting/deferred.cpp
         lib/render/lighting/deferred.hpp
+        lib/render/lighting/exposure.cpp
+        lib/render/lighting/exposure.hpp
         lib/render/lighting/openpbr.cpp
         lib/render/lighting/openpbr.hpp
         lib/render/lighting/openpbr_data.cpp
         lib/render/lighting/sky_probe.cpp
         lib/render/lighting/sky_probe.hpp
+        lib/render/lighting/tonemap.hpp
         lib/render/material/classes.cpp
         lib/render/material/classes.hpp
         lib/render/material/gx_lookup.cpp

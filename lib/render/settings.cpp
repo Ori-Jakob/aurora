@@ -21,6 +21,7 @@
 #include "hints.hpp"
 #include "lighting/clusters.hpp"
 #include "lighting/deferred.hpp"
+#include "lighting/exposure.hpp"
 #include "lighting/sky_probe.hpp"
 #include "post/composite.hpp"
 #include "post/taa.hpp"
@@ -130,6 +131,9 @@ constexpr BuiltOptions DefaultBuiltOptions = [] {
   // AO reaches the screen only through the deferred-fog composite, so their bits ship together
   built[static_cast<size_t>(Feature::Ao)] = ao::BuiltOptionMask;
   built[static_cast<size_t>(Feature::DeferredFog)] = 1u << 1;
+  // PBR reaches players once its lighting, exposure and tonemappers are in; .mat maps feed only PBR
+  built[static_cast<size_t>(Feature::Pbr)] = 1u << 1;
+  built[static_cast<size_t>(Feature::LegacyMatMaps)] = 1u << 1;
   return built;
 }();
 
@@ -520,6 +524,8 @@ struct SettingsEnv {
   std::optional<float> sharpness;
   std::optional<UpscalerOverride> upscaler;
   std::optional<float> legacyBlend;
+  std::optional<ExposureOverride> exposure;
+  std::optional<Tonemap> tonemap;
 };
 
 const SettingsEnv& settings_env() noexcept {
@@ -563,6 +569,22 @@ const SettingsEnv& settings_env() noexcept {
         Log.warn("AURORA_RENDER_LEGACY_BLEND={} is not a finite number; ignored", value);
       }
     }
+    if (const char* value = SDL_getenv("AURORA_RENDER_EXPOSURE")) {
+      out.exposure = parse_exposure_override(value);
+      if (out.exposure) {
+        Log.warn("AURORA_RENDER_EXPOSURE={}: overriding the exposure setting", value);
+      } else {
+        Log.warn("AURORA_RENDER_EXPOSURE={} is not match, auto, manual or manual:<ev>; ignored", value);
+      }
+    }
+    if (const char* value = SDL_getenv("AURORA_RENDER_TONEMAP")) {
+      out.tonemap = parse_tonemap_override(value);
+      if (out.tonemap) {
+        Log.warn("AURORA_RENDER_TONEMAP={}: overriding the tonemapper setting", value);
+      } else {
+        Log.warn("AURORA_RENDER_TONEMAP={} is not neutral or agx; ignored", value);
+      }
+    }
     return out;
   }();
   return env;
@@ -585,6 +607,13 @@ Settings with_env_overrides(Settings settings) noexcept {
   }
   if (env.legacyBlend) {
     settings.legacyBlend = *env.legacyBlend;
+  }
+  if (env.exposure) {
+    settings.exposure = env.exposure->exposure;
+    settings.exposureBias = env.exposure->bias.value_or(settings.exposureBias);
+  }
+  if (env.tonemap) {
+    settings.tonemap = *env.tonemap;
   }
 #if AURORA_ENABLE_RENDER
   if (const std::optional<Quality> ao = ao::env_ao_request()) {
@@ -832,7 +861,7 @@ ForceMode forced_gbuffer(ForceMode mode, uint64_t latchIndex) noexcept {
   }
 }
 
-// AURORA_RENDER_PBR builds PBR for development before its lighting ships, as AURORA_RENDER_AO did for AO
+// AURORA_RENDER_PBR also requests PBR, so verification runs never depend on the settings
 BuiltOptions with_pbr_dev_built(BuiltOptions built, bool requested) noexcept {
   if (requested) {
     built[feature_index(Feature::Pbr)] |= 1u << 1;
@@ -841,6 +870,39 @@ BuiltOptions with_pbr_dev_built(BuiltOptions built, bool requested) noexcept {
 }
 
 bool mat_maps_env() noexcept { return mat_maps_env_read(); }
+
+std::optional<ExposureOverride> parse_exposure_override(std::string_view text) noexcept {
+  if (text == "match") {
+    return ExposureOverride{.exposure = Exposure::MatchLegacy};
+  }
+  if (text == "auto") {
+    return ExposureOverride{.exposure = Exposure::Auto};
+  }
+  if (text == "manual") {
+    return ExposureOverride{.exposure = Exposure::Manual};
+  }
+  constexpr std::string_view Prefix = "manual:";
+  if (!text.starts_with(Prefix)) {
+    return std::nullopt;
+  }
+  text.remove_prefix(Prefix.size());
+  float bias = 0.f;
+  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), bias);
+  if (text.empty() || error != std::errc{} || end != text.data() + text.size() || !std::isfinite(bias)) {
+    return std::nullopt;
+  }
+  return ExposureOverride{.exposure = Exposure::Manual, .bias = std::clamp(bias, -MaxExposureBias, MaxExposureBias)};
+}
+
+std::optional<Tonemap> parse_tonemap_override(std::string_view text) noexcept {
+  if (text == "neutral") {
+    return Tonemap::PbrNeutral;
+  }
+  if (text == "agx") {
+    return Tonemap::AgX;
+  }
+  return std::nullopt;
+}
 
 std::optional<float> parse_legacy_blend(std::string_view text) noexcept {
   float value = 0.f;
@@ -1251,6 +1313,7 @@ std::shared_ptr<const FrameState> latch_frame() {
   lighting::deferred::on_latch(latched, graph.get());
   // Producers latch before the composite, which gates its PBR term on them
   lighting::sky_probe::on_latch(latched, graph.get());
+  lighting::exposure::on_latch(latched, graph.get());
   composite::on_latch(latched, graph.get());
   latch_pass_params();
   inspectorOpen = g_graphEnvironment.inspectorOpen;

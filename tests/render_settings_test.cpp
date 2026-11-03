@@ -13,6 +13,7 @@
 #include <array>
 #include <cstdint>
 #include <random>
+#include <string_view>
 #include <thread>
 
 // gx/texture.hpp needs absl, which render-off builds of this target do not link
@@ -68,6 +69,27 @@ protected:
   }
   void TearDown() override { detail::testing::reset(); }
 };
+
+TEST(RenderSettings, ExposureEnvParses) {
+  using detail::ExposureOverride;
+  using detail::parse_exposure_override;
+  EXPECT_EQ(parse_exposure_override("match"), ExposureOverride{.exposure = Exposure::MatchLegacy});
+  EXPECT_EQ(parse_exposure_override("auto"), ExposureOverride{.exposure = Exposure::Auto});
+  EXPECT_EQ(parse_exposure_override("manual"), ExposureOverride{.exposure = Exposure::Manual});
+  EXPECT_EQ(parse_exposure_override("manual:0"), (ExposureOverride{.exposure = Exposure::Manual, .bias = 0.f}));
+  EXPECT_EQ(parse_exposure_override("manual:-1.5"), (ExposureOverride{.exposure = Exposure::Manual, .bias = -1.5f}));
+  EXPECT_EQ(parse_exposure_override("manual:12"), (ExposureOverride{.exposure = Exposure::Manual, .bias = 8.f}));
+  EXPECT_EQ(parse_exposure_override("manual:-40"), (ExposureOverride{.exposure = Exposure::Manual, .bias = -8.f}));
+  for (const std::string_view text :
+       {"", "Match", "manual:", "manual:x", "manual:1x", "manual:nan", "manual:inf", "auto:1", " match"}) {
+    EXPECT_FALSE(parse_exposure_override(text).has_value()) << text;
+  }
+  EXPECT_EQ(detail::parse_tonemap_override("neutral"), Tonemap::PbrNeutral);
+  EXPECT_EQ(detail::parse_tonemap_override("agx"), Tonemap::AgX);
+  for (const std::string_view text : {"", "AgX", "aces", "neutral "}) {
+    EXPECT_FALSE(detail::parse_tonemap_override(text).has_value()) << text;
+  }
+}
 
 TEST_F(RenderLatchTest, ApplyLandsAtNextLatch) {
   apply_settings({.legacyBlend = 0.5f});

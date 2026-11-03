@@ -8,6 +8,7 @@
 #include "render/module.hpp"
 #if AURORA_ENABLE_RENDER
 #include "render/geometry/compact.hpp"
+#include "render/lighting/deferred.hpp"
 #include "render/material/classes.hpp"
 #include "render/post/composite.hpp"
 #endif
@@ -292,8 +293,7 @@ TEST_F(RenderApiTest, MaterialFeaturesBuiltByDefault) {
   for (const auto& [caps, msaa] : devices) {
     EXPECT_EQ(evaluate_support(Feature::TextureMaterials, 1, Settings{}, env(caps, built, msaa)), Supported);
     EXPECT_EQ(evaluate_support(Feature::StochasticTiling, 1, Settings{}, env(caps, built, msaa)), Supported);
-    EXPECT_EQ(evaluate_support(Feature::LegacyMatMaps, 1, Settings{}, env(caps, built, msaa)),
-              unsupported(Reason::NotImplemented));
+    EXPECT_EQ(evaluate_support(Feature::LegacyMatMaps, 1, Settings{}, env(caps, built, msaa)), Supported) << msaa;
     const Settings clamped =
         clamp_settings({.textureMaterials = true, .stochasticTiling = true}, env(caps, built, msaa));
     EXPECT_TRUE(clamped.textureMaterials) << msaa;
@@ -475,22 +475,26 @@ TEST_F(RenderApiTest, PbrTierNeedsFortyFourBytes) {
   EXPECT_EQ(evaluate_support(Feature::Reflections, 0, pbr, env(budget32, all)), unsupported(Reason::ColorBudget));
 }
 
-TEST_F(RenderApiTest, PbrDevBuildOnlyThroughEnv) {
+TEST_F(RenderApiTest, PbrBuiltByDefault) {
   const BuiltOptions& defaults = detail::default_built_options();
+  EXPECT_EQ(defaults[static_cast<size_t>(Feature::Pbr)], 1u << 1);
+  EXPECT_EQ(defaults[static_cast<size_t>(Feature::LegacyMatMaps)], 1u << 1);
   Caps budget32 = full_caps();
   budget32.limits.maxColorAttachmentBytesPerSample = 32;
   Caps budget64 = full_caps();
   budget64.limits.maxColorAttachmentBytesPerSample = 64;
   Settings pbr;
   pbr.pbr = true;
-  EXPECT_EQ(evaluate_support(Feature::Pbr, 0, pbr, env(budget64, defaults)), unsupported(Reason::NotImplemented));
-  EXPECT_FALSE(detail::clamp_settings(pbr, env(budget64, defaults)).pbr);
+  EXPECT_EQ(evaluate_support(Feature::Pbr, 0, pbr, env(full_caps(), defaults)), Supported);
+  EXPECT_EQ(evaluate_support(Feature::Pbr, 0, pbr, env(budget64, defaults)), Supported);
+  EXPECT_EQ(evaluate_support(Feature::Pbr, 0, pbr, env(budget32, defaults)), unsupported(Reason::ColorBudget));
+  EXPECT_EQ(evaluate_support(Feature::Pbr, 0, pbr, env(compat_caps(), defaults)), unsupported(Reason::NeedsCore));
+  EXPECT_EQ(evaluate_support(Feature::Pbr, 0, pbr, env(full_caps(), defaults, 4)), unsupported(Reason::MsaaActive));
+  EXPECT_TRUE(detail::clamp_settings(pbr, env(budget64, defaults)).pbr);
+  EXPECT_FALSE(detail::clamp_settings(pbr, env(budget32, defaults)).pbr);
   EXPECT_EQ(detail::with_pbr_dev_built(defaults, false), defaults);
-  const BuiltOptions dev = detail::with_pbr_dev_built(defaults, true);
-  EXPECT_EQ(evaluate_support(Feature::Pbr, 0, pbr, env(budget64, dev)), Supported);
-  EXPECT_EQ(evaluate_support(Feature::Pbr, 0, pbr, env(budget32, dev)), unsupported(Reason::ColorBudget));
-  EXPECT_TRUE(detail::clamp_settings(pbr, env(budget64, dev)).pbr);
-  EXPECT_FALSE(detail::clamp_settings(pbr, env(budget32, dev)).pbr);
+  EXPECT_EQ(detail::with_pbr_dev_built(defaults, true), defaults);
+  EXPECT_FALSE(detail::clamp_settings(Settings{}, env(full_caps(), defaults)).pbr);
 }
 
 TEST_F(RenderApiTest, LegacyBlendEnvParses) {
@@ -585,14 +589,43 @@ TEST_F(RenderApiTest, PbrReadyFollowsComposite) {
 }
 #endif
 
-TEST_F(RenderApiTest, PbrStaysUnbuiltByDefault) {
-  const BuiltOptions& built = detail::default_built_options();
-  EXPECT_EQ(built[static_cast<size_t>(Feature::Pbr)], 0u);
-  Settings pbr;
-  pbr.pbr = true;
-  EXPECT_EQ(evaluate_support(Feature::Pbr, 0, pbr, env(full_caps(), built)), unsupported(Reason::NotImplemented));
-  EXPECT_FALSE(detail::clamp_settings(pbr, env(full_caps(), built)).pbr);
+#if AURORA_ENABLE_RENDER
+TEST_F(RenderApiTest, PbrReadyFollowsLighting) {
+  struct OverrideReset {
+    ~OverrideReset() {
+      detail::composite::testing::set_ready_override(std::nullopt);
+      detail::lighting::testing::set_ready_override(std::nullopt);
+      webgpu::g_graphicsConfig.surfaceBuffer = false;
+      webgpu::g_graphicsConfig.gbuffer = false;
+    }
+  } reset;
+  detail::testing::set_caps(full_caps());
+  apply_settings({.pbr = true});
+  detail::latch_frame();
+  ASSERT_TRUE(feature_enabled(effective_settings(), Feature::Pbr));
+  webgpu::g_graphicsConfig.gbuffer = true;
+  webgpu::g_graphicsConfig.surfaceBuffer = true;
+  ASSERT_EQ(webgpu::scene_tier(), webgpu::SceneTier::Pbr);
+  detail::composite::testing::set_ready_override(true);
+  EXPECT_FALSE(detail::lighting::ready(effective_settings()));
+  EXPECT_FALSE(feature_ready(Feature::Pbr));
+  detail::lighting::testing::set_ready_override(true);
+  EXPECT_TRUE(feature_ready(Feature::Pbr));
+  detail::composite::testing::set_ready_override(false);
+  EXPECT_FALSE(feature_ready(Feature::Pbr));
+  detail::composite::testing::set_ready_override(std::nullopt);
+  detail::lighting::testing::set_ready_override(std::nullopt);
+  webgpu::g_graphicsConfig.surfaceBuffer = false;
+  webgpu::g_graphicsConfig.gbuffer = false;
+  apply_settings({});
+  detail::latch_frame();
+  EXPECT_TRUE(feature_ready(Feature::Pbr));
+  detail::composite::testing::reset();
+  detail::lighting::deferred::testing::reset();
+  EXPECT_TRUE(feature_ready(Feature::Pbr));
+  gfx::shutdown_pipeline_cache();
 }
+#endif
 
 #if AURORA_ENABLE_RENDER
 TEST_F(RenderApiTest, AoReadyTracksPipelines) {
@@ -794,7 +827,9 @@ TEST_F(RenderApiTest, LegacyMatMapsSetterStores) {
   const Settings built = clamp_settings(request, env(full_caps(), built_all()));
   EXPECT_TRUE(built.legacyMatMaps);
   EXPECT_TRUE(feature_enabled(built, Feature::LegacyMatMaps));
-  const Settings unbuilt = clamp_settings(request, env(full_caps(), detail::default_built_options()));
+  BuiltOptions withoutMaps = detail::default_built_options();
+  withoutMaps[static_cast<size_t>(Feature::LegacyMatMaps)] = 0;
+  const Settings unbuilt = clamp_settings(request, env(full_caps(), withoutMaps));
   EXPECT_FALSE(unbuilt.legacyMatMaps);
   EXPECT_TRUE(unbuilt.textureMaterials);
   EXPECT_FALSE(feature_enabled(unbuilt, Feature::LegacyMatMaps));

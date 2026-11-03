@@ -20,6 +20,7 @@
 #include "gx_ext/surface_table.hpp"
 #include "lighting/clusters.hpp"
 #include "lighting/deferred.hpp"
+#include "lighting/exposure.hpp"
 #include "lighting/openpbr.hpp"
 #include "lighting/sky_probe.hpp"
 #include "material/gx_lookup.hpp"
@@ -112,6 +113,7 @@ void initialize() {
   lighting::openpbr::initialize();
   lighting::deferred::initialize();
   lighting::sky_probe::initialize();
+  lighting::exposure::initialize();
   gx_ext::fwd_env::initialize();
   gx_ext::surface_table::initialize();
   debug::surface_expand::initialize();
@@ -151,6 +153,7 @@ void shutdown() noexcept {
   shaders::shutdown();
   jobs::shutdown();
   hzb::shutdown();
+  lighting::exposure::shutdown();
   lighting::sky_probe::shutdown();
   lighting::deferred::shutdown();
   lighting::openpbr::shutdown();
@@ -181,6 +184,7 @@ void on_worker_frame_begin([[maybe_unused]] uint64_t frameId, [[maybe_unused]] c
   gx_ext::fwd_env::worker_frame_begin(frameId);
   ao::worker_tick(frameId);
   lighting::sky_probe::worker_tick(frameId);
+  lighting::exposure::worker_tick(frameId);
   taa::worker_tick(frameId);
   systems::tick_worker(frameId);
   native_worker_frame_begin();
@@ -242,9 +246,12 @@ bool feature_ready(Feature feature) noexcept {
     return false;
   }
   // PBR shows only through the PBR tier and the composite, so a refused switch or a pending pipeline keeps Applying
+  if (feature == Feature::Pbr && webgpu::scene_tier() != webgpu::SceneTier::Pbr) {
+    return false;
+  }
+  // Without its lighting passes the composite keeps the original shading, so Applying... waits for them
   if (feature == Feature::Pbr &&
-      (webgpu::scene_tier() != webgpu::SceneTier::Pbr || !detail::composite::ready(effective_settings()) ||
-       !detail::lighting::ready(effective_settings()))) {
+      !(detail::composite::ready(effective_settings()) && detail::lighting::ready(effective_settings()))) {
     return false;
   }
 #endif

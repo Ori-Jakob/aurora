@@ -1049,6 +1049,7 @@ protected:
 
 TEST_F(LightDeferredGraph, DeclaresOnPbrSurface) {
   composite::initialize();
+  composite::testing::set_pbr_producers_override(true);
   ASSERT_TRUE(openpbr::resident());
   const auto graph = compile(pbr_settings());
   ASSERT_EQ(status(*graph, deferred::Pass), CullReason::None);
@@ -1086,6 +1087,7 @@ TEST_F(LightDeferredGraph, DeclaresOnPbrSurface) {
 
 TEST_F(LightDeferredGraph, DisabledAtFullBlend) {
   composite::initialize();
+  composite::testing::set_pbr_producers_override(true);
   const auto graph = live_graph(pbr_settings(1.f));
   EXPECT_FALSE(clusters::armed());
   const FrameState state{.graph = graph};
@@ -1105,6 +1107,7 @@ TEST_F(LightDeferredGraph, DisabledAtFullBlend) {
 
 TEST_F(LightDeferredGraph, NoLightHintsDisable) {
   composite::initialize();
+  composite::testing::set_pbr_producers_override(true);
   set_hints(scene_hints({}, false));
   const auto graph = live_graph(pbr_settings(0.f));
   ASSERT_TRUE(clusters::armed());
@@ -1117,6 +1120,7 @@ TEST_F(LightDeferredGraph, NoLightHintsDisable) {
 
 TEST_F(LightDeferredGraph, NonResidentLutsDropToDummy) {
   composite::initialize();
+  composite::testing::set_pbr_producers_override(true);
   const auto graph = live_graph(pbr_settings(0.f));
   ASSERT_TRUE(clusters::armed());
   ASSERT_TRUE(composite::pbr_active() || composite::identity_forced());
@@ -1136,6 +1140,7 @@ TEST_F(LightDeferredGraph, NonResidentLutsDropToDummy) {
 
 TEST_F(LightDeferredGraph, MissingClustersDropsToDummy) {
   composite::initialize();
+  composite::testing::set_pbr_producers_override(true);
   clusters::shutdown();
   const auto graph = live_graph(pbr_settings(0.f));
   EXPECT_NE(status(*graph, deferred::Pass), CullReason::None);
@@ -1145,6 +1150,7 @@ TEST_F(LightDeferredGraph, MissingClustersDropsToDummy) {
 
 TEST_F(LightDeferredGraph, ReadyNeedsLighting) {
   composite::initialize();
+  composite::testing::set_pbr_producers_override(true);
   EXPECT_TRUE(lighting::ready(Settings{}));
   m_settings = pbr_settings();
   EXPECT_FALSE(lighting::ready(m_settings));
@@ -1159,6 +1165,7 @@ TEST_F(LightDeferredGraph, ReadyNeedsLighting) {
 
 TEST_F(LightDeferredGraph, NoActiveConsumerAtFullBlend) {
   composite::initialize();
+  composite::testing::set_pbr_producers_override(true);
   const auto graph = live_graph(pbr_settings(1.f));
   ASSERT_EQ(status(*graph, clusters::Pass), CullReason::None);
   const FrameState state{.graph = graph};

@@ -26,6 +26,10 @@ struct StageData;
 
 namespace aurora::render::detail::lighting {
 [[nodiscard]] bool ready(const Settings& settings) noexcept;
+
+namespace testing {
+void set_ready_override(std::optional<bool> ready) noexcept;
+} // namespace testing
 } // namespace aurora::render::detail::lighting
 
 namespace aurora::render::detail::lighting::deferred {

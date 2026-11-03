@@ -14,6 +14,7 @@
 #include "render/graph_layout.hpp"
 #include "render/jobs.hpp"
 #include "render/lighting/sky_probe.hpp"
+#include "render/lighting/tonemap.hpp"
 #include "render/shader_resolve.hpp"
 #include "render/shaders.hpp"
 #include "render/systems/dispatch.hpp"
@@ -30,6 +31,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1489,6 +1491,94 @@ TEST(RenderShadersGpu, SkyLibraryMatchesCpu) {
         EXPECT_EQ(got(7), 1.0) << i;
       }
     }
+  }
+}
+
+constexpr std::string_view TonemapLibraryWgsl = R"(//#import aurora/tonemap
+@group(0) @binding(0) var<storage, read_write> io: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  let c = vec3f(io[id.x * 4u], io[id.x * 4u + 1u], io[id.x * 4u + 2u]);
+  let s = io[id.x * 4u + 3u];
+  let neutral = tonemap_pbr_neutral(c);
+  let agx = tonemap_agx(c);
+  let split = tonemap_agx_from_inset(tonemap_agx_inset_log2(c) + s);
+  let out = 512u + id.x * 12u;
+  io[out] = neutral.x;
+  io[out + 1u] = neutral.y;
+  io[out + 2u] = neutral.z;
+  io[out + 3u] = agx.x;
+  io[out + 4u] = agx.y;
+  io[out + 5u] = agx.z;
+  io[out + 6u] = split.x;
+  io[out + 7u] = split.y;
+  io[out + 8u] = split.z;
+  io[out + 9u] = tonemap_luminance(agx);
+  io[out + 10u] = select(0.0, 1.0, all(tonemap_apply(c, true) == agx));
+  io[out + 11u] = select(0.0, 1.0, all(tonemap_apply(c, false) == neutral));
+}
+)";
+
+TEST(RenderShadersGpu, TonemapLibraryMatchesCpu) {
+  namespace tonemap = detail::lighting::tonemap;
+  GpuReadback gpu;
+  if (!gpu.start()) {
+    GTEST_SKIP() << "no adapter";
+  }
+  if (gpu.device->adapterInfo.backendType == wgpu::BackendType::Null) {
+    GTEST_SKIP() << "the null backend runs no shaders";
+  }
+  ASSERT_TRUE(register_source("test/tonemap_library", TonemapLibraryWgsl));
+  const PipelineId id = request_compute({.shader = "test/tonemap_library"});
+  ASSERT_EQ(wait(id, WaitNs), PipelineStatus::Ready);
+  constexpr uint32_t Cases = 64;
+  constexpr uint64_t Size = (512 + Cases * 12) * sizeof(float);
+  std::vector<float> io((512 + Cases * 12), 0.f);
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const float inf = std::numeric_limits<float>::infinity();
+  for (uint32_t i = 0; i < Cases; ++i) {
+    const float t = 0.37f * static_cast<float>(i);
+    std::array<float, 3> c{std::exp2(std::sin(t) * 9.f), std::exp2(std::cos(1.3f * t) * 9.f),
+                           std::exp2(std::sin(0.7f * t + 1.f) * 9.f)};
+    if (i % 16 == 3) {
+      c[0] = nan;
+    } else if (i % 16 == 7) {
+      c[1] = inf;
+    } else if (i % 16 == 11) {
+      c[2] = -2.f;
+    } else if (i % 16 == 13) {
+      c = {0.f, 0.f, 0.f};
+    }
+    std::copy(c.begin(), c.end(), io.begin() + i * 4);
+    io[i * 4 + 3] = std::sin(2.1f * t) * 6.f;
+  }
+  const wgpu::ComputePipeline pipeline = compute_pipeline(id);
+  const wgpu::Buffer buffer =
+      gpu.buffer(Size, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst);
+  gpu.device->queue.WriteBuffer(buffer, 0, io.data(), Size);
+  const std::array groups{gpu.group(pipeline, 0, buffer, Size)};
+  const std::vector<uint32_t> words = gpu.run(pipeline, groups, 1, buffer, Size);
+  ASSERT_EQ(words.size(), io.size());
+  const auto got = [&](uint32_t i, uint32_t k) { return std::bit_cast<float>(words[512 + i * 12 + k]); };
+  for (uint32_t i = 0; i < Cases; ++i) {
+    const tonemap::Rgb c{io[i * 4], io[i * 4 + 1], io[i * 4 + 2]};
+    const tonemap::Rgb neutral = tonemap::pbr_neutral(c);
+    const tonemap::Rgb agx = tonemap::agx(c);
+    tonemap::Rgb l = tonemap::agx_inset_log2(c);
+    for (float& v : l) {
+      v += io[i * 4 + 3];
+    }
+    const tonemap::Rgb split = tonemap::agx_from_inset(l);
+    for (uint32_t k = 0; k < 3; ++k) {
+      EXPECT_NEAR(got(i, k), neutral[k], 2e-5f) << i << " neutral " << k;
+      // AgX ends in pow 2.2 near white, so backend log2 and pow precision shows there first
+      EXPECT_NEAR(got(i, 3 + k), agx[k], 1e-4f) << i << " agx " << k;
+      EXPECT_NEAR(got(i, 6 + k), split[k], 1e-4f) << i << " split " << k;
+    }
+    EXPECT_NEAR(got(i, 9), tonemap::luminance(agx), 1e-4f) << i;
+    EXPECT_EQ(got(i, 10), 1.f) << i;
+    EXPECT_EQ(got(i, 11), 1.f) << i;
   }
 }
 

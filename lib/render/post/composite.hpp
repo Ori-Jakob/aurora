@@ -29,7 +29,15 @@ inline constexpr std::string_view NoFogEnv = "AURORA_RENDER_COMPOSITE_NOFOG";
 inline constexpr wgpu::TextureFormat AoFormat = wgpu::TextureFormat::RGBA8Unorm;
 
 // Bindings follow declaration order, so later terms append and never renumber
-enum Binding : uint32_t { BindLegacy = 0, BindFog = 1, BindNormal = 2, BindAo = 3, BindSurface = 4, BindHdr = 5 };
+enum Binding : uint32_t {
+  BindLegacy = 0,
+  BindFog = 1,
+  BindNormal = 2,
+  BindAo = 3,
+  BindSurface = 4,
+  BindHdr = 5,
+  BindExposure = 6,
+};
 
 enum ParamFlags : uint32_t {
   FlagIdentity = 1u << 0,
@@ -37,6 +45,7 @@ enum ParamFlags : uint32_t {
 };
 // Set only while the PBR term can change pixels, so legacyBlend = 1 runs the AO-only path bit for bit
 inline constexpr uint32_t FlagPbr = 1u << 2;
+inline constexpr uint32_t FlagTonemapAgX = 1u << 3;
 
 struct Params {
   uint32_t flags = 0;
@@ -87,11 +96,13 @@ void reset() noexcept;
 void set_flags(std::optional<uint32_t> flags) noexcept;
 void force_params(std::optional<Params> params) noexcept;
 void set_camera_override(std::shared_ptr<const SceneHints> hints) noexcept;
+void set_pbr_producers_override(std::optional<bool> live) noexcept;
+void set_ready_override(std::optional<bool> ready) noexcept;
 [[nodiscard]] bool pbr_active_for(bool live, bool hdrLive, bool classView, const Settings& settings) noexcept;
 [[nodiscard]] std::array<float, 3> legacy_ao(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7,
                                              float ao, float normalAlpha) noexcept;
 [[nodiscard]] std::array<float, 3> legacy_pbr_hdr(std::array<float, 3> legacy, std::array<float, 3> fogColor,
                                                   uint32_t q7, float ao, float normalAlpha, std::array<float, 4> hdr,
-                                                  float legacyBlend) noexcept;
+                                                  float legacyBlend, float exposure, bool agx) noexcept;
 } // namespace testing
 } // namespace aurora::render::detail::composite

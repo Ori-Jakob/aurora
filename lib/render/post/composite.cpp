@@ -6,6 +6,9 @@
 #include "../frame_state.hpp"
 #include "../hints.hpp"
 #include "../lighting/deferred.hpp"
+#include "../lighting/exposure.hpp"
+#include "../lighting/sky_probe.hpp"
+#include "../lighting/tonemap.hpp"
 #include "../pass_context.hpp"
 #include "../scene/overlay.hpp"
 #include "../stage_data.hpp"
@@ -37,7 +40,7 @@ constexpr TexRef Normal{BindNormal};
 constexpr TexRef AoFinal{BindAo};
 constexpr TexRef SurfaceRec{BindSurface};
 constexpr TexRef Hdr{BindHdr};
-constexpr TexRef Color{BindHdr + 1};
+constexpr TexRef Color{BindExposure + 1};
 constexpr uint64_t NoFrame = UINT64_MAX;
 constexpr wgpu::ColorWriteMask RgbMask =
     wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue;
@@ -60,6 +63,8 @@ LatchSlot g_slot;
 std::shared_ptr<const SceneHints> g_cameraOverride;
 std::optional<uint32_t> g_flagsOverride;
 std::optional<Params> g_paramsOverride;
+std::optional<bool> g_producersOverride;
+std::optional<bool> g_readyOverride;
 bool g_contractWarned = false;
 
 std::atomic_uint64_t g_enabledFrame{NoFrame};
@@ -133,6 +138,10 @@ bool params_carry_pbr(std::span<const std::byte> bytes) noexcept {
   }
   std::memcpy(&params, bytes.data(), sizeof(params));
   return (params.flags & FlagPbr) != 0;
+}
+
+bool pbr_producers_live() noexcept {
+  return g_producersOverride.value_or(lighting::exposure::pipelines_live() && lighting::sky_probe::producing());
 }
 
 bool ready_for(const LatchSlot& slot, const Settings& settings) noexcept {
@@ -211,6 +220,11 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
               UseOptions{.missing = Missing::BindDummyBlack, .sampleType = wgpu::TextureSampleType::Uint});
   // Always declared, so every tier and PBR off share one layout; the black dummy has alpha 0 and keeps Sb
   builder.use(resource::SceneHdr, Access::Sampled, Missing::BindDummyBlack);
+  // A white dummy reads 1.0 in every word, so a missing meter shows unexposed H, never black
+  builder.use_buffer(lighting::exposure::Resource, Access::Uniform,
+                     UseOptions{.missing = Missing::BindDummyWhite,
+                                .visibility = wgpu::ShaderStage::Fragment,
+                                .dummySize = lighting::exposure::BufferBytes});
   builder.use(resource::GxColor, Access::ColorRMW);
 }
 
@@ -372,6 +386,17 @@ std::optional<std::string> check_contract(const CompiledGraph& graph) {
                          LegacyTex, legacy.extent.width, legacy.extent.height);
     }
   }
+  if (const CompiledUse* exposure = composite_use(graph, lighting::exposure::Resource);
+      exposure != nullptr && !exposure->staticDummy) {
+    const CompiledResource& buffer = graph.resources[exposure->resource];
+    if (buffer.creator == InvalidNode || buffer.creator != graph.find_node(lighting::exposure::Pass)) {
+      return fmt::format("{} does not come from {}", lighting::exposure::Resource, lighting::exposure::Pass);
+    }
+    if (buffer.bufferSize < lighting::exposure::BufferBytes) {
+      return fmt::format("{} is {} bytes, not {}", lighting::exposure::Resource, buffer.bufferSize,
+                         lighting::exposure::BufferBytes);
+    }
+  }
   for (const std::string_view name : {resource::AoFinal, resource::Fog, resource::GxNormal}) {
     if (name == resource::AoFinal && !aoProduced) {
       continue;
@@ -524,8 +549,10 @@ void on_latch(const PassSetup& latched, const CompiledGraph* graph) {
   // The view the graph was compiled for, so the composite and TAA's declare never disagree
   g_slot.classView = debug::find_view(latched.debug_view()) != nullptr;
   g_slot.aoLive = settings != nullptr && ao_wanted(*settings) && g_slot.aoProduced;
-  g_slot.pbrActive =
-      settings != nullptr && testing::pbr_active_for(g_slot.live, g_slot.hdrLive, g_slot.classView, *settings);
+  // PBR waits for its meter and probe, so no player sees unexposed light while they compile
+  g_slot.pbrActive = settings != nullptr &&
+                     testing::pbr_active_for(g_slot.live, g_slot.hdrLive, g_slot.classView, *settings) &&
+                     pbr_producers_live();
   const bool pbrActive = g_slot.pbrActive;
   lock.unlock();
   if (g_pass != InvalidPassId) {
@@ -535,13 +562,21 @@ void on_latch(const PassSetup& latched, const CompiledGraph* graph) {
     if (pbrActive) {
       params.flags |= FlagPbr;
       params.legacyBlend = settings->legacyBlend;
+      if (settings->tonemap == Tonemap::AgX) {
+        params.flags |= FlagTonemapAgX;
+      }
     }
     params = g_paramsOverride.value_or(params);
     set_pass_params(g_pass, std::as_bytes(std::span{&params, 1}));
   }
 }
 
-bool ready(const Settings& settings) noexcept { return ready_for(latched_slot(), settings); }
+bool ready(const Settings& settings) noexcept {
+  if (g_readyOverride) {
+    return *g_readyOverride;
+  }
+  return ready_for(latched_slot(), settings);
+}
 
 bool ao_ready(const Settings& settings) noexcept {
   const LatchSlot slot = latched_slot();
@@ -604,6 +639,8 @@ void reset() noexcept {
   g_cameraOverride.reset();
   g_flagsOverride.reset();
   g_paramsOverride.reset();
+  g_producersOverride.reset();
+  g_readyOverride.reset();
   g_contractWarned = false;
   g_mismatchWarned.store(false, std::memory_order_relaxed);
   g_copies.store(0, std::memory_order_relaxed);
@@ -620,6 +657,10 @@ void reset() noexcept {
 void set_flags(std::optional<uint32_t> flags) noexcept { g_flagsOverride = flags; }
 
 void force_params(std::optional<Params> params) noexcept { g_paramsOverride = params; }
+
+void set_pbr_producers_override(std::optional<bool> live) noexcept { g_producersOverride = live; }
+
+void set_ready_override(std::optional<bool> ready) noexcept { g_readyOverride = ready; }
 
 bool pbr_active_for(bool live, bool hdrLive, bool classView, const Settings& settings) noexcept {
   return live && hdrLive && pbr_term_wanted(settings) && !classView;
@@ -645,13 +686,16 @@ std::array<float, 3> legacy_ao(std::array<float, 3> legacy, std::array<float, 3>
 }
 
 std::array<float, 3> legacy_pbr_hdr(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7, float ao,
-                                    float normalAlpha, std::array<float, 4> hdr, float legacyBlend) noexcept {
+                                    float normalAlpha, std::array<float, 4> hdr, float legacyBlend, float exposure,
+                                    bool agx) noexcept {
   if (hdr[3] < 0.5f || legacyBlend >= 1.f) {
     return legacy_ao(legacy, fogColor, q7, ao, normalAlpha);
   }
   const bool receiver = std::round(std::clamp(normalAlpha, 0.f, 1.f) * 3.f) >= 1.f;
   const float a = receiver && ao < 1.f ? ao : 1.f;
   const float q = static_cast<float>(std::min(q7, 127u)) / 127.f;
+  const lighting::tonemap::Rgb mapped =
+      lighting::tonemap::apply({hdr[0] * exposure, hdr[1] * exposure, hdr[2] * exposure}, agx);
   std::array<float, 3> out{};
   for (size_t i = 0; i < out.size(); ++i) {
     const float s = legacy[i] - q * fogColor[i];
@@ -659,7 +703,7 @@ std::array<float, 3> legacy_pbr_hdr(std::array<float, 3> legacy, std::array<floa
       return legacy;
     }
     const float sp = std::max(s, 0.f);
-    const float linear = std::clamp(hdr[i], 0.f, 1.f);
+    const float linear = std::clamp(mapped[i], 0.f, 1.f);
     const float encoded = linear <= 0.0031308f ? linear * 12.92f : 1.055f * std::pow(linear, 1.f / 2.4f) - 0.055f;
     const float t = 1.f - legacyBlend;
     out[i] = legacy[i] - sp + (sp * a * (1.f - t) + (1.f - q) * encoded * t);

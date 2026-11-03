@@ -21,7 +21,9 @@
 #include "render/jobs.hpp"
 #include "render/lighting/clusters.hpp"
 #include "render/lighting/deferred.hpp"
+#include "render/lighting/exposure.hpp"
 #include "render/lighting/openpbr.hpp"
+#include "render/lighting/tonemap.hpp"
 #include "render/module.hpp"
 #include "render/pass_context.hpp"
 #include "render/post/composite.hpp"
@@ -174,6 +176,40 @@ void encode_stub_hdr(PassContext& ctx, const void* state) {
   ctx.encoder().CopyBufferToTexture(&from, &to, &extent);
 }
 
+struct StubExposure {
+  std::array<float, 4> words{1.f, 1.f, 1.f, 1.f};
+  int calls = 0;
+};
+
+// Named as the meter, because the composite's contract accepts a real exposure buffer only from it
+void declare_stub_exposure(InternalPassBuilder& builder, const PassSetup&, const void*) {
+  builder.after(phase::Exposure);
+  builder.create_buffer(lighting::exposure::Resource, {.size = lighting::exposure::BufferBytes}, Access::CopyDst);
+}
+
+void encode_stub_exposure(PassContext& ctx, const void* state) {
+  auto& stub = *static_cast<StubExposure*>(const_cast<void*>(state));
+  ++stub.calls;
+  const BufferView view = ctx.buffer(BufRef{0});
+  if (view.buffer) {
+    ctx.encoder().WriteBuffer(view.buffer, view.offset, reinterpret_cast<const uint8_t*>(stub.words.data()),
+                              sizeof(stub.words));
+  }
+}
+
+PassDesc stub_exposure_desc(StubExposure& stub) {
+  return {
+      .name = std::string{lighting::exposure::Pass},
+      .stage = Stage::OpaqueDone,
+      .kind = PassKind::Encoder,
+      .order = 0,
+      .runsWithoutMarker = true,
+      .declare = declare_stub_exposure,
+      .encode = encode_stub_exposure,
+      .state = &stub,
+  };
+}
+
 PassDesc stub_hdr_desc(StubHdr& stub) {
   return {
       .name = "test.hdr",
@@ -234,6 +270,7 @@ TEST(CompositeRules, ParamsAreSixteenBytes) {
   EXPECT_EQ(composite::FlagIdentity, 1u);
   EXPECT_EQ(composite::FlagNoFog, 2u);
   EXPECT_EQ(composite::FlagPbr, 4u);
+  EXPECT_EQ(composite::FlagTonemapAgX, 8u);
   const composite::Params params;
   EXPECT_EQ(params.flags, 0u);
   EXPECT_EQ(params.legacyBlend, 0.f);
@@ -301,6 +338,8 @@ TEST(CompositeRules, InputTableIsAppendOnly) {
   EXPECT_EQ(composite::BindAo, 3u);
   EXPECT_EQ(composite::BindSurface, 4u);
   EXPECT_EQ(composite::BindHdr, 5u);
+  EXPECT_EQ(composite::BindExposure, 6u);
+  EXPECT_EQ(lighting::exposure::Resource, "exposure");
   EXPECT_EQ(composite::LegacyTex, "legacyTex");
   EXPECT_EQ(composite::CopyPass, "legacy.copy");
   EXPECT_EQ(composite::Pass, "composite.main");
@@ -432,21 +471,28 @@ TEST(CompositeRules, PbrMirrorBlendOneIsLegacyBits) {
   for (int i = 0; i < 4000; ++i) {
     MirrorInput in = random_input(rng, i);
     const std::array<float, 3> legacy = composite::testing::legacy_ao(in.l, in.fc, in.q7, in.ao, in.alpha);
-    ASSERT_EQ(composite::testing::legacy_pbr_hdr(in.l, in.fc, in.q7, in.ao, in.alpha, in.hdr, 1.f), legacy) << i;
+    const float e = static_cast<float>(i % 4) + 0.5f;
+    const bool agx = i % 2 == 0;
+    ASSERT_EQ(composite::testing::legacy_pbr_hdr(in.l, in.fc, in.q7, in.ao, in.alpha, in.hdr, 1.f, e, agx), legacy)
+        << i;
     const float lb = static_cast<float>(i % 3) / 2.f;
     in.hdr[3] = static_cast<float>(i % 2) * 0.49f;
-    ASSERT_EQ(composite::testing::legacy_pbr_hdr(in.l, in.fc, in.q7, in.ao, in.alpha, in.hdr, lb), legacy) << i;
+    ASSERT_EQ(composite::testing::legacy_pbr_hdr(in.l, in.fc, in.q7, in.ao, in.alpha, in.hdr, lb, e, agx), legacy) << i;
   }
 }
 
-TEST(CompositeRules, PbrMirrorUsesHdr) {
+TEST(CompositeRules, PbrMirrorUsesExposureAndTonemap) {
   std::mt19937 rng{0xA1BEu};
   size_t fogged = 0;
   size_t bad = 0;
+  constexpr std::array<float, 3> Exposures{0.5f, 1.f, 2.7f};
   for (int i = 0; i < 4000; ++i) {
     const MirrorInput in = random_input(rng, i);
+    const float e = Exposures[static_cast<size_t>(i) % Exposures.size()];
+    const bool agx = (i / 3) % 2 == 0;
     const std::array<float, 3> out =
-        composite::testing::legacy_pbr_hdr(in.l, in.fc, in.q7, in.ao, in.alpha, in.hdr, 0.f);
+        composite::testing::legacy_pbr_hdr(in.l, in.fc, in.q7, in.ao, in.alpha, in.hdr, 0.f, e, agx);
+    const lighting::tonemap::Rgb mapped = lighting::tonemap::apply({in.hdr[0] * e, in.hdr[1] * e, in.hdr[2] * e}, agx);
     const float q = static_cast<float>(in.q7) / 127.f;
     bool guard = false;
     for (size_t c = 0; c < 3; ++c) {
@@ -460,7 +506,7 @@ TEST(CompositeRules, PbrMirrorUsesHdr) {
     bool all = true;
     for (size_t c = 0; c < 3; ++c) {
       const float s = in.l[c] - q * in.fc[c];
-      const float base = (1.f - q) * encode_srgb(in.hdr[c]);
+      const float base = (1.f - q) * encode_srgb(mapped[c]);
       ASSERT_NEAR(out[c], in.l[c] - std::max(s, 0.f) + base, 1e-5f) << i;
       if (s >= 0.f) {
         ASSERT_NEAR(out[c], q * in.fc[c] + base, 1e-5f) << i;
@@ -472,6 +518,48 @@ TEST(CompositeRules, PbrMirrorUsesHdr) {
   }
   EXPECT_GT(fogged, 1000u);
   EXPECT_GT(bad, 0u);
+}
+
+TEST(CompositeRules, LegacyScaleEqualsAo) {
+  std::mt19937 rng{0x5CA1Eu};
+  for (int i = 0; i < 2000; ++i) {
+    MirrorInput in = random_input(rng, i);
+    in.alpha = 1.f;
+    const float q = static_cast<float>(in.q7) / 127.f;
+    bool guard = false;
+    for (size_t c = 0; c < 3; ++c) {
+      guard |= in.l[c] - q * in.fc[c] < -2.f / 255.f;
+    }
+    if (guard) {
+      continue;
+    }
+    const std::array<float, 3> half =
+        composite::testing::legacy_pbr_hdr(in.l, in.fc, in.q7, in.ao, in.alpha, in.hdr, 0.5f, 1.f, false);
+    const std::array<float, 3> pbr =
+        composite::testing::legacy_pbr_hdr(in.l, in.fc, in.q7, in.ao, in.alpha, in.hdr, 0.f, 1.f, false);
+    for (size_t c = 0; c < 3; ++c) {
+      const float sp = std::max(in.l[c] - q * in.fc[c], 0.f);
+      const float pv = pbr[c] - (in.l[c] - sp);
+      ASSERT_NEAR(half[c], in.l[c] - sp + 0.5f * sp * in.ao + 0.5f * pv, 2e-6f) << i;
+    }
+  }
+}
+
+TEST(CompositeRules, NonFiniteHdrMirrorStaysFinite) {
+  constexpr float Inf = std::numeric_limits<float>::infinity();
+  for (const std::array<float, 4> hdr :
+       {std::array<float, 4>{Inf, 1.f, 1.f, 1.f}, std::array<float, 4>{std::nanf(""), 0.f, 2.f, 1.f},
+        std::array<float, 4>{-1.f, 65504.f, 0.f, 1.f}}) {
+    for (const bool agx : {false, true}) {
+      const std::array<float, 3> out =
+          composite::testing::legacy_pbr_hdr({0.5f, 0.5f, 0.5f}, {0.f, 0.f, 0.f}, 0, 1.f, 1.f, hdr, 0.f, 2.f, agx);
+      for (const float c : out) {
+        EXPECT_TRUE(std::isfinite(c));
+        EXPECT_GE(c, 0.f);
+        EXPECT_LE(c, 1.f);
+      }
+    }
+  }
 }
 
 class CompositeDeviceTest : public ::testing::Test {
@@ -537,6 +625,8 @@ protected:
 
   void start_modules() {
     composite::initialize();
+    // No meter or probe module runs here, so tests that want the PBR term stand in for both
+    composite::testing::set_pbr_producers_override(true);
     m_hints = camera_hints();
     composite::testing::set_camera_override(m_hints);
     ao::testing::set_camera_override(m_hints);
@@ -735,6 +825,7 @@ protected:
       for (const uint32_t flags : {0u, uint32_t{composite::FlagIdentity}, uint32_t{composite::FlagNoFog}}) {
         composite::testing::reset();
         composite::testing::set_camera_override(m_hints);
+        composite::testing::set_pbr_producers_override(true);
         composite::testing::set_flags(flags);
         StubAo stub;
         const PassId stubId = register_pass(stub_ao_desc(stub));
@@ -845,13 +936,13 @@ TEST_F(CompositeGraph, BindingOrderLegacyFogNormalAoSurfaceHdr) {
   const NodeId node = graph->find_node(composite::Pass);
   ASSERT_EQ(graph->nodes[node].status, CullReason::None);
   const auto uses = graph->node_uses(node);
-  ASSERT_EQ(uses.size(), 7u);
-  const std::array<std::string_view, 7> names{composite::LegacyTex, resource::Fog,     resource::GxNormal,
-                                              resource::AoFinal,    resource::Surface, resource::SceneHdr,
-                                              resource::GxColor};
+  ASSERT_EQ(uses.size(), 8u);
+  const std::array<std::string_view, 8> names{
+      composite::LegacyTex, resource::Fog,      resource::GxNormal,           resource::AoFinal,
+      resource::Surface,    resource::SceneHdr, lighting::exposure::Resource, resource::GxColor};
   for (size_t i = 0; i < names.size(); ++i) {
     EXPECT_EQ(graph->resources[uses[i].resource].name, names[i]) << i;
-    EXPECT_EQ(uses[i].access, i < 6 ? Access::Sampled : Access::ColorRMW) << i;
+    EXPECT_EQ(uses[i].access, i < 6 ? Access::Sampled : i == 6 ? Access::Uniform : Access::ColorRMW) << i;
     if (i < 4) {
       EXPECT_EQ(uses[i].missing, Missing::DisablePass) << i;
     }
@@ -861,7 +952,106 @@ TEST_F(CompositeGraph, BindingOrderLegacyFogNormalAoSurfaceHdr) {
   EXPECT_EQ(uses[composite::BindSurface].options.sampleType, wgpu::TextureSampleType::Uint);
   EXPECT_EQ(uses[composite::BindHdr].missing, Missing::BindDummyBlack);
   EXPECT_TRUE(uses[composite::BindHdr].staticDummy);
+  EXPECT_EQ(uses[composite::BindExposure].missing, Missing::BindDummyWhite);
+  EXPECT_TRUE(uses[composite::BindExposure].buffer);
+  EXPECT_EQ(uses[composite::BindExposure].options.dummySize, lighting::exposure::BufferBytes);
+  EXPECT_EQ(uses[composite::BindExposure].visibility, wgpu::ShaderStage::Fragment);
+  EXPECT_TRUE(uses[composite::BindExposure].staticDummy);
   EXPECT_EQ(graph->nodes[node].paramsSize, sizeof(composite::Params));
+}
+
+TEST_F(CompositeGraph, BindingOrderAppendsExposure) {
+  ASSERT_TRUE(use_pbr_tier());
+  StubHdr hdr;
+  produce_hdr(hdr);
+  StubExposure meter;
+  register_pass(stub_exposure_desc(meter));
+  const auto graph = live_graph(pbr_settings(0.f, Quality::High));
+  const NodeId node = graph->find_node(composite::Pass);
+  ASSERT_EQ(graph->nodes[node].status, CullReason::None);
+  const auto uses = graph->node_uses(node);
+  ASSERT_EQ(uses.size(), 8u);
+  EXPECT_EQ(graph->resources[uses[composite::BindExposure].resource].name, lighting::exposure::Resource);
+  EXPECT_FALSE(uses[composite::BindExposure].staticDummy);
+  EXPECT_EQ(composite::check_contract(*graph), std::nullopt);
+  EXPECT_TRUE(composite::live());
+}
+
+TEST_F(CompositeGraph, ExposureBindsWhiteDummyUnderTierB) {
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  StubExposure meter;
+  const PassId meterId = register_pass(stub_exposure_desc(meter));
+  const auto graph = live_graph(ao_settings());
+  const NodeId node = graph->find_node(composite::Pass);
+  ASSERT_EQ(graph->nodes[node].status, CullReason::None);
+  EXPECT_FALSE(graph->node_uses(node)[composite::BindExposure].staticDummy);
+  EXPECT_EQ(composite::check_contract(*graph), std::nullopt);
+  unregister_pass(meterId);
+  const auto bare = live_graph(ao_settings());
+  EXPECT_TRUE(bare->node_uses(bare->find_node(composite::Pass))[composite::BindExposure].staticDummy);
+  EXPECT_EQ(composite::check_contract(*bare), std::nullopt);
+}
+
+TEST_F(CompositeGraph, ExposureFromAnotherPassRefuses) {
+  ASSERT_TRUE(use_pbr_tier());
+  StubHdr hdr;
+  produce_hdr(hdr);
+  const TestPass impostor{.name = "t.exposure", .kind = PassKind::Encoder, .declare = [](InternalPassBuilder& b) {
+                            b.after(phase::Exposure);
+                            b.create_buffer(lighting::exposure::Resource, {.size = 16}, Access::CopyDst);
+                          }};
+  register_pass(desc_of(impostor));
+  const auto graph = live_graph(pbr_settings(0.f));
+  const std::optional<std::string> reason = composite::check_contract(*graph);
+  ASSERT_TRUE(reason.has_value());
+  EXPECT_NE(reason->find(lighting::exposure::Pass), std::string::npos) << *reason;
+  EXPECT_FALSE(composite::live());
+}
+
+TEST_F(CompositeGraph, AgxFlagOnlyWhilePbrActive) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  ASSERT_TRUE(use_pbr_tier());
+  StubHdr hdr;
+  produce_hdr(hdr);
+  Settings agx = pbr_settings(0.f, Quality::High);
+  agx.tonemap = Tonemap::AgX;
+  const auto graph = live_graph(agx);
+  ASSERT_TRUE(composite::pbr_active());
+  EXPECT_EQ(latched_params(*graph).flags & (composite::FlagPbr | composite::FlagTonemapAgX),
+            composite::FlagPbr | composite::FlagTonemapAgX);
+  m_settings.tonemap = Tonemap::PbrNeutral;
+  latch(graph.get());
+  EXPECT_EQ(latched_params(*graph).flags & composite::FlagTonemapAgX, 0u);
+  m_settings.tonemap = Tonemap::AgX;
+  m_settings.legacyBlend = 1.f;
+  latch(graph.get());
+  EXPECT_EQ(latched_params(*graph).flags & (composite::FlagPbr | composite::FlagTonemapAgX), 0u);
+  m_settings.legacyBlend = 0.f;
+  composite::testing::set_pbr_producers_override(false);
+  latch(graph.get());
+  EXPECT_FALSE(composite::pbr_active());
+  EXPECT_EQ(latched_params(*graph).flags & (composite::FlagPbr | composite::FlagTonemapAgX), 0u);
+}
+
+TEST_F(CompositeGraph, PbrWaitsForMeterPipelines) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  ASSERT_TRUE(use_pbr_tier());
+  StubHdr hdr;
+  produce_hdr(hdr);
+  composite::testing::set_pbr_producers_override(std::nullopt);
+  const auto graph = live_graph(pbr_settings(0.f, Quality::High));
+  EXPECT_TRUE(composite::hdr_produced(*graph));
+  EXPECT_FALSE(lighting::exposure::pipelines_live());
+  EXPECT_FALSE(composite::pbr_active());
+  EXPECT_EQ(latched_params(*graph).flags & composite::FlagPbr, 0u);
+  composite::testing::set_pbr_producers_override(true);
+  latch(graph.get());
+  EXPECT_TRUE(composite::pbr_active());
 }
 
 TEST_F(CompositeGraph, HdrBindsBlackDummyWithoutLighting) {
@@ -1694,6 +1884,8 @@ struct PixelRun {
   bool hdrEnabled = true;
   std::optional<composite::Params> params;
   uint32_t draws = 1;
+  std::optional<float> exposure;
+  std::function<void(std::array<uint16_t, 4>&, size_t)> hdrEdit;
 };
 
 Pixel control() { return {.color = {200, 180, 160, 255}, .code = 1, .fc = {}, .q7 = 0, .ao = 64}; }
@@ -1833,7 +2025,10 @@ protected:
       std::vector<uint16_t> texels(size_t{hdr.rowBytes / 2} * height, 0);
       for (uint32_t y = 0; y < height; ++y) {
         for (uint32_t x = 0; x < width; ++x) {
-          const std::array<uint16_t, 4> words = hdr_words(pixels[size_t{y} * width + x]);
+          std::array<uint16_t, 4> words = hdr_words(pixels[size_t{y} * width + x]);
+          if (options.hdrEdit) {
+            options.hdrEdit(words, size_t{y} * width + x);
+          }
           std::copy(words.begin(), words.end(), texels.begin() + size_t{y} * (hdr.rowBytes / 2) + size_t{x} * 4);
         }
       }
@@ -1845,6 +2040,12 @@ protected:
       hdrId = register_pass(stub_hdr_desc(hdr));
       lighting::deferred::testing::force_enabled(true);
     }
+    StubExposure meter;
+    PassId meterId = InvalidPassId;
+    if (options.exposure) {
+      meter.words = {*options.exposure, 1.f / *options.exposure, 1.f, 1.f};
+      meterId = register_pass(stub_exposure_desc(meter));
+    }
     const uint32_t draws = composite::testing::counters().draws;
     const auto graph = live_graph(options.settings);
     EXPECT_TRUE(composite::live());
@@ -1855,6 +2056,10 @@ protected:
     }
     if (hdrId != InvalidPassId) {
       unregister_pass(hdrId);
+    }
+    if (meterId != InvalidPassId) {
+      EXPECT_EQ(meter.calls, 1);
+      unregister_pass(meterId);
     }
     lighting::deferred::testing::force_enabled(std::nullopt);
     EXPECT_EQ(composite::testing::counters().draws, draws + options.draws);
@@ -1869,11 +2074,12 @@ protected:
     return {to_byte(out[0]), to_byte(out[1]), to_byte(out[2])};
   }
 
-  static std::array<int, 3> pbr_mirror(const Pixel& p, float legacyBlend) {
+  static std::array<int, 3> pbr_mirror(const Pixel& p, float legacyBlend, float e = 1.f, bool agx = false,
+                                       std::optional<std::array<float, 4>> hdr = std::nullopt) {
     const std::array<float, 3> l{p.color.r / 255.f, p.color.g / 255.f, p.color.b / 255.f};
     const std::array<float, 3> fc{p.fc[0] / 255.f, p.fc[1] / 255.f, p.fc[2] / 255.f};
-    const std::array<float, 3> out =
-        composite::testing::legacy_pbr_hdr(l, fc, p.q7, p.ao / 255.f, p.code / 3.f, hdr_of(p), legacyBlend);
+    const std::array<float, 3> out = composite::testing::legacy_pbr_hdr(l, fc, p.q7, p.ao / 255.f, p.code / 3.f,
+                                                                        hdr.value_or(hdr_of(p)), legacyBlend, e, agx);
     return {to_byte(out[0]), to_byte(out[1]), to_byte(out[2])};
   }
 
@@ -2219,6 +2425,76 @@ TEST_F(CompositeGpu, PbrBlendHalfMatchesMirror) {
     changed += same(out[i], off[i]) ? 0 : 1;
   }
   EXPECT_GT(changed, out.size() / 4);
+}
+
+TEST_F(CompositeGpu, PbrBlendHalfFollowsExposureAndTonemap) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  std::mt19937 rng{53};
+  const auto pixels = grid(64, 48, [&](uint32_t x, uint32_t) { return random_pixel(rng, x % 3 == 0 ? 0 : 1); });
+  for (const float e : {0.5f, 1.f, 2.7f}) {
+    for (const Tonemap tm : {Tonemap::PbrNeutral, Tonemap::AgX}) {
+      SCOPED_TRACE(std::to_string(e) + (tm == Tonemap::AgX ? " agx" : " neutral"));
+      Settings settings = pbr_settings(0.5f, Quality::High);
+      settings.tonemap = tm;
+      const auto out = run_pixels(64, 48, pixels, {.settings = settings, .exposure = e});
+      for (size_t i = 0; i < out.size(); ++i) {
+        if (guard_tie(pixels[i])) {
+          continue;
+        }
+        ASSERT_TRUE(same_rgb(out[i], pbr_mirror(pixels[i], 0.5f, e, tm == Tonemap::AgX), 1)) << i;
+      }
+    }
+  }
+}
+
+TEST_F(CompositeGpu, ExposureDummyIsIdentity) {
+  std::mt19937 rng{59};
+  const auto pixels = grid(64, 48, [&](uint32_t x, uint32_t) { return random_pixel(rng, x % 4 == 0 ? 0 : 1); });
+  const auto dummy = run_pixels(64, 48, pixels, {.settings = pbr_settings(0.f, Quality::High)});
+  const auto one = run_pixels(64, 48, pixels, {.settings = pbr_settings(0.f, Quality::High), .exposure = 1.f});
+  for (size_t i = 0; i < one.size(); ++i) {
+    ASSERT_TRUE(same(dummy[i], one[i])) << i;
+  }
+}
+
+TEST_F(CompositeGpu, AoTermRefactorIsBitIdentical) {
+  std::mt19937 rng{61};
+  const auto pixels = grid(61, 37, [&](uint32_t, uint32_t) { return random_pixel(rng, 0); });
+  const auto out = run_pixels(61, 37, pixels, {.settings = ao_settings()});
+  for (size_t i = 0; i < out.size(); ++i) {
+    if (guard_tie(pixels[i])) {
+      continue;
+    }
+    ASSERT_TRUE(same_rgb(out[i], mirror(pixels[i]), 1)) << i;
+  }
+}
+
+TEST_F(CompositeGpu, NonFiniteHdrStaysFinite) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  const auto pixels = grid(64, 48, [](uint32_t, uint32_t) {
+    Pixel p = control();
+    p.albedo = {200, 200, 200};
+    p.cls = 1;
+    return p;
+  });
+  constexpr std::array<uint16_t, 3> Specials{0x7C00u, 0x7E00u, 0xFC00u};
+  const auto edit = [&](std::array<uint16_t, 4>& words, size_t i) { words[i % 3] = Specials[(i / 3) % 3]; };
+  for (const Tonemap tm : {Tonemap::PbrNeutral, Tonemap::AgX}) {
+    Settings settings = pbr_settings(0.f, Quality::High);
+    settings.tonemap = tm;
+    const auto out = run_pixels(64, 48, pixels, {.settings = settings, .exposure = 2.f, .hdrEdit = edit});
+    for (size_t i = 0; i < out.size(); ++i) {
+      std::array<uint16_t, 4> words = hdr_words(pixels[i]);
+      edit(words, i);
+      const std::array<float, 4> hdr{lighting::openpbr::from_half(words[0]), lighting::openpbr::from_half(words[1]),
+                                     lighting::openpbr::from_half(words[2]), 1.f};
+      ASSERT_TRUE(same_rgb(out[i], pbr_mirror(pixels[i], 0.f, 2.f, tm == Tonemap::AgX, hdr), 1)) << i;
+    }
+  }
 }
 
 TEST_F(CompositeGpu, ClassZeroKeepsLegacyBits) {

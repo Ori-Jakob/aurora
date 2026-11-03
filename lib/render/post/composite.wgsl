@@ -7,6 +7,13 @@ struct CompositeParams {
   pad1: u32,
 }
 
+struct CompositeExposure {
+  e: f32,
+  inv_e: f32,
+  ratio: f32,
+  one: f32,
+}
+
 @group(0) @binding(1) var<uniform> composite_params: CompositeParams;
 
 @group(1) @binding(0) var legacy_tex: texture_2d<f32>;
@@ -15,6 +22,7 @@ struct CompositeParams {
 @group(1) @binding(3) var ao_final: texture_2d<f32>;
 @group(1) @binding(4) var surface_tex: texture_2d<u32>;
 @group(1) @binding(5) var scene_hdr: texture_2d<f32>;
+@group(1) @binding(6) var<uniform> composite_exposure: CompositeExposure;
 
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
@@ -27,13 +35,7 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   // Every input is read at this pixel, so the composite is exact under jitter and at any render size
   let p = vec2i(pos.xy);
   var t = composite_identity_terms();
-  var a = textureLoad(ao_final, composite_texel(p, textureDimensions(ao_final)), 0).r;
-  if ((composite_params.flags & COMPOSITE_FLAG_IDENTITY) != 0u) {
-    a = 1.0;
-  }
-  if (a < 1.0 && gbuf_receiver_code(textureLoad(scene_normal, p, 0).a) >= 1u) {
-    t.ao = a;
-  }
+  t.ao = composite_ao_term(ao_final, scene_normal, p, (composite_params.flags & COMPOSITE_FLAG_IDENTITY) != 0u);
   if ((composite_params.flags & (COMPOSITE_FLAG_PBR | COMPOSITE_FLAG_IDENTITY)) == COMPOSITE_FLAG_PBR) {
     let hdr = textureLoad(scene_hdr, composite_texel(p, textureDimensions(scene_hdr)), 0);
     // H already carries AO on indirect light; alpha 0 (dummy, unlit, class 0) keeps the legacy line
@@ -41,6 +43,8 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
       t.pbr = true;
       t.lb = composite_params.legacy_blend;
       t.h = hdr.rgb;
+      t.e = composite_exposure.e;
+      t.agx = (composite_params.flags & COMPOSITE_FLAG_TONEMAP_AGX) != 0u;
     }
   }
   if (composite_is_identity(t)) {

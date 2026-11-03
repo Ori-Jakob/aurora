@@ -1,5 +1,6 @@
 #include "deferred.hpp"
 
+#include "exposure.hpp"
 #include "openpbr.hpp"
 #include "sky_probe.hpp"
 
@@ -26,10 +27,23 @@
 #include <utility>
 
 namespace aurora::render::detail::lighting {
+namespace {
+std::optional<bool> g_readyOverride;
+} // namespace
+
 // A declared probe joins Applying..., so the first lit frames already have sky light
 bool ready(const Settings& settings) noexcept {
-  return clusters::ready(settings) && deferred::ready(settings) && sky_probe::ready(settings);
+  if (g_readyOverride) {
+    return *g_readyOverride;
+  }
+  // The meter keeps the row at Applying... while it compiles; the composite separately waits for it
+  return clusters::ready(settings) && deferred::ready(settings) && sky_probe::ready(settings) &&
+         exposure::ready(settings);
 }
+
+namespace testing {
+void set_ready_override(std::optional<bool> ready) noexcept { g_readyOverride = ready; }
+} // namespace testing
 } // namespace aurora::render::detail::lighting
 
 namespace aurora::render::detail::lighting::deferred {
@@ -343,6 +357,7 @@ void reset() noexcept {
   g_hintsOverride.reset();
   g_modeOverride.reset();
   g_forceEnabled.reset();
+  lighting::testing::set_ready_override(std::nullopt);
   for (std::atomic_uint32_t* counter : {&g_ran, &g_armed, &g_identity, &g_noLights, &g_notResident, &g_pending}) {
     counter->store(0, std::memory_order_relaxed);
   }
