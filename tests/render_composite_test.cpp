@@ -1611,15 +1611,14 @@ protected:
     publish(webgpu::g_fogRecordBuffer, upload(wgpu::TextureFormat::RGBA8Uint, width, height, fog, "test fog"),
             wgpu::TextureFormat::RGBA8Uint);
     if (options.settings.pbr) {
-      std::vector<uint32_t> surface(pixels.size() * 4, 0);
+      std::vector<uint32_t> surface(pixels.size() * 2, 0);
       for (size_t i = 0; i < pixels.size(); ++i) {
         const Pixel& p = pixels[i];
-        surface[i * 4] = uint32_t{p.albedo[0]} | uint32_t{p.albedo[1]} << 8 | uint32_t{p.albedo[2]} << 16 | 255u << 24;
-        surface[i * 4 + 1] = 217u | uint32_t{p.cls} << 16;
+        surface[i * 2] = uint32_t{p.albedo[0]} | uint32_t{p.albedo[1]} << 8 | uint32_t{p.albedo[2]} << 16 | 255u << 24;
+        surface[i * 2 + 1] = 217u | uint32_t{p.cls} << gx::surface::SlotShift;
       }
-      publish(webgpu::g_surfaceBuffer,
-              upload(wgpu::TextureFormat::RGBA32Uint, width, height, surface, "test surface", 16),
-              wgpu::TextureFormat::RGBA32Uint);
+      publish(webgpu::g_surfaceBuffer, upload(webgpu::SurfaceBufferFormat, width, height, surface, "test surface", 8),
+              webgpu::SurfaceBufferFormat);
     }
     StubAo stub;
     stub.rowBytes = (width * 4 + 255) & ~255u;
