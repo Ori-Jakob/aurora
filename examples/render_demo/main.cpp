@@ -800,6 +800,10 @@ int main(int argc, char* argv[]) {
     // PBR ships no built bit in M9, so only the verification hook can reach the Surface layout
     SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_PBR", "on", false);
   }
+  if (options.unlitCheck) {
+    // Below a blend of 1 the composite shows the light-free preview, so dimming the sun would move nothing
+    SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_LEGACY_BLEND", "1", true);
+  }
   if (options.companionCheck) {
     SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_MAT_MAPS", "on", false);
   }
