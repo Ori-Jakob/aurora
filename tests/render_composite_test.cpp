@@ -867,6 +867,8 @@ TEST_F(CompositeGraph, PbrWithoutAoProducerKeepsGameShadows) {
   EXPECT_FALSE(composite::ao_gate(FrameState{.settings = m_settings, .graph = graph}));
   EXPECT_FALSE(composite::ao_ready(m_settings));
   EXPECT_TRUE(composite::ao_ready(pbr_settings(0.f)));
+  EXPECT_TRUE(composite::ready(ao_settings()));
+  EXPECT_FALSE(composite::ao_ready(ao_settings()));
   StubAo stub;
   register_pass(stub_ao_desc(stub));
   const auto withAo = live_graph(pbr_settings(0.f, Quality::High));
@@ -923,10 +925,35 @@ TEST_F(CompositeGraph, PbrParamsMatchPbrOffWhenInactive) {
 TEST_F(CompositeGraph, BlendChangeKeepsGraphHash) {
   StubAo stub;
   register_pass(stub_ao_desc(stub));
+  constexpr std::string_view HistoryName = "t.history";
+  const TestPass history{
+      .name = "t.history_writer", .kind = PassKind::Compute, .declare = [](InternalPassBuilder& b) {
+        b.after(phase::Ao);
+        b.history("t.history",
+                  {.format = wgpu::TextureFormat::RGBA8Unorm, .extraUsage = wgpu::TextureUsage::TextureBinding},
+                  Access::StorageWrite);
+        b.side_effect();
+      }};
+  register_pass(desc_of(history));
   ASSERT_TRUE(use_pbr_tier());
   const auto first = live_graph(pbr_settings(1.f, Quality::High));
   const NodeId node = first->find_node(composite::Pass);
   const shaders::PipelineStats before = shaders::stats();
+  uint64_t frame = 0;
+  const auto history_kept = [&](const std::shared_ptr<CompiledGraph>& graph) {
+    const FrameState state{.graph = graph};
+    StageData stage = build(state, ++frame);
+    const auto resource = graph->find_resource(HistoryName);
+    if (resource == InvalidResource) {
+      ADD_FAILURE() << "no " << HistoryName << " in the graph";
+      return false;
+    }
+    const bool kept = stage.prev_valid(graph->resources[resource].historySlot);
+    EXPECT_EQ(encode(stage), std::nullopt);
+    return kept;
+  };
+  EXPECT_FALSE(history_kept(first));
+  EXPECT_TRUE(history_kept(first));
   for (const float lb : {0.5f, 0.f, 1.f}) {
     const auto graph = live_graph(pbr_settings(lb, Quality::High));
     EXPECT_EQ(graph->graphHash, first->graphHash) << lb;
@@ -934,7 +961,35 @@ TEST_F(CompositeGraph, BlendChangeKeepsGraphHash) {
     const shaders::PipelineStats now = shaders::stats();
     EXPECT_EQ(now.ready + now.pending + now.failed, before.ready + before.pending + before.failed) << lb;
     EXPECT_EQ(composite::pbr_active(), lb < 1.f && !composite::identity_forced()) << lb;
+    EXPECT_TRUE(history_kept(graph)) << lb;
   }
+}
+
+TEST_F(CompositeGraph, PbrReadyNeedsTheTierWhileTheCompositeIsReady) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  struct SettingsReset {
+    ~SettingsReset() { testing::reset(); }
+  } reset;
+  ASSERT_TRUE(use_pbr_tier());
+  testing::set_caps(caps());
+  testing::set_built_options(Feature::Pbr, 1u << 1);
+  apply_settings(pbr_settings(0.f, Quality::High));
+  const std::shared_ptr<const FrameState> state = latch_frame();
+  ASSERT_TRUE(state != nullptr && state->graph != nullptr);
+  wait_ready(*state->graph);
+  ASSERT_TRUE(feature_enabled(effective_settings(), Feature::Pbr));
+  ASSERT_TRUE(feature_enabled(effective_settings(), Feature::DeferredFog));
+  ASSERT_TRUE(composite::ready(effective_settings()));
+  EXPECT_TRUE(feature_ready(Feature::Pbr));
+  EXPECT_TRUE(feature_ready(Feature::DeferredFog));
+  EXPECT_FALSE(composite::ao_ready(effective_settings()));
+  EXPECT_FALSE(feature_ready(Feature::Ao));
+  ASSERT_TRUE(webgpu::set_scene_tier(webgpu::SceneTier::Base));
+  EXPECT_TRUE(composite::ready(effective_settings()));
+  EXPECT_TRUE(feature_ready(Feature::DeferredFog));
+  EXPECT_FALSE(feature_ready(Feature::Pbr));
 }
 
 TEST_F(CompositeGraph, SurfaceContractMismatchRefuses) {
@@ -1837,6 +1892,7 @@ TEST_F(CompositeGpu, OddExtentCoversEdges) {
     }
   }
 }
+
 Pixel random_pixel(std::mt19937& rng, uint8_t cls) {
   std::uniform_int_distribution<int> byte(0, 255);
   const auto b = [&] { return static_cast<uint8_t>(byte(rng)); };

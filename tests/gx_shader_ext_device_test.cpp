@@ -2428,17 +2428,17 @@ TEST_F(GxShaderExtDevice, CompanionFrameMatchesAnalyticTangents) {
   std::uniform_real_distribution<double> angle{-1.2, 1.2};
   std::uniform_real_distribution<double> step{0.2, 1.5};
   for (uint32_t c = 0; c < 64; ++c) {
-    // A tilted plane with a uv parameterisation; odd cases mirror u
+    // A tilted plane with a uv parameterisation; odd cases mirror u in uv space, so their uv Jacobian is negative
     const double a = angle(rng), b = angle(rng);
     const V3 du{std::cos(a), std::sin(a) * std::sin(b), std::sin(a) * std::cos(b) * 0.3};
     const V3 n = unit(cross(du, V3{0.2 * std::sin(b), std::cos(b), -0.4}));
     const V3 dv = unit(cross(n, du));
-    const double su = (c & 1u) != 0 ? -step(rng) : step(rng);
-    const double sv = step(rng);
-    const V3 dpdu = scale(unit(du), su);
-    const V3 dpdv = scale(dv, sv);
-    const std::array<double, 2> d1{0.7 * step(rng), -0.3 * step(rng)};
-    const std::array<double, 2> d2{0.25 * step(rng), -0.8 * step(rng)};
+    const double mirror = (c & 1u) != 0 ? -1.0 : 1.0;
+    const V3 dpdu = scale(unit(du), step(rng));
+    const V3 dpdv = scale(dv, step(rng));
+    const std::array<double, 2> d1{mirror * 0.7 * step(rng), 0.3 * step(rng)};
+    const std::array<double, 2> d2{-mirror * 0.25 * step(rng), 0.8 * step(rng)};
+    ASSERT_EQ(d1[0] * d2[1] - d2[0] * d1[1] < 0.0, (c & 1u) != 0) << c;
     const V3 dp1 = sub(scale(dpdu, d1[0]), scale(dpdv, -d1[1]));
     const V3 dp2 = sub(scale(dpdu, d2[0]), scale(dpdv, -d2[1]));
     const std::array<double, 4> words{d1[0], d1[1], d2[0], d2[1]};

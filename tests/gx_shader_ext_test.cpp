@@ -1550,10 +1550,11 @@ TEST_F(GxShaderExtTest, AlbedoSubstitutesOnlyLayerPair) {
   EXPECT_NE(plain.find("out.surface = gx_surface_pack(unlit_rgb, 1.0, 0.85, 0.0, "), std::string::npos);
 }
 
-TEST_F(GxShaderExtTest, CompanionPredicateDrivesLayoutAndKind) {
+TEST_F(GxShaderExtTest, CompanionPredicateLeavesTwinAndFallbackLegacy) {
   const ShaderConfig config = layered(modulate());
   const ShaderInfo info = build_shader_info(config);
   EXPECT_TRUE(uses_companions(config, info, PbrTargets));
+  EXPECT_TRUE(info.companionLane);
   EXPECT_FALSE(uses_forward_env(config, PbrTargets));
   RenderExtConfig fwd = config.ext;
   fwd.fwdEnv = 1;
@@ -1568,6 +1569,23 @@ TEST_F(GxShaderExtTest, CompanionPredicateDrivesLayoutAndKind) {
   const PipelineConfig fallback = render_ext::fallback_config(pipeline);
   EXPECT_EQ(fallback.shaderConfig.ext.layer0, 0u);
   EXPECT_FALSE(uses_companions(fallback.shaderConfig, build_shader_info(fallback.shaderConfig), PbrTargets));
+}
+
+TEST_F(GxShaderExtTest, CompanionWithForwardEnvironmentIsRefused) {
+#ifdef NDEBUG
+  GTEST_SKIP() << "the pipeline CHECK is compiled out of release builds";
+#else
+  PipelineConfig config{};
+  config.shaderConfig = layered(modulate());
+  config.shaderConfig.ext.fwdEnv = 1;
+  const gfx::RenderTargetLayout layout =
+      gfx::compose_scene_layout({.gbuffer = true, .surface = true}, {.color = wgpu::TextureFormat::BGRA8Unorm,
+                                                                     .depth = wgpu::TextureFormat::Depth32Float,
+                                                                     .size = {64, 64, 1},
+                                                                     .samples = 1});
+  EXPECT_DEATH(static_cast<void>(build_pipeline(config, layout, PipelineOptions{}, {}, {}, "companion fwdEnv")),
+               "companion maps and the forward environment");
+#endif
 }
 } // namespace
 } // namespace aurora::gx

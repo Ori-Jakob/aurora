@@ -1145,6 +1145,7 @@ TEST_F(RenderGxExt, FwdEnvPublisherSortsAfterComposite) {
   const std::optional<std::string> contract = detail::composite::check_contract(graph);
   EXPECT_FALSE(contract.has_value()) << contract.value_or("");
 }
+
 gfx::RenderTargetLayout pbr_layout() {
   return gfx::compose_scene_layout({.gbuffer = true, .surface = true}, {.color = wgpu::TextureFormat::BGRA8Unorm,
                                                                         .depth = wgpu::TextureFormat::Depth32Float,
