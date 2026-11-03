@@ -1049,14 +1049,15 @@ bool switch_pending(uint8_t end) noexcept {
 // Every path through the frame reaches this once, so the HUD never lands in the scene targets
 void switch_to_output(bool reopen) {
   auto& frame = current_frame_packet();
-  g_recorder.composed = true;
   if (g_recorder.currentRenderPass != UINT32_MAX) {
     auto& pass = current_render_passes()[g_recorder.currentRenderPass];
     if (!pass.sealed) {
       pass.discardable = !pass.has_consumer() && !pass.has_content();
+      // Sealed before the switch marks the frame composed, so deferred overlays still go back into this scene pass
       enqueue_pass(frame, g_recorder.currentRenderPass);
     }
   }
+  g_recorder.composed = true;
   const auto composeIndex = static_cast<uint32_t>(frame.sceneComposes.size());
   render::detail::SceneComposeData& data = frame.sceneComposes.emplace_back();
   data.frameId = frame.frameId;

@@ -9,6 +9,7 @@
 #include "gfx/recording.hpp"
 #include "gfx/texture.hpp"
 #include "gx/gx.hpp"
+#include "gx/pipeline.hpp"
 #include "gx/shader_info.hpp"
 #include "render/debug/views.hpp"
 #include "render/frame_state.hpp"
@@ -436,6 +437,49 @@ TEST_F(SceneSplit, OutputPixelRectsScaleToSceneTarget) {
   // Past the compose the pass is output-sized, so output pixels pass through untouched
   EXPECT_EQ(gx::map_render_viewport(full).width, static_cast<float>(OutputWidth));
   EXPECT_EQ(gx::map_logical_scissor(fullScissor).width, static_cast<int32_t>(OutputWidth));
+}
+
+size_t draws_named(const gfx::detail::RenderPass& pass, uint32_t id) {
+  return static_cast<size_t>(std::ranges::count_if(pass.commands, [id](const gfx::detail::Command& command) {
+    if (command.type != gfx::detail::CommandType::Draw) {
+      return false;
+    }
+    gx::DrawData draw;
+    std::memcpy(&draw, command.data.draw.payload.data(), sizeof(draw));
+    return draw.vtxCount == id;
+  }));
+}
+
+TEST_F(SceneSplit, DeferredOverlaysRestoredBeforeTheSwitch) {
+  upscale::testing::set_split_env(2.f);
+  for (const std::optional<Stage> marker :
+       {std::optional{Stage::PrePost}, std::optional{Stage::BeforeHud}, std::optional<Stage>{}}) {
+    SCOPED_TRACE(marker ? stage_name(*marker) : "finish");
+    start_frame();
+    ASSERT_TRUE(upscale::split_live());
+    gfx::record_stage(Stage::SceneBegin);
+    const gfx::OverlayStats before = gfx::overlay_stats();
+    ASSERT_TRUE(gfx::set_overlay_target(true));
+    gx::DrawData draw;
+    draw.vtxCount = 7;
+    draw.instanceCount = 1;
+    gfx::push_draw_command(draw);
+    gfx::set_overlay_target(false);
+    if (marker) {
+      gfx::record_stage(*marker);
+    }
+    end_frame();
+    const gfx::OverlayStats after = gfx::overlay_stats();
+    EXPECT_EQ(after.restoredLate - before.restoredLate, 1u);
+    EXPECT_EQ(after.dropped - before.dropped, 0u);
+    EXPECT_EQ(gfx::detail::testing::overlay_command_count(), 0u);
+    ASSERT_EQ(count_ops(FrameOpType::SceneCompose), 1u);
+    ASSERT_FALSE(m_frame.renderPasses.empty());
+    const auto& scene = m_frame.renderPasses.front();
+    EXPECT_EQ(scene.colorAttachments[gfx::SceneColorAttachmentIndex].view.Get(), webgpu::scene_color().view.Get());
+    EXPECT_EQ(draws_named(scene, 7), 1u);
+    EXPECT_FALSE(scene.discardable);
+  }
 }
 
 TEST(UpscaleRules, OutputPixelScale) {
