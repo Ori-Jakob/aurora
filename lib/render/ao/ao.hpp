@@ -170,7 +170,8 @@ constexpr std::array<float, 2> falloff_bounds(float lo, float hi, float weight, 
 }
 
 constexpr float apply_strength(float visibility, float strength, float floor) noexcept {
-  return std::max(1.f - strength * (1.f - visibility), 1.f - std::min(strength, 1.f) * (1.f - floor));
+  const float lowest = strength >= 1.f ? floor : 1.f - strength * (1.f - floor);
+  return std::max(1.f - strength * (1.f - visibility), lowest);
 }
 
 struct EnvOverrides {

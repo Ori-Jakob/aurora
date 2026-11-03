@@ -1180,6 +1180,17 @@ TEST(AoRules, StrengthCurve) {
   }
 }
 
+TEST(AoRules, FloorIsExactAtFullStrength) {
+  const float floor = ao::MinVisibility;
+  for (const float k : {1.f, 1.25f, 1.5f, 2.f}) {
+    EXPECT_EQ(ao::apply_strength(0.f, k, floor), floor) << k;
+    EXPECT_EQ(ao::apply_strength(floor, k, floor), floor) << k;
+    EXPECT_EQ(std::lround(ao::apply_strength(0.f, k, floor) * 255.f), 51) << k;
+  }
+  EXPECT_GE(ao::apply_strength(0.f, 1.f, floor) * 255.f, 51.f);
+  EXPECT_FLOAT_EQ(ao::apply_strength(0.f, 0.5f, floor), 1.f - 0.5f * (1.f - floor));
+}
+
 TEST(AoRules, TuningDefaultsMatchConstants) {
   EXPECT_EQ(Settings{}.aoRadius, ao::RadiusMetres);
   EXPECT_EQ(Settings{}.aoStrength, 1.f);
@@ -3001,6 +3012,30 @@ TEST_F(AoDenoiseGpu, MovingOccluderTrailBounded) {
     }
   }
   EXPECT_EQ(checked, 32u);
+}
+
+TEST_F(AoDenoiseGpu, DeoccludedHistoryReachesOne) {
+  begin(frontal_rig(64, 48, 500.0));
+  const auto patch = [](uint32_t x, uint32_t y) { return x >= 8 && x < 24 && y >= 6 && y < 18; };
+  std::vector<HistoryTexel> history;
+  for (uint64_t frame = 1; frame <= 112; ++frame) {
+    history = step(frame, [&](uint32_t x, uint32_t y, uint8_t e) {
+      const double occluded = frame <= 16 ? 0.4 : 0.99;
+      return raw_of(frame <= 48 && patch(x, y) ? occluded : 1.0, e);
+    });
+  }
+  ASSERT_EQ(history.size(), m_raw.size());
+  size_t checked = 0;
+  for (uint32_t y = 8; y < 16; ++y) {
+    for (uint32_t x = 10; x < 22; ++x) {
+      const float ao = history[size_t{y} * m_gridWidth + x].ao;
+      EXPECT_EQ(ao, 1.f) << x << "," << y;
+      EXPECT_EQ(std::lround(ao * 255.f), 255) << x << "," << y;
+      ++checked;
+    }
+  }
+  EXPECT_EQ(checked, 96u);
+  EXPECT_EQ(ao::denoise::testing::counters().temporalResets, 1u);
 }
 
 TEST_F(AoDenoiseGpu, MotionContrastCapsSamples) {

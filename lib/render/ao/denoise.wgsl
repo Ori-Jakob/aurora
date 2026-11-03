@@ -157,7 +157,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let cap = min(ao_temporal_cap(lag, contrast), ao_params.max_samples);
   let n = select(1.0, min(history_n + 1.0, max(floor(cap), 1.0)), valid);
   let clipped = clamp(history_ao, d - box, d + box);
-  let ao = select(d, clipped + (d - clipped) / n, valid);
+  let blended = select(d, clipped + (d - clipped) / n, valid);
+  // f16 steps below 1 are 2^-11, so an open texel would otherwise never leave 254
+  let ao = select(blended, min(max(blended, clipped + 1.0 / 2048.0), 1.0), valid && d >= 1.0);
   textureStore(ao_history, id.xy, vec4f(ao, n, log_z, edges));
 //#endif
 }

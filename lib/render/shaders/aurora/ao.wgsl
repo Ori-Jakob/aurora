@@ -138,5 +138,7 @@ fn ao_temporal_cap(lag: f32, contrast_px: f32) -> f32 {
 
 // Strength scales the darkening; above 1 it deepens mid-tones but stops at the floor
 fn ao_apply_strength(v: f32, k: f32, floor_value: f32) -> f32 {
-  return max(1.0 - k * (1.0 - v), 1.0 - min(k, 1.0) * (1.0 - floor_value));
+  // At full strength the floor is the constant itself, so every GPU packs it to the same code
+  let lowest = select(1.0 - k * (1.0 - floor_value), floor_value, k >= 1.0);
+  return max(1.0 - k * (1.0 - v), lowest);
 }
