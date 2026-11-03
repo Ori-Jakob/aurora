@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bitset>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -94,6 +95,7 @@ uint64_t current_bind_generation() noexcept { return 1; }
 GXState::CopyTextureRef resolve_copy_texture(const GXState::CopyTextureKey& key) noexcept {
   auto& ref = g_gxState.copyTextures[key.dest];
   ++ref.revision;
+  ref.key = key;
   return ref;
 }
 } // namespace texture
@@ -116,9 +118,20 @@ void evict_copy_texture(const void* dest) noexcept {
 }
 void shutdown() noexcept {}
 Vec2<uint32_t> logical_fb_size() noexcept { return {640, 480}; }
-Vec2<float> output_pixel_scale() noexcept { return {1.f, 1.f}; }
-gfx::Viewport map_render_viewport(const gfx::Viewport& viewport) noexcept { return viewport; }
-gfx::ClipRect map_render_scissor(const gfx::ClipRect& scissor) noexcept { return scissor; }
+Vec2<float> g_testOutputPixelScale{1.f, 1.f};
+Vec2<float> output_pixel_scale() noexcept { return g_testOutputPixelScale; }
+gfx::Viewport map_render_viewport(const gfx::Viewport& viewport) noexcept {
+  const auto [x, y] = g_testOutputPixelScale;
+  return {viewport.left * x, viewport.top * y, viewport.width * x, viewport.height * y, viewport.znear, viewport.zfar};
+}
+gfx::ClipRect map_render_scissor(const gfx::ClipRect& scissor) noexcept {
+  const auto [x, y] = g_testOutputPixelScale;
+  const auto left = static_cast<int32_t>(std::floor(static_cast<float>(scissor.x) * x));
+  const auto top = static_cast<int32_t>(std::floor(static_cast<float>(scissor.y) * y));
+  const auto right = static_cast<int32_t>(std::ceil(static_cast<float>(scissor.x + scissor.width) * x));
+  const auto bottom = static_cast<int32_t>(std::ceil(static_cast<float>(scissor.y + scissor.height) * y));
+  return {left, top, right - left, bottom - top};
+}
 gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcept { return logicalViewport; }
 gfx::ClipRect map_logical_scissor(const gfx::ClipRect& logicalScissor) noexcept { return logicalScissor; }
 void set_logical_viewport(const gfx::Viewport& viewport) noexcept {

@@ -1,5 +1,6 @@
 #include "settings.hpp"
 
+#include "ao/ao.hpp"
 #include "frame_state.hpp"
 #include "graph.hpp"
 #include "graph_api.hpp"
@@ -13,7 +14,6 @@
 #include "../gx/texture.hpp"
 #include "../logging.hpp"
 #include "../webgpu/caps.hpp"
-#include "ao/ao.hpp"
 
 #if AURORA_ENABLE_RENDER
 #include "debug/debug.hpp"

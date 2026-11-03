@@ -319,13 +319,17 @@ TEST(AoRules, RepresentativeTexelClamped) {
 }
 
 TEST(AoRules, DevBuiltOnlyWithEnv) {
-  const BuiltOptions& base = default_built_options();
+  constexpr size_t AoIndex = static_cast<size_t>(Feature::Ao);
+  BuiltOptions base = default_built_options();
+  base[AoIndex] &= ~ao::BuiltOptionMask;
+  ASSERT_NE(base, default_built_options());
   EXPECT_EQ(ao::with_dev_built(base, std::nullopt), base);
   EXPECT_EQ(ao::with_dev_built(base, Quality::Off), base);
-  for (const Quality quality : {Quality::Low, Quality::High, Quality::Ultra}) {
+  for (const Quality quality : {Quality::Low, Quality::Medium, Quality::High, Quality::Ultra}) {
     const BuiltOptions built = ao::with_dev_built(base, quality);
+    EXPECT_EQ(built[AoIndex] & ao::BuiltOptionMask, ao::BuiltOptionMask) << static_cast<int>(quality);
     for (size_t i = 0; i < built.size(); ++i) {
-      const uint32_t want = static_cast<Feature>(i) == Feature::Ao ? base[i] | ao::BuiltOptionMask : base[i];
+      const uint32_t want = i == AoIndex ? base[i] | ao::BuiltOptionMask : base[i];
       EXPECT_EQ(built[i], want) << feature_name(static_cast<Feature>(i));
     }
   }

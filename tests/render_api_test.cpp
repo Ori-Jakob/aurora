@@ -2,10 +2,10 @@
 
 #include "gfx/pipeline_cache.hpp"
 #include "gfx/scene_targets.hpp"
+#include "render/ao/ao.hpp"
 #include "render/debug/debug.hpp"
 #include "render/frame_state.hpp"
 #include "render/module.hpp"
-#include "render/ao/ao.hpp"
 #if AURORA_ENABLE_RENDER
 #include "render/geometry/compact.hpp"
 #include "render/post/composite.hpp"

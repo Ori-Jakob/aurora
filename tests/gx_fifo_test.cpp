@@ -30,6 +30,7 @@ extern std::atomic_uint32_t g_testLogErrors;
 
 namespace aurora::gx {
 extern uint32_t g_testPipelineBuildCount;
+extern Vec2<float> g_testOutputPixelScale;
 } // namespace aurora::gx
 
 namespace aurora::gfx {
@@ -4811,6 +4812,64 @@ TEST_F(GXFifoTest, ScissorRender_EncodesAuroraOverride) {
   EXPECT_EQ(g_gxState.renderScissor.y, 40);
   EXPECT_EQ(g_gxState.renderScissor.width, 800);
   EXPECT_EQ(g_gxState.renderScissor.height, 600);
+}
+
+struct ScopedOutputPixelScale {
+  explicit ScopedOutputPixelScale(aurora::Vec2<float> scale) { aurora::gx::g_testOutputPixelScale = scale; }
+  ~ScopedOutputPixelScale() { aurora::gx::g_testOutputPixelScale = {1.f, 1.f}; }
+  ScopedOutputPixelScale(const ScopedOutputPixelScale&) = delete;
+  ScopedOutputPixelScale& operator=(const ScopedOutputPixelScale&) = delete;
+};
+
+TEST_F(GXFifoTest, RenderPixelRects_FollowSplitSceneScale) {
+  GXSetViewportRender(100.0f, 50.0f, 1280.0f, 720.0f, 0.0f, 1.0f);
+  GXSetScissorRender(100, 40, 800, 600);
+  const auto bytes = capture_fifo();
+
+  const ScopedOutputPixelScale scale({0.5f, 0.75f});
+  reset_gx_state();
+  decode_fifo(bytes);
+
+  EXPECT_FLOAT_EQ(g_gxState.renderViewport.left, 50.0f);
+  EXPECT_FLOAT_EQ(g_gxState.renderViewport.top, 37.5f);
+  EXPECT_FLOAT_EQ(g_gxState.renderViewport.width, 640.0f);
+  EXPECT_FLOAT_EQ(g_gxState.renderViewport.height, 540.0f);
+  EXPECT_FLOAT_EQ(g_gxState.renderViewport.znear, 0.0f);
+  EXPECT_FLOAT_EQ(g_gxState.renderViewport.zfar, 1.0f);
+  EXPECT_EQ(g_gxState.renderScissor.x, 50);
+  EXPECT_EQ(g_gxState.renderScissor.y, 30);
+  EXPECT_EQ(g_gxState.renderScissor.width, 400);
+  EXPECT_EQ(g_gxState.renderScissor.height, 450);
+}
+
+TEST_F(GXFifoTest, NativeTexCopy_FollowsSplitSceneScale) {
+  void* const dest = reinterpret_cast<void*>(0x5678);
+  GXSetTexCopySrc(0, 0, 640, 480);
+  GXSetTexCopyDst(640, 480, GX_TF_RGBA8, GX_FALSE);
+  GXCopyTex(dest, GX_FALSE);
+  const auto bytes = capture_fifo();
+
+  struct Case {
+    AuroraViewportPolicy policy;
+    aurora::Vec2<float> scale;
+    u32 width;
+    u32 height;
+  };
+  for (const Case& c :
+       {Case{AURORA_VIEWPORT_NATIVE, {1.f, 1.f}, 640, 480}, Case{AURORA_VIEWPORT_NATIVE, {0.5f, 0.75f}, 320, 360},
+        Case{AURORA_VIEWPORT_FIT, {0.5f, 0.75f}, 640, 480}}) {
+    SCOPED_TRACE(::testing::Message() << "policy " << c.policy << " scale " << c.scale.x << "x" << c.scale.y);
+    const ScopedOutputPixelScale scale(c.scale);
+    reset_gx_state();
+    g_gxState.viewportPolicy = c.policy;
+    decode_fifo(bytes);
+
+    const auto it = g_gxState.copyTextures.find(dest);
+    ASSERT_NE(it, g_gxState.copyTextures.end());
+    EXPECT_EQ(it->second.key.width, c.width);
+    EXPECT_EQ(it->second.key.height, c.height);
+    EXPECT_EQ(it->second.key.format, GX_TF_RGBA8);
+  }
 }
 
 // --- GXLoadLightObjImm (XF 0x600-0x67F) ---

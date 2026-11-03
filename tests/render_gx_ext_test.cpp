@@ -15,8 +15,8 @@
 #include "render/gx_ext/records.hpp"
 #include "render/gx_ext/unlit.hpp"
 #include "render/hints.hpp"
-#include "render/post/composite.hpp"
 #include "render/material/registry.hpp"
+#include "render/post/composite.hpp"
 #include "render/scene/classifier.hpp"
 #include "webgpu/gpu.hpp"
 

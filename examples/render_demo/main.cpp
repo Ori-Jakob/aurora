@@ -793,7 +793,7 @@ int main(int argc, char* argv[]) {
   }
 
   if (options.aoCheck || options.fwdEnvCheck) {
-    // apply_settings alone cannot reach AO before its built bits ship, so the check builds it through the env
+    // The checks run at AO High whatever the saved settings say
     SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_AO", "high", false);
   }
   if (options.unlitCheck || options.companionCheck) {
