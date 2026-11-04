@@ -88,6 +88,9 @@ void set_cpu_zone_timing(uint32_t timing) noexcept;
 void cpu_zone_record(CpuZone zone, uint64_t ns) noexcept;
 void set_array_immutable(uint64_t address, uint32_t size, bool le, uint32_t generation) noexcept;
 void release_array_immutable(uint64_t address, uint32_t generation) noexcept;
+using ReleaseListener = void (*)(uintptr_t begin, uint32_t size) noexcept;
+// Only while the FIFO is drained; a release then reports the declared range it evicts
+void set_release_listener(ReleaseListener listener) noexcept;
 // Only while the FIFO is drained
 void reset_immutable_arrays() noexcept;
 void init_immutable_arrays() noexcept;

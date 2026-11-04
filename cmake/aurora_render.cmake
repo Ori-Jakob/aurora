@@ -187,6 +187,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/scene/classifier.hpp
         lib/render/scene/classify.cpp
         lib/render/scene/classify.hpp
+        lib/render/scene/gc.cpp
+        lib/render/scene/gc.hpp
         lib/render/scene/identity.cpp
         lib/render/scene/identity.hpp
         lib/render/scene/motion.cpp

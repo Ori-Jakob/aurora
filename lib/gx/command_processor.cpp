@@ -213,6 +213,7 @@ struct Arena {
   bool reset = false;
 } g_arena;
 ImmutableArrayMode g_immutableMode = ImmutableArrayMode::On;
+std::atomic<ReleaseListener> g_releaseListener{nullptr};
 bool g_warnedOverlap = false;
 bool g_warnedStaleRelease = false;
 bool g_warnedArenaFull = false;
@@ -1650,7 +1651,14 @@ void release_array_immutable(uint64_t address, uint32_t generation) noexcept {
                generation, it->second.generation);
     }
   }
+  if (const ReleaseListener listener = g_releaseListener.load(std::memory_order_relaxed); listener != nullptr) {
+    listener(it->first, it->second.size);
+  }
   evict_immutable(it);
+}
+
+void set_release_listener(ReleaseListener listener) noexcept {
+  g_releaseListener.store(listener, std::memory_order_relaxed);
 }
 
 void reset_immutable_arrays() noexcept {

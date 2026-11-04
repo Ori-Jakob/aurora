@@ -321,11 +321,15 @@ std::string format_retained_line(const RetainedFrame& frame) {
       "\"transient\": {}, \"late\": {}, \"instances\": {}, \"statics\": {}, \"created\": {}, \"rekeyed\": {}, "
       "\"newSubId\": {}, \"newOccurrence\": {}, \"relatched\": {}, \"staticRestream\": {}, \"signatureMisses\": {}, "
       "\"reorigins\": {}, \"overflow\": {}, \"droppedEntries\": {}, \"undeliveredStatics\": {}, "
-      "\"lostCaptures\": {}, \"resyncs\": {}, \"eventsPending\": {}}}\n",
+      "\"lostCaptures\": {}, \"resyncs\": {}, \"eventsPending\": {}, \"evictedDynamic\": {}, \"evictedStatic\": {}, "
+      "\"evictedReleased\": {}, \"recreatedStatic\": {}, \"recreatedDynamic\": {}, \"pendingSweeps\": {}, "
+      "\"releaseOverflow\": {}}}\n",
       frame.frame, frame.active, frame.sceneFrame, frame.epoch, frame.entries, frame.captureOnly, frame.transient,
       frame.late, frame.instances, frame.statics, frame.created, frame.rekeyed, frame.newSubId, frame.newOccurrence,
       frame.relatched, frame.staticRestream, frame.signatureMisses, frame.reorigins, frame.overflow,
-      frame.droppedEntries, frame.undeliveredStatics, frame.lostCaptures, frame.resyncs, frame.eventsPending);
+      frame.droppedEntries, frame.undeliveredStatics, frame.lostCaptures, frame.resyncs, frame.eventsPending,
+      frame.evictedDynamic, frame.evictedStatic, frame.evictedReleased, frame.recreatedStatic, frame.recreatedDynamic,
+      frame.pendingSweeps, frame.releaseOverflow);
 }
 
 std::string format_retained_summary(std::span<const RetainedFrame> frames) {
@@ -345,11 +349,23 @@ std::string format_retained_summary(std::span<const RetainedFrame> frames) {
   uint64_t droppedEntries = 0;
   uint64_t lostCaptures = 0;
   uint64_t resyncs = 0;
+  uint64_t recreatedStatic = 0;
+  uint64_t recreatedDynamic = 0;
+  uint64_t evictedDynamic = 0;
+  uint64_t evictedStatic = 0;
+  uint64_t evictedReleased = 0;
+  uint64_t releaseOverflow = 0;
+  uint32_t peakSweeps = 0;
   for (const RetainedFrame& frame : frames) {
     entries += frame.entries;
     transient += frame.transient;
     captureOnly += frame.captureOnly;
     peakLive = std::max(peakLive, frame.instances);
+    evictedDynamic += frame.evictedDynamic;
+    evictedStatic += frame.evictedStatic;
+    evictedReleased += frame.evictedReleased;
+    releaseOverflow += frame.releaseOverflow;
+    peakSweeps = std::max(peakSweeps, frame.pendingSweeps);
     if (frame.frame < RetainedGateFirstFrame) {
       continue;
     }
@@ -365,17 +381,21 @@ std::string format_retained_summary(std::span<const RetainedFrame> frames) {
     droppedEntries += frame.droppedEntries;
     lostCaptures += frame.lostCaptures;
     resyncs += frame.resyncs;
+    recreatedStatic += frame.recreatedStatic;
+    recreatedDynamic += frame.recreatedDynamic;
   }
   const double transientShare = entries != 0 ? static_cast<double>(transient) / static_cast<double>(entries) : 0.0;
   return fmt::format(
       "aurora_gxreplay: retained: frames {}, entries {}, captureOnly {}, transient {}, transientShare {:.4f}, "
-      "peakLive {}, undeliveredStatics {}; gate over {} frames from {}: rekeyed {}, relatched {}, staticRestream {}, "
-      "signatureMisses {}; newSubId {}, newOccurrence {}, reorigins {}, overflow {}, droppedEntries {}, "
-      "lostCaptures {}, resyncs {}\n",
+      "peakLive {}, undeliveredStatics {}, evicted dynamic {} static {} released {}, peakSweeps {}, "
+      "releaseOverflow {}; gate over {} frames from {}: rekeyed {}, recreatedStatic {}, relatched {}, "
+      "staticRestream {}, signatureMisses {}; newSubId {}, newOccurrence {}, recreatedDynamic {}, reorigins {}, "
+      "overflow {}, droppedEntries {}, lostCaptures {}, resyncs {}\n",
       frames.size(), entries, captureOnly, transient, transientShare, peakLive,
-      frames.empty() ? 0u : frames.back().undeliveredStatics, gateFrames, RetainedGateFirstFrame, rekeyed, relatched,
-      staticRestream, signatureMisses, newSubId, newOccurrence, reorigins, overflow, droppedEntries, lostCaptures,
-      resyncs);
+      frames.empty() ? 0u : frames.back().undeliveredStatics, evictedDynamic, evictedStatic, evictedReleased,
+      peakSweeps, releaseOverflow, gateFrames, RetainedGateFirstFrame, rekeyed, recreatedStatic, relatched,
+      staticRestream, signatureMisses, newSubId, newOccurrence, recreatedDynamic, reorigins, overflow, droppedEntries,
+      lostCaptures, resyncs);
 }
 
 std::string format_timing_json(std::span<const FrameTiming> timings) {

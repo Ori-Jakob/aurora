@@ -519,6 +519,13 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
             .lostCaptures = counts.lostCaptures,
             .resyncs = counts.resyncs,
             .eventsPending = counts.eventsPending,
+            .evictedDynamic = counts.evictedDynamic,
+            .evictedStatic = counts.evictedStatic,
+            .evictedReleased = counts.evictedReleased,
+            .recreatedStatic = counts.recreatedStatic,
+            .recreatedDynamic = counts.recreatedDynamic,
+            .pendingSweeps = counts.pendingSweeps,
+            .releaseOverflow = counts.releaseOverflow,
         };
         retainedLines << format_retained_line(line);
         if (!retainedLines) {

@@ -613,31 +613,50 @@ TEST(GxReplayReport, FormatsRetainedLine) {
       .lostCaptures = 11,
       .resyncs = 12,
       .eventsPending = 13,
+      .evictedDynamic = 14,
+      .evictedStatic = 15,
+      .evictedReleased = 16,
+      .recreatedStatic = 17,
+      .recreatedDynamic = 18,
+      .pendingSweeps = 19,
+      .releaseOverflow = 20,
   };
   EXPECT_EQ(format_retained_line(frame),
             "{\"frame\": 4, \"active\": true, \"sceneFrame\": 3, \"epoch\": 2, \"entries\": 10, \"captureOnly\": 1, "
             "\"transient\": 2, \"late\": 3, \"instances\": 7, \"statics\": 5, \"created\": 6, \"rekeyed\": 1, "
             "\"newSubId\": 2, \"newOccurrence\": 3, \"relatched\": 4, \"staticRestream\": 5, \"signatureMisses\": 6, "
             "\"reorigins\": 7, \"overflow\": 8, \"droppedEntries\": 9, \"undeliveredStatics\": 10, "
-            "\"lostCaptures\": 11, \"resyncs\": 12, \"eventsPending\": 13}\n");
+            "\"lostCaptures\": 11, \"resyncs\": 12, \"eventsPending\": 13, \"evictedDynamic\": 14, "
+            "\"evictedStatic\": 15, \"evictedReleased\": 16, \"recreatedStatic\": 17, \"recreatedDynamic\": 18, "
+            "\"pendingSweeps\": 19, \"releaseOverflow\": 20}\n");
 }
 
 TEST(GxReplayReport, RetainedSummaryGatesFromFrame30) {
   std::vector<RetainedFrame> frames;
   for (uint32_t i = 0; i < 32; ++i) {
-    frames.push_back({.frame = i, .entries = 4, .transient = 1, .instances = i, .rekeyed = 1, .relatched = 2});
+    frames.push_back({.frame = i,
+                      .entries = 4,
+                      .transient = 1,
+                      .instances = i,
+                      .rekeyed = 1,
+                      .relatched = 2,
+                      .evictedDynamic = 1,
+                      .recreatedStatic = 1,
+                      .pendingSweeps = i % 5});
   }
   frames.back().undeliveredStatics = 3;
   EXPECT_EQ(format_retained_summary(frames),
             "aurora_gxreplay: retained: frames 32, entries 128, captureOnly 0, transient 32, transientShare 0.2500, "
-            "peakLive 31, undeliveredStatics 3; gate over 2 frames from 30: rekeyed 2, relatched 4, staticRestream 0, "
-            "signatureMisses 0; newSubId 0, newOccurrence 0, reorigins 0, overflow 0, droppedEntries 0, "
-            "lostCaptures 0, resyncs 0\n");
+            "peakLive 31, undeliveredStatics 3, evicted dynamic 32 static 0 released 0, peakSweeps 4, "
+            "releaseOverflow 0; gate over 2 frames from 30: rekeyed 2, recreatedStatic 2, relatched 4, "
+            "staticRestream 0, signatureMisses 0; newSubId 0, newOccurrence 0, recreatedDynamic 0, reorigins 0, "
+            "overflow 0, droppedEntries 0, lostCaptures 0, resyncs 0\n");
   EXPECT_EQ(format_retained_summary({}),
             "aurora_gxreplay: retained: frames 0, entries 0, captureOnly 0, transient 0, transientShare 0.0000, "
-            "peakLive 0, undeliveredStatics 0; gate over 0 frames from 30: rekeyed 0, relatched 0, staticRestream 0, "
-            "signatureMisses 0; newSubId 0, newOccurrence 0, reorigins 0, overflow 0, droppedEntries 0, "
-            "lostCaptures 0, resyncs 0\n");
+            "peakLive 0, undeliveredStatics 0, evicted dynamic 0 static 0 released 0, peakSweeps 0, "
+            "releaseOverflow 0; gate over 0 frames from 30: rekeyed 0, recreatedStatic 0, relatched 0, "
+            "staticRestream 0, signatureMisses 0; newSubId 0, newOccurrence 0, recreatedDynamic 0, reorigins 0, "
+            "overflow 0, droppedEntries 0, lostCaptures 0, resyncs 0\n");
 }
 
 namespace {

@@ -1,6 +1,7 @@
 #include "identity.hpp"
 
 #include "classify.hpp"
+#include "gc.hpp"
 #include "../hints.hpp"
 #include "../stage_data.hpp"
 #include "../../gfx/hash.hpp"
@@ -62,13 +63,11 @@ struct Slot {
   InstanceInfo info;
   Affine world{};
   uint64_t seenHintFrame = Never;
-  uint64_t lastSceneFrame = Never;
   uint64_t signature = 0;
-  const void* posArray = nullptr;
-  uint32_t posArraySize = 0;
   uint32_t generation = 0;
   uint32_t createdEvent = NoIndex;
   uint32_t object = NoIndex;
+  uint32_t livePos = NoIndex;
   bool live = false;
   bool delivered = false;
   bool createdPending = false;
@@ -183,6 +182,9 @@ Totals g_totals;
 uint32_t g_peakLive = 0;
 
 std::vector<Slot> g_slots;
+std::vector<gc::Life> g_lives;
+std::vector<uint32_t> g_liveList;
+std::vector<gc::Eviction> g_evictions;
 std::vector<uint32_t> g_index;
 std::vector<uint32_t> g_free;
 std::vector<ObjectEntry> g_objects;
@@ -285,6 +287,10 @@ void clear_tables() noexcept {
     slot = {};
     slot.generation = generation;
   }
+  std::fill(g_lives.begin(), g_lives.end(), gc::Life{});
+  g_liveList.clear();
+  g_evictions.clear();
+  gc::reset();
   std::fill(g_index.begin(), g_index.end(), 0u);
   g_free.clear();
   for (uint32_t i = MaxSlots; i-- > 0;) {
@@ -315,6 +321,10 @@ void allocate() {
     return;
   }
   g_slots.assign(MaxSlots, Slot{});
+  g_lives.assign(MaxSlots, gc::Life{});
+  g_liveList.reserve(MaxSlots);
+  g_evictions.reserve(MaxSlots);
+  gc::allocate();
   g_index.assign(IndexSlots, 0u);
   g_free.reserve(MaxSlots);
   g_objects.assign(ObjectSlots, ObjectEntry{});
@@ -329,7 +339,12 @@ void allocate() {
 }
 
 void release() noexcept {
+  gx::fifo::set_release_listener(nullptr);
   g_slots = {};
+  g_lives = {};
+  g_liveList = {};
+  g_evictions = {};
+  gc::release();
   g_index = {};
   g_free = {};
   g_objects = {};
@@ -714,6 +729,12 @@ bool latchable(uint32_t classBits) noexcept {
 
 bool rigid_dynamic(uint32_t classBits) noexcept { return (classBits & (StaticBits | class_bit::Palette)) == 0; }
 
+// Rebound at every sighting, so a release earlier in the frame cannot mark an array declared again after it
+void bind_pos(gc::Life& life) noexcept {
+  life.posBegin = indexed_attr(GX_VA_POS) ? reinterpret_cast<uintptr_t>(gx::g_gxState.arrays[GX_VA_POS].data) : 0;
+  life.posSeq = gc::release_seq();
+}
+
 uint32_t create(const Pending& pending, const Key& key, uint32_t classBits, uint64_t layoutKey,
                 const Affine& world) noexcept {
   FrameCounts& counts = g_frame.counts;
@@ -726,7 +747,15 @@ uint32_t create(const Pending& pending, const Key& key, uint32_t classBits, uint
   }
   bool objectCreated = false;
   const uint32_t object = object_lookup(pending.object, objectCreated);
-  if (key.occurrence != 0) {
+  const gc::Recreation prior = gc::recreated(key, g_frame.sceneFrame);
+  // A key the collector evicted was seen before, so its return is a re-creation and never a new key
+  if (prior.reason != EvictReason::None) {
+    if (prior.age <= gc::RecentFrames) {
+      counts.recreatedStatic += prior.reason == EvictReason::Epoch ? 1 : 0;
+      counts.recreatedDynamic += prior.reason == EvictReason::Dynamic ? 1 : 0;
+      g_totals.churn += prior.reason == EvictReason::Epoch ? 1 : 0;
+    }
+  } else if (key.occurrence != 0) {
     ++counts.newOccurrence;
   } else if (object != NoIndex && !objectCreated && seen_last_scene_frame(g_objects[object])) {
     ++counts.rekeyed;
@@ -745,7 +774,11 @@ uint32_t create(const Pending& pending, const Key& key, uint32_t classBits, uint
   slot.live = true;
   slot.object = object;
   slot.seenHintFrame = g_frame.hintFrame;
-  slot.lastSceneFrame = g_frame.sceneFrame;
+  slot.livePos = static_cast<uint32_t>(g_liveList.size());
+  g_liveList.push_back(index);
+  gc::Life& life = g_lives[index];
+  life = {.lastSeen = g_frame.sceneFrame, .statics = (classBits & StaticBits) != 0};
+  bind_pos(life);
   const uint64_t topology = topology_hash(pending, layoutKey);
   slot.info = {
       .slot = index,
@@ -764,10 +797,6 @@ uint32_t create(const Pending& pending, const Key& key, uint32_t classBits, uint
   if (latchable(classBits)) {
     slot.world = world;
     slot.latched = true;
-  }
-  if (indexed_attr(GX_VA_POS)) {
-    slot.posArray = gx::g_gxState.arrays[GX_VA_POS].data;
-    slot.posArraySize = gx::g_gxState.arrays[GX_VA_POS].size;
   }
   index_insert(key, index);
   ++g_live;
@@ -823,7 +852,8 @@ uint32_t find_or_create(const Pending& pending, uint32_t classBits, uint64_t lay
     Slot& slot = g_slots[index];
     if (slot.seenHintFrame != g_frame.hintFrame) {
       slot.seenHintFrame = g_frame.hintFrame;
-      slot.lastSceneFrame = g_frame.sceneFrame;
+      g_lives[index].lastSeen = g_frame.sceneFrame;
+      bind_pos(g_lives[index]);
       touch_object(slot.object);
       if ((slot.info.classBits & StaticBits) != 0) {
         check_static(slot, pending, layoutKey);
@@ -1043,6 +1073,15 @@ void evict_slot(uint32_t index, EvictReason reason) noexcept {
   if (const uint32_t pos = index_find(slot.info.key); pos != NoIndex) {
     index_erase(pos);
   }
+  const uint32_t moved = g_liveList.back();
+  g_liveList[slot.livePos] = moved;
+  g_slots[moved].livePos = slot.livePos;
+  g_liveList.pop_back();
+  FrameCounts& counts = g_frame.counts;
+  counts.evictedDynamic += reason == EvictReason::Dynamic ? 1 : 0;
+  counts.evictedStatic += reason == EvictReason::Epoch ? 1 : 0;
+  counts.evictedReleased += reason == EvictReason::Released ? 1 : 0;
+  gc::remember(slot.info.key, reason, g_sceneClock);
   --g_live;
   if ((slot.info.classBits & StaticBits) != 0) {
     --g_liveStatics;
@@ -1056,9 +1095,26 @@ void evict_slot(uint32_t index, EvictReason reason) noexcept {
   const uint32_t generation = slot.generation;
   slot = {};
   slot.generation = generation;
-  g_free.push_back(index);
+  g_lives[index] = {};
+  // Frames sealed before the eviction may still name the slot on the worker
+  gc::quarantine(index);
   ++g_totals.evicted;
   g_lifecycleChanged = true;
+}
+
+void collect(bool scene) noexcept {
+  const detail::SceneHints& hints = detail::live_scene_hints();
+  g_evictions.clear();
+  const gc::SweepResult result = gc::sweep({.sceneFrame = g_sceneClock,
+                                            .scene = scene,
+                                            .epochKnown = hints.has(detail::SceneHasEpoch),
+                                            .epoch = hints.sceneEpoch},
+                                           g_liveList, g_lives, g_evictions);
+  g_frame.counts.releaseOverflow += result.releaseOverflow;
+  for (const gc::Eviction& eviction : g_evictions) {
+    evict_slot(eviction.slot, eviction.reason);
+  }
+  gc::free_quarantined(g_free);
 }
 
 void publish() {
@@ -1071,6 +1127,7 @@ void publish() {
   counts.statics = g_liveStatics;
   counts.undeliveredStatics = g_undeliveredStatics;
   counts.eventsPending = static_cast<uint32_t>(g_events.size());
+  counts.pendingSweeps = g_active ? gc::pending_sweeps() : 0;
   const RetainedStats stats{
       .active = g_active,
       .coverageComplete = false,
@@ -1135,6 +1192,7 @@ void set_demand(Demand demand, bool on) noexcept {
 }
 
 void apply_frame_state(const detail::FrameState&) noexcept {
+  gx::fifo::set_release_listener(g_active ? &gc::on_release : nullptr);
   if (!g_active) {
     return;
   }
@@ -1145,15 +1203,17 @@ void apply_frame_state(const detail::FrameState&) noexcept {
 }
 
 void end_frame() noexcept {
+  const bool scene = detail::live_scene_hints().has(detail::SceneHasMainCamera);
   if (g_active) {
     if (!g_log.empty()) {
       drop_log();
     }
     g_pending = {};
     g_tentative.reset();
+    collect(scene);
   }
   publish();
-  if (g_active && detail::live_scene_hints().has(detail::SceneHasMainCamera)) {
+  if (g_active && scene) {
     ++g_sceneClock;
   }
   const uint64_t hintFrame = g_frame.hintFrame;
@@ -1344,6 +1404,8 @@ Instance instance(uint32_t slot) noexcept {
   return {.live = entry.live,
           .delivered = entry.delivered,
           .latched = entry.latched,
+          .released = g_lives[slot].released,
+          .lastSeen = g_lives[slot].lastSeen,
           .slotGeneration = entry.generation,
           .info = entry.info,
           .world = entry.world};

@@ -175,6 +175,13 @@ struct FrameCounts {
   uint32_t resyncs = 0;
   uint32_t eventsPending = 0;
   uint32_t delivered = 0;
+  uint32_t evictedDynamic = 0;
+  uint32_t evictedStatic = 0;
+  uint32_t evictedReleased = 0;
+  uint32_t recreatedStatic = 0;
+  uint32_t recreatedDynamic = 0;
+  uint32_t pendingSweeps = 0;
+  uint32_t releaseOverflow = 0;
 };
 
 // Game thread while the FIFO is idle
@@ -206,6 +213,8 @@ struct Instance {
   bool live = false;
   bool delivered = false;
   bool latched = false;
+  bool released = false;
+  uint64_t lastSeen = 0;
   uint32_t slotGeneration = 0;
   InstanceInfo info;
   Affine world{};
