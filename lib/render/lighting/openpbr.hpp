@@ -139,6 +139,8 @@ struct Prepared {
 [[nodiscard]] Vec3 eval_light(const Tables& tables, const Prepared& p, const Vec3& l, bool specular = true);
 [[nodiscard]] Vec3 eval_ambient(const Prepared& p, const Vec3& irradiance, const Vec3& radiance);
 [[nodiscard]] Vec3 directional_albedo(const Prepared& p);
+// What the coat and fuzz pass of the emission beneath them toward the viewer
+[[nodiscard]] Vec3 emission_scale(const Prepared& p);
 
 // Filtered lookups in texel space; z is the IOR index for lut3d, layer selects lut2d's slice
 [[nodiscard]] std::array<double, 2> sample_lut3d(const Tables& tables, double x, double y, double z);

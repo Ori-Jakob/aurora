@@ -43,6 +43,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <numbers>
@@ -436,6 +437,55 @@ TEST(OpenPbrMirror, ThinCutoutTransmitsItsBaseColour) {
   }
 }
 
+TEST(OpenPbrMirror, ThinTransmissionFollowsDiffuseRoughness) {
+  OpenPbrParams params = thin_params();
+  params.specularWeight = 0.f;
+  params.thinWalledWrap = 0.f;
+  params.subsurfaceScatterAnisotropy = 0.f;
+  params.baseDiffuseRoughness = 0.8f;
+  const openpbr::Tables& tables = openpbr::testing::tables();
+  const Vec3 n{0.0, 0.0, 1.0};
+  // A black base gives both sides the same albedo, so the back lobe must be the front lobe mirrored
+  const openpbr::Prepared p =
+      prepare(classes::gpu_row(params), {.baseColor = {0.0, 0.0, 0.0}, .roughness = 0.85}, n, view_at(n, 0.6));
+  ASSERT_EQ(p.diffuse, p.transmit);
+  std::mt19937 rng{0x7B1Eu};
+  std::uniform_real_distribution<double> unit(0.0, 1.0);
+  double offLambert = 0.0;
+  for (int i = 0; i < 64; ++i) {
+    const Vec3 back = normalized({unit(rng) - 0.5, unit(rng) - 0.5, -0.05 - unit(rng)});
+    const Vec3 through = openpbr::eval_light(tables, p, back, false);
+    const Vec3 mirrored = openpbr::eval_light(tables, p, {back[0], back[1], -back[2]}, false);
+    for (size_t c = 0; c < 3; ++c) {
+      EXPECT_NEAR(through[c], mirrored[c], 1e-12) << i << " " << c;
+      offLambert = std::max(offLambert, std::abs(through[c] - p.transmit[c] * p.ecV * -back[2]));
+    }
+  }
+  EXPECT_GT(offLambert, 1e-3);
+  const Vec3 ambient = openpbr::eval_ambient(p, {Pi, Pi, Pi}, {0.0, 0.0, 0.0});
+  const Vec3 direct = integrate(p, 160, true);
+  for (size_t c = 0; c < 3; ++c) {
+    EXPECT_NEAR(ambient[c], direct[c], 3e-3) << c;
+  }
+}
+
+TEST(OpenPbrMirror, CoatTakesTheBaseIorRelativeToIt) {
+  const Vec3 n{0.0, 0.0, 1.0};
+  const auto eta = [&](float coatWeight, float coatIor, float specularWeight = 1.f) {
+    OpenPbrParams params = coat_params();
+    params.coatWeight = coatWeight;
+    params.coatIor = coatIor;
+    params.specularWeight = specularWeight;
+    return prepare(classes::gpu_row(params), {}, n, view_at(n, 0.7)).eta;
+  };
+  EXPECT_NEAR(eta(0.f, 1.6f), 1.5, 1e-6);
+  EXPECT_NEAR(eta(1.f, 1.5f), 1.0, 1e-6);
+  EXPECT_NEAR(eta(1.f, 1.3f), 1.5 / 1.3, 1e-6);
+  EXPECT_NEAR(eta(1.f, 1.6f), 1.6 / 1.5, 1e-6);
+  EXPECT_NEAR(eta(0.5f, 2.f), 1.0, 1e-6);
+  EXPECT_NEAR(eta(1.f, 1.6f, 0.f), 1.0, 1e-6);
+}
+
 TEST(OpenPbrMirror, LambertAtZeroDiffuseRoughness) {
   OpenPbrParams params;
   params.specularWeight = 0.f;
@@ -764,6 +814,36 @@ TEST(DeferredMirror, SurfaceAmbientUsesZ) {
   px.ambient = {};
   params.flags = deferred::FlagSurfaceAmbient;
   EXPECT_EQ(deferred::testing::shade(px, {}, {}, params, class_rows()).rgb, (Vec3{0.0, 0.0, 0.0}));
+}
+
+TEST(DeferredMirror, EmissionSitsUnderCoatAndFuzz) {
+  std::array<classes::GpuRow, 256> rows{};
+  std::ranges::copy(class_rows(), rows.begin());
+  for (const auto& [id, params] :
+       {std::pair{200u, OpenPbrParams{}}, std::pair{201u, coat_params()}, std::pair{202u, fuzz_params()}}) {
+    OpenPbrParams emitter = params;
+    emitter.emissionScale = 2.f;
+    rows[id] = classes::gpu_row(emitter);
+  }
+  deferred::testing::Pixel px = facing_pixel(0x09);
+  px.albedo = {1.0, 1.0, 1.0};
+  px.emissive = {0.5, 0.25, 1.0};
+  const auto shaded = [&](uint32_t cls) {
+    px.classId = cls;
+    return deferred::testing::shade(px, {}, {}, light_params(), rows).rgb;
+  };
+  const Vec3 plain = shaded(200);
+  const Vec3 v = scale(px.position, -1.0 / std::sqrt(dot(px.position, px.position)));
+  for (const uint32_t cls : {201u, 202u}) {
+    const Vec3 under = shaded(cls);
+    const Vec3 passed = openpbr::emission_scale(prepare(rows[cls], {.baseColor = {1.0, 1.0, 1.0}}, px.normal, v));
+    for (size_t c = 0; c < 3; ++c) {
+      EXPECT_EQ(plain[c], px.emissive[c] * 2.0) << c;
+      EXPECT_LT(passed[c], 1.0) << cls << " " << c;
+      EXPECT_NEAR(under[c], plain[c] * passed[c], 1e-12) << cls << " " << c;
+    }
+  }
+  EXPECT_EQ(openpbr::emission_scale(prepare(rows[200], {}, px.normal, v)), (Vec3{1.0, 1.0, 1.0}));
 }
 
 TEST(DeferredMirror, BackFacingNormalsAreBent) {
@@ -2005,6 +2085,7 @@ fn probe_row(index: u32) -> ClassParams {
     row.base.y = 0.6;
   } else if (index == 10u) {
     row.subsurface = vec4f(0.6, 0.9, 0.4, 0.6);
+    row.base.x = 0.5;
     row.base.z = 0.2;
     row.misc.z = bitcast<f32>(1u);
     row.misc.w = 0.3;
@@ -2098,6 +2179,7 @@ classes::GpuRow probe_row(const classes::GpuRows& rows, uint32_t index) {
     row.v[25] = 0.6f;
   } else if (index == 10) {
     row.v[12] = 0.6f, row.v[13] = 0.9f, row.v[14] = 0.4f, row.v[15] = 0.6f;
+    row.v[24] = 0.5f;
     row.v[26] = 0.2f;
     row.v[30] = std::bit_cast<float>(1u);
     row.v[31] = 0.3f;

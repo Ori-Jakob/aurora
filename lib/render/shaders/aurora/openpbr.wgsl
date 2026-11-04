@@ -126,6 +126,16 @@ fn openpbr_apply_specular_weight(eta: f32, weight: f32) -> f32 {
   return select(ior, 1.0 / ior, eta < 1.0);
 }
 
+//#if OPENPBR_LAYERED
+// openpbr-bsdf takes the base IOR relative to the coat, so specular weight 0 index-matches the base to the coat
+fn openpbr_coated_eta(ior: f32, weight: f32, coat_weight: f32, coat_ior: f32) -> f32 {
+  let medium = mix(1.0, coat_ior, coat_weight);
+  let eta = openpbr_apply_specular_weight(ior / medium, weight);
+  // The coat bends no rays here, so a base under a denser coat keeps external reflection instead of a false TIR
+  return select(eta, 1.0 / eta, eta < 1.0 && medium * eta >= 1.0);
+}
+//#endif
+
 fn openpbr_fresnel(eta: f32, cos_in: f32) -> f32 {
   if (eta == 1.0) {
     return 0.0;
@@ -263,6 +273,11 @@ fn openpbr_prepare(s: OpenPbrSurface, cls: ClassParams, n: vec3f, v: vec3f, lut3
   let dielectric = 1.0 - metal;
   let base = s.base_color * cls.base.w;
   p.eta = openpbr_apply_specular_weight(cls.ior.x, spec_weight);
+//#if OPENPBR_LAYERED
+  if (cls.coat.w > 0.0) {
+    p.eta = openpbr_coated_eta(cls.ior.x, spec_weight, cls.coat.w, max(cls.ior.y, 1.0));
+  }
+//#endif
   p.alpha_index = openpbr_alpha_index(p.alpha);
   p.ior_index = openpbr_ior_index(p.eta);
   p.ec_v = openpbr_extrapolate(openpbr_lut3d(lut3d, smp, p.mu_v, p.alpha_index, p.ior_index).g, p.eta);
@@ -295,7 +310,11 @@ fn openpbr_prepare(s: OpenPbrSurface, cls: ClassParams, n: vec3f, v: vec3f, lut3
     p.wrap = saturate(cls.misc.w);
   }
   p.sigma = cls.base.x;
-  var ambient_diffuse = (openpbr_eon_albedo(p.diffuse, p.sigma, p.mu_v) + p.transmit) * p.ec_v;
+  var ambient_diffuse = openpbr_eon_albedo(p.diffuse, p.sigma, p.mu_v);
+  if (p.thin) {
+    ambient_diffuse += openpbr_eon_albedo(p.transmit, p.sigma, p.mu_v);
+  }
+  ambient_diffuse *= p.ec_v;
   var ambient_specular = p.spec_tint * (1.0 - p.ec_v) + metal_ss * p.metal_weight;
   if (p.alpha >= OPENPBR_MIN_ALPHA_ENERGY_LOSS) {
     ambient_specular += p.metal_ms * p.ecm_v;
@@ -360,7 +379,9 @@ fn openpbr_eval_light(p: OpenPbrPrepared, l: vec3f, specular: bool, lut3d: textu
   if (p.thin && nl < 0.0) {
     let mu_t = min(-nl, 1.0);
     let ec_t = openpbr_extrapolate(openpbr_lut3d(lut3d, smp, mu_t, p.alpha_index, p.ior_index).g, p.eta);
-    out += p.transmit * (p.ec_v * ec_t * p.inv_ec_avg * mu_t);
+    // openpbr-bsdf transmits through the rough diffuse lobe flipped to the back, with the view mirrored through it
+    out += openpbr_eon_pi(p.transmit, p.sigma, p.mu_v, mu_t, dot(p.v, l) + 2.0 * p.mu_v * mu_t) *
+           (p.ec_v * ec_t * p.inv_ec_avg * mu_t);
   }
   let h = normalize(p.v + l);
   let nh = max(dot(p.n, h), 0.0);
@@ -408,3 +429,17 @@ fn openpbr_eval_light(p: OpenPbrPrepared, l: vec3f, specular: bool, lut3d: textu
 fn openpbr_eval_ambient(p: OpenPbrPrepared, irradiance: vec3f, radiance: vec3f) -> vec3f {
   return p.ambient_diffuse * irradiance * (1.0 / OPENPBR_PI) + p.ambient_specular * radiance;
 }
+
+//#if OPENPBR_LAYERED
+// Emission sits under the coat and fuzz, as in openpbr-bsdf, so it loses what they reflect toward the viewer
+fn openpbr_emission_scale(p: OpenPbrPrepared) -> vec3f {
+  var scale = vec3f(1.0);
+  if (p.coat_weight > 0.0) {
+    scale = p.coat_base;
+  }
+  if (p.fuzz_weight > 0.0) {
+    scale *= p.fuzz_base;
+  }
+  return scale;
+}
+//#endif

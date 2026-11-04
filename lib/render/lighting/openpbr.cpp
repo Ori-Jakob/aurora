@@ -67,6 +67,12 @@ double apply_specular_weight(double eta, double weight) noexcept {
   return eta < 1.0 ? 1.0 / ior : ior;
 }
 
+double coated_eta(double ior, double weight, double coatWeight, double coatIor) noexcept {
+  const double medium = std::lerp(1.0, coatIor, coatWeight);
+  const double eta = apply_specular_weight(ior / medium, weight);
+  return eta < 1.0 && medium * eta >= 1.0 ? 1.0 / eta : eta;
+}
+
 double fresnel(double eta, double c) noexcept {
   if (eta == 1.0) {
     return 0.0;
@@ -543,6 +549,9 @@ Prepared prepare(const Tables& t, const material::classes::GpuRow& row, const Su
   const Vec3 base = s.baseColor * static_cast<double>(r[27]);
   const Vec3 sssColour = (flags & material::classes::RowSubsurfaceTint) != 0 ? row3(row, 12) * base : row3(row, 12);
   p.eta = apply_specular_weight(r[20], specWeight);
+  if (coatWeight > 0.0) {
+    p.eta = coated_eta(r[20], specWeight, coatWeight, std::max(static_cast<double>(r[21]), 1.0));
+  }
   const double ai = alpha_index(p.alpha);
   const double ii = ior_index(p.eta);
   p.ecV = extrapolate(sample_lut3d(t, cos_index(p.muV), ai, ii)[1], p.eta);
@@ -570,7 +579,11 @@ Prepared prepare(const Tables& t, const material::classes::GpuRow& row, const Su
     p.diffuse = (base * (1.0 - sssWeight) + sssColour * sssWeight) * dielectric;
   }
   p.sigma = r[24];
-  Vec3 ambientDiffuse = (eon_albedo(p.diffuse, p.sigma, p.muV) + p.transmit) * p.ecV;
+  Vec3 ambientDiffuse = eon_albedo(p.diffuse, p.sigma, p.muV);
+  if (p.thin) {
+    ambientDiffuse = ambientDiffuse + eon_albedo(p.transmit, p.sigma, p.muV);
+  }
+  ambientDiffuse = ambientDiffuse * p.ecV;
   Vec3 ambientSpecular = p.specTint * (1.0 - p.ecV) + metalSs * p.metalWeight +
                          (p.alpha >= MinAlphaWithEnergyLoss ? p.metalMs * p.ecmV : splat(0.0));
   p.coatWeight = coatWeight;
@@ -629,7 +642,8 @@ Vec3 eval_light(const Tables& t, const Prepared& p, const Vec3& l, bool specular
   if (p.thin && nl < 0.0) {
     const double muT = std::min(-nl, 1.0);
     const double ecT = extrapolate(sample_lut3d(t, cos_index(muT), ai, ior_index(p.eta))[1], p.eta);
-    out = out + p.transmit * (p.ecV * ecT * p.invEcAvg * muT);
+    out = out +
+          eon_pi(p.transmit, p.sigma, p.muV, muT, dot(p.v, l) + 2.0 * p.muV * muT) * (p.ecV * ecT * p.invEcAvg * muT);
   }
   const Vec3 h = normalize(p.v + l);
   const double nh = std::max(dot(p.n, h), 0.0);
@@ -673,6 +687,17 @@ Vec3 eval_ambient(const Prepared& p, const Vec3& irradiance, const Vec3& radianc
 }
 
 Vec3 directional_albedo(const Prepared& p) { return p.ambientDiffuse + p.ambientSpecular; }
+
+Vec3 emission_scale(const Prepared& p) {
+  Vec3 scale{1.0, 1.0, 1.0};
+  if (p.coatWeight > 0.0) {
+    scale = p.coatBase;
+  }
+  if (p.fuzzWeight > 0.0) {
+    scale = scale * p.fuzzBase;
+  }
+  return scale;
+}
 
 namespace testing {
 const Tables& tables() { return shared_tables(); }

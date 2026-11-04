@@ -223,7 +223,11 @@ fn shade(@builtin(global_invocation_id) id: vec3u, @builtin(local_invocation_ind
     }
   }
   if (mode == DEFERRED_MODE_FULL) {
+//#if OPENPBR_LAYERED
+    h += s.emissive * row.emission.rgb * row.emission.w * openpbr_emission_scale(p);
+//#else
     h += s.emissive * row.emission.rgb * row.emission.w;
+//#endif
   }
   if (deferred_bad(h)) {
     textureStore(scene_hdr, px, vec4f(0.0));

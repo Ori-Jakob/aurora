@@ -527,7 +527,7 @@ Result shade(const Pixel& px, const clusters::LightListHeader& header, std::span
   }
   if (mode == Mode::Full) {
     const Vec3 emission{row.v[16] * row.v[19], row.v[17] * row.v[19], row.v[18] * row.v[19]};
-    h = add(h, mul(px.emissive, emission));
+    h = add(h, mul(mul(px.emissive, emission), openpbr::emission_scale(p)));
   }
   Result out;
   for (size_t i = 0; i < 3; ++i) {
