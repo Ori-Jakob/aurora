@@ -1727,6 +1727,27 @@ TEST_F(GxShaderExtTest, AmbientExtOnlyForVertexOrBaked) {
   }
 }
 
+TEST_F(GxShaderExtTest, VertexAmbientOnRegisterMaterialReachesSurface) {
+  // The game's grass: a lit channel whose material is the register and whose ambient is the vertex colour
+  ShaderConfig grass = modulate();
+  grass.colorChannels[GX_COLOR0].ambSrc = GX_SRC_VTX;
+  const ShaderInfo info = build_shader_info(grass);
+  ASSERT_TRUE(info.unlitAdmitted);
+  const unlit::Plan plan = unlit::plan(grass);
+  EXPECT_EQ(plan.rewrite[0], unlit::RewriteMaterial);
+  EXPECT_EQ(plan.rawVtx, 1u);
+  const unlit::Ambient ambient = unlit::ambient_of(grass, info);
+  EXPECT_EQ(ambient.source, unlit::AmbientSource::Vertex);
+  EXPECT_FALSE(ambient.rawVertex);
+  EXPECT_EQ(surface_ext_member(build_shader_source(keyed(grass), DstAlphaMode::None, PbrTargets)),
+            "out.surface_ext = gx_surface_ext_pack(select(vec3f(0.0), in.ccv0, (umat & 0x80000000u) != 0u), "
+            "vec3f(0.0));");
+  EXPECT_EQ(varying_count(grass, PbrTargets), varying_count(modulate(), PbrTargets) + 1);
+  ShaderConfig noColour = grass;
+  noColour.attrs[GX_VA_CLR0] = {};
+  EXPECT_EQ(unlit::ambient_of(noColour, build_shader_info(noColour)).source, unlit::AmbientSource::Unknown);
+}
+
 TEST_F(GxShaderExtTest, EmitGatedByLaneBit) {
   const ShaderConfig config = keyed(layered(modulate()));
   for (const ShaderTargets& targets : {PbrTargets, PbrIdTargets}) {

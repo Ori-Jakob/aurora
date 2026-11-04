@@ -359,6 +359,11 @@ Plan analyse(const ShaderConfig& config) noexcept {
           p.rewrite[c] = RewriteZero;
         } else if (channel.matSrc == GX_SRC_REG) {
           p.rewrite[c] = RewriteMaterial;
+          // The material comes from the register, so a vertex ambient only reaches Surface as the raw colour
+          if (channel.lightingEnabled && channel.ambSrc == GX_SRC_VTX &&
+              config.attrs[GX_VA_CLR0 + c].attrType != GX_NONE) {
+            p.rawVtx |= static_cast<uint8_t>(1u << c);
+          }
         } else {
           p.rewrite[c] = RewriteVertex;
           if (config.attrs[GX_VA_CLR0 + c].attrType != GX_NONE) {

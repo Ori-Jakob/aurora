@@ -3028,12 +3028,16 @@ TEST_F(GxShaderExtDevice, SurfaceAmbientMatchesRegister) {
   };
   ShaderConfig registerVertex = unlit_lit(GX_SRC_VTX, GX_SRC_REG);
   ShaderConfig vertexAmbient = unlit_lit(GX_SRC_VTX, GX_SRC_VTX);
+  // Grass: the material is the register and only the vertex colour carries the ambient
+  ShaderConfig registerMaterial = unlit_lit(GX_SRC_REG, GX_SRC_VTX);
   registerVertex.ext.surfaceExt = 1;
   vertexAmbient.ext.surfaceExt = 1;
+  registerMaterial.ext.surfaceExt = 1;
   const std::array<float, 3> vtx{0.25f, 0.5f, 0.75f};
   const std::array<float, 2> reg{64.f / 255.f, 191.f / 255.f};
-  for (const auto& [config, baked] : {Case{registerVertex, true}, Case{registerVertex, false},
-                                      Case{vertexAmbient, true}, Case{vertexAmbient, false}}) {
+  for (const auto& [config, baked] :
+       {Case{registerVertex, true}, Case{registerVertex, false}, Case{vertexAmbient, true}, Case{vertexAmbient, false},
+        Case{registerMaterial, true}, Case{registerMaterial, false}}) {
     const std::string text = build_shader_source(config, DstAlphaMode::None, targets);
     const std::string member =
         member_between(text, "\n    let uslot = ", "uslot);") + member_between(text, "\n    out.surface_ext = ", ";");
@@ -3056,7 +3060,8 @@ TEST_F(GxShaderExtDevice, SurfaceAmbientMatchesRegister) {
     ASSERT_TRUE(out.has_value());
     const bool vertex = config.colorChannels[GX_COLOR0].ambSrc == GX_SRC_VTX;
     std::array<float, 3> ambient = vertex ? vtx : std::array{reg[0], reg[0], reg[1]};
-    for (size_t c = 0; c < 3 && baked; ++c) {
+    const bool vertexMaterial = config.colorChannels[GX_COLOR0].matSrc == GX_SRC_VTX;
+    for (size_t c = 0; c < 3 && baked && vertexMaterial; ++c) {
       ambient[c] *= vtx[c];
     }
     for (uint32_t i = 0; i < 64; ++i) {
@@ -3064,7 +3069,8 @@ TEST_F(GxShaderExtDevice, SurfaceAmbientMatchesRegister) {
           surface::join({static_cast<uint16_t>((*out)[i * 4]), static_cast<uint16_t>((*out)[i * 4 + 1]),
                          static_cast<uint16_t>((*out)[i * 4 + 2]), static_cast<uint16_t>((*out)[i * 4 + 3])});
       const surface::Fields fields{.ambient = (i & 1u) != 0 ? ambient : std::array<float, 3>{}};
-      EXPECT_EQ(ext[0], surface::pack_ext(fields)[0]) << "vertex " << vertex << " baked " << baked << " i " << i;
+      EXPECT_EQ(ext[0], surface::pack_ext(fields)[0])
+          << "vertex " << vertex << " material " << vertexMaterial << " baked " << baked << " i " << i;
       EXPECT_EQ(ext[1], 0u);
     }
   }
