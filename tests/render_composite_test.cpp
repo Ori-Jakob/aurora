@@ -218,6 +218,7 @@ void encode_stub_hdr(PassContext& ctx, const void* state) {
 
 struct StubExposure {
   std::array<float, 4> words{1.f, 1.f, 1.f, 1.f};
+  bool enabled = true;
   int calls = 0;
 };
 
@@ -225,6 +226,10 @@ struct StubExposure {
 void declare_stub_exposure(InternalPassBuilder& builder, const PassSetup&, const void*) {
   builder.after(phase::Exposure);
   builder.create_buffer(lighting::exposure::Resource, {.size = lighting::exposure::BufferBytes}, Access::CopyDst);
+}
+
+bool stub_exposure_enabled(const StageData&, const void* state) {
+  return static_cast<const StubExposure*>(state)->enabled;
 }
 
 void encode_stub_exposure(PassContext& ctx, const void* state) {
@@ -245,6 +250,7 @@ PassDesc stub_exposure_desc(StubExposure& stub) {
       .order = 0,
       .runsWithoutMarker = true,
       .declare = declare_stub_exposure,
+      .enabled = stub_exposure_enabled,
       .encode = encode_stub_exposure,
       .state = &stub,
   };
@@ -2535,8 +2541,10 @@ struct PixelRun {
   std::optional<composite::Params> params;
   uint32_t draws = 1;
   std::optional<float> exposure;
+  bool exposureEnabled = true;
   std::function<void(std::array<uint16_t, 4>&, size_t)> hdrEdit;
   bool radiance = false;
+  uint32_t radianceClears = 0;
   std::function<std::array<float, 4>(size_t)> ssil;
 };
 
@@ -2697,6 +2705,7 @@ protected:
     PassId meterId = InvalidPassId;
     if (options.exposure) {
       meter.words = {*options.exposure, 1.f / *options.exposure, 1.f, 1.f};
+      meter.enabled = options.exposureEnabled;
       meterId = register_pass(stub_exposure_desc(meter));
     }
     StubSsil ssil;
@@ -2733,7 +2742,7 @@ protected:
     }
     EXPECT_EQ(composite::testing::counters().radianceDraws,
               before.radianceDraws + (options.radiance ? options.draws : 0));
-    EXPECT_EQ(composite::testing::counters().radianceClears, before.radianceClears);
+    EXPECT_EQ(composite::testing::counters().radianceClears, before.radianceClears + options.radianceClears);
     if (stubId != InvalidPassId) {
       unregister_pass(stubId);
     }
@@ -2746,7 +2755,7 @@ protected:
       unregister_pass(ssilId);
     }
     if (meterId != InvalidPassId) {
-      EXPECT_EQ(meter.calls, 1);
+      EXPECT_EQ(meter.calls, options.exposureEnabled ? 1 : 0);
       unregister_pass(meterId);
     }
     lighting::deferred::testing::force_enabled(std::nullopt);
@@ -3170,6 +3179,31 @@ TEST_F(CompositeGpu, SsilUnderPbrScalesByExposure) {
               worst, lifted);
   EXPECT_LE(worst, 1u);
   EXPECT_GT(lifted, out.size() / 10);
+}
+
+TEST_F(CompositeGpu, SsilSkippedMeterClearsRadiance) {
+  const SsilCase c = ssil_cases(64 * 48, 0x55A5u);
+  const Settings settings = pbr_settings(0.f, Quality::High);
+  const auto irr = [&](size_t i) { return c.irr[i]; };
+  run_pixels(64, 48, c.pixels, {.settings = settings, .exposure = 2.7f, .radiance = true, .ssil = irr});
+  EXPECT_TRUE(composite::pbr_active());
+  const size_t written =
+      static_cast<size_t>(std::ranges::count_if(m_radiance, [](const std::array<float, 4>& r) { return r[3] > 0.f; }));
+  EXPECT_GT(written, m_radiance.size() / 2);
+  const std::vector<Rgba> aoOnly =
+      run_pixels(64, 48, c.pixels, {.settings = settings, .exposure = 2.7f, .exposureEnabled = false});
+  const std::vector<Rgba> skipped = run_pixels(64, 48, c.pixels,
+                                               {.settings = settings,
+                                                .exposure = 2.7f,
+                                                .exposureEnabled = false,
+                                                .radiance = true,
+                                                .radianceClears = 1,
+                                                .ssil = irr});
+  ASSERT_EQ(skipped.size(), aoOnly.size());
+  for (size_t i = 0; i < skipped.size(); ++i) {
+    ASSERT_EQ(m_radiance[i], (std::array<float, 4>{})) << i;
+    ASSERT_TRUE(same(skipped[i], aoOnly[i])) << i;
+  }
 }
 
 TEST_F(CompositeGpu, OddExtentCoversEdges) {

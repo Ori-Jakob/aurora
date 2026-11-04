@@ -31,6 +31,7 @@ const EXPOSURE_FLAG_TARGET_S: u32 = 2u;
 const EXPOSURE_FLAG_SNAP: u32 = 4u;
 const EXPOSURE_FLAG_RESET: u32 = 8u;
 const EXPOSURE_FLAG_SSIL: u32 = 16u;
+const EXPOSURE_FLAG_SSIL_EXPOSED: u32 = 32u;
 const EXPOSURE_STATE_VALID: u32 = 1u;
 const EXPOSURE_STATE_MODE_MASK: u32 = 6u;
 const EXPOSURE_STATE_AGX: u32 = 8u;
@@ -129,7 +130,8 @@ fn exposure_sample(p: vec2i, w: ExposureWindow, agx: bool, acc: ptr<function, ar
   t.ao = composite_ao_term(ao_final, gx_normal, p, false);
   if ((exposure_params.flags & EXPOSURE_FLAG_SSIL) != 0u && t.ao < 1.0) {
     // The meter sees last frame's exposure; the one-frame lag sits inside its smoothing
-    t.bounce = composite_ssil_term(ssil_irr, p, exposure_exp2(w.prev_s), exposure_params.ssil_albedo);
+    let e_bounce = select(1.0, exposure_exp2(w.prev_s), (exposure_params.flags & EXPOSURE_FLAG_SSIL_EXPOSED) != 0u);
+    t.bounce = composite_ssil_term(ssil_irr, p, e_bounce, exposure_params.ssil_albedo);
   }
   let sp = max(s, vec3f(0.0));
   let sx = select(sp * composite_legacy_scale(t, sp, rec.q), sp,

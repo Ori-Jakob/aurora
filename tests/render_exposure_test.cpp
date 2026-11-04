@@ -1124,6 +1124,70 @@ protected:
     return out;
   }
 
+  // The composite's FlagPbr sets the units of ssil.irr, so the meter's bounce takes e only while it is latched
+  void check_ssil_meter(bool compositePbr) {
+    const std::vector<MeterPixel> pixels = scene(17, 0.3f, true);
+    load(pixels);
+    const wgpu::Extent3D size = webgpu::g_frameBuffer.size;
+    std::mt19937 rng{0x55E0u};
+    std::uniform_real_distribution<float> unit(0.f, 1.f);
+    std::vector<std::array<float, 4>> irr(pixels.size());
+    StubTexture ssil{
+        .resource = resource::SsilIrradiance, .format = wgpu::TextureFormat::RGBA16Float, .after = phase::Ao};
+    ssil.rowBytes = (size.width * 8 + 255) & ~255u;
+    std::vector<uint16_t> texels(size_t{ssil.rowBytes / 2} * size.height, 0);
+    for (size_t i = 0; i < irr.size(); ++i) {
+      irr[i] = {0.6f * unit(rng), 0.4f * unit(rng), 0.2f * unit(rng), unit(rng)};
+      for (size_t c = 0; c < 4; ++c) {
+        texels[(i / size.width) * (ssil.rowBytes / 2) + (i % size.width) * 4 + c] =
+            lighting::openpbr::to_half(irr[i][c]);
+      }
+    }
+    ssil.staging = staging(texels.data(), texels.size() * 2);
+    register_pass(stub_desc(ssil, "test.ssil"));
+    composite::testing::set_pbr_producers_override(compositePbr);
+    Settings settings = pbr_settings();
+    settings.ao = Quality::High;
+    const auto graph = live_graph(settings);
+    ASSERT_EQ(composite::pbr_active(), compositePbr);
+    const FrameState state{.graph = graph};
+    const Frame first = run(state, 1);
+    const Frame second = run(state, 2);
+    const float firstE = exposure::testing::exp2_exact(std::bit_cast<float>(first.state[0]));
+    // The meter reads last frame's exposure, so the second frame's bounce carries the first frame's e
+    for (const auto& [frame, e] : {std::pair{&first, 1.f}, std::pair{&second, compositePbr ? firstE : 1.f}}) {
+      double target = 0.0;
+      double weight = 0.0;
+      size_t bounced = 0;
+      for (size_t i = 0; i < pixels.size(); ++i) {
+        const MeterPixel& p = pixels[i];
+        if (!sampled(p)) {
+          continue;
+        }
+        const std::array<float, 3> l{p.legacy[0] / 255.f, p.legacy[1] / 255.f, p.legacy[2] / 255.f};
+        const std::array<float, 3> fc{p.fc[0] / 255.f, p.fc[1] / 255.f, p.fc[2] / 255.f};
+        const float q = p.q7 / 127.f;
+        std::array<float, 3> bounce{};
+        for (size_t c = 0; c < 3; ++c) {
+          bounce[c] = ao::legacy_albedo() * e * lighting::openpbr::from_half(lighting::openpbr::to_half(irr[i][c]));
+        }
+        const std::array<float, 3> sb =
+            composite::testing::legacy_ssil(l, fc, p.q7, p.ao / 255.f, p.code / 3.f, bounce);
+        bounced += sb != composite::testing::legacy_ao(l, fc, p.q7, p.ao / 255.f, p.code / 3.f) ? 1 : 0;
+        Rgb lin{};
+        for (size_t c = 0; c < 3; ++c) {
+          lin[c] = srgb_decode((sb[c] - q * fc[c]) / (1.f - q));
+        }
+        const double w = 1.0 - q;
+        target += w * std::log2(std::max(tonemap::luminance(lin), exposure::YFloor));
+        weight += w;
+      }
+      EXPECT_GT(bounced, pixels.size() / 4);
+      EXPECT_NEAR(std::bit_cast<float>(frame->state[4]), target / weight, 2e-4) << e;
+    }
+    EXPECT_GT(std::abs(firstE - 1.f), 0.05f);
+  }
+
   StubTexture m_ao{.resource = resource::AoFinal, .format = wgpu::TextureFormat::RGBA8Unorm, .after = phase::Ao};
   Readback m_state{.resource = exposure::State, .size = 256};
   Readback m_partials{.resource = exposure::Partials, .isBuffer = true, .size = exposure::PartialBytes};
@@ -1405,66 +1469,8 @@ TEST_F(ExposureGpu, MeterTargetMatchesCompositeSb) {
   EXPECT_NEAR(std::bit_cast<float>(frame.state[4]), target / weight, 2e-4);
 }
 
-TEST_F(ExposureGpu, MeterTargetMatchesCompositeSbWithSsil) {
-  const std::vector<MeterPixel> pixels = scene(17, 0.3f, true);
-  load(pixels);
-  const wgpu::Extent3D size = webgpu::g_frameBuffer.size;
-  std::mt19937 rng{0x55E0u};
-  std::uniform_real_distribution<float> unit(0.f, 1.f);
-  std::vector<std::array<float, 4>> irr(pixels.size());
-  StubTexture ssil{
-      .resource = resource::SsilIrradiance, .format = wgpu::TextureFormat::RGBA16Float, .after = phase::Ao};
-  ssil.rowBytes = (size.width * 8 + 255) & ~255u;
-  std::vector<uint16_t> texels(size_t{ssil.rowBytes / 2} * size.height, 0);
-  for (size_t i = 0; i < irr.size(); ++i) {
-    irr[i] = {0.6f * unit(rng), 0.4f * unit(rng), 0.2f * unit(rng), unit(rng)};
-    for (size_t c = 0; c < 4; ++c) {
-      texels[(i / size.width) * (ssil.rowBytes / 2) + (i % size.width) * 4 + c] = lighting::openpbr::to_half(irr[i][c]);
-    }
-  }
-  ssil.staging = staging(texels.data(), texels.size() * 2);
-  register_pass(stub_desc(ssil, "test.ssil"));
-  composite::testing::set_pbr_producers_override(true);
-  Settings settings = pbr_settings();
-  settings.ao = Quality::High;
-  const auto graph = live_graph(settings);
-  ASSERT_TRUE(composite::pbr_active());
-  const FrameState state{.graph = graph};
-  const Frame first = run(state, 1);
-  const Frame second = run(state, 2);
-  // The meter reads last frame's exposure, so the second frame's bounce carries the first frame's e
-  for (const auto& [frame, e] :
-       {std::pair{&first, 1.f},
-        std::pair{&second, exposure::testing::exp2_exact(std::bit_cast<float>(first.state[0]))}}) {
-    double target = 0.0;
-    double weight = 0.0;
-    size_t bounced = 0;
-    for (size_t i = 0; i < pixels.size(); ++i) {
-      const MeterPixel& p = pixels[i];
-      if (!sampled(p)) {
-        continue;
-      }
-      const std::array<float, 3> l{p.legacy[0] / 255.f, p.legacy[1] / 255.f, p.legacy[2] / 255.f};
-      const std::array<float, 3> fc{p.fc[0] / 255.f, p.fc[1] / 255.f, p.fc[2] / 255.f};
-      const float q = p.q7 / 127.f;
-      std::array<float, 3> bounce{};
-      for (size_t c = 0; c < 3; ++c) {
-        bounce[c] = ao::legacy_albedo() * e * lighting::openpbr::from_half(lighting::openpbr::to_half(irr[i][c]));
-      }
-      const std::array<float, 3> sb = composite::testing::legacy_ssil(l, fc, p.q7, p.ao / 255.f, p.code / 3.f, bounce);
-      bounced += sb != composite::testing::legacy_ao(l, fc, p.q7, p.ao / 255.f, p.code / 3.f) ? 1 : 0;
-      Rgb lin{};
-      for (size_t c = 0; c < 3; ++c) {
-        lin[c] = srgb_decode((sb[c] - q * fc[c]) / (1.f - q));
-      }
-      const double w = 1.0 - q;
-      target += w * std::log2(std::max(tonemap::luminance(lin), exposure::YFloor));
-      weight += w;
-    }
-    EXPECT_GT(bounced, pixels.size() / 4);
-    EXPECT_NEAR(std::bit_cast<float>(frame->state[4]), target / weight, 2e-4) << e;
-  }
-  EXPECT_NE(std::bit_cast<float>(first.state[0]), 0.f);
-}
+TEST_F(ExposureGpu, MeterTargetMatchesCompositeSbWithSsil) { check_ssil_meter(true); }
+
+TEST_F(ExposureGpu, MeterBounceWaitsForCompositeExposure) { check_ssil_meter(false); }
 } // namespace
 } // namespace aurora::render::detail

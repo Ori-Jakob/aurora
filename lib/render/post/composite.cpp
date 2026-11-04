@@ -74,6 +74,8 @@ std::optional<bool> g_radianceForced;
 bool g_contractWarned = false;
 bool g_ssilWarned = false;
 bool g_latchedPbr = false;
+std::atomic_bool g_exposureUnits{false};
+std::optional<bool> g_exposureUnitsOverride;
 std::atomic_uint32_t g_unitsEpoch{0};
 
 std::atomic_uint64_t g_enabledFrame{NoFrame};
@@ -165,6 +167,15 @@ const CompiledUse* composite_use(const CompiledGraph& graph, std::string_view re
     }
   }
   return nullptr;
+}
+
+// A frame the meter skipped binds its white dummy, so under FlagPbr the bound e is not the radiance's units
+bool exposure_skipped(const StageData& stage, uint32_t flags) noexcept {
+  if ((flags & FlagPbr) == 0 || stage.frame == nullptr || stage.frame->graph == nullptr) {
+    return false;
+  }
+  const CompiledUse* use = composite_use(*stage.frame->graph, lighting::exposure::Resource);
+  return use != nullptr && !use->staticDummy && use->hasFallback && stage.dummy_bound(use->stageUse);
 }
 
 uint32_t params_flags_of(std::span<const std::byte> bytes) noexcept {
@@ -393,11 +404,28 @@ void encode(PassContext& ctx, const void*) {
   if ((params_flags_of(ctx.params()) & FlagSsil) != 0) {
     bump(g_ssilDraws);
   }
+  // Its legacy pixels went out in e = 1 units, which next frame's readers would take for pre-exposure
+  if (radiance && exposure_skipped(ctx.stage_data(), params_flags_of(ctx.params()))) {
+    bail(ctx, radiance);
+  }
   if (params_carry_pbr(ctx.params())) {
     bump(g_pbrDraws);
     if (lighting::deferred::ran(ctx.stage_data())) {
       bump(g_hdrDraws);
     }
+  }
+}
+
+void fill_stage(const StageData& stage, const void*, std::span<std::byte> bytes) {
+  if (bytes.size() < sizeof(Params)) {
+    return;
+  }
+  Params params;
+  std::memcpy(&params, bytes.data(), sizeof(Params));
+  // ssil.irr is pre-exposure under FlagPbr, so without the meter's e the bounce has no units to be applied in
+  if ((params.flags & FlagSsil) != 0 && exposure_skipped(stage, params.flags)) {
+    params.flags &= ~uint32_t{FlagSsil};
+    std::memcpy(bytes.data(), &params, sizeof(Params));
   }
 }
 
@@ -602,6 +630,7 @@ PassDesc pass_desc() {
       .enabled = enabled,
       .encode = encode,
       .pipelines = request_pipelines,
+      .stageParams = fill_stage,
   };
 }
 
@@ -630,6 +659,7 @@ void shutdown() noexcept {
   g_contractWarned = false;
   g_ssilWarned = false;
   g_latchedPbr = false;
+  g_exposureUnits.store(false, std::memory_order_relaxed);
   g_enabledFrame.store(NoFrame, std::memory_order_relaxed);
   g_encodeMismatch.store(false, std::memory_order_relaxed);
   const testing::Counters c = testing::counters();
@@ -720,6 +750,7 @@ void on_latch(const PassSetup& latched, const CompiledGraph* graph) {
     params = g_paramsOverride.value_or(params);
     set_pass_params(g_pass, std::as_bytes(std::span{&params, 1}));
     const bool latchedPbr = (params.flags & FlagPbr) != 0;
+    g_exposureUnits.store(latchedPbr, std::memory_order_relaxed);
     if (latchedPbr != std::exchange(g_latchedPbr, latchedPbr)) {
       g_unitsEpoch.fetch_add(1, std::memory_order_relaxed);
     }
@@ -740,6 +771,10 @@ bool ao_ready(const Settings& settings) noexcept {
 }
 
 bool pbr_active() noexcept { return latched_slot().pbrActive; }
+
+bool exposure_units() noexcept {
+  return g_exposureUnitsOverride.value_or(g_exposureUnits.load(std::memory_order_relaxed));
+}
 
 bool pbr_applied(const StageData& opaqueDone) noexcept {
   const CompiledGraph* graph = opaqueDone.frame != nullptr ? opaqueDone.frame->graph.get() : nullptr;
@@ -800,6 +835,7 @@ void reset() noexcept {
   g_producersOverride.reset();
   g_readyOverride.reset();
   g_radianceForced.reset();
+  g_exposureUnitsOverride.reset();
   g_contractWarned = false;
   g_mismatchWarned.store(false, std::memory_order_relaxed);
   g_copies.store(0, std::memory_order_relaxed);
@@ -826,6 +862,8 @@ void set_pbr_producers_override(std::optional<bool> live) noexcept { g_producers
 void set_ready_override(std::optional<bool> ready) noexcept { g_readyOverride = ready; }
 
 void set_radiance_forced(std::optional<bool> forced) noexcept { g_radianceForced = forced; }
+
+void set_exposure_units(std::optional<bool> exposed) noexcept { g_exposureUnitsOverride = exposed; }
 
 void bump_units_epoch() noexcept { g_unitsEpoch.fetch_add(1, std::memory_order_relaxed); }
 

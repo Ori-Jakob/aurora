@@ -9,6 +9,7 @@
 #include "../gx_ext/unlit.hpp"
 #include "../hints.hpp"
 #include "../pass_context.hpp"
+#include "../post/composite.hpp"
 #include "../shaders.hpp"
 #include "../stage_data.hpp"
 
@@ -127,8 +128,9 @@ void fill_stage_params(const StageData& stage, const void*, std::span<std::byte>
     return;
   }
   Params params;
+  // Until the composite applies exposure the radiance SSIL gathers is in legacy units, which H cannot take
   fill_params(stage_hints(stage), g_surfaceAmbient.load(std::memory_order_relaxed), current_mode(), params,
-              g_ssil.load(std::memory_order_relaxed));
+              g_ssil.load(std::memory_order_relaxed) && composite::exposure_units());
   std::memcpy(bytes.data(), &params, sizeof(Params));
 }
 

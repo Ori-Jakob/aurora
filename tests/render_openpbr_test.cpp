@@ -1691,6 +1691,8 @@ protected:
                                             .size = staged.size() * 2};
     m_ssil.staging = m_device->device.CreateBuffer(&descriptor);
     m_device->queue.WriteBuffer(m_ssil.staging, 0, staged.data(), staged.size() * 2);
+    // Under a latched FlagPbr the stub's values are pre-exposure, which is what light.deferred adds
+    composite::testing::set_exposure_units(true);
     return register_pass(stub_texture_desc(m_ssil));
   }
 
@@ -2049,6 +2051,28 @@ TEST_F(LightDeferredGpu, SsilNotMultipliedByAo) {
     ++checked;
   }
   EXPECT_GT(checked, 1000u);
+}
+
+TEST_F(LightDeferredGpu, SsilWaitsForCompositeExposure) {
+  std::mt19937 rng{0x5522u};
+  set_hints(scene_hints(mixed_lights()));
+  std::vector<GpuPixel> pixels(size_t{64} * 48);
+  for (size_t i = 0; i < pixels.size(); ++i) {
+    pixels[i] = random_gpu_pixel(rng);
+    pixels[i].receiver = 1;
+  }
+  stage_pixels(64, 48, pixels);
+  deferred::testing::force_enabled(true);
+  stage_ao(64, 48, std::vector<uint8_t>(pixels.size(), 128));
+  const auto off = run_hdr(pbr_settings(), 1);
+  const PassId ssilId = stage_ssil(64, 48, std::vector<std::array<float, 4>>(pixels.size(), {0.25f, 0.2f, 0.15f, 1.f}));
+  composite::testing::set_exposure_units(false);
+  const auto unexposed = run_hdr(pbr_settings(), 2);
+  composite::testing::set_exposure_units(true);
+  const auto exposed = run_hdr(pbr_settings(), 3);
+  unregister_pass(ssilId);
+  EXPECT_EQ(off, unexposed);
+  EXPECT_NE(off, exposed);
 }
 
 TEST_F(LightDeferredGpu, AoDummyClamps) {

@@ -306,6 +306,10 @@ void fill_stage(const StageData& stage, const void*, std::span<std::byte> bytes)
   if (hints == nullptr || !hints->motionValid) {
     params.flags |= FlagReset;
   }
+  // The composite scales the bounce by e only while it applies exposure, and the target must see what it shows
+  if ((params.flags & FlagSsil) != 0 && composite::exposure_units()) {
+    params.flags |= FlagSsilExposed;
+  }
   std::memcpy(bytes.data(), &params, sizeof(params));
 }
 struct Window {

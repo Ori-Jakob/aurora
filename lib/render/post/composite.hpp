@@ -86,6 +86,8 @@ void on_latch(const PassSetup& latched, const CompiledGraph* graph);
 [[nodiscard]] bool ready(const Settings& settings) noexcept;
 [[nodiscard]] bool ao_ready(const Settings& settings) noexcept;
 [[nodiscard]] bool pbr_active() noexcept;
+// The latched FlagPbr: ssil.irr is in pre-exposure units only under it, so its readers key on this one bit
+[[nodiscard]] bool exposure_units() noexcept;
 [[nodiscard]] bool pbr_applied(const StageData& opaqueDone) noexcept;
 [[nodiscard]] bool live() noexcept;
 [[nodiscard]] bool enabled_this_frame(uint64_t frameId) noexcept;
@@ -115,6 +117,7 @@ void set_camera_override(std::shared_ptr<const SceneHints> hints) noexcept;
 void set_pbr_producers_override(std::optional<bool> live) noexcept;
 void set_ready_override(std::optional<bool> ready) noexcept;
 void set_radiance_forced(std::optional<bool> forced) noexcept;
+void set_exposure_units(std::optional<bool> exposed) noexcept;
 void bump_units_epoch() noexcept;
 [[nodiscard]] bool pbr_active_for(bool live, bool hdrLive, bool classView, const Settings& settings) noexcept;
 [[nodiscard]] std::array<float, 3> legacy_ao(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7,

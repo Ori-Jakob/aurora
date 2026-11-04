@@ -70,6 +70,7 @@ enum ParamFlags : uint32_t {
   FlagSnap = 1u << 2,
   FlagReset = 1u << 3,
   FlagSsil = 1u << 4,
+  FlagSsilExposed = 1u << 5,
 };
 
 enum StateFlags : uint32_t {
