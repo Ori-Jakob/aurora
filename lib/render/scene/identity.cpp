@@ -72,6 +72,8 @@ struct Slot {
   bool delivered = false;
   bool createdPending = false;
   bool latched = false;
+  bool captureOnlySeen = false;
+  bool visibleSeen = false;
 };
 
 struct ObjectEntry {
@@ -122,7 +124,8 @@ struct DrawRef {
   uint32_t indexCount = 0;
   gx::DrawImmediateData immediates{};
   uint32_t record = 0;
-  const gx::PipelineConfig* config = nullptr;
+  const gx::AttrConfig* attrs = nullptr;
+  uint8_t stride = 0;
 };
 
 struct FifoFrame {
@@ -133,6 +136,7 @@ struct FifoFrame {
   double eye = 0.0;
   std::array<double, 3> transientOrigin{};
   bool opaquePrepared = false;
+  bool staticCreated = false;
   FrameCounts counts;
 };
 
@@ -143,6 +147,7 @@ struct Totals {
   uint64_t churn = 0;
   uint64_t lostCaptures = 0;
   uint64_t resyncs = 0;
+  uint64_t capturedOnly = 0;
 };
 
 class Zone {
@@ -178,6 +183,17 @@ bool g_active = false;
 bool g_allocated = false;
 bool g_wantCovered = false;
 uint64_t g_sceneClock = 0;
+bool g_producerCalled = false;
+bool g_holdCalled = true;
+bool g_producer = false;
+bool g_held = true;
+bool g_coverage = false;
+uint64_t g_lastDisturb = 0;
+std::array<SettlePredicate, MaxSettlePredicates> g_settle{};
+uint32_t g_settleCount = 0;
+std::atomic_uint64_t g_reportedLost{0};
+std::atomic_bool g_captureActive{false};
+std::atomic_bool g_coverageComplete{false};
 Totals g_totals;
 uint32_t g_peakLive = 0;
 
@@ -470,17 +486,17 @@ void ensure_view() noexcept {
   }
 }
 
-uint16_t layout_index(const gx::ShaderConfig& config) noexcept {
+uint16_t layout_index(const gx::AttrConfig* attrs, uint8_t stride) noexcept {
+  constexpr size_t AttrBytes = sizeof(Layout::attrs);
   if (!g_layouts.empty()) {
     const Layout& last = g_layouts.back();
-    if (last.stride == config.vtxStride &&
-        std::memcmp(last.attrs.data(), config.attrs.data(), sizeof(last.attrs)) == 0) {
+    if (last.stride == stride && std::memcmp(last.attrs.data(), attrs, AttrBytes) == 0) {
       return static_cast<uint16_t>(g_layouts.size() - 1);
     }
   }
   Hasher hasher;
-  hasher.update(config.attrs.data(), sizeof(config.attrs));
-  hasher.update(config.vtxStride);
+  hasher.update(attrs, AttrBytes);
+  hasher.update(stride);
   const uint64_t key = hasher.digest();
   for (size_t i = g_layouts.size(); i-- > 0;) {
     if (g_layouts[i].key == key) {
@@ -490,7 +506,10 @@ uint16_t layout_index(const gx::ShaderConfig& config) noexcept {
   if (g_layouts.size() >= MaxLayouts) {
     return UINT16_MAX;
   }
-  g_layouts.push_back({.attrs = config.attrs, .stride = config.vtxStride, .key = key});
+  Layout& layout = g_layouts.emplace_back();
+  std::memcpy(layout.attrs.data(), attrs, AttrBytes);
+  layout.stride = stride;
+  layout.key = key;
   return static_cast<uint16_t>(g_layouts.size() - 1);
 }
 
@@ -802,6 +821,7 @@ uint32_t create(const Pending& pending, const Key& key, uint32_t classBits, uint
   ++g_live;
   g_peakLive = std::max(g_peakLive, g_live);
   if ((classBits & StaticBits) != 0) {
+    g_frame.staticCreated = true;
     ++g_liveStatics;
     ++g_undeliveredStatics;
     if (object != NoIndex && g_objects[object].statics++ == 0) {
@@ -915,8 +935,7 @@ void record(const DrawRef& draw) noexcept {
   g_pending.valid = false;
   FrameCounts& counts = g_frame.counts;
   const gx::GXState& state = gx::g_gxState;
-  const gx::ShaderConfig& config = draw.config->shaderConfig;
-  const bool palette = config.attrs[GX_VA_PNMTXIDX].attrType != GX_NONE;
+  const bool palette = draw.attrs[GX_VA_PNMTXIDX].attrType != GX_NONE;
   const uint32_t matrixCount = palette ? PaletteSlots : 1;
   if (g_log.size() >= MaxEntries || g_matrices.size() + matrixCount > MaxMatrices) {
     ++counts.droppedEntries;
@@ -926,7 +945,7 @@ void record(const DrawRef& draw) noexcept {
     }
     return;
   }
-  const uint16_t layout = layout_index(config);
+  const uint16_t layout = layout_index(draw.attrs, draw.stride);
   if (layout == UINT16_MAX) {
     ++counts.droppedEntries;
     drop(pending.flags);
@@ -942,6 +961,9 @@ void record(const DrawRef& draw) noexcept {
   }
   std::array<double, 3> origin = g_frame.transientOrigin;
   if (slot != TransientSlot) {
+    Slot& seen = g_slots[slot];
+    seen.captureOnlySeen = seen.captureOnlySeen || (pending.flags & entry_flag::CaptureOnly) != 0;
+    seen.visibleSeen = seen.visibleSeen || (pending.flags & entry_flag::CaptureOnly) == 0;
     world = instance_world(slot, world, origin);
     if ((pending.objectFlags & object_flag::Teleport) != 0) {
       queue_event(EventType::Teleported, slot);
@@ -1102,7 +1124,7 @@ void evict_slot(uint32_t index, EvictReason reason) noexcept {
   g_lifecycleChanged = true;
 }
 
-void collect(bool scene) noexcept {
+bool collect(bool scene) noexcept {
   const detail::SceneHints& hints = detail::live_scene_hints();
   g_evictions.clear();
   const gc::SweepResult result = gc::sweep({.sceneFrame = g_sceneClock,
@@ -1115,6 +1137,25 @@ void collect(bool scene) noexcept {
     evict_slot(eviction.slot, eviction.reason);
   }
   gc::free_quarantined(g_free);
+  return result.epochChanged;
+}
+
+bool settled(bool epochChanged) noexcept {
+  const FrameCounts& counts = g_frame.counts;
+  if (g_frame.staticCreated || epochChanged || counts.lostCaptures != 0 || counts.resyncs != 0 ||
+      counts.overflow != 0 || counts.droppedEntries != 0) {
+    g_lastDisturb = g_sceneClock;
+  }
+  // aurora cannot know about geometry it was never sent, so only a producer that stopped holding can settle
+  if (!g_producer || g_held || g_undeliveredStatics != 0 || g_sceneClock - g_lastDisturb < QuietFrames) {
+    return false;
+  }
+  for (uint32_t i = 0; i < g_settleCount; ++i) {
+    if (!g_settle[i]()) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void publish() {
@@ -1128,9 +1169,10 @@ void publish() {
   counts.undeliveredStatics = g_undeliveredStatics;
   counts.eventsPending = static_cast<uint32_t>(g_events.size());
   counts.pendingSweeps = g_active ? gc::pending_sweeps() : 0;
+  counts.coverageComplete = g_coverage;
   const RetainedStats stats{
       .active = g_active,
-      .coverageComplete = false,
+      .coverageComplete = g_coverage,
       .instances = g_live,
       .staticInstances = g_liveStatics,
       .staticObjects = g_staticObjects,
@@ -1141,6 +1183,7 @@ void publish() {
       .churn = g_totals.churn,
       .lostCaptures = g_totals.lostCaptures,
       .resyncs = g_totals.resyncs,
+      .capturedOnly = g_totals.capturedOnly,
   };
   std::shared_ptr<const std::vector<uint64_t>> covered;
   const bool rebuild = g_wantCovered && g_active && std::exchange(g_lifecycleChanged, false);
@@ -1180,7 +1223,11 @@ void latch_gate(const Settings&, const Caps& caps) noexcept {
     }
     g_active = next;
     g_frame = {};
+    g_lastDisturb = g_sceneClock;
   }
+  g_producer = g_producerCalled;
+  g_held = g_holdCalled;
+  g_captureActive.store(next, std::memory_order_relaxed);
   latch_resources(next);
 }
 
@@ -1204,14 +1251,20 @@ void apply_frame_state(const detail::FrameState&) noexcept {
 
 void end_frame() noexcept {
   const bool scene = detail::live_scene_hints().has(detail::SceneHasMainCamera);
+  const uint64_t reported = g_reportedLost.exchange(0, std::memory_order_relaxed);
+  g_coverage = false;
   if (g_active) {
     if (!g_log.empty()) {
       drop_log();
     }
     g_pending = {};
     g_tentative.reset();
-    collect(scene);
+    const bool epochChanged = collect(scene);
+    g_frame.counts.lostCaptures += static_cast<uint32_t>(reported);
+    g_totals.lostCaptures += reported;
+    g_coverage = settled(epochChanged);
   }
+  g_coverageComplete.store(g_coverage, std::memory_order_relaxed);
   publish();
   if (g_active && scene) {
     ++g_sceneClock;
@@ -1228,6 +1281,9 @@ void reset() noexcept {
   }
   g_resetPending = g_active;
   g_sceneClock = 0;
+  g_lastDisturb = 0;
+  g_coverage = false;
+  g_coverageComplete.store(false, std::memory_order_relaxed);
   g_totals = {};
   g_peakLive = 0;
   g_frame = {};
@@ -1244,7 +1300,33 @@ void want_covered_objects(bool want) noexcept {
   g_lifecycleChanged = true;
 }
 
+void hold_coverage(bool hold) noexcept {
+  g_producerCalled = true;
+  g_holdCalled = hold;
+}
+
+void add_settle_predicate(SettlePredicate predicate) noexcept {
+  for (uint32_t i = 0; i < g_settleCount; ++i) {
+    if (g_settle[i] == predicate) {
+      return;
+    }
+  }
+  if (predicate != nullptr && g_settleCount < MaxSettlePredicates) {
+    g_settle[g_settleCount++] = predicate;
+  }
+}
+
 bool active() noexcept { return g_active; }
+
+void report_lost(uint32_t count) noexcept { g_reportedLost.fetch_add(count, std::memory_order_relaxed); }
+
+bool capture_active() noexcept { return g_captureActive.load(std::memory_order_relaxed); }
+
+bool coverage_complete() noexcept { return g_coverageComplete.load(std::memory_order_relaxed); }
+
+bool captures(const DrawClass& cls, const gx::draw_route::Query& query) noexcept {
+  return g_active && candidate(cls, query);
+}
 
 void route(const DrawClass& cls, const gx::draw_route::Query& query) noexcept {
   if (!g_active) {
@@ -1255,7 +1337,7 @@ void route(const DrawClass& cls, const gx::draw_route::Query& query) noexcept {
     return;
   }
   const Zone zone;
-  set_pending(cls, query, 0);
+  set_pending(cls, query, cls.suppressed ? entry_flag::CaptureOnly : 0);
 }
 
 void on_push(const gx::DrawData& draw, const gx::PipelineConfig& config) noexcept {
@@ -1268,7 +1350,8 @@ void on_push(const gx::DrawData& draw, const gx::PipelineConfig& config) noexcep
       .indexCount = draw.indexCount,
       .immediates = draw.immediateData,
       .record = draw.immediateData._pad,
-      .config = &config,
+      .attrs = config.shaderConfig.attrs.data(),
+      .stride = config.shaderConfig.vtxStride,
   });
 }
 
@@ -1280,7 +1363,22 @@ void on_merge(const gx::draw_route::MergedDraw& draw) noexcept {
       .vertRange = {draw.vertOffset, draw.vertSize},
       .immediates = draw.command->immediateData,
       .record = draw.command->immediateData._pad,
-      .config = draw.config,
+      .attrs = draw.config->shaderConfig.attrs.data(),
+      .stride = draw.config->shaderConfig.vtxStride,
+  });
+}
+
+void on_capture(const gx::draw_route::CapturedDraw& draw) noexcept {
+  if (!g_active || !g_pending.valid) {
+    return;
+  }
+  record({
+      .vertRange = {draw.vertOffset, draw.vertSize},
+      .idxRange = {draw.idxOffset, draw.idxSize},
+      .indexCount = draw.indexCount,
+      .immediates = *draw.immediates,
+      .attrs = draw.attrs,
+      .stride = draw.vtxStride,
   });
 }
 
@@ -1352,6 +1450,8 @@ void seal(detail::StageData& stage) noexcept {
   const auto delivered = static_cast<uint32_t>(g_tentative->entries.size());
   g_frame.counts.delivered += delivered;
   g_totals.captured += delivered;
+  g_totals.capturedOnly += static_cast<uint64_t>(std::ranges::count_if(
+      g_tentative->entries, [](const Entry& entry) { return (entry.flags & entry_flag::CaptureOnly) != 0; }));
   commit_events();
   g_log.clear();
   g_matrices.clear();
@@ -1385,6 +1485,14 @@ void reset() noexcept {
   g_checkLast = UINT64_MAX;
   g_overrun = -1;
   g_wantCovered = false;
+  g_producerCalled = false;
+  g_holdCalled = true;
+  g_producer = false;
+  g_held = true;
+  g_settle = {};
+  g_settleCount = 0;
+  g_reportedLost.store(0, std::memory_order_relaxed);
+  g_captureActive.store(false, std::memory_order_relaxed);
   retained::reset();
 }
 
@@ -1405,6 +1513,8 @@ Instance instance(uint32_t slot) noexcept {
           .delivered = entry.delivered,
           .latched = entry.latched,
           .released = g_lives[slot].released,
+          .captureOnlySeen = entry.captureOnlySeen,
+          .visibleSeen = entry.visibleSeen,
           .lastSeen = g_lives[slot].lastSeen,
           .slotGeneration = entry.generation,
           .info = entry.info,
@@ -1422,16 +1532,6 @@ uint32_t find(const Key& key) noexcept {
 void evict(uint32_t slot, EvictReason reason) noexcept {
   if (g_allocated && slot < MaxSlots) {
     evict_slot(slot, reason);
-  }
-}
-
-void route_capture_only(const DrawClass& cls, const gx::draw_route::Query& query) noexcept {
-  if (!g_active) {
-    return;
-  }
-  g_pending.valid = false;
-  if (candidate(cls, query)) {
-    set_pending(cls, query, entry_flag::CaptureOnly);
   }
 }
 } // namespace testing

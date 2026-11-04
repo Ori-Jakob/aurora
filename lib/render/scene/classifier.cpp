@@ -117,6 +117,8 @@ void Classifier::set_objects(bool enabled) noexcept { m_objects = enabled; }
 
 void Classifier::set_merge_key(MergeKey key) noexcept { m_mergeKey = key; }
 
+void Classifier::set_count_captured(bool count) noexcept { m_countCaptured = count; }
+
 void Classifier::end_frame() noexcept {
   if (m_ended) {
     return;
@@ -354,7 +356,7 @@ const DrawClass& Classifier::route(const DrawInputs& inputs) noexcept {
     m_hasPushed = true;
   }
   count(cls, inputs);
-  cls.ordinal = m_objectOpen && !cls.suppressed && !inputs.offscreen
+  cls.ordinal = m_objectOpen && (!cls.suppressed || m_countCaptured) && !inputs.offscreen
                     ? static_cast<uint16_t>(std::min<uint32_t>(m_objectDraws++, 0xFFFF))
                     : 0;
   if (m_record) {

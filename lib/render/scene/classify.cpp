@@ -135,6 +135,11 @@ gx::draw_route::Decision route(void*, const gx::draw_route::Query& query) noexce
   };
   const DrawClass& cls = g_classifier.route(inputs);
   if (cls.suppressed) {
+    // Every other role keeps suppressing, so a stamped shape stays out of shadow and reflection passes
+    if (retained::captures(cls, query)) {
+      retained::route(cls, query);
+      return {.route = gx::draw_route::Route::Capture};
+    }
     return {.route = gx::draw_route::Route::Suppress};
   }
   // Each command carries one draw record, so a changed class must start its own command
@@ -171,7 +176,10 @@ bool push(void*, gx::DrawData& draw, const gx::PipelineConfig& config, const gx:
 
 void merge(void*, const gx::draw_route::MergedDraw& draw) noexcept { retained::on_merge(draw); }
 
-constexpr gx::draw_route::Router g_router{.route = &route, .push = &push, .userData = nullptr, .merge = &merge};
+void capture(void*, const gx::draw_route::CapturedDraw& draw) noexcept { retained::on_capture(draw); }
+
+constexpr gx::draw_route::Router g_router{
+    .route = &route, .push = &push, .userData = nullptr, .merge = &merge, .capture = &capture};
 } // namespace
 
 void install() noexcept {
@@ -222,6 +230,7 @@ void apply_frame_state(const detail::FrameState& state) noexcept {
   apply_merge_key();
   overlay::apply_frame_state(state);
   retained::apply_frame_state(state);
+  g_classifier.set_count_captured(retained::active());
 }
 
 void seal_frame() noexcept {

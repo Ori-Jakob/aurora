@@ -7,7 +7,9 @@
 #include <span>
 
 namespace aurora::gx {
+struct AttrConfig;
 struct DrawData;
+struct DrawImmediateData;
 struct PipelineConfig;
 struct ShaderInfo;
 } // namespace aurora::gx
@@ -18,6 +20,8 @@ enum class Route : uint8_t {
   Suppress,
   // Recorded into the overlay side list; replayed after the OPAQUE_DONE stage or put back in place
   Defer,
+  // Its bytes are pushed for the capture hook and no draw is recorded, so a retained consumer sees a hidden draw
+  Capture,
 };
 
 struct Query {
@@ -41,12 +45,27 @@ struct MergedDraw {
   const PipelineConfig* config = nullptr;
 };
 
+struct CapturedDraw {
+  GXPrimitive prim = GX_TRIANGLES;
+  uint32_t vertOffset = 0;
+  uint32_t vertSize = 0;
+  uint32_t idxOffset = 0;
+  uint32_t idxSize = 0;
+  uint32_t vtxCount = 0;
+  uint32_t indexCount = 0;
+  const DrawImmediateData* immediates = nullptr;
+  const AttrConfig* attrs = nullptr;
+  uint8_t vtxStride = 0;
+};
+
 struct Router {
   Decision (*route)(void* userData, const Query& query) noexcept = nullptr;
   // True when the hook changed the pipeline, bind groups, uniform or instance count, so later draws must not merge
   bool (*push)(void* userData, DrawData& draw, const PipelineConfig& config, const ShaderInfo& info) noexcept = nullptr;
   void* userData = nullptr;
   void (*merge)(void* userData, const MergedDraw& draw) noexcept = nullptr;
+  // Without it a Capture decision suppresses the draw
+  void (*capture)(void* userData, const CapturedDraw& draw) noexcept = nullptr;
 };
 
 inline std::atomic<const Router*> g_router{nullptr};

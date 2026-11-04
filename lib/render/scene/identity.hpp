@@ -20,6 +20,7 @@ struct PipelineConfig;
 namespace aurora::gx::draw_route {
 struct Query;
 struct MergedDraw;
+struct CapturedDraw;
 } // namespace aurora::gx::draw_route
 
 namespace aurora::render {
@@ -48,6 +49,8 @@ inline constexpr uint32_t TransientSlot = 0xFFFFFFFF;
 inline constexpr uint16_t NoGroup = 0xFFFF;
 inline constexpr double ReoriginDistance = 2048.0;
 inline constexpr double TransientGrid = 64.0;
+inline constexpr uint64_t QuietFrames = 8;
+inline constexpr uint32_t MaxSettlePredicates = 8;
 
 enum class Demand : uint8_t {
   Env = 1u << 0,
@@ -182,7 +185,11 @@ struct FrameCounts {
   uint32_t recreatedDynamic = 0;
   uint32_t pendingSweeps = 0;
   uint32_t releaseOverflow = 0;
+  bool coverageComplete = false;
 };
+
+// Game thread at end_frame; false holds coverage back
+using SettlePredicate = bool (*)() noexcept;
 
 // Game thread while the FIFO is idle
 void latch_gate(const Settings& settings, const Caps& caps) noexcept;
@@ -192,13 +199,22 @@ void apply_frame_state(const detail::FrameState& state) noexcept;
 void end_frame() noexcept;
 void reset() noexcept;
 void want_covered_objects(bool want) noexcept;
+// The first call registers the caller as the producer; latched with the gate
+void hold_coverage(bool hold) noexcept;
+void add_settle_predicate(SettlePredicate predicate) noexcept;
 
 [[nodiscard]] bool active() noexcept;
+// Any thread
+void report_lost(uint32_t count) noexcept;
+[[nodiscard]] bool capture_active() noexcept;
+[[nodiscard]] bool coverage_complete() noexcept;
 
 // FIFO thread
+[[nodiscard]] bool captures(const DrawClass& cls, const gx::draw_route::Query& query) noexcept;
 void route(const DrawClass& cls, const gx::draw_route::Query& query) noexcept;
 void on_push(const gx::DrawData& draw, const gx::PipelineConfig& config) noexcept;
 void on_merge(const gx::draw_route::MergedDraw& draw) noexcept;
+void on_capture(const gx::draw_route::CapturedDraw& draw) noexcept;
 void prepare(detail::StageData& stage) noexcept;
 void skip(detail::StageData& stage) noexcept;
 void seal(detail::StageData& stage) noexcept;
@@ -214,6 +230,8 @@ struct Instance {
   bool delivered = false;
   bool latched = false;
   bool released = false;
+  bool captureOnlySeen = false;
+  bool visibleSeen = false;
   uint64_t lastSeen = 0;
   uint32_t slotGeneration = 0;
   InstanceInfo info;
@@ -225,6 +243,5 @@ void set_overrun(int overrun) noexcept;
 [[nodiscard]] Instance instance(uint32_t slot) noexcept;
 [[nodiscard]] uint32_t find(const Key& key) noexcept;
 void evict(uint32_t slot, EvictReason reason) noexcept;
-void route_capture_only(const DrawClass& cls, const gx::draw_route::Query& query) noexcept;
 } // namespace testing
 } // namespace aurora::render::scene::retained

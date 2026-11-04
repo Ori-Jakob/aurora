@@ -277,6 +277,7 @@ struct DrawRouteCounters {
   // Merges actually prevented; classify.json's mergeBreaks counts every requested break
   uint64_t mergeBreaks = 0;
   uint64_t substituted = 0;
+  uint64_t captured = 0;
   bool operator==(const DrawRouteCounters&) const = default;
 };
 
@@ -295,10 +296,17 @@ struct RetainedStats {
   uint64_t churn = 0;
   uint64_t lostCaptures = 0;
   uint64_t resyncs = 0;
+  uint64_t capturedOnly = 0;
   bool operator==(const RetainedStats&) const = default;
 };
 
 RetainedStats retained_stats() noexcept;
+// Latched per frame; a producer stamps CAPTURE_ONLY only while it is true
+bool retained_capture_active() noexcept;
+// Latched at the end of each frame; never true without a settled producer
+bool retained_coverage_complete() noexcept;
+// Game thread; true while the caller is still capturing, and the first call makes it the producer
+void retained_hold_coverage(bool hold) noexcept;
 
 // M10
 struct OpenPbrParams {

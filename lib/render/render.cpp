@@ -309,6 +309,7 @@ DrawRouteCounters draw_route_counters() noexcept {
       .suppressed = stats.suppressed,
       .mergeBreaks = stats.mergeBreaks,
       .substituted = stats.substituted,
+      .captured = stats.captured,
   };
 }
 
@@ -317,6 +318,28 @@ RetainedStats retained_stats() noexcept {
   return scene::retained::stats();
 #else
   return {};
+#endif
+}
+
+bool retained_capture_active() noexcept {
+#if AURORA_ENABLE_RENDER
+  return scene::retained::capture_active();
+#else
+  return false;
+#endif
+}
+
+bool retained_coverage_complete() noexcept {
+#if AURORA_ENABLE_RENDER
+  return scene::retained::coverage_complete();
+#else
+  return false;
+#endif
+}
+
+void retained_hold_coverage([[maybe_unused]] bool hold) noexcept {
+#if AURORA_ENABLE_RENDER
+  scene::retained::hold_coverage(hold);
 #endif
 }
 

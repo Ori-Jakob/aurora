@@ -54,6 +54,8 @@ extern std::vector<gx::PipelineConfig> g_testWarmedConfigs;
 extern bool g_testOffscreen;
 extern bool g_testOverlayTarget;
 extern std::vector<gx::DrawData> g_testOverlayDraws;
+extern ResidentStorage g_testResidentStorage;
+extern bool g_testStorageRanges;
 namespace testing {
 void reset_stub_ranges() noexcept;
 } // namespace testing
@@ -321,6 +323,8 @@ protected:
     route::set_router(nullptr);
     hints::set_sink(nullptr);
     hints::testing::reset_counters();
+    fifo::reset_immutable_arrays();
+    gfx::g_testStorageRanges = false;
     gfx::g_testMergeDraws = false;
     gfx::g_testNormalAttachment = false;
     gfx::set_blocking_pipelines(false);
@@ -358,8 +362,12 @@ protected:
     EXPECT_EQ(g_testLastResolveInfoSize, resolves);
   }
 
-  void install_router(bool withPush = false) {
-    router = {.route = &on_route, .push = withPush ? &on_push : nullptr, .userData = this, .merge = &on_merge};
+  void install_router(bool withPush = false, bool withCapture = true) {
+    router = {.route = &on_route,
+              .push = withPush ? &on_push : nullptr,
+              .userData = this,
+              .merge = &on_merge,
+              .capture = withCapture ? &on_capture : nullptr};
     route::set_router(&router);
   }
 
@@ -390,6 +398,33 @@ protected:
     }
     triangle();
     triangle();
+  }
+
+  void expect_captured_pair_split() {
+    // As with suppression, except that the captured vertices reach the buffer between A and C1
+    EXPECT_EQ(gfx::g_testDrawCount, 2u);
+    EXPECT_EQ(gfx::g_testMergedDrawCount, 1u);
+    EXPECT_EQ(gfx::g_testLastDraw.vtxCount, 6u);
+    EXPECT_EQ(gfx::g_testLastDraw.vertRange.offset, 9 * kVtxSize);
+    EXPECT_EQ(gfx::g_testLastDraw.vertRange.size, 6 * kVtxSize);
+    EXPECT_EQ(gfx::g_testPushedVertexBytes, 15 * kVtxSize);
+    const fifo::DrawRouteStats stats = fifo::draw_route_stats();
+    EXPECT_EQ(stats.routed, 5u);
+    EXPECT_EQ(stats.suppressed, 0u);
+    EXPECT_EQ(stats.captured, 2u);
+    EXPECT_EQ(stats.mergeBreaks, 0u);
+    EXPECT_EQ(stats.substituted, 0u);
+    EXPECT_EQ(g_gxState.dirty, 0u);
+    ASSERT_EQ(captures.size(), 2u);
+    for (uint32_t i = 0; i < 2; ++i) {
+      EXPECT_EQ(captures[i].vertOffset, (3 + 3 * i) * kVtxSize) << i;
+      EXPECT_EQ(captures[i].vertSize, 3 * kVtxSize) << i;
+      EXPECT_EQ(captures[i].vtxStart, captures[i].vertOffset) << i;
+      EXPECT_EQ(captures[i].vtxCount, 3u) << i;
+      EXPECT_EQ(captures[i].idxSize, 0u) << i;
+      EXPECT_EQ(captures[i].stride, kVtxSize) << i;
+      EXPECT_EQ(captures[i].posType, GX_DIRECT) << i;
+    }
   }
 
   void expect_diverted_pair_split() {
@@ -445,7 +480,7 @@ protected:
     auto& test = *static_cast<GXDrawRouteTest*>(userData);
     test.queries.push_back(query);
     if (test.capture_only()) {
-      return {.route = route::Route::Suppress};
+      return {.route = test.captureMode ? route::Route::Capture : route::Route::Suppress};
     }
     if (std::ranges::find(test.deferAt, test.queries.size()) != test.deferAt.end()) {
       return {.route = route::Route::Defer};
@@ -469,6 +504,31 @@ protected:
                            draw.config != nullptr});
   }
 
+  static void on_capture(void* userData, const route::CapturedDraw& draw) noexcept {
+    auto& test = *static_cast<GXDrawRouteTest*>(userData);
+    test.captures.push_back({
+        .vertOffset = draw.vertOffset,
+        .vertSize = draw.vertSize,
+        .idxSize = draw.idxSize,
+        .vtxCount = draw.vtxCount,
+        .indexCount = draw.indexCount,
+        .vtxStart = draw.immediates->vtxStart,
+        .stride = draw.vtxStride,
+        .posType = draw.attrs[GX_VA_POS].attrType,
+    });
+  }
+
+  struct CaptureCall {
+    uint32_t vertOffset;
+    uint32_t vertSize;
+    uint32_t idxSize;
+    uint32_t vtxCount;
+    uint32_t indexCount;
+    uint32_t vtxStart;
+    uint8_t stride;
+    uint8_t posType;
+  };
+
   struct MergeCall {
     uint32_t vertOffset;
     uint32_t vertSize;
@@ -480,7 +540,9 @@ protected:
   hints::Sink sink;
   route::Router router;
   std::vector<MergeCall> merges;
+  std::vector<CaptureCall> captures;
   std::vector<route::Query> queries;
+  bool captureMode = false;
   // 1-based query and push numbers; 0 never matches
   size_t breakAt = 0;
   size_t substituteAt = 0;
@@ -573,6 +635,107 @@ TEST_F(GXDrawRouteTest, SuppressedStateChangeStaysDirty) {
   EXPECT_EQ(gfx::g_testDrawCount, 2u);
   EXPECT_EQ(gfx::g_testMergedDrawCount, 0u);
   EXPECT_EQ(g_gxState.dirty, 0u);
+}
+
+TEST_F(GXDrawRouteTest, CaptureRouteScopeKeepsVertices) {
+  captureMode = true;
+  install_router();
+  emit_diverted_pair(Diversion::Scope);
+  decode();
+  expect_captured_pair_split();
+}
+
+TEST_F(GXDrawRouteTest, CaptureRouteObjectKeepsVertices) {
+  captureMode = true;
+  install_router();
+  emit_diverted_pair(Diversion::Object);
+  decode();
+  expect_captured_pair_split();
+}
+
+TEST_F(GXDrawRouteTest, CapturedStateChangeStaysDirty) {
+  captureMode = true;
+  install_router();
+  triangle();
+  push_capture_only_scope();
+  GXSetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+  triangle();
+  GXAuroraPopScope();
+  triangle();
+  decode();
+  EXPECT_EQ(fifo::draw_route_stats().captured, 1u);
+  EXPECT_EQ(fifo::draw_route_stats().suppressed, 0u);
+  // The captured draw never consumed the TEV change, so the next draw still rebuilds for it
+  EXPECT_EQ(g_testPipelineBuildCount, 2u);
+  EXPECT_EQ(gfx::g_testDrawCount, 2u);
+  EXPECT_EQ(gfx::g_testMergedDrawCount, 0u);
+  EXPECT_EQ(g_gxState.dirty, 0u);
+}
+
+TEST_F(GXDrawRouteTest, CaptureWithoutHookSuppresses) {
+  captureMode = true;
+  install_router(false, false);
+  emit_diverted_pair(Diversion::Scope);
+  decode();
+  expect_diverted_pair_split();
+  EXPECT_EQ(fifo::draw_route_stats().captured, 0u);
+  EXPECT_TRUE(captures.empty());
+}
+
+TEST_F(GXDrawRouteTest, CapturedIndexedDrawPushesItsIndices) {
+  captureMode = true;
+  install_router();
+  push_capture_only_scope();
+  indexed_triangle();
+  GXAuroraPopScope();
+  triangle();
+  decode_then_bp();
+  ASSERT_EQ(captures.size(), 1u);
+  EXPECT_EQ(captures[0].indexCount, 3u);
+  EXPECT_EQ(captures[0].idxSize, 3 * sizeof(uint16_t));
+  EXPECT_EQ(captures[0].vtxCount, 3u);
+  EXPECT_EQ(gfx::g_testPushedIndexBytes, 3 * sizeof(uint16_t));
+  EXPECT_EQ(gfx::g_testPushedVertexBytes, 6 * kVtxSize);
+  EXPECT_EQ(gfx::g_testDrawCount, 1u);
+  EXPECT_EQ(fifo::draw_route_stats().captured, 1u);
+}
+
+TEST_F(GXDrawRouteTest, CaptureReadsArraysReadOnly) {
+  fifo::reset_immutable_arrays();
+  gfx::g_testStorageRanges = true;
+  gfx::g_testResidentStorage = {
+      .frameId = 1, .base = 1u << 20, .capacity = 1u << 20, .limit = 4u << 20, .blockAlign = 256, .epoch = 1};
+  captureMode = true;
+  install_router();
+  static constexpr std::array<f32, 9> positions{0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f, 0.f};
+  const auto pos_triangle = [] {
+    GXBegin(GX_TRIANGLES, GX_VTXFMT0, 3);
+    GXPosition1x8(0);
+    GXPosition1x8(1);
+    GXPosition1x8(2);
+    GXEnd();
+  };
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  GXSetArray(GX_VA_POS, positions.data(), sizeof(positions), 12, false);
+  GXAuroraSetArrayImmutable(positions.data(), sizeof(positions), GX_FALSE, 1);
+  push_capture_only_scope();
+  pos_triangle();
+  GXAuroraPopScope();
+  const uint64_t stages = fifo::immutable_array_stats().stages;
+  decode();
+  ASSERT_EQ(captures.size(), 1u);
+  EXPECT_EQ(captures[0].stride, 1u);
+  EXPECT_EQ(captures[0].posType, GX_INDEX8);
+  EXPECT_EQ(g_gxState.arrays[GX_VA_POS].cachedRange.size, 0u);
+  EXPECT_EQ(fifo::immutable_array_stats().stages, stages);
+  // The visible draw after it stages the declared array, as it would with no capture before it
+  pos_triangle();
+  decode();
+  EXPECT_EQ(fifo::immutable_array_stats().stages, stages + 1);
+  EXPECT_EQ(g_gxState.arrays[GX_VA_POS].cachedRange.size, sizeof(positions));
+  EXPECT_EQ(gfx::g_testDrawCount, 1u);
 }
 
 TEST_F(GXDrawRouteTest, BreakMergeSplitsCleanDraws) {

@@ -323,13 +323,13 @@ std::string format_retained_line(const RetainedFrame& frame) {
       "\"reorigins\": {}, \"overflow\": {}, \"droppedEntries\": {}, \"undeliveredStatics\": {}, "
       "\"lostCaptures\": {}, \"resyncs\": {}, \"eventsPending\": {}, \"evictedDynamic\": {}, \"evictedStatic\": {}, "
       "\"evictedReleased\": {}, \"recreatedStatic\": {}, \"recreatedDynamic\": {}, \"pendingSweeps\": {}, "
-      "\"releaseOverflow\": {}}}\n",
+      "\"releaseOverflow\": {}, \"coverageComplete\": {}}}\n",
       frame.frame, frame.active, frame.sceneFrame, frame.epoch, frame.entries, frame.captureOnly, frame.transient,
       frame.late, frame.instances, frame.statics, frame.created, frame.rekeyed, frame.newSubId, frame.newOccurrence,
       frame.relatched, frame.staticRestream, frame.signatureMisses, frame.reorigins, frame.overflow,
       frame.droppedEntries, frame.undeliveredStatics, frame.lostCaptures, frame.resyncs, frame.eventsPending,
       frame.evictedDynamic, frame.evictedStatic, frame.evictedReleased, frame.recreatedStatic, frame.recreatedDynamic,
-      frame.pendingSweeps, frame.releaseOverflow);
+      frame.pendingSweeps, frame.releaseOverflow, frame.coverageComplete);
 }
 
 std::string format_retained_summary(std::span<const RetainedFrame> frames) {
@@ -542,8 +542,9 @@ std::string cpu_zone_row(const CpuFrameZones& frame) {
                      frame.retainedMs, frame.retainedCalls);
   return out + fmt::format(
                    ", \"routed\": {}, \"suppressed\": {}, \"mergeBreaks\": {}, \"substituted\": {}, "
-                   "\"deferred\": {}, \"merged\": {}}}",
-                   frame.routed, frame.suppressed, frame.mergeBreaks, frame.substituted, frame.deferred, frame.merged);
+                   "\"deferred\": {}, \"captured\": {}, \"merged\": {}}}",
+                   frame.routed, frame.suppressed, frame.mergeBreaks, frame.substituted, frame.deferred, frame.captured,
+                   frame.merged);
 }
 
 std::string warm_cpu_zones(bool drawZones, std::span<const CpuFrameZones> frames, const std::vector<uint32_t>& runs) {

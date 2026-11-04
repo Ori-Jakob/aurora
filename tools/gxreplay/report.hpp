@@ -84,6 +84,7 @@ struct CpuFrameZones {
   uint64_t mergeBreaks = 0;
   uint64_t substituted = 0;
   uint64_t deferred = 0;
+  uint64_t captured = 0;
   uint64_t merged = 0;
 };
 
@@ -140,6 +141,7 @@ struct RetainedFrame {
   uint32_t recreatedDynamic = 0;
   uint32_t pendingSweeps = 0;
   uint32_t releaseOverflow = 0;
+  bool coverageComplete = false;
 };
 
 inline constexpr uint32_t RetainedGateFirstFrame = 30;

@@ -131,7 +131,7 @@ struct DrawClass {
   bool suppressed = false;
   bool keyChanged = false;
   uint32_t index = 0;
-  // Pre-merge GX draw index within the open object; offscreen and suppressed draws are not counted
+  // Pre-merge GX draw index within the open object; offscreen draws never count, suppressed ones only while captured
   uint16_t ordinal = 0;
 };
 
@@ -260,6 +260,7 @@ public:
   void set_record(bool record) noexcept;
   void set_objects(bool enabled) noexcept;
   void set_merge_key(MergeKey key) noexcept;
+  void set_count_captured(bool count) noexcept;
   void end_frame() noexcept;
 
   void camera(Role role) noexcept;
@@ -327,6 +328,7 @@ private:
   bool m_hasPushed = false;
   bool m_record = false;
   bool m_objects = false;
+  bool m_countCaptured = false;
   MergeKey m_mergeKey = MergeKey::Full;
   bool m_ended = false;
   uint64_t m_sequence = 0;

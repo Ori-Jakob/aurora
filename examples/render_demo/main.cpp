@@ -568,6 +568,8 @@ std::optional<std::string> overlay_failure(const render_demo::OverlayCheckReport
 struct HintCounterSnapshot {
   std::array<render_demo::ObservedCounters, render_demo::LastHintId + 1 - render_demo::FirstHintId> ids{};
   uint64_t suppressedDraws = 0;
+  uint64_t capturedDraws = 0;
+  aurora::render::RetainedStats retained;
 };
 
 // aurora_end_frame drained every frame's FIFO, so the core counters already cover each hint the demo emitted
@@ -583,7 +585,11 @@ HintCounterSnapshot read_hint_counters() {
         .bytes = counters.bytes,
     };
   }
-  snapshot.suppressedDraws = aurora::render::draw_route_counters().suppressed;
+  const aurora::render::DrawRouteCounters route = aurora::render::draw_route_counters();
+  // A captured CAPTURE_ONLY draw stays hidden too, so the hint check counts it with the suppressed ones
+  snapshot.suppressedDraws = route.suppressed + route.captured;
+  snapshot.capturedDraws = route.captured;
+  snapshot.retained = aurora::render::retained_stats();
   return snapshot;
 }
 
@@ -611,6 +617,17 @@ void print_hint_summary(const render_demo::HintTally& tally, const HintCounterSn
       static_cast<unsigned long long>(total.skipped), static_cast<unsigned long long>(total.malformed),
       static_cast<unsigned long long>(total.late), static_cast<unsigned long long>(total.bytes),
       static_cast<unsigned long long>(snapshot.suppressedDraws));
+  const aurora::render::RetainedStats& retained = snapshot.retained;
+  if (retained.active) {
+    std::printf(
+        "render_demo: retained: instances %u, statics %u, undelivered statics %u, created %llu, evicted %llu, "
+        "captured %llu, capture-only %llu, captured draws %llu, lost captures %llu, coverage %s\n",
+        retained.instances, retained.staticInstances, retained.undeliveredStatics,
+        static_cast<unsigned long long>(retained.created), static_cast<unsigned long long>(retained.evicted),
+        static_cast<unsigned long long>(retained.captured), static_cast<unsigned long long>(retained.capturedOnly),
+        static_cast<unsigned long long>(snapshot.capturedDraws), static_cast<unsigned long long>(retained.lostCaptures),
+        retained.coverageComplete ? "complete" : "open");
+  }
 }
 
 constexpr uint64_t CustomDrawProbeUniformBytes = 256;

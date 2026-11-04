@@ -480,52 +480,10 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
   ZoneScoped;
 
-  const auto& vtxFmt = g_gxState.vtxFmts[fmt];
   config.shaderConfig = {};
   config.shaderConfig.fogType = g_gxState.fog.type;
   config.shaderConfig.fogRangeEnabled = g_gxState.fog.rangeEnabled;
-  u8 vtxOffset = 0;
-  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
-    const auto attr = static_cast<GXAttr>(i);
-    const auto type = g_gxState.vtxDesc[i];
-    auto& mapping = config.shaderConfig.attrs[i];
-    if (type == GX_NONE) {
-      mapping = {};
-      continue;
-    }
-    const auto& attrFmt = vtxFmt.attrs[i];
-    const auto cnt = comp_cnt_count(attr, attrFmt.cnt);
-    const bool nbt3 = attr == GX_VA_NRM && attrFmt.cnt == GX_NRM_NBT3;
-    mapping = AttrConfig{
-        .attrType = static_cast<u8>(type),
-        .cnt = cnt,
-        .compType = static_cast<u8>(attrFmt.type),
-        .offset = vtxOffset,
-        .stride = 0,
-        .frac = attrFmt.frac,
-        .le = false,
-        .nbt3 = nbt3,
-    };
-    switch (type) {
-    case GX_DIRECT: {
-      vtxOffset += comp_type_size(attr, attrFmt.type) * cnt;
-      break;
-    }
-    case GX_INDEX8:
-      mapping.stride = g_gxState.arrays[i].stride;
-      mapping.le = g_gxState.arrays[i].le;
-      vtxOffset += nbt3 ? 3 : 1;
-      break;
-    case GX_INDEX16:
-      mapping.stride = g_gxState.arrays[i].stride;
-      mapping.le = g_gxState.arrays[i].le;
-      vtxOffset += nbt3 ? 6 : 2;
-      break;
-    default:
-      Log.fatal("populate_pipeline_config: Invalid vertex type {}", type);
-    }
-  }
-  config.shaderConfig.vtxStride = vtxOffset;
+  populate_vertex_layout(config.shaderConfig, fmt);
   if (primitive == GX_LINES) {
     config.shaderConfig.lineMode = 1;
   } else if (primitive == GX_LINESTRIP) {

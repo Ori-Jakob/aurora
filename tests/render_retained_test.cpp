@@ -152,7 +152,7 @@ protected:
   }
   static void end_object() { sink().objectEnd(sink().userData); }
 
-  uint32_t draw(uint32_t vtxCount = 3, uint8_t fill = 0, bool merge = false, bool captureOnly = false) {
+  uint32_t draw(uint32_t vtxCount = 3, uint8_t fill = 0, bool merge = false) {
     const uint32_t size = vtxCount * Stride;
     std::fill_n(m_fifo.begin() + m_offset, size, fill);
     const gx::draw_route::Query query{
@@ -162,12 +162,23 @@ protected:
         .vertices = std::span<const uint8_t>{m_fifo.data() + m_offset, size},
     };
     const gx::draw_route::Router* router = gx::draw_route::router();
-    router->route(router->userData, query);
-    if (captureOnly) {
-      testing::route_capture_only(scene::testing::classifier().last(), query);
-    }
+    const gx::draw_route::Route route = router->route(router->userData, query).route;
     const uint32_t offset = m_offset;
     m_offset += size;
+    if (route == gx::draw_route::Route::Capture) {
+      const gx::DrawImmediateData immediates{.vtxStart = offset, .currentPnMtx = gx::g_gxState.currentPnMtx};
+      router->capture(router->userData, {.prim = GX_TRIANGLES,
+                                         .vertOffset = offset,
+                                         .vertSize = size,
+                                         .vtxCount = vtxCount,
+                                         .immediates = &immediates,
+                                         .attrs = m_config.shaderConfig.attrs.data(),
+                                         .vtxStride = m_config.shaderConfig.vtxStride});
+      return offset;
+    }
+    if (route == gx::draw_route::Route::Suppress) {
+      return offset;
+    }
     if (merge) {
       m_command.vertRange.size += size;
       m_command.vtxCount += vtxCount;
@@ -487,8 +498,8 @@ TEST_F(RenderRetainedTest, Delivery) {
 
   testing::set_overrun(1);
   begin_frame();
-  begin_object(0x81, AURORA_CAT_STATIC);
-  draw(3, 0, false, true);
+  begin_object(0x81, AURORA_CAT_STATIC, AURORA_OBJ_CAPTURE_ONLY);
+  draw();
   end_object();
   EXPECT_EQ(seal_stage(), nullptr);
   counts = end();
@@ -832,6 +843,87 @@ TEST_F(RenderRetainedTest, GcSlotQuarantine) {
   end();
   EXPECT_EQ(slot_of(0x130), a);
   EXPECT_EQ(testing::instance(a).slotGeneration, generation + 1);
+}
+
+bool g_settledForTest = false;
+
+TEST_F(RenderRetainedTest, CoverageNeedsProducer) {
+  const auto frame = [&](uint64_t id = 0x140) {
+    begin_frame();
+    object_draw(id, AURORA_CAT_STATIC);
+    EXPECT_NE(seal_stage(), nullptr);
+    return end().coverageComplete;
+  };
+  for (uint32_t i = 0; i < 20; ++i) {
+    EXPECT_FALSE(frame()) << i;
+  }
+  EXPECT_TRUE(capture_active());
+  EXPECT_FALSE(coverage_complete());
+  hold_coverage(false);
+  EXPECT_TRUE(frame());
+  EXPECT_TRUE(coverage_complete());
+  EXPECT_TRUE(stats().coverageComplete);
+  hold_coverage(true);
+  EXPECT_FALSE(frame());
+  hold_coverage(false);
+  EXPECT_TRUE(frame());
+
+  g_settledForTest = false;
+  add_settle_predicate(+[]() noexcept { return g_settledForTest; });
+  EXPECT_FALSE(frame());
+  g_settledForTest = true;
+  EXPECT_TRUE(frame());
+
+  EXPECT_FALSE(frame(0x141));
+  for (uint64_t i = 1; i < QuietFrames; ++i) {
+    EXPECT_FALSE(frame()) << i;
+  }
+  EXPECT_TRUE(frame());
+
+  set_demand(Demand::Tool, false);
+  begin_frame();
+  EXPECT_FALSE(end().coverageComplete);
+  EXPECT_FALSE(capture_active());
+  EXPECT_FALSE(coverage_complete());
+}
+
+TEST_F(RenderRetainedTest, CoverageLostCapture) {
+  hold_coverage(false);
+  const auto capture = [&] {
+    begin_frame();
+    begin_object(0x150, AURORA_CAT_STATIC, AURORA_OBJ_CAPTURE_ONLY);
+    draw();
+    end_object();
+    seal_stage();
+    return end();
+  };
+  testing::set_overrun(1);
+  FrameCounts counts = capture();
+  EXPECT_EQ(counts.captureOnly, 1u);
+  EXPECT_EQ(counts.lostCaptures, 1u);
+  EXPECT_EQ(counts.undeliveredStatics, 1u);
+  EXPECT_FALSE(counts.coverageComplete);
+  testing::set_overrun(0);
+  for (uint64_t i = 1; i < QuietFrames; ++i) {
+    EXPECT_FALSE(capture().coverageComplete) << i;
+  }
+  counts = capture();
+  EXPECT_TRUE(counts.coverageComplete);
+  EXPECT_EQ(counts.undeliveredStatics, 0u);
+  EXPECT_EQ(stats().capturedOnly, QuietFrames);
+  const testing::Instance instance = testing::instance(slot_of(0x150));
+  EXPECT_TRUE(instance.captureOnlySeen);
+  EXPECT_FALSE(instance.visibleSeen);
+
+  report_lost(2);
+  counts = capture();
+  EXPECT_EQ(counts.lostCaptures, 2u);
+  EXPECT_FALSE(counts.coverageComplete);
+  for (uint64_t i = 1; i < QuietFrames; ++i) {
+    EXPECT_FALSE(capture().coverageComplete) << i;
+  }
+  EXPECT_TRUE(capture().coverageComplete);
+  EXPECT_EQ(stats().lostCaptures, 3u);
 }
 } // namespace
 } // namespace aurora::render::scene::retained

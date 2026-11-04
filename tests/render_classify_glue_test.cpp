@@ -811,5 +811,111 @@ TEST_F(RenderClassifyGlue, RetainedKeepsMerging) {
     EXPECT_EQ(on.mergeBreaks, identity == 0 ? 0u : 6u);
   }
 }
+
+TEST_F(RenderClassifyGlue, CaptureOnlyWhileRetainedAndMain) {
+  const gx::draw_route::Router* router = gx::draw_route::router();
+  ASSERT_NE(router->capture, nullptr);
+  const auto frame = [&](bool on) {
+    retained::set_demand(retained::Demand::Tool, on);
+    detail::begin_hint_frame();
+    retained::latch_gate(Settings{}, test::full_caps());
+    apply_frame_state(detail::FrameState{});
+    main_scene();
+  };
+  const auto route = [&](GXPrimitive prim = GX_TRIANGLES) {
+    return router->route(router->userData, {.prim = prim, .fmt = GX_VTXFMT0, .vtxCount = 3}).route;
+  };
+  retained::testing::reset();
+  frame(false);
+  begin_object(0x50, 0, AURORA_OBJ_CAPTURE_ONLY);
+  EXPECT_EQ(route(), Route::Suppress);
+  end_object();
+  seal_frame();
+
+  frame(true);
+  begin_object(0x50, 0, AURORA_OBJ_CAPTURE_ONLY);
+  EXPECT_EQ(route(), Route::Capture);
+  EXPECT_EQ(route(GX_LINES), Route::Suppress);
+  EXPECT_EQ(route(GX_POINTS), Route::Suppress);
+  sink().scopePush(sink().userData, {});
+  send(camera(AURORA_CAMERA_REFLECTION, perspective()));
+  EXPECT_EQ(route(), Route::Suppress);
+  EXPECT_EQ(last().key.role, Role::Reflection);
+  sink().scopePop(sink().userData);
+  gx::g_gxState.vtxDesc[GX_VA_POS] = GX_INDEX16;
+  gx::g_gxState.arrays[GX_VA_POS].gpu = true;
+  gx::g_gxState.gpuArrayMask = 1;
+  EXPECT_EQ(route(), Route::Suppress);
+  gx::g_gxState.gpuArrayMask = 0;
+  gx::g_gxState.arrays[GX_VA_POS] = {};
+  gx::g_gxState.vtxDesc[GX_VA_POS] = GX_DIRECT;
+  EXPECT_EQ(route(), Route::Capture);
+  end_object();
+  EXPECT_EQ(route(), Route::Push);
+  seal_frame();
+  retained::testing::reset();
+}
+
+TEST_F(RenderClassifyGlue, CapturedShapeKeepsItsSlot) {
+  retained::testing::reset();
+  retained::set_demand(retained::Demand::Tool, true);
+  const gx::draw_route::Router* router = gx::draw_route::router();
+  std::vector<uint8_t> fifo(256, 0);
+  gx::PipelineConfig config{};
+  config.shaderConfig.vtxStride = 12;
+  const gx::ShaderInfo info{};
+  std::array<uint32_t, 2> slots{};
+  for (uint32_t frame = 0; frame < 2; ++frame) {
+    detail::begin_hint_frame();
+    retained::latch_gate(Settings{}, test::full_caps());
+    apply_frame_state(detail::FrameState{});
+    main_scene();
+    begin_object(0x60, 0, frame == 0 ? 0 : AURORA_OBJ_CAPTURE_ONLY);
+    for (uint32_t i = 0; i < 2; ++i) {
+      const uint32_t offset = i * 36;
+      const gx::draw_route::Query query{
+          .prim = GX_TRIANGLES, .fmt = GX_VTXFMT0, .vtxCount = 3, .vertices = {fifo.data() + offset, 36}};
+      const Decision decision = router->route(router->userData, query);
+      if (frame == 0) {
+        EXPECT_EQ(decision.route, Route::Push);
+        gx::DrawData command{.vertRange = {offset, 36}, .vtxCount = 3, .instanceCount = 1};
+        router->push(router->userData, command, config, info);
+      } else {
+        EXPECT_EQ(decision.route, Route::Capture);
+        const gx::DrawImmediateData immediates{.vtxStart = offset};
+        router->capture(router->userData, {.prim = GX_TRIANGLES,
+                                           .vertOffset = offset,
+                                           .vertSize = 36,
+                                           .vtxCount = 3,
+                                           .immediates = &immediates,
+                                           .attrs = config.shaderConfig.attrs.data(),
+                                           .vtxStride = 12});
+      }
+    }
+    end_object();
+    detail::StageData stage{.stage = Stage::OpaqueDone};
+    retained::prepare(stage);
+    retained::seal(stage);
+    ASSERT_NE(stage.retained, nullptr);
+    ASSERT_EQ(stage.retained->entries.size(), 2u);
+    for (uint32_t i = 0; i < 2; ++i) {
+      const retained::Entry& entry = stage.retained->entries[i];
+      EXPECT_EQ((entry.flags & retained::entry_flag::CaptureOnly) != 0, frame == 1) << i;
+      if (frame == 0) {
+        slots[i] = entry.slot;
+      } else {
+        EXPECT_EQ(entry.slot, slots[i]) << i;
+        EXPECT_EQ(entry.record, 0u) << i;
+      }
+    }
+    seal_frame();
+  }
+  EXPECT_EQ(retained::frame_counts().created, 0u);
+  EXPECT_EQ(retained::frame_counts().newOccurrence, 0u);
+  const retained::testing::Instance instance = retained::testing::instance(slots[1]);
+  EXPECT_TRUE(instance.captureOnlySeen);
+  EXPECT_TRUE(instance.visibleSeen);
+  retained::testing::reset();
+}
 } // namespace
 } // namespace aurora::render::scene

@@ -94,6 +94,7 @@ CpuFrameZones frame_zones(uint32_t run, uint32_t frame, const gx::fifo::CpuZoneS
       .mergeBreaks = routeAfter.mergeBreaks - routeBefore.mergeBreaks,
       .substituted = routeAfter.substituted - routeBefore.substituted,
       .deferred = routeAfter.deferred - routeBefore.deferred,
+      .captured = routeAfter.captured - routeBefore.captured,
       .merged = stats.mergedDrawCallCount,
   };
 }
@@ -264,6 +265,10 @@ ExitCode bring_up_aurora(int argc, char* argv[], const Options& options, const t
   // The request outlives the run-start reset, so every repeat classifies the same way
   render::scene::request_report({.records = options.classifyDraws, .objects = options.classifyObjects});
   render::scene::retained::set_demand(render::scene::retained::Demand::Tool, options.retainedJson);
+  if (options.retainedJson) {
+    // A trace cannot capture again, so its coverage settles on delivery and quiet frames alone
+    render::scene::retained::hold_coverage(false);
+  }
   if (options.debugView != 0) {
     render::apply_settings(render::Settings{.debugView = options.debugView});
     if (options.debugViewBit != 0) {
@@ -526,6 +531,7 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
             .recreatedDynamic = counts.recreatedDynamic,
             .pendingSweeps = counts.pendingSweeps,
             .releaseOverflow = counts.releaseOverflow,
+            .coverageComplete = counts.coverageComplete,
         };
         retainedLines << format_retained_line(line);
         if (!retainedLines) {

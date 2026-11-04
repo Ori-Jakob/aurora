@@ -361,6 +361,7 @@ std::vector<CpuFrameZones> zone_rows() {
       .mergeBreaks = 1,
       .substituted = 3,
       .deferred = 4,
+      .captured = 5,
       .merged = 14,
   };
   CpuFrameZones warmA = zone_row(1, 1, 1.0);
@@ -400,7 +401,7 @@ TEST(GxReplayReport, CpuZonesJsonFormat) {
                 "\"residentHits\": 7, \"residentStages\": 3, \"encodedDraws\": 365, \"texturedDraws\": 300, "
                 "\"uniformBinds\": 330, \"textureBinds\": 150, \"indexBinds\": 6, \"encodeMs\": 0.750, "
                 "\"retainedMs\": 0.250, \"retainedCalls\": 40, \"routed\": 380, \"suppressed\": 2, "
-                "\"mergeBreaks\": 1, \"substituted\": 3, \"deferred\": 4, \"merged\": 14},\n"),
+                "\"mergeBreaks\": 1, \"substituted\": 3, \"deferred\": 4, \"captured\": 5, \"merged\": 14},\n"),
       std::string::npos)
       << json;
   EXPECT_NE(json.find("      \"meanFifoMs\": 18.000,\n      \"p95FifoMs\": 50.000,\n"), std::string::npos) << json;
@@ -620,6 +621,7 @@ TEST(GxReplayReport, FormatsRetainedLine) {
       .recreatedDynamic = 18,
       .pendingSweeps = 19,
       .releaseOverflow = 20,
+      .coverageComplete = true,
   };
   EXPECT_EQ(format_retained_line(frame),
             "{\"frame\": 4, \"active\": true, \"sceneFrame\": 3, \"epoch\": 2, \"entries\": 10, \"captureOnly\": 1, "
@@ -628,7 +630,7 @@ TEST(GxReplayReport, FormatsRetainedLine) {
             "\"reorigins\": 7, \"overflow\": 8, \"droppedEntries\": 9, \"undeliveredStatics\": 10, "
             "\"lostCaptures\": 11, \"resyncs\": 12, \"eventsPending\": 13, \"evictedDynamic\": 14, "
             "\"evictedStatic\": 15, \"evictedReleased\": 16, \"recreatedStatic\": 17, \"recreatedDynamic\": 18, "
-            "\"pendingSweeps\": 19, \"releaseOverflow\": 20}\n");
+            "\"pendingSweeps\": 19, \"releaseOverflow\": 20, \"coverageComplete\": true}\n");
 }
 
 TEST(GxReplayReport, RetainedSummaryGatesFromFrame30) {

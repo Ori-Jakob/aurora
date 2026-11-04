@@ -223,6 +223,7 @@ std::atomic<uint64_t> g_suppressed{0};
 std::atomic<uint64_t> g_mergeBreaks{0};
 std::atomic<uint64_t> g_substituted{0};
 std::atomic<uint64_t> g_deferred{0};
+std::atomic<uint64_t> g_captured{0};
 std::atomic_uint32_t g_cpuZoneTimed{0};
 std::array<std::atomic_uint64_t, CpuZoneCount> g_cpuZoneCalls{};
 std::array<std::atomic_uint64_t, CpuZoneCount> g_cpuZoneNs{};
@@ -573,6 +574,29 @@ gfx::Range upload_array(const AttrArray& array) noexcept {
     stage(entry, range, pushed);
   }
   return range;
+}
+
+// Leaves cachedRange and the arena alone, so the next visible draw uploads and stages exactly as it would have
+std::optional<gfx::Range> capture_array_range(const AttrArray& array) noexcept {
+  if (array.gpu) {
+    return std::nullopt;
+  }
+  if (array.cachedRange.size != 0) {
+    return array.cachedRange;
+  }
+  // An arena not synced this frame may still change its epoch, so only a synced one can serve a hit
+  if (g_immutableMode != ImmutableArrayMode::Off && !g_immutableArrays.empty() && g_arena.frameId != 0 &&
+      g_arena.frameId == gfx::resident_storage().frameId && !g_arena.bypass) {
+    const auto it = g_immutableArrays.find(reinterpret_cast<uintptr_t>(array.data));
+    if (it != g_immutableArrays.end()) {
+      const ImmutableArray& entry = it->second;
+      if (entry.setFrame == g_arena.frameId && entry.size == array.size && entry.le == array.le &&
+          entry.epoch == g_arena.epoch && entry.stagedFrame != g_arena.frameId) {
+        return gfx::Range{g_arena.base + entry.offset, array.size};
+      }
+    }
+  }
+  return push_array(array);
 }
 
 u8 line_mode_for_prim(GXPrimitive prim) noexcept {
@@ -1130,7 +1154,7 @@ static DrawData* merge_target(GXPrimitive prim, GXVtxFmt fmt) noexcept {
   return lastDraw != nullptr && lastDraw->instanceCount == 1 ? lastDraw : nullptr;
 }
 
-enum class RouteAction : uint8_t { Push, Skip, Defer };
+enum class RouteAction : uint8_t { Push, Skip, Defer, Capture };
 
 // A diverted draw ends the merge chain, so no later draw can merge across what was left out
 static RouteAction route_draw(const draw_route::Query& query) noexcept {
@@ -1148,6 +1172,15 @@ static RouteAction route_draw(const draw_route::Query& query) noexcept {
   if (decision.route == draw_route::Route::Defer) {
     break_draw_merge();
     return RouteAction::Defer;
+  }
+  if (decision.route == draw_route::Route::Capture) {
+    break_draw_merge();
+    if (router->capture == nullptr) {
+      g_suppressed.fetch_add(1, std::memory_order_relaxed);
+      return RouteAction::Skip;
+    }
+    g_captured.fetch_add(1, std::memory_order_relaxed);
+    return RouteAction::Capture;
   }
   // Only a break that prevents a merge counts; an indexed draw always starts its own command
   if (decision.breakMerge && !query.indexed && merge_target(query.prim, query.fmt) != nullptr) {
@@ -1189,6 +1222,44 @@ static bool gpu_arrays_ready() noexcept {
   return true;
 }
 
+// Consumes no dirty bit and no draw cache field, so the draws after it build and merge as if it were suppressed
+static void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, u32 indexCount, std::span<const u8> indexData,
+                         std::span<const u8> vertexData) noexcept {
+  ZoneScoped;
+  const auto* router = draw_route::router();
+  DrawImmediateData immediates{.currentPnMtx = g_gxState.currentPnMtx};
+  for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
+    if (g_gxState.vtxDesc[i] != GX_INDEX8 && g_gxState.vtxDesc[i] != GX_INDEX16) {
+      continue;
+    }
+    const auto range = capture_array_range(g_gxState.arrays[i]);
+    if (!range) {
+      return;
+    }
+    immediates.arrayStart[i - GX_VA_POS] = range->offset;
+  }
+  gfx::Range idxRange;
+  if (!indexData.empty()) {
+    idxRange = gfx::push_indices(indexData.data(), indexData.size(), 4);
+  }
+  const gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), 4);
+  immediates.vtxStart = vertRange.offset;
+  ShaderConfig layout{};
+  populate_vertex_layout(layout, fmt);
+  router->capture(router->userData, {
+                                        .prim = prim,
+                                        .vertOffset = vertRange.offset,
+                                        .vertSize = vertRange.size,
+                                        .idxOffset = idxRange.offset,
+                                        .idxSize = idxRange.size,
+                                        .vtxCount = vtxCount,
+                                        .indexCount = indexCount,
+                                        .immediates = &immediates,
+                                        .attrs = layout.attrs.data(),
+                                        .vtxStride = layout.vtxStride,
+                                    });
+}
+
 static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange) noexcept {
   ZoneScoped;
   u32 numIndices = 0;
@@ -1228,6 +1299,10 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
       {.prim = prim, .fmt = fmt, .vtxCount = vtxCount, .vertices = {reader.data() + reader.offset(), totalVtxBytes}});
   if (action == RouteAction::Skip) {
     reader.skip(totalVtxBytes);
+    return;
+  }
+  if (action == RouteAction::Capture) {
+    capture_draw(prim, fmt, vtxCount, 0, {}, reader.take(totalVtxBytes));
     return;
   }
   const OverlayDraw overlay{action == RouteAction::Defer};
@@ -1323,6 +1398,11 @@ static void handle_draw_indexed(ByteReader& reader) noexcept {
                                              : RouteAction::Push;
   if (action == RouteAction::Skip) {
     reader.skip(idxBytes + totalVtxBytes);
+    return;
+  }
+  if (action == RouteAction::Capture) {
+    const auto indexData = reader.take(idxBytes);
+    capture_draw(prim, fmt, vtxCount, indexCount, indexData, reader.take(totalVtxBytes));
     return;
   }
   const OverlayDraw overlay{action == RouteAction::Defer};
@@ -1560,6 +1640,7 @@ DrawRouteStats draw_route_stats() noexcept {
       .mergeBreaks = g_mergeBreaks.load(std::memory_order_relaxed),
       .substituted = g_substituted.load(std::memory_order_relaxed),
       .deferred = g_deferred.load(std::memory_order_relaxed),
+      .captured = g_captured.load(std::memory_order_relaxed),
   };
 }
 
@@ -1764,6 +1845,7 @@ void reset_draw_route_stats() noexcept {
   g_mergeBreaks.store(0, std::memory_order_relaxed);
   g_substituted.store(0, std::memory_order_relaxed);
   g_deferred.store(0, std::memory_order_relaxed);
+  g_captured.store(0, std::memory_order_relaxed);
 }
 
 void reset_array_upload_stats() noexcept {

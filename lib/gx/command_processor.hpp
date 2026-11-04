@@ -25,6 +25,7 @@ struct DrawRouteStats {
   uint64_t mergeBreaks = 0;
   uint64_t substituted = 0;
   uint64_t deferred = 0;
+  uint64_t captured = 0;
 };
 
 struct ArrayUploadStats {
