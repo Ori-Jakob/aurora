@@ -44,6 +44,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <limits>
 #include <map>
 #include <memory>
 #include <numbers>
@@ -508,8 +509,12 @@ TEST(OpenPbrMirror, LambertAtZeroDiffuseRoughness) {
 }
 
 TEST(OpenPbrMirror, AmbientMatchesIntegratedDirect) {
+  OpenPbrParams tinted;
+  tinted.specularColor = {0.9f, 0.6f, 0.3f};
+  std::vector<Config> configs = white_configs();
+  configs.push_back({"metal/f82", classes::gpu_row(tinted), 1.0});
   double worst = 0.0;
-  for (const Config& config : white_configs()) {
+  for (const Config& config : configs) {
     if (config.sphere) {
       continue;
     }
@@ -517,10 +522,9 @@ TEST(OpenPbrMirror, AmbientMatchesIntegratedDirect) {
       for (const double muV : {0.3, 0.7}) {
         SCOPED_TRACE(config.name + " r " + std::to_string(roughness) + " mu " + std::to_string(muV));
         const Vec3 n{0.0, 0.0, 1.0};
-        // Tinted metals take an approximate F in the ambient term until W3's DFG, so they stay white here
-        const Vec3 base = config.metal > 0.0 ? Vec3{1.0, 1.0, 1.0} : Vec3{0.8, 0.5, 0.2};
-        const openpbr::Prepared p = prepare(
-            config.row, {.baseColor = base, .roughness = roughness, .metalness = config.metal}, n, view_at(n, muV));
+        const openpbr::Prepared p =
+            prepare(config.row, {.baseColor = {0.8, 0.5, 0.2}, .roughness = roughness, .metalness = config.metal}, n,
+                    view_at(n, muV));
         const Vec3 ambient = openpbr::eval_ambient(p, {Pi, Pi, Pi}, {1.0, 1.0, 1.0});
         const Vec3 direct = integrate(p, 160, false);
         for (size_t c = 0; c < 3; ++c) {
@@ -674,25 +678,31 @@ TEST(DeferredPipelines, SubgroupWalkNeedsSubgroups) {
 TEST(DeferredMirror, FalloffFollowsDeclaredCurve) {
   for (const float p : {0.f, 1.f, 1.5f, 2.f}) {
     for (const float radius : {2015.f, 7555.f}) {
-      AuroraLight light = make_light(AURORA_LIGHT_POINT, {0.f, 0.f, -500.f}, {0.f, 0.f, -1.f}, radius);
-      light.falloffExponent = p;
-      const clusters::GpuLight gpu = prepared_light(light, identity_view());
-      double previous = deferred::testing::attenuation(gpu, 0.0);
-      EXPECT_NEAR(previous, 1.0, 1e-6) << p;
-      EXPECT_NEAR(deferred::testing::attenuation(gpu, radius), 0.0, 1e-6) << p;
-      EXPECT_LT(deferred::testing::attenuation(gpu, radius * 0.999), 0.02) << p;
-      for (int i = 1; i <= 4096; ++i) {
-        const double d = radius * i / 4096.0;
-        const double a = deferred::testing::attenuation(gpu, d);
-        EXPECT_LE(a, previous + 1e-12) << p << " d " << d;
-        if (p > 0.f) {
-          const double k = 254.0 / std::pow(double{radius}, double{p});
-          const double gx = 1.0 / (1.0 + k * std::pow(d, double{p}));
-          for (const double gain : {1.0, 2.0}) {
-            EXPECT_LE(gain * std::abs(a - gx), gain / 255.0 + 1e-6) << p << " d " << d;
-          }
+      for (const float gain : {1.f, 2.f}) {
+        SCOPED_TRACE(std::to_string(p) + " r " + std::to_string(radius) + " gain " + std::to_string(gain));
+        AuroraLight light = make_light(AURORA_LIGHT_POINT, {0.f, 0.f, -500.f}, {0.f, 0.f, -1.f}, radius);
+        light.falloffExponent = p;
+        // dusk's light tuning scales only the colour, so the gained light must keep the game's radius and curve
+        for (float& c : light.color) {
+          c *= gain;
         }
-        previous = a;
+        const clusters::GpuLight gpu = prepared_light(light, identity_view());
+        const auto lit = [&](double d) { return gpu.v2[0] * deferred::testing::attenuation(gpu, d); };
+        double previous = lit(0.0);
+        EXPECT_NEAR(previous, gain, 1e-6);
+        EXPECT_NEAR(lit(radius), 0.0, 1e-6);
+        EXPECT_LT(lit(radius * 0.999), 0.02 * gain);
+        for (int i = 1; i <= 4096; ++i) {
+          const double d = radius * i / 4096.0;
+          const double a = lit(d);
+          EXPECT_LE(a, previous + 1e-12) << "d " << d;
+          if (p > 0.f) {
+            const double k = 254.0 / std::pow(double{radius}, double{p});
+            const double gx = 1.0 / (1.0 + k * std::pow(d, double{p}));
+            EXPECT_LE(std::abs(a - gain * gx), gain / 255.0 + 1e-6) << "d " << d;
+          }
+          previous = a;
+        }
       }
     }
   }
@@ -2251,6 +2261,171 @@ TEST_F(OpenPbrGpu, LibraryMatchesMirror) {
   }
   EXPECT_LE(bad, ProbeCases / 400) << first;
   EXPECT_GT(facing, 100u);
+}
+
+constexpr std::string_view LutProbeShader = R"(//#import aurora/openpbr
+
+@group(0) @binding(2) var linear_clamp: sampler;
+@group(1) @binding(0) var probe_lut3d: texture_3d<f32>;
+@group(1) @binding(1) var probe_lut2d: texture_2d_array<f32>;
+@group(1) @binding(2) var<storage, read_write> probe_out: array<vec4f>;
+
+fn probe_hash(x: u32) -> u32 {
+  var h = x * 747796405u + 2891336453u;
+  h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+  return (h >> 22u) ^ h;
+}
+
+fn probe_unit(seed: ptr<function, u32>) -> f32 {
+  *seed = probe_hash(*seed);
+  return f32(*seed >> 8u) * (1.0 / 16777216.0);
+}
+
+// Indices past both edges pin the clamp, and texel nodes pin the layout free of filtering error
+fn probe_index(seed: ptr<function, u32>, node: bool) -> f32 {
+  let x = probe_unit(seed) * 35.0 - 2.0;
+  return select(x, floor(x), node);
+}
+
+@compute @workgroup_size(64)
+fn probe(@builtin(global_invocation_id) id: vec3u) {
+  let i = id.x;
+  if (i >= arrayLength(&probe_out) / 4u) {
+    return;
+  }
+  var seed = i * 7919u + 3u;
+  let node = i % 4u == 0u;
+  let x = probe_index(&seed, node);
+  let y = probe_index(&seed, node);
+  let z = probe_index(&seed, node);
+  probe_out[i * 4u] = vec4f(openpbr_lut3d(probe_lut3d, linear_clamp, x / OPENPBR_TABLE_MAX, y, z), 0.0, 0.0);
+  for (var layer = 0u; layer < 3u; layer++) {
+    probe_out[i * 4u + 1u + layer] = openpbr_lut2d(probe_lut2d, linear_clamp, x, y, layer);
+  }
+}
+)";
+
+constexpr uint32_t LutCases = 1024;
+constexpr uint64_t LutProbeBytes = uint64_t{LutCases} * 64;
+constexpr std::string_view LutProbeOut = "light.test_lut_probe";
+
+void declare_lut_probe(InternalPassBuilder& builder, const PassSetup&, const void*) {
+  builder.after(phase::Lighting);
+  builder.import_persistent_texture(openpbr::Lut3d, openpbr::lut3d_handle(), openpbr::lut3d_desc(), Access::Sampled);
+  builder.import_persistent_texture(openpbr::Lut2d, openpbr::lut2d_handle(), openpbr::lut2d_desc(), Access::Sampled);
+  builder.create_buffer(LutProbeOut, {.size = LutProbeBytes}, Access::StorageWrite);
+}
+
+void request_lut_probe(const PipelineSetup& setup, const void*, std::span<uint32_t, MaxPassPipelines> ids) {
+  ids[0] = shaders::request_compute({.label = "t.lut_probe",
+                                     .shader = "test/openpbr_lut_probe",
+                                     .entryPoint = "probe",
+                                     .layout = setup.layout,
+                                     .layoutKey = setup.layoutHash})
+               .value;
+}
+
+void encode_lut_probe(PassContext& ctx, const void*) {
+  const wgpu::ComputePipeline pipeline = shaders::compute_pipeline(ctx.pipeline(0));
+  const wgpu::ComputePassEncoder pass = ctx.begin_compute();
+  if (!pipeline || !pass) {
+    return;
+  }
+  pass.SetPipeline(pipeline);
+  pass.DispatchWorkgroups(LutCases / 64);
+  pass.End();
+}
+
+template <size_t Axes, typename Sample>
+double texel_spread(const std::array<double, Axes>& index, const Sample& sample) {
+  double lo = std::numeric_limits<double>::infinity();
+  double hi = -lo;
+  for (uint32_t corner = 0; corner < (1u << Axes); ++corner) {
+    std::array<double, Axes> at{};
+    for (size_t a = 0; a < Axes; ++a) {
+      const double base = std::floor(std::clamp(index[a], 0.0, 31.0));
+      at[a] = std::min(base + ((corner >> a) & 1u), 31.0);
+    }
+    const double value = sample(at);
+    lo = std::min(lo, value);
+    hi = std::max(hi, value);
+  }
+  return hi - lo;
+}
+
+TEST_F(OpenPbrGpu, LutsSampleAsMirror) {
+  ASSERT_TRUE(shaders::register_source("test/openpbr_lut_probe", LutProbeShader));
+  register_pass({.name = "t.lut_probe",
+                 .stage = Stage::OpaqueDone,
+                 .kind = PassKind::Compute,
+                 .order = 3,
+                 .declare = declare_lut_probe,
+                 .encode = encode_lut_probe,
+                 .pipelines = request_lut_probe});
+  Readback reader{.resource = LutProbeOut, .isBuffer = true};
+  const wgpu::BufferDescriptor staging{.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::CopySrc,
+                                       .size = LutProbeBytes};
+  reader.buffer = m_device->device.CreateBuffer(&staging);
+  register_pass(readback_desc(reader, "t.lut_probe_read"));
+  set_hints(scene_hints({}));
+  make_depth(64, 48);
+  const auto graph = live_graph(pbr_settings());
+  ASSERT_EQ(status(*graph, "t.lut_probe"), CullReason::None);
+  const FrameState state{.graph = graph};
+  StageData stage = build(state, 1);
+  ASSERT_EQ(encode(stage), std::nullopt);
+  ASSERT_EQ(reader.calls, 1);
+  const auto words = test::read_buffer(*m_device, reader.buffer, 0, LutProbeBytes);
+  ASSERT_TRUE(words.has_value());
+  const openpbr::Tables& tables = openpbr::testing::tables();
+  size_t bad = 0;
+  size_t checked = 0;
+  double worst = 0.0;
+  std::string first;
+  const auto check = [&](uint32_t i, size_t word, double want, double spread, bool exact) {
+    const double got = std::bit_cast<float>((*words)[size_t{i} * 16 + word]);
+    const double error = std::abs(got - want);
+    // Filtering returns f16 precision from weights with few fractional bits, so the bound follows the blended texels
+    const double bound = exact ? 0.0 : 1e-6 + f16_ulp(want) + spread / 64.0;
+    if (!exact) {
+      worst = std::max(worst, error / bound);
+    }
+    ++checked;
+    if (!(error <= bound) && bad++ == 0) {
+      first = std::to_string(i) + " word " + std::to_string(word) + " got " + std::to_string(got) + " want " +
+              std::to_string(want) + " spread " + std::to_string(spread);
+    }
+  };
+  for (uint32_t i = 0; i < LutCases; ++i) {
+    uint32_t seed = i * 7919u + 3u;
+    const bool node = i % 4 == 0;
+    const auto index = [&] {
+      const float x = probe_unit(seed) * 35.f - 2.f;
+      return node ? std::floor(x) : x;
+    };
+    const float x = index();
+    const float y = index();
+    const float z = index();
+    const std::array<double, 3> at3{openpbr::cos_index(x / 31.f), y, z};
+    const std::array<double, 2> want3 = openpbr::sample_lut3d(tables, at3[0], at3[1], at3[2]);
+    for (size_t c = 0; c < 2; ++c) {
+      const double spread = texel_spread(
+          at3, [&](const std::array<double, 3>& a) { return openpbr::sample_lut3d(tables, a[0], a[1], a[2])[c]; });
+      check(i, c, want3[c], spread, false);
+    }
+    const std::array<double, 2> at2{x, y};
+    for (uint32_t layer = 0; layer < 3; ++layer) {
+      const std::array<double, 4> want2 = openpbr::sample_lut2d(tables, x, y, layer);
+      for (size_t c = 0; c < 4; ++c) {
+        const double spread = texel_spread(
+            at2, [&](const std::array<double, 2>& a) { return openpbr::sample_lut2d(tables, a[0], a[1], layer)[c]; });
+        check(i, 4 + layer * 4 + c, want2[c], spread, node);
+      }
+    }
+  }
+  RecordProperty("worst", std::to_string(worst));
+  std::printf("luts against the mirror: worst %.3f of the bound over %zu values\n", worst, checked);
+  EXPECT_EQ(bad, 0u) << first;
 }
 
 TEST_F(OpenPbrGpu, ClassBufferFollowsEpoch) {

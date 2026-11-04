@@ -2599,6 +2599,39 @@ TEST_F(CompositeGpu, HdrDummyKeepsSb) {
   }
 }
 
+TEST_F(CompositeGpu, HdrAlphaZeroKeepsSb) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  std::mt19937 rng{67};
+  const auto pixels = grid(64, 48, [&](uint32_t, uint32_t) { return random_pixel(rng, 1); });
+  // A bright H under every alpha, so a pixel that reads it cannot pass for Sb
+  constexpr std::array<float, 4> Alphas{0.f, 0.49f, 0.5f, 1.f};
+  const auto edit = [&](std::array<uint16_t, 4>& words, size_t i) {
+    words = {lighting::openpbr::to_half(4.f), lighting::openpbr::to_half(2.f), lighting::openpbr::to_half(1.f),
+             lighting::openpbr::to_half(Alphas[i % Alphas.size()])};
+  };
+  const auto off = run_pixels(64, 48, pixels, {.settings = ao_settings()});
+  const auto out = run_pixels(64, 48, pixels, {.settings = pbr_settings(0.f, Quality::High), .hdrEdit = edit});
+  size_t lit = 0;
+  for (size_t i = 0; i < out.size(); ++i) {
+    std::array<uint16_t, 4> words{};
+    edit(words, i);
+    const std::array<float, 4> hdr{lighting::openpbr::from_half(words[0]), lighting::openpbr::from_half(words[1]),
+                                   lighting::openpbr::from_half(words[2]), lighting::openpbr::from_half(words[3])};
+    if (hdr[3] < 0.5f) {
+      ASSERT_TRUE(same(out[i], off[i])) << i;
+      continue;
+    }
+    if (guard_tie(pixels[i])) {
+      continue;
+    }
+    ASSERT_TRUE(same_rgb(out[i], pbr_mirror(pixels[i], 0.f, 1.f, false, hdr), 1)) << i;
+    lit += same(out[i], off[i]) ? 0 : 1;
+  }
+  EXPECT_GT(lit, out.size() / 8);
+}
+
 TEST_F(CompositeGpu, IdentityForcedIgnoresPbr) {
   std::mt19937 rng{43};
   const auto pixels = grid(64, 48, [&](uint32_t, uint32_t) { return random_pixel(rng, 1); });
