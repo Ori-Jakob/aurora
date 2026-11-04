@@ -42,6 +42,7 @@ std::atomic_bool g_classView{false};
 std::atomic<float> g_strength{1.f};
 std::shared_ptr<const SceneHints> g_cameraOverride;
 std::optional<bool> g_sinkOverride;
+std::optional<float> g_giStart;
 
 std::atomic_uint32_t g_skippedNoScene{0};
 std::atomic_uint32_t g_cameraFills{0};
@@ -209,6 +210,8 @@ BuiltOptions with_dev_built(BuiltOptions built, std::optional<Quality> request) 
   return built;
 }
 
+float gi_start_metres([[maybe_unused]] const Settings& settings) noexcept { return g_giStart.value_or(NoGiStart); }
+
 Params latched_params(const Settings& settings, const EnvOverrides& env) noexcept {
   Settings tuning;
   tuning.aoRadius = env.radius.value_or(settings.aoRadius);
@@ -220,7 +223,8 @@ Params latched_params(const Settings& settings, const EnvOverrides& env) noexcep
   params.stepsPerSlice = row.steps;
   params.flags = env.flags;
   params.strength = tuning.aoStrength;
-  params.radiusMetres = tuning.aoRadius;
+  // SSIL comes out of this loop, so clamping AO to d0 also ends SSIL there
+  params.radiusMetres = near_field(tuning.aoRadius, gi_start_metres(settings)).aoMetres;
   params.thicknessMetres = env.thickness.value_or(ThicknessMetres);
   params.minVisibility = env.floor.value_or(MinVisibility);
   return params;
@@ -345,6 +349,7 @@ Counters counters() noexcept {
 void reset() noexcept {
   g_cameraOverride.reset();
   g_sinkOverride.reset();
+  g_giStart.reset();
   g_skippedNoScene.store(0, std::memory_order_relaxed);
   g_cameraFills.store(0, std::memory_order_relaxed);
   hiz::testing::reset();
@@ -356,6 +361,8 @@ void reset() noexcept {
 void set_camera_override(std::shared_ptr<const SceneHints> hints) noexcept { g_cameraOverride = std::move(hints); }
 
 void set_sink_override(std::optional<bool> sink) noexcept { g_sinkOverride = sink; }
+
+void set_gi_start(std::optional<float> metres) noexcept { g_giStart = metres; }
 
 void unregister(std::string_view pass) noexcept {
   for (size_t i = 0; i < ChainPasses.size(); ++i) {

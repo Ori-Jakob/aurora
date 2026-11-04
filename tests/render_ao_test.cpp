@@ -1195,6 +1195,135 @@ TEST(AoRules, FloorIsExactAtFullStrength) {
   EXPECT_FLOAT_EQ(ao::apply_strength(0.f, 0.5f, floor), 1.f - 0.5f * (1.f - floor));
 }
 
+std::vector<float> near_field_radii() {
+  std::vector<float> radii;
+  for (const float metres : {0.25f, 0.375f, 0.73f, 1.5f}) {
+    for (const float upm : {1.f, 50.f, 100.f}) {
+      radii.push_back(metres * upm);
+    }
+  }
+  return radii;
+}
+
+float sweep_distance(float nearFieldRadius, uint32_t index) {
+  return nearFieldRadius * 1.5f * static_cast<float>(index) / 1023.f;
+}
+
+double reference_falloff(double dist, double effectRadius) {
+  const double falloffRange = double{ao::FalloffRange} * effectRadius;
+  const double falloffFrom = effectRadius * (1.0 - double{ao::FalloffRange});
+  const double falloffMul = -1.0 / falloffRange;
+  const double falloffAdd = falloffFrom / falloffRange + 1.0;
+  return std::clamp(dist * falloffMul + falloffAdd, 0.0, 1.0);
+}
+
+TEST(AoRules, NearFieldIsAoRadiusWithoutGi) {
+  ao::testing::reset();
+  EXPECT_EQ(ao::gi_start_metres(Settings{}), ao::NoGiStart);
+  for (const float radius : {0.25f, 0.73f, 1.5f}) {
+    const ao::NearField field = ao::near_field(radius, ao::NoGiStart);
+    EXPECT_EQ(std::bit_cast<uint32_t>(field.aoMetres), std::bit_cast<uint32_t>(radius)) << radius;
+    EXPECT_EQ(std::bit_cast<uint32_t>(field.ssilMetres), std::bit_cast<uint32_t>(radius)) << radius;
+    Settings settings;
+    settings.aoRadius = radius;
+    const ao::Params params = ao::latched_params(settings, {});
+    EXPECT_EQ(std::bit_cast<uint32_t>(params.radiusMetres), std::bit_cast<uint32_t>(radius)) << radius;
+  }
+}
+
+TEST(AoRules, GiStartClampsAoAndEndsSsil) {
+  static_assert(ao::near_field(0.73f, 0.375f).aoMetres == 0.375f);
+  const ao::NearField inside = ao::near_field(0.73f, 0.375f);
+  EXPECT_EQ(inside.aoMetres, 0.375f);
+  EXPECT_EQ(inside.ssilMetres, 0.375f);
+  const ao::NearField beyond = ao::near_field(0.25f, 0.375f);
+  EXPECT_EQ(beyond.aoMetres, 0.25f);
+  EXPECT_EQ(beyond.ssilMetres, 0.375f);
+}
+
+TEST(AoRules, InvalidGiStartMeansNoGi) {
+  for (const float start : {std::numeric_limits<float>::quiet_NaN(), 0.f, -0.f, -0.5f,
+                            -std::numeric_limits<float>::infinity(), ao::NoGiStart}) {
+    const ao::NearField field = ao::near_field(0.73f, start);
+    EXPECT_EQ(field.aoMetres, 0.73f) << start;
+    EXPECT_EQ(field.ssilMetres, 0.73f) << start;
+  }
+}
+
+TEST(AoRules, FalloffEndsAtNearField) {
+  constexpr float range = ao::FalloffRange;
+  constexpr float bandEndUlp = std::numeric_limits<float>::epsilon();
+  constexpr float beyond = std::numeric_limits<float>::infinity();
+  for (const float d0 : near_field_radii()) {
+    const float from = d0 * (1.f - range);
+    EXPECT_LE(ao::falloff_weight(d0, d0, range), bandEndUlp) << d0;
+    EXPECT_EQ(ao::falloff_weight(std::nextafter(d0, beyond), d0, range), 0.f) << d0;
+    EXPECT_EQ(ao::falloff_weight(2.f * d0, d0, range), 0.f) << d0;
+    EXPECT_GE(ao::falloff_weight(from, d0, range), 1.f - bandEndUlp) << d0;
+    EXPECT_EQ(ao::falloff_weight(std::nextafter(from, 0.f), d0, range), 1.f) << d0;
+    EXPECT_EQ(ao::falloff_weight(0.f, d0, range), 1.f) << d0;
+    float previous = 1.f;
+    for (uint32_t i = 0; i < 1024; ++i) {
+      const float dist = sweep_distance(d0, i);
+      const float weight = ao::falloff_weight(dist, d0, range);
+      EXPECT_LE(weight, previous) << d0 << " at " << dist;
+      EXPECT_NEAR(weight, reference_falloff(dist, d0), 1e-6) << d0 << " at " << dist;
+      if (dist < from) {
+        EXPECT_EQ(weight, 1.f) << d0 << " at " << dist;
+      }
+      if (dist > d0) {
+        EXPECT_EQ(weight, 0.f) << d0 << " at " << dist;
+      }
+      previous = weight;
+    }
+  }
+}
+
+TEST(AoRules, NearFieldWeightsPartition) {
+  constexpr float range = ao::FalloffRange;
+  constexpr float bandEndUlp = std::numeric_limits<float>::epsilon();
+  for (const float d0 : near_field_radii()) {
+    const float from = d0 * (1.f - range);
+    for (uint32_t i = 0; i < 1024; ++i) {
+      const float dist = sweep_distance(d0, i);
+      const float ssil = ao::falloff_weight(dist, d0, range);
+      const float gi = ao::gi_weight(dist, d0, range);
+      EXPECT_LE(std::abs(ssil + gi - 1.f), bandEndUlp) << d0 << " at " << dist;
+      if (dist < from) {
+        EXPECT_EQ(gi, 0.f) << d0 << " at " << dist;
+      }
+      if (dist >= d0) {
+        EXPECT_GE(gi, 1.f - bandEndUlp) << d0 << " at " << dist;
+      }
+      if (dist > d0) {
+        EXPECT_EQ(gi, 1.f) << d0 << " at " << dist;
+      }
+    }
+    EXPECT_EQ(ao::gi_weight(std::nextafter(d0, std::numeric_limits<float>::infinity()), d0, range), 1.f) << d0;
+    EXPECT_EQ(ao::gi_weight(std::nextafter(from, 0.f), d0, range), 0.f) << d0;
+  }
+}
+
+TEST(AoRules, LatchedParamsCarryNearField) {
+  ao::testing::reset();
+  Settings settings;
+  settings.aoRadius = 0.73f;
+  ao::testing::set_gi_start(0.375f);
+  EXPECT_EQ(ao::gi_start_metres(settings), 0.375f);
+  EXPECT_EQ(ao::latched_params(settings, {}).radiusMetres, 0.375f);
+  EXPECT_EQ(ao::latched_params(settings, {.radius = 0.25f}).radiusMetres, 0.25f);
+  ao::testing::set_gi_start(2.f);
+  EXPECT_EQ(ao::latched_params(settings, {.radius = 9.f}).radiusMetres, 1.5f);
+  for (const float start : {std::numeric_limits<float>::quiet_NaN(), 0.f, -1.f, ao::NoGiStart}) {
+    ao::testing::set_gi_start(start);
+    EXPECT_EQ(ao::latched_params(settings, {}).radiusMetres, 0.73f) << start;
+  }
+  ao::testing::set_gi_start(0.375f);
+  ao::testing::reset();
+  EXPECT_EQ(ao::gi_start_metres(settings), ao::NoGiStart);
+  EXPECT_EQ(ao::latched_params(settings, {}).radiusMetres, 0.73f);
+}
+
 TEST(AoRules, TuningDefaultsMatchConstants) {
   EXPECT_EQ(Settings{}.aoRadius, ao::RadiusMetres);
   EXPECT_EQ(Settings{}.aoStrength, 1.f);
@@ -1414,6 +1543,20 @@ TEST_F(AoChainGraph, TuningReachesParams) {
     EXPECT_EQ(filled.strength, 0.5f) << name;
   }
   EXPECT_EQ(ao::effective_strength(), 0.5f);
+  ao::testing::set_gi_start(0.5f);
+  latch_chain(*graph);
+  const StageData nearField = build(state, 10, depth64());
+  for (const std::string_view name : ChainPasses) {
+    const NodeId node = graph->find_node(name);
+    const ao::Params latched = params_from(latched_pass_params(graph->nodes[node].id));
+    EXPECT_EQ(latched.radiusMetres, 0.5f) << name;
+    const auto it = std::ranges::find(nearField.bindings.params, node, &StageBindings::Params::node);
+    ASSERT_NE(it, nearField.bindings.params.end()) << name;
+    const ao::Params filled = params_from(std::span{it->bytes}.first(it->size));
+    EXPECT_EQ(filled.effectRadius, 25.f) << name;
+    EXPECT_EQ(filled.strength, 0.5f) << name;
+  }
+  ao::testing::set_gi_start(std::nullopt);
   const ao::Params env =
       ao::latched_params(settings, {.radius = 0.6f, .thickness = 2.f, .strength = 1.2f, .floor = 0.03f});
   EXPECT_EQ(env.radiusMetres, 0.6f);

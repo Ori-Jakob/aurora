@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -197,6 +198,36 @@ constexpr float apply_strength(float visibility, float strength, float floor) no
   return std::max(1.f - strength * (1.f - visibility), lowest);
 }
 
+// GI starts at d0 once a GI module supplies it; until then the near field ends at the AO radius
+inline constexpr float NoGiStart = std::numeric_limits<float>::infinity();
+
+struct NearField {
+  float aoMetres;
+  float ssilMetres;
+};
+
+// AO is clamped to d0 and SSIL covers [0, d0), so neither overlaps GI
+constexpr NearField near_field(float aoRadiusMetres, float giStartMetres) noexcept {
+  if (!(giStartMetres > 0.f) || giStartMetres == NoGiStart) {
+    return {aoRadiusMetres, aoRadiusMetres};
+  }
+  return {std::min(aoRadiusMetres, giStartMetres), giStartMetres};
+}
+
+// Zero at the effect radius: SSIL shares AO's loop, so this is also its reach
+constexpr float falloff_weight(float dist, float effectRadius, float falloffRange) noexcept {
+  const float range = falloffRange * effectRadius;
+  const float from = effectRadius * (1.f - falloffRange);
+  const float mul = -1.f / range;
+  const float add = from / range + 1.f;
+  return std::clamp(dist * mul + add, 0.f, 1.f);
+}
+
+// The far field fades in as SSIL fades out, so their weights sum to 1 across the falloff band
+constexpr float gi_weight(float dist, float nearFieldRadius, float falloffRange) noexcept {
+  return 1.f - falloff_weight(dist, nearFieldRadius, falloffRange);
+}
+
 struct EnvOverrides {
   std::optional<float> radius;
   std::optional<float> thickness;
@@ -212,6 +243,8 @@ struct EnvOverrides {
 [[nodiscard]] std::optional<Quality> env_ao_request() noexcept;
 [[nodiscard]] BuiltOptions with_dev_built(BuiltOptions built, std::optional<Quality> request) noexcept;
 
+// M21-W5 returns where its cones reach full weight while GI is on
+[[nodiscard]] float gi_start_metres(const Settings& settings) noexcept;
 [[nodiscard]] Params latched_params(const Settings& settings, const EnvOverrides& env) noexcept;
 [[nodiscard]] bool identity_forced() noexcept;
 [[nodiscard]] bool sink_forced() noexcept;
@@ -238,6 +271,7 @@ Counters counters() noexcept;
 void reset() noexcept;
 void set_camera_override(std::shared_ptr<const SceneHints> hints) noexcept;
 void set_sink_override(std::optional<bool> sink) noexcept;
+void set_gi_start(std::optional<float> metres) noexcept;
 void unregister(std::string_view pass) noexcept;
 } // namespace testing
 } // namespace aurora::render::detail::ao
