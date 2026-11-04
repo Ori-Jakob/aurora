@@ -102,7 +102,8 @@ fn exposure_window() -> ExposureWindow {
   let tonemap_changed = ((prev.y & EXPOSURE_STATE_AGX) != 0u) != ((p.flags & EXPOSURE_FLAG_AGX) != 0u);
   let forced = (p.flags & (EXPOSURE_FLAG_SNAP | EXPOSURE_FLAG_RESET)) != 0u;
   // A held frame cannot take a snap it was asked for, so it passes the snap on to the next frame
-  let owed = (prev.y & (EXPOSURE_STATE_SNAPPED | EXPOSURE_STATE_HELD)) == (EXPOSURE_STATE_SNAPPED | EXPOSURE_STATE_HELD);
+  let held_snap = EXPOSURE_STATE_SNAPPED | EXPOSURE_STATE_HELD;
+  let owed = (prev.y & held_snap) == held_snap;
   let snap = !valid || forced || mode_changed || tonemap_changed || owed;
   let edge = EXPOSURE_MAX_EV - 15.5 * EXPOSURE_STEP_EV;
   let s = select(prev_s, 0.0, !valid);
