@@ -55,6 +55,17 @@ struct FwdEnvCheckReport {
   std::vector<FwdEnvSample> samples;
 };
 
+struct SsilCheckReport {
+  u32 encodes = 0;
+  bool ready = false;
+  u32 width = 0;
+  u32 height = 0;
+  u32 texels = 0;
+  u32 outOfRange = 0;
+  u32 bounced = 0;
+  std::vector<SsilSample> samples;
+};
+
 struct UnlitCheckReport {
   u32 encodes = 0;
   bool ready = false;
@@ -108,6 +119,7 @@ struct GraphPassOptions {
   bool companionCheck = false;
   bool overlayCheck = false;
   bool classCheck = false;
+  bool ssilCheck = false;
 };
 
 struct GraphPassReport {
@@ -125,6 +137,7 @@ struct GraphPassReport {
   std::array<u32, FogCheckWords> fog{};
   AoCheckReport ao;
   FwdEnvCheckReport fwdEnv;
+  SsilCheckReport ssil;
   UnlitCheckReport unlit;
   CompanionCheckReport companion;
   OverlayCheckReport overlay;

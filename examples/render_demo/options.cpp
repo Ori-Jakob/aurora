@@ -36,6 +36,7 @@ constexpr uint32_t UnlitCheckMinFrames = 40;
 constexpr uint32_t CompanionCheckMinFrames = 92;
 constexpr uint32_t ClassCheckMinFrames = 40;
 constexpr uint32_t OverlayCheckMinFrames = 40;
+constexpr uint32_t SsilCheckMinFrames = 90;
 constexpr uint32_t MaxGpuPadMiB = 1024;
 
 std::optional<uint32_t> parse_u32(std::string_view text) noexcept {
@@ -221,6 +222,11 @@ bool apply_class_check(Options& options, std::string_view) {
   return true;
 }
 
+bool apply_ssil_check(Options& options, std::string_view) {
+  options.ssilCheck = true;
+  return true;
+}
+
 bool apply_no_hints(Options& options, std::string_view) {
   options.hints = false;
   return true;
@@ -311,7 +317,7 @@ struct Flag {
   bool frameLoop = false;
 };
 
-constexpr std::array<Flag, 37> Flags{{
+constexpr std::array<Flag, 38> Flags{{
     {"--frames", true, apply_frames, true},
     {"--timeout", true, apply_timeout, true},
     {"--backend", true, apply_backend},
@@ -336,6 +342,7 @@ constexpr std::array<Flag, 37> Flags{{
     {"--companion-check", false, apply_companion_check, true},
     {"--overlay-check", false, apply_overlay_check, true},
     {"--class-check", false, apply_class_check, true},
+    {"--ssil-check", false, apply_ssil_check, true},
     {"--no-hints", false, apply_no_hints, true},
     {"--check-hints", false, apply_check_hints, true},
     {"--custom-draw-probe", false, apply_custom_draw_probe, true},
@@ -437,7 +444,7 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
   // Graph passes and custom draws record GPU work outside the GX FIFO, so the capture would be discarded
   if ((options.vignette || options.depthCheck || options.motionCheck || options.motionView || options.fogCheck ||
        options.aoCheck || options.fwdEnvCheck || options.unlitCheck || options.companionCheck || options.overlayCheck ||
-       options.classCheck || options.gpuCull != 0) &&
+       options.classCheck || options.ssilCheck || options.gpuCull != 0) &&
       !options.tracePath.empty()) {
     error = "render graph passes cannot be traced";
     return std::nullopt;
@@ -512,6 +519,14 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
     error = "--class-check needs at least 40 frames";
     return std::nullopt;
   }
+  if (options.ssilCheck && (!options.hints || options.msaa > 1)) {
+    error = "--ssil-check cannot be combined with --no-hints or --msaa above 1";
+    return std::nullopt;
+  }
+  if (options.ssilCheck && options.frames != 0 && options.frames < SsilCheckMinFrames) {
+    error = "--ssil-check needs at least 90 frames";
+    return std::nullopt;
+  }
   if ((options.cullCheck || options.cullTimings) && options.gpuCull == 0) {
     error = options.cullCheck ? "--cull-check needs --gpu-cull" : "--cull-timings needs --gpu-cull";
     return std::nullopt;
@@ -581,6 +596,11 @@ std::string_view usage() noexcept {
          "                      flags, categories, ambient and back-face normals read as expected, a class and\n"
          "                      manifest edit compiles nothing and blend 1 keeps the legacy normal (needs at least\n"
          "                      40 frames)\n"
+         "  --ssil-check        build AO at High with Indirect Light, stand a red wall and a thin green fin on the\n"
+         "                      ground, register demo.ssil_check and exit with code 19 unless ssil.irr, gathered\n"
+         "                      from the composite's radiance and upsampled by ao.upsample, carries the wall's red\n"
+         "                      onto the floor at its foot and the fin's green only to the floor its lit face\n"
+         "                      points at (needs at least 90 frames)\n"
          "  --no-hints          emit no render hints and no capture-only draw\n"
 
          "  --check-hints       exit with code 8 unless aurora decoded or skipped every emitted hint as expected\n"

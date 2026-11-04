@@ -673,6 +673,33 @@ TEST_F(RenderApiTest, AoReadyTracksPipelines) {
 }
 #endif
 
+#if AURORA_ENABLE_RENDER
+TEST_F(RenderApiTest, SsilReadyFollowsPipelines) {
+  struct OverrideReset {
+    ~OverrideReset() { detail::composite::testing::set_ready_override(std::nullopt); }
+  } reset;
+  detail::testing::set_caps(full_caps());
+  apply_settings({.ao = Quality::High, .ssil = true});
+  detail::latch_frame();
+  ASSERT_TRUE(feature_enabled(effective_settings(), Feature::Ssil));
+  detail::composite::testing::set_ready_override(true);
+  EXPECT_FALSE(detail::ao::ssil_ready(effective_settings()));
+  EXPECT_FALSE(feature_ready(Feature::Ssil));
+  EXPECT_FALSE(feature_active(Feature::Ssil));
+
+  apply_settings({.ao = Quality::High});
+  detail::latch_frame();
+  EXPECT_TRUE(detail::ao::ssil_ready(effective_settings()));
+  EXPECT_TRUE(feature_ready(Feature::Ssil));
+  detail::composite::testing::set_ready_override(std::nullopt);
+
+  apply_settings({});
+  detail::latch_frame();
+  EXPECT_TRUE(feature_ready(Feature::Ssil));
+  gfx::shutdown_pipeline_cache();
+}
+#endif
+
 TEST_F(RenderApiTest, AoTuningSanitized) {
   for (const float bad : {NaN, Infinity, -Infinity}) {
     Settings request;

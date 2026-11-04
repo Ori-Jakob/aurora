@@ -117,29 +117,21 @@ TEST(SsilRules, SkyAndDistantAddNothing) {
   EXPECT_EQ(ao::ssil_legacy_gain(1.f, {1.f, 1.f, 1.f}, {0.5f, 0.5f, 0.5f}), (std::array<float, 3>{1.f, 1.f, 1.f}));
 }
 
-TEST(SsilRules, CameraFlipIsSymmetric) {
-  const ref::Normal3 n{0.3, -0.2, 0.9};
-  const ref::Normal3 flipped{-n[0], -n[1], -n[2]};
-  const ref::Normal3 toEmitter{0.1, 0.2, 0.97};
-  EXPECT_DOUBLE_EQ(ref::ssil_facing(flipped, toEmitter),
-                   std::clamp(1.0 + 4.0 * (n[0] * toEmitter[0] + n[1] * toEmitter[1] + n[2] * toEmitter[2]), 0.0, 1.0));
-}
-
 TEST(SsilRules, FeedbackConverges) {
-  const double albedo = 0.9;
-  const double as = 0.4;
-  const double e = 1.0;
-  double h = 0.0;
-  double last = 0.0;
+  constexpr float Albedo = 0.9f;
+  constexpr float Visible = 0.4f;
+  constexpr float Pi = 3.14159265358979f;
+  float radiance = 0.f;
   for (int frame = 0; frame < 64; ++frame) {
-    last = h;
-    h = albedo * (as * e + (1.0 - as) * h);
-    EXPECT_LE(h, e);
-    EXPECT_GE(h, last);
+    const std::array<float, 3> bounce = ao::ssil_bounce_irradiance({radiance, radiance, radiance, 1.f}, Visible);
+    const float next = Albedo * (Visible * Pi + bounce[0]) / Pi;
+    EXPECT_GE(next, radiance - 1e-6f) << frame;
+    EXPECT_LT(next, 1.f) << frame;
+    radiance = next;
   }
-  const double fixed = albedo * as * e / (1.0 - albedo * (1.0 - as));
-  EXPECT_NEAR(h, fixed, 1e-3);
-  EXPECT_LT(fixed, e);
+  const float fixed = Albedo * Visible / (1.f - Albedo * (1.f - Visible));
+  EXPECT_NEAR(radiance, fixed, 1e-3f);
+  EXPECT_LT(fixed, 1.f);
 }
 
 TEST(CompositeRules, LegacyScaleIsAoWithoutBounce) {

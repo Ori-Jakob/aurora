@@ -3148,6 +3148,30 @@ TEST_F(CompositeGpu, SsilIdentityStillDiscards) {
   }
 }
 
+TEST_F(CompositeGpu, SsilUnderPbrScalesByExposure) {
+  constexpr float E = 2.7f;
+  const SsilCase c = ssil_cases(64 * 48, 0x55A4u);
+  const std::vector<Rgba> out = run_pixels(
+      64, 48, c.pixels,
+      {.settings = pbr_settings(0.f, Quality::High), .exposure = E, .ssil = [&](size_t i) { return c.irr[i]; }});
+  EXPECT_TRUE(composite::pbr_active());
+  size_t worst = 0;
+  size_t lifted = 0;
+  for (size_t i = 0; i < out.size(); ++i) {
+    const std::array<int, 3> want = ssil_mirror(c.pixels[i], c.irr[i], ao::SsilLegacyAlbedo * E);
+    const std::array<int, 3> unexposed = ssil_mirror(c.pixels[i], c.irr[i], ao::SsilLegacyAlbedo);
+    const std::array<int, 3> got{out[i].r, out[i].g, out[i].b};
+    for (size_t k = 0; k < 3; ++k) {
+      worst = std::max<size_t>(worst, static_cast<size_t>(std::abs(got[k] - want[k])));
+    }
+    lifted += want[0] > unexposed[0] + 1 || want[1] > unexposed[1] + 1 || want[2] > unexposed[2] + 1 ? 1 : 0;
+  }
+  std::printf("SSIL composite under FlagPbr at e %.1f: worst %zu code, %zu pixels above the unexposed bounce\n", E,
+              worst, lifted);
+  EXPECT_LE(worst, 1u);
+  EXPECT_GT(lifted, out.size() / 10);
+}
+
 TEST_F(CompositeGpu, OddExtentCoversEdges) {
   for (const auto [width, height] : {std::pair{61u, 37u}, std::pair{3u, 5u}}) {
     SCOPED_TRACE(std::to_string(width) + "x" + std::to_string(height));

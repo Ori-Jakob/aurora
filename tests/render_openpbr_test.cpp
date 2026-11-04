@@ -1442,6 +1442,45 @@ Vec3 decoded_normal(const Vec3& n) {
   return {decode(unorm10(n[0])), decode(unorm10(n[1])), -decode(unorm10(-n[2]))};
 }
 
+struct StubTexture {
+  std::string name;
+  std::string_view resource;
+  wgpu::TextureFormat format = wgpu::TextureFormat::RGBA8Unorm;
+  wgpu::Buffer staging;
+  uint32_t rowBytes = 0;
+  int calls = 0;
+};
+
+void declare_stub_texture(InternalPassBuilder& builder, const PassSetup&, const void* state) {
+  const auto& stub = *static_cast<const StubTexture*>(state);
+  builder.after(phase::Ao);
+  builder.create(stub.resource, {.format = stub.format, .sizeClass = SizeClass::Efb}, Access::CopyDst);
+}
+
+void encode_stub_texture(PassContext& ctx, const void* state) {
+  auto& stub = *static_cast<StubTexture*>(const_cast<void*>(state));
+  ++stub.calls;
+  const wgpu::Extent3D size = ctx.extent(TexRef{0});
+  const wgpu::TexelCopyBufferInfo from{.layout = {.bytesPerRow = stub.rowBytes, .rowsPerImage = size.height},
+                                       .buffer = stub.staging};
+  const wgpu::TexelCopyTextureInfo to{.texture = ctx.texture(TexRef{0})};
+  const wgpu::Extent3D extent{size.width, size.height, 1};
+  ctx.encoder().CopyBufferToTexture(&from, &to, &extent);
+}
+
+PassDesc stub_texture_desc(StubTexture& stub) {
+  return {
+      .name = stub.name,
+      .stage = Stage::OpaqueDone,
+      .kind = PassKind::Copy,
+      .order = 5,
+      .runsWithoutMarker = true,
+      .declare = declare_stub_texture,
+      .encode = encode_stub_texture,
+      .state = &stub,
+  };
+}
+
 class LightDeferredGpu : public DeferredDeviceTest {
 protected:
   void SetUp() override {
@@ -1623,6 +1662,41 @@ protected:
     deferred::fill_params(m_hints.get(), true, mode, params);
     return params;
   }
+
+  void stage_ao(uint32_t width, uint32_t height, const std::vector<uint8_t>& ao) {
+    m_ao = StubTexture{.name = "t.ao_final", .resource = resource::AoFinal};
+    m_ao.rowBytes = (width * 4 + 255) & ~255u;
+    std::vector<uint8_t> staged(size_t{m_ao.rowBytes} * height, 0);
+    for (size_t i = 0; i < ao.size(); ++i) {
+      staged[(i / width) * m_ao.rowBytes + (i % width) * 4] = ao[i];
+    }
+    const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                            .size = staged.size()};
+    m_ao.staging = m_device->device.CreateBuffer(&descriptor);
+    m_device->queue.WriteBuffer(m_ao.staging, 0, staged.data(), staged.size());
+    m_aoId = register_pass(stub_texture_desc(m_ao));
+  }
+
+  PassId stage_ssil(uint32_t width, uint32_t height, const std::vector<std::array<float, 4>>& irr) {
+    m_ssil = StubTexture{
+        .name = "t.ssil_irr", .resource = resource::SsilIrradiance, .format = wgpu::TextureFormat::RGBA16Float};
+    m_ssil.rowBytes = (width * 8 + 255) & ~255u;
+    std::vector<uint16_t> staged(size_t{m_ssil.rowBytes / 2} * height, 0);
+    for (size_t i = 0; i < irr.size(); ++i) {
+      for (size_t c = 0; c < 4; ++c) {
+        staged[(i / width) * (m_ssil.rowBytes / 2) + (i % width) * 4 + c] = openpbr::to_half(irr[i][c]);
+      }
+    }
+    const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                            .size = staged.size() * 2};
+    m_ssil.staging = m_device->device.CreateBuffer(&descriptor);
+    m_device->queue.WriteBuffer(m_ssil.staging, 0, staged.data(), staged.size() * 2);
+    return register_pass(stub_texture_desc(m_ssil));
+  }
+
+  StubTexture m_ao;
+  StubTexture m_ssil;
+  PassId m_aoId = InvalidPassId;
 };
 
 GpuPixel random_gpu_pixel(std::mt19937& rng) {
@@ -1872,84 +1946,7 @@ TEST_F(LightDeferredGpu, ThinCutoutPassesLightFromBehind) {
   }
 }
 
-struct StubTexture {
-  std::string name;
-  std::string_view resource;
-  wgpu::TextureFormat format = wgpu::TextureFormat::RGBA8Unorm;
-  wgpu::Buffer staging;
-  uint32_t rowBytes = 0;
-  int calls = 0;
-};
-
-void declare_stub_texture(InternalPassBuilder& builder, const PassSetup&, const void* state) {
-  const auto& stub = *static_cast<const StubTexture*>(state);
-  builder.after(phase::Ao);
-  builder.create(stub.resource, {.format = stub.format, .sizeClass = SizeClass::Efb}, Access::CopyDst);
-}
-
-void encode_stub_texture(PassContext& ctx, const void* state) {
-  auto& stub = *static_cast<StubTexture*>(const_cast<void*>(state));
-  ++stub.calls;
-  const wgpu::Extent3D size = ctx.extent(TexRef{0});
-  const wgpu::TexelCopyBufferInfo from{.layout = {.bytesPerRow = stub.rowBytes, .rowsPerImage = size.height},
-                                       .buffer = stub.staging};
-  const wgpu::TexelCopyTextureInfo to{.texture = ctx.texture(TexRef{0})};
-  const wgpu::Extent3D extent{size.width, size.height, 1};
-  ctx.encoder().CopyBufferToTexture(&from, &to, &extent);
-}
-
-PassDesc stub_texture_desc(StubTexture& stub) {
-  return {
-      .name = stub.name,
-      .stage = Stage::OpaqueDone,
-      .kind = PassKind::Copy,
-      .order = 5,
-      .runsWithoutMarker = true,
-      .declare = declare_stub_texture,
-      .encode = encode_stub_texture,
-      .state = &stub,
-  };
-}
-
-class SsilDeferredGpu : public LightDeferredGpu {
-protected:
-  void stage_ao(uint32_t width, uint32_t height, const std::vector<uint8_t>& ao) {
-    m_ao = StubTexture{.name = "t.ao_final", .resource = resource::AoFinal};
-    m_ao.rowBytes = (width * 4 + 255) & ~255u;
-    std::vector<uint8_t> staged(size_t{m_ao.rowBytes} * height, 0);
-    for (size_t i = 0; i < ao.size(); ++i) {
-      staged[(i / width) * m_ao.rowBytes + (i % width) * 4] = ao[i];
-    }
-    const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
-                                            .size = staged.size()};
-    m_ao.staging = m_device->device.CreateBuffer(&descriptor);
-    m_device->queue.WriteBuffer(m_ao.staging, 0, staged.data(), staged.size());
-    m_aoId = register_pass(stub_texture_desc(m_ao));
-  }
-
-  PassId stage_ssil(uint32_t width, uint32_t height, const std::vector<std::array<float, 4>>& irr) {
-    m_ssil = StubTexture{
-        .name = "t.ssil_irr", .resource = resource::SsilIrradiance, .format = wgpu::TextureFormat::RGBA16Float};
-    m_ssil.rowBytes = (width * 8 + 255) & ~255u;
-    std::vector<uint16_t> staged(size_t{m_ssil.rowBytes / 2} * height, 0);
-    for (size_t i = 0; i < irr.size(); ++i) {
-      for (size_t c = 0; c < 4; ++c) {
-        staged[(i / width) * (m_ssil.rowBytes / 2) + (i % width) * 4 + c] = openpbr::to_half(irr[i][c]);
-      }
-    }
-    const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
-                                            .size = staged.size() * 2};
-    m_ssil.staging = m_device->device.CreateBuffer(&descriptor);
-    m_device->queue.WriteBuffer(m_ssil.staging, 0, staged.data(), staged.size() * 2);
-    return register_pass(stub_texture_desc(m_ssil));
-  }
-
-  StubTexture m_ao;
-  StubTexture m_ssil;
-  PassId m_aoId = InvalidPassId;
-};
-
-TEST_F(SsilDeferredGpu, SsilFurnaceIncrementIsExact) {
+TEST_F(LightDeferredGpu, SsilFurnaceIncrementIsExact) {
   std::mt19937 rng{0x551Fu};
   std::uniform_real_distribution<float> unit(0.f, 1.f);
   set_hints(scene_hints({}));
@@ -1999,7 +1996,7 @@ TEST_F(SsilDeferredGpu, SsilFurnaceIncrementIsExact) {
   EXPECT_GT(filled, 1000u);
 }
 
-TEST_F(SsilDeferredGpu, SsilOffIsBitIdentical) {
+TEST_F(LightDeferredGpu, SsilOffIsBitIdentical) {
   std::mt19937 rng{0x5520u};
   set_hints(scene_hints(mixed_lights()));
   std::vector<GpuPixel> pixels(size_t{64} * 48);
@@ -2018,7 +2015,7 @@ TEST_F(SsilDeferredGpu, SsilOffIsBitIdentical) {
   EXPECT_EQ(off, zero);
 }
 
-TEST_F(SsilDeferredGpu, SsilNotMultipliedByAo) {
+TEST_F(LightDeferredGpu, SsilNotMultipliedByAo) {
   std::mt19937 rng{0x5521u};
   set_hints(scene_hints({}));
   std::vector<GpuPixel> pixels(size_t{64} * 48);

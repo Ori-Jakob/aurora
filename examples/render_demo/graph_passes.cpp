@@ -1513,6 +1513,223 @@ bool register_fwd_env_check(std::string& error) {
   return true;
 }
 
+constexpr u32 SsilHeaderWords = 8;
+constexpr u32 SsilSampleWords = 6;
+
+enum SsilCheckWord : u32 { SsilWidth, SsilHeight, SsilWritten, SsilTexels, SsilOutOfRange, SsilBounced };
+
+// Reads ssil.irr as the real composite and ao.upsample leave it, so no stub stands between the two producers
+constexpr std::string_view SsilCheckWgsl = R"(
+struct SsilProbe {
+  ndc: vec2f,
+  cls: u32,
+  pad: u32,
+};
+@group(1) @binding(0) var ssil_irr: texture_2d<f32>;
+@group(1) @binding(1) var scene_normal: texture_2d<f32>;
+@group(2) @binding(0) var<storage, read_write> results: array<atomic<u32>>;
+@group(2) @binding(1) var<storage, read> probes: array<SsilProbe>;
+
+@compute @workgroup_size(8, 8)
+fn cs_main(@builtin(global_invocation_id) id: vec3u, @builtin(num_workgroups) groups: vec3u) {
+  let size = textureDimensions(ssil_irr);
+  if (all(id.xy == vec2u(0u))) {
+    atomicStore(&results[0], size.x);
+    atomicStore(&results[1], size.y);
+    atomicStore(&results[2], 1u);
+  }
+  let index = id.y * groups.x * 8u + id.x;
+  if (index < arrayLength(&probes)) {
+    let centre = (probes[index].ndc * vec2f(0.5, -0.5) + 0.5) * vec2f(size);
+    let p = clamp(vec2i(floor(centre)), vec2i(0), vec2i(size) - 1);
+    let v = textureLoad(ssil_irr, p, 0);
+    let base = 8u + index * 6u;
+    atomicStore(&results[base], bitcast<u32>(v.r));
+    atomicStore(&results[base + 1u], bitcast<u32>(v.g));
+    atomicStore(&results[base + 2u], bitcast<u32>(v.b));
+    atomicStore(&results[base + 3u], bitcast<u32>(v.a));
+    atomicStore(&results[base + 4u], u32(round(saturate(textureLoad(scene_normal, p, 0).a) * 3.0)));
+  }
+  if (any(id.xy >= size)) {
+    return;
+  }
+  atomicAdd(&results[3], 1u);
+  let v = textureLoad(ssil_irr, vec2i(id.xy), 0);
+  let finite = all((bitcast<vec4u>(v) & vec4u(0x7f800000u)) != vec4u(0x7f800000u));
+  if (!finite || any(v.rgb < vec3f(0.0)) || any(v.rgb > vec3f(16.0)) || v.a < 0.0 || v.a > 1.0) {
+    atomicAdd(&results[4], 1u);
+  } else if (v.a > 0.0) {
+    atomicAdd(&results[5], 1u);
+  }
+}
+)";
+
+struct SsilCheckPass {
+  PassId id = aurora::render::InvalidPass;
+  std::atomic_uint32_t encodes = 0;
+  std::atomic_uint32_t armedFrame = UINT32_MAX;
+  // Main thread only
+  bool waitedForPipelines = false;
+  std::chrono::steady_clock::time_point deadline;
+  std::vector<SsilProbe> probes;
+  uint64_t bytes = 0;
+  wgpu::Buffer output;
+  wgpu::Buffer readback;
+  wgpu::Buffer probeBuffer;
+  wgpu::BindGroupLayout layout;
+  wgpu::BindGroup group;
+  // Render worker only
+  wgpu::ComputePipeline pipeline;
+  wgpu::BindGroupLayout passLayout;
+  bool copied = false;
+  u32 copiedFrame = 0;
+  bool mapRequested = false;
+  std::atomic<ProbeResult> result = ProbeResult::Pending;
+  std::mutex mutex;
+  std::vector<u32> values;
+};
+
+SsilCheckPass sSsil;
+
+void declare_ssil_check(PassBuilder& builder, void*) {
+  using aurora::render::Missing;
+  namespace resource = aurora::render::resource;
+  builder.after(aurora::render::phase::Ao);
+  builder.use(resource::SsilIrradiance, Access::Sampled, Missing::DisablePass);
+  builder.use(resource::GxNormal, Access::Sampled, Missing::DisablePass);
+  builder.side_effect();
+}
+
+void encode_ssil_check(PassContext& ctx, void* userdata) {
+  auto& check = *static_cast<SsilCheckPass*>(userdata);
+  check.encodes.fetch_add(1, std::memory_order_relaxed);
+  if (!check.pipeline || check.passLayout.Get() != ctx.pass_layout().Get()) {
+    const std::string code{SsilCheckWgsl};
+    const wgpu::ShaderSourceWGSL wgsl{wgpu::ShaderSourceWGSL::Init{.code = code.c_str()}};
+    const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl, .label = "demo.ssil_check"};
+    const std::array<wgpu::BindGroupLayout, 3> layouts{ctx.frame_layout(), ctx.pass_layout(), check.layout};
+    const wgpu::PipelineLayoutDescriptor layoutDescriptor{
+        .label = "demo.ssil_check",
+        .bindGroupLayoutCount = layouts.size(),
+        .bindGroupLayouts = layouts.data(),
+    };
+    const wgpu::ComputePipelineDescriptor descriptor{
+        .label = "demo.ssil_check",
+        .layout = ctx.device().CreatePipelineLayout(&layoutDescriptor),
+        .compute = {.module = ctx.device().CreateShaderModule(&moduleDescriptor), .entryPoint = "cs_main"},
+    };
+    check.pipeline = ctx.device().CreateComputePipeline(&descriptor);
+    check.passLayout = ctx.pass_layout();
+  }
+  constexpr aurora::render::TexRef Irradiance{0};
+  const wgpu::Extent3D size = ctx.extent(Irradiance);
+  ctx.encoder().ClearBuffer(check.output, 0, check.bytes);
+  const wgpu::ComputePassEncoder compute = ctx.begin_compute();
+  if (!compute) {
+    return;
+  }
+  compute.SetPipeline(check.pipeline);
+  compute.SetBindGroup(2, check.group);
+  compute.DispatchWorkgroups((size.width + 7) / 8, (size.height + 7) / 8);
+  compute.End();
+  if (!check.copied && ctx.frame() >= check.armedFrame.load(std::memory_order_acquire)) {
+    ctx.encoder().CopyBufferToBuffer(check.output, 0, check.readback, 0, check.bytes);
+    check.copied = true;
+    check.copiedFrame = ctx.frame();
+  }
+}
+
+void ssil_check_mapped(SsilCheckPass& check, wgpu::MapAsyncStatus status) {
+  if (status != wgpu::MapAsyncStatus::Success) {
+    check.result.store(ProbeResult::Failed, std::memory_order_release);
+    return;
+  }
+  const auto* mapped = static_cast<const u32*>(check.readback.GetConstMappedRange(0, check.bytes));
+  if (mapped != nullptr) {
+    std::lock_guard lock{check.mutex};
+    check.values.assign(mapped, mapped + check.bytes / sizeof(u32));
+  }
+  check.readback.Unmap();
+  check.result.store(mapped != nullptr ? ProbeResult::Ready : ProbeResult::Failed, std::memory_order_release);
+}
+
+void ssil_check_submitted(u32 frame, void* userdata) {
+  auto& check = *static_cast<SsilCheckPass*>(userdata);
+  if (!check.copied || check.mapRequested || frame != check.copiedFrame) {
+    return;
+  }
+  check.mapRequested = true;
+  check.readback.MapAsync(
+      wgpu::MapMode::Read, 0, check.bytes, wgpu::CallbackMode::AllowSpontaneous,
+      [&check](wgpu::MapAsyncStatus status, wgpu::StringView) { ssil_check_mapped(check, status); });
+}
+
+bool register_ssil_check(std::string& error) {
+  sSsil.probes = ssil_check_probes();
+  if (sSsil.probes.empty()) {
+    error = "demo.ssil_check has no probes on screen";
+    return false;
+  }
+  sSsil.bytes = (SsilHeaderWords + sSsil.probes.size() * SsilSampleWords) * sizeof(u32);
+  const wgpu::Device device = aurora::gfx::device();
+  const auto buffer = [&](const char* label, wgpu::BufferUsage usage, uint64_t size) {
+    const wgpu::BufferDescriptor descriptor{.label = label, .usage = usage, .size = size};
+    return device.CreateBuffer(&descriptor);
+  };
+  sSsil.output =
+      buffer("demo.ssil_check output",
+             wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst, sSsil.bytes);
+  sSsil.readback =
+      buffer("demo.ssil_check readback", wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst, sSsil.bytes);
+  const uint64_t probeBytes = sSsil.probes.size() * sizeof(SsilProbe);
+  sSsil.probeBuffer =
+      buffer("demo.ssil_check probes", wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, probeBytes);
+  device.GetQueue().WriteBuffer(sSsil.probeBuffer, 0, sSsil.probes.data(), probeBytes);
+  const std::array layoutEntries{
+      wgpu::BindGroupLayoutEntry{
+          .binding = 0,
+          .visibility = wgpu::ShaderStage::Compute,
+          .buffer = {.type = wgpu::BufferBindingType::Storage},
+      },
+      wgpu::BindGroupLayoutEntry{
+          .binding = 1,
+          .visibility = wgpu::ShaderStage::Compute,
+          .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage},
+      },
+  };
+  const wgpu::BindGroupLayoutDescriptor layoutDescriptor{
+      .label = "demo.ssil_check",
+      .entryCount = layoutEntries.size(),
+      .entries = layoutEntries.data(),
+  };
+  sSsil.layout = device.CreateBindGroupLayout(&layoutDescriptor);
+  const std::array groupEntries{
+      wgpu::BindGroupEntry{.binding = 0, .buffer = sSsil.output, .size = sSsil.bytes},
+      wgpu::BindGroupEntry{.binding = 1, .buffer = sSsil.probeBuffer, .size = probeBytes},
+  };
+  const wgpu::BindGroupDescriptor groupDescriptor{
+      .label = "demo.ssil_check",
+      .layout = sSsil.layout,
+      .entryCount = groupEntries.size(),
+      .entries = groupEntries.data(),
+  };
+  sSsil.group = device.CreateBindGroup(&groupDescriptor);
+  sSsil.id = aurora::render::register_pass({
+      .name = "demo.ssil_check",
+      .stage = aurora::render::Stage::OpaqueDone,
+      .kind = aurora::render::PassKind::Compute,
+      .declare = declare_ssil_check,
+      .encode = encode_ssil_check,
+      .afterSubmit = ssil_check_submitted,
+      .userdata = &sSsil,
+  });
+  if (sSsil.id == aurora::render::InvalidPass) {
+    error = "register_pass refused demo.ssil_check";
+    return false;
+  }
+  return true;
+}
+
 constexpr u32 UnlitHeaderWords = 4;
 constexpr u32 UnlitSampleWords = 8;
 
@@ -2250,6 +2467,25 @@ void update_fwd_env_check(u32 frame) {
     std::this_thread::sleep_for(AoCompileWait);
   }
 }
+
+void update_ssil_check(u32 frame) {
+  if (sSsil.id == aurora::render::InvalidPass || frame < SsilCheckFrame ||
+      sSsil.armedFrame.load(std::memory_order_relaxed) != UINT32_MAX) {
+    return;
+  }
+  if (!std::exchange(sSsil.waitedForPipelines, true)) {
+    wait_for_pipelines();
+    sSsil.deadline = std::chrono::steady_clock::now() + PipelineWait;
+  }
+  // The bounce rides AO's temporal history, so it is judged only once that history has had frames to settle
+  const u32 encodes = sSsil.encodes.load(std::memory_order_relaxed);
+  const bool late = std::chrono::steady_clock::now() >= sSsil.deadline;
+  if (!pipelines_compiling() && (encodes >= SsilSettleFrames || (late && encodes != 0))) {
+    sSsil.armedFrame.store(aurora::gfx::current_frame(), std::memory_order_release);
+  } else if (!late) {
+    std::this_thread::sleep_for(AoCompileWait);
+  }
+}
 } // namespace
 
 // Aurora's pipeline threads update the counter through atomic_ref, so it is read the same way
@@ -2309,6 +2545,9 @@ bool register_graph_passes(const GraphPassOptions& options, std::string& error) 
   if (options.overlayCheck && !register_overlay_check(error)) {
     return false;
   }
+  if (options.ssilCheck && !register_ssil_check(error)) {
+    return false;
+  }
   return options.gpuCull == 0 ||
          register_cull_passes(
              {.instances = options.gpuCull, .check = options.cullCheck, .timings = options.cullTimings}, error);
@@ -2317,6 +2556,7 @@ bool register_graph_passes(const GraphPassOptions& options, std::string& error) 
 void update_graph_passes(u32 frame) {
   update_cull_passes(frame);
   update_fwd_env_check(frame);
+  update_ssil_check(frame);
   update_unlit_check(frame);
   update_companion_check(frame);
   update_class_check(frame);
@@ -2391,6 +2631,7 @@ void finish_graph_passes() {
   const bool motion = waiting(sMotion.id, sMotion.encodes, sMotion.armedFrame);
   const bool fog = waiting(sFog.id, sFog.encodes, sFog.armedFrame);
   const bool fwdEnv = waiting(sFwdEnv.id, sFwdEnv.encodes, sFwdEnv.armedFrame);
+  const bool ssil = waiting(sSsil.id, sSsil.encodes, sSsil.armedFrame);
   const auto unlitPending = [] {
     return sUnlit.id != aurora::render::InvalidPass && sUnlit.encodes.load(std::memory_order_relaxed) != 0 &&
            std::ranges::any_of(sUnlit.slots, [](const UnlitCheckSlot& slot) {
@@ -2416,7 +2657,8 @@ void finish_graph_passes() {
   while (((depth && sProbe.result.load(std::memory_order_acquire) == ProbeResult::Pending) ||
           (motion && sMotion.result.load(std::memory_order_acquire) == ProbeResult::Pending) ||
           (fog && sFog.result.load(std::memory_order_acquire) == ProbeResult::Pending) ||
-          (fwdEnv && sFwdEnv.result.load(std::memory_order_acquire) == ProbeResult::Pending) || unlitPending() ||
+          (fwdEnv && sFwdEnv.result.load(std::memory_order_acquire) == ProbeResult::Pending) ||
+          (ssil && sSsil.result.load(std::memory_order_acquire) == ProbeResult::Pending) || unlitPending() ||
           companionPending() || (sAo.id != aurora::render::InvalidPass && aoPending()) || overlay_pending(sOverlayA) ||
           overlay_pending(sOverlayB)) &&
          std::chrono::steady_clock::now() < deadline) {
@@ -2469,6 +2711,30 @@ GraphPassReport graph_pass_report() {
                                          .ao = words[base + 2],
                                          .normal = words[base + 3],
                                          .depthBits = words[base + 4]});
+      }
+    }
+  }
+  if (sSsil.id != aurora::render::InvalidPass) {
+    report.ssil.encodes = sSsil.encodes.load(std::memory_order_relaxed);
+    report.ssil.ready = sSsil.result.load(std::memory_order_acquire) == ProbeResult::Ready;
+    std::lock_guard lock{sSsil.mutex};
+    const std::vector<u32>& words = sSsil.values;
+    if (report.ssil.ready && words.size() >= SsilHeaderWords && words[SsilWritten] == 1) {
+      report.ssil.width = words[SsilWidth];
+      report.ssil.height = words[SsilHeight];
+      report.ssil.texels = words[SsilTexels];
+      report.ssil.outOfRange = words[SsilOutOfRange];
+      report.ssil.bounced = words[SsilBounced];
+      for (size_t i = 0; i < sSsil.probes.size(); ++i) {
+        const size_t base = SsilHeaderWords + i * SsilSampleWords;
+        if (base + SsilSampleWords > words.size()) {
+          break;
+        }
+        report.ssil.samples.push_back(
+            {.cls = sSsil.probes[i].cls,
+             .irr = {std::bit_cast<f32>(words[base]), std::bit_cast<f32>(words[base + 1]),
+                     std::bit_cast<f32>(words[base + 2]), std::bit_cast<f32>(words[base + 3])},
+             .code = words[base + 4]});
       }
     }
   }
@@ -2600,11 +2866,12 @@ void unregister_graph_passes() {
       sFog.id == aurora::render::InvalidPass && sAo.id == aurora::render::InvalidPass &&
       sFwdEnv.id == aurora::render::InvalidPass && sUnlit.id == aurora::render::InvalidPass &&
       sCompanion.id == aurora::render::InvalidPass && sOverlayA.id == aurora::render::InvalidPass &&
-      sOverlayB.id == aurora::render::InvalidPass && sClass.id == aurora::render::InvalidPass) {
+      sOverlayB.id == aurora::render::InvalidPass && sClass.id == aurora::render::InvalidPass &&
+      sSsil.id == aurora::render::InvalidPass) {
     return;
   }
   for (PassId* id : {&sVignette.id, &sProbe.id, &sMotion.id, &sMotionView.id, &sFog.id, &sAo.id, &sFwdEnv.id,
-                     &sUnlit.id, &sCompanion.id, &sOverlayA.id, &sOverlayB.id, &sClass.id}) {
+                     &sUnlit.id, &sCompanion.id, &sOverlayA.id, &sOverlayB.id, &sClass.id, &sSsil.id}) {
     if (*id != aurora::render::InvalidPass) {
       aurora::render::unregister_pass(*id);
       *id = aurora::render::InvalidPass;
@@ -2658,6 +2925,14 @@ void unregister_graph_passes() {
   sFwdEnv.readback = {};
   sFwdEnv.output = {};
   sFwdEnv.waitedForPipelines = false;
+  sSsil.pipeline = {};
+  sSsil.passLayout = {};
+  sSsil.group = {};
+  sSsil.layout = {};
+  sSsil.probeBuffer = {};
+  sSsil.readback = {};
+  sSsil.output = {};
+  sSsil.waitedForPipelines = false;
   sUnlit.pipeline = {};
   sUnlit.passLayout = {};
   sUnlit.group = {};

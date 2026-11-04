@@ -4295,6 +4295,200 @@ TEST_F(SsilGpu, FacingRejectsBackFacesAtCoarseMips) {
   EXPECT_DOUBLE_EQ(ref::ssil_facing({0.0, 0.0, 0.0}, {0.0, 0.0, 1.0}), 1.0);
 }
 
+TEST_F(SsilGpu, NormalPyramidMatchesMirror) {
+  Rig rig = crease_rig();
+  rig.classify = [](const Vec3d& p, uint32_t tag) { return tag == TagGround && p[0] > 60.0 ? TagBand : tag; };
+  rig.code = [](uint32_t tag) { return tag == TagBand ? 0u : 3u; };
+  rig.shade = [](const Vec3d& n, uint32_t tag) { return tag == TagWall ? Vec3d{-n[0], -n[1], -n[2]} : n; };
+  begin_ssil(rig, Quality::High, red_wall_white_floor);
+  const SsilFrame f = step_ssil(1);
+  ASSERT_FALSE(f.normals.empty());
+  ASSERT_EQ(f.normals[0].size(), m_hiz.size());
+  StageCamera camera;
+  ASSERT_TRUE(fill_stage_camera(m_hints.get(), camera));
+  const auto unorm = [](uint32_t packed, uint32_t shift) { return ((packed >> shift) & 1023u) / 1023.0 * 2.0 - 1.0; };
+  size_t sky = 0;
+  size_t codeZero = 0;
+  size_t flipped = 0;
+  size_t bad = 0;
+  for (uint32_t gy = 0; gy < m_gridHeight; ++gy) {
+    for (uint32_t gx = 0; gx < m_gridWidth; ++gx) {
+      const size_t i = size_t{gy} * m_gridWidth + gx;
+      const uint32_t qx = rep(gx, m_scene.width);
+      const uint32_t qy = rep(gy, m_scene.height);
+      const uint32_t packed = m_scene.normals[size_t{qy} * m_scene.width + qx];
+      std::array<double, 3> want{};
+      if (m_hiz[i] >= 0.5 * ao::SkyDepth) {
+        ++sky;
+      } else if (ref::normal_code(packed) == 0) {
+        ++codeZero;
+      } else {
+        const std::array<double, 3> raw{unorm(packed, 0), unorm(packed, 10), unorm(packed, 20)};
+        const double len = std::sqrt(raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]);
+        want = {raw[0] / len, raw[1] / len, -raw[2] / len};
+        const std::array<double, 3> pos = ref::view_position_fwd(
+            camera, (qx + 0.5) / m_scene.width, (qy + 0.5) / m_scene.height, m_hiz[i], m_scene.width, m_scene.height);
+        if (want[0] * -pos[0] + want[1] * -pos[1] + want[2] * -pos[2] < 0.0) {
+          want = {-want[0], -want[1], -want[2]};
+          ++flipped;
+        }
+      }
+      const std::array<double, 3> got = decode_normal_word(f.normals[0][i]);
+      for (size_t c = 0; c < 3; ++c) {
+        bad += std::abs(got[c] - want[c]) > 1.5 / 255.0 ? 1 : 0;
+      }
+    }
+  }
+  std::printf("ssil.normal mip 0: %zu sky, %zu code 0, %zu flipped toward the camera, %zu channels off the mirror\n",
+              sky, codeZero, flipped, bad);
+  EXPECT_GT(sky, 100u);
+  EXPECT_GT(codeZero, 100u);
+  EXPECT_GT(flipped, 100u);
+  EXPECT_LE(bad, m_hiz.size() / 500);
+}
+
+TEST_F(SsilGpu, CameraFlipIsSymmetric) {
+  Rig rig = crease_rig();
+  begin_ssil(rig, Quality::High, red_wall_white_floor);
+  const SsilFrame facing = step_ssil(1);
+  rig.shade = [](const Vec3d& n, uint32_t) { return Vec3d{-n[0], -n[1], -n[2]}; };
+  begin_ssil(rig, Quality::High, red_wall_white_floor);
+  const SsilFrame away = step_ssil(1);
+  ASSERT_GE(facing.normals.size(), 4u);
+  ASSERT_EQ(facing.normals.size(), away.normals.size());
+  size_t worst = 0;
+  for (size_t mip = 0; mip < facing.normals.size(); ++mip) {
+    ASSERT_EQ(facing.normals[mip].size(), away.normals[mip].size());
+    for (size_t i = 0; i < facing.normals[mip].size(); ++i) {
+      for (uint32_t c = 0; c < 3; ++c) {
+        const int a = static_cast<int>((facing.normals[mip][i] >> (8 * c)) & 0xFFu);
+        const int b = static_cast<int>((away.normals[mip][i] >> (8 * c)) & 0xFFu);
+        worst = std::max<size_t>(worst, static_cast<size_t>(std::abs(a - b)));
+      }
+    }
+  }
+  EXPECT_LE(worst, 2u);
+}
+
+TEST_F(SsilGpu, ReprojectsWithMotion) {
+  constexpr uint32_t Width = 128;
+  constexpr uint32_t Height = 64;
+  constexpr int32_t Dx = 3;
+  constexpr int32_t Dy = -2;
+  const auto pattern = [](int32_t x, int32_t y) {
+    return std::array<float, 4>{0.0625f * static_cast<float>(x % 64), 0.0625f * static_cast<float>(y), 0.5f, 1.f};
+  };
+  begin_ssil(frontal_rig(Width, Height, 500.0), Quality::High, [&](uint32_t x, uint32_t y, uint32_t) {
+    return pattern(static_cast<int32_t>(x), static_cast<int32_t>(y));
+  });
+  // Whole-pixel steps are exact in f16, so every reprojected texel lands on a single radiance texel
+  set_motion([](uint32_t, uint32_t) {
+    return std::array<float, 2>{2.f * Dx / static_cast<float>(Width), -2.f * Dy / static_cast<float>(Height)};
+  });
+  step_ssil(1);
+  const SsilFrame f = step_ssil(2);
+  EXPECT_EQ(ao::ssil_radiance::testing::counters().reprojected, 1u);
+  ASSERT_FALSE(f.radiance.empty());
+  size_t moved = 0;
+  size_t offscreen = 0;
+  for (uint32_t gy = 0; gy < m_gridHeight; ++gy) {
+    for (uint32_t gx = 0; gx < m_gridWidth; ++gx) {
+      const std::array<float, 4>& got = f.radiance[0][size_t{gy} * m_gridWidth + gx].v;
+      const int32_t px = static_cast<int32_t>(rep(gx, Width)) - Dx;
+      const int32_t py = static_cast<int32_t>(rep(gy, Height)) - Dy;
+      if (px < 0 || py >= static_cast<int32_t>(Height)) {
+        EXPECT_EQ(got, (std::array<float, 4>{})) << gx << "," << gy;
+        ++offscreen;
+        continue;
+      }
+      const std::array<float, 4> want = pattern(px, py);
+      for (size_t c = 0; c < 4; ++c) {
+        EXPECT_NEAR(got[c], want[c], 2e-3f) << gx << "," << gy << " channel " << c;
+      }
+      ++moved;
+    }
+  }
+  EXPECT_GT(moved, f.radiance[0].size() * 9 / 10);
+  EXPECT_GT(offscreen, 0u);
+}
+
+TEST_F(SsilGpu, DisocclusionRejects) {
+  constexpr uint32_t Width = 128;
+  constexpr uint32_t Height = 96;
+  constexpr std::array<float, 4> Lit{0.6f, 0.4f, 0.2f, 1.f};
+  begin_ssil(frontal_rig(Width, Height, 500.0), Quality::High, [&](uint32_t, uint32_t, uint32_t) { return Lit; });
+  step_ssil(1);
+  const SsilFrame settled = step_ssil(2);
+  ASSERT_FALSE(settled.radiance.empty());
+  for (const SsilTexel& t : settled.radiance[0]) {
+    EXPECT_NEAR(t.v[3], 1.f, 1e-3f);
+  }
+  set_depth(depth_with_block(250.0, 32, 24, 96, 72));
+  set_motion([](uint32_t, uint32_t y) { return y < 16 ? std::array<float, 2>{3.f, 0.f} : std::array<float, 2>{}; });
+  const SsilFrame f = step_ssil(3);
+  EXPECT_EQ(ao::ssil_radiance::testing::counters().reprojected, 2u);
+  size_t uncovered = 0;
+  size_t badMotion = 0;
+  size_t kept = 0;
+  for (uint32_t gy = 0; gy < m_gridHeight; ++gy) {
+    for (uint32_t gx = 0; gx < m_gridWidth; ++gx) {
+      const std::array<float, 4>& got = f.radiance[0][size_t{gy} * m_gridWidth + gx].v;
+      const uint32_t qx = rep(gx, Width);
+      const uint32_t qy = rep(gy, Height);
+      if (qy < 16) {
+        EXPECT_EQ(got, (std::array<float, 4>{})) << gx << "," << gy;
+        ++badMotion;
+      } else if (qx >= 34 && qx < 94 && qy >= 26 && qy < 70) {
+        EXPECT_EQ(got, (std::array<float, 4>{})) << gx << "," << gy;
+        ++uncovered;
+      } else if (qx < 30 || qx >= 98 || qy >= 76) {
+        for (size_t c = 0; c < 4; ++c) {
+          EXPECT_NEAR(got[c], Lit[c], 1e-3f) << gx << "," << gy;
+        }
+        ++kept;
+      }
+    }
+  }
+  EXPECT_GT(uncovered, 500u);
+  EXPECT_GT(badMotion, 200u);
+  EXPECT_GT(kept, 500u);
+}
+
+TEST_F(SsilGpu, EveryResetCauseWritesZero) {
+  begin_ssil(crease_rig(), Quality::High, red_wall_white_floor);
+  const auto cleared = [](const SsilFrame& f) {
+    if (f.radiance.empty()) {
+      return false;
+    }
+    return std::ranges::all_of(f.radiance[0], [](const SsilTexel& t) { return t.v == std::array<float, 4>{}; });
+  };
+  const auto counters = [] { return ao::ssil_radiance::testing::counters(); };
+  EXPECT_TRUE(cleared(step_ssil(1)));
+  EXPECT_EQ(counters().clearedNoRadiance, 1u);
+  EXPECT_FALSE(cleared(step_ssil(2)));
+  composite::testing::bump_units_epoch();
+  latch(m_graph.get());
+  EXPECT_TRUE(cleared(step_ssil(3)));
+  EXPECT_EQ(counters().clearedUnits, 1u);
+  latch(m_graph.get());
+  EXPECT_FALSE(cleared(step_ssil(4)));
+  auto still = std::make_shared<SceneHints>(*m_hints);
+  still->motionValid = false;
+  ao::testing::set_camera_override(still);
+  EXPECT_TRUE(cleared(step_ssil(5)));
+  EXPECT_EQ(counters().clearedMotion, 1u);
+  ao::testing::set_camera_override(m_hints);
+  EXPECT_FALSE(cleared(step_ssil(6)));
+  const uint32_t dispatches = counters().dispatches;
+  EXPECT_EQ(run(FrameState{.graph = m_graph}, 7, scene_depth(m_depth), true), std::nullopt);
+  EXPECT_EQ(counters().dispatches, dispatches);
+  EXPECT_TRUE(cleared(step_ssil(8)));
+  EXPECT_EQ(counters().clearedNoHistory, 1u);
+  EXPECT_FALSE(cleared(step_ssil(9)));
+  EXPECT_EQ(counters().cleared, 4u);
+  EXPECT_EQ(counters().reprojected, 4u);
+}
+
 TEST(AoReference, SsilSharesEqualOcclusion) {
   const Mat4x4<float> proj = perspective(Near, Far);
   const Frame frame = render_rig(crease_rig(), proj);

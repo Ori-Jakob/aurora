@@ -61,6 +61,7 @@ enum ExitCode : int {
   ExitCompanionCheck = 16,
   ExitOverlayCheck = 17,
   ExitClassCheck = 18,
+  ExitSsilCheck = 19,
 };
 
 std::atomic_uint32_t g_errorCount = 0;
@@ -386,6 +387,28 @@ ClassOutcome class_outcome(const render_demo::ClassCheckReport& report, const Cl
     outcome.failure = "the class and manifest edit compiled " + std::to_string(compiles) + " pipelines";
   } else {
     outcome.failure = render_demo::check_classes(outcome.summary);
+  }
+  return outcome;
+}
+
+struct SsilOutcome {
+  render_demo::SsilCheckSummary summary;
+  std::optional<std::string> failure;
+};
+
+SsilOutcome ssil_outcome(const render_demo::SsilCheckReport& report, bool nullBackend) {
+  SsilOutcome outcome{
+      .summary = render_demo::summarize_ssil(report.samples, report.texels, report.bounced, report.outOfRange)};
+  // The null backend runs no shaders, so its values say nothing
+  if (nullBackend) {
+    return outcome;
+  }
+  if (report.encodes == 0) {
+    outcome.failure = "ssil.irr never reached demo.ssil_check";
+  } else if (!report.ready || report.samples.empty()) {
+    outcome.failure = "check readback did not complete";
+  } else {
+    outcome.failure = render_demo::check_ssil(outcome.summary);
   }
   return outcome;
 }
@@ -898,9 +921,12 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  if (options.aoCheck || options.fwdEnvCheck) {
+  if (options.aoCheck || options.fwdEnvCheck || options.ssilCheck) {
     // The checks run at AO High whatever the saved settings say
     SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_AO", "high", false);
+  }
+  if (options.ssilCheck) {
+    SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_SSIL", "on", false);
   }
   if (options.unlitCheck || options.companionCheck) {
     // PBR ships no built bit in M9, so only the verification hook can reach the Surface layout
@@ -969,7 +995,8 @@ int main(int argc, char* argv[]) {
                                          .unlitCheck = options.unlitCheck,
                                          .companionCheck = options.companionCheck,
                                          .overlayCheck = options.overlayCheck,
-                                         .classCheck = options.classCheck};
+                                         .classCheck = options.classCheck,
+                                         .ssilCheck = options.ssilCheck};
   bool decodingChanged = false;
 
   GXInit(nullptr, 0);
@@ -993,7 +1020,8 @@ int main(int argc, char* argv[]) {
                                                                    .unlitCheck = options.unlitCheck,
                                                                    .companionCheck = options.companionCheck,
                                                                    .overlayCheck = options.overlayCheck,
-                                                                   .classCheck = options.classCheck},
+                                                                   .classCheck = options.classCheck,
+                                                                   .ssilCheck = options.ssilCheck},
                                                                   graphError)) {
     std::fprintf(stderr, "render_demo: render graph setup failed: %s\n", graphError.c_str());
     render_demo::shutdown_scene();
@@ -1298,6 +1326,26 @@ int main(int argc, char* argv[]) {
         classRun.createdAfterEdit - classRun.createdAtEdit, g_unknownClassLines.load(std::memory_order_relaxed),
         graphReport.classes.width, graphReport.classes.height);
   }
+  const SsilOutcome ssilOutcome =
+      options.ssilCheck ? ssil_outcome(graphReport.ssil, info.backend == BACKEND_NULL) : SsilOutcome{};
+  if (options.ssilCheck) {
+    const std::string status = ssilOutcome.failure            ? "FAILED: " + *ssilOutcome.failure
+                               : info.backend == BACKEND_NULL ? std::string{"skipped (null backend)"}
+                                                              : std::string{"passed"};
+    const auto& b = ssilOutcome.summary.bands;
+    const auto band = [&](render_demo::SsilProbeClass cls) { return b[static_cast<size_t>(cls)]; };
+    const auto wall = band(render_demo::SsilProbeClass::WallFoot);
+    const auto back = band(render_demo::SsilProbeClass::FinBack);
+    const auto front = band(render_demo::SsilProbeClass::FinFront);
+    const auto open = band(render_demo::SsilProbeClass::Open);
+    std::printf(
+        "render_demo: ssil check %s: %u of %u texels bounced, %u out of range at %ux%u; wall foot %u (%.4f, %.4f, "
+        "%.4f), behind fin %u (%.4f, %.4f, %.4f), before fin %u (%.4f, %.4f, %.4f), open %u coverage %.4f\n",
+        status.c_str(), ssilOutcome.summary.bounced, ssilOutcome.summary.texels, ssilOutcome.summary.outOfRange,
+        graphReport.ssil.width, graphReport.ssil.height, wall.receivers, wall.mean[0], wall.mean[1], wall.mean[2],
+        back.receivers, back.mean[0], back.mean[1], back.mean[2], front.receivers, front.mean[0], front.mean[1],
+        front.mean[2], open.receivers, open.coverage);
+  }
   const char* overlayEnv = SDL_getenv("AURORA_RENDER_OVERLAY_DEFER");
   const std::string_view overlayMode = overlayEnv != nullptr ? overlayEnv : "unset";
   const std::optional<std::string> overlayFailure =
@@ -1399,6 +1447,9 @@ int main(int argc, char* argv[]) {
   }
   if (classOutcome.failure) {
     return ExitClassCheck;
+  }
+  if (ssilOutcome.failure) {
+    return ExitSsilCheck;
   }
 
   if (cullFailure) {

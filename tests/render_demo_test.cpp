@@ -294,6 +294,65 @@ TEST(RenderDemoOptions, ParsesDepthCheck) {
   EXPECT_EQ(parse_error({"--depth-check", "--trace", "x"}), "render graph passes cannot be traced");
 }
 
+TEST(RenderDemoOptions, ParsesSsilCheck) {
+  const auto defaults = parse({});
+  ASSERT_TRUE(defaults);
+  EXPECT_FALSE(defaults->ssilCheck);
+  const auto check = parse({"--ssil-check"});
+  ASSERT_TRUE(check);
+  EXPECT_TRUE(check->ssilCheck);
+  EXPECT_EQ(parse_error({"--ssil-check", "--frames", "89"}), "--ssil-check needs at least 90 frames");
+  EXPECT_TRUE(parse({"--ssil-check", "--frames", "90"}));
+  EXPECT_EQ(parse_error({"--ssil-check", "--no-hints"}),
+            "--ssil-check cannot be combined with --no-hints or --msaa above 1");
+  EXPECT_EQ(parse_error({"--ssil-check", "--msaa", "4"}),
+            "--ssil-check cannot be combined with --no-hints or --msaa above 1");
+  EXPECT_EQ(parse_error({"--ssil-check", "--trace", "x"}), "render graph passes cannot be traced");
+}
+
+namespace {
+std::vector<SsilSample> ssil_samples(std::array<f32, 4> wall, std::array<f32, 4> back, std::array<f32, 4> front,
+                                     std::array<f32, 4> open) {
+  std::vector<SsilSample> out;
+  for (u32 i = 0; i < SsilBandProbes; ++i) {
+    out.push_back({.cls = SsilProbeClass::WallFoot, .irr = wall, .code = 3});
+    out.push_back({.cls = SsilProbeClass::FinBack, .irr = back, .code = 3});
+    out.push_back({.cls = SsilProbeClass::FinFront, .irr = front, .code = 3});
+    out.push_back({.cls = SsilProbeClass::Open, .irr = open, .code = 3});
+  }
+  return out;
+}
+} // namespace
+
+TEST(RenderDemoGraph, SsilCheckAcceptsBleedAndFacing) {
+  const auto samples =
+      ssil_samples({0.3f, 0.08f, 0.07f, 0.5f}, {0.25f, 0.05f, 0.06f, 0.4f}, {0.05f, 0.2f, 0.06f, 0.4f}, {});
+  EXPECT_EQ(check_ssil(summarize_ssil(samples, 4096, 2048, 0)), std::nullopt);
+}
+
+TEST(RenderDemoGraph, SsilCheckRejectsEachFailure) {
+  const std::array<f32, 4> wall{0.3f, 0.08f, 0.07f, 0.5f};
+  const std::array<f32, 4> back{0.25f, 0.05f, 0.06f, 0.4f};
+  const std::array<f32, 4> front{0.05f, 0.2f, 0.06f, 0.4f};
+  EXPECT_NE(check_ssil(summarize_ssil(ssil_samples(wall, back, front, {}), 4096, 2048, 1)), std::nullopt);
+  EXPECT_NE(check_ssil(summarize_ssil(ssil_samples(wall, back, front, {}), 4096, 10, 0)), std::nullopt);
+  EXPECT_NE(check_ssil(summarize_ssil(ssil_samples({0.1f, 0.1f, 0.1f, 0.5f}, back, front, {}), 4096, 2048, 0)),
+            std::nullopt);
+  EXPECT_NE(check_ssil(summarize_ssil(ssil_samples(wall, {0.25f, 0.08f, 0.06f, 0.4f}, front, {}), 4096, 2048, 0)),
+            std::nullopt);
+  EXPECT_NE(check_ssil(summarize_ssil(ssil_samples(wall, {0.04f, 0.05f, 0.06f, 0.4f}, front, {}), 4096, 2048, 0)),
+            std::nullopt);
+  EXPECT_NE(check_ssil(summarize_ssil(ssil_samples(wall, back, {0.2f, 0.1f, 0.06f, 0.4f}, {}), 4096, 2048, 0)),
+            std::nullopt);
+  EXPECT_NE(check_ssil(summarize_ssil(ssil_samples(wall, back, front, {0.f, 0.f, 0.f, 0.2f}), 4096, 2048, 0)),
+            std::nullopt);
+  std::vector<SsilSample> sky = ssil_samples(wall, back, front, {});
+  for (SsilSample& sample : sky) {
+    sample.code = sample.cls == SsilProbeClass::FinBack ? 0 : sample.code;
+  }
+  EXPECT_NE(check_ssil(summarize_ssil(sky, 4096, 2048, 0)), std::nullopt);
+}
+
 namespace {
 std::array<f32, 4> probe(f32 sky, f32 mid, f32 close, f32 width = 1280.f) { return {sky, mid, close, width}; }
 } // namespace

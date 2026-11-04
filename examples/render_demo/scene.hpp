@@ -31,6 +31,7 @@ struct SceneOptions {
   bool companionCheck = false;
   bool overlayCheck = false;
   bool classCheck = false;
+  bool ssilCheck = false;
 };
 
 struct OverlayColors {
@@ -82,6 +83,13 @@ struct ClassProbe {
 };
 static_assert(sizeof(ClassProbe) == 16);
 
+struct SsilProbe {
+  f32 ndc[2];
+  SsilProbeClass cls;
+  u32 pad;
+};
+static_assert(sizeof(SsilProbe) == 16);
+
 struct FogResolveCounts {
   u32 checked = 0;
   u32 live = 0;
@@ -100,6 +108,7 @@ std::vector<UnlitProbe> unlit_probes();
 std::vector<CompanionProbe> companion_probes();
 CompanionAxes companion_axes() noexcept;
 std::vector<ClassProbe> class_probes();
+std::vector<SsilProbe> ssil_check_probes();
 std::string class_manifest(bool edited);
 std::span<const u8> ground_texture_base() noexcept;
 std::array<f32, 2> overlay_probe() noexcept;

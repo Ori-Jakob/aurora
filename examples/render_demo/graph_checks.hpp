@@ -149,6 +149,33 @@ inline constexpr u32 FwdEnvFarSensitive = 8;
 inline constexpr u32 FwdEnvNearSensitive = 16;
 inline constexpr u32 FwdEnvCardSensitive = 16;
 
+inline constexpr u32 SsilCheckFrame = 40;
+inline constexpr u32 SsilSettleFrames = 24;
+inline constexpr u32 SsilBandProbes = 6;
+inline constexpr u32 SsilBouncedTexels = 1000;
+
+enum class SsilProbeClass : u32 { WallFoot, FinBack, FinFront, Open, Count };
+
+struct SsilSample {
+  SsilProbeClass cls = SsilProbeClass::WallFoot;
+  std::array<f32, 4> irr{};
+  u32 code = 0;
+};
+
+struct SsilBand {
+  u32 probes = 0;
+  u32 receivers = 0;
+  std::array<double, 3> mean{};
+  double coverage = 0.0;
+};
+
+struct SsilCheckSummary {
+  std::array<SsilBand, static_cast<size_t>(SsilProbeClass::Count)> bands{};
+  u32 texels = 0;
+  u32 bounced = 0;
+  u32 outOfRange = 0;
+};
+
 inline constexpr u32 UnlitCheckFirstFrame = 18;
 inline constexpr u32 UnlitCheckSecondFrame = 38;
 inline constexpr u32 UnlitSunFrame = 20;
@@ -304,4 +331,6 @@ std::optional<std::string> check_companions(const CompanionCheckSummary& summary
 ClassCheckSummary summarize_classes(std::span<const std::vector<ClassSample>, ClassPhaseCount> phases,
                                     bool bakedVertex);
 std::optional<std::string> check_classes(const ClassCheckSummary& summary);
+SsilCheckSummary summarize_ssil(std::span<const SsilSample> samples, u32 texels, u32 bounced, u32 outOfRange);
+std::optional<std::string> check_ssil(const SsilCheckSummary& summary);
 } // namespace render_demo

@@ -57,6 +57,8 @@ constexpr u64 FwdEnvWallObject = 0x600;
 constexpr u64 FwdEnvStripAObject = 0x610;
 constexpr u64 FwdEnvStripBObject = 0x611;
 constexpr u64 FwdEnvCardObject = 0x612;
+constexpr u64 SsilWallObject = 0x800;
+constexpr u64 SsilFinObject = 0x801;
 constexpr u32 GroundMaterial = 1;
 constexpr u32 SceneEpoch = 1;
 constexpr u32 GroundTextureSize = 64;
@@ -113,6 +115,7 @@ constexpr FogParams FwdEnvFog{GX_FOG_PERSP_LIN, 13.f, 40.f, 0.5f, 400.f, ClearCo
 constexpr f32 CardZ0 = 0.5f;
 constexpr f32 CardZ1 = 1.28f;
 constexpr f32 CardTop = 1.2f;
+constexpr GXColor SsilFinColor{40, 220, 60, 255};
 
 f32 ao_slider_z(u32 frame) noexcept {
   const u32 last = AoSliderRemoved - 1;
@@ -671,6 +674,17 @@ void set_konst_tev(GXColor colour) {
   GXSetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_KONST);
   GXSetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
   GXSetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+}
+
+void draw_ssil_check(const Mtx view) {
+  set_lit_channel(GX_SRC_VTX);
+  set_pass_color_tev();
+  GXSetCurrentMtx(GX_PNMTX0);
+  GXSetCullMode(GX_CULL_BACK);
+  draw_ao_slab(view, AoWall, SsilWallObject, AURORA_CAT_STATIC, AURORA_OBJ_IMMOBILE);
+  set_konst_tev(SsilFinColor);
+  draw_ao_slab(view, AoPole, SsilFinObject, AURORA_CAT_STATIC, AURORA_OBJ_IMMOBILE);
+  set_pass_color_tev();
 }
 
 void draw_fwd_env_layers(const Mtx view) {
@@ -1282,6 +1296,33 @@ CompanionAxes companion_axes() noexcept {
   return {.x = axis({1.f, 0.f, 0.f}), .z = axis({0.f, 0.f, 1.f})};
 }
 
+std::vector<SsilProbe> ssil_check_probes() {
+  const SceneCamera camera = scene_camera(AoCheckClock);
+  std::vector<SsilProbe> probes;
+  const auto add = [&](SsilProbeClass cls, f32 x, f32 z) {
+    const std::array<f32, 2> ndc = project(camera, {x, 0.f, z});
+    probes.push_back({.ndc = {ndc[0], ndc[1]}, .cls = cls});
+  };
+  const f32 wallFace = AoWall.centre.x + AoWall.size.x / 2.f;
+  const f32 finFace = AoPole.centre.x + AoPole.size.x / 2.f;
+  for (const f32 gap : {0.1f, 0.2f, 0.3f}) {
+    for (const f32 z : {-6.5f, -6.f, -5.5f, -2.5f, -2.f, -1.5f}) {
+      add(SsilProbeClass::WallFoot, wallFace + gap, z);
+    }
+    // Offset in z, so the line of sight passes beside the fin rather than through it
+    for (const f32 dz : {-0.3f, -0.25f, 0.2f, 0.25f}) {
+      add(SsilProbeClass::FinBack, wallFace + 0.1f + gap, AoPole.centre.z + dz);
+      add(SsilProbeClass::FinFront, finFace + 0.05f + gap, AoPole.centre.z + dz);
+    }
+  }
+  for (const f32 x : {20.f, 20.5f, 21.f}) {
+    for (const f32 z : {-4.5f, -3.5f, -2.5f}) {
+      add(SsilProbeClass::Open, x, z);
+    }
+  }
+  return probes;
+}
+
 std::vector<ClassProbe> class_probes() {
   SceneCamera camera = scene_camera(AoCheckClock);
   C_MTXIdentity(camera.view);
@@ -1333,7 +1374,7 @@ void draw_scene(u32 frame, const SceneOptions& options) {
   set_hint_emission(options.hints);
   upload_gpu_arrays(options);
   const u32 clock = options.aoCheck || options.fwdEnvCheck || options.unlitCheck || options.companionCheck ||
-                            options.overlayCheck || options.classCheck
+                            options.overlayCheck || options.classCheck || options.ssilCheck
                         ? AoCheckClock
                         : frame;
   const f32 t = static_cast<f32>(clock) / 60.f;
@@ -1374,6 +1415,9 @@ void draw_scene(u32 frame, const SceneOptions& options) {
   }
   if (options.fwdEnvCheck) {
     draw_fwd_env_walls(view);
+  }
+  if (options.ssilCheck) {
+    draw_ssil_check(view);
   }
   if (options.unlitCheck) {
     begin_object(UnlitControlObject, AURORA_CAT_STATIC | AURORA_CAT_TERRAIN | AURORA_CAT_NO_PBR, AURORA_OBJ_IMMOBILE);

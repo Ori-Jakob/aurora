@@ -654,4 +654,77 @@ std::optional<std::string> check_fwd_env(const FwdEnvSummary& summary) {
   }
   return gate_failure(summary.card, "card D", FwdEnvCardSensitive, 0.9, 1.0);
 }
+
+SsilCheckSummary summarize_ssil(std::span<const SsilSample> samples, u32 texels, u32 bounced, u32 outOfRange) {
+  SsilCheckSummary summary{.texels = texels, .bounced = bounced, .outOfRange = outOfRange};
+  for (const SsilSample& sample : samples) {
+    SsilBand& band = summary.bands[static_cast<size_t>(sample.cls)];
+    ++band.probes;
+    if (sample.code == 0) {
+      continue;
+    }
+    ++band.receivers;
+    for (size_t c = 0; c < 3; ++c) {
+      band.mean[c] += sample.irr[c];
+    }
+    band.coverage += sample.irr[3];
+  }
+  for (SsilBand& band : summary.bands) {
+    if (band.receivers != 0) {
+      for (double& value : band.mean) {
+        value /= band.receivers;
+      }
+      band.coverage /= band.receivers;
+    }
+  }
+  return summary;
+}
+
+std::optional<std::string> check_ssil(const SsilCheckSummary& summary) {
+  char text[192];
+  if (summary.outOfRange != 0) {
+    std::snprintf(text, sizeof(text), "%u ssil.irr texels are not finite, above 16 or outside [0, 1] in coverage",
+                  summary.outOfRange);
+    return std::string{text};
+  }
+  if (summary.bounced < SsilBouncedTexels) {
+    std::snprintf(text, sizeof(text), "only %u of %u ssil.irr texels carry a bounce", summary.bounced, summary.texels);
+    return std::string{text};
+  }
+  constexpr std::array<const char*, static_cast<size_t>(SsilProbeClass::Count)> Names{
+      "the floor at the red wall", "the floor behind the green fin", "the floor in front of the green fin",
+      "the open floor"};
+  for (size_t i = 0; i < summary.bands.size(); ++i) {
+    if (summary.bands[i].receivers < SsilBandProbes) {
+      std::snprintf(text, sizeof(text), "%s has %u receiving probes of %u", Names[i], summary.bands[i].receivers,
+                    summary.bands[i].probes);
+      return std::string{text};
+    }
+  }
+  const auto& wall = summary.bands[static_cast<size_t>(SsilProbeClass::WallFoot)].mean;
+  if (!(wall[0] > 0.01 && wall[0] > 1.5 * wall[1])) {
+    std::snprintf(text, sizeof(text), "%s gets bounce (%.4f, %.4f, %.4f), not the wall's red", Names[0], wall[0],
+                  wall[1], wall[2]);
+    return std::string{text};
+  }
+  const auto& front = summary.bands[static_cast<size_t>(SsilProbeClass::FinFront)].mean;
+  if (!(front[1] > 0.01 && front[1] > front[0])) {
+    std::snprintf(text, sizeof(text), "%s gets bounce (%.4f, %.4f, %.4f), not the fin's green", Names[2], front[0],
+                  front[1], front[2]);
+    return std::string{text};
+  }
+  // The fin's lit face points away from the floor behind it; only AO's filters may carry a little green there
+  const auto& back = summary.bands[static_cast<size_t>(SsilProbeClass::FinBack)].mean;
+  if (!(back[1] <= 0.3 * front[1] && back[0] > back[1])) {
+    std::snprintf(text, sizeof(text), "%s gets bounce (%.4f, %.4f, %.4f) from a face turned away", Names[1], back[0],
+                  back[1], back[2]);
+    return std::string{text};
+  }
+  const SsilBand& open = summary.bands[static_cast<size_t>(SsilProbeClass::Open)];
+  if (open.coverage > 0.05) {
+    std::snprintf(text, sizeof(text), "%s has bounce coverage %.3f with nothing near it", Names[3], open.coverage);
+    return std::string{text};
+  }
+  return std::nullopt;
+}
 } // namespace render_demo
