@@ -1,3 +1,23 @@
+// The table layout, lookups and LTC data follow adobe/openpbr-bsdf at c91aad1d1ce1693e803f039d7c92c2965c4eb013,
+// which carries this notice:
+//
+// Copyright 2026 Adobe
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// The LTC table is reproduced there from tizian/ltc-sheen by Tizian Zeltner, Brent Burley and Matt Jen-Yuan Chiang,
+// also licensed under the Apache License, Version 2.0.
+
 #include "openpbr.hpp"
 
 #include "../../logging.hpp"

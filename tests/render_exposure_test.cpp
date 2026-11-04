@@ -1037,7 +1037,6 @@ protected:
     std::vector<float> partials;
   };
 
-  // Production latches every frame, so one-latch flags such as the re-arm snap last exactly one frame
   // The composite writes the EFB in place, so every frame starts again from the game's colour
   void write_color() const {
     const wgpu::Extent3D size = webgpu::g_frameBuffer.size;
@@ -1046,6 +1045,7 @@ protected:
     m_device->queue.WriteTexture(&destination, m_color.data(), m_color.size() * 4, &layout, &size);
   }
 
+  // Production latches every frame, so one-latch flags such as the re-arm snap last exactly one frame
   Frame run(const FrameState& state, uint64_t frameId) {
     write_color();
     latch(state.graph.get());

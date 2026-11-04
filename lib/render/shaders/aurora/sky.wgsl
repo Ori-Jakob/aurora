@@ -1,5 +1,4 @@
-// Sky probe v1: linear Rec.709 in legacy-white units with the gain and skyVisibility already applied; consumers pass
-// their own ambient a and BAKED_LIGHT flag, and never add ENVIRONMENT ambient or multiply by skyVisibility
+// Sky probe v1: linear Rec.709 in legacy-white units, with the gain and skyVisibility already applied
 
 struct SkySh9 {
   c: array<vec4f, 9>,
@@ -100,6 +99,7 @@ fn sky_pixel_scale(sh: SkySh9, a: vec3f) -> vec3f {
   return clamp(a / max(sh.amb.rgb, vec3f(SKY_AMBIENT_FLOOR)), vec3f(0.0), vec3f(SKY_SCALE_MAX));
 }
 
+// Consumers pass their own ambient a and BAKED_LIGHT flag, and never add ENVIRONMENT ambient or skyVisibility on top
 fn sky_env_irradiance(sh: SkySh9, n: vec3f, a: vec3f, baked: bool) -> vec3f {
   let mode = sky_mode(sh);
   if (mode == SKY_MODE_PIXEL_FLAT || (mode == SKY_MODE_PIXEL && baked)) {
