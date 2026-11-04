@@ -71,6 +71,7 @@ void Classifier::clear_frame() noexcept {
   m_scopes = {};
   m_object = {};
   m_objectOpen = false;
+  m_objectHasWorld = false;
   m_objectDraws = 0;
   m_scopeDepth = 0;
   m_scopeSwallow = 0;
@@ -154,6 +155,8 @@ void Classifier::object_begin(const ObjectHint& hint) noexcept {
       .object = {.id = hint.id, .subId = hint.subId, .generation = hint.generation, .valid = true},
   };
   m_objectOpen = true;
+  m_objectHasWorld = hint.hasWorld;
+  m_objectWorld = hint.world;
   m_objectDraws = 0;
   m_keyDirty = true;
 }
@@ -163,6 +166,7 @@ void Classifier::object_end() noexcept {
   if (m_objectOpen) {
     m_object = {};
     m_objectOpen = false;
+    m_objectHasWorld = false;
     m_objectDraws = 0;
     m_keyDirty = true;
   } else if (m_objectSwallow > 0) {
@@ -350,6 +354,9 @@ const DrawClass& Classifier::route(const DrawInputs& inputs) noexcept {
     m_hasPushed = true;
   }
   count(cls, inputs);
+  cls.ordinal = m_objectOpen && !cls.suppressed && !inputs.offscreen
+                    ? static_cast<uint16_t>(std::min<uint32_t>(m_objectDraws++, 0xFFFF))
+                    : 0;
   if (m_record) {
     // Never grows past the reservation, so the FIFO thread does not allocate
     if (m_records.size() < MaxRecordedDraws && m_records.size() < m_records.capacity()) {
@@ -358,9 +365,6 @@ const DrawClass& Classifier::route(const DrawInputs& inputs) noexcept {
       ++m_stats.droppedRecords;
     }
   }
-  cls.ordinal = m_objectOpen && !cls.suppressed && !inputs.offscreen
-                    ? static_cast<uint16_t>(std::min<uint32_t>(m_objectDraws++, 0xFFFF))
-                    : 0;
   m_last = cls;
   return m_last;
 }

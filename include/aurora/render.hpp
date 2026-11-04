@@ -282,6 +282,24 @@ struct DrawRouteCounters {
 
 DrawRouteCounters draw_route_counters() noexcept;
 
+struct RetainedStats {
+  bool active = false;
+  bool coverageComplete = false;
+  uint32_t instances = 0;
+  uint32_t staticInstances = 0;
+  uint32_t staticObjects = 0;
+  uint32_t undeliveredStatics = 0;
+  uint64_t created = 0;
+  uint64_t evicted = 0;
+  uint64_t captured = 0;
+  uint64_t churn = 0;
+  uint64_t lostCaptures = 0;
+  uint64_t resyncs = 0;
+  bool operator==(const RetainedStats&) const = default;
+};
+
+RetainedStats retained_stats() noexcept;
+
 // M10
 struct OpenPbrParams {
   float baseWeight = 1.f;

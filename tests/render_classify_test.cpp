@@ -620,6 +620,37 @@ TEST_F(RenderClassify, RecordsOnlyWhenRequested) {
   EXPECT_EQ(classifier.draws().back().cls.index, MaxRecordedDraws - 1);
 }
 
+TEST_F(RenderClassify, RecordCarriesOrdinal) {
+  classifier.set_record(true);
+  main_scene();
+  classifier.object_begin(object(5));
+  for (uint32_t i = 0; i < 3; ++i) {
+    EXPECT_EQ(classifier.route(main_draw()).ordinal, i);
+  }
+  classifier.object_end();
+  classifier.route(main_draw());
+  Mat3x4<float> world{};
+  world.m0[3] = 4.f;
+  ObjectHint withWorld = object(6);
+  withWorld.hasWorld = true;
+  withWorld.world = world;
+  classifier.object_begin(withWorld);
+  ASSERT_NE(classifier.object_world(), nullptr);
+  EXPECT_EQ(classifier.object_world()->m0[3], 4.f);
+  classifier.route(main_draw());
+  classifier.object_end();
+  EXPECT_EQ(classifier.object_world(), nullptr);
+  ASSERT_EQ(classifier.draws().size(), 5u);
+  for (uint32_t i = 0; i < 3; ++i) {
+    EXPECT_EQ(classifier.draws()[i].cls.ordinal, i);
+  }
+  EXPECT_EQ(classifier.draws()[3].cls.ordinal, 0u);
+  EXPECT_FALSE(classifier.draws()[3].cls.key.object.valid);
+  EXPECT_EQ(classifier.draws()[4].cls.ordinal, 0u);
+  classifier.object_begin(object(7));
+  EXPECT_EQ(classifier.object_world(), nullptr);
+}
+
 TEST_F(RenderClassify, BeginFrameResets) {
   classifier.set_record(true);
   classifier.set_merge_key(MergeKey::ObjectOnly);

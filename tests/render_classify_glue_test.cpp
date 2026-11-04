@@ -20,6 +20,7 @@
 #include "render/post/taa.hpp"
 #include "render/post/upscale/fsr/fsr_pass.hpp"
 #include "render/scene/classify.hpp"
+#include "render/scene/identity.hpp"
 #include "render/scene/overlay.hpp"
 #include "render/settings.hpp"
 #include "render/stage_data.hpp"
@@ -719,6 +720,96 @@ TEST_F(RenderClassifyGlue, ResetClearsEverything) {
   EXPECT_FALSE(last().key.object.valid);
   EXPECT_EQ(last().key.categories, 0u);
   EXPECT_EQ(stats().unclassified, 1u);
+}
+TEST_F(RenderClassifyGlue, RetainedKeepsMerging) {
+  struct Counts {
+    uint64_t routed = 0;
+    uint64_t mergeBreaks = 0;
+    uint64_t substituted = 0;
+    uint64_t merged = 0;
+    uint64_t commands = 0;
+    uint64_t entries = 0;
+  };
+  const gx::draw_route::Router* router = gx::draw_route::router();
+  ASSERT_NE(router->merge, nullptr);
+  std::vector<uint8_t> fifo(4096, 0);
+  gx::PipelineConfig config{};
+  config.shaderConfig.vtxStride = 12;
+  const gx::ShaderInfo info{};
+  const auto run = [&](bool retainedOn) {
+    retained::testing::reset();
+    retained::set_demand(retained::Demand::Tool, retainedOn);
+    Counts counts;
+    gx::DrawData command{};
+    for (uint32_t frame = 0; frame < 3; ++frame) {
+      detail::begin_hint_frame();
+      retained::latch_gate(Settings{}, test::full_caps());
+      apply_frame_state(detail::FrameState{});
+      main_scene();
+      uint32_t offset = 0;
+      bool mergeable = false;
+      const auto gx_draw = [&](uint32_t vtxCount, bool stateChange) {
+        const uint32_t size = vtxCount * 12;
+        const Decision decision = router->route(
+            router->userData,
+            {.prim = GX_TRIANGLES, .fmt = GX_VTXFMT0, .vtxCount = vtxCount, .vertices = {fifo.data() + offset, size}});
+        ++counts.routed;
+        mergeable = mergeable && !stateChange;
+        if (mergeable && decision.breakMerge) {
+          ++counts.mergeBreaks;
+        }
+        if (mergeable && !decision.breakMerge) {
+          command.vtxCount += vtxCount;
+          command.vertRange.size += size;
+          router->merge(router->userData,
+                        {.vertOffset = offset, .vertSize = size, .command = &command, .config = &config});
+          ++counts.merged;
+        } else {
+          command = {};
+          command.vertRange = {offset, size};
+          command.vtxCount = vtxCount;
+          command.instanceCount = 1;
+          command.immediateData.vtxStart = offset;
+          const bool substituted = router->push(router->userData, command, config, info);
+          counts.substituted += substituted ? 1 : 0;
+          mergeable = !substituted;
+          ++counts.commands;
+        }
+        offset += size;
+      };
+      begin_object(0x10);
+      gx_draw(3, false);
+      gx_draw(3, false);
+      gx_draw(3, true);
+      end_object();
+      begin_object(0x11);
+      gx_draw(4, false);
+      gx_draw(4, false);
+      end_object();
+      gx_draw(3, false);
+      detail::StageData stage{.stage = Stage::OpaqueDone};
+      retained::prepare(stage);
+      retained::seal(stage);
+      counts.entries += stage.retained != nullptr ? stage.retained->entries.size() : 0;
+      seal_frame();
+    }
+    retained::testing::reset();
+    return counts;
+  };
+  for (const int identity : {0, 1}) {
+    testing::set_identity_override(identity);
+    const Counts off = run(false);
+    const Counts on = run(true);
+    EXPECT_EQ(on.routed, off.routed) << identity;
+    EXPECT_EQ(on.mergeBreaks, off.mergeBreaks) << identity;
+    EXPECT_EQ(on.substituted, off.substituted) << identity;
+    EXPECT_EQ(on.merged, off.merged) << identity;
+    EXPECT_EQ(on.commands, off.commands) << identity;
+    EXPECT_EQ(off.entries, 0u);
+    EXPECT_EQ(on.entries, on.routed);
+    EXPECT_EQ(on.merged, identity == 0 ? 12u : 6u);
+    EXPECT_EQ(on.mergeBreaks, identity == 0 ? 0u : 6u);
+  }
 }
 } // namespace
 } // namespace aurora::render::scene

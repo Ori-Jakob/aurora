@@ -1,6 +1,7 @@
 #include "graph.hpp"
 #include "debug/debug.hpp"
 #include "debug/views.hpp"
+#include "scene/identity.hpp"
 
 #include "../webgpu/gpu.hpp"
 
@@ -81,6 +82,7 @@ GraphEnvironment gather_graph_environment() {
   env.profile = webgpu::g_featureProfile;
   env.inspectorOpen = debug::inspector_open();
   env.viewOverride = debug::view_override();
+  env.retained = scene::retained::active();
   return env;
 }
 } // namespace aurora::render::detail

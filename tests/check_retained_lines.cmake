@@ -1,0 +1,27 @@
+# Checks that an aurora_gxreplay retained.json has exactly one line per frame, in order:
+#   cmake -DLINES=<retained.json> -DFRAMES=<count> -P check_retained_lines.cmake
+cmake_minimum_required(VERSION 3.25)
+
+foreach (_var IN ITEMS LINES FRAMES)
+  if (NOT DEFINED ${_var})
+    message(FATAL_ERROR "check_retained_lines: -D${_var}=... is required")
+  endif ()
+endforeach ()
+if (NOT EXISTS "${LINES}")
+  message(FATAL_ERROR "check_retained_lines: ${LINES} does not exist")
+endif ()
+
+file(STRINGS "${LINES}" _lines)
+list(LENGTH _lines _count)
+if (NOT _count EQUAL FRAMES)
+  message(FATAL_ERROR "check_retained_lines: ${LINES} has ${_count} lines, expected ${FRAMES}")
+endif ()
+set(_index 0)
+foreach (_line IN LISTS _lines)
+  string(JSON _frame GET "${_line}" frame)
+  if (NOT _frame EQUAL _index)
+    message(FATAL_ERROR "check_retained_lines: line ${_index} is frame ${_frame}")
+  endif ()
+  math(EXPR _index "${_index} + 1")
+endforeach ()
+message(STATUS "check_retained_lines: ${_count} lines in frame order")

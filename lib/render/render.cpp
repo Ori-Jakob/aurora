@@ -29,6 +29,7 @@
 #include "post/taa.hpp"
 #include "post/temporal_resolve.hpp"
 #include "post/upscale/upscale.hpp"
+#include "scene/identity.hpp"
 #include "scene/motion.hpp"
 #include "systems/dispatch.hpp"
 #include "systems/systems.hpp"
@@ -309,6 +310,14 @@ DrawRouteCounters draw_route_counters() noexcept {
       .mergeBreaks = stats.mergeBreaks,
       .substituted = stats.substituted,
   };
+}
+
+RetainedStats retained_stats() noexcept {
+#if AURORA_ENABLE_RENDER
+  return scene::retained::stats();
+#else
+  return {};
+#endif
 }
 
 #if AURORA_ENABLE_RENDER

@@ -46,10 +46,12 @@ struct Options {
   bool classifyJson = false;
   bool classifyObjects = false;
   bool classifyDraws = false;
+  bool retainedJson = false;
 
   // A view also writes classify.json, so its counters explain what the view coloured
   [[nodiscard]] bool writes_classify_json() const noexcept { return classifyJson || debugView != 0; }
   [[nodiscard]] bool classifies() const noexcept { return writes_classify_json() || classifyDraws; }
+  [[nodiscard]] bool seals() const noexcept { return classifies() || retainedJson; }
 };
 
 std::optional<AuroraBackend> parse_backend(std::string_view name) noexcept;

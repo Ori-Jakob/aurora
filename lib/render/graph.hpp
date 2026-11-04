@@ -200,6 +200,7 @@ struct GraphEnvironment {
   bool inspectorOpen = false;
   // Kept here so picking a view in the inspector recompiles the graph the way a settings change does
   uint16_t viewOverride = 0;
+  bool retained = false;
   bool operator==(const GraphEnvironment&) const = default;
 };
 

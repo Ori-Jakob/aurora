@@ -77,6 +77,14 @@ struct CpuFrameZones {
   uint64_t textureBinds = 0;
   uint64_t indexBinds = 0;
   double encodeMs = 0.0;
+  double retainedMs = 0.0;
+  uint64_t retainedCalls = 0;
+  uint64_t routed = 0;
+  uint64_t suppressed = 0;
+  uint64_t mergeBreaks = 0;
+  uint64_t substituted = 0;
+  uint64_t deferred = 0;
+  uint64_t merged = 0;
 };
 
 struct ResidentRun {
@@ -100,6 +108,35 @@ struct ReportContext {
   bool deterministic = true;
 };
 
+struct RetainedFrame {
+  uint32_t frame = 0;
+  bool active = false;
+  uint64_t sceneFrame = 0;
+  uint32_t epoch = 0;
+  uint32_t entries = 0;
+  uint32_t captureOnly = 0;
+  uint32_t transient = 0;
+  uint32_t late = 0;
+  uint32_t instances = 0;
+  uint32_t statics = 0;
+  uint32_t created = 0;
+  uint32_t rekeyed = 0;
+  uint32_t newSubId = 0;
+  uint32_t newOccurrence = 0;
+  uint32_t relatched = 0;
+  uint32_t staticRestream = 0;
+  uint32_t signatureMisses = 0;
+  uint32_t reorigins = 0;
+  uint32_t overflow = 0;
+  uint32_t droppedEntries = 0;
+  uint32_t undeliveredStatics = 0;
+  uint32_t lostCaptures = 0;
+  uint32_t resyncs = 0;
+  uint32_t eventsPending = 0;
+};
+
+inline constexpr uint32_t RetainedGateFirstFrame = 30;
+
 struct ClassifyFrame {
   uint32_t frame = 0;
   render::scene::FrameReport report;
@@ -112,6 +149,8 @@ std::string format_classify_json(const ReportContext& context, std::string_view 
                                  std::span<const ClassifyFrame> frames, bool objects);
 std::string format_classify_draw_line(uint32_t frame, const render::scene::ClassifiedDraw& draw);
 std::string format_classify_summary(std::span<const ClassifyFrame> frames, uint64_t malformedHints);
+std::string format_retained_line(const RetainedFrame& frame);
+std::string format_retained_summary(std::span<const RetainedFrame> frames);
 std::string format_timing_json(std::span<const FrameTiming> timings);
 std::string format_gpu_timing_json(bool supported, std::span<const GpuFrameTiming> timings);
 std::string format_cpu_zones_json(bool drawZones, std::span<const CpuFrameZones> frames);

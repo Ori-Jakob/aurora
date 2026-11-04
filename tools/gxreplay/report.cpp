@@ -284,11 +284,11 @@ std::string format_classify_draw_line(uint32_t frame, const scene::ClassifiedDra
       "{{\"frame\": {}, \"index\": {}, \"kind\": \"{}\", \"role\": \"{}\", \"check\": \"{}\", "
       "\"window\": \"{}\", \"object\": {}, \"subId\": {}, \"generation\": {}, \"categories\": {}, "
       "\"flags\": {}, \"material\": {}, \"tevPolicy\": {}, \"scope\": {}, \"vertices\": {}, "
-      "\"indexed\": {}, \"suppressed\": {}}}\n",
+      "\"indexed\": {}, \"suppressed\": {}, \"ordinal\": {}}}\n",
       frame, cls.index, scene::kind_name(cls.kind), scene::role_name(key.role), scene::check_name(cls.check),
       scene::window_name(key.window), key.object.valid ? object_id(key.object.id) : std::string{"null"},
       key.object.subId, key.object.generation, key.categories, key.flags, key.materialClass, key.tevPolicy, key.scope,
-      draw.vertices, draw.indexed, cls.suppressed);
+      draw.vertices, draw.indexed, cls.suppressed, cls.ordinal);
 }
 
 std::string format_classify_summary(std::span<const ClassifyFrame> frames, uint64_t malformedHints) {
@@ -313,6 +313,69 @@ std::string format_classify_summary(std::span<const ClassifyFrame> frames, uint6
       "aurora_gxreplay: classification: frames {}, draws {}, main {}, sky {}, sky misses {}, "
       "suppressed {}, hint errors {}, malformed hints {}, view substituted {}\n",
       frames.size(), draws, main, sky, skyMisses, suppressed, hintErrors, malformedHints, substituted);
+}
+
+std::string format_retained_line(const RetainedFrame& frame) {
+  return fmt::format(
+      "{{\"frame\": {}, \"active\": {}, \"sceneFrame\": {}, \"epoch\": {}, \"entries\": {}, \"captureOnly\": {}, "
+      "\"transient\": {}, \"late\": {}, \"instances\": {}, \"statics\": {}, \"created\": {}, \"rekeyed\": {}, "
+      "\"newSubId\": {}, \"newOccurrence\": {}, \"relatched\": {}, \"staticRestream\": {}, \"signatureMisses\": {}, "
+      "\"reorigins\": {}, \"overflow\": {}, \"droppedEntries\": {}, \"undeliveredStatics\": {}, "
+      "\"lostCaptures\": {}, \"resyncs\": {}, \"eventsPending\": {}}}\n",
+      frame.frame, frame.active, frame.sceneFrame, frame.epoch, frame.entries, frame.captureOnly, frame.transient,
+      frame.late, frame.instances, frame.statics, frame.created, frame.rekeyed, frame.newSubId, frame.newOccurrence,
+      frame.relatched, frame.staticRestream, frame.signatureMisses, frame.reorigins, frame.overflow,
+      frame.droppedEntries, frame.undeliveredStatics, frame.lostCaptures, frame.resyncs, frame.eventsPending);
+}
+
+std::string format_retained_summary(std::span<const RetainedFrame> frames) {
+  uint64_t entries = 0;
+  uint64_t transient = 0;
+  uint64_t captureOnly = 0;
+  uint32_t peakLive = 0;
+  uint64_t gateFrames = 0;
+  uint64_t rekeyed = 0;
+  uint64_t relatched = 0;
+  uint64_t staticRestream = 0;
+  uint64_t signatureMisses = 0;
+  uint64_t newSubId = 0;
+  uint64_t newOccurrence = 0;
+  uint64_t reorigins = 0;
+  uint64_t overflow = 0;
+  uint64_t droppedEntries = 0;
+  uint64_t lostCaptures = 0;
+  uint64_t resyncs = 0;
+  for (const RetainedFrame& frame : frames) {
+    entries += frame.entries;
+    transient += frame.transient;
+    captureOnly += frame.captureOnly;
+    peakLive = std::max(peakLive, frame.instances);
+    if (frame.frame < RetainedGateFirstFrame) {
+      continue;
+    }
+    ++gateFrames;
+    rekeyed += frame.rekeyed;
+    relatched += frame.relatched;
+    staticRestream += frame.staticRestream;
+    signatureMisses += frame.signatureMisses;
+    newSubId += frame.newSubId;
+    newOccurrence += frame.newOccurrence;
+    reorigins += frame.reorigins;
+    overflow += frame.overflow;
+    droppedEntries += frame.droppedEntries;
+    lostCaptures += frame.lostCaptures;
+    resyncs += frame.resyncs;
+  }
+  const double transientShare = entries != 0 ? static_cast<double>(transient) / static_cast<double>(entries) : 0.0;
+  return fmt::format(
+      "aurora_gxreplay: retained: frames {}, entries {}, captureOnly {}, transient {}, transientShare {:.4f}, "
+      "peakLive {}, undeliveredStatics {}; gate over {} frames from {}: rekeyed {}, relatched {}, staticRestream {}, "
+      "signatureMisses {}; newSubId {}, newOccurrence {}, reorigins {}, overflow {}, droppedEntries {}, "
+      "lostCaptures {}, resyncs {}\n",
+      frames.size(), entries, captureOnly, transient, transientShare, peakLive,
+      frames.empty() ? 0u : frames.back().undeliveredStatics, gateFrames, RetainedGateFirstFrame, rekeyed, relatched,
+      staticRestream, signatureMisses, newSubId, newOccurrence, reorigins, overflow, droppedEntries, lostCaptures,
+      resyncs);
 }
 
 std::string format_timing_json(std::span<const FrameTiming> timings) {
@@ -455,7 +518,12 @@ std::string cpu_zone_row(const CpuFrameZones& frame) {
   for (size_t i = 0; i < counts.size(); ++i) {
     out += fmt::format(", \"{}\": {}", CpuZoneCountNames[i], counts[i]);
   }
-  return out + fmt::format(", \"encodeMs\": {:.3f}}}", frame.encodeMs);
+  out += fmt::format(", \"encodeMs\": {:.3f}, \"retainedMs\": {:.3f}, \"retainedCalls\": {}", frame.encodeMs,
+                     frame.retainedMs, frame.retainedCalls);
+  return out + fmt::format(
+                   ", \"routed\": {}, \"suppressed\": {}, \"mergeBreaks\": {}, \"substituted\": {}, "
+                   "\"deferred\": {}, \"merged\": {}}}",
+                   frame.routed, frame.suppressed, frame.mergeBreaks, frame.substituted, frame.deferred, frame.merged);
 }
 
 std::string warm_cpu_zones(bool drawZones, std::span<const CpuFrameZones> frames, const std::vector<uint32_t>& runs) {
@@ -481,6 +549,7 @@ std::string warm_cpu_zones(bool drawZones, std::span<const CpuFrameZones> frames
   std::array<double, CpuZoneMsNames.size()> msSums{};
   std::array<double, CpuZoneCountNames.size()> countSums{};
   double encodeMsSum = 0.0;
+  double retainedMsSum = 0.0;
   double ratioSum = 0.0;
   double ratioMax = 0.0;
   size_t ratioRows = 0;
@@ -496,6 +565,7 @@ std::string warm_cpu_zones(bool drawZones, std::span<const CpuFrameZones> frames
       countSums[i] += static_cast<double>(counts[i]);
     }
     encodeMsSum += frame->encodeMs;
+    retainedMsSum += frame->retainedMs;
     if (frame->uniqueArrayBytes != 0) {
       const double ratio = (static_cast<double>(frame->storageBytes) - static_cast<double>(frame->fogLutBytes)) /
                            static_cast<double>(frame->uniqueArrayBytes);
@@ -534,6 +604,7 @@ std::string warm_cpu_zones(bool drawZones, std::span<const CpuFrameZones> frames
   out += fmt::format("    \"meanEncodeMs\": {:.3f},\n", encodeMsSum / count);
   out += fmt::format("    \"sectionMeanMs\": {},\n", sections);
   out += fmt::format("    \"storageRatio\": {},\n", storageRatio);
+  out += fmt::format("    \"nestedMeanMs\": {{\"retained\": {:.3f}}},\n", retainedMsSum / count);
   out += fmt::format("    \"means\": {}\n", means);
   out += "  }";
   return out;

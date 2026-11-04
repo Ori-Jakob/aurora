@@ -180,13 +180,18 @@ bool apply_classify_draws(Options& options, std::string_view) {
   return true;
 }
 
+bool apply_retained_json(Options& options, std::string_view) {
+  options.retainedJson = true;
+  return true;
+}
+
 struct Flag {
   std::string_view name;
   bool takesValue;
   bool (*apply)(Options& options, std::string_view value);
 };
 
-constexpr std::array<Flag, 27> Flags{{
+constexpr std::array<Flag, 28> Flags{{
     {"--out", true, apply_out},
     {"--backend", true, apply_backend},
     {"--profile", true, apply_profile},
@@ -210,6 +215,7 @@ constexpr std::array<Flag, 27> Flags{{
     {"--classify-json", false, apply_classify_json},
     {"--classify-objects", false, apply_classify_objects},
     {"--classify-draws", false, apply_classify_draws},
+    {"--retained-json", false, apply_retained_json},
     {"-v", false, apply_verbose},
     {"--verbose", false, apply_verbose},
     {"-h", false, apply_help},
@@ -368,6 +374,7 @@ std::string_view usage() noexcept {
          "  --classify-json           write classify.json with per-frame classification counters\n"
          "  --classify-objects        also list each frame's objects in classify.json\n"
          "  --classify-draws          write classify_draws.jsonl with one line per routed draw\n"
+         "  --retained-json           write retained.json with one line per frame of retained instances\n"
          "  -v, --verbose             debug logging\n"
          "  -h, --help                show this message\n";
 }

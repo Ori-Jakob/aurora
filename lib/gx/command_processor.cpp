@@ -1223,7 +1223,8 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
       return;
     }
 
-  const RouteAction action = route_draw({.prim = prim, .fmt = fmt, .vtxCount = vtxCount});
+  const RouteAction action = route_draw(
+      {.prim = prim, .fmt = fmt, .vtxCount = vtxCount, .vertices = {reader.data() + reader.offset(), totalVtxBytes}});
   if (action == RouteAction::Skip) {
     reader.skip(totalVtxBytes);
     return;
@@ -1269,6 +1270,12 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
     lastDraw->vtxCount += vtxCount;
     lastDraw->indexCount += numIndices;
     gfx::detail::increment_merged_draw_count();
+    if (const auto* router = draw_route::router(); router != nullptr && router->merge != nullptr) {
+      router->merge(router->userData, {.vertOffset = vertRange.offset,
+                                       .vertSize = vertRange.size,
+                                       .command = lastDraw,
+                                       .config = &sDrawCache.config});
+    }
     return;
   }
 
@@ -1305,9 +1312,14 @@ static void handle_draw_indexed(ByteReader& reader) noexcept {
       gpu_channel::note_suppressed_draw();
       return;
     }
-  const RouteAction action = indexCount != 0
-                                 ? route_draw({.prim = prim, .fmt = fmt, .vtxCount = vtxCount, .indexed = true})
-                                 : RouteAction::Push;
+  const u8* fifoBytes = reader.data() + reader.offset();
+  const RouteAction action = indexCount != 0 ? route_draw({.prim = prim,
+                                                           .fmt = fmt,
+                                                           .vtxCount = vtxCount,
+                                                           .indexed = true,
+                                                           .vertices = {fifoBytes + idxBytes, totalVtxBytes},
+                                                           .indices = {fifoBytes, idxBytes}})
+                                             : RouteAction::Push;
   if (action == RouteAction::Skip) {
     reader.skip(idxBytes + totalVtxBytes);
     return;
@@ -1576,6 +1588,17 @@ void set_cpu_zone_timing(uint32_t timing) noexcept {
                        std::memory_order_relaxed);
 }
 
+bool cpu_zone_timed(CpuZone zone) noexcept {
+  return ((g_cpuZoneTimed.load(std::memory_order_relaxed) >> zone) & 1u) != 0;
+}
+
+void cpu_zone_record(CpuZone zone, uint64_t ns) noexcept {
+  bump(g_cpuZoneCalls[zone]);
+  if (ns != 0) {
+    bump(g_cpuZoneNs[zone], ns);
+  }
+}
+
 void set_array_immutable(uint64_t address, uint32_t size, bool le, uint32_t generation) noexcept {
   // Off is the W1 baseline, so a declaration must not erase W1's uploads or fill the table
   if (g_immutableMode == ImmutableArrayMode::Off) {
@@ -1678,6 +1701,29 @@ void end_gpu_frame() noexcept {
     g_gxState.dirty |= DirtyImmediates;
   }
   gpu_channel::end_frame();
+}
+
+uint32_t immutable_generation(const void* data, uint32_t size) noexcept {
+  if (g_immutableMode == ImmutableArrayMode::Off || g_immutableArrays.empty()) {
+    return 0;
+  }
+  const u64 frameId = gfx::resident_storage().frameId;
+  const auto it = g_immutableArrays.find(reinterpret_cast<uintptr_t>(data));
+  if (frameId == 0 || it == g_immutableArrays.end() || it->second.setFrame != frameId || it->second.size != size) {
+    return 0;
+  }
+  return it->second.generation;
+}
+
+std::span<const u8> array_bytes(const AttrArray& array, uint32_t offset, uint32_t size) noexcept {
+  if (array.gpu || array.data == nullptr || offset > array.size || size > array.size - offset) {
+    return {};
+  }
+  if (const auto it = sArrayUploads.find(std::pair<const void*, u32>{array.data, array.size});
+      it != sArrayUploads.end()) {
+    return {sArrayShadow.data() + it->second.shadowOffset + offset, size};
+  }
+  return guest_memory::read(guest_memory::Kind::VertexArray, static_cast<const u8*>(array.data) + offset, size);
 }
 
 ImmutableArrayStats immutable_array_stats() noexcept {

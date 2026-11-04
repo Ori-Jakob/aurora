@@ -17,6 +17,7 @@
 #include "shaders.hpp"
 #include "post/upscale/compose.hpp"
 #include "post/upscale/upscale.hpp"
+#include "scene/identity.hpp"
 #include "../webgpu/gpu_prof.hpp"
 #endif
 
@@ -81,10 +82,12 @@ bool build_stage_data(StageData& stage) {
       invalidate_histories(g_frameCull);
     }
   }
+  scene::retained::prepare(stage);
 #endif
   const StageProgram& program = graph->stages[static_cast<size_t>(stage.stage)];
   if (program.passes.empty()) {
 #if AURORA_ENABLE_RENDER
+    scene::retained::skip(stage);
     // FrameEnd publishes even without passes, so a frame whose passes all sit in other stages still pairs
     if (stage.stage == Stage::FrameEnd && stage.frame->inspectorOpen) {
       debug::record_stage_cull(*graph, stage.stage, stage.frameId, {});
@@ -140,9 +143,11 @@ bool build_stage_data(StageData& stage) {
   stage.dummies = std::move(mask.dummies);
   stage.prevValid = std::move(mask.prevValid);
   if (!stage.any_enabled()) {
+    scene::retained::skip(stage);
     return false;
   }
   build_stage_bindings(stage);
+  scene::retained::seal(stage);
   return true;
 #else
   return stage.any_enabled();

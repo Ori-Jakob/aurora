@@ -27,6 +27,7 @@
 #include "post/taa.hpp"
 #include "post/upscale/upscale.hpp"
 #include "scene/classify.hpp"
+#include "scene/identity.hpp"
 #include "scene/motion.hpp"
 #endif
 
@@ -1277,6 +1278,7 @@ std::shared_ptr<const FrameState> latch_frame() {
   begin_hint_frame();
   latch_external_passes();
   debug::on_latch();
+  scene::retained::latch_gate(latched_settings(), caps());
   const bool passesChanged = consume_graph_dirty();
   // The hash ignores ids and callbacks, so a re-registered external pass is only noticed by the epoch
   const bool externalsChanged = external_pass_epoch() != g_externalEpoch;

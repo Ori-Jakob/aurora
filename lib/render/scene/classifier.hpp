@@ -1,5 +1,6 @@
 #pragma once
 
+#include <aurora/math.hpp>
 #include <aurora/render.hpp>
 #include <dolphin/gx/GXAurora.h>
 
@@ -74,6 +75,8 @@ struct ObjectHint {
   uint32_t generation = 0;
   uint32_t categories = 0;
   uint32_t flags = 0;
+  bool hasWorld = false;
+  Mat3x4<float> world{};
 };
 
 struct ScopeHint {
@@ -272,6 +275,9 @@ public:
   void count_merge_break() noexcept { ++m_stats.mergeBreaks; }
 
   [[nodiscard]] const DrawClass& last() const noexcept { return m_last; }
+  [[nodiscard]] const Mat3x4<float>* object_world() const noexcept {
+    return m_objectOpen && m_objectHasWorld ? &m_objectWorld : nullptr;
+  }
   [[nodiscard]] const FrameStats& stats() const noexcept { return m_stats; }
   [[nodiscard]] FrameStats& stats() noexcept { return m_stats; }
   [[nodiscard]] std::span<const ClassifiedDraw> draws() const noexcept { return m_records; }
@@ -305,6 +311,8 @@ private:
   std::array<Entry, MaxScopeDepth> m_scopes{};
   Entry m_object;
   bool m_objectOpen = false;
+  bool m_objectHasWorld = false;
+  Mat3x4<float> m_objectWorld{};
   uint32_t m_objectDraws = 0;
   uint32_t m_scopeDepth = 0;
   uint32_t m_scopeSwallow = 0;

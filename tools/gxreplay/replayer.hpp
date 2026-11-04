@@ -45,6 +45,7 @@ struct ReplayResult {
   uint64_t misses = 0;
   std::vector<std::vector<uint8_t>> images;
   std::vector<ClassifyFrame> classify;
+  std::vector<RetainedFrame> retained;
   uint64_t malformedHints = 0;
 };
 

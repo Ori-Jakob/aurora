@@ -359,7 +359,7 @@ protected:
   }
 
   void install_router(bool withPush = false) {
-    router = {.route = &on_route, .push = withPush ? &on_push : nullptr, .userData = this};
+    router = {.route = &on_route, .push = withPush ? &on_push : nullptr, .userData = this, .merge = &on_merge};
     route::set_router(&router);
   }
 
@@ -463,9 +463,23 @@ protected:
     return test.pushes == test.substituteAt || test.pushes == test.emptyAt;
   }
 
+  static void on_merge(void* userData, const route::MergedDraw& draw) noexcept {
+    auto& test = *static_cast<GXDrawRouteTest*>(userData);
+    test.merges.push_back({draw.vertOffset, draw.vertSize, draw.command != nullptr ? draw.command->vtxCount : 0u,
+                           draw.config != nullptr});
+  }
+
+  struct MergeCall {
+    uint32_t vertOffset;
+    uint32_t vertSize;
+    uint32_t commandVtxCount;
+    bool hasConfig;
+  };
+
   HintRecorder recorder;
   hints::Sink sink;
   route::Router router;
+  std::vector<MergeCall> merges;
   std::vector<route::Query> queries;
   // 1-based query and push numbers; 0 never matches
   size_t breakAt = 0;
@@ -499,6 +513,35 @@ TEST_F(GXDrawRouteTest, PushOnlyRouterMergesLikeNoRouter) {
   EXPECT_EQ(stats.routed, 5u);
   EXPECT_EQ(stats.suppressed, 0u);
   EXPECT_EQ(stats.mergeBreaks, 0u);
+}
+
+TEST_F(GXDrawRouteTest, MergedFollowerReachesMergeHook) {
+  install_router();
+  triangle();
+  triangle();
+  decode();
+  EXPECT_EQ(gfx::g_testDrawCount, 1u);
+  EXPECT_EQ(gfx::g_testMergedDrawCount, 1u);
+  ASSERT_EQ(merges.size(), 1u);
+  EXPECT_EQ(merges[0].vertOffset, 3 * kVtxSize);
+  EXPECT_EQ(merges[0].vertSize, 3 * kVtxSize);
+  EXPECT_EQ(merges[0].commandVtxCount, 6u);
+  EXPECT_TRUE(merges[0].hasConfig);
+  ASSERT_EQ(queries.size(), 2u);
+  EXPECT_EQ(queries[1].vertices.size(), 3 * kVtxSize);
+}
+
+TEST_F(GXDrawRouteTest, IndexedQueryCarriesItsBytes) {
+  install_router();
+  indexed_triangle();
+  const auto bytes = capture_fifo();
+  decode_fifo(bytes);
+  ASSERT_EQ(queries.size(), 1u);
+  ASSERT_EQ(queries[0].indices.size(), 3 * sizeof(uint16_t));
+  ASSERT_EQ(queries[0].vertices.size(), 3 * kVtxSize);
+  EXPECT_EQ(queries[0].vertices.data(), queries[0].indices.data() + queries[0].indices.size());
+  EXPECT_GE(queries[0].indices.data(), bytes.data());
+  EXPECT_LE(queries[0].vertices.data() + queries[0].vertices.size(), bytes.data() + bytes.size());
 }
 
 TEST_F(GXDrawRouteTest, CaptureOnlyScopeResetsMerge) {

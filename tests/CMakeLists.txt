@@ -312,6 +312,7 @@ if (AURORA_ENABLE_GX)
     target_sources(render_tests PRIVATE render_gx_ext_test.cpp)
     target_sources(render_tests PRIVATE render_history_reset_test.cpp)
     target_sources(render_tests PRIVATE render_motion_test.cpp)
+    target_sources(render_tests PRIVATE render_retained_test.cpp)
     target_sources(render_tests PRIVATE render_texture_inspector_test.cpp)
     target_sources(render_tests PRIVATE render_fake_shadow_test.cpp)
     target_sources(render_tests PRIVATE render_fake_shadows_tab_test.cpp)
@@ -801,6 +802,17 @@ if (TARGET aurora_gxreplay)
       FIXTURES_REQUIRED gxreplay_classify
       PASS_REGULAR_EXPRESSION "frames 3, draws 9, main 0, sky 0, sky misses 0, suppressed 0, hint errors 0"
       FAIL_REGULAR_EXPRESSION "\\[(ERROR|FATAL): ")
+    add_test(NAME gxreplay_retained_json
+      COMMAND $<TARGET_FILE:aurora_gxreplay> ${_classify_trace} --backend null --no-png --retained-json
+              --out ${_gxreplay_dir}/classify/retained)
+    set_tests_properties(gxreplay_retained_json PROPERTIES LABELS smoke TIMEOUT 180
+      FIXTURES_REQUIRED gxreplay_classify FIXTURES_SETUP gxreplay_retained
+      PASS_REGULAR_EXPRESSION "retained: frames 3, " FAIL_REGULAR_EXPRESSION "\\[(ERROR|FATAL): ")
+    add_test(NAME gxreplay_retained_json_lines
+      COMMAND ${CMAKE_COMMAND} -DLINES=${_gxreplay_dir}/classify/retained/retained.json -DFRAMES=3
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/check_retained_lines.cmake)
+    set_tests_properties(gxreplay_retained_json_lines PROPERTIES LABELS smoke TIMEOUT 60
+      FIXTURES_REQUIRED gxreplay_retained)
     foreach (_view IN ITEMS role kind main window category object scope bit)
       add_test(NAME gxreplay_debug_view_${_view}
         COMMAND $<TARGET_FILE:aurora_gxreplay> ${_classify_trace} --backend null --no-png --debug-view ${_view}

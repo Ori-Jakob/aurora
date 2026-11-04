@@ -61,6 +61,7 @@ void set_identity_demand(bool demand) noexcept;
 // FIFO thread
 [[nodiscard]] bool identity_collecting() noexcept;
 [[nodiscard]] ViewCounts& view_counts() noexcept;
+[[nodiscard]] const Mat3x4<float>* object_world() noexcept;
 [[nodiscard]] uint32_t sky_draws() noexcept;
 void on_camera(const gx::hints::Camera& camera) noexcept;
 void on_object_begin(const gx::hints::ObjectBegin& object) noexcept;

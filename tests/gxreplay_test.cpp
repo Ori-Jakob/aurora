@@ -354,6 +354,14 @@ std::vector<CpuFrameZones> zone_rows() {
       .textureBinds = 150,
       .indexBinds = 6,
       .encodeMs = 0.75,
+      .retainedMs = 0.25,
+      .retainedCalls = 40,
+      .routed = 380,
+      .suppressed = 2,
+      .mergeBreaks = 1,
+      .substituted = 3,
+      .deferred = 4,
+      .merged = 14,
   };
   CpuFrameZones warmA = zone_row(1, 1, 1.0);
   warmA.arraysMs = 0.5;
@@ -373,6 +381,7 @@ std::vector<CpuFrameZones> zone_rows() {
   warmB.residentHits = 5;
   warmB.indexBinds = 6;
   warmB.encodeMs = 1.0;
+  warmB.retainedMs = 0.5;
   return {first, zone_row(0, 1, 9.0), zone_row(1, 0, 50.0), warmA, warmB};
 }
 } // namespace
@@ -389,7 +398,9 @@ TEST(GxReplayReport, CpuZonesJsonFormat) {
                 "\"fogLutPushes\": 1, \"fogLutBytes\": 17204, \"resolves\": 130, \"uniqueArrayBytes\": 455404, "
                 "\"vertBytes\": 1000, \"indexBytes\": 2000, \"uniformBytes\": 3000, \"storageBytes\": 900000, "
                 "\"residentHits\": 7, \"residentStages\": 3, \"encodedDraws\": 365, \"texturedDraws\": 300, "
-                "\"uniformBinds\": 330, \"textureBinds\": 150, \"indexBinds\": 6, \"encodeMs\": 0.750},\n"),
+                "\"uniformBinds\": 330, \"textureBinds\": 150, \"indexBinds\": 6, \"encodeMs\": 0.750, "
+                "\"retainedMs\": 0.250, \"retainedCalls\": 40, \"routed\": 380, \"suppressed\": 2, "
+                "\"mergeBreaks\": 1, \"substituted\": 3, \"deferred\": 4, \"merged\": 14},\n"),
       std::string::npos)
       << json;
   EXPECT_NE(json.find("      \"meanFifoMs\": 18.000,\n      \"p95FifoMs\": 50.000,\n"), std::string::npos) << json;
@@ -402,7 +413,8 @@ TEST(GxReplayReport, CpuZonesJsonFormat) {
       << json;
   EXPECT_NE(json.find("\"pushDraws\": 15.5"), std::string::npos) << json;
   EXPECT_NE(json.find("\"sectionMeanMs\": {\"arrays\": 1.000, "), std::string::npos) << json;
-  EXPECT_NE(json.find("\"storageRatio\": null,"), std::string::npos) << json;
+  EXPECT_NE(json.find("\"storageRatio\": null,\n    \"nestedMeanMs\": {\"retained\": 0.250},\n"), std::string::npos)
+      << json;
   EXPECT_TRUE(
       json.ends_with("\"storageBytes\": 800.0, \"residentHits\": 4.0, \"residentStages\": 0.0, "
                      "\"encodedDraws\": 0.0, \"texturedDraws\": 0.0, \"uniformBinds\": 0.0, "
@@ -564,6 +576,68 @@ TEST(GxReplayOptions, ParsesClassifyFlags) {
   EXPECT_TRUE(draws->classifyDraws);
   EXPECT_FALSE(draws->writes_classify_json());
   EXPECT_TRUE(draws->classifies());
+  EXPECT_TRUE(draws->seals());
+  EXPECT_FALSE(defaults.seals());
+
+  const auto retained = parse({"demo.gxtrace", "--out", "o", "--retained-json"});
+  ASSERT_TRUE(retained);
+  EXPECT_TRUE(retained->retainedJson);
+  EXPECT_FALSE(retained->classifies());
+  EXPECT_TRUE(retained->seals());
+  EXPECT_NE(usage().find("--retained-json "), std::string_view::npos);
+}
+
+TEST(GxReplayReport, FormatsRetainedLine) {
+  const RetainedFrame frame{
+      .frame = 4,
+      .active = true,
+      .sceneFrame = 3,
+      .epoch = 2,
+      .entries = 10,
+      .captureOnly = 1,
+      .transient = 2,
+      .late = 3,
+      .instances = 7,
+      .statics = 5,
+      .created = 6,
+      .rekeyed = 1,
+      .newSubId = 2,
+      .newOccurrence = 3,
+      .relatched = 4,
+      .staticRestream = 5,
+      .signatureMisses = 6,
+      .reorigins = 7,
+      .overflow = 8,
+      .droppedEntries = 9,
+      .undeliveredStatics = 10,
+      .lostCaptures = 11,
+      .resyncs = 12,
+      .eventsPending = 13,
+  };
+  EXPECT_EQ(format_retained_line(frame),
+            "{\"frame\": 4, \"active\": true, \"sceneFrame\": 3, \"epoch\": 2, \"entries\": 10, \"captureOnly\": 1, "
+            "\"transient\": 2, \"late\": 3, \"instances\": 7, \"statics\": 5, \"created\": 6, \"rekeyed\": 1, "
+            "\"newSubId\": 2, \"newOccurrence\": 3, \"relatched\": 4, \"staticRestream\": 5, \"signatureMisses\": 6, "
+            "\"reorigins\": 7, \"overflow\": 8, \"droppedEntries\": 9, \"undeliveredStatics\": 10, "
+            "\"lostCaptures\": 11, \"resyncs\": 12, \"eventsPending\": 13}\n");
+}
+
+TEST(GxReplayReport, RetainedSummaryGatesFromFrame30) {
+  std::vector<RetainedFrame> frames;
+  for (uint32_t i = 0; i < 32; ++i) {
+    frames.push_back({.frame = i, .entries = 4, .transient = 1, .instances = i, .rekeyed = 1, .relatched = 2});
+  }
+  frames.back().undeliveredStatics = 3;
+  EXPECT_EQ(format_retained_summary(frames),
+            "aurora_gxreplay: retained: frames 32, entries 128, captureOnly 0, transient 32, transientShare 0.2500, "
+            "peakLive 31, undeliveredStatics 3; gate over 2 frames from 30: rekeyed 2, relatched 4, staticRestream 0, "
+            "signatureMisses 0; newSubId 0, newOccurrence 0, reorigins 0, overflow 0, droppedEntries 0, "
+            "lostCaptures 0, resyncs 0\n");
+  EXPECT_EQ(format_retained_summary({}),
+            "aurora_gxreplay: retained: frames 0, entries 0, captureOnly 0, transient 0, transientShare 0.0000, "
+            "peakLive 0, undeliveredStatics 0; gate over 0 frames from 30: rekeyed 0, relatched 0, staticRestream 0, "
+            "signatureMisses 0; newSubId 0, newOccurrence 0, reorigins 0, overflow 0, droppedEntries 0, "
+            "lostCaptures 0, resyncs 0\n");
 }
 
 namespace {
@@ -711,11 +785,12 @@ TEST(GxReplayReport, FormatsClassifyDrawLine) {
   draw.cls.key.scope = 0xDEADBEEF;
   draw.vertices = 36;
   draw.indexed = true;
+  draw.cls.ordinal = 2;
   EXPECT_EQ(format_classify_draw_line(5, draw),
             "{\"frame\": 5, \"index\": 4, \"kind\": \"mainOpaque\", \"role\": \"main\", \"check\": \"passed\", "
             "\"window\": \"translucent\", \"object\": \"0x0000000000000012\", \"subId\": 3, \"generation\": 2, "
             "\"categories\": 9, \"flags\": 2, \"material\": 1, \"tevPolicy\": 16, \"scope\": 3735928559, "
-            "\"vertices\": 36, \"indexed\": true, \"suppressed\": false}\n");
+            "\"vertices\": 36, \"indexed\": true, \"suppressed\": false, \"ordinal\": 2}\n");
 
   scene::ClassifiedDraw loose;
   loose.cls.suppressed = true;
@@ -723,7 +798,7 @@ TEST(GxReplayReport, FormatsClassifyDrawLine) {
             "{\"frame\": 0, \"index\": 0, \"kind\": \"foreign\", \"role\": \"none\", \"check\": \"role\", "
             "\"window\": \"preScene\", \"object\": null, \"subId\": 0, \"generation\": 0, \"categories\": 0, "
             "\"flags\": 0, \"material\": 0, \"tevPolicy\": 0, \"scope\": 0, \"vertices\": 0, \"indexed\": false, "
-            "\"suppressed\": true}\n");
+            "\"suppressed\": true, \"ordinal\": 0}\n");
 }
 
 TEST(GxReplayReport, FormatsClassifySummary) {

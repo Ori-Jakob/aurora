@@ -18,6 +18,7 @@
 #include "render/debug/views.hpp"
 #include "render/jobs.hpp"
 #include "render/scene/classify.hpp"
+#include "render/scene/identity.hpp"
 #endif
 #include "webgpu/gpu.hpp"
 #include "webgpu/gpu_prof.hpp"
@@ -48,7 +49,8 @@ double elapsed_ms(Clock::time_point start, Clock::time_point end) {
 CpuFrameZones frame_zones(uint32_t run, uint32_t frame, const gx::fifo::CpuZoneStats& before,
                           const gx::fifo::CpuZoneStats& after, const gx::fifo::ImmutableArrayStats& residentBefore,
                           const gx::fifo::ImmutableArrayStats& residentAfter, const gx::BindCounts& bindsBefore,
-                          const gx::BindCounts& bindsAfter, uint64_t resolves, uint64_t uniqueArrayBytes,
+                          const gx::BindCounts& bindsAfter, const gx::fifo::DrawRouteStats& routeBefore,
+                          const gx::fifo::DrawRouteStats& routeAfter, uint64_t resolves, uint64_t uniqueArrayBytes,
                           const AuroraStats& stats) {
   const auto ms = [&](gx::fifo::CpuZone zone) { return static_cast<double>(after.ns[zone] - before.ns[zone]) / 1e6; };
   const auto calls = [&](gx::fifo::CpuZone zone) { return after.calls[zone] - before.calls[zone]; };
@@ -85,6 +87,14 @@ CpuFrameZones frame_zones(uint32_t run, uint32_t frame, const gx::fifo::CpuZoneS
       .textureBinds = bindsAfter.textureBinds - bindsBefore.textureBinds,
       .indexBinds = bindsAfter.indexBinds - bindsBefore.indexBinds,
       .encodeMs = static_cast<double>(bindsAfter.encodeNs - bindsBefore.encodeNs) / 1e6,
+      .retainedMs = ms(gx::fifo::CpuZoneRetained),
+      .retainedCalls = calls(gx::fifo::CpuZoneRetained),
+      .routed = routeAfter.routed - routeBefore.routed,
+      .suppressed = routeAfter.suppressed - routeBefore.suppressed,
+      .mergeBreaks = routeAfter.mergeBreaks - routeBefore.mergeBreaks,
+      .substituted = routeAfter.substituted - routeBefore.substituted,
+      .deferred = routeAfter.deferred - routeBefore.deferred,
+      .merged = stats.mergedDrawCallCount,
   };
 }
 
@@ -192,8 +202,8 @@ public:
 ExitCode bring_up_aurora(int argc, char* argv[], const Options& options, const trace::TraceInfo& info, bool synthetic,
                          AuroraInfo& auroraInfo, std::string& error) {
 #if !AURORA_ENABLE_RENDER
-  if (options.classifies()) {
-    error = "--debug-view and --classify-* need the render module";
+  if (options.seals()) {
+    error = "--debug-view, --classify-* and --retained-json need the render module";
     return ExitUsage;
   }
 #endif
@@ -253,6 +263,7 @@ ExitCode bring_up_aurora(int argc, char* argv[], const Options& options, const t
   render::jobs::set_synchronous(true);
   // The request outlives the run-start reset, so every repeat classifies the same way
   render::scene::request_report({.records = options.classifyDraws, .objects = options.classifyObjects});
+  render::scene::retained::set_demand(render::scene::retained::Demand::Tool, options.retainedJson);
   if (options.debugView != 0) {
     render::apply_settings(render::Settings{.debugView = options.debugView});
     if (options.debugViewBit != 0) {
@@ -319,6 +330,14 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
       return fail(ExitUsage, fmt::format("failed to write {}", io::fs_path_to_string(drawLinesPath)), error);
     }
   }
+  std::ofstream retainedLines;
+  const auto retainedLinesPath = m_options.outDir / "retained.json";
+  if (run == 0 && m_options.retainedJson) {
+    retainedLines.open(retainedLinesPath, std::ios::binary | std::ios::trunc);
+    if (!retainedLines) {
+      return fail(ExitUsage, fmt::format("failed to write {}", io::fs_path_to_string(retainedLinesPath)), error);
+    }
+  }
 
   const trace::BlobSink sink = [this](const trace::Hash128& hash, std::span<const uint8_t> bytes,
                                       std::string& sinkError) { return m_store.add_blob(hash, bytes, sinkError); };
@@ -365,6 +384,7 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
 
     const uint64_t missesBefore = m_store.misses();
     const auto zonesBefore = gx::fifo::cpu_zone_stats();
+    const auto routeBefore = gx::fifo::draw_route_stats();
     const auto residentBefore = gx::fifo::immutable_array_stats();
     const uint64_t resolvesBefore = m_store.resolves();
     m_frameArrays.clear();
@@ -417,6 +437,7 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
     const auto processEnd = Clock::now();
     const uint64_t hintBytes = gx::hints::total_bytes() - hintBytesBefore;
     const auto zonesAfter = gx::fifo::cpu_zone_stats();
+    const auto routeAfter = gx::fifo::draw_route_stats();
     const auto residentAfter = gx::fifo::immutable_array_stats();
     const uint64_t resolvesAfter = m_store.resolves();
 
@@ -450,8 +471,8 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
       });
       if (m_options.cpuZones) {
         out.cpuZones.push_back(frame_zones(run, index, zonesBefore, zonesAfter, residentBefore, residentAfter,
-                                           bindsBefore, gx::bind_counts(), resolvesAfter - resolvesBefore,
-                                           m_uniqueArrayBytes, *aurora_get_stats()));
+                                           bindsBefore, gx::bind_counts(), routeBefore, routeAfter,
+                                           resolvesAfter - resolvesBefore, m_uniqueArrayBytes, *aurora_get_stats()));
       }
       if (m_options.gpuTimings) {
         collect_gpu_timing(run, index, out);
@@ -467,9 +488,45 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
         rgba = {};
       }
 #if AURORA_ENABLE_RENDER
-      if (run == 0 && m_options.classifies()) {
+      if (run == 0 && m_options.seals()) {
         // The next latch would seal this frame too; sealing now keeps the report next to its frame
         render::scene::seal_frame();
+      }
+      if (retainedLines.is_open()) {
+        const auto counts = render::scene::retained::frame_counts();
+        const RetainedFrame line{
+            .frame = index,
+            .active = counts.active,
+            .sceneFrame = counts.sceneFrame,
+            .epoch = counts.epoch,
+            .entries = counts.entries,
+            .captureOnly = counts.captureOnly,
+            .transient = counts.transient,
+            .late = counts.late,
+            .instances = counts.instances,
+            .statics = counts.statics,
+            .created = counts.created,
+            .rekeyed = counts.rekeyed,
+            .newSubId = counts.newSubId,
+            .newOccurrence = counts.newOccurrence,
+            .relatched = counts.relatched,
+            .staticRestream = counts.staticRestream,
+            .signatureMisses = counts.signatureMisses,
+            .reorigins = counts.reorigins,
+            .overflow = counts.overflow,
+            .droppedEntries = counts.droppedEntries,
+            .undeliveredStatics = counts.undeliveredStatics,
+            .lostCaptures = counts.lostCaptures,
+            .resyncs = counts.resyncs,
+            .eventsPending = counts.eventsPending,
+        };
+        retainedLines << format_retained_line(line);
+        if (!retainedLines) {
+          return fail(ExitUsage, fmt::format("failed to write {}", io::fs_path_to_string(retainedLinesPath)), error);
+        }
+        out.retained.push_back(line);
+      }
+      if (run == 0 && m_options.classifies()) {
         if (const auto report = render::scene::latest_report()) {
           if (drawLines.is_open()) {
             for (const auto& draw : report->draws) {
@@ -513,6 +570,12 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
     drawLines.close();
     if (!drawLines) {
       return fail(ExitUsage, fmt::format("failed to write {}", io::fs_path_to_string(drawLinesPath)), error);
+    }
+  }
+  if (retainedLines.is_open()) {
+    retainedLines.close();
+    if (!retainedLines) {
+      return fail(ExitUsage, fmt::format("failed to write {}", io::fs_path_to_string(retainedLinesPath)), error);
     }
   }
   out.malformedHints = malformed_hints() - malformedBefore;

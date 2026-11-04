@@ -2120,6 +2120,14 @@ uint32_t align_uniform(uint32_t value) {
   return AURORA_ALIGN(value, detail::resources().limits.minUniformBufferOffsetAlignment);
 }
 
+bool frame_overrun() noexcept {
+  if (!g_recorder.active()) {
+    return false;
+  }
+  const FramePacket& frame = current_frame_packet();
+  return frame.vertexOverrun != 0 || frame.indexOverrun != 0 || frame.uniformOverrun != 0 || frame.storageOverrun != 0;
+}
+
 uint64_t uniform_space_left() noexcept {
   if (!g_recorder.active()) {
     return 0;

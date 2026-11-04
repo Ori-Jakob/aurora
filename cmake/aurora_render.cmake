@@ -182,10 +182,13 @@ if (AURORA_ENABLE_RENDER)
         lib/render/post/upscale/native_upscale.hpp
         lib/render/post/upscale/upscale.cpp
         lib/render/post/upscale/upscale.hpp
+        lib/render/scene/affine.hpp
         lib/render/scene/classifier.cpp
         lib/render/scene/classifier.hpp
         lib/render/scene/classify.cpp
         lib/render/scene/classify.hpp
+        lib/render/scene/identity.cpp
+        lib/render/scene/identity.hpp
         lib/render/scene/motion.cpp
         lib/render/scene/motion.hpp
         lib/render/scene/overlay.cpp

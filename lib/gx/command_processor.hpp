@@ -4,7 +4,12 @@
 
 #include <array>
 #include <cstdint>
+#include <span>
 #include <vector>
+
+namespace aurora::gx {
+struct AttrArray;
+} // namespace aurora::gx
 
 namespace aurora::gx::fifo {
 
@@ -55,6 +60,7 @@ enum CpuZone : uint8_t {
   CpuZoneBindGroupBuild,
   CpuZoneUniformBuild,
   CpuZoneFogLut,
+  CpuZoneRetained,
   CpuZoneCount,
 };
 enum CpuZoneTiming : uint32_t { CpuZoneTimingFifo = 1u << 0, CpuZoneTimingDraws = 1u << 1 };
@@ -78,12 +84,16 @@ ArrayUploadStats array_upload_stats() noexcept;
 CpuZoneStats cpu_zone_stats() noexcept;
 // Fifo times only process(), so the yardstick reads the clock a few times per frame instead of per draw
 void set_cpu_zone_timing(uint32_t timing) noexcept;
+[[nodiscard]] bool cpu_zone_timed(CpuZone zone) noexcept;
+void cpu_zone_record(CpuZone zone, uint64_t ns) noexcept;
 void set_array_immutable(uint64_t address, uint32_t size, bool le, uint32_t generation) noexcept;
 void release_array_immutable(uint64_t address, uint32_t generation) noexcept;
 // Only while the FIFO is drained
 void reset_immutable_arrays() noexcept;
 void init_immutable_arrays() noexcept;
 ImmutableArrayStats immutable_array_stats() noexcept;
+[[nodiscard]] uint32_t immutable_generation(const void* data, uint32_t size) noexcept;
+[[nodiscard]] std::span<const uint8_t> array_bytes(const AttrArray& array, uint32_t offset, uint32_t size) noexcept;
 void load_array_gpu(uint8_t attr, uint64_t handle, uint32_t byteOffset) noexcept;
 // Only while the FIFO is drained
 void end_gpu_frame() noexcept;

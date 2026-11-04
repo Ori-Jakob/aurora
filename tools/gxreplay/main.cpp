@@ -86,6 +86,12 @@ bool write_classify(const Options& options, const ReportContext& context, const 
   return true;
 }
 
+void print_retained(const Options& options, const ReplayResult& result) {
+  if (options.retainedJson) {
+    std::fputs(format_retained_summary(result.retained).c_str(), stdout);
+  }
+}
+
 #if AURORA_ENABLE_RENDER
 // A view recolours the hint trace, so each quad is checked against the colour its own record picks
 bool check_view_frames(const Options& options, const ReplayResult& hints, const ReplayResult& plain, bool pixelProbes,
@@ -450,6 +456,7 @@ int run_replay(int argc, char* argv[], const Options& options) {
   };
   const bool reportsWritten = write_reports(options, context, frames, timings, gpuTimings, cpuZones) &&
                               write_classify(options, context, results[0]);
+  print_retained(options, results[0]);
   aurora_shutdown();
 
   for (const auto& result : results) {

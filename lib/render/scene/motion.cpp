@@ -1,5 +1,6 @@
 #include "motion.hpp"
 
+#include "affine.hpp"
 #include "classifier.hpp"
 #include "../gx_ext/records.hpp"
 #include "../post/temporal_resolve.hpp"
@@ -359,65 +360,6 @@ void sample_immobile(const Key& key, uint32_t slot) noexcept {
   }
   ++g_frame.counts.immobileSamples;
   g_frame.counts.immobileMaxPx = std::max(g_frame.counts.immobileMaxPx, *residual);
-}
-
-struct Affine {
-  double m[3][4];
-};
-
-Affine to_affine(const Mat3x4<float>& in) noexcept {
-  Affine out{};
-  const Vec4<float>* rows[3] = {&in.m0, &in.m1, &in.m2};
-  for (int r = 0; r < 3; ++r) {
-    for (int c = 0; c < 4; ++c) {
-      out.m[r][c] = (*rows[r])[c];
-    }
-  }
-  return out;
-}
-
-Affine inverse(const Affine& a) noexcept {
-  const auto& m = a.m;
-  const double c00 = m[1][1] * m[2][2] - m[1][2] * m[2][1];
-  const double c01 = m[1][2] * m[2][0] - m[1][0] * m[2][2];
-  const double c02 = m[1][0] * m[2][1] - m[1][1] * m[2][0];
-  const double det = m[0][0] * c00 + m[0][1] * c01 + m[0][2] * c02;
-  Affine out{};
-  if (det == 0.0 || !std::isfinite(det)) {
-    return out;
-  }
-  const double inv = 1.0 / det;
-  out.m[0][0] = c00 * inv;
-  out.m[0][1] = (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv;
-  out.m[0][2] = (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv;
-  out.m[1][0] = c01 * inv;
-  out.m[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv;
-  out.m[1][2] = (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv;
-  out.m[2][0] = c02 * inv;
-  out.m[2][1] = (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv;
-  out.m[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv;
-  for (int r = 0; r < 3; ++r) {
-    out.m[r][3] = -(out.m[r][0] * m[0][3] + out.m[r][1] * m[1][3] + out.m[r][2] * m[2][3]);
-  }
-  return out;
-}
-
-Affine multiply(const Affine& a, const Affine& b) noexcept {
-  Affine out{};
-  for (int r = 0; r < 3; ++r) {
-    for (int c = 0; c < 4; ++c) {
-      out.m[r][c] = a.m[r][0] * b.m[0][c] + a.m[r][1] * b.m[1][c] + a.m[r][2] * b.m[2][c] + (c == 3 ? a.m[r][3] : 0.0);
-    }
-  }
-  return out;
-}
-
-std::array<double, 3> transform(const Affine& a, const std::array<double, 3>& p) noexcept {
-  std::array<double, 3> out{};
-  for (int r = 0; r < 3; ++r) {
-    out[r] = a.m[r][0] * p[0] + a.m[r][1] * p[1] + a.m[r][2] * p[2] + a.m[r][3];
-  }
-  return out;
 }
 
 float halton(uint32_t index, uint32_t base) noexcept {

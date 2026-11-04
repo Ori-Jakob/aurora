@@ -9,6 +9,10 @@
 #include <memory>
 #include <vector>
 
+namespace aurora::render::scene::retained {
+struct Frame;
+} // namespace aurora::render::scene::retained
+
 namespace aurora::render::detail {
 struct FrameState;
 // Defined with its Dawn views in scene_depth.hpp, so stage data links without Dawn
@@ -43,6 +47,8 @@ struct StageData {
   std::shared_ptr<const SceneHints> sceneHints;
   // Taken at OpaqueDone, when every output-2 draw of the frame has its slot
   std::shared_ptr<const std::vector<std::array<uint32_t, 4>>> surfaceTable;
+  // Sealed at OpaqueDone and PrePost; a skipped OpaqueDone hands its entries to PrePost
+  std::shared_ptr<const scene::retained::Frame> retained;
 
   [[nodiscard]] bool is_enabled(uint32_t index) const noexcept {
     return index < passCount && ((enabled[index / 64] >> (index % 64)) & 1u) != 0;

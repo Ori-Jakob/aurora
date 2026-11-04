@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <span>
 
 namespace aurora::gx {
 struct DrawData;
@@ -24,6 +25,8 @@ struct Query {
   GXVtxFmt fmt = GX_VTXFMT0;
   uint32_t vtxCount = 0;
   bool indexed = false;
+  std::span<const uint8_t> vertices;
+  std::span<const uint8_t> indices;
 };
 
 struct Decision {
@@ -31,11 +34,19 @@ struct Decision {
   bool breakMerge = false;
 };
 
+struct MergedDraw {
+  uint32_t vertOffset = 0;
+  uint32_t vertSize = 0;
+  const DrawData* command = nullptr;
+  const PipelineConfig* config = nullptr;
+};
+
 struct Router {
   Decision (*route)(void* userData, const Query& query) noexcept = nullptr;
   // True when the hook changed the pipeline, bind groups, uniform or instance count, so later draws must not merge
   bool (*push)(void* userData, DrawData& draw, const PipelineConfig& config, const ShaderInfo& info) noexcept = nullptr;
   void* userData = nullptr;
+  void (*merge)(void* userData, const MergedDraw& draw) noexcept = nullptr;
 };
 
 inline std::atomic<const Router*> g_router{nullptr};

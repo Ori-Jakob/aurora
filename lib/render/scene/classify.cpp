@@ -1,4 +1,5 @@
 #include "classify.hpp"
+#include "identity.hpp"
 #include "overlay.hpp"
 
 #include "../fakeshadow/texture_gate.hpp"
@@ -138,6 +139,7 @@ gx::draw_route::Decision route(void*, const gx::draw_route::Query& query) noexce
   }
   // Each command carries one draw record, so a changed class must start its own command
   const bool records = gx_ext::records::on_route(cls);
+  retained::route(cls, query);
   // Its colour would be mixed away by the PBR term, so it draws after the composite instead
   if (overlay::defers(cls, inputs.depthWrite)) {
     return {.route = gx::draw_route::Route::Defer};
@@ -159,6 +161,7 @@ bool push(void*, gx::DrawData& draw, const gx::PipelineConfig& config, const gx:
                        g_hooks->push(draw, config, info, cls);
   // Before the inspector's observer, which reads the record locator
   gx_ext::records::stamp(draw, config, info, cls);
+  retained::on_push(draw, config);
   // Last, so the inspector records the draw that is actually pushed
   if (g_observer != nullptr && g_observer->observe != nullptr) {
     g_observer->observe(draw, config, info, cls);
@@ -166,7 +169,9 @@ bool push(void*, gx::DrawData& draw, const gx::PipelineConfig& config, const gx:
   return changed || gate != fakeshadow::Edit::Untouched;
 }
 
-constexpr gx::draw_route::Router g_router{.route = &route, .push = &push, .userData = nullptr};
+void merge(void*, const gx::draw_route::MergedDraw& draw) noexcept { retained::on_merge(draw); }
+
+constexpr gx::draw_route::Router g_router{.route = &route, .push = &push, .userData = nullptr, .merge = &merge};
 } // namespace
 
 void install() noexcept {
@@ -192,6 +197,7 @@ void remove() noexcept {
 void reset() noexcept {
   g_classifier.reset();
   fakeshadow::reset_frame();
+  retained::reset();
   g_sealed = false;
   std::shared_ptr<const FrameReport> previous;
   std::lock_guard lock{g_reportMutex};
@@ -215,6 +221,7 @@ void apply_frame_state(const detail::FrameState& state) noexcept {
   g_classifier.set_objects(state.inspectorOpen || g_request.objects);
   apply_merge_key();
   overlay::apply_frame_state(state);
+  retained::apply_frame_state(state);
 }
 
 void seal_frame() noexcept {
@@ -223,6 +230,7 @@ void seal_frame() noexcept {
   }
   g_classifier.end_frame();
   fakeshadow::seal();
+  retained::end_frame();
   const FrameStats& stats = g_classifier.stats();
   warn_counts(stats);
   const detail::SceneHints& hints = detail::live_scene_hints();
@@ -259,6 +267,8 @@ bool identity_collecting() noexcept {
 
 ViewCounts& view_counts() noexcept { return g_classifier.stats().view; }
 
+const Mat3x4<float>* object_world() noexcept { return g_classifier.object_world(); }
+
 uint32_t sky_draws() noexcept { return g_classifier.stats().kinds[static_cast<size_t>(Kind::Sky)]; }
 
 void on_camera(const gx::hints::Camera& camera) noexcept { g_classifier.camera(static_cast<Role>(camera.role)); }
@@ -270,6 +280,8 @@ void on_object_begin(const gx::hints::ObjectBegin& object) noexcept {
       .generation = object.generation,
       .categories = object.categories,
       .flags = object.flags,
+      .hasWorld = object.hasWorld,
+      .world = object.world,
   });
 }
 
