@@ -958,30 +958,44 @@ TEST_F(GraphBindTest, BindFailureInvalidatesNextPrev) {
              b.side_effect();
            }},
   };
+  std::vector<bool> valid;
+  passes[1].encode = [&](PassContext& ctx) { valid.push_back(ctx.prev_valid(TexRef{0})); };
   const TestFrame frame{compile(passes)};
   const uint16_t history = frame.graph->resources[frame.use("bf.read", 0).resource].historySlot;
   ASSERT_NE(history, InvalidResource);
-  // Only the real cull carries one frame's ran bits into the next, so every frame goes through build_stage_data
-  const auto run = [&](uint64_t frameId) {
-    g_uniforms.clear();
-    on_worker_frame_begin(frameId, &frame.state);
+  // Two frame slots let the recording thread cull frame N + 1 before the worker encodes frame N
+  std::vector<StageData> built;
+  built.reserve(5);
+  std::vector<bool> culled;
+  const auto build = [&](uint64_t frameId) {
     StageData begin{.stage = Stage::SceneBegin, .frameId = frameId, .markerSeen = true, .frame = &frame.state};
     build_stage_data(begin);
-    StageData opaque{.stage = Stage::OpaqueDone, .frameId = frameId, .markerSeen = true, .frame = &frame.state};
+    StageData& opaque = built.emplace_back(
+        StageData{.stage = Stage::OpaqueDone, .frameId = frameId, .markerSeen = true, .frame = &frame.state});
     EXPECT_TRUE(build_stage_data(opaque));
-    const bool valid = test_bit(opaque.prevValid, history);
-    EXPECT_EQ(execute(opaque), std::nullopt);
-    return valid;
+    culled.push_back(test_bit(opaque.prevValid, history));
   };
-  EXPECT_FALSE(run(1));
-  EXPECT_TRUE(run(2));
+  const auto encode = [&](size_t index) {
+    g_uniforms.clear();
+    on_worker_frame_begin(built[index].frameId, &frame.state);
+    EXPECT_EQ(execute(built[index]), std::nullopt);
+  };
+  build(1);
+  build(2);
+  encode(0);
+  build(3);
+  encode(1);
+  build(4);
   gate.open = false;
-  EXPECT_TRUE(run(3));
-  EXPECT_EQ(passes[0].calls, 2);
+  encode(2);
   gate.open = true;
-  EXPECT_FALSE(run(4));
-  EXPECT_EQ(passes[0].calls, 3);
-  EXPECT_TRUE(run(5));
+  build(5);
+  encode(3);
+  EXPECT_EQ(testing::last_identities(frame.node("bf.read")).at(0).kind, IdentityKind::Dummy);
+  encode(4);
+  EXPECT_EQ(culled, (std::vector<bool>{false, true, true, true, true}));
+  EXPECT_EQ(valid, (std::vector<bool>{false, true, true, false, true}));
+  EXPECT_EQ(passes[0].calls, 4);
   EXPECT_EQ(count_logs(LOG_WARNING, "imports 'bf.gate'"), 1u);
 }
 

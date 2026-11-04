@@ -664,8 +664,6 @@ constexpr bool test_bit(std::span<const uint64_t> bits, size_t index) noexcept {
 DummyKey dummy_key(const CompiledGraph& graph, const CompiledUse& use, const GraphFeatures& features = {}) noexcept;
 void begin_frame_cull(const CompiledGraph& graph, FrameCullState& state) noexcept;
 void invalidate_histories(FrameCullState& state) noexcept;
-// The cull counts every scheduled pass as run; one that failed to bind wrote nothing anyone may read
-void mark_not_encoded(const CompiledGraph& graph, NodeId node, FrameCullState& state) noexcept;
 void cull_stage(const CompiledGraph& graph, Stage stage, std::span<const uint64_t> enabled, FrameCullState& state,
                 StageMask& out, std::span<FrameCullReason> reasons = {});
 

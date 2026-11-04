@@ -166,11 +166,9 @@ void run_stage(const wgpu::CommandEncoder& encoder, const StageData& stage) {
     }
     const NodeId nodeId = program.passes[i];
     poison_before(encoder, stage, nodeId);
-    // A pass skipped at bind time wrote nothing, so its histories must not flip
+    // A pass skipped at bind time wrote nothing, so its histories must not flip and history_fresh refuses its prev
     if (encode_timed(encoder, stage, *graph, nodeId)) {
       after_pass(stage, nodeId);
-    } else {
-      mark_not_encoded(*graph, nodeId, g_frameCull);
     }
   }
 #endif

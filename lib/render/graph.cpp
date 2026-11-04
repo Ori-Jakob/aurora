@@ -3324,12 +3324,6 @@ void invalidate_histories(FrameCullState& state) noexcept {
   state.cutStage = state.nextStage;
 }
 
-void mark_not_encoded(const CompiledGraph& graph, NodeId node, FrameCullState& state) noexcept {
-  if (state.graphHash == graph.graphHash && node < graph.nodes.size()) {
-    assign_bit(state.ran, graph.nodes[node].frameSlot, false);
-  }
-}
-
 void cull_stage(const CompiledGraph& graph, Stage stage, std::span<const uint64_t> enabled, FrameCullState& state,
                 StageMask& out, std::span<FrameCullReason> reasons) {
   assert(static_cast<uint8_t>(stage) >= state.nextStage);
