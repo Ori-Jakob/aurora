@@ -427,6 +427,33 @@ TEST(ExposureRules, HoldsWithFewSamples) {
   EXPECT_EQ(empty.s, 0.f);
 }
 
+TEST(ExposureRules, HeldResetSnapsTheNextMeasuredFrame) {
+  const Params reset = params_of(Exposure::MatchLegacy, 1.f / 60.f, exposure::FlagReset);
+  const Params match = params_of(Exposure::MatchLegacy);
+  const Solved few = exposure::testing::solve(reset, linear_partials(100.f, 100.f, 0.f, 3.f, reset, {}), {});
+  const Solved empty = exposure::testing::solve(reset, linear_partials(0.f, 0.f, 0.f, 3.f, reset, {}), {});
+  EXPECT_NEAR(few.s, 3.f, 1e-5f);
+  EXPECT_EQ(empty.s, 0.f);
+  const Texels kept = valid_prev(1.5f, Exposure::MatchLegacy);
+  const Params snap = params_of(Exposure::MatchLegacy, 1.f / 60.f, exposure::FlagSnap);
+  const Solved held = exposure::testing::solve(snap, linear_partials(100.f, 100.f, 0.f, 3.f, snap, kept), kept);
+  EXPECT_EQ(held.s, 1.5f);
+  for (const Solved& before : {few, empty, held}) {
+    EXPECT_EQ(before.flags & (exposure::StateHeld | exposure::StateSnapped),
+              uint32_t{exposure::StateHeld | exposure::StateSnapped});
+    const Texels prev = exposure::testing::texels(before);
+    EXPECT_TRUE(exposure::testing::snaps(match, prev));
+    const Solved next = exposure::testing::solve(match, linear_partials(1000.f, 1000.f, 0.f, 5.f, match, prev), prev);
+    EXPECT_TRUE(next.flags & exposure::StateSnapped);
+    EXPECT_NEAR(next.s, 5.f, 1e-5f);
+    EXPECT_EQ(exposure::testing::words(next)[2], 1.f);
+    const Solved after = exposure::testing::solve(
+        match, linear_partials(1000.f, 1000.f, 0.f, 6.f, match, exposure::testing::texels(next)),
+        exposure::testing::texels(next));
+    EXPECT_FALSE(after.flags & exposure::StateSnapped);
+  }
+}
+
 TEST(ExposureRules, PinsUnreachableTarget) {
   const Params params = params_of(Exposure::MatchLegacy);
   const Solved high = exposure::testing::solve(params, linear_partials(1000.f, 1000.f, -40.f, 0.f, params, {}), {});
@@ -1211,6 +1238,29 @@ TEST_F(ExposureGpu, ResetSnapsToSolve) {
   const Frame changed = run(state, 4);
   EXPECT_NE(changed.state[1] & exposure::StateSnapped, 0u);
   EXPECT_NE(changed.state[1] & exposure::StateAgx, 0u);
+}
+
+TEST_F(ExposureGpu, HeldResetSnapsTheNextMeasuredFrame) {
+  // Only the top row is PBR, which the grid samples 192 times, under the hold count
+  std::vector<MeterPixel> pixels = scene(13, 0.3f, false);
+  for (size_t i = exposure::GridWidth; i < pixels.size(); ++i) {
+    pixels[i].lit = false;
+  }
+  load(pixels);
+  const auto graph = live_graph(pbr_settings());
+  const FrameState state{.graph = graph};
+  const Frame few = run(state, 1);
+  ASSERT_EQ(std::bit_cast<float>(few.state[7]), static_cast<float>(exposure::GridWidth));
+  EXPECT_EQ(few.state[1] & (exposure::StateHeld | exposure::StateSnapped),
+            uint32_t{exposure::StateHeld | exposure::StateSnapped});
+  EXPECT_EQ(few.state[0], few.state[2]);
+  EXPECT_NE(std::bit_cast<float>(few.state[0]), 0.f);
+  load(scene(14, 2.f, false));
+  const Frame measured = run(state, 2);
+  EXPECT_EQ(measured.state[1] & exposure::StateHeld, 0u);
+  EXPECT_NE(measured.state[1] & exposure::StateSnapped, 0u);
+  EXPECT_EQ(measured.state[0], measured.state[2]);
+  EXPECT_EQ(measured.words[2], 1.f);
 }
 
 TEST_F(ExposureGpu, RepeatIsBitIdentical) {

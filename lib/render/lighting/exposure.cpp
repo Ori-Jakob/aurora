@@ -297,6 +297,7 @@ struct Window {
   float step = SnapStepEv;
   bool snap = true;
   float prevS = 0.f;
+  bool history = false;
 };
 
 Window window_of(const Params& params, const std::array<uint32_t, 8>& prev) noexcept {
@@ -304,11 +305,15 @@ Window window_of(const Params& params, const std::array<uint32_t, 8>& prev) noex
   const bool valid = (prev[1] & StateValid) != 0 && std::abs(prevS) <= MaxEv;
   const bool modeChanged = ((prev[1] & StateModeMask) >> StateModeShift) != params.mode;
   const bool tonemapChanged = ((prev[1] & StateAgx) != 0) != ((params.flags & FlagAgx) != 0);
-  const bool snap = !valid || (params.flags & (FlagSnap | FlagReset)) != 0 || modeChanged || tonemapChanged;
+  const bool owed = (prev[1] & (StateSnapped | StateHeld)) == (StateSnapped | StateHeld);
+  const bool snap = !valid || (params.flags & (FlagSnap | FlagReset)) != 0 || modeChanged || tonemapChanged || owed;
   constexpr float Edge = MaxEv - 15.5f * StepEv;
   const float s = valid ? prevS : 0.f;
-  return {
-      .center = snap ? 0.f : std::clamp(s, -Edge, Edge), .step = snap ? SnapStepEv : StepEv, .snap = snap, .prevS = s};
+  return {.center = snap ? 0.f : std::clamp(s, -Edge, Edge),
+          .step = snap ? SnapStepEv : StepEv,
+          .snap = snap,
+          .prevS = s,
+          .history = valid};
 }
 } // namespace
 
@@ -494,8 +499,8 @@ Solved solve(const Params& params, std::span<const float> partials, const std::a
     }
     out.weight = sums[WordWeight];
     out.count = sums[WordCount];
-    if (out.count < HoldFraction * static_cast<float>(GridCells) || !(out.weight > 0.f)) {
-      held = true;
+    held = out.count < HoldFraction * static_cast<float>(GridCells) || !(out.weight > 0.f);
+    if (held && (w.history || !(out.weight > 0.f))) {
       out.target = w.prevS;
     } else {
       const bool match = params.mode == static_cast<uint32_t>(Exposure::MatchLegacy);

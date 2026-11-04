@@ -61,6 +61,7 @@ struct ExposureWindow {
   step: f32,
   snap: bool,
   prev_s: f32,
+  history: bool,
 }
 
 @group(0) @binding(1) var<uniform> exposure_params: ExposureParams;
@@ -97,11 +98,13 @@ fn exposure_window() -> ExposureWindow {
   let mode_changed = ((prev.y & EXPOSURE_STATE_MODE_MASK) >> 1u) != p.mode;
   let tonemap_changed = ((prev.y & EXPOSURE_STATE_AGX) != 0u) != ((p.flags & EXPOSURE_FLAG_AGX) != 0u);
   let forced = (p.flags & (EXPOSURE_FLAG_SNAP | EXPOSURE_FLAG_RESET)) != 0u;
-  let snap = !valid || forced || mode_changed || tonemap_changed;
+  // A held frame cannot take a snap it was asked for, so it passes the snap on to the next frame
+  let owed = (prev.y & (EXPOSURE_STATE_SNAPPED | EXPOSURE_STATE_HELD)) == (EXPOSURE_STATE_SNAPPED | EXPOSURE_STATE_HELD);
+  let snap = !valid || forced || mode_changed || tonemap_changed || owed;
   let edge = EXPOSURE_MAX_EV - 15.5 * EXPOSURE_STEP_EV;
   let s = select(prev_s, 0.0, !valid);
   return ExposureWindow(select(clamp(s, -edge, edge), 0.0, snap), select(EXPOSURE_STEP_EV, EXPOSURE_SNAP_STEP_EV, snap),
-                        snap, s);
+                        snap, s, valid);
 }
 
 fn exposure_candidate(w: ExposureWindow, k: u32) -> f32 {
@@ -210,8 +213,9 @@ fn solve(@builtin(local_invocation_index) li: u32) {
   } else {
     weight = exposure_sums[EXPOSURE_WORD_WEIGHT];
     count = exposure_sums[EXPOSURE_WORD_COUNT];
-    if (count < EXPOSURE_HOLD_COUNT || !(weight > 0.0)) {
-      held = true;
+    held = count < EXPOSURE_HOLD_COUNT || !(weight > 0.0);
+    // Without a history to hold, a few samples still beat 0 EV
+    if (held && (w.history || !(weight > 0.0))) {
       s_t = w.prev_s;
     } else {
       // MatchLegacy solves against the game's own image, so neither bias may move it
