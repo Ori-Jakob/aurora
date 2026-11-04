@@ -14,6 +14,13 @@ struct CompositeExposure {
   one: f32,
 }
 
+//#if COMPOSITE_RADIANCE
+struct CompositeOut {
+  @location(0) color: vec4f,
+  @location(1) radiance: vec4f,
+}
+
+//#endif
 @group(0) @binding(1) var<uniform> composite_params: CompositeParams;
 
 @group(1) @binding(0) var legacy_tex: texture_2d<f32>;
@@ -31,7 +38,11 @@ fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
 }
 
 @fragment
+//#if COMPOSITE_RADIANCE
+fn fs_main(@builtin(position) pos: vec4f) -> CompositeOut {
+//#else
 fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+//#endif
   // Every input is read at this pixel, so the composite is exact under jitter and at any render size
   let p = vec2i(pos.xy);
   var t = composite_identity_terms();
@@ -47,16 +58,26 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
       t.agx = (composite_params.flags & COMPOSITE_FLAG_TONEMAP_AGX) != 0u;
     }
   }
+//#if !COMPOSITE_RADIANCE
   if (composite_is_identity(t)) {
     discard;
   }
+//#endif
   var rec = gbuf_fog_decode(textureLoad(fog_record, p, 0));
   if ((composite_params.flags & COMPOSITE_FLAG_NO_FOG) != 0u) {
     rec.q = 0.0;
   }
+//#if COMPOSITE_RADIANCE
+  let l = textureLoad(legacy_tex, p, 0).rgb;
+  let e = composite_eval(l, rec, t);
+  let units = composite_units(composite_params.flags, composite_exposure.e, composite_exposure.inv_e);
+  // Identity and bad pixels rewrite L, which round-trips exactly, so the history covers every pixel
+  return CompositeOut(vec4f(select(e.rgb, l, e.keep), 0.0), composite_radiance(e, rec, t, units.y));
+//#else
   let e = composite_eval(textureLoad(legacy_tex, p, 0).rgb, rec, t);
   if (e.keep) {
     discard;
   }
   return vec4f(e.rgb, 0.0);
+//#endif
 }

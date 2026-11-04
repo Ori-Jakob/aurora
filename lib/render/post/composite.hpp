@@ -27,6 +27,11 @@ inline constexpr std::string_view LegacyTex = "legacyTex";
 inline constexpr std::string_view Shader = "post/composite";
 inline constexpr std::string_view NoFogEnv = "AURORA_RENDER_COMPOSITE_NOFOG";
 inline constexpr wgpu::TextureFormat AoFormat = wgpu::TextureFormat::RGBA8Unorm;
+inline constexpr std::string_view RadianceEnv = "AURORA_RENDER_COMPOSITE_RADIANCE";
+inline constexpr std::string_view RadianceDefine = "COMPOSITE_RADIANCE";
+inline constexpr wgpu::TextureFormat RadianceFormat = wgpu::TextureFormat::RGBA16Float;
+// The meter's fog cut, so radiance and exposure agree on which pixels are fog-drowned
+inline constexpr uint32_t RadianceFogCutQ7 = 114;
 
 // Bindings follow declaration order, so later terms append and never renumber
 enum Binding : uint32_t {
@@ -61,10 +66,13 @@ static_assert(sizeof(Params) == 16 && offsetof(Params, legacyBlend) == 4);
 [[nodiscard]] bool hdr_produced(const CompiledGraph& graph) noexcept;
 [[nodiscard]] bool ao_produced(const CompiledGraph& graph) noexcept;
 [[nodiscard]] bool declare_wanted(const PassSetup& setup) noexcept;
+[[nodiscard]] bool radiance_wanted(const PassSetup& setup) noexcept;
+[[nodiscard]] bool radiance_bound(const CompiledGraph& graph) noexcept;
+[[nodiscard]] bool radiance_env_on(const char* value) noexcept;
 [[nodiscard]] uint32_t params_flags(bool identity, const char* noFog) noexcept;
 [[nodiscard]] std::optional<std::string> check_contract(const CompiledGraph& graph);
 [[nodiscard]] shaders::RenderPipelineDesc pipeline_desc(wgpu::TextureFormat efb, const wgpu::PipelineLayout& layout,
-                                                        uint64_t layoutKey);
+                                                        uint64_t layoutKey, bool radiance = false);
 PassDesc copy_pass_desc();
 PassDesc pass_desc();
 void initialize();
@@ -90,6 +98,8 @@ struct Counters {
   uint32_t pbrDraws = 0;
   uint32_t idleFrames = 0;
   uint32_t hdrDraws = 0;
+  uint32_t radianceDraws = 0;
+  uint32_t radianceClears = 0;
 };
 Counters counters() noexcept;
 void reset() noexcept;
@@ -98,11 +108,16 @@ void force_params(std::optional<Params> params) noexcept;
 void set_camera_override(std::shared_ptr<const SceneHints> hints) noexcept;
 void set_pbr_producers_override(std::optional<bool> live) noexcept;
 void set_ready_override(std::optional<bool> ready) noexcept;
+void set_radiance_forced(std::optional<bool> forced) noexcept;
 [[nodiscard]] bool pbr_active_for(bool live, bool hdrLive, bool classView, const Settings& settings) noexcept;
 [[nodiscard]] std::array<float, 3> legacy_ao(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7,
                                              float ao, float normalAlpha) noexcept;
 [[nodiscard]] std::array<float, 3> legacy_pbr_hdr(std::array<float, 3> legacy, std::array<float, 3> fogColor,
                                                   uint32_t q7, float ao, float normalAlpha, std::array<float, 4> hdr,
                                                   float legacyBlend, float exposure, bool agx) noexcept;
+[[nodiscard]] std::array<float, 2> units(uint32_t flags, float e, float invE) noexcept;
+[[nodiscard]] std::array<float, 4> radiance(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7,
+                                            float ao, float normalAlpha, std::array<float, 4> hdr, bool pbrFlag,
+                                            float legacyBlend, float invE) noexcept;
 } // namespace testing
 } // namespace aurora::render::detail::composite

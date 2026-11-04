@@ -14,9 +14,11 @@
 #include "render/graph_layout.hpp"
 #include "render/jobs.hpp"
 #include "render/lighting/deferred.hpp"
+#include "render/lighting/exposure.hpp"
 #include "render/lighting/openpbr.hpp"
 #include "render/lighting/sky_probe.hpp"
 #include "render/lighting/tonemap.hpp"
+#include "render/post/composite.hpp"
 #include "render/shader_resolve.hpp"
 #include "render/shaders.hpp"
 #include "render/systems/dispatch.hpp"
@@ -496,6 +498,45 @@ TEST_F(RenderShaders, AoGtaoSsilHookCompiles) {
   EXPECT_TRUE(validate_module("ao/gtao", defines, error)) << error;
   EXPECT_TRUE(validate_module("ao/gtao", {}, error)) << error;
   EXPECT_TRUE(validate_module("ao/upsample", {}, error)) << error;
+}
+
+TEST_F(RenderShaders, CompositeRadianceVariantCompiles) {
+  const std::array<std::string_view, 1> radiance{detail::composite::RadianceDefine};
+  std::string error;
+  EXPECT_TRUE(validate_module(detail::composite::Shader, radiance, error)) << error;
+  EXPECT_TRUE(validate_module(detail::composite::Shader, {}, error)) << error;
+  EXPECT_TRUE(validate_module("aurora/composite", radiance, error)) << error;
+  EXPECT_TRUE(validate_module(detail::lighting::exposure::Shader, {}, error)) << error;
+}
+
+TEST_F(RenderShaders, DefaultVariantsCarryNoRadiance) {
+  const SourceLookup library = [](std::string_view id) -> std::optional<std::string_view> {
+    for (const EmbeddedShader& shader : embedded_library()) {
+      if (shader.id == id) {
+        return text_of(shader);
+      }
+    }
+    return std::nullopt;
+  };
+  constexpr std::array<std::string_view, 5> Symbols{"@location(1)", "composite_radiance", "composite_units",
+                                                    "COMPOSITE_RADIANCE_MIN_T", "CompositeOut"};
+  for (const std::string_view root : {detail::composite::Shader, detail::lighting::exposure::Shader}) {
+    ResolvedSource source;
+    std::string error;
+    ASSERT_TRUE(resolve_source(root, {}, library, source, error)) << error;
+    for (const std::string_view symbol : Symbols) {
+      EXPECT_EQ(source.text.find(symbol), std::string::npos) << root << ": " << symbol;
+    }
+  }
+  const std::array<std::string_view, 1> radiance{detail::composite::RadianceDefine};
+  ResolvedSource source;
+  std::string error;
+  ASSERT_TRUE(resolve_source(detail::composite::Shader, radiance, library, source, error)) << error;
+  for (const std::string_view symbol : Symbols) {
+    EXPECT_NE(source.text.find(symbol), std::string::npos) << symbol;
+  }
+  EXPECT_EQ(source.text.find("discard"), std::string::npos);
+  EXPECT_NE(source.text.find("13.0 / 127.0"), std::string::npos);
 }
 
 TEST_F(RenderShaders, NeverReadyIsNeverReady) {

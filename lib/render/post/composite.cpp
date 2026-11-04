@@ -41,6 +41,9 @@ constexpr TexRef AoFinal{BindAo};
 constexpr TexRef SurfaceRec{BindSurface};
 constexpr TexRef Hdr{BindHdr};
 constexpr TexRef Color{BindExposure + 1};
+// Declared after gx.color, so every binding and the Color attachment keep their numbers
+constexpr TexRef Radiance{static_cast<uint16_t>(Color.index + 1)};
+constexpr std::array<std::string_view, 1> RadianceDefines{RadianceDefine};
 constexpr uint64_t NoFrame = UINT64_MAX;
 constexpr wgpu::ColorWriteMask RgbMask =
     wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue;
@@ -65,6 +68,7 @@ std::optional<uint32_t> g_flagsOverride;
 std::optional<Params> g_paramsOverride;
 std::optional<bool> g_producersOverride;
 std::optional<bool> g_readyOverride;
+std::optional<bool> g_radianceForced;
 bool g_contractWarned = false;
 
 std::atomic_uint64_t g_enabledFrame{NoFrame};
@@ -79,6 +83,8 @@ std::atomic_uint32_t g_contractFailures{0};
 std::atomic_uint32_t g_pbrDraws{0};
 std::atomic_uint32_t g_idleFrames{0};
 std::atomic_uint32_t g_hdrDraws{0};
+std::atomic_uint32_t g_radianceDraws{0};
+std::atomic_uint32_t g_radianceClears{0};
 
 inline void bump(std::atomic_uint32_t& counter) noexcept {
   counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
@@ -104,6 +110,30 @@ bool no_fog_forced() noexcept {
     return on;
   }();
   return forced;
+}
+
+bool radiance_forced() noexcept {
+  if (g_radianceForced) {
+    return *g_radianceForced;
+  }
+  static const bool forced = [] {
+    const char* value = SDL_getenv(std::string{RadianceEnv}.c_str());
+    if (value == nullptr) {
+      return false;
+    }
+    const bool on = radiance_env_on(value);
+    if (on) {
+      Log.warn("{}=on: writing radiance.defogged without SSIL, for verification only", RadianceEnv);
+    } else {
+      Log.warn("{}={} is not on; ignored", RadianceEnv, value);
+    }
+    return on;
+  }();
+  return forced;
+}
+
+float srgb_to_linear(float stored) noexcept {
+  return stored <= 0.04045f ? stored / 12.92f : std::pow((stored + 0.055f) / 1.055f, 2.4f);
 }
 
 bool node_live(const CompiledGraph& graph, std::string_view name) noexcept {
@@ -226,6 +256,13 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
                                 .visibility = wgpu::ShaderStage::Fragment,
                                 .dummySize = lighting::exposure::BufferBytes});
   builder.use(resource::GxColor, Access::ColorRMW);
+  if (radiance_wanted(setup)) {
+    // Next frame's screen-space passes sample it, so the usage cannot depend on a capture
+    builder.history(
+        resource::RadianceDefogged,
+        {.format = RadianceFormat, .sizeClass = SizeClass::Efb, .extraUsage = wgpu::TextureUsage::TextureBinding},
+        Access::ColorWrite);
+  }
 }
 
 bool enabled(const StageData& stage, const void*) {
@@ -259,21 +296,44 @@ void request_pipelines(const PipelineSetup& setup, const void*, std::span<uint32
     return;
   }
   const wgpu::TextureFormat efb = setup.pass->env->gxFormats[static_cast<size_t>(GxResource::Color)];
-  ids[0] = shaders::request_render(pipeline_desc(efb, setup.layout, setup.layoutHash)).value;
+  const bool radiance = radiance_wanted(*setup.pass);
+  ids[0] = shaders::request_render(pipeline_desc(efb, setup.layout, setup.layoutHash, radiance)).value;
+}
+
+// The history flips whenever the pass encodes, so a frame that draws nothing must not keep last frame's radiance
+void bail(const PassContext& ctx, bool radiance) {
+  if (!radiance) {
+    return;
+  }
+  const std::array<ColorTarget, 1> colors{{{.ref = Radiance}}};
+  if (const wgpu::RenderPassEncoder pass = ctx.begin_render(colors, nullptr, "composite.main radiance clear")) {
+    pass.End();
+    bump(g_radianceClears);
+  }
 }
 
 void encode(PassContext& ctx, const void*) {
+  // Taken from the graph being encoded, never the latched slot, which may already hold the next graph
+  const FrameState* frame = ctx.stage_data().frame;
+  const bool radiance = frame != nullptr && frame->graph != nullptr && radiance_bound(*frame->graph);
   const uint32_t samples = ctx.sample_count(Color);
   CHECK(samples == 1, "composite: gx.color has {} samples", samples);
   if (!legacy_matches(ctx, Color, Legacy)) {
     encode_mismatch(ctx, Color, Legacy, LegacyTex);
+    bail(ctx, radiance);
     return;
   }
   for (const auto& [ref, name] : {std::pair{Fog, resource::Fog}, std::pair{Normal, resource::GxNormal}}) {
     if (!same_extent(ctx.extent(ref), ctx.extent(Color))) {
       encode_mismatch(ctx, Color, ref, name);
+      bail(ctx, radiance);
       return;
     }
+  }
+  if (radiance && !same_extent(ctx.extent(Radiance), ctx.extent(Color))) {
+    encode_mismatch(ctx, Color, Radiance, resource::RadianceDefogged);
+    bail(ctx, radiance);
+    return;
   }
   // White and black dummies are 1x1 and every load clamps, so they never fail the extent check
   for (const auto& [ref, name] : {std::pair{AoFinal, resource::AoFinal}, std::pair{SurfaceRec, resource::Surface},
@@ -281,21 +341,27 @@ void encode(PassContext& ctx, const void*) {
     const wgpu::Extent3D extent = ctx.extent(ref);
     if (!same_extent(extent, ctx.extent(Color)) && (extent.width != 1 || extent.height != 1)) {
       encode_mismatch(ctx, Color, ref, name);
+      bail(ctx, radiance);
       return;
     }
   }
   const wgpu::RenderPipeline pipeline = shaders::render_pipeline(ctx.pipeline(0));
   if (!pipeline) {
+    bail(ctx, radiance);
     return;
   }
   const wgpu::RenderPassEncoder pass = ctx.begin_render();
   if (!pass) {
+    bail(ctx, radiance);
     return;
   }
   pass.SetPipeline(pipeline);
   pass.Draw(3);
   pass.End();
   bump(g_draws);
+  if (radiance) {
+    bump(g_radianceDraws);
+  }
   if (params_carry_pbr(ctx.params())) {
     bump(g_pbrDraws);
     if (lighting::deferred::ran(ctx.stage_data())) {
@@ -304,7 +370,9 @@ void encode(PassContext& ctx, const void*) {
   }
 }
 
-bool m8_env_set() noexcept { return ao::env_ao_request().has_value() || identity_forced() || no_fog_forced(); }
+bool m8_env_set() noexcept {
+  return ao::env_ao_request().has_value() || identity_forced() || no_fog_forced() || radiance_forced();
+}
 } // namespace
 
 bool wanted(const Settings& settings) noexcept {
@@ -337,6 +405,17 @@ bool declare_wanted(const PassSetup& setup) noexcept {
   return setup.settings != nullptr && setup.env != nullptr && wanted(*setup.settings) &&
          setup.gx_available(GxResource::Fog) && setup.gx_available(GxResource::Normal) && setup.env->gxSampleCount == 1;
 }
+
+bool radiance_wanted(const PassSetup& setup) noexcept {
+  // SSIL is the first reader; M23's reflections widen this one predicate
+  return declare_wanted(setup) && ao::wanted(setup) && (setup.settings->ssil || radiance_forced());
+}
+
+bool radiance_bound(const CompiledGraph& graph) noexcept {
+  return composite_use(graph, resource::RadianceDefogged) != nullptr;
+}
+
+bool radiance_env_on(const char* value) noexcept { return value != nullptr && std::string_view{value} == "on"; }
 
 uint32_t params_flags(bool identity, const char* noFog) noexcept {
   uint32_t flags = identity ? FlagIdentity : 0u;
@@ -397,6 +476,16 @@ std::optional<std::string> check_contract(const CompiledGraph& graph) {
                          lighting::exposure::BufferBytes);
     }
   }
+  if (const CompiledUse* radiance = composite_use(graph, resource::RadianceDefogged); radiance != nullptr) {
+    const CompiledResource& target = graph.resources[radiance->resource];
+    if (target.kind != ResourceKind::History || target.tex.format != RadianceFormat ||
+        !same_extent(target.extent, legacy.extent)) {
+      return fmt::format("{} is {} {}x{}{}, not a {} History at {}x{}", resource::RadianceDefogged,
+                         magic_enum::enum_name(target.tex.format), target.extent.width, target.extent.height,
+                         target.kind == ResourceKind::History ? "" : " outside the history pool",
+                         magic_enum::enum_name(RadianceFormat), legacy.extent.width, legacy.extent.height);
+    }
+  }
   for (const std::string_view name : {resource::AoFinal, resource::Fog, resource::GxNormal}) {
     if (name == resource::AoFinal && !aoProduced) {
       continue;
@@ -430,7 +519,7 @@ std::optional<std::string> check_contract(const CompiledGraph& graph) {
 }
 
 shaders::RenderPipelineDesc pipeline_desc(wgpu::TextureFormat efb, const wgpu::PipelineLayout& layout,
-                                          uint64_t layoutKey) {
+                                          uint64_t layoutKey, bool radiance) {
   shaders::RenderPipelineDesc desc{
       .label = "composite.main",
       .shader = Shader,
@@ -438,10 +527,14 @@ shaders::RenderPipelineDesc pipeline_desc(wgpu::TextureFormat efb, const wgpu::P
       .fragmentEntry = "fs_main",
       .layout = layout,
       .layoutKey = layoutKey,
-      .colorCount = 1,
+      .colorCount = radiance ? 2u : 1u,
   };
   // EFB alpha is the game's shadow stencil, so the composite writes RGB only
   desc.colors[0] = {.format = efb, .writeMask = RgbMask};
+  if (radiance) {
+    desc.defines = RadianceDefines;
+    desc.colors[1] = {.format = RadianceFormat, .writeMask = wgpu::ColorWriteMask::All};
+  }
   return desc;
 }
 
@@ -505,6 +598,7 @@ void shutdown() noexcept {
       "camera, {} under a class view, {} graphs refused)";
   constexpr std::string_view PbrLine =
       "Composite PBR term ran on {} frames ({} with scene.hdr, {} idle without AO or H)";
+  constexpr std::string_view RadianceLine = "Composite radiance written on {} frames ({} cleared on bail)";
   if (m8_env_set()) {
     Log.info(Line, c.draws, c.skippedMismatch, c.skippedNoScene, c.skippedView, c.contractFailures);
   } else {
@@ -514,6 +608,11 @@ void shutdown() noexcept {
     Log.info(PbrLine, c.pbrDraws, c.hdrDraws, c.idleFrames);
   } else {
     Log.debug(PbrLine, c.pbrDraws, c.hdrDraws, c.idleFrames);
+  }
+  if (m8_env_set()) {
+    Log.info(RadianceLine, c.radianceDraws, c.radianceClears);
+  } else {
+    Log.debug(RadianceLine, c.radianceDraws, c.radianceClears);
   }
 }
 
@@ -632,6 +731,8 @@ Counters counters() noexcept {
       .pbrDraws = g_pbrDraws.load(std::memory_order_relaxed),
       .idleFrames = g_idleFrames.load(std::memory_order_relaxed),
       .hdrDraws = g_hdrDraws.load(std::memory_order_relaxed),
+      .radianceDraws = g_radianceDraws.load(std::memory_order_relaxed),
+      .radianceClears = g_radianceClears.load(std::memory_order_relaxed),
   };
 }
 
@@ -641,6 +742,7 @@ void reset() noexcept {
   g_paramsOverride.reset();
   g_producersOverride.reset();
   g_readyOverride.reset();
+  g_radianceForced.reset();
   g_contractWarned = false;
   g_mismatchWarned.store(false, std::memory_order_relaxed);
   g_copies.store(0, std::memory_order_relaxed);
@@ -652,6 +754,8 @@ void reset() noexcept {
   g_pbrDraws.store(0, std::memory_order_relaxed);
   g_idleFrames.store(0, std::memory_order_relaxed);
   g_hdrDraws.store(0, std::memory_order_relaxed);
+  g_radianceDraws.store(0, std::memory_order_relaxed);
+  g_radianceClears.store(0, std::memory_order_relaxed);
 }
 
 void set_flags(std::optional<uint32_t> flags) noexcept { g_flagsOverride = flags; }
@@ -661,6 +765,8 @@ void force_params(std::optional<Params> params) noexcept { g_paramsOverride = pa
 void set_pbr_producers_override(std::optional<bool> live) noexcept { g_producersOverride = live; }
 
 void set_ready_override(std::optional<bool> ready) noexcept { g_readyOverride = ready; }
+
+void set_radiance_forced(std::optional<bool> forced) noexcept { g_radianceForced = forced; }
 
 bool pbr_active_for(bool live, bool hdrLive, bool classView, const Settings& settings) noexcept {
   return live && hdrLive && pbr_term_wanted(settings) && !classView;
@@ -707,6 +813,31 @@ std::array<float, 3> legacy_pbr_hdr(std::array<float, 3> legacy, std::array<floa
     const float encoded = linear <= 0.0031308f ? linear * 12.92f : 1.055f * std::pow(linear, 1.f / 2.4f) - 0.055f;
     const float t = 1.f - legacyBlend;
     out[i] = legacy[i] - sp + (sp * a * (1.f - t) + (1.f - q) * encoded * t);
+  }
+  return out;
+}
+
+std::array<float, 2> units(uint32_t flags, float e, float invE) noexcept {
+  return (flags & FlagPbr) != 0 ? std::array{e, invE} : std::array{1.f, 1.f};
+}
+
+std::array<float, 4> radiance(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7, float ao,
+                              float normalAlpha, std::array<float, 4> hdr, bool pbrFlag, float legacyBlend,
+                              float invE) noexcept {
+  const bool receiver = std::round(std::clamp(normalAlpha, 0.f, 1.f) * 3.f) >= 1.f;
+  const float a = receiver && ao < 1.f ? ao : 1.f;
+  const float q = static_cast<float>(std::min(q7, 127u)) / 127.f;
+  const float divisor = std::max(1.f - q, static_cast<float>(127u - RadianceFogCutQ7) / 127.f);
+  const bool pbr = pbrFlag && hdr[3] >= 0.5f && legacyBlend < 1.f;
+  const float t = 1.f - legacyBlend;
+  std::array<float, 4> out{0.f, 0.f, 0.f, 1.f};
+  for (size_t i = 0; i < 3; ++i) {
+    const float s = legacy[i] - q * fogColor[i];
+    if (s < -2.f / 255.f) {
+      return {};
+    }
+    const float leg = srgb_to_linear(std::clamp(std::max(s, 0.f) * a / divisor, 0.f, 1.f)) * invE;
+    out[i] = pbr ? leg * (1.f - t) + hdr[i] * t : leg;
   }
   return out;
 }

@@ -65,3 +65,21 @@ fn composite_eval(l: vec3f, rec: GbufFog, t: CompositeTerms) -> CompositeEval {
   }
   return CompositeEval(rgb, s, bad, bad || composite_is_identity(t));
 }
+//#if COMPOSITE_RADIANCE
+
+// The meter's q7 114 cut: fog-drowned pixels give darker radiance, never fog colour
+const COMPOSITE_RADIANCE_MIN_T: f32 = 13.0 / 127.0;
+
+// Exposure applies only while the PBR term is armed; radiance takes .y and legacy bounce .x, so the two cancel
+fn composite_units(flags: u32, e: f32, inv_e: f32) -> vec2f {
+  return select(vec2f(1.0), vec2f(e, inv_e), (flags & COMPOSITE_FLAG_PBR) != 0u);
+}
+
+// Divides GX fog out of the pre-fog result, so screen-space passes never gather fog colour
+fn composite_radiance(e: CompositeEval, rec: GbufFog, t: CompositeTerms, inv_e: f32) -> vec4f {
+  let sx = max(e.s, vec3f(0.0)) * composite_legacy_scale(t);
+  let leg = srgb_to_linear(saturate(sx / max(1.0 - rec.q, COMPOSITE_RADIANCE_MIN_T))) * inv_e;
+  let r = select(leg, mix(leg, t.h, 1.0 - t.lb), t.pbr && t.lb < 1.0);
+  return select(vec4f(r, 1.0), vec4f(0.0), e.bad);
+}
+//#endif

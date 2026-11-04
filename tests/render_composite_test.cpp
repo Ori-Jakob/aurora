@@ -287,6 +287,18 @@ TEST(CompositeRules, TargetIsRgbOnlyInEfbFormat) {
     EXPECT_EQ(desc.depthFormat, wgpu::TextureFormat::Undefined);
     EXPECT_EQ(desc.sampleCount, 1u);
     EXPECT_EQ(desc.layoutKey, 7u);
+    EXPECT_TRUE(desc.defines.empty());
+    const shaders::RenderPipelineDesc radiance = composite::pipeline_desc(format, {}, 7, true);
+    EXPECT_EQ(radiance.shader, composite::Shader);
+    ASSERT_EQ(radiance.colorCount, 2u);
+    EXPECT_EQ(radiance.colors[0].format, format);
+    EXPECT_EQ(radiance.colors[0].writeMask, RgbMask);
+    EXPECT_EQ(radiance.colors[1].format, wgpu::TextureFormat::RGBA16Float);
+    EXPECT_EQ(radiance.colors[1].writeMask, wgpu::ColorWriteMask::All);
+    EXPECT_FALSE(radiance.colors[1].blend);
+    ASSERT_EQ(radiance.defines.size(), 1u);
+    EXPECT_EQ(radiance.defines[0], "COMPOSITE_RADIANCE");
+    EXPECT_EQ(radiance.layoutKey, 7u);
   }
 }
 
@@ -560,6 +572,261 @@ TEST(CompositeRules, NonFiniteHdrMirrorStaysFinite) {
       }
     }
   }
+}
+
+GraphEnvironment radiance_env() {
+  GraphEnvironment env;
+  env.gxFormats[static_cast<size_t>(GxResource::Color)] = wgpu::TextureFormat::BGRA8Unorm;
+  env.gxFormats[static_cast<size_t>(GxResource::Fog)] = wgpu::TextureFormat::RGBA8Uint;
+  env.gxFormats[static_cast<size_t>(GxResource::Normal)] = wgpu::TextureFormat::RGB10A2Unorm;
+  env.gxFormats[static_cast<size_t>(GxResource::Motion)] = wgpu::TextureFormat::RG16Float;
+  return env;
+}
+
+struct RadianceForcedReset {
+  ~RadianceForcedReset() {
+    composite::testing::set_radiance_forced(std::nullopt);
+    composite::testing::set_flags(std::nullopt);
+  }
+};
+
+TEST(CompositeRules, RadianceWantedFollowsSsil) {
+  const RadianceForcedReset reset;
+  composite::testing::set_radiance_forced(false);
+  const GraphEnvironment env = radiance_env();
+  const auto wanted = [](const Settings& settings, const GraphEnvironment& e, DepthSource depth = DepthSource::Direct) {
+    return composite::radiance_wanted({.settings = &settings, .env = &e, .sceneDepth = depth});
+  };
+  Settings ssil = ao_settings();
+  ssil.ssil = true;
+  EXPECT_TRUE(wanted(ssil, env));
+  EXPECT_FALSE(wanted(ao_settings(), env));
+  Settings noAo = ssil;
+  noAo.ao = Quality::Off;
+  EXPECT_FALSE(wanted(noAo, env));
+  EXPECT_FALSE(wanted(ssil, env, DepthSource::Unavailable));
+  GraphEnvironment noMotion = env;
+  noMotion.gxFormats[static_cast<size_t>(GxResource::Motion)] = wgpu::TextureFormat::Undefined;
+  EXPECT_FALSE(wanted(ssil, noMotion));
+  GraphEnvironment noFog = env;
+  noFog.gxFormats[static_cast<size_t>(GxResource::Fog)] = wgpu::TextureFormat::Undefined;
+  EXPECT_FALSE(wanted(ssil, noFog));
+  GraphEnvironment msaa = env;
+  msaa.gxSampleCount = 4;
+  EXPECT_FALSE(wanted(ssil, msaa));
+  EXPECT_FALSE(composite::radiance_wanted({.settings = nullptr, .env = &env, .sceneDepth = DepthSource::Direct}));
+  for (const uint32_t flags : {0u, uint32_t{composite::FlagIdentity}}) {
+    composite::testing::set_flags(flags);
+    for (const float lb : {0.f, 0.5f, 1.f}) {
+      Settings pbr = ssil;
+      pbr.pbr = true;
+      pbr.legacyBlend = lb;
+      EXPECT_TRUE(wanted(pbr, env)) << lb;
+      pbr.ssil = false;
+      EXPECT_FALSE(wanted(pbr, env)) << lb;
+    }
+  }
+  composite::testing::set_radiance_forced(true);
+  EXPECT_TRUE(wanted(ao_settings(), env));
+  EXPECT_FALSE(wanted(noAo, env));
+  EXPECT_FALSE(wanted(ao_settings(), msaa));
+  EXPECT_FALSE(wanted(ao_settings(), noMotion));
+}
+
+TEST(CompositeRules, RadianceEnvParses) {
+  EXPECT_EQ(composite::RadianceEnv, "AURORA_RENDER_COMPOSITE_RADIANCE");
+  EXPECT_EQ(composite::RadianceDefine, "COMPOSITE_RADIANCE");
+  EXPECT_EQ(composite::RadianceFormat, wgpu::TextureFormat::RGBA16Float);
+  EXPECT_TRUE(composite::radiance_env_on("on"));
+  for (const char* value : {"off", "ON", "", "1", "on ", "true"}) {
+    EXPECT_FALSE(composite::radiance_env_on(value)) << value;
+  }
+  EXPECT_FALSE(composite::radiance_env_on(nullptr));
+}
+
+float radiance_stored(float linear) { return encode_srgb(linear); }
+
+TEST(CompositeRules, RadianceMirrorRemovesFog) {
+  constexpr std::array<std::array<uint8_t, 3>, 5> Fogs{
+      {{255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 255}, {128, 153, 179}}};
+  std::mt19937 rng{0xF06u};
+  std::uniform_int_distribution<int> byte(0, 255);
+  for (const auto& fcBytes : Fogs) {
+    const std::array<float, 3> fc{fcBytes[0] / 255.f, fcBytes[1] / 255.f, fcBytes[2] / 255.f};
+    const float norm = std::sqrt(fc[0] * fc[0] + fc[1] * fc[1] + fc[2] * fc[2]);
+    double along = 0.0;
+    size_t count = 0;
+    for (uint32_t q7 = 0; q7 <= 127; ++q7) {
+      const float q = static_cast<float>(q7) / 127.f;
+      const float divisor = std::max(1.f - q, 13.f / 127.f);
+      for (int i = 0; i < 64; ++i) {
+        std::array<float, 3> s{};
+        std::array<float, 3> l{};
+        for (size_t c = 0; c < 3; ++c) {
+          s[c] = static_cast<float>(byte(rng)) / 255.f;
+          l[c] = std::round(255.f * ((1.f - q) * s[c] + q * fc[c])) / 255.f;
+        }
+        const std::array<float, 4> r = composite::testing::radiance(l, fc, q7, 1.f, 1.f, {}, false, 0.f, 1.f);
+        ASSERT_EQ(r[3], 1.f) << q7;
+        double dot = 0.0;
+        for (size_t c = 0; c < 3; ++c) {
+          const float expected = s[c] * (1.f - q) / divisor;
+          const float stored = radiance_stored(r[c]);
+          ASSERT_NEAR(stored, expected, 0.5f / 255.f / divisor + 2e-5f) << q7 << " " << c;
+          dot += (stored - expected) * fc[c] / norm;
+        }
+        along += dot;
+        ++count;
+      }
+    }
+    EXPECT_LE(std::abs(along / static_cast<double>(count)) * 255.0, 0.1) << int{fcBytes[0]} << int{fcBytes[1]};
+  }
+}
+
+TEST(CompositeRules, RadianceMirrorBlendOneIsLegacy) {
+  std::mt19937 rng{0x1E6u};
+  size_t valid = 0;
+  for (int i = 0; i < 4000; ++i) {
+    MirrorInput in = random_input(rng, i);
+    const std::array<float, 4> legacy =
+        composite::testing::radiance(in.l, in.fc, in.q7, in.ao, in.alpha, in.hdr, false, 0.f, 1.f);
+    ASSERT_EQ(composite::testing::radiance(in.l, in.fc, in.q7, in.ao, in.alpha, in.hdr, true, 1.f, 1.f), legacy) << i;
+    const std::array<float, 4> pbr =
+        composite::testing::radiance(in.l, in.fc, in.q7, in.ao, in.alpha, in.hdr, true, 0.f, 1.f);
+    if (legacy[3] == 0.f) {
+      ASSERT_EQ(pbr, legacy) << i;
+      continue;
+    }
+    ++valid;
+    ASSERT_EQ(pbr, (std::array<float, 4>{in.hdr[0], in.hdr[1], in.hdr[2], 1.f})) << i;
+    in.hdr[3] = 0.49f;
+    for (const float lb : {0.f, 0.5f}) {
+      ASSERT_EQ(composite::testing::radiance(in.l, in.fc, in.q7, in.ao, in.alpha, in.hdr, true, lb, 1.f), legacy) << i;
+    }
+  }
+  EXPECT_GT(valid, 1000u);
+}
+
+TEST(CompositeRules, RadianceUnitsFollowFlagPbrOnly) {
+  std::mt19937 rng{0x0417u};
+  for (const float e : {0.5f, 1.f, 2.7f}) {
+    for (const uint32_t flags : {0u, uint32_t{composite::FlagIdentity}, uint32_t{composite::FlagNoFog},
+                                 composite::FlagTonemapAgX, composite::FlagIdentity | composite::FlagTonemapAgX}) {
+      EXPECT_EQ(composite::testing::units(flags, e, 1.f / e), (std::array<float, 2>{1.f, 1.f})) << flags;
+      EXPECT_EQ(composite::testing::units(flags | composite::FlagPbr, e, 1.f / e), (std::array<float, 2>{e, 1.f / e}))
+          << flags;
+    }
+    // A legacy receiver's bounce multiplies by .x, so legacy-to-legacy light does not depend on e
+    const std::array<float, 2> units = composite::testing::units(composite::FlagPbr, e, 1.f / e);
+    for (int i = 0; i < 500; ++i) {
+      MirrorInput in = random_input(rng, i);
+      in.hdr[3] = 0.f;
+      const std::array<float, 4> plain =
+          composite::testing::radiance(in.l, in.fc, in.q7, in.ao, in.alpha, in.hdr, true, 0.f, 1.f);
+      const std::array<float, 4> scaled =
+          composite::testing::radiance(in.l, in.fc, in.q7, in.ao, in.alpha, in.hdr, true, 0.f, units[1]);
+      for (size_t c = 0; c < 3; ++c) {
+        ASSERT_NEAR(scaled[c] * units[0], plain[c], 1e-6f * std::max(plain[c], 1.f)) << i;
+      }
+      ASSERT_EQ(scaled[3], plain[3]);
+    }
+  }
+}
+
+TEST(CompositeRules, RadianceLegacyBiasIsPinned) {
+  constexpr float Grey = 0.18f;
+  for (const bool agx : {false, true}) {
+    const lighting::tonemap::Rgb mapped = lighting::tonemap::apply({Grey, Grey, Grey}, agx);
+    EXPECT_NEAR(mapped[0], agx ? 0.2148f : 0.14f, 1e-3f) << agx;
+    const float y = std::round(encode_srgb(mapped[0]) * 255.f) / 255.f;
+    for (const float e : {0.5f, 1.f, 2.7f}) {
+      // The legacy branch stores lin(y)/e with no tonemap inverse, so it reads T(0.18), not 0.18
+      const std::array<float, 4> r = composite::testing::radiance({y, y, y}, {}, 0, 1.f, 1.f, {}, true, 0.f, 1.f / e);
+      EXPECT_NEAR(r[0] * e / Grey, mapped[0] / Grey, 0.015f) << agx << " " << e;
+    }
+  }
+}
+
+TEST(CompositeRules, RadianceFogCutMatchesMeter) {
+  EXPECT_EQ(composite::RadianceFogCutQ7, lighting::exposure::FogCutQ7);
+  EXPECT_EQ(static_cast<float>(127u - composite::RadianceFogCutQ7) / 127.f, 13.f / 127.f);
+  const std::array<float, 3> fc{0.8f, 0.6f, 0.4f};
+  for (uint32_t q7 = 100; q7 <= 127; ++q7) {
+    // The pixel is fog colour all through, so above the cut its radiance only darkens toward black
+    const std::array<float, 4> r = composite::testing::radiance(fc, fc, q7, 1.f, 1.f, {}, false, 0.f, 1.f);
+    const float q = static_cast<float>(q7) / 127.f;
+    const float scale = q7 <= composite::RadianceFogCutQ7 ? 1.f : (1.f - q) / (13.f / 127.f);
+    for (size_t c = 0; c < 3; ++c) {
+      ASSERT_NEAR(radiance_stored(r[c]), fc[c] * scale, 2e-5f) << q7;
+      ASSERT_LE(radiance_stored(r[c]), fc[c] + 2e-5f) << q7;
+    }
+  }
+  const std::array<float, 4> drowned = composite::testing::radiance(fc, fc, 127, 1.f, 1.f, {}, false, 0.f, 1.f);
+  EXPECT_EQ(drowned, (std::array<float, 4>{0.f, 0.f, 0.f, 1.f}));
+}
+
+struct RadianceProbe {
+  bool prev = false;
+  int calls = 0;
+  std::vector<bool> prevValid;
+  wgpu::Buffer readback;
+  uint32_t rowBytes = 0;
+  wgpu::Extent3D extent{};
+};
+
+// A prev probe reads last frame's radiance where SSIL will; a copy probe reads this frame's after the composite
+void declare_radiance_probe(InternalPassBuilder& builder, const PassSetup&, const void* state) {
+  const auto& probe = *static_cast<const RadianceProbe*>(state);
+  if (probe.prev) {
+    builder.after(phase::Ao);
+    builder.use_prev(resource::RadianceDefogged);
+  } else {
+    builder.after(composite::Pass);
+    builder.use(resource::RadianceDefogged, Access::CopySrc);
+  }
+  builder.side_effect();
+}
+
+void encode_radiance_probe(PassContext& ctx, const void* state) {
+  auto& probe = *static_cast<RadianceProbe*>(const_cast<void*>(state));
+  ++probe.calls;
+  if (probe.prev) {
+    probe.prevValid.push_back(ctx.prev_valid(TexRef{0}));
+    return;
+  }
+  probe.extent = ctx.extent(TexRef{0});
+  probe.rowBytes = (probe.extent.width * 8 + 255) & ~255u;
+  const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                          .size = uint64_t{probe.rowBytes} * probe.extent.height};
+  probe.readback = ctx.device().CreateBuffer(&descriptor);
+  const wgpu::TexelCopyTextureInfo source{.texture = ctx.texture(TexRef{0})};
+  const wgpu::TexelCopyBufferInfo destination{
+      .layout = {.bytesPerRow = probe.rowBytes, .rowsPerImage = probe.extent.height}, .buffer = probe.readback};
+  const wgpu::Extent3D size{probe.extent.width, probe.extent.height, 1};
+  ctx.encoder().CopyTextureToBuffer(&source, &destination, &size);
+}
+
+PassDesc radiance_probe_desc(RadianceProbe& probe) {
+  return {
+      .name = probe.prev ? "t.radiance_prev" : "t.radiance_copy",
+      .stage = Stage::OpaqueDone,
+      .kind = probe.prev ? PassKind::Compute : PassKind::Copy,
+      .order = 0,
+      .runsWithoutMarker = true,
+      .declare = declare_radiance_probe,
+      .encode = encode_radiance_probe,
+      .state = &probe,
+  };
+}
+
+// History resets read the scene hints, so tests that cut the camera emit it through the hint sink
+void emit_camera(uint32_t cutEpoch) {
+  begin_hint_frame();
+  gx::hints::Camera camera = camera_hints()->mainCamera;
+  camera.view = {{1.f, 0.f, 0.f, 0.f}, {0.f, 1.f, 0.f, 0.f}, {0.f, 0.f, 1.f, 0.f}};
+  camera.cutEpoch = cutEpoch;
+  const gx::hints::Sink& sink = *gx::hints::sink();
+  sink.camera(sink.userData, camera);
 }
 
 class CompositeDeviceTest : public ::testing::Test {
@@ -1268,20 +1535,20 @@ TEST_F(CompositeGraph, BlendChangeKeepsGraphHash) {
   const NodeId node = first->find_node(composite::Pass);
   const shaders::PipelineStats before = shaders::stats();
   uint64_t frame = 0;
-  const auto history_kept = [&](const std::shared_ptr<CompiledGraph>& graph) {
+  const auto history_kept = [&](const std::shared_ptr<CompiledGraph>& graph, std::string_view name) {
     const FrameState state{.graph = graph};
     StageData stage = build(state, ++frame);
-    const auto resource = graph->find_resource(HistoryName);
+    const auto resource = graph->find_resource(name);
     if (resource == InvalidResource) {
-      ADD_FAILURE() << "no " << HistoryName << " in the graph";
+      ADD_FAILURE() << "no " << name << " in the graph";
       return false;
     }
     const bool kept = stage.prev_valid(graph->resources[resource].historySlot);
     EXPECT_EQ(encode(stage), std::nullopt);
     return kept;
   };
-  EXPECT_FALSE(history_kept(first));
-  EXPECT_TRUE(history_kept(first));
+  EXPECT_FALSE(history_kept(first, HistoryName));
+  EXPECT_TRUE(history_kept(first, HistoryName));
   for (const float lb : {0.5f, 0.f, 1.f}) {
     const auto graph = live_graph(pbr_settings(lb, Quality::High));
     EXPECT_EQ(graph->graphHash, first->graphHash) << lb;
@@ -1289,7 +1556,21 @@ TEST_F(CompositeGraph, BlendChangeKeepsGraphHash) {
     const shaders::PipelineStats now = shaders::stats();
     EXPECT_EQ(now.ready + now.pending + now.failed, before.ready + before.pending + before.failed) << lb;
     EXPECT_EQ(composite::pbr_active(), lb < 1.f && !composite::identity_forced()) << lb;
-    EXPECT_TRUE(history_kept(graph)) << lb;
+    EXPECT_TRUE(history_kept(graph, HistoryName)) << lb;
+  }
+  composite::testing::set_radiance_forced(true);
+  const auto radiance = live_graph(pbr_settings(1.f, Quality::High));
+  ASSERT_TRUE(composite::radiance_bound(*radiance));
+  EXPECT_NE(radiance->graphHash, first->graphHash);
+  EXPECT_FALSE(history_kept(radiance, resource::RadianceDefogged));
+  EXPECT_TRUE(history_kept(radiance, resource::RadianceDefogged));
+  for (const float lb : {0.5f, 0.f, 1.f}) {
+    const auto graph = live_graph(pbr_settings(lb, Quality::High));
+    EXPECT_EQ(graph->graphHash, radiance->graphHash) << lb;
+    EXPECT_EQ(graph->nodes[graph->find_node(composite::Pass)].pipelineIds,
+              radiance->nodes[radiance->find_node(composite::Pass)].pipelineIds)
+        << lb;
+    EXPECT_TRUE(history_kept(graph, resource::RadianceDefogged)) << lb;
   }
 }
 
@@ -1842,6 +2123,259 @@ TEST_F(CompositeGraph, AoGateFollowsComposite) {
   EXPECT_FALSE(composite::ao_gate(state));
 }
 
+TEST_F(CompositeGraph, RadianceIsSecondAttachmentAfterColor) {
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  composite::testing::set_radiance_forced(true);
+  const auto graph = live_graph(ao_settings());
+  ASSERT_EQ(composite::check_contract(*graph), std::nullopt);
+  ASSERT_TRUE(composite::live());
+  ASSERT_TRUE(composite::radiance_bound(*graph));
+  const NodeId node = graph->find_node(composite::Pass);
+  const auto uses = graph->node_uses(node);
+  ASSERT_EQ(uses.size(), 9u);
+  EXPECT_EQ(graph->resources[uses[7].resource].name, resource::GxColor);
+  EXPECT_EQ(uses[7].access, Access::ColorRMW);
+  EXPECT_EQ(graph->resources[uses[8].resource].name, resource::RadianceDefogged);
+  EXPECT_EQ(uses[8].access, Access::ColorWrite);
+  const CompiledResource& radiance = graph->resources[uses[8].resource];
+  const CompiledResource& legacy = graph->resources[graph->find_resource(composite::LegacyTex)];
+  EXPECT_EQ(radiance.kind, ResourceKind::History);
+  EXPECT_EQ(radiance.creator, node);
+  EXPECT_EQ(radiance.tex.format, wgpu::TextureFormat::RGBA16Float);
+  EXPECT_EQ(radiance.tex.sizeClass, SizeClass::Efb);
+  EXPECT_EQ(radiance.tex.divisor, 1u);
+  EXPECT_EQ(radiance.extent.width, legacy.extent.width);
+  EXPECT_EQ(radiance.extent.height, legacy.extent.height);
+  EXPECT_NE(radiance.textureUsage & wgpu::TextureUsage::TextureBinding, wgpu::TextureUsage::None);
+  EXPECT_NE(radiance.textureUsage & wgpu::TextureUsage::RenderAttachment, wgpu::TextureUsage::None);
+  for (size_t i = 0; i < 7; ++i) {
+    EXPECT_NE(uses[i].access, Access::ColorWrite) << i;
+  }
+  const std::array<std::string_view, 7> inputs{composite::LegacyTex,        resource::Fog,     resource::GxNormal,
+                                               resource::AoFinal,           resource::Surface, resource::SceneHdr,
+                                               lighting::exposure::Resource};
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    EXPECT_EQ(graph->resources[uses[i].resource].name, inputs[i]) << i;
+  }
+  const FrameState state{.graph = graph};
+  testing::record_bind_details(true);
+  EXPECT_EQ(run(state, 1), std::nullopt);
+  const std::vector<testing::AttachmentOps> ops = testing::last_attachment_ops();
+  testing::record_bind_details(false);
+  ASSERT_EQ(ops.size(), 2u);
+  EXPECT_EQ(ops[0].load, wgpu::LoadOp::Load);
+  EXPECT_EQ(ops[1].load, wgpu::LoadOp::Clear);
+  EXPECT_EQ(ops[1].width, legacy.extent.width);
+  EXPECT_EQ(composite::testing::counters().radianceDraws, 1u);
+  EXPECT_EQ(composite::testing::counters().radianceClears, 0u);
+}
+
+TEST_F(CompositeGraph, SsilOffKeepsGraphAndPipeline) {
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  composite::testing::set_radiance_forced(false);
+  const auto off = live_graph(ao_settings());
+  const NodeId node = off->find_node(composite::Pass);
+  ASSERT_EQ(off->nodes[node].status, CullReason::None);
+  EXPECT_FALSE(composite::radiance_bound(*off));
+  EXPECT_EQ(off->find_resource(resource::RadianceDefogged), InvalidResource);
+  EXPECT_EQ(off->node_uses(node).size(), 8u);
+  const composite::Params offParams = latched_params(*off);
+  composite::testing::set_radiance_forced(true);
+  const auto on = live_graph(ao_settings());
+  ASSERT_TRUE(composite::radiance_bound(*on));
+  EXPECT_NE(on->graphHash, off->graphHash);
+  EXPECT_NE(on->nodes[on->find_node(composite::Pass)].pipelineIds[0], off->nodes[node].pipelineIds[0]);
+  EXPECT_TRUE(same_params(latched_params(*on), offParams));
+  composite::testing::set_radiance_forced(false);
+  const auto back = live_graph(ao_settings());
+  EXPECT_EQ(back->graphHash, off->graphHash);
+  EXPECT_EQ(back->nodes[back->find_node(composite::Pass)].pipelineIds, off->nodes[node].pipelineIds);
+  EXPECT_TRUE(same_params(latched_params(*back), offParams));
+  Settings ssil = ao_settings();
+  ssil.ssil = true;
+  EXPECT_TRUE(composite::radiance_bound(*compile(ssil)));
+  ssil.ao = Quality::Off;
+  EXPECT_EQ(compile(ssil)->find_resource(resource::RadianceDefogged), InvalidResource);
+}
+
+TEST_F(CompositeGraph, RadianceHistoryIsSinkWithoutReader) {
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  composite::testing::set_radiance_forced(true);
+  const auto graph = live_graph(ao_settings());
+  const NodeId node = graph->find_node(composite::Pass);
+  const ResourceId id = graph->find_resource(resource::RadianceDefogged);
+  ASSERT_NE(id, InvalidResource);
+  EXPECT_EQ(graph->nodes[node].status, CullReason::None);
+  for (const CompiledUse& use : graph->uses) {
+    if (use.resource == id) {
+      EXPECT_EQ(use.node, node) << graph->nodes[use.node].name;
+    }
+  }
+  EXPECT_NE(std::ranges::find(graph->histories, id), graph->histories.end());
+  const FrameState state{.graph = graph};
+  for (uint64_t frame = 1; frame <= 3; ++frame) {
+    StageData opaque = build(state, frame);
+    EXPECT_TRUE(pass_enabled(*graph, opaque, composite::Pass));
+    EXPECT_EQ(opaque.prev_valid(graph->resources[id].historySlot), frame > 1) << frame;
+    EXPECT_EQ(encode(opaque), std::nullopt);
+  }
+  EXPECT_EQ(composite::testing::counters().draws, 3u);
+  EXPECT_EQ(composite::testing::counters().radianceDraws, 3u);
+  EXPECT_EQ(composite::testing::counters().radianceClears, 0u);
+}
+
+TEST_F(CompositeGraph, RadianceContractMismatchRefuses) {
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  composite::testing::set_radiance_forced(true);
+  for (int edit = 0; edit < 3; ++edit) {
+    SCOPED_TRACE(edit);
+    const auto graph = compile(ao_settings());
+    ASSERT_EQ(composite::check_contract(*graph), std::nullopt);
+    CompiledResource& radiance = graph->resources[graph->find_resource(resource::RadianceDefogged)];
+    if (edit == 0) {
+      radiance.tex.format = wgpu::TextureFormat::RGBA8Unorm;
+    } else if (edit == 1) {
+      radiance.extent.width /= 2;
+    } else {
+      radiance.kind = ResourceKind::Transient;
+    }
+    const std::optional<std::string> reason = composite::check_contract(*graph);
+    ASSERT_TRUE(reason.has_value());
+    EXPECT_NE(reason->find(resource::RadianceDefogged), std::string::npos) << *reason;
+    composite::on_latch({.settings = &m_settings, .env = &m_env}, nullptr);
+    latch(graph.get());
+    EXPECT_FALSE(composite::live());
+  }
+  EXPECT_EQ(composite::testing::counters().contractFailures, 3u);
+}
+
+TEST_F(CompositeGraph, RadianceClearedOnEncodeBail) {
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  composite::testing::set_radiance_forced(true);
+  // A scene extent the EFB does not match passes the contract but fails the encode-time legacy check
+  m_sceneSize = GraphExtent{48, 40};
+  const auto graph = live_graph(ao_settings());
+  ASSERT_TRUE(composite::live());
+  ASSERT_TRUE(composite::radiance_bound(*graph));
+  const FrameState state{.graph = graph};
+  testing::record_bind_details(true);
+  EXPECT_EQ(run(state, 1), std::nullopt);
+  const std::vector<testing::AttachmentOps> ops = testing::last_attachment_ops();
+  testing::record_bind_details(false);
+  ASSERT_EQ(ops.size(), 1u);
+  EXPECT_FALSE(ops[0].depth);
+  EXPECT_EQ(ops[0].load, wgpu::LoadOp::Clear);
+  EXPECT_EQ(ops[0].store, wgpu::StoreOp::Store);
+  EXPECT_EQ(ops[0].clearColor.r, 0.0);
+  EXPECT_EQ(ops[0].clearColor.a, 0.0);
+  EXPECT_EQ(ops[0].width, 48u);
+  EXPECT_EQ(ops[0].height, 40u);
+  const composite::testing::Counters c = composite::testing::counters();
+  EXPECT_EQ(c.draws, 0u);
+  EXPECT_EQ(c.radianceDraws, 0u);
+  EXPECT_EQ(c.radianceClears, 1u);
+  EXPECT_GE(c.skippedMismatch, 1u);
+}
+
+TEST_F(CompositeGraph, RadianceEncodeReadsTheEncodedGraph) {
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  uint64_t frame = 0;
+  const auto graphs = [&] {
+    composite::testing::set_radiance_forced(true);
+    const auto with = compile(ao_settings());
+    composite::testing::set_radiance_forced(false);
+    const auto without = compile(ao_settings());
+    wait_ready(*with);
+    wait_ready(*without);
+    EXPECT_TRUE(composite::radiance_bound(*with));
+    EXPECT_FALSE(composite::radiance_bound(*without));
+    return std::pair{with, without};
+  };
+  // A is enabled against its own latch, then B is latched before A encodes, as a worker can see it
+  const auto encode_after_latch = [&](const std::shared_ptr<CompiledGraph>& a,
+                                      const std::shared_ptr<CompiledGraph>& b) {
+    composite::on_latch({.settings = &m_settings, .env = &m_env}, nullptr);
+    latch(a.get());
+    const FrameState state{.graph = a};
+    StageData opaque = build(state, ++frame);
+    EXPECT_TRUE(pass_enabled(*a, opaque, composite::Pass));
+    latch(b.get());
+    EXPECT_EQ(encode(opaque), std::nullopt);
+  };
+  const auto [with, without] = graphs();
+  encode_after_latch(with, without);
+  EXPECT_EQ(composite::testing::counters().draws, 1u);
+  EXPECT_EQ(composite::testing::counters().radianceDraws, 1u);
+  encode_after_latch(without, with);
+  EXPECT_EQ(composite::testing::counters().draws, 2u);
+  EXPECT_EQ(composite::testing::counters().radianceDraws, 1u);
+  m_sceneSize = GraphExtent{48, 40};
+  const auto [withBad, withoutBad] = graphs();
+  encode_after_latch(withBad, withoutBad);
+  EXPECT_EQ(composite::testing::counters().radianceClears, 1u);
+  encode_after_latch(withoutBad, withBad);
+  EXPECT_EQ(composite::testing::counters().radianceClears, 1u);
+  EXPECT_EQ(composite::testing::counters().draws, 2u);
+}
+
+TEST_F(CompositeGraph, RadiancePrevFollowsCompositeRuns) {
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  RadianceProbe probe{.prev = true};
+  register_pass(radiance_probe_desc(probe));
+  composite::testing::set_radiance_forced(true);
+  auto graph = live_graph(ao_settings());
+  uint64_t frame = 0;
+  uint32_t epoch = 0;
+  const auto prev_valid = [&](const std::shared_ptr<CompiledGraph>& g) {
+    emit_camera(epoch);
+    const FrameState state{.graph = g};
+    const size_t before = probe.prevValid.size();
+    EXPECT_EQ(run(state, ++frame), std::nullopt);
+    if (probe.prevValid.size() != before + 1) {
+      ADD_FAILURE() << "the probe did not run on frame " << frame;
+      return false;
+    }
+    return static_cast<bool>(probe.prevValid.back());
+  };
+  EXPECT_FALSE(prev_valid(graph));
+  EXPECT_TRUE(prev_valid(graph));
+  EXPECT_TRUE(prev_valid(graph));
+  m_settings.debugView = 1;
+  latch(graph.get());
+  EXPECT_TRUE(prev_valid(graph));
+  m_settings.debugView = 0;
+  latch(graph.get());
+  EXPECT_FALSE(prev_valid(graph));
+  EXPECT_TRUE(prev_valid(graph));
+  ++epoch;
+  EXPECT_FALSE(prev_valid(graph));
+  EXPECT_TRUE(prev_valid(graph));
+  m_sceneSize = GraphExtent{48, 40};
+  const auto resized = live_graph(ao_settings());
+  EXPECT_NE(resized->graphHash, graph->graphHash);
+  EXPECT_FALSE(prev_valid(resized));
+  m_sceneSize.reset();
+  graph = live_graph(ao_settings());
+  EXPECT_FALSE(prev_valid(graph));
+  EXPECT_TRUE(prev_valid(graph));
+  composite::testing::set_radiance_forced(false);
+  const auto off = live_graph(ao_settings());
+  EXPECT_FALSE(composite::radiance_bound(*off));
+  EXPECT_FALSE(prev_valid(off));
+  EXPECT_FALSE(prev_valid(off));
+  composite::testing::set_radiance_forced(true);
+  graph = live_graph(ao_settings());
+  EXPECT_FALSE(prev_valid(graph));
+  EXPECT_TRUE(prev_valid(graph));
+}
+
 struct Rgba {
   uint8_t r = 0;
   uint8_t g = 0;
@@ -1886,6 +2420,7 @@ struct PixelRun {
   uint32_t draws = 1;
   std::optional<float> exposure;
   std::function<void(std::array<uint16_t, 4>&, size_t)> hdrEdit;
+  bool radiance = false;
 };
 
 Pixel control() { return {.color = {200, 180, 160, 255}, .code = 1, .fc = {}, .q7 = 0, .ao = 64}; }
@@ -1978,6 +2513,7 @@ protected:
     }
     composite::testing::set_flags(options.flags);
     composite::testing::force_params(options.params);
+    composite::testing::set_radiance_forced(options.radiance);
     std::vector<uint32_t> color(pixels.size());
     std::vector<uint32_t> normal(pixels.size());
     std::vector<uint32_t> fog(pixels.size());
@@ -2046,11 +2582,24 @@ protected:
       meter.words = {*options.exposure, 1.f / *options.exposure, 1.f, 1.f};
       meterId = register_pass(stub_exposure_desc(meter));
     }
-    const uint32_t draws = composite::testing::counters().draws;
+    RadianceProbe probe;
+    const PassId probeId = options.radiance ? register_pass(radiance_probe_desc(probe)) : InvalidPassId;
+    const composite::testing::Counters before = composite::testing::counters();
+    const uint32_t draws = before.draws;
     const auto graph = live_graph(options.settings);
     EXPECT_TRUE(composite::live());
+    EXPECT_EQ(composite::radiance_bound(*graph), options.radiance);
     const FrameState state{.graph = graph};
     EXPECT_EQ(run(state, ++m_frame), std::nullopt);
+    if (probeId != InvalidPassId) {
+      unregister_pass(probeId);
+      EXPECT_EQ(probe.calls, 1);
+      m_radiance = read_radiance(probe);
+      m_radianceExtent = probe.extent;
+    }
+    EXPECT_EQ(composite::testing::counters().radianceDraws,
+              before.radianceDraws + (options.radiance ? options.draws : 0));
+    EXPECT_EQ(composite::testing::counters().radianceClears, before.radianceClears);
     if (stubId != InvalidPassId) {
       unregister_pass(stubId);
     }
@@ -2065,6 +2614,30 @@ protected:
     EXPECT_EQ(composite::testing::counters().draws, draws + options.draws);
     EXPECT_EQ(composite::testing::counters().skippedMismatch, 0u);
     return read_color(width, height);
+  }
+
+  std::vector<std::array<float, 4>> read_radiance(const RadianceProbe& probe) const {
+    std::vector<std::array<float, 4>> out(size_t{probe.extent.width} * probe.extent.height);
+    if (!probe.readback) {
+      ADD_FAILURE() << "the radiance probe copied nothing";
+      return out;
+    }
+    const auto words = test::read_buffer(*m_device, probe.readback, 0, uint64_t{probe.rowBytes} * probe.extent.height);
+    if (!words) {
+      ADD_FAILURE() << "radiance readback failed";
+      return out;
+    }
+    const auto* bytes = reinterpret_cast<const uint8_t*>(words->data());
+    for (uint32_t y = 0; y < probe.extent.height; ++y) {
+      for (uint32_t x = 0; x < probe.extent.width; ++x) {
+        std::array<uint16_t, 4> texel{};
+        std::memcpy(texel.data(), bytes + size_t{y} * probe.rowBytes + size_t{x} * 8, sizeof(texel));
+        out[size_t{y} * probe.extent.width + x] = {
+            lighting::openpbr::from_half(texel[0]), lighting::openpbr::from_half(texel[1]),
+            lighting::openpbr::from_half(texel[2]), lighting::openpbr::from_half(texel[3])};
+      }
+    }
+    return out;
   }
 
   static std::array<int, 3> mirror(const Pixel& p) {
@@ -2100,6 +2673,8 @@ protected:
   }
 
   uint64_t m_frame = 0;
+  std::vector<std::array<float, 4>> m_radiance;
+  wgpu::Extent3D m_radianceExtent{};
 };
 
 std::vector<Pixel> grid(uint32_t width, uint32_t height, const std::function<Pixel(uint32_t, uint32_t)>& fn) {
@@ -2641,6 +3216,244 @@ TEST_F(CompositeGpu, IdentityForcedIgnoresPbr) {
        .params = composite::Params{.flags = composite::FlagPbr | composite::FlagIdentity, .legacyBlend = 0.f}});
   for (size_t i = 0; i < out.size(); ++i) {
     ASSERT_TRUE(same(out[i], pixels[i].color)) << i;
+  }
+}
+float srgb_linear(float s) { return s <= 0.04045f ? s / 12.92f : std::pow((s + 0.055f) / 1.055f, 2.4f); }
+
+float half_ulp(float x) {
+  const float a = std::abs(x);
+  if (a < 6.103515625e-05f) {
+    return 5.9604645e-08f;
+  }
+  return std::ldexp(1.f, std::ilogb(a) - 10);
+}
+
+bool radiance_near(const std::array<float, 4>& gpu, const std::array<float, 4>& cpu) {
+  for (size_t c = 0; c < 4; ++c) {
+    if (std::abs(gpu[c] - cpu[c]) > half_ulp(cpu[c]) + 1e-7f) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::array<float, 4> radiance_mirror(const Pixel& p, bool pbrFlag, float legacyBlend, float invE,
+                                     std::optional<std::array<float, 4>> hdr = std::nullopt) {
+  const std::array<float, 3> l{p.color.r / 255.f, p.color.g / 255.f, p.color.b / 255.f};
+  const std::array<float, 3> fc{p.fc[0] / 255.f, p.fc[1] / 255.f, p.fc[2] / 255.f};
+  return composite::testing::radiance(l, fc, p.q7, p.ao / 255.f, p.code / 3.f, hdr.value_or(hdr_of(p)), pbrFlag,
+                                      legacyBlend, invE);
+}
+
+TEST_F(CompositeGpu, RadianceRewriteIsExact) {
+  std::mt19937 rng{47};
+  std::uniform_int_distribution<int> byte(0, 255);
+  // Rows 0-2 sweep one channel through every code on open receivers, rows 3-5 on code-0 pixels under AO
+  const auto pixels = grid(256, 6, [&](uint32_t x, uint32_t y) {
+    std::array<uint8_t, 3> rgb{static_cast<uint8_t>(byte(rng)), static_cast<uint8_t>(byte(rng)),
+                               static_cast<uint8_t>(byte(rng))};
+    rgb[y % 3] = static_cast<uint8_t>(x);
+    return Pixel{.color = {rgb[0], rgb[1], rgb[2], static_cast<uint8_t>(byte(rng))},
+                 .code = static_cast<uint8_t>(y < 3 ? 1 : 0),
+                 .fc = {static_cast<uint8_t>(byte(rng)), 0, 0},
+                 .q7 = 0,
+                 .ao = static_cast<uint8_t>(y < 3 ? 255 : 64)};
+  });
+  const auto out = run_pixels(256, 6, pixels, {.radiance = true});
+  for (size_t i = 0; i < out.size(); ++i) {
+    ASSERT_TRUE(same(out[i], pixels[i].color)) << i;
+    ASSERT_EQ(m_radiance[i][3], 1.f) << i;
+  }
+}
+
+TEST_F(CompositeGpu, RadianceVariantMatchesDefaultColour) {
+  std::mt19937 rng{53};
+  const auto pixels = grid(61, 37, [&](uint32_t x, uint32_t) { return random_pixel(rng, x % 3 == 0 ? 0 : 1); });
+  for (const Settings& settings : {ao_settings(), pbr_settings(0.f, Quality::High), pbr_settings(0.5f, Quality::High),
+                                   pbr_settings(1.f, Quality::High)}) {
+    SCOPED_TRACE(settings.pbr ? settings.legacyBlend : -1.f);
+    const auto plain = run_pixels(61, 37, pixels, {.settings = settings});
+    const auto radiance = run_pixels(61, 37, pixels, {.settings = settings, .radiance = true});
+    size_t changed = 0;
+    for (size_t i = 0; i < plain.size(); ++i) {
+      ASSERT_TRUE(same(radiance[i], plain[i])) << i;
+      changed += same(plain[i], pixels[i].color) ? 0 : 1;
+    }
+    EXPECT_GT(changed, plain.size() / 8);
+  }
+}
+
+TEST_F(CompositeGpu, RadianceRemovesFogColour) {
+  constexpr std::array<std::array<uint8_t, 3>, 5> Fogs{
+      {{255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 255}, {128, 153, 179}}};
+  constexpr uint32_t Rows = 8;
+  std::mt19937 rng{59};
+  std::uniform_int_distribution<int> byte(0, 255);
+  std::vector<std::array<uint8_t, 3>> surface(128 * Rows * Fogs.size());
+  for (auto& s : surface) {
+    s = {static_cast<uint8_t>(byte(rng)), static_cast<uint8_t>(byte(rng)), static_cast<uint8_t>(byte(rng))};
+  }
+  const auto pixels = grid(128, Rows * Fogs.size(), [&](uint32_t x, uint32_t y) {
+    const auto& fc = Fogs[y / Rows];
+    const auto& s = surface[size_t{y} * 128 + x];
+    const float q = static_cast<float>(x) / 127.f;
+    std::array<uint8_t, 3> l{};
+    for (size_t c = 0; c < 3; ++c) {
+      l[c] = static_cast<uint8_t>(std::lround(255.f * ((1.f - q) * s[c] / 255.f + q * fc[c] / 255.f)));
+    }
+    return Pixel{.color = {l[0], l[1], l[2], 255}, .code = 1, .fc = fc, .q7 = static_cast<uint8_t>(x), .ao = 255};
+  });
+  run_pixels(128, Rows * Fogs.size(), pixels, {.radiance = true});
+  for (size_t f = 0; f < Fogs.size(); ++f) {
+    const std::array<float, 3> fc{Fogs[f][0] / 255.f, Fogs[f][1] / 255.f, Fogs[f][2] / 255.f};
+    const float norm = std::sqrt(fc[0] * fc[0] + fc[1] * fc[1] + fc[2] * fc[2]);
+    double along = 0.0;
+    size_t count = 0;
+    for (uint32_t y = f * Rows; y < (f + 1) * Rows; ++y) {
+      for (uint32_t x = 0; x < 128; ++x) {
+        const size_t i = size_t{y} * 128 + x;
+        const std::array<float, 4>& r = m_radiance[i];
+        ASSERT_EQ(r[3], 1.f) << i;
+        const float q = static_cast<float>(x) / 127.f;
+        const float divisor = std::max(1.f - q, 13.f / 127.f);
+        const float bound = 0.5f / 255.f / divisor;
+        double dot = 0.0;
+        for (size_t c = 0; c < 3; ++c) {
+          const float expected = surface[i][c] / 255.f * (1.f - q) / divisor;
+          const float lo = srgb_linear(std::max(expected - bound, 0.f));
+          const float hi = srgb_linear(std::min(expected + bound, 1.f));
+          ASSERT_GE(r[c], lo - half_ulp(lo) - 1e-7f) << i << " " << c;
+          ASSERT_LE(r[c], hi + half_ulp(hi) + 1e-7f) << i << " " << c;
+          dot += (encode_srgb(r[c]) - expected) * fc[c] / norm;
+        }
+        along += dot;
+        ++count;
+      }
+    }
+    EXPECT_LE(std::abs(along / static_cast<double>(count)) * 255.0, 0.1) << f;
+  }
+}
+
+TEST_F(CompositeGpu, RadianceUnitsIgnoreExposureWithoutPbr) {
+  std::mt19937 rng{61};
+  const auto pixels = grid(64, 48, [&](uint32_t, uint32_t) { return random_pixel(rng, 0); });
+  run_pixels(64, 48, pixels, {.radiance = true});
+  const std::vector<std::array<float, 4>> white = m_radiance;
+  run_pixels(64, 48, pixels, {.exposure = 2.7f, .radiance = true});
+  size_t lit = 0;
+  for (size_t i = 0; i < white.size(); ++i) {
+    ASSERT_EQ(m_radiance[i], white[i]) << i;
+    lit += white[i][0] > 0.f ? 1 : 0;
+  }
+  EXPECT_GT(lit, white.size() / 4);
+  const auto colour = run_pixels(64, 48, pixels,
+                                 {.params = composite::Params{.flags = composite::FlagPbr, .legacyBlend = 0.f},
+                                  .exposure = 2.7f,
+                                  .radiance = true});
+  const auto plain = run_pixels(64, 48, pixels, {});
+  for (size_t i = 0; i < white.size(); ++i) {
+    ASSERT_TRUE(same(colour[i], plain[i])) << i;
+    ASSERT_EQ(m_radiance[i][3], white[i][3]) << i;
+    for (size_t c = 0; c < 3; ++c) {
+      ASSERT_NEAR(m_radiance[i][c] * 2.7f, white[i][c], half_ulp(white[i][c]) * 2.7f + 1e-7f) << i << " " << c;
+    }
+  }
+}
+
+TEST_F(CompositeGpu, RadianceMatchesMirror) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  std::mt19937 rng{67};
+  const auto pixels = grid(128, 64, [&](uint32_t x, uint32_t y) {
+    Pixel p = random_pixel(rng, x % 4 == 0 ? 0 : 1);
+    p.q7 = static_cast<uint8_t>(x);
+    if (y % 8 == 0) {
+      p.ao = 255;
+    }
+    return p;
+  });
+  size_t checked = 0;
+  size_t pbr = 0;
+  for (const float e : {0.5f, 1.f, 2.7f}) {
+    for (const bool agx : {false, true}) {
+      for (const float lb : {0.f, 0.5f, 1.f}) {
+        SCOPED_TRACE(std::to_string(e) + (agx ? " agx " : " neutral ") + std::to_string(lb));
+        Settings settings = pbr_settings(lb, Quality::High);
+        settings.tonemap = agx ? Tonemap::AgX : Tonemap::PbrNeutral;
+        run_pixels(128, 64, pixels, {.settings = settings, .exposure = e, .radiance = true});
+        const bool armed = lb < 1.f;
+        for (size_t i = 0; i < pixels.size(); ++i) {
+          if (guard_tie(pixels[i])) {
+            continue;
+          }
+          const std::array<float, 4> cpu = radiance_mirror(pixels[i], armed, lb, armed ? 1.f / e : 1.f);
+          ASSERT_TRUE(radiance_near(m_radiance[i], cpu))
+              << i << ": " << m_radiance[i][0] << " " << m_radiance[i][1] << " " << m_radiance[i][2] << " "
+              << m_radiance[i][3] << " vs " << cpu[0] << " " << cpu[1] << " " << cpu[2] << " " << cpu[3];
+          ++checked;
+          pbr += armed && pixels[i].cls != 0 && cpu[3] > 0.f ? 1 : 0;
+        }
+      }
+    }
+  }
+  EXPECT_GT(pbr, checked / 6);
+}
+
+TEST_F(CompositeGpu, RadianceBadPixelsInvalid) {
+  std::mt19937 rng{71};
+  const auto pixels = grid(64, 48, [&](uint32_t x, uint32_t) {
+    Pixel p = random_pixel(rng, 0);
+    if (x % 2 == 0) {
+      p.color = {10, 12, 14, 255};
+      p.fc = {255, 255, 255};
+      p.q7 = 64;
+    }
+    return p;
+  });
+  const auto out = run_pixels(64, 48, pixels, {.radiance = true});
+  size_t bad = 0;
+  for (size_t i = 0; i < out.size(); ++i) {
+    const std::array<float, 4> cpu = radiance_mirror(pixels[i], false, 0.f, 1.f);
+    if (i % 2 == 0) {
+      ASSERT_EQ(cpu[3], 0.f) << i;
+      ASSERT_EQ(m_radiance[i], (std::array<float, 4>{})) << i;
+      ASSERT_TRUE(same(out[i], pixels[i].color)) << i;
+      ++bad;
+    } else if (!guard_tie(pixels[i])) {
+      ASSERT_EQ(m_radiance[i][3], cpu[3]) << i;
+    }
+  }
+  EXPECT_EQ(bad, out.size() / 2);
+}
+
+TEST_F(CompositeGpu, RadianceLeavesEfbAlphaUntouched) {
+  std::mt19937 rng{73};
+  std::uniform_int_distribution<int> byte(0, 255);
+  const auto pixels = grid(64, 48, [&](uint32_t x, uint32_t) {
+    Pixel p = random_pixel(rng, x % 2 == 0 ? 0 : 1);
+    p.color.a = static_cast<uint8_t>(byte(rng));
+    return p;
+  });
+  for (const Settings& settings : {ao_settings(), pbr_settings(0.f, Quality::High)}) {
+    const auto out = run_pixels(64, 48, pixels, {.settings = settings, .radiance = true});
+    for (size_t i = 0; i < out.size(); ++i) {
+      ASSERT_EQ(out[i].a, pixels[i].color.a) << i;
+    }
+  }
+}
+
+TEST_F(CompositeGpu, RadianceEncodesValidationClean) {
+  for (const auto [width, height] : {std::pair{1u, 1u}, std::pair{61u, 37u}, std::pair{4779u, 9u}}) {
+    SCOPED_TRACE(std::to_string(width) + "x" + std::to_string(height));
+    std::mt19937 rng{width};
+    const auto pixels = grid(width, height, [&](uint32_t x, uint32_t) { return random_pixel(rng, x % 2); });
+    for (const Settings& settings : {ao_settings(), pbr_settings(0.f, Quality::High)}) {
+      run_pixels(width, height, pixels, {.settings = settings, .radiance = true});
+      EXPECT_EQ(m_radianceExtent.width, width);
+      EXPECT_EQ(m_radianceExtent.height, height);
+      EXPECT_EQ(m_radiance.size(), size_t{width} * height);
+    }
   }
 }
 } // namespace
