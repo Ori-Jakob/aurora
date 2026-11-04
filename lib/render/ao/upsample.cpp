@@ -5,12 +5,15 @@
 
 #include "../pass_context.hpp"
 
+#include <array>
 #include <atomic>
 #include <span>
 #include <string>
 
 namespace aurora::render::detail::ao::upsample {
 namespace {
+constexpr std::array<std::string_view, 1> SsilDefines{"AO_SSIL"};
+
 std::atomic_uint32_t g_draws{0};
 
 void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) {
@@ -26,6 +29,10 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
   builder.use(resource::GxDepth, Access::Sampled, Unfilterable);
   builder.use(resource::GxNormal, Access::Sampled, Missing::DisablePass);
   builder.create(resource::AoFinal, final_desc(), Access::ColorWrite);
+  if (ssil_wanted(setup)) {
+    builder.use(denoise::SsilHistory, Access::Sampled, Missing::BindDummyBlack);
+    builder.create(resource::SsilIrradiance, irradiance_desc(), Access::ColorWrite);
+  }
   if (sink_forced()) {
     // Dev timing only: keeps the chain alive before the composite consumes ao.final
     builder.side_effect();
@@ -33,7 +40,7 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
 }
 
 void request_pipelines(const PipelineSetup& setup, const void*, std::span<uint32_t, MaxPassPipelines> ids) {
-  shaders::RenderPipelineDesc desc = testing::pipeline_desc();
+  shaders::RenderPipelineDesc desc = testing::pipeline_desc(setup.pass != nullptr && ssil_wanted(*setup.pass));
   desc.layout = setup.layout;
   desc.layoutKey = setup.layoutHash;
   ids[0] = shaders::request_render(desc).value;
@@ -77,15 +84,19 @@ Counters counters() noexcept { return {.draws = g_draws.load(std::memory_order_r
 
 void reset() noexcept { g_draws.store(0, std::memory_order_relaxed); }
 
-shaders::RenderPipelineDesc pipeline_desc() {
+shaders::RenderPipelineDesc pipeline_desc(bool ssil) {
   shaders::RenderPipelineDesc desc{
       .label = "ao.upsample",
       .shader = Shader,
       .vertexEntry = "vs_main",
       .fragmentEntry = "fs_main",
-      .colorCount = 1,
+      .colorCount = ssil ? 2u : 1u,
   };
   desc.colors[0] = {.format = Format};
+  if (ssil) {
+    desc.defines = SsilDefines;
+    desc.colors[1] = {.format = SsilFormat};
+  }
   return desc;
 }
 } // namespace testing

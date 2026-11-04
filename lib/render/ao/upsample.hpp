@@ -15,10 +15,20 @@ namespace aurora::render::detail::ao::upsample {
 inline constexpr std::string_view Pass = "ao.upsample";
 inline constexpr std::string_view Shader = "ao/upsample";
 inline constexpr wgpu::TextureFormat Format = wgpu::TextureFormat::RGBA8Unorm;
+inline constexpr wgpu::TextureFormat SsilFormat = wgpu::TextureFormat::RGBA16Float;
 
 constexpr TexDesc final_desc() noexcept {
   return {
       .format = Format,
+      .sizeClass = SizeClass::Efb,
+      .divisor = 1,
+      .extraUsage = wgpu::TextureUsage::TextureBinding,
+  };
+}
+
+constexpr TexDesc irradiance_desc() noexcept {
+  return {
+      .format = SsilFormat,
       .sizeClass = SizeClass::Efb,
       .divisor = 1,
       .extraUsage = wgpu::TextureUsage::TextureBinding,
@@ -33,6 +43,6 @@ struct Counters {
 };
 Counters counters() noexcept;
 void reset() noexcept;
-shaders::RenderPipelineDesc pipeline_desc();
+shaders::RenderPipelineDesc pipeline_desc(bool ssil = false);
 } // namespace testing
 } // namespace aurora::render::detail::ao::upsample

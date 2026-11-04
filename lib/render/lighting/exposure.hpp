@@ -69,6 +69,7 @@ enum ParamFlags : uint32_t {
   FlagTargetS = 1u << 1,
   FlagSnap = 1u << 2,
   FlagReset = 1u << 3,
+  FlagSsil = 1u << 4,
 };
 
 enum StateFlags : uint32_t {
@@ -89,9 +90,11 @@ struct Params {
   float envBias = 0.f;
   float dt = 0.f;
   float anchor = 0.f;
-  uint32_t pad[2]{};
+  float ssilAlbedo = 0.f;
+  uint32_t pad = 0;
 };
-static_assert(sizeof(Params) == 32 && offsetof(Params, dt) == 16 && offsetof(Params, anchor) == 20);
+static_assert(sizeof(Params) == 32 && offsetof(Params, dt) == 16 && offsetof(Params, anchor) == 20 &&
+              offsetof(Params, ssilAlbedo) == 24);
 
 // The GPU reads the previous s from the prev texel, so only the mirror carries it for the ratio word
 struct Solved {

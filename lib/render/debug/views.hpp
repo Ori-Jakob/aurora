@@ -90,7 +90,7 @@ struct GbufView {
 }
 
 // Target rows snapshot one scene target and decomposition rows decode several; both replace RGB before the HUD
-inline constexpr std::array<GbufView, 22> GbufViews{{
+inline constexpr std::array<GbufView, 26> GbufViews{{
     {16, "gbuf.motion", "G-buffer: motion", "gbuf.motion", "phase.post_taa", Stage::PrePost, 0, false},
     {17, "gbuf.reactive", "G-buffer: reactive", "gbuf.reactive", "phase.post_taa", Stage::PrePost, 1, false},
     {18, "gbuf.fog", "Fog record: weight", "gbuf.fog", "phase.composite", Stage::OpaqueDone, 2, true},
@@ -124,6 +124,13 @@ inline constexpr std::array<GbufView, 22> GbufViews{{
      Stage::OpaqueDone, 5, false},
     {38, "sky.probe.mask", "Sky probe: sky-test mask", "sky.probe.view", "phase.composite", Stage::OpaqueDone, 5,
      false},
+    {39, "ssil.irr", "Indirect light: bounce radiance", "ssil.irr", "phase.composite", Stage::OpaqueDone, 15, false},
+    {40, "ssil.irr.coverage", "Indirect light: known share", "ssil.irr", "phase.composite", Stage::OpaqueDone, 16,
+     false},
+    {41, "ssil.radiance", "Indirect light: reprojected radiance (mip 0)", "ssil.radiance", "phase.ao",
+     Stage::OpaqueDone, 17, false},
+    {42, "ssil.radiance.normal", "Indirect light: facing normals (mip 0)", "ssil.normal", "phase.ao", Stage::OpaqueDone,
+     18, false},
 }};
 
 struct ViewSelection {

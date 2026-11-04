@@ -62,6 +62,7 @@ PassId g_pass = InvalidPassId;
 std::mutex g_slotMutex;
 LatchSlot g_slot;
 std::atomic_bool g_surfaceAmbient{true};
+std::atomic_bool g_ssil{false};
 std::shared_ptr<const SceneHints> g_hintsOverride;
 std::optional<Mode> g_modeOverride;
 std::optional<bool> g_forceEnabled;
@@ -89,7 +90,7 @@ Mode env_mode() noexcept {
       Log.warn("{}={}: light.deferred shades a test configuration, for verification only", ModeEnv, value);
       return *parsed;
     }
-    Log.warn("{}={} is not grey, direct, indirect, furnace or furnace-metal; ignored", ModeEnv, value);
+    Log.warn("{}={} is not grey, direct, indirect, furnace, furnace-metal or furnace-ao; ignored", ModeEnv, value);
     return Mode::Full;
   }();
   return mode;
@@ -126,7 +127,8 @@ void fill_stage_params(const StageData& stage, const void*, std::span<std::byte>
     return;
   }
   Params params;
-  fill_params(stage_hints(stage), g_surfaceAmbient.load(std::memory_order_relaxed), current_mode(), params);
+  fill_params(stage_hints(stage), g_surfaceAmbient.load(std::memory_order_relaxed), current_mode(), params,
+              g_ssil.load(std::memory_order_relaxed));
   std::memcpy(bytes.data(), &params, sizeof(Params));
 }
 
@@ -182,6 +184,7 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
   builder.use(sky_probe::Probe, Access::Sampled, Missing::BindDummyBlack);
   builder.use_buffer(sky_probe::Sh9, Access::Uniform,
                      UseOptions{.missing = Missing::BindDummyBlack, .dummySize = sky_probe::Sh9Bytes});
+  builder.use(resource::SsilIrradiance, Access::Sampled, Missing::BindDummyBlack);
 }
 
 void request_pipelines(const PipelineSetup& setup, const void*, std::span<uint32_t, MaxPassPipelines> ids) {
@@ -237,6 +240,18 @@ void encode(PassContext& ctx, const void*) {
 
 using Vec3 = testing::Vec3;
 
+material::classes::GpuRow furnace_ao_row(material::classes::GpuRow row) noexcept {
+  for (const size_t i : {0u, 1u, 2u, 3u, 7u, 11u, 15u, 19u}) {
+    row.v[i] = 0.f;
+  }
+  row.v[24] = 0.f;
+  row.v[25] = 0.f;
+  row.v[26] = 0.f;
+  row.v[27] = 1.f;
+  row.v[30] = 0.f;
+  return row;
+}
+
 Vec3 add(const Vec3& a, const Vec3& b) noexcept { return {a[0] + b[0], a[1] + b[1], a[2] + b[2]}; }
 Vec3 scale(const Vec3& a, double s) noexcept { return {a[0] * s, a[1] * s, a[2] * s}; }
 Vec3 mul(const Vec3& a, const Vec3& b) noexcept { return {a[0] * b[0], a[1] * b[1], a[2] * b[2]}; }
@@ -244,12 +259,13 @@ double dot3(const Vec3& a, const Vec3& b) noexcept { return a[0] * b[0] + a[1] *
 } // namespace
 
 std::optional<Mode> parse_mode(std::string_view text) noexcept {
-  constexpr std::array<std::pair<std::string_view, Mode>, 5> Modes{{
+  constexpr std::array<std::pair<std::string_view, Mode>, 6> Modes{{
       {"grey", Mode::Grey},
       {"direct", Mode::Direct},
       {"indirect", Mode::Indirect},
       {"furnace", Mode::Furnace},
       {"furnace-metal", Mode::FurnaceMetal},
+      {"furnace-ao", Mode::FurnaceAo},
   }};
   for (const auto& [name, mode] : Modes) {
     if (text == name) {
@@ -267,7 +283,7 @@ std::array<float, 3> srgb_to_linear(const float (&stored)[3]) noexcept {
   return out;
 }
 
-void fill_params(const SceneHints* hints, bool surfaceAmbient, Mode mode, Params& out) noexcept {
+void fill_params(const SceneHints* hints, bool surfaceAmbient, Mode mode, Params& out, bool ssil) noexcept {
   out = {};
   fill_stage_camera(hints, out.camera);
   fill_view_rotation(hints, out.viewToWorld);
@@ -276,6 +292,23 @@ void fill_params(const SceneHints* hints, bool surfaceAmbient, Mode mode, Params
     std::ranges::copy(ambient, out.ambient);
   }
   out.flags = (surfaceAmbient ? uint32_t{FlagSurfaceAmbient} : 0u) | static_cast<uint32_t>(mode) << ModeShift;
+  if (ssil) {
+    out.flags |= FlagSsil;
+  }
+}
+
+bool ssil_bound(const CompiledGraph& graph) noexcept {
+  const NodeId node = graph.find_node(Pass);
+  const ResourceId id = graph.find_resource(resource::SsilIrradiance);
+  if (node == InvalidNode || id == InvalidResource || graph.nodes[node].status != CullReason::None) {
+    return false;
+  }
+  for (const CompiledUse& use : graph.node_uses(node)) {
+    if (use.resource == id) {
+      return !use.staticDummy;
+    }
+  }
+  return false;
 }
 
 bool frame_enabled(const StageData& stage) noexcept {
@@ -376,6 +409,7 @@ void on_latch(const PassSetup&, const CompiledGraph* graph) {
     slot.ids = graph->nodes[graph->find_node(Pass)].pipelineIds;
   }
   g_surfaceAmbient.store(gx_ext::unlit::classes_enabled(), std::memory_order_relaxed);
+  g_ssil.store(graph != nullptr && ssil_bound(*graph), std::memory_order_relaxed);
   std::lock_guard lock{g_slotMutex};
   g_slot = slot;
 }
@@ -453,6 +487,7 @@ Result shade(const Pixel& px, const clusters::LightListHeader& header, std::span
   }
   const auto mode = static_cast<Mode>((params.flags & ModeMask) >> ModeShift);
   const bool furnace = mode == Mode::Furnace || mode == Mode::FurnaceMetal;
+  const bool furnaceAo = mode == Mode::FurnaceAo;
   const double distance = std::sqrt(dot3(px.position, px.position));
   const Vec3 v = scale(px.position, -1.0 / distance);
   const Vec3 n = bend_normal(px.normal, v);
@@ -463,14 +498,18 @@ Result shade(const Pixel& px, const clusters::LightListHeader& header, std::span
   if (mode == Mode::Grey) {
     surface.baseColor = {0.5, 0.5, 0.5};
   }
-  if (furnace) {
+  if (furnace || furnaceAo) {
     surface.baseColor = {1.0, 1.0, 1.0};
     surface.metalness = mode == Mode::FurnaceMetal ? 1.0 : 0.0;
   }
-  const material::classes::GpuRow& row = rows[std::min(px.classId, 255u)];
+  material::classes::GpuRow row = rows[std::min(px.classId, 255u)];
+  if (furnaceAo) {
+    row = furnace_ao_row(row);
+  }
   const openpbr::Tables& tables = openpbr::testing::tables();
   const openpbr::Prepared p = openpbr::prepare(tables, row, surface, n, v);
-  double ao = std::min(px.receiver >= 1 ? std::pow(px.aoFinal, 2.2) : 1.0, px.ao);
+  const double aoScreen = px.receiver >= 1 ? std::pow(px.aoFinal, 2.2) : 1.0;
+  double ao = std::min(aoScreen, px.ao);
   Vec3 a{};
   for (size_t i = 0; i < 3; ++i) {
     a[i] = (params.flags & FlagSurfaceAmbient) != 0 ? srgb_decode(px.ambient[i]) : params.ambient[i];
@@ -479,11 +518,19 @@ Result shade(const Pixel& px, const clusters::LightListHeader& header, std::span
     a = {1.0, 1.0, 1.0};
     ao = 1.0;
   }
+  if (furnaceAo) {
+    a = {1.0, 1.0, 1.0};
+    ao = aoScreen;
+  }
   Vec3 h{};
   if (mode != Mode::Direct) {
     h = scale(openpbr::eval_ambient(p, scale(a, Pi), a), ao);
+    if ((params.flags & FlagSsil) != 0 && px.receiver >= 1) {
+      const Vec3 bounce = scale({px.ssil[0], px.ssil[1], px.ssil[2]}, Pi * (1.0 - aoScreen));
+      h = add(h, openpbr::eval_ambient(p, bounce, {}));
+    }
   }
-  if (mode != Mode::Indirect && !furnace) {
+  if (mode != Mode::Indirect && !furnace && !furnaceAo) {
     const bool thin = (px.flags & gx::surface::ThinTranslucent) != 0;
     const uint32_t dirCount = std::min(header.dirCount, clusters::MaxDirectional);
     const uint32_t localCount = std::min(header.localCount, clusters::MaxLights - dirCount);

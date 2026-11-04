@@ -25,6 +25,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/ao/gtao.hpp
         lib/render/ao/hiz.cpp
         lib/render/ao/hiz.hpp
+        lib/render/ao/ssil_radiance.cpp
+        lib/render/ao/ssil_radiance.hpp
         lib/render/ao/upsample.cpp
         lib/render/ao/upsample.hpp
         lib/render/debug/capture.cpp

@@ -31,6 +31,12 @@
 @group(1) @binding(2) var scene_motion: texture_2d<f32>;
 @group(1) @binding(3) var ao_history: texture_storage_2d<rgba16float, write>;
 @group(2) @binding(0) var prev_history: texture_2d<f32>;
+//#if AO_SSIL
+//#import aurora/ssil
+@group(1) @binding(4) var ssil_raw: texture_2d<f32>;
+@group(1) @binding(5) var ssil_history: texture_storage_2d<rgba16float, write>;
+@group(2) @binding(1) var prev_ssil: texture_2d<f32>;
+//#endif
 
 const DENOISE_DIAGONAL_WEIGHT: f32 = 0.85 * 0.5;
 const DENOISE_LEAK_THRESHOLD: f32 = 2.5;
@@ -88,6 +94,59 @@ fn denoise_spatial(t: array<vec4f, 9>) -> DenoiseSpatial {
   return DenoiseSpatial(select(sum / weight_sum, 1.0, all_open), sigma, receivers);
 }
 
+//#if AO_SSIL
+const DENOISE_SSIL_OPEN_WEIGHT: f32 = 1.0 / 64.0;
+const DENOISE_SSIL_CLIP_FLOOR: f32 = 1.0 / 256.0;
+
+struct DenoiseSsil {
+  value: vec4f,
+  sigma: vec4f,
+}
+
+fn denoise_ssil_bound(v: vec4f) -> vec4f {
+  return vec4f(clamp(v.rgb, vec3f(0.0), vec3f(SSIL_RADIANCE_CLAMP)), saturate(v.a));
+}
+
+fn denoise_ssil_spatial(p: vec2i, last: vec2i, t: array<vec4f, 9>) -> DenoiseSsil {
+  let edges_l = ao_unpack_edges(t[3].g);
+  let edges_t = ao_unpack_edges(t[1].g);
+  let edges_r = ao_unpack_edges(t[5].g);
+  let edges_b = ao_unpack_edges(t[7].g);
+  var edges_c = ao_unpack_edges(t[4].g) * vec4f(edges_l.y, edges_r.x, edges_t.w, edges_b.z);
+  let leak_range = 4.0 - DENOISE_LEAK_THRESHOLD;
+  let edginess = saturate(leak_range - dot(edges_c, vec4f(1.0))) / leak_range * DENOISE_LEAK_STRENGTH;
+  edges_c = saturate(edges_c + edginess);
+  let weight_tl = DENOISE_DIAGONAL_WEIGHT * (edges_c.x * edges_l.z + edges_c.z * edges_t.x);
+  let weight_tr = DENOISE_DIAGONAL_WEIGHT * (edges_c.z * edges_t.y + edges_c.y * edges_r.z);
+  let weight_bl = DENOISE_DIAGONAL_WEIGHT * (edges_c.w * edges_b.x + edges_c.x * edges_l.w);
+  let weight_br = DENOISE_DIAGONAL_WEIGHT * (edges_c.y * edges_r.w + edges_c.w * edges_b.y);
+  let weights = array<f32, 9>(weight_tl, edges_c.z, weight_tr, edges_c.x, ao_params.denoise_beta, edges_c.y, weight_bl,
+                              edges_c.w, weight_br);
+  var sum = vec4f(0.0);
+  var weight_sum = 0.0;
+  var moment1 = vec4f(0.0);
+  var moment2 = vec4f(0.0);
+  var receivers = 0.0;
+  for (var i = 0u; i < 9u; i++) {
+    if (t[i].b <= 0.5) {
+      continue;
+    }
+    let s = ssil_fetch(ssil_raw, clamp(p + vec2i(i32(i % 3u) - 1, i32(i / 3u) - 1), vec2i(0), last));
+    moment1 += s;
+    moment2 += s * s;
+    receivers += 1.0;
+    if (weights[i] > 0.0) {
+      let w = weights[i] * (1.0 - ao_raw_visibility(t[i]) + DENOISE_SSIL_OPEN_WEIGHT);
+      sum += w * s;
+      weight_sum += w;
+    }
+  }
+  let mean = moment1 / max(receivers, 1.0);
+  let sigma = sqrt(max(moment2 / max(receivers, 1.0) - mean * mean, vec4f(0.0)));
+  return DenoiseSsil(select(vec4f(0.0), sum / weight_sum, weight_sum > 0.0), sigma);
+}
+
+//#endif
 fn denoise_motion(q: vec2u) -> vec2f {
   return textureLoad(scene_motion, q, 0).xy;
 }
@@ -113,12 +172,21 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let edges = t[4].g;
   if (t[4].b <= 0.5) {
     textureStore(ao_history, id.xy, vec4f(1.0, 0.0, log_z, edges));
+//#if AO_SSIL
+    textureStore(ssil_history, id.xy, vec4f(0.0));
+//#endif
     return;
   }
   let spatial = denoise_spatial(t);
   let d = spatial.value;
+//#if AO_SSIL
+  let ss = denoise_ssil_spatial(p, last, t);
+//#endif
 //#if AO_RESET
   textureStore(ao_history, id.xy, vec4f(d, 1.0, log_z, edges));
+//#if AO_SSIL
+  textureStore(ssil_history, id.xy, denoise_ssil_bound(ss.value));
+//#endif
 //#else
   let full = textureDimensions(scene_motion);
   let divisor = ao_divisor(full, size);
@@ -161,5 +229,23 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   // f16 steps below 1 are 2^-11, so an open texel would otherwise never leave 254
   let ao = select(blended, min(max(blended, clipped + 1.0 / 2048.0), 1.0), valid && d >= 1.0);
   textureStore(ao_history, id.xy, vec4f(ao, n, log_z, edges));
+//#if AO_SSIL
+  var ssil_out = ss.value;
+  if (valid && all(textureDimensions(prev_ssil) == size)) {
+    var ssil_prev = vec4f(0.0);
+    for (var i = 0; i < 4; i++) {
+      ssil_prev += w[i] * textureLoad(prev_ssil, clamp(base + vec2i(i & 1, i >> 1u), vec2i(0), last), 0);
+    }
+    ssil_prev /= divide;
+    let ssil_box = AO_CLIP_GAMMA * ss.sigma / sqrt(max(spatial.receivers, 1.0)) + DENOISE_SSIL_CLIP_FLOOR;
+    let luma_box = dot(ssil_box.rgb, SSIL_LUMA);
+    let ssil_lag = saturate((abs(dot(ssil_prev.rgb - ss.value.rgb, SSIL_LUMA)) - luma_box) / luma_box);
+    let ssil_n = min(n, max(floor(min(ao_temporal_cap(ssil_lag, contrast), ao_params.max_samples)), 1.0));
+    let ssil_clipped = clamp(ssil_prev, ss.value - ssil_box, ss.value + ssil_box);
+    ssil_out = ssil_clipped + (ss.value - ssil_clipped) / ssil_n;
+  }
+  // Clipping each channel can push light past its share, so the bound is restored after the blend
+  textureStore(ssil_history, id.xy, denoise_ssil_bound(ssil_out));
+//#endif
 //#endif
 }

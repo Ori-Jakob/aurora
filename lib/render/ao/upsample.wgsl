@@ -30,6 +30,14 @@
 @group(1) @binding(2) var scene_depth: texture_2d<f32>;
 @group(1) @binding(3) var scene_normal: texture_2d<f32>;
 @group(0) @binding(3) var nearest_clamp: sampler;
+//#if AO_SSIL
+@group(1) @binding(4) var ssil_history: texture_2d<f32>;
+
+struct UpsampleOut {
+  @location(0) ao: vec4f,
+  @location(1) ssil: vec4f,
+}
+//#endif
 
 // One packed edge of a tap, unpacked exactly as ao_unpack_edges does
 fn upsample_edge_bits(packed_edges: f32, shift: u32) -> f32 {
@@ -110,11 +118,79 @@ fn upsample_visibility(f: vec2u, dz: f32) -> f32 {
   return v;
 }
 
+//#if AO_SSIL
+// Zero wherever AO is forced open, so identity and open ground carry no bounce
+fn upsample_ssil(f: vec2u, dz: f32, v: f32) -> vec4f {
+  if (v >= 1.0 - 0.5 / 255.0) {
+    return vec4f(0.0);
+  }
+  let full = textureDimensions(scene_depth);
+  let grid = textureDimensions(ao_history);
+  let d = ao_divisor(full, grid);
+  let z = camera_view_depth(ao_params.camera, dz);
+  let g = (vec2f(f) - f32(d / 2u)) / f32(d);
+  let base = vec2i(floor(g));
+  let fraction = g - vec2f(base);
+  let uv = (vec2f(base) + 1.0) / vec2f(grid);
+  let a = textureGather(0, ao_history, nearest_clamp, uv).wzxy;
+  let receiver = textureGather(1, ao_history, nearest_clamp, uv).wzxy > vec4f(0.0);
+  let packed = textureGather(3, ao_history, nearest_clamp, uv).wzxy;
+  let tz = textureGather(0, ao_hiz, nearest_clamp, uv).wzxy;
+  let gap = abs(tz - z);
+  var home = 4u;
+  var home_gap = 0.0;
+  for (var i = 0u; i < 4u; i++) {
+    if (receiver[i] && (home == 4u || gap[i] < home_gap)) {
+      home = i;
+      home_gap = gap[i];
+    }
+  }
+  let reject = ao_params.depth_reject * z;
+  if (home == 4u || home_gap > reject) {
+    return vec4f(0.0);
+  }
+  let left = (home & 1u) == 0u;
+  let top = (home >> 1u) == 0u;
+  let home_edges = ao_unpack_edges(packed[home]);
+  let horizontal = select(home_edges.x, home_edges.y, left);
+  let vertical = select(home_edges.z, home_edges.w, top);
+  let across = upsample_edge_bits(packed[home ^ 1u], select(2u, 0u, top));
+  let down = upsample_edge_bits(packed[home ^ 2u], select(6u, 4u, left));
+  let diagonal = 0.5 * (horizontal * across + vertical * down);
+  let k = vec4u(0u, 1u, 2u, 3u) ^ vec4u(home);
+  let edge = select(select(vec4f(diagonal), vec4f(vertical), k == vec4u(2u)),
+                    select(vec4f(horizontal), vec4f(1.0), k == vec4u(0u)), k < vec4u(2u));
+  let wx = vec4f(1.0 - fraction.x, fraction.x, 1.0 - fraction.x, fraction.x);
+  let wy = vec4f(1.0 - fraction.y, 1.0 - fraction.y, fraction.y, fraction.y);
+  let depth_weight = saturate(1.0 - gap / reject);
+  let w = select(vec4f(0.0), (wx * wy + 1e-3) * edge * depth_weight * (1.0 - a + 1.0 / 64.0), receiver);
+  let weights = w.x + w.y + w.z + w.w;
+  if (weights <= 0.0) {
+    return vec4f(0.0);
+  }
+  let taps = array<vec4f, 4>(textureGather(0, ssil_history, nearest_clamp, uv).wzxy,
+                             textureGather(1, ssil_history, nearest_clamp, uv).wzxy,
+                             textureGather(2, ssil_history, nearest_clamp, uv).wzxy,
+                             textureGather(3, ssil_history, nearest_clamp, uv).wzxy);
+  return vec4f(dot(w, taps[0]), dot(w, taps[1]), dot(w, taps[2]), dot(w, taps[3])) / weights;
+}
+
+//#endif
 @fragment
+//#if AO_SSIL
+fn fs_main(@builtin(position) pos: vec4f) -> UpsampleOut {
+//#else
 fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+//#endif
   let f = vec2u(pos.xy);
   let dz = textureLoad(scene_depth, f, 0).r;
   let key = pack2x16float(vec2f(dz, 0.0)) & 0xFFFFu;
+//#if AO_SSIL
+  let v = upsample_visibility(f, dz);
+  // G and B carry this pixel's depth, so forward draws take AO only where they lie on it
+  return UpsampleOut(vec4f(v, f32(key & 0xFFu) / 255.0, f32(key >> 8u) / 255.0, 0.0), upsample_ssil(f, dz, v));
+//#else
   // G and B carry this pixel's depth, so forward draws take AO only where they lie on it
   return vec4f(upsample_visibility(f, dz), f32(key & 0xFFu) / 255.0, f32(key >> 8u) / 255.0, 0.0);
+//#endif
 }

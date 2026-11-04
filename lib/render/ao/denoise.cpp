@@ -23,10 +23,13 @@ namespace aurora::render::detail::ao::denoise {
 namespace {
 [[maybe_unused]] constexpr Module Log{"aurora::render::ao"};
 constexpr TexRef HistoryTarget{3};
+constexpr TexRef SsilHistoryTarget{5};
 constexpr uint32_t PrevGroupIndex = 2;
 constexpr size_t CacheCapacity = 4;
 constexpr uint64_t LayoutSalt = 0x414F2D44454E4F53ull;
 constexpr std::array<std::string_view, 1> ResetDefines{"AO_RESET"};
+constexpr std::array<std::string_view, 1> SsilDefines{"AO_SSIL"};
+constexpr std::array<std::string_view, 2> SsilResetDefines{"AO_RESET", "AO_SSIL"};
 
 struct PipelineLayoutEntry {
   wgpu::BindGroupLayout passLayout;
@@ -36,12 +39,14 @@ struct PipelineLayoutEntry {
 struct CacheEntry {
   wgpu::BindGroupLayout layout;
   wgpu::TextureView prev;
+  wgpu::TextureView prevSsil;
   wgpu::BindGroup group;
   uint64_t lastUsed = 0;
 };
 
 std::mutex g_layoutMutex;
 wgpu::BindGroupLayout g_prevLayout;
+wgpu::BindGroupLayout g_prevSsilLayout;
 std::vector<PipelineLayoutEntry> g_pipelineLayouts;
 
 std::vector<CacheEntry> g_cache;
@@ -52,6 +57,7 @@ std::atomic_uint32_t g_dispatches{0};
 std::atomic_uint32_t g_valid{0};
 std::atomic_uint32_t g_resets{0};
 std::atomic_uint32_t g_groupsCreated{0};
+std::atomic_uint32_t g_ssilResets{0};
 
 inline void bump(std::atomic_uint32_t& counter) noexcept {
   counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
@@ -68,32 +74,53 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
               UseOptions{.missing = Missing::DisablePass, .sampleType = wgpu::TextureSampleType::UnfilterableFloat});
   builder.use(resource::Motion, Access::Sampled, Missing::DisablePass);
   builder.history(History, history_desc(working_divisor(setup.settings->ao)), Access::StorageWrite);
+  if (ssil_wanted(setup)) {
+    builder.local()[0] = std::byte{1};
+    builder.use(gtao::SsilRaw, Access::Sampled, Missing::BindDummyBlack);
+    builder.history(SsilHistory, ssil_history_desc(working_divisor(setup.settings->ao)), Access::StorageWrite);
+  }
 }
 
-wgpu::PipelineLayout pipeline_layout(const PipelineSetup& setup) {
+bool ssil_pass(std::span<const std::byte, PassLocalSize> local) noexcept { return local[0] == std::byte{1}; }
+
+wgpu::BindGroupLayout create_prev_layout(uint32_t entries, const char* label) {
+  const std::array layoutEntries{
+      wgpu::BindGroupLayoutEntry{
+          .binding = 0,
+          .visibility = wgpu::ShaderStage::Compute,
+          .texture = {.sampleType = wgpu::TextureSampleType::Float, .viewDimension = wgpu::TextureViewDimension::e2D},
+      },
+      wgpu::BindGroupLayoutEntry{
+          .binding = 1,
+          .visibility = wgpu::ShaderStage::Compute,
+          .texture = {.sampleType = wgpu::TextureSampleType::Float, .viewDimension = wgpu::TextureViewDimension::e2D},
+      },
+  };
+  const wgpu::BindGroupLayoutDescriptor descriptor{
+      .label = label,
+      .entryCount = entries,
+      .entries = layoutEntries.data(),
+  };
+  return webgpu::g_device.CreateBindGroupLayout(&descriptor);
+}
+
+wgpu::PipelineLayout pipeline_layout(const PipelineSetup& setup, bool ssil) {
   if (!webgpu::g_device || !setup.frameLayout || !setup.passLayout) {
     return {};
   }
   std::lock_guard lock{g_layoutMutex};
   if (!g_prevLayout) {
-    const wgpu::BindGroupLayoutEntry entry{
-        .binding = 0,
-        .visibility = wgpu::ShaderStage::Compute,
-        .texture = {.sampleType = wgpu::TextureSampleType::Float, .viewDimension = wgpu::TextureViewDimension::e2D},
-    };
-    const wgpu::BindGroupLayoutDescriptor descriptor{
-        .label = "ao.denoise history",
-        .entryCount = 1,
-        .entries = &entry,
-    };
-    g_prevLayout = webgpu::g_device.CreateBindGroupLayout(&descriptor);
+    g_prevLayout = create_prev_layout(1, "ao.denoise history");
+  }
+  if (ssil && !g_prevSsilLayout) {
+    g_prevSsilLayout = create_prev_layout(2, "ao.denoise ssil history");
   }
   for (const PipelineLayoutEntry& entry : g_pipelineLayouts) {
     if (entry.passLayout.Get() == setup.passLayout.Get()) {
       return entry.layout;
     }
   }
-  const std::array groups{setup.frameLayout, setup.passLayout, g_prevLayout};
+  const std::array groups{setup.frameLayout, setup.passLayout, ssil ? g_prevSsilLayout : g_prevLayout};
   const wgpu::PipelineLayoutDescriptor descriptor{
       .label = "ao.denoise",
       .bindGroupLayoutCount = groups.size(),
@@ -104,13 +131,14 @@ wgpu::PipelineLayout pipeline_layout(const PipelineSetup& setup) {
   return layout;
 }
 
-wgpu::BindGroupLayout prev_layout() {
+wgpu::BindGroupLayout prev_layout(bool ssil) {
   std::lock_guard lock{g_layoutMutex};
-  return g_prevLayout;
+  return ssil ? g_prevSsilLayout : g_prevLayout;
 }
 
 void request_pipelines(const PipelineSetup& setup, const void*, std::span<uint32_t, MaxPassPipelines> ids) {
-  const wgpu::PipelineLayout layout = pipeline_layout(setup);
+  const bool ssil = ssil_pass(setup.local);
+  const wgpu::PipelineLayout layout = pipeline_layout(setup, ssil);
   if (!layout) {
     return;
   }
@@ -119,6 +147,8 @@ void request_pipelines(const PipelineSetup& setup, const void*, std::span<uint32
                                         .label = "ao.denoise",
                                         .shader = Shader,
                                         .entryPoint = "main",
+                                        .defines = ssil ? std::span<const std::string_view>{SsilDefines}
+                                                        : std::span<const std::string_view>{},
                                         .layout = layout,
                                         .layoutKey = key,
                                     })
@@ -127,7 +157,8 @@ void request_pipelines(const PipelineSetup& setup, const void*, std::span<uint32
                                         .label = "ao.denoise reset",
                                         .shader = Shader,
                                         .entryPoint = "main",
-                                        .defines = ResetDefines,
+                                        .defines = ssil ? std::span<const std::string_view>{SsilResetDefines}
+                                                        : std::span<const std::string_view>{ResetDefines},
                                         .layout = layout,
                                         .layoutKey = key,
                                     })
@@ -148,11 +179,12 @@ const wgpu::TextureView& dummy_prev(const wgpu::Device& device) {
   return g_dummyView;
 }
 
-wgpu::BindGroup cached_group(const PassContext& ctx, const wgpu::BindGroupLayout& layout,
-                             const wgpu::TextureView& prev) {
+wgpu::BindGroup cached_group(const PassContext& ctx, const wgpu::BindGroupLayout& layout, const wgpu::TextureView& prev,
+                             const wgpu::TextureView& prevSsil) {
   const uint64_t frame = ctx.frame_id();
   for (CacheEntry& entry : g_cache) {
-    if (entry.layout.Get() == layout.Get() && entry.prev.Get() == prev.Get()) {
+    if (entry.layout.Get() == layout.Get() && entry.prev.Get() == prev.Get() &&
+        entry.prevSsil.Get() == prevSsil.Get()) {
       entry.lastUsed = frame;
       return entry.group;
     }
@@ -160,16 +192,20 @@ wgpu::BindGroup cached_group(const PassContext& ctx, const wgpu::BindGroupLayout
   if (g_cache.size() >= CacheCapacity) {
     g_cache.erase(std::ranges::min_element(g_cache, {}, &CacheEntry::lastUsed));
   }
-  const wgpu::BindGroupEntry entry{.binding = 0, .textureView = prev};
+  const std::array entries{
+      wgpu::BindGroupEntry{.binding = 0, .textureView = prev},
+      wgpu::BindGroupEntry{.binding = 1, .textureView = prevSsil},
+  };
   const wgpu::BindGroupDescriptor descriptor{
       .label = "ao.denoise history",
       .layout = layout,
-      .entryCount = 1,
-      .entries = &entry,
+      .entryCount = prevSsil ? 2u : 1u,
+      .entries = entries.data(),
   };
   CacheEntry& added = g_cache.emplace_back(CacheEntry{
       .layout = layout,
       .prev = prev,
+      .prevSsil = prevSsil,
       .group = ctx.device().CreateBindGroup(&descriptor),
       .lastUsed = frame,
   });
@@ -188,21 +224,34 @@ uint32_t latched_flags(const PassContext& ctx) noexcept {
 }
 
 void encode(PassContext& ctx, const void*) {
-  const bool temporalOff = (latched_flags(ctx) & FlagTemporalOff) != 0;
+  const uint32_t flags = latched_flags(ctx);
+  const bool temporalOff = (flags & FlagTemporalOff) != 0;
   const bool prevValid = ctx.prev_valid(HistoryTarget);
   const bool motionValid = motion_valid(ctx.stage_data());
   wgpu::TextureView prev = prevValid && motionValid && !temporalOff ? ctx.prev(HistoryTarget) : wgpu::TextureView{};
   const bool reset = !prev;
+  const bool ssil = ssil_pass(ctx.local());
   const wgpu::ComputePipeline pipeline = shaders::compute_pipeline(ctx.pipeline(reset ? 1 : 0));
-  const wgpu::BindGroupLayout layout = prev_layout();
+  const wgpu::BindGroupLayout layout = prev_layout(ssil);
   if (reset) {
     prev = dummy_prev(ctx.device());
   }
-  if (!pipeline || !layout || !prev) {
+  wgpu::TextureView prevSsil;
+  bool ssilReset = false;
+  if (ssil) {
+    if (!reset && ctx.prev_valid(SsilHistoryTarget) && (flags & FlagSsilReset) == 0) {
+      prevSsil = ctx.prev(SsilHistoryTarget);
+    }
+    ssilReset = !prevSsil;
+    if (ssilReset) {
+      prevSsil = dummy_prev(ctx.device());
+    }
+  }
+  if (!pipeline || !layout || !prev || (ssil && !prevSsil)) {
     return;
   }
   const wgpu::Extent3D size = ctx.extent(HistoryTarget);
-  const wgpu::BindGroup group = cached_group(ctx, layout, prev);
+  const wgpu::BindGroup group = cached_group(ctx, layout, prev, prevSsil);
   const wgpu::ComputePassEncoder pass = ctx.begin_compute();
   if (!pass) {
     return;
@@ -213,6 +262,9 @@ void encode(PassContext& ctx, const void*) {
   pass.End();
   bump(g_dispatches);
   bump(reset ? g_resets : g_valid);
+  if (ssilReset) {
+    bump(g_ssilResets);
+  }
   if (reset && !temporalOff) {
     Log.debug("AO history reset at frame {}: {}", ctx.frame_id(),
               !prevValid    ? "no valid history"
@@ -253,6 +305,7 @@ void shutdown() noexcept {
   std::lock_guard lock{g_layoutMutex};
   g_pipelineLayouts.clear();
   g_prevLayout = {};
+  g_prevSsilLayout = {};
 }
 
 namespace testing {
@@ -262,6 +315,7 @@ Counters counters() noexcept {
       .temporalValid = g_valid.load(std::memory_order_relaxed),
       .temporalResets = g_resets.load(std::memory_order_relaxed),
       .groupsCreated = g_groupsCreated.load(std::memory_order_relaxed),
+      .ssilResets = g_ssilResets.load(std::memory_order_relaxed),
   };
 }
 
@@ -271,6 +325,7 @@ void reset() noexcept {
   g_valid.store(0, std::memory_order_relaxed);
   g_resets.store(0, std::memory_order_relaxed);
   g_groupsCreated.store(0, std::memory_order_relaxed);
+  g_ssilResets.store(0, std::memory_order_relaxed);
 }
 } // namespace testing
 } // namespace aurora::render::detail::ao::denoise

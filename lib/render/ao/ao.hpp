@@ -5,6 +5,7 @@
 #include "../stage_camera.hpp"
 
 #include <aurora/render.hpp>
+#include <webgpu/webgpu_cpp.h>
 
 #include <algorithm>
 #include <array>
@@ -42,7 +43,7 @@ inline constexpr float ClipGamma = 2.f;
 inline constexpr float ClipFloor = 2.f / 255.f;
 inline constexpr float MotionContrastPx = 0.5f;
 inline constexpr uint32_t NoisePeriod = 64;
-inline constexpr size_t MaxAoPasses = 4;
+inline constexpr size_t MaxAoPasses = 5;
 inline constexpr uint32_t SectorCount = 32;
 inline constexpr float RawScale = 1.5f;
 inline constexpr float PixelTooClose = 1.3f;
@@ -52,12 +53,21 @@ inline constexpr std::array<uint32_t, 2> R2Steps{3242174889u, 2447445414u};
 
 // Built by default with the composite, the only way AO reaches the screen
 inline constexpr uint32_t BuiltOptionMask = (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4);
+inline constexpr uint32_t SsilBuiltOption = 1u << 1;
+inline constexpr float SsilRadianceClamp = 16.f;
+inline constexpr float SsilLegacyAlbedo = 0.5f;
+inline constexpr float SsilLinearFloor = 0x1p-12f;
+inline constexpr std::array<float, 3> SsilLuma{0.2126f, 0.7152f, 0.0722f};
+inline constexpr wgpu::TextureFormat SsilNormalFormat = wgpu::TextureFormat::RGBA8Unorm;
+
+enum class SsilEnv : uint8_t { Unset, On, Off, Furnace };
 
 enum ParamFlags : uint32_t {
   FlagTemporalOff = 1u << 0,
   FlagIdentityForced = 1u << 1,
   FlagNormalFromDepth = 1u << 2,
   FlagSectorCeil = 1u << 3,
+  FlagSsilReset = 1u << 4,
 };
 
 struct QualityRow {
@@ -228,6 +238,25 @@ constexpr float gi_weight(float dist, float nearFieldRadius, float falloffRange)
   return 1.f - falloff_weight(dist, nearFieldRadius, falloffRange);
 }
 
+inline std::array<float, 3> ssil_legacy_gain(float a, const std::array<float, 3>& bounce,
+                                             const std::array<float, 3>& receiverLinear) noexcept {
+  const float linearAo = std::pow(a, 2.2f);
+  const float luma =
+      SsilLuma[0] * receiverLinear[0] + SsilLuma[1] * receiverLinear[1] + SsilLuma[2] * receiverLinear[2];
+  std::array<float, 3> out{};
+  for (size_t i = 0; i < out.size(); ++i) {
+    const float x = (1.f - linearAo) * bounce[i] / std::max(luma, SsilLinearFloor);
+    out[i] = std::max(std::pow(std::min(linearAo + x, 1.f), 1.f / 2.2f), a);
+  }
+  return out;
+}
+
+inline std::array<float, 3> ssil_bounce_irradiance(const std::array<float, 4>& irradiance, float linearAo) noexcept {
+  constexpr float Pi = 3.14159265358979f;
+  return {Pi * (1.f - linearAo) * irradiance[0], Pi * (1.f - linearAo) * irradiance[1],
+          Pi * (1.f - linearAo) * irradiance[2]};
+}
+
 struct EnvOverrides {
   std::optional<float> radius;
   std::optional<float> thickness;
@@ -250,6 +279,14 @@ struct EnvOverrides {
 [[nodiscard]] bool sink_forced() noexcept;
 
 [[nodiscard]] bool wanted(const PassSetup& setup) noexcept;
+[[nodiscard]] bool ssil_wanted(const PassSetup& setup) noexcept;
+[[nodiscard]] bool ssil_live(const CompiledGraph& graph) noexcept;
+[[nodiscard]] bool ssil_ready(const Settings& settings) noexcept;
+[[nodiscard]] std::optional<SsilEnv> parse_ssil(std::string_view text) noexcept;
+[[nodiscard]] SsilEnv env_ssil_request() noexcept;
+[[nodiscard]] BuiltOptions with_ssil_dev_built(BuiltOptions built, SsilEnv request) noexcept;
+[[nodiscard]] bool ssil_furnace() noexcept;
+[[nodiscard]] float legacy_albedo() noexcept;
 [[nodiscard]] bool scene_ready(const StageData& stage, const void* state) noexcept;
 void fill_camera(const StageData& stage, const void* state, std::span<std::byte> params);
 void on_latch(const PassSetup& latched, const CompiledGraph* graph);
@@ -272,6 +309,8 @@ void reset() noexcept;
 void set_camera_override(std::shared_ptr<const SceneHints> hints) noexcept;
 void set_sink_override(std::optional<bool> sink) noexcept;
 void set_gi_start(std::optional<float> metres) noexcept;
+void set_ssil_env(std::optional<SsilEnv> env) noexcept;
+void set_legacy_albedo(std::optional<float> albedo) noexcept;
 void unregister(std::string_view pass) noexcept;
 } // namespace testing
 } // namespace aurora::render::detail::ao

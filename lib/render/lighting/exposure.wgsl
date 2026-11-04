@@ -30,6 +30,7 @@ const EXPOSURE_FLAG_AGX: u32 = 1u;
 const EXPOSURE_FLAG_TARGET_S: u32 = 2u;
 const EXPOSURE_FLAG_SNAP: u32 = 4u;
 const EXPOSURE_FLAG_RESET: u32 = 8u;
+const EXPOSURE_FLAG_SSIL: u32 = 16u;
 const EXPOSURE_STATE_VALID: u32 = 1u;
 const EXPOSURE_STATE_MODE_MASK: u32 = 6u;
 const EXPOSURE_STATE_AGX: u32 = 8u;
@@ -45,7 +46,7 @@ struct ExposureParams {
   env_bias: f32,
   dt: f32,
   anchor: f32,
-  pad0: u32,
+  ssil_albedo: f32,
   pad1: u32,
 }
 
@@ -73,6 +74,7 @@ struct ExposureWindow {
 @group(1) @binding(5) var state_out: texture_storage_2d<rgba32uint, write>;
 @group(1) @binding(6) var<storage, read_write> partials: array<f32>;
 @group(1) @binding(7) var<storage, read_write> exposure_out: ExposureWords;
+@group(1) @binding(8) var ssil_irr: texture_2d<f32>;
 @group(2) @binding(0) var state_prev: texture_2d<u32>;
 
 var<workgroup> exposure_tree: array<array<f32, EXPOSURE_WORDS>, EXPOSURE_GROUP_SIZE>;
@@ -125,8 +127,13 @@ fn exposure_sample(p: vec2i, w: ExposureWindow, agx: bool, acc: ptr<function, ar
   }
   var t = composite_identity_terms();
   t.ao = composite_ao_term(ao_final, gx_normal, p, false);
+  if ((exposure_params.flags & EXPOSURE_FLAG_SSIL) != 0u && t.ao < 1.0) {
+    // The meter sees last frame's exposure; the one-frame lag sits inside its smoothing
+    t.bounce = composite_ssil_term(ssil_irr, p, exposure_exp2(w.prev_s), exposure_params.ssil_albedo);
+  }
   let sp = max(s, vec3f(0.0));
-  let sx = select(sp * composite_legacy_scale(t), sp, (exposure_params.flags & EXPOSURE_FLAG_TARGET_S) != 0u);
+  let sx = select(sp * composite_legacy_scale(t, sp, rec.q), sp,
+                  (exposure_params.flags & EXPOSURE_FLAG_TARGET_S) != 0u);
   let weight = 1.0 - rec.q;
   let y_ld = max(tonemap_luminance(srgb_to_linear(saturate(sx / weight))), EXPOSURE_Y_FLOOR);
   (*acc)[EXPOSURE_WORD_WEIGHT] += weight;

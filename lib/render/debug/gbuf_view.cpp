@@ -19,22 +19,11 @@ namespace {
 constexpr std::array<std::string_view, 1> UintDefines{"SOURCE_UINT"};
 constexpr wgpu::ColorWriteMask RgbMask =
     wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue;
-constexpr std::array<shaders::Constant, 15> ModeConstants{{
-    {"VIEW_MODE", 0},
-    {"VIEW_MODE", 1},
-    {"VIEW_MODE", 2},
-    {"VIEW_MODE", 3},
-    {"VIEW_MODE", 4},
-    {"VIEW_MODE", 5},
-    {"VIEW_MODE", 6},
-    {"VIEW_MODE", 7},
-    {"VIEW_MODE", 8},
-    {"VIEW_MODE", 9},
-    {"VIEW_MODE", 10},
-    {"VIEW_MODE", 11},
-    {"VIEW_MODE", 12},
-    {"VIEW_MODE", 13},
-    {"VIEW_MODE", 14},
+constexpr std::array<shaders::Constant, 19> ModeConstants{{
+    {"VIEW_MODE", 0},  {"VIEW_MODE", 1},  {"VIEW_MODE", 2},  {"VIEW_MODE", 3},  {"VIEW_MODE", 4},
+    {"VIEW_MODE", 5},  {"VIEW_MODE", 6},  {"VIEW_MODE", 7},  {"VIEW_MODE", 8},  {"VIEW_MODE", 9},
+    {"VIEW_MODE", 10}, {"VIEW_MODE", 11}, {"VIEW_MODE", 12}, {"VIEW_MODE", 13}, {"VIEW_MODE", 14},
+    {"VIEW_MODE", 15}, {"VIEW_MODE", 16}, {"VIEW_MODE", 17}, {"VIEW_MODE", 18},
 }};
 
 std::atomic_uint64_t g_generation{0};

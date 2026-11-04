@@ -3,10 +3,12 @@
 #include "denoise.hpp"
 #include "gtao.hpp"
 #include "hiz.hpp"
+#include "ssil_radiance.hpp"
 #include "upsample.hpp"
 
 #include "../debug/views.hpp"
 #include "../hints.hpp"
+#include "../post/composite.hpp"
 #include "../shaders.hpp"
 #include "../stage_data.hpp"
 
@@ -28,7 +30,8 @@
 namespace aurora::render::detail::ao {
 namespace {
 constexpr Module Log{"aurora::render::ao"};
-constexpr std::array<std::string_view, 4> ChainPasses{hiz::Pass, gtao::Pass, upsample::Pass, denoise::Pass};
+constexpr std::array<std::string_view, 5> ChainPasses{hiz::Pass, gtao::Pass, upsample::Pass, denoise::Pass,
+                                                      ssil_radiance::Pass};
 static_assert(ChainPasses.size() <= MaxAoPasses);
 
 struct LatchSlot {
@@ -43,6 +46,10 @@ std::atomic<float> g_strength{1.f};
 std::shared_ptr<const SceneHints> g_cameraOverride;
 std::optional<bool> g_sinkOverride;
 std::optional<float> g_giStart;
+std::optional<SsilEnv> g_ssilEnvOverride;
+std::optional<float> g_albedoOverride;
+std::atomic_bool g_ssilLive{false};
+uint32_t g_ssilEpoch = 0;
 
 std::atomic_uint32_t g_skippedNoScene{0};
 std::atomic_uint32_t g_cameraFills{0};
@@ -160,6 +167,34 @@ bool node_live(const CompiledGraph& graph, std::string_view name) noexcept {
   return node != InvalidNode && graph.nodes[node].kind == NodeKind::Pass &&
          graph.nodes[node].status == CullReason::None;
 }
+
+SsilEnv env_ssil() noexcept {
+  static const SsilEnv request = [] {
+    const char* value = SDL_getenv("AURORA_RENDER_SSIL");
+    if (value == nullptr) {
+      return SsilEnv::Unset;
+    }
+    const std::optional<SsilEnv> parsed = parse_ssil(value);
+    if (!parsed) {
+      Log.warn("AURORA_RENDER_SSIL={} is not on, off or furnace; ignored", value);
+      return SsilEnv::Unset;
+    }
+    Log.warn("AURORA_RENDER_SSIL={}: overriding Indirect Light, for verification only", value);
+    return *parsed;
+  }();
+  return request;
+}
+
+float env_albedo() noexcept {
+  static const float albedo = [] {
+    const char* value = SDL_getenv("AURORA_RENDER_SSIL_ALBEDO");
+    if (value == nullptr) {
+      return SsilLegacyAlbedo;
+    }
+    return parse_bounded("AURORA_RENDER_SSIL_ALBEDO", value, 1.f).value_or(SsilLegacyAlbedo);
+  }();
+  return albedo;
+}
 } // namespace
 
 uint32_t working_divisor(Quality quality) noexcept { return working_divisor(quality, env_overrides().divisor); }
@@ -245,6 +280,46 @@ bool wanted(const PassSetup& setup) noexcept {
          setup.gx_available(GxResource::Motion) && setup.gx_available(GxResource::Normal);
 }
 
+bool ssil_wanted(const PassSetup& setup) noexcept {
+  // The composite writes the radiance SSIL gathers and is its only consumer without PBR
+  return wanted(setup) && composite::declare_wanted(setup) && setup.settings->ssil;
+}
+
+bool ssil_live(const CompiledGraph& graph) noexcept {
+  return node_live(graph, ssil_radiance::Pass) && node_live(graph, gtao::Pass);
+}
+
+bool ssil_ready(const Settings& settings) noexcept {
+  return !settings.ssil || settings.ao == Quality::Off ||
+         (g_ssilLive.load(std::memory_order_relaxed) && pipelines_live() && hints_enabled());
+}
+
+std::optional<SsilEnv> parse_ssil(std::string_view text) noexcept {
+  if (text == "on") {
+    return SsilEnv::On;
+  }
+  if (text == "off") {
+    return SsilEnv::Off;
+  }
+  if (text == "furnace") {
+    return SsilEnv::Furnace;
+  }
+  return std::nullopt;
+}
+
+SsilEnv env_ssil_request() noexcept { return g_ssilEnvOverride.value_or(env_ssil()); }
+
+BuiltOptions with_ssil_dev_built(BuiltOptions built, SsilEnv request) noexcept {
+  if (request == SsilEnv::On || request == SsilEnv::Furnace) {
+    built[static_cast<size_t>(Feature::Ssil)] |= SsilBuiltOption;
+  }
+  return built;
+}
+
+bool ssil_furnace() noexcept { return env_ssil_request() == SsilEnv::Furnace; }
+
+float legacy_albedo() noexcept { return g_albedoOverride.value_or(env_albedo()); }
+
 bool scene_ready(const StageData& stage, const void*) noexcept {
   const bool ready =
       !stage.flushedAtFinish && camera_usable(stage_hints(stage)) && !g_classView.load(std::memory_order_relaxed);
@@ -276,7 +351,14 @@ void fill_camera(const StageData& stage, const void*, std::span<std::byte> bytes
 }
 
 void on_latch(const PassSetup& latched, const CompiledGraph* graph) {
-  const Params params = latched_params(*latched.settings, env_overrides());
+  Params params = latched_params(*latched.settings, env_overrides());
+  const bool ssil = graph != nullptr && ssil_live(*graph);
+  const uint32_t epoch = composite::units_epoch();
+  if (ssil && epoch != g_ssilEpoch) {
+    params.flags |= FlagSsilReset;
+  }
+  g_ssilEpoch = epoch;
+  g_ssilLive.store(ssil, std::memory_order_relaxed);
   for (const PassId pass : g_passes) {
     if (pass != InvalidPassId) {
       set_pass_params(pass, std::as_bytes(std::span{&params, 1}));
@@ -316,6 +398,7 @@ void initialize() {
     g_passes[1] = register_pass(gtao::pass_desc());
     g_passes[2] = register_pass(upsample::pass_desc());
     g_passes[3] = register_pass(denoise::pass_desc());
+    g_passes[4] = register_pass(ssil_radiance::pass_desc());
   }
 }
 
@@ -329,12 +412,15 @@ void shutdown() noexcept {
   g_slot = {};
   g_classView.store(false, std::memory_order_relaxed);
   g_strength.store(1.f, std::memory_order_relaxed);
+  g_ssilLive.store(false, std::memory_order_relaxed);
   hiz::clear_cache();
+  ssil_radiance::clear_cache();
   denoise::shutdown();
 }
 
 void worker_tick(uint64_t frameId) noexcept {
   hiz::worker_tick(frameId);
+  ssil_radiance::worker_tick(frameId);
   denoise::worker_tick(frameId);
 }
 
@@ -350,12 +436,16 @@ void reset() noexcept {
   g_cameraOverride.reset();
   g_sinkOverride.reset();
   g_giStart.reset();
+  g_ssilEnvOverride.reset();
+  g_albedoOverride.reset();
+  g_ssilEpoch = composite::units_epoch();
   g_skippedNoScene.store(0, std::memory_order_relaxed);
   g_cameraFills.store(0, std::memory_order_relaxed);
   hiz::testing::reset();
   gtao::testing::reset();
   upsample::testing::reset();
   denoise::testing::reset();
+  ssil_radiance::testing::reset();
 }
 
 void set_camera_override(std::shared_ptr<const SceneHints> hints) noexcept { g_cameraOverride = std::move(hints); }
@@ -363,6 +453,10 @@ void set_camera_override(std::shared_ptr<const SceneHints> hints) noexcept { g_c
 void set_sink_override(std::optional<bool> sink) noexcept { g_sinkOverride = sink; }
 
 void set_gi_start(std::optional<float> metres) noexcept { g_giStart = metres; }
+
+void set_ssil_env(std::optional<SsilEnv> env) noexcept { g_ssilEnvOverride = env; }
+
+void set_legacy_albedo(std::optional<float> albedo) noexcept { g_albedoOverride = albedo; }
 
 void unregister(std::string_view pass) noexcept {
   for (size_t i = 0; i < ChainPasses.size(); ++i) {

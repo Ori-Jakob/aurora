@@ -42,6 +42,7 @@ enum Binding : uint32_t {
   BindSurface = 4,
   BindHdr = 5,
   BindExposure = 6,
+  BindSsil = 7,
 };
 
 enum ParamFlags : uint32_t {
@@ -51,13 +52,15 @@ enum ParamFlags : uint32_t {
 // Set only while the PBR term can change pixels, so legacyBlend = 1 runs the AO-only path bit for bit
 inline constexpr uint32_t FlagPbr = 1u << 2;
 inline constexpr uint32_t FlagTonemapAgX = 1u << 3;
+inline constexpr uint32_t FlagSsil = 1u << 4;
 
 struct Params {
   uint32_t flags = 0;
   float legacyBlend = 0.f;
-  uint32_t pad[2]{};
+  float ssilAlbedo = 0.f;
+  uint32_t pad = 0;
 };
-static_assert(sizeof(Params) == 16 && offsetof(Params, legacyBlend) == 4);
+static_assert(sizeof(Params) == 16 && offsetof(Params, legacyBlend) == 4 && offsetof(Params, ssilAlbedo) == 8);
 
 [[nodiscard]] bool wanted(const Settings& settings) noexcept;
 [[nodiscard]] bool ao_wanted(const Settings& settings) noexcept;
@@ -69,6 +72,8 @@ static_assert(sizeof(Params) == 16 && offsetof(Params, legacyBlend) == 4);
 [[nodiscard]] bool radiance_wanted(const PassSetup& setup) noexcept;
 [[nodiscard]] bool radiance_bound(const CompiledGraph& graph) noexcept;
 [[nodiscard]] bool radiance_env_on(const char* value) noexcept;
+[[nodiscard]] bool ssil_bound(const CompiledGraph& graph) noexcept;
+[[nodiscard]] uint32_t units_epoch() noexcept;
 [[nodiscard]] uint32_t params_flags(bool identity, const char* noFog) noexcept;
 [[nodiscard]] std::optional<std::string> check_contract(const CompiledGraph& graph);
 [[nodiscard]] shaders::RenderPipelineDesc pipeline_desc(wgpu::TextureFormat efb, const wgpu::PipelineLayout& layout,
@@ -100,6 +105,7 @@ struct Counters {
   uint32_t hdrDraws = 0;
   uint32_t radianceDraws = 0;
   uint32_t radianceClears = 0;
+  uint32_t ssilDraws = 0;
 };
 Counters counters() noexcept;
 void reset() noexcept;
@@ -109,6 +115,7 @@ void set_camera_override(std::shared_ptr<const SceneHints> hints) noexcept;
 void set_pbr_producers_override(std::optional<bool> live) noexcept;
 void set_ready_override(std::optional<bool> ready) noexcept;
 void set_radiance_forced(std::optional<bool> forced) noexcept;
+void bump_units_epoch() noexcept;
 [[nodiscard]] bool pbr_active_for(bool live, bool hdrLive, bool classView, const Settings& settings) noexcept;
 [[nodiscard]] std::array<float, 3> legacy_ao(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7,
                                              float ao, float normalAlpha) noexcept;
@@ -116,6 +123,8 @@ void set_radiance_forced(std::optional<bool> forced) noexcept;
                                                   uint32_t q7, float ao, float normalAlpha, std::array<float, 4> hdr,
                                                   float legacyBlend, float exposure, bool agx) noexcept;
 [[nodiscard]] std::array<float, 2> units(uint32_t flags, float e, float invE) noexcept;
+[[nodiscard]] std::array<float, 3> legacy_ssil(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7,
+                                               float ao, float normalAlpha, std::array<float, 3> bounce) noexcept;
 [[nodiscard]] std::array<float, 4> radiance(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7,
                                             float ao, float normalAlpha, std::array<float, 4> hdr, bool pbrFlag,
                                             float legacyBlend, float invE) noexcept;

@@ -99,6 +99,20 @@ fn ao_view_color(uv: vec2f) -> vec3f {
     case 8u: {
       return vec3f(ao_raw_visibility(value));
     }
+    case 15u: {
+      let bounce = 3.14159265 * max(value.rgb, vec3f(0.0));
+      return bounce / (1.0 + bounce);
+    }
+    case 16u: {
+      return vec3f(saturate(value.a));
+    }
+    case 17u: {
+      let radiance = max(value.rgb, vec3f(0.0)) / max(value.a, 1e-4);
+      return radiance / (1.0 + radiance);
+    }
+    case 18u: {
+      return value.rgb;
+    }
     default: {
       if ((bitcast<u32>(value.r) & 0x7f800000u) == 0x7f800000u) {
         return vec3f(1.0, 0.0, 1.0);

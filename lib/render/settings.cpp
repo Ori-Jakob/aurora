@@ -134,6 +134,8 @@ constexpr BuiltOptions DefaultBuiltOptions = [] {
   // PBR reaches players once its lighting, exposure and tonemappers are in; .mat maps feed only PBR
   built[static_cast<size_t>(Feature::Pbr)] = 1u << 1;
   built[static_cast<size_t>(Feature::LegacyMatMaps)] = 1u << 1;
+  // SSIL ships with the defogged radiance it gathers, so no player sees fog-tinted bounce
+  built[static_cast<size_t>(Feature::Ssil)] = ao::SsilBuiltOption;
   return built;
 }();
 
@@ -619,6 +621,9 @@ Settings with_env_overrides(Settings settings) noexcept {
   if (const std::optional<Quality> ao = ao::env_ao_request()) {
     settings.ao = *ao;
   }
+  if (const ao::SsilEnv ssil = ao::env_ssil_request(); ssil != ao::SsilEnv::Unset) {
+    settings.ssil = ssil != ao::SsilEnv::Off;
+  }
 #endif
   return settings;
 }
@@ -627,6 +632,7 @@ Settings with_env_overrides(Settings settings) noexcept {
 BuiltOptions support_built(const BuiltOptions& built) noexcept {
 #if AURORA_ENABLE_RENDER
   BuiltOptions out = with_pbr_dev_built(ao::with_dev_built(built, ao::env_ao_request()), pbr_env());
+  out = ao::with_ssil_dev_built(out, ao::env_ssil_request());
 #else
   BuiltOptions out = with_pbr_dev_built(built, pbr_env());
 #endif

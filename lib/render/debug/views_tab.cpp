@@ -189,6 +189,9 @@ std::optional<std::string> view_blocked(const GbufView& view, const detail::Fram
     }
     return std::string{view.resource} + " is not in the scene layout";
   }
+  if (view.resource.starts_with("ssil.")) {
+    return feature_enabled(settings, Feature::Ssil) ? std::nullopt : std::optional<std::string>{"needs Indirect Light"};
+  }
   // Lighting rows are produced by PBR passes, not by AO
   if (view.resource.starts_with("light.") || view.resource.starts_with("sky.")) {
     if (!feature_enabled(settings, Feature::Pbr)) {

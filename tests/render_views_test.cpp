@@ -187,8 +187,8 @@ TEST_F(RenderViews, GbufViewTableFollowsClassRange) {
       EXPECT_EQ(view.mode, static_cast<uint32_t>(view.id - FirstGbufView));
     }
   }
-  EXPECT_EQ(expected, 39u);
-  EXPECT_EQ(targetModes, (std::set<uint32_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}));
+  EXPECT_EQ(expected, 43u);
+  EXPECT_EQ(targetModes, (std::set<uint32_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}));
   EXPECT_EQ(find_gbuf_view(LastReservedClassView), nullptr);
   EXPECT_EQ(find_gbuf_view(35), nullptr);
   EXPECT_EQ(find_gbuf_view(16)->stage, Stage::PrePost);
@@ -346,6 +346,36 @@ TEST_F(RenderViews, SkyProbeRowsNeedPbr) {
   EXPECT_EQ(view_blocked(*mask, &frame), std::nullopt);
   graph->sceneDepthSource = DepthSource::Copy;
   EXPECT_EQ(view_blocked(*mask, &frame), "needs readable scene depth");
+}
+
+TEST_F(RenderViews, SsilRowsAppendFrom39) {
+  struct Row {
+    uint16_t id;
+    std::string_view name;
+    std::string_view resource;
+    std::string_view anchor;
+    uint32_t mode;
+  };
+  constexpr std::array<Row, 4> Rows{{
+      {39, "ssil.irr", resource::SsilIrradiance, "phase.composite", 15},
+      {40, "ssil.irr.coverage", resource::SsilIrradiance, "phase.composite", 16},
+      {41, "ssil.radiance", "ssil.radiance", "phase.ao", 17},
+      {42, "ssil.radiance.normal", "ssil.normal", "phase.ao", 18},
+  }};
+  for (const Row& row : Rows) {
+    const GbufView* view = find_gbuf_view(row.id);
+    ASSERT_NE(view, nullptr) << row.id;
+    EXPECT_EQ(view->name, row.name);
+    EXPECT_EQ(view->resource, row.resource);
+    EXPECT_EQ(view->anchor, row.anchor);
+    EXPECT_EQ(view->mode, row.mode);
+    EXPECT_EQ(view->kind, GbufViewKind::Target);
+    EXPECT_FALSE(view->uintSource);
+    EXPECT_TRUE(view->label.starts_with("Indirect light: ")) << view->label;
+    EXPECT_EQ(parse_view(row.name)->id, row.id);
+    EXPECT_EQ(view_blocked(*view, nullptr), std::optional<std::string>{"needs Indirect Light"});
+  }
+  EXPECT_EQ(GbufViews.back().id, 42u);
 }
 
 TEST_F(RenderViews, ShortNamesAreUnique) {

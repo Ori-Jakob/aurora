@@ -10,6 +10,7 @@
 #include "render/ao/denoise.hpp"
 #include "render/ao/gtao.hpp"
 #include "render/ao/hiz.hpp"
+#include "render/ao/ssil_radiance.hpp"
 #include "render/ao/upsample.hpp"
 #include "render/debug/views.hpp"
 #include "render/frame_state.hpp"
@@ -22,6 +23,7 @@
 #include "render/jobs.hpp"
 #include "render/module.hpp"
 #include "render/pass_context.hpp"
+#include "render/post/composite.hpp"
 #include "render/scene_depth.hpp"
 #include "render/settings.hpp"
 #include "render/shaders.hpp"
@@ -3399,6 +3401,940 @@ TEST_F(AoDenoiseGpu, BorderTexelsValidationClean) {
       EXPECT_EQ(ao::denoise::testing::counters().dispatches, 3u);
     }
   }
+}
+TEST(AoRules, SsilDevHookBuildsAndRequests) {
+  EXPECT_EQ(ao::parse_ssil("on"), ao::SsilEnv::On);
+  EXPECT_EQ(ao::parse_ssil("off"), ao::SsilEnv::Off);
+  EXPECT_EQ(ao::parse_ssil("furnace"), ao::SsilEnv::Furnace);
+  for (const std::string_view bad : {"", "On", "high", "1"}) {
+    EXPECT_EQ(ao::parse_ssil(bad), std::nullopt) << bad;
+  }
+  const BuiltOptions none{};
+  const auto ssil = static_cast<size_t>(Feature::Ssil);
+  EXPECT_EQ(ao::with_ssil_dev_built(none, ao::SsilEnv::Unset)[ssil], 0u);
+  EXPECT_EQ(ao::with_ssil_dev_built(none, ao::SsilEnv::Off)[ssil], 0u);
+  EXPECT_EQ(ao::with_ssil_dev_built(none, ao::SsilEnv::On)[ssil], ao::SsilBuiltOption);
+  EXPECT_EQ(ao::with_ssil_dev_built(none, ao::SsilEnv::Furnace)[ssil], ao::SsilBuiltOption);
+  ao::testing::set_ssil_env(ao::SsilEnv::Furnace);
+  EXPECT_TRUE(ao::ssil_furnace());
+  ao::testing::set_ssil_env(ao::SsilEnv::Off);
+  EXPECT_FALSE(ao::ssil_furnace());
+  ao::testing::set_ssil_env(ao::SsilEnv::On);
+  ao::testing::set_legacy_albedo(0.3f);
+  EXPECT_EQ(ao::legacy_albedo(), 0.3f);
+  ao::testing::reset();
+  EXPECT_EQ(ao::legacy_albedo(), ao::SsilLegacyAlbedo);
+  EXPECT_EQ(ao::env_ssil_request(), ao::SsilEnv::Unset);
+}
+
+Settings ssil_settings(Quality quality) {
+  Settings settings = ao_settings(quality);
+  settings.ssil = true;
+  return settings;
+}
+
+class SsilGraph : public AoChainGraph {
+protected:
+  static std::vector<std::string_view> use_names(const CompiledGraph& graph, std::string_view pass) {
+    std::vector<std::string_view> out;
+    const NodeId node = graph.find_node(pass);
+    if (node == InvalidNode) {
+      return out;
+    }
+    for (const CompiledUse& use : node_uses(graph, node)) {
+      out.push_back(graph.resources[use.resource].name);
+    }
+    return out;
+  }
+
+  void wait_all(const CompiledGraph& graph) {
+    for (const CompiledNode& node : graph.nodes) {
+      if (node.kind != NodeKind::Pass || node.status != CullReason::None) {
+        continue;
+      }
+      for (const uint32_t id : node.pipelineIds) {
+        if (id != 0) {
+          ASSERT_EQ(shaders::wait({id}, PipelineWaitNs), shaders::PipelineStatus::Ready) << node.name;
+        }
+      }
+    }
+  }
+};
+
+TEST_F(SsilGraph, OffDeclaresNothing) {
+  Reader reader{.resource = resource::AoFinal};
+  register_pass(reader_desc(reader));
+  const auto graph = compile(ao_settings(Quality::High));
+  const NodeId skipped = graph->find_node(ao::ssil_radiance::Pass);
+  ASSERT_NE(skipped, InvalidNode);
+  EXPECT_EQ(graph->nodes[skipped].status, CullReason::Skipped);
+  for (const std::string_view name : {ao::ssil_radiance::Resource, ao::ssil_radiance::Normal, ao::gtao::SsilRaw,
+                                      ao::denoise::SsilHistory, resource::SsilIrradiance}) {
+    EXPECT_EQ(graph->find_resource(name), InvalidResource) << name;
+  }
+  EXPECT_EQ(use_names(*graph, ao::gtao::Pass).size(), 3u);
+  EXPECT_EQ(use_names(*graph, ao::denoise::Pass).size(), 4u);
+  EXPECT_EQ(use_names(*graph, ao::upsample::Pass).size(), 5u);
+  const NodeId upsample = graph->find_node(ao::upsample::Pass);
+  EXPECT_FALSE(ao::ssil_live(*graph));
+  Settings noAo = ssil_settings(Quality::High);
+  noAo.ao = Quality::Off;
+  const auto off = compile(noAo);
+  EXPECT_EQ(off->nodes[off->find_node(ao::ssil_radiance::Pass)].status, CullReason::Skipped);
+  EXPECT_NE(upsample, InvalidNode);
+}
+
+TEST_F(SsilGraph, NeedsComposite) {
+  Reader reader{.resource = resource::AoFinal};
+  register_pass(reader_desc(reader));
+  PassSetup setup{.settings = &m_settings, .env = &m_env, .sceneDepth = DepthSource::Direct};
+  m_settings = ssil_settings(Quality::High);
+  m_env = gather_graph_environment();
+  EXPECT_TRUE(ao::ssil_wanted(setup));
+  m_env.gxSampleCount = 4;
+  EXPECT_FALSE(ao::ssil_wanted(setup));
+  m_env = gather_graph_environment();
+  m_settings.ssil = false;
+  EXPECT_FALSE(ao::ssil_wanted(setup));
+  m_settings = ssil_settings(Quality::High);
+  setup.sceneDepth = DepthSource::Copy;
+  EXPECT_FALSE(ao::ssil_wanted(setup));
+}
+
+TEST_F(SsilGraph, DeclaresChain) {
+  Reader reader{.resource = resource::AoFinal};
+  register_pass(reader_desc(reader));
+  const auto graph = compile(ssil_settings(Quality::High));
+  for (const std::string_view pass :
+       {ao::hiz::Pass, ao::ssil_radiance::Pass, ao::gtao::Pass, ao::denoise::Pass, ao::upsample::Pass}) {
+    const NodeId node = graph->find_node(pass);
+    ASSERT_NE(node, InvalidNode) << pass;
+    EXPECT_EQ(graph->nodes[node].status, CullReason::None) << pass;
+  }
+  EXPECT_TRUE(ao::ssil_live(*graph));
+  const NodeId radiance = graph->find_node(ao::ssil_radiance::Pass);
+  EXPECT_EQ(graph->nodes[radiance].order, 6u);
+  EXPECT_EQ(graph->nodes[radiance].paramsSize, sizeof(ao::Params));
+  const CompiledResource& irr = graph->resources[graph->find_resource(resource::SsilIrradiance)];
+  EXPECT_EQ(irr.tex.format, wgpu::TextureFormat::RGBA16Float);
+  EXPECT_EQ(irr.tex.divisor, 1u);
+  EXPECT_EQ(irr.creator, graph->find_node(ao::upsample::Pass));
+  const CompiledResource& final = graph->resources[graph->find_resource(resource::AoFinal)];
+  EXPECT_EQ(irr.extent.width, final.extent.width);
+  EXPECT_EQ(irr.extent.height, final.extent.height);
+  EXPECT_EQ(graph->resources[graph->find_resource(ao::denoise::SsilHistory)].kind, ResourceKind::History);
+}
+
+TEST_F(SsilGraph, RadianceDeclaresTwoPyramids) {
+  Reader reader{.resource = resource::AoFinal};
+  register_pass(reader_desc(reader));
+  const auto graph = compile(ssil_settings(Quality::High));
+  const NodeId node = graph->find_node(ao::ssil_radiance::Pass);
+  ASSERT_NE(node, InvalidNode);
+  const auto uses = node_uses(*graph, node);
+  ASSERT_EQ(uses.size(), 7u);
+  const std::array<std::string_view, 7> names{
+      resource::RadianceDefogged, ao::denoise::History,        resource::Motion,         ao::hiz::Resource,
+      resource::GxNormal,         ao::ssil_radiance::Resource, ao::ssil_radiance::Normal};
+  for (size_t i = 0; i < names.size(); ++i) {
+    EXPECT_EQ(graph->resources[uses[i].resource].name, names[i]) << i;
+  }
+  EXPECT_EQ(uses[0].role, UseRole::Prev);
+  EXPECT_EQ(uses[1].role, UseRole::Prev);
+  EXPECT_EQ(uses[0].missing, Missing::BindDummyBlack);
+  EXPECT_EQ(uses[1].missing, Missing::BindDummyBlack);
+  for (size_t i = 2; i < 5; ++i) {
+    EXPECT_EQ(uses[i].missing, Missing::DisablePass) << i;
+  }
+  EXPECT_EQ(uses[5].access, Access::StorageWrite);
+  EXPECT_EQ(uses[6].access, Access::StorageWrite);
+  const CompiledResource& radiance = graph->resources[uses[5].resource];
+  const CompiledResource& normal = graph->resources[uses[6].resource];
+  const CompiledResource& hiz = graph->resources[graph->find_resource(ao::hiz::Resource)];
+  EXPECT_EQ(radiance.tex.format, wgpu::TextureFormat::RGBA16Float);
+  EXPECT_EQ(normal.tex.format, wgpu::TextureFormat::RGBA8Unorm);
+  EXPECT_EQ(radiance.extent.width, hiz.extent.width);
+  EXPECT_EQ(radiance.extent.height, hiz.extent.height);
+  EXPECT_EQ(radiance.mipLevels, hiz.mipLevels);
+  EXPECT_EQ(normal.mipLevels, hiz.mipLevels);
+}
+
+TEST_F(SsilGraph, GtaoAppendsRadianceNormalThenRaw) {
+  Reader reader{.resource = resource::AoFinal};
+  register_pass(reader_desc(reader));
+  const auto graph = compile(ssil_settings(Quality::High));
+  const NodeId node = graph->find_node(ao::gtao::Pass);
+  const auto uses = node_uses(*graph, node);
+  ASSERT_EQ(uses.size(), 6u);
+  EXPECT_EQ(graph->resources[uses[3].resource].name, ao::ssil_radiance::Resource);
+  EXPECT_EQ(graph->resources[uses[4].resource].name, ao::ssil_radiance::Normal);
+  EXPECT_EQ(graph->resources[uses[5].resource].name, ao::gtao::SsilRaw);
+  EXPECT_EQ(uses[3].missing, Missing::BindDummyBlack);
+  EXPECT_EQ(uses[4].missing, Missing::BindDummyBlack);
+  EXPECT_EQ(uses[3].options.sampleType, wgpu::TextureSampleType::UnfilterableFloat);
+  EXPECT_EQ(uses[5].access, Access::StorageWrite);
+  const auto upsample = use_names(*graph, ao::upsample::Pass);
+  ASSERT_EQ(upsample.size(), 7u);
+  EXPECT_EQ(upsample[5], ao::denoise::SsilHistory);
+  EXPECT_EQ(upsample[6], resource::SsilIrradiance);
+}
+
+TEST_F(SsilGraph, DenoiseAppendsRawThenHistory) {
+  Reader reader{.resource = resource::AoFinal};
+  register_pass(reader_desc(reader));
+  const auto graph = compile(ssil_settings(Quality::High));
+  const auto names = use_names(*graph, ao::denoise::Pass);
+  ASSERT_EQ(names.size(), 6u);
+  EXPECT_EQ(names[3], ao::denoise::History);
+  EXPECT_EQ(names[4], ao::gtao::SsilRaw);
+  EXPECT_EQ(names[5], ao::denoise::SsilHistory);
+  const NodeId node = graph->find_node(ao::denoise::Pass);
+  EXPECT_EQ(node_uses(*graph, node)[4].missing, Missing::BindDummyBlack);
+}
+
+TEST_F(SsilGraph, ChainFitsMaxAoPasses) {
+  static_assert(ao::MaxAoPasses == 5);
+  Reader reader{.resource = resource::AoFinal};
+  register_pass(reader_desc(reader));
+  const auto graph = compile(ssil_settings(Quality::High));
+  size_t passes = 0;
+  for (const std::string_view pass :
+       {ao::hiz::Pass, ao::gtao::Pass, ao::upsample::Pass, ao::denoise::Pass, ao::ssil_radiance::Pass}) {
+    passes += graph->find_node(pass) != InvalidNode ? 1 : 0;
+  }
+  EXPECT_EQ(passes, ao::MaxAoPasses);
+}
+
+TEST_F(SsilGraph, PrevUsesCarryNoProducerEdge) {
+  Reader reader{.resource = resource::AoFinal};
+  register_pass(reader_desc(reader));
+  const auto graph = compile(ssil_settings(Quality::High));
+  const NodeId radiance = graph->find_node(ao::ssil_radiance::Pass);
+  const NodeId denoise = graph->find_node(ao::denoise::Pass);
+  ASSERT_NE(radiance, InvalidNode);
+  ASSERT_NE(denoise, InvalidNode);
+  EXPECT_EQ(graph->nodes[radiance].status, CullReason::None);
+  EXPECT_LT(graph->nodes[radiance].programIndex, graph->nodes[denoise].programIndex);
+  EXPECT_LT(graph->nodes[radiance].programIndex, graph->nodes[graph->find_node(ao::gtao::Pass)].programIndex);
+  EXPECT_GT(graph->nodes[radiance].programIndex, graph->nodes[graph->find_node(ao::hiz::Pass)].programIndex);
+}
+
+TEST_F(SsilGraph, PyramidsFollowHizChain) {
+  for (const auto [width, height] : {std::pair{16u, 16u}, std::pair{30u, 18u}, std::pair{2558u, 1438u}}) {
+    for (const Quality quality : {Quality::High, Quality::Ultra}) {
+      SCOPED_TRACE(std::to_string(width) + "x" + std::to_string(height) + " q" +
+                   std::to_string(static_cast<int>(quality)));
+      use_globals({width, height, 1});
+      ao::testing::set_camera_override(camera_hints(perspective(Near, Far)));
+      Reader reader{.resource = resource::AoFinal};
+      register_pass(reader_desc(reader));
+      const auto graph = compile(ssil_settings(quality));
+      const NodeId node = graph->find_node(ao::ssil_radiance::Pass);
+      ASSERT_NE(node, InvalidNode);
+      EXPECT_EQ(graph->nodes[node].status, CullReason::None);
+      const CompiledResource& hiz = graph->resources[graph->find_resource(ao::hiz::Resource)];
+      for (const std::string_view name : {ao::ssil_radiance::Resource, ao::ssil_radiance::Normal}) {
+        const CompiledResource& pyramid = graph->resources[graph->find_resource(name)];
+        EXPECT_EQ(pyramid.extent.width, hiz.extent.width) << name;
+        EXPECT_EQ(pyramid.extent.height, hiz.extent.height) << name;
+        EXPECT_EQ(ao::ssil_radiance::written_levels(pyramid.mipLevels), ao::hiz::written_levels(hiz.mipLevels)) << name;
+      }
+    }
+  }
+}
+
+TEST_F(SsilGraph, GroupCacheEmptiesAfterOff) {
+  use_globals({61, 37, 1});
+  ao::testing::set_camera_override(camera_hints(perspective(Near, Far)));
+  Reader reader{.resource = resource::AoFinal};
+  register_pass(reader_desc(reader));
+  const auto graph = compile(ssil_settings(Quality::High));
+  wait_all(*graph);
+  latch(graph.get());
+  const FrameState state{.graph = graph};
+  const auto depth = scene_depth(test::make_depth(*m_device, 61, 37));
+  EXPECT_EQ(run(state, 1, depth), std::nullopt);
+  EXPECT_EQ(run(state, 2, depth), std::nullopt);
+  EXPECT_EQ(ao::ssil_radiance::testing::counters().cacheEntries, 1u);
+  EXPECT_GT(ao::ssil_radiance::testing::counters().groupsCreated, 0u);
+  ao::worker_tick(2 + ao::ssil_radiance::RetainFrames);
+  EXPECT_EQ(ao::ssil_radiance::testing::counters().cacheEntries, 1u);
+  ao::worker_tick(3 + ao::ssil_radiance::RetainFrames);
+  EXPECT_EQ(ao::ssil_radiance::testing::counters().cacheEntries, 0u);
+  EXPECT_EQ(run(state, 3, depth), std::nullopt);
+  EXPECT_EQ(ao::ssil_radiance::testing::counters().cacheEntries, 1u);
+  ao::shutdown();
+  EXPECT_EQ(ao::ssil_radiance::testing::counters().cacheEntries, 0u);
+  ao::initialize();
+}
+
+TEST_F(SsilGraph, RadiancePrevBindsBlackWithoutWriter) {
+  use_globals({64, 48, 1});
+  ao::testing::set_camera_override(camera_hints(perspective(Near, Far)));
+  Reader reader{.resource = resource::AoFinal};
+  register_pass(reader_desc(reader));
+  const auto graph = compile(ssil_settings(Quality::High));
+  wait_all(*graph);
+  latch(graph.get());
+  const FrameState state{.graph = graph};
+  const auto depth = scene_depth(test::make_depth(*m_device, 64, 48));
+  for (uint64_t frame = 1; frame <= 3; ++frame) {
+    EXPECT_EQ(run(state, frame, depth), std::nullopt);
+  }
+  const ao::ssil_radiance::testing::Counters c = ao::ssil_radiance::testing::counters();
+  EXPECT_EQ(c.reprojected, 0u);
+  EXPECT_EQ(c.cleared, 3u);
+  EXPECT_EQ(c.clearedNoRadiance, 3u);
+  EXPECT_EQ(ao::upsample::testing::counters().draws, 3u);
+}
+
+TEST_F(SsilGraph, PrepareDisabledKeepsAo) {
+  use_globals({64, 48, 1});
+  ao::testing::set_camera_override(camera_hints(perspective(Near, Far)));
+  ao::testing::unregister(ao::ssil_radiance::Pass);
+  Reader reader{.resource = resource::AoFinal};
+  register_pass(reader_desc(reader));
+  const auto graph = compile(ssil_settings(Quality::High));
+  EXPECT_EQ(graph->find_node(ao::ssil_radiance::Pass), InvalidNode);
+  for (const std::string_view pass : {ao::hiz::Pass, ao::gtao::Pass, ao::denoise::Pass, ao::upsample::Pass}) {
+    const NodeId node = graph->find_node(pass);
+    ASSERT_NE(node, InvalidNode) << pass;
+    EXPECT_EQ(graph->nodes[node].status, CullReason::None) << pass;
+  }
+  const NodeId gtao = graph->find_node(ao::gtao::Pass);
+  EXPECT_TRUE(node_uses(*graph, gtao)[3].staticDummy);
+  EXPECT_TRUE(node_uses(*graph, gtao)[4].staticDummy);
+  wait_all(*graph);
+  latch(graph.get());
+  const FrameState state{.graph = graph};
+  EXPECT_EQ(run(state, 1, scene_depth(test::make_depth(*m_device, 64, 48))), std::nullopt);
+  EXPECT_EQ(ao::gtao::testing::counters().dispatches, 1u);
+  EXPECT_EQ(reader.calls, 1);
+}
+
+TEST_F(SsilGraph, UnitsEpochResets) {
+  use_globals({64, 48, 1});
+  ao::testing::set_camera_override(camera_hints(perspective(Near, Far)));
+  Reader reader{.resource = resource::AoFinal};
+  register_pass(reader_desc(reader));
+  const auto graph = compile(ssil_settings(Quality::High));
+  const NodeId node = graph->find_node(ao::ssil_radiance::Pass);
+  ASSERT_NE(node, InvalidNode);
+  const auto flags = [&] { return params_from(latched_pass_params(graph->nodes[node].id)).flags; };
+  latch(graph.get());
+  EXPECT_EQ(flags() & ao::FlagSsilReset, 0u);
+  composite::testing::bump_units_epoch();
+  latch(graph.get());
+  EXPECT_NE(flags() & ao::FlagSsilReset, 0u);
+  latch(graph.get());
+  EXPECT_EQ(flags() & ao::FlagSsilReset, 0u);
+  composite::testing::bump_units_epoch();
+  const auto off = compile(ao_settings(Quality::High));
+  latch(off.get());
+  latch(graph.get());
+  EXPECT_EQ(flags() & ao::FlagSsilReset, 0u);
+}
+
+TEST_F(SsilGraph, EncodesValidationClean) {
+  for (const auto [width, height] :
+       {std::pair{1u, 1u}, std::pair{3u, 5u}, std::pair{61u, 37u}, std::pair{640u, 360u}}) {
+    for (const Quality quality : {Quality::Low, Quality::High, Quality::Ultra}) {
+      SCOPED_TRACE(std::to_string(width) + "x" + std::to_string(height) + " q" +
+                   std::to_string(static_cast<int>(quality)));
+      use_globals({width, height, 1});
+      ao::testing::set_camera_override(camera_hints(perspective(Near, Far)));
+      Reader reader{.resource = resource::SsilIrradiance};
+      register_pass(reader_desc(reader));
+      const auto graph = compile(ssil_settings(quality));
+      wait_all(*graph);
+      latch(graph.get());
+      const FrameState state{.graph = graph};
+      const auto depth = scene_depth(test::make_depth(*m_device, width, height));
+      EXPECT_EQ(run(state, 1, depth), std::nullopt);
+      EXPECT_EQ(run(state, 2, depth), std::nullopt);
+      EXPECT_EQ(ao::ssil_radiance::testing::counters().dispatches,
+                2 * ao::ssil_radiance::written_levels(
+                        graph->resources[graph->find_resource(ao::ssil_radiance::Resource)].mipLevels));
+      EXPECT_EQ(reader.calls, 2);
+    }
+  }
+}
+
+struct SsilTexel {
+  std::array<float, 4> v{};
+};
+
+struct SsilFrame {
+  std::vector<uint32_t> raw;
+  std::vector<uint32_t> final;
+  std::vector<SsilTexel> ssilRaw;
+  std::vector<SsilTexel> irr;
+  std::vector<std::vector<SsilTexel>> radiance;
+  std::vector<std::vector<uint32_t>> normals;
+};
+
+class SsilGpu : public AoDenoiseGpu {
+protected:
+  using RadianceFn = std::function<std::array<float, 4>(uint32_t x, uint32_t y, uint32_t tag)>;
+
+  void begin_ssil(const Rig& rig, Quality quality, const RadianceFn& radiance, bool ssil = true,
+                  std::optional<ao::SsilEnv> env = std::nullopt) {
+    use_globals({rig.width, rig.height, 1});
+    ao::testing::set_ssil_env(env);
+    m_proj = perspective(Near, Far);
+    m_hints = camera_hints(m_proj);
+    ao::testing::set_camera_override(m_hints);
+    m_divisor = ao::working_divisor(quality);
+    m_gridWidth = ao::grid_size(rig.width, m_divisor);
+    m_gridHeight = ao::grid_size(rig.height, m_divisor);
+    m_scene = render_rig(rig, m_proj);
+    upload_normals(m_scene);
+    set_motion({});
+    m_depth = test::make_depth(*m_device, rig.width, rig.height);
+    set_depth(m_scene.depth);
+    m_radianceRow = (rig.width * 8 + 255) & ~255u;
+    std::vector<uint16_t> staged(size_t{m_radianceRow / 2} * rig.height, 0);
+    for (uint32_t y = 0; y < rig.height; ++y) {
+      for (uint32_t x = 0; x < rig.width; ++x) {
+        const std::array<float, 4> value =
+            radiance ? radiance(x, y, m_scene.tags[size_t{y} * rig.width + x]) : std::array<float, 4>{};
+        for (size_t c = 0; c < 4; ++c) {
+          staged[size_t{y} * (m_radianceRow / 2) + x * 4 + c] = float_to_half(value[c]);
+        }
+      }
+    }
+    const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                            .size = staged.size() * 2};
+    m_radianceStaging = m_device->device.CreateBuffer(&descriptor);
+    m_device->queue.WriteBuffer(m_radianceStaging, 0, staged.data(), staged.size() * 2);
+    m_radianceStub = TestPass{.name = "t.radiance", .kind = PassKind::Encoder, .order = 7};
+    m_radianceStub.declare = [](InternalPassBuilder& b) {
+      b.after(phase::Composite);
+      b.history(resource::RadianceDefogged,
+                {.format = wgpu::TextureFormat::RGBA16Float,
+                 .sizeClass = SizeClass::Efb,
+                 .extraUsage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst},
+                Access::ColorWrite);
+    };
+    m_radianceStub.encode = [this](PassContext& ctx) {
+      const wgpu::Texture target = ctx.texture(TexRef{0});
+      const wgpu::TexelCopyBufferInfo from{.layout = {.bytesPerRow = m_radianceRow, .rowsPerImage = target.GetHeight()},
+                                           .buffer = m_radianceStaging};
+      const wgpu::TexelCopyTextureInfo to{.texture = target};
+      const wgpu::Extent3D extent{target.GetWidth(), target.GetHeight(), 1};
+      ctx.encoder().CopyBufferToTexture(&from, &to, &extent);
+    };
+    register_pass(desc_of(m_radianceStub));
+    m_readers.clear();
+    for (const std::string_view name :
+         {ao::gtao::Resource, std::string_view{resource::AoFinal}, ao::gtao::SsilRaw,
+          std::string_view{resource::SsilIrradiance}, ao::ssil_radiance::Resource, ao::ssil_radiance::Normal}) {
+      if (!ssil && name != ao::gtao::Resource && name != resource::AoFinal) {
+        continue;
+      }
+      m_readers.push_back(std::make_unique<Reader>(Reader{.resource = name}));
+      register_pass(reader_desc(*m_readers.back()));
+    }
+    Settings settings = ao_settings(quality);
+    settings.ssil = ssil;
+    m_graph = compile(settings);
+    for (const CompiledNode& node : m_graph->nodes) {
+      if (node.kind != NodeKind::Pass || node.status != CullReason::None) {
+        continue;
+      }
+      for (const uint32_t id : node.pipelineIds) {
+        if (id != 0) {
+          ASSERT_EQ(shaders::wait({id}, PipelineWaitNs), shaders::PipelineStatus::Ready) << node.name;
+        }
+      }
+    }
+    latch(m_graph.get());
+  }
+
+  wgpu::Texture reader_texture(std::string_view name) const {
+    for (const auto& reader : m_readers) {
+      if (reader->resource == name) {
+        return reader->texture;
+      }
+    }
+    return {};
+  }
+
+  std::vector<SsilTexel> read_half(const wgpu::Texture& texture, uint32_t mip = 0) const {
+    const uint32_t width = std::max(texture.GetWidth() >> mip, 1u);
+    const uint32_t height = std::max(texture.GetHeight() >> mip, 1u);
+    const uint32_t rowBytes = (width * 8 + 255) & ~255u;
+    const uint64_t size = uint64_t{rowBytes} * height;
+    const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                            .size = size};
+    const wgpu::Buffer buffer = m_device->device.CreateBuffer(&descriptor);
+    const wgpu::TexelCopyTextureInfo source{.texture = texture, .mipLevel = mip};
+    const wgpu::TexelCopyBufferInfo destination{.layout = {.bytesPerRow = rowBytes, .rowsPerImage = height},
+                                                .buffer = buffer};
+    const wgpu::Extent3D extent{width, height, 1};
+    const wgpu::CommandEncoder encoder = m_device->device.CreateCommandEncoder();
+    encoder.CopyTextureToBuffer(&source, &destination, &extent);
+    const wgpu::CommandBuffer commands = encoder.Finish();
+    m_device->queue.Submit(1, &commands);
+    const std::optional<std::vector<uint32_t>> words = test::read_buffer(*m_device, buffer, 0, size);
+    std::vector<SsilTexel> out(size_t{width} * height);
+    if (!words) {
+      ADD_FAILURE() << "readback failed";
+      return out;
+    }
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x) {
+        const size_t at = size_t{y} * (rowBytes / 4) + size_t{x} * 2;
+        const uint32_t rg = (*words)[at];
+        const uint32_t ba = (*words)[at + 1];
+        out[size_t{y} * width + x].v = {half_to_float(rg & 0xFFFFu), half_to_float(rg >> 16),
+                                        half_to_float(ba & 0xFFFFu), half_to_float(ba >> 16)};
+      }
+    }
+    return out;
+  }
+
+  std::vector<uint32_t> read_words(const wgpu::Texture& texture, uint32_t mip = 0) const {
+    std::vector<uint32_t> out;
+    for (const float value : test::read_texture_mip(*m_device, texture, mip)) {
+      out.push_back(std::bit_cast<uint32_t>(value));
+    }
+    return out;
+  }
+
+  SsilFrame step_ssil(uint64_t frameId) {
+    const FrameState state{.graph = m_graph};
+    EXPECT_EQ(run(state, frameId, scene_depth(m_depth)), std::nullopt);
+    SsilFrame out;
+    if (const wgpu::Texture raw = reader_texture(ao::gtao::Resource)) {
+      out.raw = read_words(raw);
+    }
+    if (const wgpu::Texture final = reader_texture(resource::AoFinal)) {
+      out.final = read_words(final);
+    }
+    if (const wgpu::Texture ssilRaw = reader_texture(ao::gtao::SsilRaw)) {
+      out.ssilRaw = read_half(ssilRaw);
+    }
+    if (const wgpu::Texture irr = reader_texture(resource::SsilIrradiance)) {
+      out.irr = read_half(irr);
+    }
+    if (const wgpu::Texture radiance = reader_texture(ao::ssil_radiance::Resource)) {
+      const uint32_t levels = ao::ssil_radiance::written_levels(radiance.GetMipLevelCount());
+      for (uint32_t mip = 0; mip < levels; ++mip) {
+        out.radiance.push_back(read_half(radiance, mip));
+      }
+    }
+    if (const wgpu::Texture normal = reader_texture(ao::ssil_radiance::Normal)) {
+      const uint32_t levels = ao::ssil_radiance::written_levels(normal.GetMipLevelCount());
+      for (uint32_t mip = 0; mip < levels; ++mip) {
+        out.normals.push_back(read_words(normal, mip));
+      }
+    }
+    return out;
+  }
+
+  static std::array<double, 3> decode_normal_word(uint32_t word) {
+    return {(word & 0xFFu) / 255.0 * 2.0 - 1.0, ((word >> 8) & 0xFFu) / 255.0 * 2.0 - 1.0,
+            ((word >> 16) & 0xFFu) / 255.0 * 2.0 - 1.0};
+  }
+
+  ref::SsilPyramids gpu_pyramids(const SsilFrame& f) const {
+    ref::SsilPyramids out;
+    for (size_t mip = 0; mip < f.radiance.size(); ++mip) {
+      out.widths.push_back(std::max(m_gridWidth >> mip, 1u));
+      out.heights.push_back(std::max(m_gridHeight >> mip, 1u));
+      std::vector<ref::Rgba> radiance;
+      std::vector<ref::Normal3> normals;
+      for (size_t i = 0; i < f.radiance[mip].size(); ++i) {
+        const auto& v = f.radiance[mip][i].v;
+        radiance.push_back({v[0], v[1], v[2], v[3]});
+        normals.push_back(decode_normal_word(f.normals[mip][i]));
+      }
+      out.radiance.push_back(std::move(radiance));
+      out.normals.push_back(std::move(normals));
+    }
+    return out;
+  }
+
+  std::vector<ref::GtaoTexel> cpu_ssil(const ref::SsilPyramids& pyramids, uint64_t frameId) const {
+    ao::Params params = cpu_params(*m_graph, frameId);
+    StageCamera camera;
+    EXPECT_TRUE(fill_stage_camera(m_hints.get(), camera));
+    const ref::CpuPyramid depth =
+        ref::build_pyramid(m_scene.depth, m_scene.width, m_scene.height, m_divisor, camera, params.effectRadius,
+                           static_cast<uint32_t>(pyramids.widths.size()));
+    return ref::estimate_gtao({.depth = m_scene.depth,
+                               .normals = m_scene.normals,
+                               .width = m_scene.width,
+                               .height = m_scene.height,
+                               .divisor = m_divisor,
+                               .camera = camera,
+                               .params = params,
+                               .ssil = &pyramids},
+                              depth);
+  }
+
+  uint32_t m_radianceRow = 0;
+  wgpu::Buffer m_radianceStaging;
+  TestPass m_radianceStub;
+  std::vector<std::unique_ptr<Reader>> m_readers;
+};
+
+Rig crease_rig() {
+  Rig rig{.width = 160, .height = 120, .eyeHeight = 250.0, .pitch = 15.0 * Deg};
+  rig.boxes = {{{-300.0, 0.0, 700.0}, {300.0, 400.0, 760.0}, TagWall}};
+  return rig;
+}
+
+std::array<float, 4> red_wall_white_floor(uint32_t, uint32_t, uint32_t tag) {
+  if (tag == TagWall) {
+    return {0.8f, 0.05f, 0.05f, 1.f};
+  }
+  return tag == 0 ? std::array<float, 4>{0.f, 0.f, 0.f, 1.f} : std::array<float, 4>{0.5f, 0.5f, 0.5f, 1.f};
+}
+
+TEST_F(SsilGpu, AoRawUnchangedByVariant) {
+  for (const Quality quality : {Quality::High, Quality::Ultra}) {
+    SCOPED_TRACE(static_cast<int>(quality));
+    begin_ssil(crease_rig(), quality, red_wall_white_floor, false);
+    step_ssil(4);
+    const SsilFrame off = step_ssil(5);
+    begin_ssil(crease_rig(), quality, red_wall_white_floor, true);
+    step_ssil(4);
+    const SsilFrame on = step_ssil(5);
+    ASSERT_EQ(off.raw.size(), on.raw.size());
+    ASSERT_EQ(off.final.size(), on.final.size());
+    ASSERT_FALSE(on.raw.empty());
+    size_t rawDiff = 0;
+    size_t finalDiff = 0;
+    size_t worst = 0;
+    for (size_t i = 0; i < on.raw.size(); ++i) {
+      rawDiff += on.raw[i] != off.raw[i] ? 1 : 0;
+      for (uint32_t c = 0; c < 4; ++c) {
+        const int a = static_cast<int>((on.raw[i] >> (8 * c)) & 0xFFu);
+        const int b = static_cast<int>((off.raw[i] >> (8 * c)) & 0xFFu);
+        worst = std::max<size_t>(worst, static_cast<size_t>(std::abs(a - b)));
+      }
+    }
+    for (size_t i = 0; i < on.final.size(); ++i) {
+      finalDiff += on.final[i] != off.final[i] ? 1 : 0;
+      for (uint32_t c = 0; c < 4; ++c) {
+        const int a = static_cast<int>((on.final[i] >> (8 * c)) & 0xFFu);
+        const int b = static_cast<int>((off.final[i] >> (8 * c)) & 0xFFu);
+        worst = std::max<size_t>(worst, static_cast<size_t>(std::abs(a - b)));
+      }
+    }
+    std::printf("SSIL variant against AO alone: ao.raw %zu / %zu texels differ, ao.final %zu / %zu, worst %zu code\n",
+                rawDiff, on.raw.size(), finalDiff, on.final.size(), worst);
+    EXPECT_LE(worst, 1u);
+    EXPECT_LE(rawDiff, on.raw.size() / 10000);
+    EXPECT_LE(finalDiff, on.final.size() / 10000);
+  }
+}
+
+TEST_F(SsilGpu, ResetWritesZero) {
+  begin_ssil(crease_rig(), Quality::High, red_wall_white_floor);
+  const SsilFrame first = step_ssil(1);
+  ASSERT_FALSE(first.radiance.empty());
+  for (const SsilTexel& t : first.radiance[0]) {
+    EXPECT_EQ(t.v[0], 0.f);
+    EXPECT_EQ(t.v[3], 0.f);
+  }
+  for (const SsilTexel& t : first.irr) {
+    EXPECT_EQ(t.v[0], 0.f);
+    EXPECT_EQ(t.v[3], 0.f);
+  }
+  EXPECT_EQ(ao::ssil_radiance::testing::counters().clearedNoRadiance, 1u);
+  const SsilFrame second = step_ssil(2);
+  EXPECT_EQ(ao::ssil_radiance::testing::counters().reprojected, 1u);
+  size_t lit = 0;
+  for (const SsilTexel& t : second.irr) {
+    lit += t.v[3] > 0.f ? 1 : 0;
+  }
+  EXPECT_GT(lit, 100u);
+}
+
+TEST_F(SsilGpu, FurnaceWritesOne) {
+  begin_ssil(crease_rig(), Quality::High, {}, true, ao::SsilEnv::Furnace);
+  const SsilFrame f = step_ssil(1);
+  ASSERT_FALSE(f.radiance.empty());
+  size_t sky = 0;
+  for (size_t i = 0; i < f.radiance[0].size(); ++i) {
+    const bool isSky = m_hiz[i] >= 0.5 * ao::SkyDepth;
+    sky += isSky ? 1 : 0;
+    for (size_t c = 0; c < 4; ++c) {
+      EXPECT_EQ(f.radiance[0][i].v[c], isSky ? 0.f : 1.f) << i;
+    }
+  }
+  size_t occluded = 0;
+  for (size_t i = 0; i < f.ssilRaw.size(); ++i) {
+    const auto& v = f.ssilRaw[i].v;
+    EXPECT_GE(v[3], 0.f);
+    EXPECT_LE(v[3], 1.f + 0x1p-10f);
+    for (size_t c = 0; c < 3; ++c) {
+      EXPECT_NEAR(v[c], v[3], 0x1p-10f) << i;
+    }
+    occluded += v[3] > 0.f ? 1 : 0;
+  }
+  for (const SsilTexel& t : f.irr) {
+    EXPECT_LE(t.v[0], 1.f + 0x1p-10f);
+    EXPECT_GE(t.v[0], 0.f);
+  }
+  EXPECT_GT(occluded, 100u);
+  std::printf("furnace: %zu sky texels, %zu with bounce\n", sky, occluded);
+}
+
+TEST_F(SsilGpu, ZeroWhereAoForced) {
+  begin_ssil(crease_rig(), Quality::High, red_wall_white_floor);
+  step_ssil(1);
+  const SsilFrame f = step_ssil(2);
+  ASSERT_EQ(f.irr.size(), f.final.size());
+  size_t zeroAtOne = 0;
+  size_t opens = 0;
+  for (size_t i = 0; i < f.final.size(); ++i) {
+    const uint32_t code = m_scene.normals[i] >> 30;
+    if (m_scene.depth[i] <= 0.f || code == 0) {
+      for (size_t c = 0; c < 4; ++c) {
+        EXPECT_EQ(f.irr[i].v[c], 0.f) << i;
+      }
+      ++zeroAtOne;
+    }
+    opens += (f.final[i] & 0xFFu) == 255 ? 1 : 0;
+  }
+  EXPECT_GT(zeroAtOne, 100u);
+  EXPECT_GT(opens, 100u);
+  edit_params(*m_graph, [](ao::Params& p) { p.flags |= ao::FlagIdentityForced; });
+  const SsilFrame forced = step_ssil(3);
+  for (size_t i = 0; i < forced.irr.size(); ++i) {
+    EXPECT_EQ(forced.irr[i].v[0], 0.f) << i;
+    EXPECT_EQ(forced.irr[i].v[3], 0.f) << i;
+  }
+}
+
+TEST_F(SsilGpu, ColouredWallBleeds) {
+  Rig rig{.width = 320, .height = 240, .eyeHeight = 250.0, .pitch = 15.0 * Deg};
+  rig.boxes = {{{-300.0, 0.0, 700.0}, {300.0, 400.0, 760.0}, TagWall}};
+  rig.classify = [](const Vec3d& p, uint32_t tag) {
+    return tag == TagGround && p[2] > 640.0 && std::abs(p[0]) < 250.0 ? TagBand : tag;
+  };
+  begin_ssil(rig, Quality::High, red_wall_white_floor);
+  step_ssil(1);
+  step_ssil(2);
+  const SsilFrame f = step_ssil(3);
+  double red = 0.0;
+  double green = 0.0;
+  size_t band = 0;
+  for (size_t i = 0; i < f.irr.size(); ++i) {
+    const auto& v = f.irr[i].v;
+    EXPECT_TRUE(std::isfinite(v[0]) && std::isfinite(v[3]));
+    EXPECT_LE(std::max({v[0], v[1], v[2]}), ao::SsilRadianceClamp);
+    EXPECT_LE(v[3], 1.f);
+    if (m_scene.tags[i] == TagBand && (f.final[i] & 0xFFu) < 250 && v[3] > 0.f) {
+      red += v[0];
+      green += v[1];
+      ++band;
+    }
+  }
+  std::printf("floor beside the red wall: %zu px, mean bounce red %.4f green %.4f\n", band, band ? red / band : 0.0,
+              band ? green / band : 0.0);
+  ASSERT_GT(band, 100u);
+  EXPECT_GT(red, 1.5 * green);
+}
+
+TEST_F(SsilGpu, InvalidRadianceExcluded) {
+  begin_ssil(crease_rig(), Quality::High, [](uint32_t x, uint32_t y, uint32_t tag) {
+    std::array<float, 4> v = red_wall_white_floor(x, y, tag);
+    if (tag == TagWall) {
+      v[3] = 0.25f;
+    }
+    return v;
+  });
+  step_ssil(1);
+  const SsilFrame f = step_ssil(2);
+  for (size_t i = 0; i < f.radiance[0].size(); ++i) {
+    const uint32_t qx = ao::rep_texel(static_cast<uint32_t>(i % m_gridWidth), m_divisor, m_scene.width);
+    const uint32_t qy = ao::rep_texel(static_cast<uint32_t>(i / m_gridWidth), m_divisor, m_scene.height);
+    if (m_scene.tags[size_t{qy} * m_scene.width + qx] == TagWall) {
+      EXPECT_LE(f.radiance[0][i].v[3], 1e-4f) << i;
+      EXPECT_LE(f.radiance[0][i].v[0], 1e-4f) << i;
+    }
+  }
+  for (const SsilTexel& t : f.ssilRaw) {
+    EXPECT_LE(t.v[0], 0.5f + 0x1p-9f);
+  }
+}
+
+TEST_F(SsilGpu, NonFiniteIsZero) {
+  begin_ssil(crease_rig(), Quality::High, [](uint32_t x, uint32_t y, uint32_t tag) {
+    std::array<float, 4> v = red_wall_white_floor(x, y, tag);
+    if (tag == TagWall) {
+      v[0] = (x & 1) != 0 ? std::numeric_limits<float>::infinity() : std::numeric_limits<float>::quiet_NaN();
+    }
+    return v;
+  });
+  step_ssil(1);
+  step_ssil(2);
+  const SsilFrame f = step_ssil(3);
+  for (const auto* image : {&f.ssilRaw, &f.irr}) {
+    for (const SsilTexel& t : *image) {
+      for (const float c : t.v) {
+        EXPECT_TRUE(std::isfinite(c));
+        EXPECT_LE(c, ao::SsilRadianceClamp);
+      }
+    }
+  }
+  for (const auto& level : f.radiance) {
+    for (const SsilTexel& t : level) {
+      for (const float c : t.v) {
+        EXPECT_TRUE(std::isfinite(c));
+      }
+    }
+  }
+}
+
+TEST_F(SsilGpu, DenoiseBoundHoldsAfterClip) {
+  begin_ssil(crease_rig(), Quality::High, [](uint32_t x, uint32_t y, uint32_t tag) {
+    return tag == TagWall ? std::array<float, 4>{(x + y) % 3 == 0 ? 60000.f : 0.f, 30.f, 0.f, 1.f}
+                          : std::array<float, 4>{16.f, 16.f, 16.f, 1.f};
+  });
+  for (uint64_t frame = 1; frame <= 5; ++frame) {
+    const SsilFrame f = step_ssil(frame);
+    for (const SsilTexel& t : f.irr) {
+      EXPECT_LE(std::max({t.v[0], t.v[1], t.v[2]}), ao::SsilRadianceClamp);
+      EXPECT_GE(std::min({t.v[0], t.v[1], t.v[2]}), 0.f);
+      EXPECT_LE(t.v[3], 1.f);
+      EXPECT_GE(t.v[3], 0.f);
+    }
+  }
+}
+
+TEST_F(SsilGpu, GtaoMatchesMirror) {
+  Rig rig = crease_rig();
+  rig.width = 320;
+  rig.height = 240;
+  begin_ssil(rig, Quality::High, red_wall_white_floor);
+  step_ssil(1);
+  const SsilFrame f = step_ssil(2);
+  const ref::SsilPyramids pyramids = gpu_pyramids(f);
+  const std::vector<ref::GtaoTexel> cpu = cpu_ssil(pyramids, 2);
+  ASSERT_EQ(cpu.size(), f.ssilRaw.size());
+  size_t compared = 0;
+  size_t close = 0;
+  double sumError = 0.0;
+  for (size_t i = 0; i < cpu.size(); ++i) {
+    const double gpuVisibility = raw_visibility(f.raw[i]);
+    if (!cpu[i].receiver || cpu[i].occluded <= 0.0 || gpuVisibility >= 1.0 ||
+        std::abs(gpuVisibility - cpu[i].visibility) > 1.0 / 64.0) {
+      continue;
+    }
+    ++compared;
+    double error = 0.0;
+    for (size_t c = 0; c < 4; ++c) {
+      error = std::max(error, std::abs(cpu[i].ssil[c] - f.ssilRaw[i].v[c]));
+    }
+    sumError += error;
+    close += error <= 0.02 ? 1 : 0;
+  }
+  std::printf("ssil.raw against the mirror: %zu / %zu within 0.02, mean worst-channel error %.5f\n", close, compared,
+              compared ? sumError / compared : 0.0);
+  ASSERT_GT(compared, 100u);
+  EXPECT_GE(close, compared * 90 / 100);
+  EXPECT_LE(sumError / compared, 0.01);
+}
+
+TEST_F(SsilGpu, PyramidMatchesHizWeights) {
+  begin_ssil(crease_rig(), Quality::High, red_wall_white_floor);
+  step_ssil(1);
+  const SsilFrame f = step_ssil(2);
+  ASSERT_GE(f.radiance.size(), 2u);
+  const ref::SsilPyramids gpu = gpu_pyramids(f);
+  ao::Params params = cpu_params(*m_graph, 2);
+  StageCamera camera;
+  ASSERT_TRUE(fill_stage_camera(m_hints.get(), camera));
+  const ref::CpuPyramid depth = ref::build_pyramid(m_scene.depth, m_scene.width, m_scene.height, m_divisor, camera,
+                                                   params.effectRadius, static_cast<uint32_t>(gpu.widths.size()));
+  const ref::SsilPyramids cpu = ref::build_ssil_pyramids(gpu.radiance[0], gpu.normals[0], depth, params.effectRadius);
+  for (size_t mip = 1; mip < gpu.radiance.size(); ++mip) {
+    size_t bad = 0;
+    for (size_t i = 0; i < gpu.radiance[mip].size(); ++i) {
+      for (size_t c = 0; c < 4; ++c) {
+        const double want = cpu.radiance[mip][i][c];
+        bad += std::abs(gpu.radiance[mip][i][c] - want) > 0.01 * std::abs(want) + 0x1p-9 ? 1 : 0;
+      }
+      for (size_t c = 0; c < 3; ++c) {
+        bad += std::abs(gpu.normals[mip][i][c] - cpu.normals[mip][i][c]) > 3.0 / 255.0 ? 1 : 0;
+      }
+    }
+    EXPECT_LE(bad, gpu.radiance[mip].size() / 200) << "mip " << mip;
+  }
+}
+
+TEST_F(SsilGpu, FacingRejectsBackFacesAtCoarseMips) {
+  Rig rig{.width = 192, .height = 144, .eyeHeight = 200.0, .pitch = 10.0 * Deg};
+  rig.boxes = {{{-300.0, 0.0, 600.0}, {300.0, 300.0, 640.0}, TagWall},
+               {{-6.0, 0.0, 420.0}, {6.0, 160.0, 520.0}, TagPole}};
+  begin_ssil(rig, Quality::High, [](uint32_t, uint32_t, uint32_t tag) {
+    return tag == TagPole ? std::array<float, 4>{0.f, 1.f, 0.f, 1.f} : std::array<float, 4>{0.2f, 0.2f, 0.2f, 1.f};
+  });
+  step_ssil(1);
+  const SsilFrame f = step_ssil(2);
+  ASSERT_GE(f.normals.size(), 4u);
+  size_t facing = 0;
+  size_t texels = 0;
+  for (size_t mip = 3; mip < std::min<size_t>(f.normals.size(), 5); ++mip) {
+    for (const uint32_t word : f.normals[mip]) {
+      const std::array<double, 3> n = decode_normal_word(word);
+      const double len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+      facing += n[2] <= 0.05 || len < 0.05 ? 1 : 0;
+      ++texels;
+    }
+  }
+  EXPECT_EQ(facing, texels);
+  EXPECT_DOUBLE_EQ(ref::ssil_facing({0.0, 0.0, 1.0}, {0.0, 0.0, 1.0}), 0.0);
+  EXPECT_DOUBLE_EQ(ref::ssil_facing({0.0, 0.0, -1.0}, {0.0, 0.0, 1.0}), 1.0);
+  EXPECT_DOUBLE_EQ(ref::ssil_facing({0.0, 0.0, 0.0}, {0.0, 0.0, 1.0}), 1.0);
+}
+
+TEST(AoReference, SsilSharesEqualOcclusion) {
+  const Mat4x4<float> proj = perspective(Near, Far);
+  const Frame frame = render_rig(crease_rig(), proj);
+  StageCamera camera;
+  ASSERT_TRUE(fill_stage_camera(camera_hints(proj).get(), camera));
+  ao::Params params = ao::latched_params(ao_settings(Quality::High), {});
+  params.effectRadius = params.radiusMetres * DefaultUnitsPerMetre;
+  params.thickness = params.thicknessMetres * DefaultUnitsPerMetre;
+  const uint32_t divisor = ao::working_divisor(Quality::High);
+  const uint32_t gridWidth = ao::grid_size(frame.width, divisor);
+  const uint32_t gridHeight = ao::grid_size(frame.height, divisor);
+  const ref::CpuPyramid depth =
+      ref::build_pyramid(frame.depth, frame.width, frame.height, divisor, camera, params.effectRadius,
+                         ao::hiz::written_levels(chain_levels(gridWidth, gridHeight)));
+  const ref::SsilPyramids pyramids =
+      ref::build_ssil_pyramids(std::vector<ref::Rgba>(size_t{gridWidth} * gridHeight, ref::Rgba{1.0, 1.0, 1.0, 1.0}),
+                               std::vector<ref::Normal3>(size_t{gridWidth} * gridHeight), depth, params.effectRadius);
+  const std::vector<ref::GtaoTexel> texels = ref::estimate_gtao({.depth = frame.depth,
+                                                                 .normals = frame.normals,
+                                                                 .width = frame.width,
+                                                                 .height = frame.height,
+                                                                 .divisor = divisor,
+                                                                 .camera = camera,
+                                                                 .params = params,
+                                                                 .ssil = &pyramids},
+                                                                depth);
+  size_t occluded = 0;
+  for (const ref::GtaoTexel& t : texels) {
+    if (t.occluded <= 0.0) {
+      EXPECT_EQ(t.ssil[3], 0.0);
+      continue;
+    }
+    ++occluded;
+    EXPECT_NEAR(t.ssil[3], 1.0, 1e-12);
+    EXPECT_NEAR(t.ssil[0], 1.0, 1e-12);
+    if (t.visibility > params.minVisibility) {
+      EXPECT_NEAR(t.occluded / params.sliceCount, 1.0 - t.visibility, 1e-12);
+    }
+  }
+  EXPECT_GT(occluded, 100u);
 }
 } // namespace
 } // namespace aurora::render::detail

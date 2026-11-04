@@ -45,7 +45,7 @@ inline constexpr uint32_t LayeredPipeline = 0;
 inline constexpr uint32_t BasePipeline = 1;
 inline constexpr std::string_view SubgroupWalkDefine = "DEFERRED_SUBGROUP_WALK";
 
-// Later milestones append bindings 14 and up and never renumber these
+// Later milestones append bindings 15 and up and never renumber these
 enum Binding : uint32_t {
   BindSurface = 0,
   BindNormal = 1,
@@ -61,12 +61,22 @@ enum Binding : uint32_t {
   BindSurfaceTable = 11,
   BindSkyProbe = 12,
   BindSkySh9 = 13,
+  BindSsil = 14,
 };
 
-enum class Mode : uint32_t { Full = 0, Grey = 1, Direct = 2, Indirect = 3, Furnace = 4, FurnaceMetal = 5 };
+enum class Mode : uint32_t {
+  Full = 0,
+  Grey = 1,
+  Direct = 2,
+  Indirect = 3,
+  Furnace = 4,
+  FurnaceMetal = 5,
+  FurnaceAo = 6
+};
 
 enum ParamFlags : uint32_t {
   FlagSurfaceAmbient = 1u << 0,
+  FlagSsil = 1u << 4,
 };
 inline constexpr uint32_t ModeShift = 1;
 inline constexpr uint32_t ModeMask = 7u << ModeShift;
@@ -84,7 +94,8 @@ static_assert(offsetof(Params, ambient) == 48 && offsetof(Params, viewToWorld) =
 
 [[nodiscard]] std::optional<Mode> parse_mode(std::string_view text) noexcept;
 [[nodiscard]] std::array<float, 3> srgb_to_linear(const float (&stored)[3]) noexcept;
-void fill_params(const SceneHints* hints, bool surfaceAmbient, Mode mode, Params& out) noexcept;
+void fill_params(const SceneHints* hints, bool surfaceAmbient, Mode mode, Params& out, bool ssil = false) noexcept;
+[[nodiscard]] bool ssil_bound(const CompiledGraph& graph) noexcept;
 
 // The pass's enabled hook and the composite's per-frame term, so H exists exactly when the composite expects it
 [[nodiscard]] bool frame_enabled(const StageData& stage) noexcept;
@@ -135,6 +146,7 @@ struct Pixel {
   Vec3 position{0.0, 0.0, 100.0};
   double depth = 0.5;
   double aoFinal = 1.0;
+  std::array<double, 4> ssil{};
   uint32_t receiver = 1;
   bool cameraValid = true;
 };

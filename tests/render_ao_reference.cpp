@@ -61,6 +61,95 @@ double depth_mip_filter(const std::array<double, 4>& depths, double effectRadius
   return weighted / total;
 }
 
+std::array<double, 4> ssil_depth_mip_weights(const std::array<double, 4>& depths, double effectRadius) {
+  const double maxDepth = std::max(std::max(depths[0], depths[1]), std::max(depths[2], depths[3]));
+  const double radius = std::max(0.75 * effectRadius, 1e-6);
+  const double falloffRange = rules::FalloffRange * radius;
+  const double falloffMul = -1.0 / falloffRange;
+  const double falloffAdd = radius * (1.0 - rules::FalloffRange) / falloffRange + 1.0;
+  std::array<double, 4> out{};
+  for (size_t i = 0; i < out.size(); ++i) {
+    out[i] = std::clamp((maxDepth - depths[i]) * falloffMul + falloffAdd, 0.0, 1.0);
+  }
+  return out;
+}
+
+double ssil_facing(const Normal3& meanNormal, const Normal3& toEmitter) {
+  const double d = meanNormal[0] * toEmitter[0] + meanNormal[1] * toEmitter[1] + meanNormal[2] * toEmitter[2];
+  return std::clamp(1.0 - 4.0 * d, 0.0, 1.0);
+}
+
+Rgba ssil_clamp_radiance(const Rgba& value) {
+  Rgba out = value;
+  const bool finite = std::isfinite(value[0]) && std::isfinite(value[1]) && std::isfinite(value[2]);
+  for (size_t i = 0; i < 3; ++i) {
+    out[i] = finite ? std::max(value[i], 0.0) : 0.0;
+  }
+  const double peak = std::max({out[0], out[1], out[2]});
+  if (peak > rules::SsilRadianceClamp) {
+    for (size_t i = 0; i < 3; ++i) {
+      out[i] = std::min(out[i] * (rules::SsilRadianceClamp / peak), double{rules::SsilRadianceClamp});
+    }
+  }
+  return out;
+}
+
+std::array<double, 4> ssil_prev_depth_weights(double fx, double fy, const std::array<double, 4>& logDepths, double z,
+                                              double reject) {
+  const std::array<double, 4> bilinear{(1.0 - fx) * (1.0 - fy), fx * (1.0 - fy), (1.0 - fx) * fy, fx * fy};
+  std::array<double, 4> out{};
+  for (size_t i = 0; i < out.size(); ++i) {
+    out[i] = std::abs(std::exp2(logDepths[i]) - z) <= reject * z ? bilinear[i] : 0.0;
+  }
+  return out;
+}
+
+SsilPyramids build_ssil_pyramids(std::vector<Rgba> radiance, std::vector<Normal3> normals, const CpuPyramid& depth,
+                                 double effectRadius) {
+  SsilPyramids out;
+  out.widths = depth.widths;
+  out.heights = depth.heights;
+  out.radiance.push_back(std::move(radiance));
+  out.normals.push_back(std::move(normals));
+  for (uint32_t level = 1; level < depth.level_count(); ++level) {
+    const uint32_t prevWidth = depth.widths[level - 1];
+    const uint32_t prevHeight = depth.heights[level - 1];
+    const uint32_t width = depth.widths[level];
+    const uint32_t height = depth.heights[level];
+    std::vector<Rgba> nextRadiance(size_t{width} * height);
+    std::vector<Normal3> nextNormals(size_t{width} * height);
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x) {
+        std::array<size_t, 4> taps{};
+        for (uint32_t i = 0; i < 4; ++i) {
+          const uint32_t tx = std::min(2 * x + (i & 1), prevWidth - 1);
+          const uint32_t ty = std::min(2 * y + (i >> 1), prevHeight - 1);
+          taps[i] = size_t{ty} * prevWidth + tx;
+        }
+        const std::array<double, 4> depths{depth.levels[level - 1][taps[0]], depth.levels[level - 1][taps[1]],
+                                           depth.levels[level - 1][taps[2]], depth.levels[level - 1][taps[3]]};
+        const std::array<double, 4> w = ssil_depth_mip_weights(depths, effectRadius);
+        const double total = w[0] + w[1] + w[2] + w[3];
+        Rgba r{};
+        Normal3 n{};
+        for (uint32_t i = 0; i < 4; ++i) {
+          for (size_t c = 0; c < 4; ++c) {
+            r[c] += w[i] * out.radiance.back()[taps[i]][c] / total;
+          }
+          for (size_t c = 0; c < 3; ++c) {
+            n[c] += w[i] * out.normals.back()[taps[i]][c] / total;
+          }
+        }
+        nextRadiance[size_t{y} * width + x] = r;
+        nextNormals[size_t{y} * width + x] = n;
+      }
+    }
+    out.radiance.push_back(std::move(nextRadiance));
+    out.normals.push_back(std::move(nextNormals));
+  }
+  return out;
+}
+
 std::array<double, 3> view_position_fwd(const render::detail::StageCamera& camera, double u, double v, double z,
                                         double width, double height) {
   const double cx = double{camera.p02} - 2.0 * camera.jitterPx[0] / width;
@@ -293,6 +382,7 @@ std::vector<GtaoTexel> estimate_gtao(const GtaoSetup& setup, const CpuPyramid& p
       const double minS = rules::PixelTooClose / screenRadius;
       double visibility = 0.0;
       double continuous = 0.0;
+      Rgba ssilSum{};
       for (uint32_t slice = 0; slice < params.sliceCount; ++slice) {
         const double phi = (slice + double{noise[0]}) / params.sliceCount * Pi;
         const double omegaX = std::cos(phi) * screenRadius;
@@ -347,12 +437,31 @@ std::vector<GtaoTexel> estimate_gtao(const GtaoSetup& setup, const CpuPyramid& p
               lo = weight * ((Pi / 2 - back - n) / Pi);
               hi = weight * ((Pi / 2 - front - n) / Pi);
             }
-            mask |= rules::sector_bits(static_cast<float>(lo), static_cast<float>(hi), ceilMode);
+            const uint32_t bits = rules::sector_bits(static_cast<float>(lo), static_cast<float>(hi), ceilMode);
+            const uint32_t newBits = bits & ~mask;
+            if (setup.ssil != nullptr && newBits != 0) {
+              const Rgba& r = setup.ssil->radiance[mip][size_t{ty} * mipWidth + tx];
+              if (r[3] > 0.0) {
+                const Vec3 l = scale(delta, 1.0 / dist);
+                const double share = std::popcount(newBits) / 32.0 *
+                                     ssil_facing(setup.ssil->normals[mip][size_t{ty} * mipWidth + tx], l);
+                for (size_t c = 0; c < 4; ++c) {
+                  ssilSum[c] += share * r[c];
+                }
+              }
+            }
+            mask |= bits;
             intervals.push_back({lo, hi});
           }
         }
         visibility += 1.0 - std::popcount(mask) / double{rules::SectorCount};
         continuous += 1.0 - interval_union(std::move(intervals));
+      }
+      texel.occluded = params.sliceCount - visibility;
+      if (texel.occluded > 0.0) {
+        for (size_t c = 0; c < 4; ++c) {
+          texel.ssil[c] = ssilSum[c] / texel.occluded;
+        }
       }
       texel.visibility = std::max(double{params.minVisibility}, visibility / params.sliceCount);
       texel.continuous = std::max(double{params.minVisibility}, continuous / params.sliceCount);

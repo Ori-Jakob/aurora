@@ -31,11 +31,31 @@ uint8_t pack_edges(const std::array<double, 4>& edges);
 std::array<double, 4> unpack_edges(uint8_t packed);
 double interval_union(std::vector<std::array<double, 2>> intervals);
 
+using Rgba = std::array<double, 4>;
+using Normal3 = std::array<double, 3>;
+
+struct SsilPyramids {
+  std::vector<uint32_t> widths;
+  std::vector<uint32_t> heights;
+  std::vector<std::vector<Rgba>> radiance;
+  std::vector<std::vector<Normal3>> normals;
+};
+
+std::array<double, 4> ssil_depth_mip_weights(const std::array<double, 4>& depths, double effectRadius);
+double ssil_facing(const Normal3& meanNormal, const Normal3& toEmitter);
+Rgba ssil_clamp_radiance(const Rgba& premultiplied);
+std::array<double, 4> ssil_prev_depth_weights(double fx, double fy, const std::array<double, 4>& logDepths, double z,
+                                              double reject);
+SsilPyramids build_ssil_pyramids(std::vector<Rgba> radiance, std::vector<Normal3> normals, const CpuPyramid& depth,
+                                 double effectRadius);
+
 struct GtaoTexel {
   double visibility = 1.0;
   double continuous = 1.0;
   bool receiver = false;
   uint8_t edges = 0;
+  Rgba ssil{};
+  double occluded = 0.0;
 };
 
 struct GtaoSetup {
@@ -46,6 +66,7 @@ struct GtaoSetup {
   uint32_t divisor = 2;
   render::detail::StageCamera camera;
   render::detail::ao::Params params;
+  const SsilPyramids* ssil = nullptr;
 };
 
 std::vector<GtaoTexel> estimate_gtao(const GtaoSetup& setup, const CpuPyramid& pyramid);

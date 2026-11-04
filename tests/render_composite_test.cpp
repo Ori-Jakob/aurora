@@ -144,6 +144,46 @@ PassDesc stub_ao_desc(StubAo& stub) {
   };
 }
 
+struct StubSsil {
+  wgpu::TextureFormat format = wgpu::TextureFormat::RGBA16Float;
+  wgpu::Buffer staging;
+  uint32_t rowBytes = 0;
+  int calls = 0;
+};
+
+void declare_stub_ssil(InternalPassBuilder& builder, const PassSetup&, const void* state) {
+  const auto& stub = *static_cast<const StubSsil*>(state);
+  builder.after(phase::Ao);
+  builder.create(resource::SsilIrradiance, {.format = stub.format, .sizeClass = SizeClass::Efb}, Access::CopyDst);
+}
+
+void encode_stub_ssil(PassContext& ctx, const void* state) {
+  auto& stub = *static_cast<StubSsil*>(const_cast<void*>(state));
+  ++stub.calls;
+  if (!stub.staging) {
+    return;
+  }
+  const wgpu::Extent3D size = ctx.extent(TexRef{0});
+  const wgpu::TexelCopyBufferInfo from{.layout = {.bytesPerRow = stub.rowBytes, .rowsPerImage = size.height},
+                                       .buffer = stub.staging};
+  const wgpu::TexelCopyTextureInfo to{.texture = ctx.texture(TexRef{0})};
+  const wgpu::Extent3D extent{size.width, size.height, 1};
+  ctx.encoder().CopyBufferToTexture(&from, &to, &extent);
+}
+
+PassDesc stub_ssil_desc(StubSsil& stub) {
+  return {
+      .name = "test.ssil",
+      .stage = Stage::OpaqueDone,
+      .kind = PassKind::Copy,
+      .order = 1,
+      .runsWithoutMarker = true,
+      .declare = declare_stub_ssil,
+      .encode = encode_stub_ssil,
+      .state = &stub,
+  };
+}
+
 struct StubHdr {
   wgpu::TextureFormat format = lighting::deferred::HdrFormat;
   bool enabled = true;
@@ -351,6 +391,9 @@ TEST(CompositeRules, InputTableIsAppendOnly) {
   EXPECT_EQ(composite::BindSurface, 4u);
   EXPECT_EQ(composite::BindHdr, 5u);
   EXPECT_EQ(composite::BindExposure, 6u);
+  EXPECT_EQ(composite::BindSsil, 7u);
+  EXPECT_EQ(composite::FlagSsil, 16u);
+  EXPECT_EQ(offsetof(composite::Params, ssilAlbedo), 8u);
   EXPECT_EQ(lighting::exposure::Resource, "exposure");
   EXPECT_EQ(composite::LegacyTex, "legacyTex");
   EXPECT_EQ(composite::CopyPass, "legacy.copy");
@@ -1203,13 +1246,14 @@ TEST_F(CompositeGraph, BindingOrderLegacyFogNormalAoSurfaceHdr) {
   const NodeId node = graph->find_node(composite::Pass);
   ASSERT_EQ(graph->nodes[node].status, CullReason::None);
   const auto uses = graph->node_uses(node);
-  ASSERT_EQ(uses.size(), 8u);
-  const std::array<std::string_view, 8> names{
+  ASSERT_EQ(uses.size(), 9u);
+  const std::array<std::string_view, 9> names{
       composite::LegacyTex, resource::Fog,      resource::GxNormal,           resource::AoFinal,
-      resource::Surface,    resource::SceneHdr, lighting::exposure::Resource, resource::GxColor};
+      resource::Surface,    resource::SceneHdr, lighting::exposure::Resource, resource::SsilIrradiance,
+      resource::GxColor};
   for (size_t i = 0; i < names.size(); ++i) {
     EXPECT_EQ(graph->resources[uses[i].resource].name, names[i]) << i;
-    EXPECT_EQ(uses[i].access, i < 6 ? Access::Sampled : i == 6 ? Access::Uniform : Access::ColorRMW) << i;
+    EXPECT_EQ(uses[i].access, i == 6 ? Access::Uniform : i == 8 ? Access::ColorRMW : Access::Sampled) << i;
     if (i < 4) {
       EXPECT_EQ(uses[i].missing, Missing::DisablePass) << i;
     }
@@ -1237,7 +1281,7 @@ TEST_F(CompositeGraph, BindingOrderAppendsExposure) {
   const NodeId node = graph->find_node(composite::Pass);
   ASSERT_EQ(graph->nodes[node].status, CullReason::None);
   const auto uses = graph->node_uses(node);
-  ASSERT_EQ(uses.size(), 8u);
+  ASSERT_EQ(uses.size(), 9u);
   EXPECT_EQ(graph->resources[uses[composite::BindExposure].resource].name, lighting::exposure::Resource);
   EXPECT_FALSE(uses[composite::BindExposure].staticDummy);
   EXPECT_EQ(composite::check_contract(*graph), std::nullopt);
@@ -1572,6 +1616,78 @@ TEST_F(CompositeGraph, BlendChangeKeepsGraphHash) {
         << lb;
     EXPECT_TRUE(history_kept(graph, resource::RadianceDefogged)) << lb;
   }
+}
+
+TEST_F(CompositeGraph, BindingOrderAppendsSsil) {
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  StubSsil ssil;
+  register_pass(stub_ssil_desc(ssil));
+  composite::testing::set_radiance_forced(true);
+  const auto graph = live_graph(ao_settings());
+  const NodeId node = graph->find_node(composite::Pass);
+  const auto uses = graph->node_uses(node);
+  ASSERT_EQ(uses.size(), 10u);
+  EXPECT_EQ(graph->resources[uses[composite::BindSsil].resource].name, resource::SsilIrradiance);
+  EXPECT_EQ(uses[composite::BindSsil].missing, Missing::BindDummyBlack);
+  EXPECT_FALSE(uses[composite::BindSsil].staticDummy);
+  EXPECT_EQ(graph->resources[uses[8].resource].name, resource::GxColor);
+  EXPECT_EQ(graph->resources[uses[9].resource].name, resource::RadianceDefogged);
+  EXPECT_TRUE(composite::ssil_bound(*graph));
+  const composite::Params params = latched_params(*graph);
+  EXPECT_NE(params.flags & composite::FlagSsil, 0u);
+  EXPECT_EQ(params.ssilAlbedo, ao::SsilLegacyAlbedo);
+}
+
+TEST_F(CompositeGraph, SsilBindsBlackDummyWithoutSsil) {
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  const auto graph = live_graph(ao_settings());
+  const NodeId node = graph->find_node(composite::Pass);
+  const auto uses = graph->node_uses(node);
+  EXPECT_TRUE(uses[composite::BindSsil].staticDummy);
+  EXPECT_FALSE(composite::ssil_bound(*graph));
+  const composite::Params params = latched_params(*graph);
+  EXPECT_EQ(params.flags & composite::FlagSsil, 0u);
+  EXPECT_EQ(params.ssilAlbedo, 0.f);
+  EXPECT_EQ(params.pad, 0u);
+}
+
+TEST_F(CompositeGraph, SsilContractMismatchClearsOnlyTheFlag) {
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  StubSsil ssil{.format = wgpu::TextureFormat::RGBA8Unorm};
+  register_pass(stub_ssil_desc(ssil));
+  const auto graph = live_graph(ao_settings());
+  EXPECT_EQ(composite::check_contract(*graph), std::nullopt);
+  EXPECT_TRUE(composite::live());
+  EXPECT_TRUE(composite::ssil_bound(*graph));
+  EXPECT_EQ(latched_params(*graph).flags & composite::FlagSsil, 0u);
+}
+
+TEST_F(CompositeGraph, UnitsEpochFollowsFlagPbr) {
+  ASSERT_TRUE(use_pbr_tier());
+  composite::testing::set_pbr_producers_override(true);
+  StubHdr hdr;
+  produce_hdr(hdr);
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  const uint32_t start = composite::units_epoch();
+  const auto pbr = live_graph(pbr_settings(0.f, Quality::High));
+  EXPECT_NE(latched_params(*pbr).flags & composite::FlagPbr, 0u);
+  EXPECT_EQ(composite::units_epoch(), start + 1);
+  latch(pbr.get());
+  EXPECT_EQ(composite::units_epoch(), start + 1);
+  m_settings.legacyBlend = 0.5f;
+  latch(pbr.get());
+  EXPECT_EQ(composite::units_epoch(), start + 1);
+  m_settings.legacyBlend = 1.f;
+  latch(pbr.get());
+  EXPECT_EQ(latched_params(*pbr).flags & composite::FlagPbr, 0u);
+  EXPECT_EQ(composite::units_epoch(), start + 2);
+  m_settings.legacyBlend = 0.f;
+  latch(pbr.get());
+  EXPECT_EQ(composite::units_epoch(), start + 3);
 }
 
 TEST_F(CompositeGraph, PbrReadyNeedsTheTierWhileTheCompositeIsReady) {
@@ -2133,12 +2249,12 @@ TEST_F(CompositeGraph, RadianceIsSecondAttachmentAfterColor) {
   ASSERT_TRUE(composite::radiance_bound(*graph));
   const NodeId node = graph->find_node(composite::Pass);
   const auto uses = graph->node_uses(node);
-  ASSERT_EQ(uses.size(), 9u);
-  EXPECT_EQ(graph->resources[uses[7].resource].name, resource::GxColor);
-  EXPECT_EQ(uses[7].access, Access::ColorRMW);
-  EXPECT_EQ(graph->resources[uses[8].resource].name, resource::RadianceDefogged);
-  EXPECT_EQ(uses[8].access, Access::ColorWrite);
-  const CompiledResource& radiance = graph->resources[uses[8].resource];
+  ASSERT_EQ(uses.size(), 10u);
+  EXPECT_EQ(graph->resources[uses[8].resource].name, resource::GxColor);
+  EXPECT_EQ(uses[8].access, Access::ColorRMW);
+  EXPECT_EQ(graph->resources[uses[9].resource].name, resource::RadianceDefogged);
+  EXPECT_EQ(uses[9].access, Access::ColorWrite);
+  const CompiledResource& radiance = graph->resources[uses[9].resource];
   const CompiledResource& legacy = graph->resources[graph->find_resource(composite::LegacyTex)];
   EXPECT_EQ(radiance.kind, ResourceKind::History);
   EXPECT_EQ(radiance.creator, node);
@@ -2149,12 +2265,12 @@ TEST_F(CompositeGraph, RadianceIsSecondAttachmentAfterColor) {
   EXPECT_EQ(radiance.extent.height, legacy.extent.height);
   EXPECT_NE(radiance.textureUsage & wgpu::TextureUsage::TextureBinding, wgpu::TextureUsage::None);
   EXPECT_NE(radiance.textureUsage & wgpu::TextureUsage::RenderAttachment, wgpu::TextureUsage::None);
-  for (size_t i = 0; i < 7; ++i) {
+  for (size_t i = 0; i < 8; ++i) {
     EXPECT_NE(uses[i].access, Access::ColorWrite) << i;
   }
-  const std::array<std::string_view, 7> inputs{composite::LegacyTex,        resource::Fog,     resource::GxNormal,
-                                               resource::AoFinal,           resource::Surface, resource::SceneHdr,
-                                               lighting::exposure::Resource};
+  const std::array<std::string_view, 8> inputs{
+      composite::LegacyTex, resource::Fog,      resource::GxNormal,           resource::AoFinal,
+      resource::Surface,    resource::SceneHdr, lighting::exposure::Resource, resource::SsilIrradiance};
   for (size_t i = 0; i < inputs.size(); ++i) {
     EXPECT_EQ(graph->resources[uses[i].resource].name, inputs[i]) << i;
   }
@@ -2180,7 +2296,7 @@ TEST_F(CompositeGraph, SsilOffKeepsGraphAndPipeline) {
   ASSERT_EQ(off->nodes[node].status, CullReason::None);
   EXPECT_FALSE(composite::radiance_bound(*off));
   EXPECT_EQ(off->find_resource(resource::RadianceDefogged), InvalidResource);
-  EXPECT_EQ(off->node_uses(node).size(), 8u);
+  EXPECT_EQ(off->node_uses(node).size(), 9u);
   const composite::Params offParams = latched_params(*off);
   composite::testing::set_radiance_forced(true);
   const auto on = live_graph(ao_settings());
@@ -2421,6 +2537,7 @@ struct PixelRun {
   std::optional<float> exposure;
   std::function<void(std::array<uint16_t, 4>&, size_t)> hdrEdit;
   bool radiance = false;
+  std::function<std::array<float, 4>(size_t)> ssil;
 };
 
 Pixel control() { return {.color = {200, 180, 160, 255}, .code = 1, .fc = {}, .q7 = 0, .ao = 64}; }
@@ -2582,6 +2699,23 @@ protected:
       meter.words = {*options.exposure, 1.f / *options.exposure, 1.f, 1.f};
       meterId = register_pass(stub_exposure_desc(meter));
     }
+    StubSsil ssil;
+    PassId ssilId = InvalidPassId;
+    if (options.ssil) {
+      ssil.rowBytes = (width * 8 + 255) & ~255u;
+      std::vector<uint16_t> texels(size_t{ssil.rowBytes / 2} * height, 0);
+      for (size_t i = 0; i < pixels.size(); ++i) {
+        const std::array<float, 4> value = options.ssil(i);
+        for (size_t c = 0; c < 4; ++c) {
+          texels[(i / width) * (ssil.rowBytes / 2) + (i % width) * 4 + c] = lighting::openpbr::to_half(value[c]);
+        }
+      }
+      const wgpu::BufferDescriptor ssilDescriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                                  .size = texels.size() * 2};
+      ssil.staging = m_device->device.CreateBuffer(&ssilDescriptor);
+      m_device->queue.WriteBuffer(ssil.staging, 0, texels.data(), texels.size() * 2);
+      ssilId = register_pass(stub_ssil_desc(ssil));
+    }
     RadianceProbe probe;
     const PassId probeId = options.radiance ? register_pass(radiance_probe_desc(probe)) : InvalidPassId;
     const composite::testing::Counters before = composite::testing::counters();
@@ -2605,6 +2739,11 @@ protected:
     }
     if (hdrId != InvalidPassId) {
       unregister_pass(hdrId);
+    }
+    if (ssilId != InvalidPassId) {
+      EXPECT_TRUE(composite::ssil_bound(*graph));
+      EXPECT_EQ(ssil.calls, 1);
+      unregister_pass(ssilId);
     }
     if (meterId != InvalidPassId) {
       EXPECT_EQ(meter.calls, 1);
@@ -2871,6 +3010,141 @@ TEST_F(CompositeGpu, NoFogModeIsPlainMultiply) {
     ASSERT_LE(std::abs(out[i].r - to_byte(p.color.r / 255.f * a)), 1) << i;
     ASSERT_LE(std::abs(out[i].g - to_byte(p.color.g / 255.f * a)), 1) << i;
     ASSERT_LE(std::abs(out[i].b - to_byte(p.color.b / 255.f * a)), 1) << i;
+  }
+}
+
+std::array<int, 3> ssil_mirror(const Pixel& p, const std::array<float, 4>& irr, float albedo) {
+  const std::array<float, 3> l{p.color.r / 255.f, p.color.g / 255.f, p.color.b / 255.f};
+  const std::array<float, 3> fc{p.fc[0] / 255.f, p.fc[1] / 255.f, p.fc[2] / 255.f};
+  const std::array<float, 3> bounce{albedo * lighting::openpbr::from_half(lighting::openpbr::to_half(irr[0])),
+                                    albedo * lighting::openpbr::from_half(lighting::openpbr::to_half(irr[1])),
+                                    albedo * lighting::openpbr::from_half(lighting::openpbr::to_half(irr[2]))};
+  const std::array<float, 3> out = composite::testing::legacy_ssil(l, fc, p.q7, p.ao / 255.f, p.code / 3.f, bounce);
+  return {to_byte(out[0]), to_byte(out[1]), to_byte(out[2])};
+}
+
+struct SsilCase {
+  std::vector<Pixel> pixels;
+  std::vector<std::array<float, 4>> irr;
+};
+
+SsilCase ssil_cases(uint32_t count, uint32_t seed) {
+  std::mt19937 rng{seed};
+  std::uniform_int_distribution<int> byte(0, 255);
+  std::uniform_real_distribution<float> unit(0.f, 1.f);
+  SsilCase out;
+  for (uint32_t i = 0; i < count; ++i) {
+    Pixel p{.color = {static_cast<uint8_t>(byte(rng)), static_cast<uint8_t>(byte(rng)), static_cast<uint8_t>(byte(rng)),
+                      255},
+            .code = static_cast<uint8_t>(i % 7 == 0 ? 0 : 1 + i % 3),
+            .fc = {static_cast<uint8_t>(byte(rng) / 4), static_cast<uint8_t>(byte(rng) / 4),
+                   static_cast<uint8_t>(byte(rng) / 4)},
+            .q7 = static_cast<uint8_t>(i % 5 == 0 ? byte(rng) / 2 : 0),
+            .ao = static_cast<uint8_t>(i % 11 == 0 ? 255 : byte(rng))};
+    out.pixels.push_back(p);
+    const float scale = i % 13 == 0 ? 8.f : 0.6f;
+    out.irr.push_back({unit(rng) * scale, unit(rng) * scale, unit(rng) * scale, unit(rng)});
+  }
+  return out;
+}
+
+TEST_F(CompositeGpu, SsilOffIsBitIdentical) {
+  const SsilCase c = ssil_cases(64 * 48, 0x55A1u);
+  const std::vector<Rgba> off = run_pixels(64, 48, c.pixels, {});
+  const uint32_t before = composite::testing::counters().ssilDraws;
+  const std::vector<Rgba> zero = run_pixels(64, 48, c.pixels, {.ssil = [](size_t) { return std::array<float, 4>{}; }});
+  EXPECT_EQ(composite::testing::counters().ssilDraws, before + 1);
+  size_t differ = 0;
+  for (size_t i = 0; i < off.size(); ++i) {
+    differ += off[i].r != zero[i].r || off[i].g != zero[i].g || off[i].b != zero[i].b || off[i].a != zero[i].a;
+  }
+  EXPECT_EQ(differ, 0u);
+  for (size_t i = 0; i < off.size(); ++i) {
+    const std::array<int, 3> want = mirror(c.pixels[i]);
+    ASSERT_LE(std::abs(off[i].r - want[0]), 1) << i;
+  }
+}
+
+TEST_F(CompositeGpu, SsilMatchesMirror) {
+  const SsilCase c = ssil_cases(64 * 48, 0x55A2u);
+  const std::vector<Rgba> out = run_pixels(64, 48, c.pixels, {.ssil = [&](size_t i) { return c.irr[i]; }});
+  size_t worst = 0;
+  size_t exact = 0;
+  for (size_t i = 0; i < out.size(); ++i) {
+    const std::array<int, 3> want = ssil_mirror(c.pixels[i], c.irr[i], ao::SsilLegacyAlbedo);
+    const std::array<int, 3> got{out[i].r, out[i].g, out[i].b};
+    size_t d = 0;
+    for (size_t k = 0; k < 3; ++k) {
+      d = std::max<size_t>(d, static_cast<size_t>(std::abs(got[k] - want[k])));
+    }
+    worst = std::max(worst, d);
+    exact += d == 0 ? 1 : 0;
+    EXPECT_EQ(out[i].a, c.pixels[i].color.a) << i;
+  }
+  std::printf("SSIL composite against the mirror: worst %zu code, %zu / %zu exact\n", worst, exact, out.size());
+  EXPECT_LE(worst, 1u);
+}
+
+TEST_F(CompositeGpu, SsilNeverBrightens) {
+  SsilCase c = ssil_cases(64 * 48, 0x55A3u);
+  for (auto& irr : c.irr) {
+    irr = {16.f, 16.f, 16.f, 1.f};
+  }
+  const std::vector<Rgba> ao = run_pixels(64, 48, c.pixels, {});
+  const std::vector<Rgba> out = run_pixels(64, 48, c.pixels, {.ssil = [&](size_t i) { return c.irr[i]; }});
+  size_t lifted = 0;
+  for (size_t i = 0; i < out.size(); ++i) {
+    const Pixel& p = c.pixels[i];
+    EXPECT_LE(out[i].r, p.color.r) << i;
+    EXPECT_LE(out[i].g, p.color.g) << i;
+    EXPECT_LE(out[i].b, p.color.b) << i;
+    EXPECT_GE(out[i].r + 1, ao[i].r) << i;
+    EXPECT_GE(out[i].g + 1, ao[i].g) << i;
+    EXPECT_GE(out[i].b + 1, ao[i].b) << i;
+    lifted += out[i].r > ao[i].r || out[i].g > ao[i].g || out[i].b > ao[i].b ? 1 : 0;
+  }
+  EXPECT_GT(lifted, out.size() / 4);
+}
+
+TEST_F(CompositeGpu, SsilKeepsReceiverHue) {
+  std::vector<Pixel> pixels;
+  std::vector<std::array<float, 4>> irr;
+  for (uint32_t i = 0; i < 64 * 48; ++i) {
+    const auto shade = static_cast<uint8_t>(60 + i % 160);
+    pixels.push_back({.color = {static_cast<uint8_t>(shade / 3), shade, static_cast<uint8_t>(shade / 5), 255},
+                      .code = 1,
+                      .ao = static_cast<uint8_t>(90 + i % 120)});
+    irr.push_back({0.2f, 0.2f, 0.2f, 1.f});
+  }
+  const std::vector<Rgba> out = run_pixels(64, 48, pixels, {.ssil = [&](size_t i) { return irr[i]; }});
+  size_t checked = 0;
+  for (size_t i = 0; i < out.size(); ++i) {
+    const Pixel& p = pixels[i];
+    const double scaleG = static_cast<double>(out[i].g) / p.color.g;
+    const double scaleR = static_cast<double>(out[i].r) / std::max<int>(p.color.r, 1);
+    if (p.color.r >= 40 && out[i].g < p.color.g) {
+      EXPECT_NEAR(scaleR, scaleG, 1.5 / p.color.r + 1.5 / p.color.g) << i;
+      ++checked;
+    }
+  }
+  EXPECT_GT(checked, 500u);
+}
+
+TEST_F(CompositeGpu, SsilIdentityStillDiscards) {
+  std::vector<Pixel> pixels(64 * 48, control());
+  for (size_t i = 0; i < pixels.size(); ++i) {
+    pixels[i].ao = i % 2 == 0 ? 255 : 128;
+    pixels[i].color.a = static_cast<uint8_t>(i % 251);
+  }
+  const std::vector<Rgba> out =
+      run_pixels(64, 48, pixels, {.ssil = [](size_t) { return std::array<float, 4>{4.f, 4.f, 4.f, 1.f}; }});
+  for (size_t i = 0; i < pixels.size(); ++i) {
+    EXPECT_EQ(out[i].a, pixels[i].color.a) << i;
+    if (pixels[i].ao == 255) {
+      EXPECT_EQ(out[i].r, pixels[i].color.r) << i;
+      EXPECT_EQ(out[i].g, pixels[i].color.g) << i;
+      EXPECT_EQ(out[i].b, pixels[i].color.b) << i;
+    }
   }
 }
 

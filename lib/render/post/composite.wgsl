@@ -3,7 +3,7 @@
 struct CompositeParams {
   flags: u32,
   legacy_blend: f32,
-  pad0: u32,
+  ssil_albedo: f32,
   pad1: u32,
 }
 
@@ -30,6 +30,7 @@ struct CompositeOut {
 @group(1) @binding(4) var surface_tex: texture_2d<u32>;
 @group(1) @binding(5) var scene_hdr: texture_2d<f32>;
 @group(1) @binding(6) var<uniform> composite_exposure: CompositeExposure;
+@group(1) @binding(7) var ssil_irr: texture_2d<f32>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
@@ -57,6 +58,10 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
       t.e = composite_exposure.e;
       t.agx = (composite_params.flags & COMPOSITE_FLAG_TONEMAP_AGX) != 0u;
     }
+  }
+  if ((composite_params.flags & COMPOSITE_FLAG_SSIL) != 0u && t.ao < 1.0) {
+    let e_bounce = composite_units(composite_params.flags, composite_exposure.e, composite_exposure.inv_e).x;
+    t.bounce = composite_ssil_term(ssil_irr, p, e_bounce, composite_params.ssil_albedo);
   }
 //#if !COMPOSITE_RADIANCE
   if (composite_is_identity(t)) {

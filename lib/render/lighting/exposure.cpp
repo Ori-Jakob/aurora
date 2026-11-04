@@ -3,6 +3,7 @@
 #include "clusters.hpp"
 #include "deferred.hpp"
 
+#include "../ao/ao.hpp"
 #include "../debug/views.hpp"
 #include "../hints.hpp"
 #include "../pass_context.hpp"
@@ -134,6 +135,21 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
   builder.history(State, state_desc(), Access::StorageWrite);
   builder.create_buffer(Partials, {.size = PartialBytes}, Access::StorageWrite);
   builder.create_buffer(Resource, {.size = BufferBytes}, Access::StorageWrite);
+  builder.use(resource::SsilIrradiance, Access::Sampled, Missing::BindDummyBlack);
+}
+
+bool meter_reads(const CompiledGraph& graph, std::string_view name) noexcept {
+  const NodeId node = graph.find_node(Pass);
+  const ResourceId id = graph.find_resource(name);
+  if (node == InvalidNode || id == InvalidResource) {
+    return false;
+  }
+  for (const CompiledUse& use : graph.node_uses(node)) {
+    if (use.resource == id) {
+      return !use.staticDummy;
+    }
+  }
+  return false;
 }
 
 wgpu::PipelineLayout pipeline_layout(const PipelineSetup& setup) {
@@ -427,6 +443,11 @@ void on_latch(const PassSetup& latched, const CompiledGraph* graph) {
     Params params;
     // A meter that was off has no history worth smoothing from, so it snaps on its first frame back
     fill_params(*settings, target(), deltaMs, slot.armed && !g_wasArmed, params);
+    if (slot.declared && settings->ao != Quality::Off && meter_reads(*graph, resource::SsilIrradiance) &&
+        meter_reads(*graph, resource::AoFinal)) {
+      params.flags |= FlagSsil;
+      params.ssilAlbedo = ao::legacy_albedo();
+    }
     set_pass_params(g_pass, std::as_bytes(std::span{&params, 1}));
   }
   g_wasArmed = slot.armed;

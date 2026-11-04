@@ -4,6 +4,7 @@
 //#import aurora/openpbr
 //#import aurora/sky
 //#import aurora/srgb
+//#import aurora/ssil
 //#import aurora/surface
 
 //#if DEFERRED_SUBGROUP_WALK
@@ -21,12 +22,14 @@ struct DeferredParams {
 }
 
 const DEFERRED_FLAG_SURFACE_AMBIENT: u32 = 1u;
+const DEFERRED_FLAG_SSIL: u32 = 16u;
 const DEFERRED_MODE_FULL: u32 = 0u;
 const DEFERRED_MODE_GREY: u32 = 1u;
 const DEFERRED_MODE_DIRECT: u32 = 2u;
 const DEFERRED_MODE_INDIRECT: u32 = 3u;
 const DEFERRED_MODE_FURNACE: u32 = 4u;
 const DEFERRED_MODE_FURNACE_METAL: u32 = 5u;
+const DEFERRED_MODE_FURNACE_AO: u32 = 6u;
 const DEFERRED_HDR_MAX: f32 = 65504.0;
 
 @group(0) @binding(1) var<uniform> deferred_params: DeferredParams;
@@ -45,6 +48,7 @@ const DEFERRED_HDR_MAX: f32 = 65504.0;
 @group(1) @binding(11) var<storage, read> surface_table: array<vec4u>;
 @group(1) @binding(12) var sky_probe: texture_2d<f32>;
 @group(1) @binding(13) var<uniform> sky_sh9: SkySh9;
+@group(1) @binding(14) var ssil_irr: texture_2d<f32>;
 
 var<workgroup> deferred_union: array<atomic<u32>, 8>;
 
@@ -135,6 +139,7 @@ fn shade(@builtin(global_invocation_id) id: vec3u, @builtin(local_invocation_ind
   }
   let mode = (deferred_params.flags >> 1u) & 7u;
   let furnace = mode == DEFERRED_MODE_FURNACE || mode == DEFERRED_MODE_FURNACE_METAL;
+  let furnace_ao = mode == DEFERRED_MODE_FURNACE_AO;
   let full = vec2f(dims);
   let pos = camera_view_position_fwd(cam, (vec2f(px) + 0.5) / full, z, full);
   let v = normalize(-pos);
@@ -149,17 +154,28 @@ fn shade(@builtin(global_invocation_id) id: vec3u, @builtin(local_invocation_ind
   if (mode == DEFERRED_MODE_GREY) {
     surface.base_color = vec3f(0.5);
   }
-  if (furnace) {
+  if (furnace || furnace_ao) {
     surface.base_color = vec3f(1.0);
     surface.metalness = select(0.0, 1.0, mode == DEFERRED_MODE_FURNACE_METAL);
   }
-  let row = light_classes[min(cls, 255u)];
+  var row = light_classes[min(cls, 255u)];
+  if (furnace_ao) {
+    // No specular lobe and no texture AO, so H is a_s plus exactly the bounce
+    row.specular = vec4f(0.0);
+    row.coat.w = 0.0;
+    row.fuzz.w = 0.0;
+    row.subsurface.w = 0.0;
+    row.emission.w = 0.0;
+    row.base = vec4f(0.0, 0.0, 0.0, 1.0);
+    row.misc.z = 0.0;
+  }
   let p = openpbr_prepare(surface, row, n, v, light_lut3d, light_lut2d, linear_clamp);
   // The AO-off dummy is 1x1, so the load clamps
   var ao = 1.0;
   if (gbuf_receiver_code(normal_texel.a) >= 1u) {
     ao = pow(deferred_texel(ao_final, px).r, 2.2);
   }
+  let ao_screen = ao;
   ao = min(ao, s.ao);
   var a = select(deferred_params.ambient, srgb_to_linear(s.ambient),
                  (deferred_params.flags & DEFERRED_FLAG_SURFACE_AMBIENT) != 0u);
@@ -167,13 +183,21 @@ fn shade(@builtin(global_invocation_id) id: vec3u, @builtin(local_invocation_ind
     a = vec3f(1.0);
     ao = 1.0;
   }
+  if (furnace_ao) {
+    a = vec3f(1.0);
+    ao = ao_screen;
+  }
   var h = vec3f(0.0);
   if (mode != DEFERRED_MODE_DIRECT) {
     let baked = (flags & GBUF_SURFACE_FLAG_BAKED_LIGHT) != 0u;
     h = openpbr_eval_ambient(p, deferred_indirect_diffuse(a, n, baked),
                              deferred_indirect_specular(a, n, v, s.roughness)) * ao;
+    // The far field keeps the visible share and the bounce fills only what screen AO removed, so AO applies once
+    if ((deferred_params.flags & DEFERRED_FLAG_SSIL) != 0u && gbuf_receiver_code(normal_texel.a) >= 1u) {
+      h += openpbr_eval_ambient(p, ssil_bounce_irradiance(ssil_fetch(ssil_irr, vec2i(px)), ao_screen), vec3f(0.0));
+    }
   }
-  if (mode != DEFERRED_MODE_INDIRECT && !furnace) {
+  if (mode != DEFERRED_MODE_INDIRECT && !furnace && !furnace_ao) {
     let thin = (flags & GBUF_SURFACE_FLAG_THIN_TRANSLUCENT) != 0u;
     let cat = s.category;
     // The category test covers directionals too: the camera fill is a masked directional

@@ -245,6 +245,11 @@ bool feature_ready(Feature feature) noexcept {
   if (feature == Feature::Ao && !detail::composite::ao_ready(effective_settings())) {
     return false;
   }
+  // Bounce shows only through the composite and light.deferred, so their pipelines gate Applying...
+  if (feature == Feature::Ssil &&
+      (!detail::ao::ssil_ready(effective_settings()) || !detail::composite::ready(effective_settings()))) {
+    return false;
+  }
   // PBR shows only through the PBR tier and the composite, so a refused switch or a pending pipeline keeps Applying
   if (feature == Feature::Pbr && webgpu::scene_tier() != webgpu::SceneTier::Pbr) {
     return false;

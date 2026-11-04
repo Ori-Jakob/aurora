@@ -13,6 +13,7 @@
 namespace aurora::render::detail::ao::denoise {
 inline constexpr std::string_view Pass = "ao.denoise";
 inline constexpr std::string_view History = "ao.history";
+inline constexpr std::string_view SsilHistory = "ssil.history";
 inline constexpr std::string_view Shader = "ao/denoise";
 inline constexpr wgpu::TextureFormat Format = wgpu::TextureFormat::RGBA16Float;
 inline constexpr uint32_t WorkgroupSize = 8;
@@ -27,6 +28,8 @@ constexpr TexDesc history_desc(uint32_t divisor) noexcept {
   };
 }
 
+constexpr TexDesc ssil_history_desc(uint32_t divisor) noexcept { return history_desc(divisor); }
+
 constexpr uint32_t groups(uint32_t size) noexcept { return (size + WorkgroupSize - 1) / WorkgroupSize; }
 
 PassDesc pass_desc();
@@ -39,6 +42,7 @@ struct Counters {
   uint32_t temporalValid = 0;
   uint32_t temporalResets = 0;
   uint32_t groupsCreated = 0;
+  uint32_t ssilResets = 0;
 };
 Counters counters() noexcept;
 void reset() noexcept;

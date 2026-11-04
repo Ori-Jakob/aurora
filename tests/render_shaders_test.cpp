@@ -500,6 +500,96 @@ TEST_F(RenderShaders, AoGtaoSsilHookCompiles) {
   EXPECT_TRUE(validate_module("ao/upsample", {}, error)) << error;
 }
 
+TEST_F(RenderShaders, AoDenoiseSsilCompiles) {
+  const std::array<std::string_view, 1> ssil{"AO_SSIL"};
+  const std::array<std::string_view, 2> reset{"AO_RESET", "AO_SSIL"};
+  std::string error;
+  EXPECT_TRUE(validate_module("ao/denoise", ssil, error)) << error;
+  EXPECT_TRUE(validate_module("ao/denoise", reset, error)) << error;
+}
+
+TEST_F(RenderShaders, AoUpsampleSsilCompiles) {
+  const std::array<std::string_view, 1> ssil{"AO_SSIL"};
+  std::string error;
+  EXPECT_TRUE(validate_module("ao/upsample", ssil, error)) << error;
+}
+
+TEST_F(RenderShaders, SsilRadianceCompiles) {
+  const std::array<std::string_view, 1> reset{"SSIL_RESET"};
+  const std::array<std::string_view, 1> furnace{"SSIL_FURNACE"};
+  std::string error;
+  EXPECT_TRUE(validate_module("ao/ssil_radiance", {}, error)) << error;
+  EXPECT_TRUE(validate_module("ao/ssil_radiance", reset, error)) << error;
+  EXPECT_TRUE(validate_module("ao/ssil_radiance", furnace, error)) << error;
+}
+
+std::optional<std::string_view> library_text(std::string_view id) {
+  for (const EmbeddedShader& shader : embedded_library()) {
+    if (shader.id == id) {
+      return text_of(shader);
+    }
+  }
+  return std::nullopt;
+}
+
+std::string function_body(std::string_view text, std::string_view signature) {
+  const size_t start = text.find(signature);
+  if (start == std::string_view::npos) {
+    return {};
+  }
+  const size_t open = text.find('{', start);
+  const size_t close = text.find("\n}", open);
+  return std::string{text.substr(open, close - open)};
+}
+
+TEST_F(RenderShaders, SsilLibraryIsBindingFree) {
+  const std::optional<std::string_view> text = library_text("aurora/ssil");
+  ASSERT_TRUE(text.has_value());
+  EXPECT_EQ(text->find("@group"), std::string_view::npos);
+  EXPECT_EQ(text->find("@binding"), std::string_view::npos);
+  EXPECT_EQ(text->find("//#import"), std::string_view::npos);
+  EXPECT_EQ(text->find("var<"), std::string_view::npos);
+  std::string error;
+  EXPECT_TRUE(validate_module("aurora/ssil", {}, error)) << error;
+}
+
+TEST_F(RenderShaders, SsilMipWeightsMatchHiz) {
+  const std::optional<std::string_view> hiz = library_text("ao/hiz");
+  const std::optional<std::string_view> ssil = library_text("ao/ssil_radiance");
+  ASSERT_TRUE(hiz.has_value() && ssil.has_value());
+  std::string want = function_body(*hiz, "fn hiz_depth_mip_filter(");
+  std::string got = function_body(*ssil, "fn ssil_depth_mip_weights(");
+  ASSERT_FALSE(want.empty());
+  ASSERT_FALSE(got.empty());
+  const size_t weightsAt = want.find("  let weights = ");
+  ASSERT_NE(weightsAt, std::string::npos);
+  const size_t weightsEnd = want.find('\n', weightsAt);
+  const std::string weights = want.substr(weightsAt + 16, weightsEnd - weightsAt - 16);
+  want = want.substr(0, weightsAt) + "  return " + weights;
+  EXPECT_EQ(got, want);
+}
+
+TEST(SsilRules, LinearAoMatchesAoModule) {
+  const std::optional<std::string_view> ssil = library_text("aurora/ssil");
+  const std::optional<std::string_view> ao = library_text("aurora/ao");
+  ASSERT_TRUE(ssil.has_value() && ao.has_value());
+  const std::string body = function_body(*ssil, "fn ssil_linear_ao(a: f32) -> f32");
+  EXPECT_EQ(body, function_body(*ao, "fn ao_linear_factor(a: f32) -> f32"));
+  EXPECT_EQ(body, "{\n  return pow(a, 2.2);");
+}
+
+TEST(SsilRules, DefogFloorMatchesRadianceAndMeter) {
+  const std::optional<std::string_view> ssil = library_text("aurora/ssil");
+  const std::optional<std::string_view> composite = library_text("aurora/composite");
+  const std::optional<std::string_view> meter = library_text(detail::lighting::exposure::Shader);
+  ASSERT_TRUE(ssil.has_value() && composite.has_value() && meter.has_value());
+  EXPECT_NE(ssil->find("const SSIL_DEFOG_MIN: f32 = 13.0 / 127.0;"), std::string_view::npos);
+  EXPECT_NE(composite->find("const COMPOSITE_RADIANCE_MIN_T: f32 = 13.0 / 127.0;"), std::string_view::npos);
+  EXPECT_NE(meter->find("const EXPOSURE_FOG_CUT_Q7: u32 = 114u;"), std::string_view::npos);
+  static_assert(detail::composite::RadianceFogCutQ7 == detail::lighting::exposure::FogCutQ7);
+  static_assert(127 - detail::composite::RadianceFogCutQ7 == 13);
+}
+
 TEST_F(RenderShaders, CompositeRadianceVariantCompiles) {
   const std::array<std::string_view, 1> radiance{detail::composite::RadianceDefine};
   std::string error;
@@ -518,8 +608,8 @@ TEST_F(RenderShaders, DefaultVariantsCarryNoRadiance) {
     }
     return std::nullopt;
   };
-  constexpr std::array<std::string_view, 5> Symbols{"@location(1)", "composite_radiance", "composite_units",
-                                                    "COMPOSITE_RADIANCE_MIN_T", "CompositeOut"};
+  constexpr std::array<std::string_view, 4> Symbols{"@location(1)", "composite_radiance", "COMPOSITE_RADIANCE_MIN_T",
+                                                    "CompositeOut"};
   for (const std::string_view root : {detail::composite::Shader, detail::lighting::exposure::Shader}) {
     ResolvedSource source;
     std::string error;

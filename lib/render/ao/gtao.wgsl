@@ -30,6 +30,12 @@
 @group(1) @binding(0) var ao_hiz: texture_2d<f32>;
 @group(1) @binding(1) var scene_normal: texture_2d<f32>;
 @group(1) @binding(2) var ao_raw: texture_storage_2d<rgba8unorm, write>;
+//#if AO_SSIL
+//#import aurora/ssil
+@group(1) @binding(3) var ssil_radiance: texture_2d<f32>;
+@group(1) @binding(4) var ssil_normal: texture_2d<f32>;
+@group(1) @binding(5) var ssil_raw: texture_storage_2d<rgba16float, write>;
+//#endif
 
 const GTAO_PI: f32 = 3.14159265358979;
 const GTAO_HALF_PI: f32 = 1.57079632679490;
@@ -117,10 +123,16 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let normal_texel = textureLoad(scene_normal, q, 0);
   if (ao_is_sky(z) || gbuf_receiver_code(normal_texel.a) == 0u) {
     textureStore(ao_raw, id.xy, vec4f(open, packed_edges, 0.0, 0.0));
+//#if AO_SSIL
+    textureStore(ssil_raw, id.xy, vec4f(0.0));
+//#endif
     return;
   }
   if (ao_params.slice_count == 0u) {
     textureStore(ao_raw, id.xy, vec4f(open, packed_edges, 1.0, 0.0));
+//#if AO_SSIL
+    textureStore(ssil_raw, id.xy, vec4f(0.0));
+//#endif
     return;
   }
 
@@ -150,6 +162,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let screen_radius = effect_radius / pixel_size;
   if (screen_radius < GTAO_PIXEL_TOO_CLOSE) {
     textureStore(ao_raw, id.xy, vec4f(open, packed_edges, 1.0, 0.0));
+//#if AO_SSIL
+    textureStore(ssil_raw, id.xy, vec4f(0.0));
+//#endif
     return;
   }
 
@@ -173,6 +188,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let slices = ao_params.slice_count;
   let steps = ao_params.steps_per_slice;
   var visibility = 0.0;
+//#if AO_SSIL
+  let ssil_live = all(textureDimensions(ssil_radiance) == size) && all(textureDimensions(ssil_normal) == size);
+  var ssil_sum = vec4f(0.0);
+//#endif
   for (var slice_index = 0u; slice_index < slices; slice_index++) {
     let phi = (f32(slice_index) + noise.x) / f32(slices) * GTAO_PI;
     let cos_phi = cos(phi);
@@ -218,7 +237,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let bits = ao_sector_bits(lo, hi, ceil_mode);
 //#if AO_SSIL
         let new_bits = bits & ~mask;
-        {
+        if (new_bits != 0u && ssil_live) {
+          let r = textureLoad(ssil_radiance, texel, i32(mip));
+          if (r.a > 0.0) {
+            let emitter = ssil_decode_normal(textureLoad(ssil_normal, texel, i32(mip)));
+            let facing = ssil_emitter_facing(emitter, delta / dist);
+            ssil_sum += f32(countOneBits(new_bits)) / 32.0 * facing * r;
+          }
         }
 //#endif
         mask |= bits;
@@ -226,6 +251,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     }
     visibility += 1.0 - f32(countOneBits(mask)) / f32(AO_SECTOR_COUNT);
   }
+//#if AO_SSIL
+  // Sectors are uniform in angle like AO's, so the occluded share is exactly what visibility leaves out
+  let occ = f32(slices) - visibility;
+  textureStore(ssil_raw, id.xy, select(vec4f(0.0), ssil_sum / occ, occ > 0.0));
+//#endif
   visibility = max(ao_params.min_visibility, pow(max(visibility / f32(slices), 1e-6), AO_FINAL_POWER));
   textureStore(ao_raw, id.xy, vec4f(saturate(visibility / AO_RAW_SCALE), packed_edges, 1.0, 0.0));
 }

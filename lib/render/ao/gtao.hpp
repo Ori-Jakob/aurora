@@ -13,6 +13,8 @@
 namespace aurora::render::detail::ao::gtao {
 inline constexpr std::string_view Pass = "ao.gtao";
 inline constexpr std::string_view Resource = "ao.raw";
+inline constexpr std::string_view SsilRaw = "ssil.raw";
+inline constexpr wgpu::TextureFormat SsilFormat = wgpu::TextureFormat::RGBA16Float;
 inline constexpr std::string_view Shader = "ao/gtao";
 inline constexpr wgpu::TextureFormat Format = wgpu::TextureFormat::RGBA8Unorm;
 inline constexpr uint32_t WorkgroupSize = 8;
@@ -20,6 +22,14 @@ inline constexpr uint32_t WorkgroupSize = 8;
 constexpr TexDesc raw_desc(uint32_t divisor) noexcept {
   return {
       .format = Format,
+      .sizeClass = SizeClass::Efb,
+      .divisor = static_cast<uint16_t>(divisor),
+  };
+}
+
+constexpr TexDesc ssil_raw_desc(uint32_t divisor) noexcept {
+  return {
+      .format = SsilFormat,
       .sizeClass = SizeClass::Efb,
       .divisor = static_cast<uint16_t>(divisor),
   };

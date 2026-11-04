@@ -40,7 +40,8 @@ constexpr TexRef Normal{BindNormal};
 constexpr TexRef AoFinal{BindAo};
 constexpr TexRef SurfaceRec{BindSurface};
 constexpr TexRef Hdr{BindHdr};
-constexpr TexRef Color{BindExposure + 1};
+constexpr TexRef SsilIrr{BindSsil};
+constexpr TexRef Color{BindSsil + 1};
 // Declared after gx.color, so every binding and the Color attachment keep their numbers
 constexpr TexRef Radiance{static_cast<uint16_t>(Color.index + 1)};
 constexpr std::array<std::string_view, 1> RadianceDefines{RadianceDefine};
@@ -56,6 +57,7 @@ struct LatchSlot {
   bool aoProduced = false;
   bool aoLive = false;
   bool pbrActive = false;
+  bool ssilLive = false;
   std::array<uint32_t, 1> ids{};
 };
 
@@ -70,6 +72,9 @@ std::optional<bool> g_producersOverride;
 std::optional<bool> g_readyOverride;
 std::optional<bool> g_radianceForced;
 bool g_contractWarned = false;
+bool g_ssilWarned = false;
+bool g_latchedPbr = false;
+std::atomic_uint32_t g_unitsEpoch{0};
 
 std::atomic_uint64_t g_enabledFrame{NoFrame};
 std::atomic_bool g_encodeMismatch{false};
@@ -85,6 +90,7 @@ std::atomic_uint32_t g_idleFrames{0};
 std::atomic_uint32_t g_hdrDraws{0};
 std::atomic_uint32_t g_radianceDraws{0};
 std::atomic_uint32_t g_radianceClears{0};
+std::atomic_uint32_t g_ssilDraws{0};
 
 inline void bump(std::atomic_uint32_t& counter) noexcept {
   counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
@@ -161,13 +167,33 @@ const CompiledUse* composite_use(const CompiledGraph& graph, std::string_view re
   return nullptr;
 }
 
-bool params_carry_pbr(std::span<const std::byte> bytes) noexcept {
+uint32_t params_flags_of(std::span<const std::byte> bytes) noexcept {
   Params params;
   if (bytes.size() < sizeof(params)) {
-    return false;
+    return 0;
   }
   std::memcpy(&params, bytes.data(), sizeof(params));
-  return (params.flags & FlagPbr) != 0;
+  return params.flags;
+}
+
+bool params_carry_pbr(std::span<const std::byte> bytes) noexcept { return (params_flags_of(bytes) & FlagPbr) != 0; }
+
+bool ssil_contract(const CompiledGraph& graph) {
+  const CompiledUse* use = composite_use(graph, resource::SsilIrradiance);
+  if (use == nullptr || use->staticDummy) {
+    return false;
+  }
+  const CompiledResource& irr = graph.resources[use->resource];
+  const ResourceId legacyId = graph.find_resource(LegacyTex);
+  const bool extentOk = legacyId != InvalidResource && same_extent(irr.extent, graph.resources[legacyId].extent);
+  if (irr.tex.format == wgpu::TextureFormat::RGBA16Float && extentOk) {
+    return true;
+  }
+  if (!std::exchange(g_ssilWarned, true)) {
+    Log.warn("Composite bounce off: {} is {} {}x{}, not RGBA16Float at legacyTex's extent", resource::SsilIrradiance,
+             magic_enum::enum_name(irr.tex.format), irr.extent.width, irr.extent.height);
+  }
+  return false;
 }
 
 bool pbr_producers_live() noexcept {
@@ -255,6 +281,8 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
                      UseOptions{.missing = Missing::BindDummyWhite,
                                 .visibility = wgpu::ShaderStage::Fragment,
                                 .dummySize = lighting::exposure::BufferBytes});
+  // Always declared, so binding numbers never depend on Indirect Light
+  builder.use(resource::SsilIrradiance, Access::Sampled, Missing::BindDummyBlack);
   builder.use(resource::GxColor, Access::ColorRMW);
   if (radiance_wanted(setup)) {
     // Next frame's screen-space passes sample it, so the usage cannot depend on a capture
@@ -337,7 +365,7 @@ void encode(PassContext& ctx, const void*) {
   }
   // White and black dummies are 1x1 and every load clamps, so they never fail the extent check
   for (const auto& [ref, name] : {std::pair{AoFinal, resource::AoFinal}, std::pair{SurfaceRec, resource::Surface},
-                                  std::pair{Hdr, resource::SceneHdr}}) {
+                                  std::pair{Hdr, resource::SceneHdr}, std::pair{SsilIrr, resource::SsilIrradiance}}) {
     const wgpu::Extent3D extent = ctx.extent(ref);
     if (!same_extent(extent, ctx.extent(Color)) && (extent.width != 1 || extent.height != 1)) {
       encode_mismatch(ctx, Color, ref, name);
@@ -361,6 +389,9 @@ void encode(PassContext& ctx, const void*) {
   bump(g_draws);
   if (radiance) {
     bump(g_radianceDraws);
+  }
+  if ((params_flags_of(ctx.params()) & FlagSsil) != 0) {
+    bump(g_ssilDraws);
   }
   if (params_carry_pbr(ctx.params())) {
     bump(g_pbrDraws);
@@ -416,6 +447,13 @@ bool radiance_bound(const CompiledGraph& graph) noexcept {
 }
 
 bool radiance_env_on(const char* value) noexcept { return value != nullptr && std::string_view{value} == "on"; }
+
+bool ssil_bound(const CompiledGraph& graph) noexcept {
+  const CompiledUse* use = composite_use(graph, resource::SsilIrradiance);
+  return use != nullptr && !use->staticDummy;
+}
+
+uint32_t units_epoch() noexcept { return g_unitsEpoch.load(std::memory_order_relaxed); }
 
 uint32_t params_flags(bool identity, const char* noFog) noexcept {
   uint32_t flags = identity ? FlagIdentity : 0u;
@@ -590,6 +628,8 @@ void shutdown() noexcept {
     g_slot = {};
   }
   g_contractWarned = false;
+  g_ssilWarned = false;
+  g_latchedPbr = false;
   g_enabledFrame.store(NoFrame, std::memory_order_relaxed);
   g_encodeMismatch.store(false, std::memory_order_relaxed);
   const testing::Counters c = testing::counters();
@@ -599,6 +639,7 @@ void shutdown() noexcept {
   constexpr std::string_view PbrLine =
       "Composite PBR term ran on {} frames ({} with scene.hdr, {} idle without AO or H)";
   constexpr std::string_view RadianceLine = "Composite radiance written on {} frames ({} cleared on bail)";
+  constexpr std::string_view SsilLine = "Composite bounce drawn on {} frames";
   if (m8_env_set()) {
     Log.info(Line, c.draws, c.skippedMismatch, c.skippedNoScene, c.skippedView, c.contractFailures);
   } else {
@@ -614,6 +655,11 @@ void shutdown() noexcept {
   } else {
     Log.debug(RadianceLine, c.radianceDraws, c.radianceClears);
   }
+  if (m8_env_set() || c.ssilDraws != 0) {
+    Log.info(SsilLine, c.ssilDraws);
+  } else {
+    Log.debug(SsilLine, c.ssilDraws);
+  }
 }
 
 void on_latch(const PassSetup& latched, const CompiledGraph* graph) {
@@ -624,6 +670,7 @@ void on_latch(const PassSetup& latched, const CompiledGraph* graph) {
     g_slot.live = false;
     g_slot.hdrLive = graph != nullptr && hdr_produced(*graph);
     g_slot.aoProduced = graph != nullptr && ao_produced(*graph);
+    g_slot.ssilLive = graph != nullptr && ssil_contract(*graph);
     g_slot.ids = {};
     g_encodeMismatch.store(false, std::memory_order_relaxed);
     if (graph != nullptr) {
@@ -653,6 +700,7 @@ void on_latch(const PassSetup& latched, const CompiledGraph* graph) {
                      testing::pbr_active_for(g_slot.live, g_slot.hdrLive, g_slot.classView, *settings) &&
                      pbr_producers_live();
   const bool pbrActive = g_slot.pbrActive;
+  const bool ssilOn = g_slot.ssilLive && g_slot.aoLive;
   lock.unlock();
   if (g_pass != InvalidPassId) {
     Params params{.flags = g_flagsOverride.value_or(params_flags(identity_forced(), nullptr) |
@@ -665,8 +713,16 @@ void on_latch(const PassSetup& latched, const CompiledGraph* graph) {
         params.flags |= FlagTonemapAgX;
       }
     }
+    if (ssilOn) {
+      params.flags |= FlagSsil;
+      params.ssilAlbedo = ao::legacy_albedo();
+    }
     params = g_paramsOverride.value_or(params);
     set_pass_params(g_pass, std::as_bytes(std::span{&params, 1}));
+    const bool latchedPbr = (params.flags & FlagPbr) != 0;
+    if (latchedPbr != std::exchange(g_latchedPbr, latchedPbr)) {
+      g_unitsEpoch.fetch_add(1, std::memory_order_relaxed);
+    }
   }
 }
 
@@ -733,6 +789,7 @@ Counters counters() noexcept {
       .hdrDraws = g_hdrDraws.load(std::memory_order_relaxed),
       .radianceDraws = g_radianceDraws.load(std::memory_order_relaxed),
       .radianceClears = g_radianceClears.load(std::memory_order_relaxed),
+      .ssilDraws = g_ssilDraws.load(std::memory_order_relaxed),
   };
 }
 
@@ -756,6 +813,8 @@ void reset() noexcept {
   g_hdrDraws.store(0, std::memory_order_relaxed);
   g_radianceDraws.store(0, std::memory_order_relaxed);
   g_radianceClears.store(0, std::memory_order_relaxed);
+  g_ssilDraws.store(0, std::memory_order_relaxed);
+  g_ssilWarned = false;
 }
 
 void set_flags(std::optional<uint32_t> flags) noexcept { g_flagsOverride = flags; }
@@ -767,6 +826,8 @@ void set_pbr_producers_override(std::optional<bool> live) noexcept { g_producers
 void set_ready_override(std::optional<bool> ready) noexcept { g_readyOverride = ready; }
 
 void set_radiance_forced(std::optional<bool> forced) noexcept { g_radianceForced = forced; }
+
+void bump_units_epoch() noexcept { g_unitsEpoch.fetch_add(1, std::memory_order_relaxed); }
 
 bool pbr_active_for(bool live, bool hdrLive, bool classView, const Settings& settings) noexcept {
   return live && hdrLive && pbr_term_wanted(settings) && !classView;
@@ -819,6 +880,32 @@ std::array<float, 3> legacy_pbr_hdr(std::array<float, 3> legacy, std::array<floa
 
 std::array<float, 2> units(uint32_t flags, float e, float invE) noexcept {
   return (flags & FlagPbr) != 0 ? std::array{e, invE} : std::array{1.f, 1.f};
+}
+
+std::array<float, 3> legacy_ssil(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7, float ao,
+                                 float normalAlpha, std::array<float, 3> bounce) noexcept {
+  const bool receiver = std::round(std::clamp(normalAlpha, 0.f, 1.f) * 3.f) >= 1.f;
+  if (!receiver || ao >= 1.f || (bounce[0] == 0.f && bounce[1] == 0.f && bounce[2] == 0.f)) {
+    return legacy_ao(legacy, fogColor, q7, ao, normalAlpha);
+  }
+  const float q = static_cast<float>(std::min(q7, 127u)) / 127.f;
+  const float divisor = std::max(1.f - q, static_cast<float>(127u - RadianceFogCutQ7) / 127.f);
+  std::array<float, 3> sp{};
+  std::array<float, 3> receiverLinear{};
+  for (size_t i = 0; i < 3; ++i) {
+    const float s = legacy[i] - q * fogColor[i];
+    if (s < -2.f / 255.f) {
+      return legacy;
+    }
+    sp[i] = std::max(s, 0.f);
+    receiverLinear[i] = srgb_to_linear(std::clamp(sp[i] / divisor, 0.f, 1.f));
+  }
+  const std::array<float, 3> scale = ao::ssil_legacy_gain(ao, bounce, receiverLinear);
+  std::array<float, 3> out{};
+  for (size_t i = 0; i < 3; ++i) {
+    out[i] = legacy[i] - sp[i] * (1.f - scale[i]);
+  }
+  return out;
 }
 
 std::array<float, 4> radiance(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7, float ao,

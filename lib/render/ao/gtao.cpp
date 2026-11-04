@@ -1,12 +1,14 @@
 #include "gtao.hpp"
 
 #include "hiz.hpp"
+#include "ssil_radiance.hpp"
 
 #include "../pass_context.hpp"
 #include "../shaders.hpp"
 
 #include "../../gx/gx.hpp"
 
+#include <array>
 #include <atomic>
 #include <span>
 #include <string>
@@ -16,6 +18,7 @@ namespace {
 static_assert(gx::UseReversedZ);
 
 constexpr TexRef Target{2};
+constexpr std::array<std::string_view, 1> SsilDefines{"AO_SSIL"};
 
 std::atomic_uint32_t g_dispatches{0};
 
@@ -29,13 +32,24 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
               UseOptions{.missing = Missing::DisablePass, .sampleType = wgpu::TextureSampleType::UnfilterableFloat});
   builder.use(resource::GxNormal, Access::Sampled, Missing::DisablePass);
   builder.create(Resource, raw_desc(working_divisor(setup.settings->ao)), Access::StorageWrite);
+  if (ssil_wanted(setup)) {
+    // SSIL inputs bind black dummies, so a missing radiance source never takes AO with it
+    builder.use(
+        ssil_radiance::Resource, Access::Sampled,
+        UseOptions{.missing = Missing::BindDummyBlack, .sampleType = wgpu::TextureSampleType::UnfilterableFloat});
+    builder.use(ssil_radiance::Normal, Access::Sampled, Missing::BindDummyBlack);
+    builder.create(SsilRaw, ssil_raw_desc(working_divisor(setup.settings->ao)), Access::StorageWrite);
+  }
 }
 
 void request_pipelines(const PipelineSetup& setup, const void*, std::span<uint32_t, MaxPassPipelines> ids) {
+  const bool ssil = setup.pass != nullptr && ssil_wanted(*setup.pass);
   ids[0] = shaders::request_compute({
                                         .label = "ao.gtao",
                                         .shader = Shader,
                                         .entryPoint = "main",
+                                        .defines = ssil ? std::span<const std::string_view>{SsilDefines}
+                                                        : std::span<const std::string_view>{},
                                         .layout = setup.layout,
                                         .layoutKey = setup.layoutHash,
                                     })

@@ -497,6 +497,26 @@ TEST_F(RenderApiTest, PbrBuiltByDefault) {
   EXPECT_FALSE(detail::clamp_settings(Settings{}, env(full_caps(), defaults)).pbr);
 }
 
+TEST_F(RenderApiTest, SsilBuiltByDefault) {
+  const BuiltOptions& defaults = detail::default_built_options();
+  EXPECT_EQ(defaults[static_cast<size_t>(Feature::Ssil)], 1u << 1);
+  Caps budget32 = full_caps();
+  budget32.limits.maxColorAttachmentBytesPerSample = 32;
+  const Settings ssil{.ao = Quality::High, .ssil = true};
+  EXPECT_EQ(evaluate_support(Feature::Ssil, 0, ssil, env(full_caps(), defaults)), Supported);
+  EXPECT_EQ(evaluate_support(Feature::Ssil, 0, ssil, env(budget32, defaults)), Supported);
+  EXPECT_EQ(evaluate_support(Feature::Ssil, 0, ssil, env(compat_caps(), defaults)), unsupported(Reason::NeedsCore));
+  EXPECT_EQ(evaluate_support(Feature::Ssil, 0, ssil, env(full_caps(), defaults, 4)), unsupported(Reason::MsaaActive));
+  Settings noAo = ssil;
+  noAo.ao = Quality::Off;
+  EXPECT_EQ(evaluate_support(Feature::Ssil, 0, noAo, env(full_caps(), defaults)), unsupported(Reason::NeedsAo));
+  EXPECT_TRUE(detail::clamp_settings(ssil, env(full_caps(), defaults)).ssil);
+  EXPECT_TRUE(detail::clamp_settings(ssil, env(budget32, defaults)).ssil);
+  EXPECT_FALSE(detail::clamp_settings(ssil, env(budget32, defaults)).pbr);
+  EXPECT_FALSE(detail::clamp_settings(noAo, env(full_caps(), defaults)).ssil);
+  EXPECT_FALSE(detail::clamp_settings(Settings{}, env(full_caps(), defaults)).ssil);
+}
+
 TEST_F(RenderApiTest, LegacyBlendEnvParses) {
   EXPECT_EQ(detail::parse_legacy_blend("0"), 0.f);
   EXPECT_EQ(detail::parse_legacy_blend("0.25"), 0.25f);

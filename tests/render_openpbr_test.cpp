@@ -6,6 +6,7 @@
 #include "gfx/resources.hpp"
 #include "gx/hints.hpp"
 #include "gx/surface_pack.hpp"
+#include "render/ao/ao.hpp"
 #include "render/debug/views.hpp"
 #include "render/frame_state.hpp"
 #include "render/gpu_heap.hpp"
@@ -856,6 +857,70 @@ TEST(DeferredMirror, EmissionSitsUnderCoatAndFuzz) {
   EXPECT_EQ(openpbr::emission_scale(prepare(rows[200], {}, px.normal, v)), (Vec3{1.0, 1.0, 1.0}));
 }
 
+TEST(DeferredMirror, SsilFillsScreenAoShare) {
+  const std::span<const classes::GpuRow, 256> rows = class_rows();
+  deferred::testing::Pixel px;
+  px.albedo = {0.8, 0.6, 0.4};
+  px.ambient = {0.5, 0.5, 0.5};
+  px.aoFinal = 0.5;
+  px.ao = 0.3;
+  px.normal = {0.2, 0.3, -0.9};
+  px.position = {20.0, -10.0, 400.0};
+  deferred::Params params;
+  deferred::fill_params(nullptr, true, deferred::Mode::Full, params);
+  const deferred::testing::Result off = deferred::testing::shade(px, {}, {}, params, rows);
+  deferred::Params on = params;
+  on.flags |= deferred::FlagSsil;
+  EXPECT_EQ(deferred::testing::shade(px, {}, {}, on, rows).rgb, off.rgb);
+  px.ssil = {0.2, 0.1, 0.05, 0.7};
+  const deferred::testing::Result one = deferred::testing::shade(px, {}, {}, on, rows);
+  px.ssil = {0.4, 0.2, 0.1, 0.7};
+  const deferred::testing::Result two = deferred::testing::shade(px, {}, {}, on, rows);
+  px.ao = 0.9;
+  const deferred::testing::Result texture = deferred::testing::shade(px, {}, {}, on, rows);
+  const deferred::testing::Result textureOff = deferred::testing::shade(px, {}, {}, params, rows);
+  for (size_t c = 0; c < 3; ++c) {
+    const double first = one.rgb[c] - off.rgb[c];
+    EXPECT_GT(first, 0.0) << c;
+    EXPECT_NEAR(two.rgb[c] - off.rgb[c], 2.0 * first, 1e-9) << c;
+    EXPECT_NEAR(texture.rgb[c] - textureOff.rgb[c], 2.0 * first, 1e-9) << "AO8 must not scale the fill";
+  }
+  px.ao = 0.3;
+  px.aoFinal = 1.0;
+  EXPECT_EQ(deferred::testing::shade(px, {}, {}, on, rows).rgb, deferred::testing::shade(px, {}, {}, params, rows).rgb);
+  px.aoFinal = 0.5;
+  px.receiver = 0;
+  EXPECT_EQ(deferred::testing::shade(px, {}, {}, on, rows).rgb, deferred::testing::shade(px, {}, {}, params, rows).rgb);
+}
+
+TEST(DeferredMirror, FurnaceAoIsScreenAoPlusBounce) {
+  const std::span<const classes::GpuRow, 256> rows = class_rows();
+  deferred::Params params;
+  deferred::fill_params(nullptr, true, deferred::Mode::FurnaceAo, params);
+  params.flags |= deferred::FlagSsil;
+  for (const double strength : {0.0, 0.5, 1.0, 1.5}) {
+    for (const double raw : {0.2, 0.45, 0.8, 1.0}) {
+      const double v = ao::apply_strength(static_cast<float>(raw), static_cast<float>(strength), 0.2f);
+      for (const double lb : {0.0, 0.3, 1.0}) {
+        for (const uint32_t cls : {1u, 4u, 9u}) {
+          deferred::testing::Pixel px;
+          px.classId = cls;
+          px.albedo = {0.3, 0.7, 0.1};
+          px.ao = 0.4;
+          px.aoFinal = v;
+          px.ssil = {lb, lb, lb, 1.0};
+          const deferred::testing::Result r = deferred::testing::shade(px, {}, {}, params, rows);
+          const double as = std::pow(v, 2.2);
+          for (size_t c = 0; c < 3; ++c) {
+            EXPECT_NEAR(r.rgb[c], as + (1.0 - as) * lb, 2e-3) << strength << " " << raw << " " << lb << " " << cls;
+            EXPECT_LE(r.rgb[c], 1.0 + 2e-3);
+          }
+        }
+      }
+    }
+  }
+}
+
 TEST(DeferredMirror, BackFacingNormalsAreBent) {
   const Vec3 v{0.0, 0.0, -1.0};
   for (const Vec3 raw :
@@ -1212,12 +1277,12 @@ TEST_F(LightDeferredGraph, DeclaresOnPbrSurface) {
   ASSERT_EQ(status(*graph, clusters::Pass), CullReason::None);
   const NodeId node = graph->find_node(deferred::Pass);
   const auto uses = graph->node_uses(node);
-  const std::array<std::string_view, 14> names{
-      resource::Surface,          resource::GxNormal,      resource::GxDepth,
-      resource::AoFinal,          clusters::List,          clusters::Grid,
-      openpbr::Classes,           openpbr::Lut3d,          openpbr::Lut2d,
-      resource::SceneHdr,         resource::SurfaceExt,    resource::SurfaceTable,
-      lighting::sky_probe::Probe, lighting::sky_probe::Sh9};
+  const std::array<std::string_view, 15> names{
+      resource::Surface,          resource::GxNormal,       resource::GxDepth,
+      resource::AoFinal,          clusters::List,           clusters::Grid,
+      openpbr::Classes,           openpbr::Lut3d,           openpbr::Lut2d,
+      resource::SceneHdr,         resource::SurfaceExt,     resource::SurfaceTable,
+      lighting::sky_probe::Probe, lighting::sky_probe::Sh9, resource::SsilIrradiance};
   ASSERT_EQ(uses.size(), names.size());
   for (size_t i = 0; i < names.size(); ++i) {
     EXPECT_EQ(graph->resources[uses[i].resource].name, names[i]) << i;
@@ -1241,6 +1306,27 @@ TEST_F(LightDeferredGraph, DeclaresOnPbrSurface) {
   EXPECT_EQ(status(*compile(pbr_settings(), DepthSource::Copy), deferred::Pass), CullReason::Skipped);
   ASSERT_TRUE(webgpu::set_scene_tier(webgpu::SceneTier::Base));
   EXPECT_EQ(status(*compile(pbr_settings()), deferred::Pass), CullReason::Skipped);
+}
+
+TEST_F(LightDeferredGraph, BindingOrderAppendsSsil) {
+  composite::initialize();
+  composite::testing::set_pbr_producers_override(true);
+  const auto graph = compile(pbr_settings());
+  const NodeId node = graph->find_node(deferred::Pass);
+  ASSERT_NE(node, InvalidNode);
+  const auto uses = graph->node_uses(node);
+  ASSERT_GT(uses.size(), deferred::BindSsil);
+  EXPECT_EQ(deferred::BindSsil, 14u);
+  EXPECT_EQ(graph->resources[uses[deferred::BindSsil].resource].name, resource::SsilIrradiance);
+  EXPECT_EQ(uses[deferred::BindSsil].missing, Missing::BindDummyBlack);
+  EXPECT_TRUE(uses[deferred::BindSsil].staticDummy);
+  EXPECT_FALSE(deferred::ssil_bound(*graph));
+  deferred::Params params;
+  deferred::fill_params(nullptr, true, deferred::Mode::Full, params, deferred::ssil_bound(*graph));
+  EXPECT_EQ(params.flags & deferred::FlagSsil, 0u);
+  EXPECT_EQ(deferred::parse_mode("furnace-ao"), deferred::Mode::FurnaceAo);
+  EXPECT_EQ(static_cast<uint32_t>(deferred::Mode::FurnaceAo) << deferred::ModeShift & ~deferred::ModeMask, 0u);
+  EXPECT_EQ(deferred::FlagSsil & deferred::ModeMask, 0u);
 }
 
 TEST_F(LightDeferredGraph, DisabledAtFullBlend) {
@@ -1784,6 +1870,188 @@ TEST_F(LightDeferredGpu, ThinCutoutPassesLightFromBehind) {
       }
     }
   }
+}
+
+struct StubTexture {
+  std::string name;
+  std::string_view resource;
+  wgpu::TextureFormat format = wgpu::TextureFormat::RGBA8Unorm;
+  wgpu::Buffer staging;
+  uint32_t rowBytes = 0;
+  int calls = 0;
+};
+
+void declare_stub_texture(InternalPassBuilder& builder, const PassSetup&, const void* state) {
+  const auto& stub = *static_cast<const StubTexture*>(state);
+  builder.after(phase::Ao);
+  builder.create(stub.resource, {.format = stub.format, .sizeClass = SizeClass::Efb}, Access::CopyDst);
+}
+
+void encode_stub_texture(PassContext& ctx, const void* state) {
+  auto& stub = *static_cast<StubTexture*>(const_cast<void*>(state));
+  ++stub.calls;
+  const wgpu::Extent3D size = ctx.extent(TexRef{0});
+  const wgpu::TexelCopyBufferInfo from{.layout = {.bytesPerRow = stub.rowBytes, .rowsPerImage = size.height},
+                                       .buffer = stub.staging};
+  const wgpu::TexelCopyTextureInfo to{.texture = ctx.texture(TexRef{0})};
+  const wgpu::Extent3D extent{size.width, size.height, 1};
+  ctx.encoder().CopyBufferToTexture(&from, &to, &extent);
+}
+
+PassDesc stub_texture_desc(StubTexture& stub) {
+  return {
+      .name = stub.name,
+      .stage = Stage::OpaqueDone,
+      .kind = PassKind::Copy,
+      .order = 5,
+      .runsWithoutMarker = true,
+      .declare = declare_stub_texture,
+      .encode = encode_stub_texture,
+      .state = &stub,
+  };
+}
+
+class SsilDeferredGpu : public LightDeferredGpu {
+protected:
+  void stage_ao(uint32_t width, uint32_t height, const std::vector<uint8_t>& ao) {
+    m_ao = StubTexture{.name = "t.ao_final", .resource = resource::AoFinal};
+    m_ao.rowBytes = (width * 4 + 255) & ~255u;
+    std::vector<uint8_t> staged(size_t{m_ao.rowBytes} * height, 0);
+    for (size_t i = 0; i < ao.size(); ++i) {
+      staged[(i / width) * m_ao.rowBytes + (i % width) * 4] = ao[i];
+    }
+    const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                            .size = staged.size()};
+    m_ao.staging = m_device->device.CreateBuffer(&descriptor);
+    m_device->queue.WriteBuffer(m_ao.staging, 0, staged.data(), staged.size());
+    m_aoId = register_pass(stub_texture_desc(m_ao));
+  }
+
+  PassId stage_ssil(uint32_t width, uint32_t height, const std::vector<std::array<float, 4>>& irr) {
+    m_ssil = StubTexture{
+        .name = "t.ssil_irr", .resource = resource::SsilIrradiance, .format = wgpu::TextureFormat::RGBA16Float};
+    m_ssil.rowBytes = (width * 8 + 255) & ~255u;
+    std::vector<uint16_t> staged(size_t{m_ssil.rowBytes / 2} * height, 0);
+    for (size_t i = 0; i < irr.size(); ++i) {
+      for (size_t c = 0; c < 4; ++c) {
+        staged[(i / width) * (m_ssil.rowBytes / 2) + (i % width) * 4 + c] = openpbr::to_half(irr[i][c]);
+      }
+    }
+    const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                            .size = staged.size() * 2};
+    m_ssil.staging = m_device->device.CreateBuffer(&descriptor);
+    m_device->queue.WriteBuffer(m_ssil.staging, 0, staged.data(), staged.size() * 2);
+    return register_pass(stub_texture_desc(m_ssil));
+  }
+
+  StubTexture m_ao;
+  StubTexture m_ssil;
+  PassId m_aoId = InvalidPassId;
+};
+
+TEST_F(SsilDeferredGpu, SsilFurnaceIncrementIsExact) {
+  std::mt19937 rng{0x551Fu};
+  std::uniform_real_distribution<float> unit(0.f, 1.f);
+  set_hints(scene_hints({}));
+  std::vector<GpuPixel> pixels(size_t{64} * 48);
+  std::vector<uint8_t> ao(pixels.size());
+  std::vector<std::array<float, 4>> irr(pixels.size());
+  for (size_t i = 0; i < pixels.size(); ++i) {
+    pixels[i] = random_gpu_pixel(rng);
+    pixels[i].receiver = static_cast<uint8_t>(i % 9 == 0 ? 0 : 1 + i % 3);
+    ao[i] = static_cast<uint8_t>(i % 7 == 0 ? 255 : 40 + i % 215);
+    const float lb = unit(rng);
+    irr[i] = {lb, lb * unit(rng), lb * unit(rng), unit(rng)};
+  }
+  const std::vector<deferred::testing::Pixel> inputs = stage_pixels(64, 48, pixels);
+  deferred::testing::force_enabled(true);
+  deferred::testing::set_mode(deferred::Mode::FurnaceAo);
+  stage_ao(64, 48, ao);
+  const auto off = run_hdr(pbr_settings(), 1);
+  const PassId ssilId = stage_ssil(64, 48, irr);
+  const auto on = run_hdr(pbr_settings(), 2);
+  unregister_pass(ssilId);
+  ASSERT_EQ(off.size(), pixels.size());
+  ASSERT_EQ(on.size(), pixels.size());
+  double worstFar = 0.0;
+  double worstIncrement = 0.0;
+  size_t filled = 0;
+  for (size_t i = 0; i < pixels.size(); ++i) {
+    if (inputs[i].classId == 0) {
+      continue;
+    }
+    const double as = inputs[i].receiver >= 1 ? std::pow(ao[i] / 255.0, 2.2) : 1.0;
+    for (size_t c = 0; c < 3; ++c) {
+      const double hOff = openpbr::from_half(off[i][c]);
+      const double hOn = openpbr::from_half(on[i][c]);
+      const double lb = openpbr::from_half(openpbr::to_half(irr[i][c]));
+      const double want = inputs[i].receiver >= 1 ? (1.0 - as) * lb : 0.0;
+      worstFar = std::max(worstFar, std::abs(hOff - as) - (0.02 * as + 0x1p-10));
+      worstIncrement = std::max(worstIncrement, std::abs(hOn - hOff - want) - (0x1p-9 + 0x1p-10 * hOn));
+      EXPECT_GE(hOn - hOff, -0x1p-10) << i;
+      filled += want > 0.01 ? 1 : 0;
+    }
+  }
+  std::printf("furnace-ao: worst excess over the far band %.6f, over the increment band %.6f, %zu filled channels\n",
+              worstFar, worstIncrement, filled);
+  EXPECT_LE(worstFar, 0.0);
+  EXPECT_LE(worstIncrement, 0.0);
+  EXPECT_GT(filled, 1000u);
+}
+
+TEST_F(SsilDeferredGpu, SsilOffIsBitIdentical) {
+  std::mt19937 rng{0x5520u};
+  set_hints(scene_hints(mixed_lights()));
+  std::vector<GpuPixel> pixels(size_t{64} * 48);
+  std::vector<uint8_t> ao(pixels.size());
+  for (size_t i = 0; i < pixels.size(); ++i) {
+    pixels[i] = random_gpu_pixel(rng);
+    ao[i] = static_cast<uint8_t>(40 + i % 216);
+  }
+  stage_pixels(64, 48, pixels);
+  deferred::testing::force_enabled(true);
+  stage_ao(64, 48, ao);
+  const auto off = run_hdr(pbr_settings(), 1);
+  const PassId ssilId = stage_ssil(64, 48, std::vector<std::array<float, 4>>(pixels.size()));
+  const auto zero = run_hdr(pbr_settings(), 2);
+  unregister_pass(ssilId);
+  EXPECT_EQ(off, zero);
+}
+
+TEST_F(SsilDeferredGpu, SsilNotMultipliedByAo) {
+  std::mt19937 rng{0x5521u};
+  set_hints(scene_hints({}));
+  std::vector<GpuPixel> pixels(size_t{64} * 48);
+  for (size_t i = 0; i < pixels.size(); ++i) {
+    pixels[i] = random_gpu_pixel(rng);
+    pixels[i].receiver = 1;
+    pixels[i].ao = i % 2 == 0 ? 255 : 64;
+  }
+  const std::vector<deferred::testing::Pixel> inputs = stage_pixels(64, 48, pixels);
+  deferred::testing::force_enabled(true);
+  stage_ao(64, 48, std::vector<uint8_t>(pixels.size(), 128));
+  const std::vector<std::array<float, 4>> irr(pixels.size(), {0.25f, 0.25f, 0.25f, 1.f});
+  const auto off = run_hdr(pbr_settings(), 1);
+  const PassId ssilId = stage_ssil(64, 48, irr);
+  const auto on = run_hdr(pbr_settings(), 2);
+  unregister_pass(ssilId);
+  deferred::Params params = mirror_params();
+  params.flags |= deferred::FlagSsil;
+  size_t checked = 0;
+  for (size_t i = 0; i < pixels.size(); ++i) {
+    if (inputs[i].classId == 0) {
+      continue;
+    }
+    deferred::testing::Pixel px = inputs[i];
+    px.aoFinal = 128.0 / 255.0;
+    px.ssil = {0.25, 0.25, 0.25, 1.0};
+    const deferred::testing::Result want = deferred::testing::shade(px, {}, {}, params, class_rows());
+    for (size_t c = 0; c < 3; ++c) {
+      ASSERT_NEAR(openpbr::from_half(on[i][c]), want.rgb[c], 2e-3 + 5e-3 * want.rgb[c]) << i;
+    }
+    ++checked;
+  }
+  EXPECT_GT(checked, 1000u);
 }
 
 TEST_F(LightDeferredGpu, AoDummyClamps) {
