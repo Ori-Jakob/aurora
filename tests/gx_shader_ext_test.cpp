@@ -4,6 +4,7 @@
 
 #include "gfx/companion_cache.hpp"
 #include "gfx/frame_packet.hpp"
+#include "gfx/pipeline_cache.hpp"
 #include "gfx/recording.hpp"
 #include "gfx/resources.hpp"
 #include "gfx/scene_targets.hpp"
@@ -248,6 +249,32 @@ TEST_F(GxShaderExtTest, StandInsDropTheExtKey) {
     EXPECT_EQ(normalized.surfaceExt, 0u);
   }
   EXPECT_EQ(render_ext::normalize(RenderExtConfig{.output = 2, .surfaceExt = 1}, info).surfaceExt, 1u);
+}
+
+TEST_F(GxShaderExtTest, StandInRowsSurviveTheCacheLoad) {
+  const gfx::RenderTargetLayout pbr = gfx::compose_scene_layout({.gbuffer = true, .surface = true}, layout_base());
+  PipelineConfig config{};
+  config.shaderConfig = single_site();
+  for (const RenderExtConfig ext : {RenderExtConfig{.output = 2, .surfaceExt = 1, .stochasticMask = 1, .layer0 = 1},
+                                    RenderExtConfig{.output = 1, .velocity = 1, .fwdEnv = 1},
+                                    RenderExtConfig{.output = 2, .tessFetch = 1, .pom = 1}}) {
+    config.shaderConfig.ext = ext;
+    const PipelineConfig standIn = render_ext::fallback_config(config, pbr);
+    ASSERT_EQ(standIn.shaderConfig.ext.surfaceReset, 1u);
+    EXPECT_TRUE(render_ext::stand_in_ext(standIn.shaderConfig.ext));
+    EXPECT_TRUE(gfx::testing::loads_row(standIn));
+  }
+  for (const RenderExtConfig ext :
+       {RenderExtConfig{.output = 2, .surfaceReset = 1}, RenderExtConfig{.velocity = 1, .surfaceReset = 1},
+        RenderExtConfig{.surfaceReset = 1, .surfaceExt = 1}, RenderExtConfig{.surfaceReset = 1, .stochasticMask = 1}}) {
+    config.shaderConfig.ext = ext;
+    EXPECT_FALSE(render_ext::stand_in_ext(ext));
+    EXPECT_FALSE(gfx::testing::loads_row(config));
+  }
+  config.shaderConfig.ext = {};
+  EXPECT_TRUE(gfx::testing::loads_row(config));
+  config.shaderConfig.ext = {.output = 1};
+  EXPECT_TRUE(gfx::testing::loads_row(config));
 }
 
 TEST_F(GxShaderExtTest, SurfaceBitsNeedTheSurfaceLayout) {

@@ -101,6 +101,7 @@ struct CreateHooks {
 // Stands in for pipeline creation so a test can see the cache layout each create runs under; null restores it
 CreateHooks set_create_hooks(const CreateHooks& hooks) noexcept;
 std::vector<uint64_t> remembered_layout_keys();
+bool loads_row(const gx::PipelineConfig& config);
 } // namespace testing
 
 } // namespace aurora::gfx

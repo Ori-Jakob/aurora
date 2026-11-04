@@ -227,6 +227,11 @@ inline PipelineConfig fallback_config(const PipelineConfig& config, const gfx::R
   return fallback;
 }
 
+// normalize drops surfaceReset, so a stored stand-in is checked against the one shape fallback_config writes
+inline bool stand_in_ext(const RenderExtConfig& ext) noexcept {
+  return ext == RenderExtConfig{.tessFetch = ext.tessFetch, .surfaceReset = 1};
+}
+
 // A PBR draw still clears the surface class while its output-2 variant compiles
 inline PipelineConfig output1_config(const PipelineConfig& config) noexcept {
   PipelineConfig twin = config;

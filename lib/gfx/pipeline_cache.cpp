@@ -378,7 +378,7 @@ static bool canonical_row(const PipelineConfig&) {
 
 static bool canonical_row(const gx::PipelineConfig& config) {
   const gx::RenderExtConfig& ext = config.shaderConfig.ext;
-  return ext == gx::RenderExtConfig{} ||
+  return ext == gx::RenderExtConfig{} || gx::render_ext::stand_in_ext(ext) ||
          gx::render_ext::normalize(ext, gx::build_shader_info(config.shaderConfig)) == ext;
 }
 
@@ -1516,6 +1516,8 @@ std::vector<uint64_t> remembered_layout_keys() {
   std::lock_guard lock{g_pipelineMutex};
   return g_sceneLayoutKeys;
 }
+
+bool loads_row(const gx::PipelineConfig& config) { return canonical_row(config); }
 } // namespace testing
 
 } // namespace aurora::gfx
