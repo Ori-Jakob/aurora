@@ -1,6 +1,7 @@
 #include "material_contract_check.hpp"
 
 #include "gfx/texture_replacement.hpp"
+#include "gx/surface_pack.hpp"
 #include "internal.hpp"
 #include "io.hpp"
 #include "render/material/classes.hpp"
@@ -1577,7 +1578,7 @@ protected:
                        classes::Source* source = nullptr) {
     const std::array<uint16_t, classes::FieldCount> ids{classId, rough, metal};
     classes::Source out{};
-    const uint32_t value = classes::material_word(ids.data(), hint, 0, GX_CULL_BACK, false, out);
+    const uint32_t value = classes::material_word(ids.data(), hint, 0, GX_CULL_BACK, false, false, out);
     if (source != nullptr) {
       *source = out;
     }
@@ -1588,8 +1589,9 @@ protected:
 };
 
 TEST_F(MaterialClasses, BuiltInTableIsAppendOnly) {
-  constexpr std::array<std::string_view, 8> Names{"default",     "ground/grass", "ground/dirt",   "ground/rock",
-                                                  "ground/sand", "ground/snow",  "foliage/grass", "water/edge"};
+  constexpr std::array<std::string_view, 9> Names{"default",       "ground/grass", "ground/dirt",
+                                                  "ground/rock",   "ground/sand",  "ground/snow",
+                                                  "foliage/grass", "water/edge",   "default/cutout"};
   const auto builtIn = classes::built_ins();
   ASSERT_EQ(builtIn.size(), Names.size());
   for (size_t i = 0; i < Names.size(); ++i) {
@@ -1598,7 +1600,7 @@ TEST_F(MaterialClasses, BuiltInTableIsAppendOnly) {
     EXPECT_EQ(classes::resolve(Names[i]), i + 1);
   }
   EXPECT_EQ(builtIn[0].params, OpenPbrParams{});
-  constexpr std::array<float, 8> Roughness{0.85f, 0.9f, 0.9f, 0.8f, 0.95f, 0.6f, 0.55f, 0.3f};
+  constexpr std::array<float, 9> Roughness{0.85f, 0.9f, 0.9f, 0.8f, 0.95f, 0.6f, 0.55f, 0.3f, 0.85f};
   for (size_t i = 0; i < Names.size(); ++i) {
     EXPECT_EQ(builtIn[i].params.specularRoughness, Roughness[i]) << Names[i];
     EXPECT_EQ(builtIn[i].params.baseMetalness, 0.f) << Names[i];
@@ -1610,6 +1612,14 @@ TEST_F(MaterialClasses, BuiltInTableIsAppendOnly) {
   EXPECT_TRUE(foliage.geometryThinWalled && foliage.twoSided && foliage.noSsr);
   EXPECT_EQ(foliage.thinWalledWrap, 0.5f);
   EXPECT_EQ(foliage.subsurfaceWeight, 0.f);
+  const OpenPbrParams& cutout = builtIn[8].params;
+  EXPECT_EQ(builtIn[8].id, classes::ThinCutout);
+  EXPECT_TRUE(cutout.geometryThinWalled && cutout.twoSided && cutout.subsurfaceTintedByBase);
+  EXPECT_FALSE(cutout.noSsr);
+  EXPECT_GT(cutout.subsurfaceWeight, 0.f);
+  EXPECT_LE(cutout.subsurfaceWeight, 1.f);
+  EXPECT_EQ(cutout.subsurfaceColor, (std::array<float, 3>{1.f, 1.f, 1.f}));
+  EXPECT_EQ(cutout.thinWalledWrap, 0.f);
   EXPECT_EQ(classes::default_word(true), 0x800100D9u);
   EXPECT_EQ(word(0, 0, 0, 0), 0x800100D9u);
   EXPECT_EQ(classes::FirstAurora, 9u);
@@ -1671,7 +1681,7 @@ TEST_F(MaterialClasses, RegisterRejectsReservedRangeAndDuplicates) {
   EXPECT_TRUE(classes::register_class(128, "game/stone", shiny));
   EXPECT_TRUE(classes::register_class(254, std::string(64, 'a'), {}));
   const classes::Stats stats = classes::stats();
-  EXPECT_EQ(stats.builtIn, 8u);
+  EXPECT_EQ(stats.builtIn, 9u);
   EXPECT_EQ(stats.registered, 4u);
   EXPECT_EQ(stats.rejected, 11u);
   latch();
@@ -1747,6 +1757,44 @@ TEST_F(MaterialClasses, PrecedenceForceManifestHintDefault) {
   EXPECT_EQ(classes::stats().unregisteredHints, 2u);
 }
 
+TEST_F(MaterialClasses, TwoSidedCutoutsTakeTheThinClass) {
+  ASSERT_TRUE(classes::register_class(200, "test/coat", {}));
+  const std::string text = manifest_with(R"("tex1_16x16_000000000000a001_14":{"class":"ground/rock"})");
+  ASSERT_EQ(add(text).status, MaterialManifestStatus::Accepted);
+  latch();
+  const uint16_t rock = find_id(KeyA);
+  const auto make = [](uint16_t classId, uint8_t hint, GXCullMode cull, bool doubleSided, bool cutout) {
+    const std::array<uint16_t, classes::FieldCount> ids{classId, 0, 0};
+    classes::Source source{};
+    return classes::material_word(ids.data(), hint, 0, cull, doubleSided, cutout, source);
+  };
+  const uint32_t thinFlags = uint32_t{gx::surface::ThinTranslucent} << 24;
+  const uint32_t leaf = make(0, 0, GX_CULL_NONE, false, true);
+  EXPECT_EQ(class_of(leaf), classes::ThinCutout);
+  EXPECT_EQ(leaf & thinFlags, thinFlags);
+  EXPECT_NE(leaf & uint32_t{gx::surface::TwoSided} << 24, 0u);
+  EXPECT_NE(leaf & (classes::default_word(true) & ~classes::default_word(false)), 0u);
+  EXPECT_EQ(class_of(make(0, 0, GX_CULL_BACK, true, true)), classes::ThinCutout);
+  // Solid two-sided geometry, one-sided cutouts and front-culled draws keep the default class
+  EXPECT_EQ(class_of(make(0, 0, GX_CULL_NONE, false, false)), classes::Default);
+  EXPECT_EQ(class_of(make(0, 0, GX_CULL_BACK, false, true)), classes::Default);
+  EXPECT_EQ(class_of(make(0, 0, GX_CULL_FRONT, true, true)), classes::Default);
+  // Any class from a manifest, a hint or a force opts out
+  EXPECT_EQ(class_of(make(rock, 0, GX_CULL_NONE, false, true)), 4u);
+  EXPECT_EQ(class_of(make(0, 200, GX_CULL_NONE, false, true)), 200u);
+  classes::set_force("default");
+  latch();
+  EXPECT_EQ(class_of(make(0, 0, GX_CULL_NONE, false, true)), classes::Default);
+  classes::set_force("");
+  latch();
+  // Retuning the built-in turns the transmission off for every unclassed cutout
+  OpenPbrParams opaque;
+  opaque.twoSided = true;
+  ASSERT_TRUE(classes::register_class(classes::ThinCutout, "default/cutout", opaque));
+  latch();
+  EXPECT_EQ(make(0, 0, GX_CULL_NONE, false, true) & thinFlags, 0u);
+}
+
 TEST_F(MaterialClasses, GpuRowsLayout) {
   OpenPbrParams p;
   p.specularColor = {0.1f, 0.2f, 0.3f};
@@ -1815,7 +1863,8 @@ TEST_F(MaterialClasses, GpuRowsLayout) {
   EXPECT_EQ(rows[1], defaultRow);
   EXPECT_EQ(rows[0], defaultRow);
   EXPECT_EQ(rows[255], defaultRow);
-  EXPECT_EQ(rows[9], defaultRow);
+  EXPECT_EQ(rows[classes::ThinCutout], classes::gpu_row(classes::built_ins()[8].params));
+  EXPECT_EQ(rows[10], defaultRow);
   EXPECT_EQ(rows[201], defaultRow);
   EXPECT_EQ(rows[200], row);
   EXPECT_EQ(rows[4], classes::gpu_row(classes::built_ins()[3].params));

@@ -357,6 +357,7 @@ std::vector<Config> white_configs() {
       {"ground/snow", built_in_row("ground/snow")},
       {"water/edge", built_in_row("water/edge")},
       {"foliage/grass", built_in_row("foliage/grass"), 0.0, true},
+      {"default/cutout", built_in_row("default/cutout"), 0.0, true},
       {"metal", default_row(), 1.0},
   };
 }
@@ -387,12 +388,13 @@ TEST(OpenPbrFurnace, WhiteConfigsConserve) {
 TEST(OpenPbrFurnace, NeverGains) {
   std::mt19937 rng{0xF0A9u};
   std::uniform_real_distribution<double> unit(0.0, 1.0);
-  const std::array<classes::GpuRow, 6> rows{default_row(),
+  const std::array<classes::GpuRow, 7> rows{default_row(),
                                             built_in_row("ground/rock"),
                                             built_in_row("foliage/grass"),
                                             classes::gpu_row(coat_params()),
                                             classes::gpu_row(fuzz_params()),
-                                            classes::gpu_row(thin_params())};
+                                            classes::gpu_row(thin_params()),
+                                            built_in_row("default/cutout")};
   for (int i = 0; i < 48; ++i) {
     const size_t which = static_cast<size_t>(i) % rows.size();
     const openpbr::Surface surface{.baseColor = {unit(rng), unit(rng), unit(rng)},
@@ -401,11 +403,36 @@ TEST(OpenPbrFurnace, NeverGains) {
     const Vec3 n = normalized({unit(rng) - 0.5, unit(rng) - 0.5, 1.0});
     const openpbr::Prepared p = prepare(rows[which], surface, n, view_at(n, 0.1 + 0.9 * unit(rng)));
     const Vec3 albedo = openpbr::directional_albedo(p);
-    const Vec3 direct = integrate(p, 96, which == 2 || which == 5);
+    const Vec3 direct = integrate(p, 96, which == 2 || which >= 5);
     for (size_t c = 0; c < 3; ++c) {
       EXPECT_LE(albedo[c], 1.0 + 1e-9) << i;
       EXPECT_LE(direct[c], 1.015) << i;
     }
+  }
+}
+
+TEST(OpenPbrMirror, ThinCutoutTransmitsItsBaseColour) {
+  const classes::GpuRow row = built_in_row("default/cutout");
+  const double w = row.v[15];
+  ASSERT_GT(w, 0.0);
+  EXPECT_EQ(std::bit_cast<uint32_t>(row.v[30]), classes::RowThin | classes::RowTwoSided | classes::RowSubsurfaceTint);
+  const Vec3 base{0.3, 0.7, 0.2};
+  const Vec3 n = normalized({0.1, 0.2, 1.0});
+  const openpbr::Prepared p = prepare(row, {.baseColor = base, .roughness = 0.85}, n, view_at(n, 0.8));
+  for (size_t c = 0; c < 3; ++c) {
+    EXPECT_NEAR(p.transmit[c], base[c] * w * 0.5, 1e-12) << c;
+    EXPECT_NEAR(p.diffuse[c], base[c] * (1.0 - w * 0.5), 1e-12) << c;
+  }
+  // A light behind the card comes through in the card's own colour; the default row stays dark there
+  const openpbr::Tables& tables = openpbr::testing::tables();
+  const Vec3 behind = normalized(add(scale(n, -1.0), {0.2, -0.1, 0.0}));
+  const Vec3 through = openpbr::eval_light(tables, p, behind);
+  const Vec3 opaque = openpbr::eval_light(
+      tables, prepare(default_row(), {.baseColor = base, .roughness = 0.85}, n, view_at(n, 0.8)), behind);
+  for (size_t c = 0; c < 3; ++c) {
+    EXPECT_GT(through[c], 0.0) << c;
+    EXPECT_NEAR(through[c] / base[c], through[0] / base[0], 1e-12) << c;
+    EXPECT_EQ(opaque[c], 0.0) << c;
   }
 }
 
@@ -505,29 +532,32 @@ TEST(OpenPbrClasses, DefaultsMatchClassRows) {
 
 TEST(OpenPbrClasses, LayeredRowsSelectTheLayeredVariant) {
   classes::testing::reset();
+  // Thin walls run in the base text, so foliage/grass and default/cutout never pull a frame onto the layered one
   const openpbr::ClassSet builtIn = openpbr::layered_classes(*classes::gpu_rows());
-  EXPECT_EQ(builtIn.count(), 1u);
-  EXPECT_TRUE(builtIn[7]);
+  EXPECT_EQ(builtIn.count(), 0u);
   EXPECT_FALSE(openpbr::layered(default_row()));
   EXPECT_TRUE(openpbr::layered(classes::gpu_row(coat_params())));
   EXPECT_TRUE(openpbr::layered(classes::gpu_row(fuzz_params())));
-  EXPECT_TRUE(openpbr::layered(classes::gpu_row(thin_params())));
+  EXPECT_FALSE(openpbr::layered(classes::gpu_row(thin_params())));
+  EXPECT_FALSE(openpbr::layered(built_in_row("default/cutout")));
   OpenPbrParams subsurface;
   subsurface.subsurfaceWeight = 0.5f;
   EXPECT_FALSE(openpbr::layered(classes::gpu_row(subsurface)));
 
   openpbr::ClassSet set = builtIn;
   set[0] = true;
+  set[200] = true;
   const auto entry = [](uint32_t cls, uint32_t flags = 0) {
     return gx::surface::Entry{cls | flags << 8 | 0x09u << 16, 0, 0, 0};
   };
   EXPECT_TRUE(deferred::needs_layered(nullptr, set));
-  const std::vector<gx::surface::Entry> plain{gx::surface::Entry{}, entry(0), entry(1), entry(2), entry(8)};
+  const std::vector<gx::surface::Entry> plain{
+      gx::surface::Entry{}, entry(0), entry(1), entry(2), entry(7), entry(8), entry(classes::ThinCutout)};
   EXPECT_FALSE(deferred::needs_layered(&plain, set));
-  std::vector<gx::surface::Entry> foliage = plain;
-  foliage.push_back(entry(7, gx::surface::Unlit));
-  EXPECT_TRUE(deferred::needs_layered(&foliage, set));
-  EXPECT_FALSE(deferred::needs_layered(&foliage, openpbr::ClassSet{}));
+  std::vector<gx::surface::Entry> coated = plain;
+  coated.push_back(entry(200, gx::surface::Unlit));
+  EXPECT_TRUE(deferred::needs_layered(&coated, set));
+  EXPECT_FALSE(deferred::needs_layered(&coated, openpbr::ClassSet{}));
 }
 
 clusters::GpuLight prepared_light(const AuroraLight& light, const Mat3x4<float>& view) {
@@ -1428,7 +1458,8 @@ GpuPixel random_gpu_pixel(std::mt19937& rng) {
   p.ao = static_cast<uint8_t>(128 + byte(rng) / 2);
   p.roughness = static_cast<uint8_t>(80 + byte(rng) % 176);
   p.metal = byte(rng) % 4 == 0 ? b() : 0;
-  p.cls = static_cast<uint8_t>(1 + byte(rng) % 8);
+  p.cls = static_cast<uint8_t>(1 + byte(rng) % 9);
+  p.flags = p.cls == 7 || p.cls == classes::ThinCutout ? uint8_t{gx::surface::ThinTranslucent} : uint8_t{0};
   p.category = byte(rng) % 3 == 0 ? 0x82 : 0x09;
   const auto shade = static_cast<uint8_t>(32 * (byte(rng) % 8));
   p.ambient = {shade, static_cast<uint8_t>(255 - shade), 128};
@@ -1619,6 +1650,48 @@ TEST_F(LightDeferredGpu, DirectFurnace256) {
   for (size_t i = 0; i < hdr.size(); ++i) {
     for (size_t c = 0; c < 3; ++c) {
       EXPECT_NEAR(openpbr::from_half(hdr[i][c]), 1.0, 0.03) << i;
+    }
+  }
+}
+
+TEST_F(LightDeferredGpu, ThinCutoutPassesLightFromBehind) {
+  // Leaf and grass cards seen from below face away from the sun; their thin class lets it through
+  std::vector<GpuPixel> pixels(size_t{8} * 8);
+  for (size_t i = 0; i < pixels.size(); ++i) {
+    GpuPixel& p = pixels[i];
+    p.albedo = {90, 200, 60};
+    if (i % 2 == 0) {
+      p.cls = classes::ThinCutout;
+      p.flags = static_cast<uint8_t>(gx::surface::ThinTranslucent | gx::surface::TwoSided);
+    }
+  }
+  const auto light = [](bool behind) {
+    return scene_hints({make_light(AURORA_LIGHT_POINT, {0.f, 0.f, behind ? -3000.f : 1000.f}, {}, 1e7f)});
+  };
+  set_hints(light(false));
+  const std::vector<deferred::testing::Pixel> inputs = stage_pixels(8, 8, pixels);
+  deferred::testing::force_enabled(true);
+  deferred::testing::set_mode(deferred::Mode::Direct);
+  uint64_t frame = 1;
+  for (const bool behind : {false, true}) {
+    set_hints(light(behind));
+    const auto hdr = run_hdr(pbr_settings(), frame++);
+    ASSERT_EQ(hdr.size(), inputs.size());
+    const Mirror m = mirror_lights();
+    const deferred::Params params = mirror_params(deferred::Mode::Direct);
+    for (size_t i = 0; i < hdr.size(); ++i) {
+      const deferred::testing::Result want =
+          deferred::testing::shade(inputs[i], m.header, m.lights, params, class_rows());
+      const bool thin = i % 2 == 0;
+      for (size_t c = 0; c < 3; ++c) {
+        const double got = openpbr::from_half(hdr[i][c]);
+        EXPECT_NEAR(got, want.rgb[c], 2e-3 + 5e-3 * want.rgb[c]) << i << " behind " << behind;
+        if (behind) {
+          EXPECT_EQ(got > 1e-3, thin) << i << " channel " << c;
+        } else {
+          EXPECT_GT(got, 1e-3) << i << " channel " << c;
+        }
+      }
     }
   }
 }

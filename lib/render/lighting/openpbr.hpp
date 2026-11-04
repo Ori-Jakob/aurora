@@ -84,7 +84,7 @@ void shutdown() noexcept;
 bool refresh_classes(const wgpu::CommandEncoder& encoder);
 
 using ClassSet = std::bitset<ClassRows>;
-// Coat, fuzz and thin walls are the lobes OPENPBR_LAYERED adds
+// Coat and fuzz are the lobes OPENPBR_LAYERED adds
 [[nodiscard]] bool layered(const material::classes::GpuRow& row) noexcept;
 [[nodiscard]] ClassSet layered_classes(const material::classes::GpuRows& rows) noexcept;
 // Render worker, after refresh_classes; every class while the tables are not resident

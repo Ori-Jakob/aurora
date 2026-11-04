@@ -39,13 +39,26 @@ constexpr OpenPbrParams foliage() noexcept {
   return params;
 }
 
+// Thin walls send half the subsurface weight through, so 1 lets a leaf pass as much light as it reflects
+constexpr float ThinCutoutSubsurface = 0.7f;
+
+constexpr OpenPbrParams thin_cutout() noexcept {
+  OpenPbrParams params;
+  params.geometryThinWalled = true;
+  params.subsurfaceWeight = ThinCutoutSubsurface;
+  params.subsurfaceColor = {1.f, 1.f, 1.f};
+  params.subsurfaceTintedByBase = true;
+  params.twoSided = true;
+  return params;
+}
+
 constexpr OpenPbrParams water_edge() noexcept {
   OpenPbrParams params;
   params.specularRoughness = 0.3f;
   return params;
 }
 
-constexpr std::array<BuiltIn, 8> kBuiltIn{{
+constexpr std::array<BuiltIn, 9> kBuiltIn{{
     {1, "default", OpenPbrParams{}},
     {2, "ground/grass", ground(0.9f)},
     {3, "ground/dirt", ground(0.9f)},
@@ -54,6 +67,7 @@ constexpr std::array<BuiltIn, 8> kBuiltIn{{
     {6, "ground/snow", ground(0.6f)},
     {7, "foliage/grass", foliage()},
     {8, "water/edge", water_edge()},
+    {ThinCutout, "default/cutout", thin_cutout()},
 }};
 
 struct ClassEntry {
@@ -218,8 +232,8 @@ uint8_t unregistered_hint(uint8_t hint) noexcept {
 std::span<const BuiltIn> built_ins() noexcept { return kBuiltIn; }
 
 GpuRow gpu_row(const OpenPbrParams& p) noexcept {
-  const uint32_t flags =
-      (p.geometryThinWalled ? RowThin : 0u) | (p.twoSided ? RowTwoSided : 0u) | (p.noSsr ? RowNoSsr : 0u);
+  const uint32_t flags = (p.geometryThinWalled ? RowThin : 0u) | (p.twoSided ? RowTwoSided : 0u) |
+                         (p.noSsr ? RowNoSsr : 0u) | (p.subsurfaceTintedByBase ? RowSubsurfaceTint : 0u);
   return {{
       p.specularColor[0],
       p.specularColor[1],
@@ -381,7 +395,7 @@ uint8_t manifest_class(uint32_t materialId) noexcept {
 }
 
 uint32_t material_word(const uint16_t idPerField[FieldCount], uint8_t hint, [[maybe_unused]] uint32_t categories,
-                       GXCullMode cull, bool doubleSided, Source& source) noexcept {
+                       GXCullMode cull, bool doubleSided, bool cutout, Source& source) noexcept {
   ++g_words;
   uint8_t cls = Default;
   source = Source::Default;
@@ -398,6 +412,11 @@ uint32_t material_word(const uint16_t idPerField[FieldCount], uint8_t hint, [[ma
   if (cls == None) {
     return 0;
   }
+  const bool twoSided = cull != GX_CULL_FRONT && (cull == GX_CULL_NONE || doubleSided || g_latched.twoSided[cls]);
+  // Unclassed two-sided cutouts are leaf and grass cards; any class from a manifest, hint or force keeps its own
+  if (source == Source::Default && twoSided && cutout) {
+    cls = ThinCutout;
+  }
   uint32_t word = g_latched.words[cls];
   if (idPerField[1] != 0) {
     word = (word & ~0xFFu) | g_ids[idPerField[1]].rough | gx::render_ext::MaterialWordRoughnessFactor;
@@ -405,7 +424,6 @@ uint32_t material_word(const uint16_t idPerField[FieldCount], uint8_t hint, [[ma
   if (idPerField[2] != 0) {
     word = (word & ~0xFF00u) | uint32_t{g_ids[idPerField[2]].metal} << 8 | gx::render_ext::MaterialWordMetalnessFactor;
   }
-  const bool twoSided = cull != GX_CULL_FRONT && (cull == GX_CULL_NONE || doubleSided || g_latched.twoSided[cls]);
   return word | (twoSided ? gx::render_ext::MaterialWordTwoSided : 0u);
 }
 

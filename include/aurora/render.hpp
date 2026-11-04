@@ -310,6 +310,8 @@ struct OpenPbrParams {
   // Diffuse wrap for thin-walled surfaces, 0 to 1; OpenPBR has no such parameter
   float thinWalledWrap = 0.f;
   bool twoSided = false, noSsr = false;
+  // subsurfaceColor multiplies the base colour, so a thin leaf passes its own colour; OpenPBR has no such parameter
+  bool subsurfaceTintedByBase = false;
 
   bool operator==(const OpenPbrParams&) const = default;
 };

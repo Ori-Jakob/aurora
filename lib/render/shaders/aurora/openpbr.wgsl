@@ -85,6 +85,7 @@ const OPENPBR_MIN_AVERAGE: f32 = 1e-4;
 const OPENPBR_ROW_THIN: u32 = 1u;
 const OPENPBR_ROW_TWO_SIDED: u32 = 2u;
 const OPENPBR_ROW_NO_SSR: u32 = 4u;
+const OPENPBR_ROW_SUBSURFACE_TINT: u32 = 8u;
 const OPENPBR_LAYER_AVERAGES: u32 = 0u;
 const OPENPBR_LAYER_METAL: u32 = 1u;
 const OPENPBR_LAYER_LTC: u32 = 2u;
@@ -281,16 +282,18 @@ fn openpbr_prepare(s: OpenPbrSurface, cls: ClassParams, n: vec3f, v: vec3f, lut3
     p.ecm_avg = max(averages.a, OPENPBR_MIN_AVERAGE);
     metal_ss = openpbr_metal_single_scatter(p.metal_f0, p.metal_tint, metal);
   }
-  p.diffuse = (base * (1.0 - sss_weight) + cls.subsurface.rgb * sss_weight) * dielectric;
-//#if OPENPBR_LAYERED
-  p.thin = (bitcast<u32>(cls.misc.z) & OPENPBR_ROW_THIN) != 0u;
+  let row_flags = bitcast<u32>(cls.misc.z);
+  let tinted = (row_flags & OPENPBR_ROW_SUBSURFACE_TINT) != 0u;
+  let sss_colour = select(cls.subsurface.rgb, cls.subsurface.rgb * base, tinted);
+  p.diffuse = (base * (1.0 - sss_weight) + sss_colour * sss_weight) * dielectric;
+  // Thin walls stay in the base text: two-sided cutouts are everywhere outdoors, and only their pixels branch here
+  p.thin = (row_flags & OPENPBR_ROW_THIN) != 0u;
   if (p.thin) {
     let anisotropy = cls.base.z;
-    p.diffuse = (base * (1.0 - sss_weight) + cls.subsurface.rgb * (sss_weight * (1.0 - anisotropy) * 0.5)) * dielectric;
-    p.transmit = cls.subsurface.rgb * (sss_weight * (1.0 + anisotropy) * 0.5 * dielectric);
+    p.diffuse = (base * (1.0 - sss_weight) + sss_colour * (sss_weight * (1.0 - anisotropy) * 0.5)) * dielectric;
+    p.transmit = sss_colour * (sss_weight * (1.0 + anisotropy) * 0.5 * dielectric);
     p.wrap = saturate(cls.misc.w);
   }
-//#endif
   p.sigma = cls.base.x;
   var ambient_diffuse = (openpbr_eon_albedo(p.diffuse, p.sigma, p.mu_v) + p.transmit) * p.ec_v;
   var ambient_specular = p.spec_tint * (1.0 - p.ec_v) + metal_ss * p.metal_weight;
@@ -354,13 +357,11 @@ fn openpbr_eval_light(p: OpenPbrPrepared, l: vec3f, specular: bool, lut3d: textu
     let couple = select(ec_l * p.inv_ec_avg, 1.0, p.wrap > 0.0);
     out = openpbr_eon_pi(p.diffuse, p.sigma, p.mu_v, mu_l, dot(p.v, l)) * (p.ec_v * couple * wrapped);
   }
-//#if OPENPBR_LAYERED
   if (p.thin && nl < 0.0) {
     let mu_t = min(-nl, 1.0);
     let ec_t = openpbr_extrapolate(openpbr_lut3d(lut3d, smp, mu_t, p.alpha_index, p.ior_index).g, p.eta);
     out += p.transmit * (p.ec_v * ec_t * p.inv_ec_avg * mu_t);
   }
-//#endif
   let h = normalize(p.v + l);
   let nh = max(dot(p.n, h), 0.0);
   let vh = max(dot(p.v, h), 0.0);

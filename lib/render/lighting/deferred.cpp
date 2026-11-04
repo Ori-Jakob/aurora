@@ -196,7 +196,7 @@ void request_pipelines(const PipelineSetup& setup, const void*, std::span<uint32
                                                       .layoutKey = setup.layoutHash,
                                                   })
                              .value;
-  // Coat, fuzz and thin-wall state stays live through every light loop, so frames without those classes skip it
+  // Coat and fuzz state stays live through every light loop, so frames without those classes skip it
   ids[BasePipeline] = shaders::request_compute({
                                                    .label = "light.deferred base",
                                                    .shader = Shader,

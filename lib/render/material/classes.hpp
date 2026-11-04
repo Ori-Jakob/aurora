@@ -18,6 +18,7 @@ namespace aurora::render::material::classes {
 inline constexpr uint8_t None = 0;
 inline constexpr uint8_t Default = 1;
 inline constexpr uint8_t FirstAurora = 9;
+inline constexpr uint8_t ThinCutout = 9;
 inline constexpr uint8_t FirstGame = 128;
 inline constexpr uint8_t Reserved = 255;
 inline constexpr size_t MaxNameLength = 64;
@@ -40,6 +41,7 @@ using GpuRows = std::array<GpuRow, 256>;
 inline constexpr uint32_t RowThin = 1;
 inline constexpr uint32_t RowTwoSided = 2;
 inline constexpr uint32_t RowNoSsr = 4;
+inline constexpr uint32_t RowSubsurfaceTint = 8;
 
 enum class Source : uint8_t { Default, Manifest, Hint, Force };
 
@@ -79,7 +81,7 @@ void shutdown() noexcept;
 
 // FIFO thread
 [[nodiscard]] uint32_t material_word(const uint16_t idPerField[FieldCount], uint8_t hint, uint32_t categories,
-                                     GXCullMode cull, bool doubleSided, Source& source) noexcept;
+                                     GXCullMode cull, bool doubleSided, bool cutout, Source& source) noexcept;
 [[nodiscard]] constexpr uint32_t default_word(bool ambient) noexcept { return ambient ? 0x800100D9u : 0x000100D9u; }
 
 namespace testing {

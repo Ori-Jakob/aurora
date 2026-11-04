@@ -510,10 +510,7 @@ bool refresh_classes(const wgpu::CommandEncoder& encoder) {
   return true;
 }
 
-bool layered(const material::classes::GpuRow& row) noexcept {
-  const auto flags = std::bit_cast<uint32_t>(row.v[30]);
-  return row.v[7] > 0.f || row.v[11] > 0.f || (flags & material::classes::RowThin) != 0;
-}
+bool layered(const material::classes::GpuRow& row) noexcept { return row.v[7] > 0.f || row.v[11] > 0.f; }
 
 ClassSet layered_classes(const material::classes::GpuRows& rows) noexcept {
   ClassSet out;
@@ -538,13 +535,13 @@ Prepared prepare(const Tables& t, const material::classes::GpuRow& row, const Su
   const double specWeight = r[3];
   const double coatWeight = r[7];
   const double fuzzWeight = r[11];
-  const Vec3 sssColour = row3(row, 12);
   const double sssWeight = r[15];
   const double anisotropy = r[26];
   const uint32_t flags = std::bit_cast<uint32_t>(r[30]);
   const double metal = std::clamp(s.metalness, 0.0, 1.0);
   const double dielectric = 1.0 - metal;
   const Vec3 base = s.baseColor * static_cast<double>(r[27]);
+  const Vec3 sssColour = (flags & material::classes::RowSubsurfaceTint) != 0 ? row3(row, 12) * base : row3(row, 12);
   p.eta = apply_specular_weight(r[20], specWeight);
   const double ai = alpha_index(p.alpha);
   const double ii = ior_index(p.eta);

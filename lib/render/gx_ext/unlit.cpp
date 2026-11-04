@@ -205,9 +205,9 @@ DrawMaterial draw_material(const gx::PipelineConfig& config, const gx::ShaderInf
     out.word = material::classes::default_word(false);
     return out;
   }
-  out.word =
-      material::classes::material_word(walk.ids.data(), cls.key.materialClass, cls.key.categories, config.cullMode,
-                                       (cls.key.flags & scene::object_flag::DoubleSided) != 0, out.source);
+  out.word = material::classes::material_word(walk.ids.data(), cls.key.materialClass, cls.key.categories,
+                                              config.cullMode, (cls.key.flags & scene::object_flag::DoubleSided) != 0,
+                                              static_cast<bool>(config.shaderConfig.alphaCompare), out.source);
   return out;
 }
 
