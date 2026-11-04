@@ -2319,7 +2319,14 @@ std::string without(std::string text, std::string_view needle, std::string_view 
 
 std::string without_flip(std::string text) {
   text = without(std::move(text), ", @builtin(front_facing) gx_ff: bool");
-  text = without(std::move(text), "\n    let uflip = !gx_ff && (gx_record_word(1u) & 0x4000u) != 0u;");
+  text = without(std::move(text),
+                 "\n    let uflip = !gx_ff && in.mv_nrm.w < 0.0 && (gx_record_word(1u) & 0x4000u) != 0u;");
+  text = without(std::move(text), "mv_nrm: vec4f,", "mv_nrm: vec3f,");
+  text = without(
+      std::move(text),
+      "\n    out.mv_nrm = vec4f(mv_nrm, dot(mv_nrm, select(vec3f(0.0, 0.0, 1.0), -mv_pos, ubuf.proj[3].w == 0.0)));",
+      "\n    out.mv_nrm = mv_nrm;");
+  text = without(std::move(text), "in.mv_nrm.xyz", "in.mv_nrm");
   text = without(std::move(text), "select(unit_nrm, -unit_nrm, uflip)", "unit_nrm");
   return without(std::move(text), "select(mapped_nrm, -mapped_nrm, uflip)", "mapped_nrm");
 }
@@ -2690,7 +2697,7 @@ TEST_F(GxShaderExtDevice, ViewPositionFromClipMatchesMvPos) {
 std::string normal_member_harness(const std::string& member) {
   return std::string{R"(
 struct In {
-  mv_nrm: vec3f,
+  mv_nrm: vec4f,
 };
 struct Imm {
   _pad: u32,
@@ -2706,7 +2713,7 @@ fn gbuffer_rx_alpha(rec: u32, len_sq: f32) -> f32 {
   return select(0.0, 1.0, len_sq > 1e-10);
 }
 )"} + companion_harness(
-             "  in.mv_nrm = in_vec3(i);"
+             "  in.mv_nrm = vec4f(in_vec3(i), 1.0);"
              "\n  imm._pad = 0u;"
              "\n  let cmp_nrm = in_vec4(i + 3u);"
              "\n  let cmp_dp1 = in_vec3(i + 7u);"
@@ -3123,7 +3130,7 @@ TEST_F(GxShaderExtDevice, TwoSidedBackFaceNormalFacesViewer) {
   const std::string member = member_between(text, "\n    let nrm_len_sq = ", "nrm_len_sq));");
   ASSERT_NE(member.find("let uflip = !gx_ff"), std::string::npos);
 
-  constexpr uint32_t Width = 4;
+  constexpr uint32_t Width = 5;
   PipelineConfig config = pipeline_for(unlit_lit(GX_SRC_REG, GX_SRC_REG));
   config.cullMode = GX_CULL_NONE;
   std::array<uint32_t, Width> flags{};
@@ -3143,7 +3150,7 @@ TEST_F(GxShaderExtDevice, TwoSidedBackFaceNormalFacesViewer) {
   }
   g_gxState = {};
   EXPECT_EQ(flags, (std::array<uint32_t, Width>{render_ext::RecordFlagBackFaceFlip, render_ext::RecordFlagBackFaceFlip,
-                                                0u, 0u}));
+                                                0u, 0u, render_ext::RecordFlagBackFaceFlip}));
 
   const std::string shader = "@group(0) @binding(0) var<storage, read> flags: array<u32>;\n" + receiver_alpha_wgsl() +
                              R"(
@@ -3151,7 +3158,7 @@ struct Imm {
   _pad: u32,
 };
 struct In {
-  mv_nrm: vec3f,
+  mv_nrm: vec4f,
 };
 struct Out {
   normal: vec4f,
@@ -3163,7 +3170,7 @@ fn gx_record_word(k: u32) -> u32 { return select(0u, rec_flags, k == 1u); }
 
 struct VsOut {
   @builtin(position) pos: vec4f,
-  @location(0) mv_nrm: vec3f,
+  @location(0) mv_nrm: vec4f,
   @location(1) @interpolate(flat) column: u32,
 };
 
@@ -3171,19 +3178,21 @@ struct VsOut {
 fn vs_main(@builtin(vertex_index) v: u32) -> VsOut {
   let column = v / 3u;
   let corner = v % 3u;
-  let left = -1.0 + 0.5 * f32(column);
+  let left = -1.0 + 0.4 * f32(column);
   var p = vec2f(left, -1.0);
   if (corner == 1u) {
     p = vec2f(left, 1.0);
   } else if (corner == 2u) {
-    p = vec2f(left + 1.0, -1.0);
+    p = vec2f(left + 0.8, -1.0);
   }
   if (column != 0u && corner != 0u) {
-    p = select(vec2f(left, 1.0), vec2f(left + 1.0, -1.0), corner == 1u);
+    p = select(vec2f(left, 1.0), vec2f(left + 0.8, -1.0), corner == 1u);
   }
   var out: VsOut;
   out.pos = vec4f(p, 0.5, 1.0);
-  out.mv_nrm = select(vec3f(0.0, 0.0, -1.0), vec3f(0.0, 0.0, 1.0), column == 0u);
+  // Grass and leaf cards keep one normal for both faces, so on a back face it can already face the viewer
+  let n = select(vec3f(0.0, 0.0, -1.0), vec3f(0.0, 0.0, 1.0), column == 0u || column == 4u);
+  out.mv_nrm = vec4f(n, n.z);
   out.column = column;
   return out;
 }
@@ -3244,7 +3253,7 @@ fn fs_main(v: VsOut, @builtin(front_facing) gx_ff: bool) -> @location(0) vec4f {
 
   const std::vector<float> texels = test::read_texture_mip(*m_device, target, 0);
   ASSERT_EQ(texels.size(), Width);
-  constexpr std::array<bool, Width> FacesViewer{true, true, false, false};
+  constexpr std::array<bool, Width> FacesViewer{true, true, false, false, true};
   for (uint32_t x = 0; x < Width; ++x) {
     const uint32_t bits = std::bit_cast<uint32_t>(texels[x]);
     EXPECT_EQ(bits >> 30, x == 0 ? 3u : 0u) << "front_facing at column " << x;

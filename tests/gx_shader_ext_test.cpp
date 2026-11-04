@@ -1204,7 +1204,10 @@ std::string unlit_block(const std::string& text) {
 }
 
 constexpr std::string_view FrontFacing = ", @builtin(front_facing) gx_ff: bool";
-constexpr std::string_view FlipLet = "\n    let uflip = !gx_ff && (gx_record_word(1u) & 0x4000u) != 0u;";
+constexpr std::string_view FlipLet =
+    "\n    let uflip = !gx_ff && in.mv_nrm.w < 0.0 && (gx_record_word(1u) & 0x4000u) != 0u;";
+constexpr std::string_view FacingOut =
+    "\n    out.mv_nrm = vec4f(mv_nrm, dot(mv_nrm, select(vec3f(0.0, 0.0, 1.0), -mv_pos, ubuf.proj[3].w == 0.0)));";
 
 std::string without(std::string text, std::string_view needle, std::string_view with = {}) {
   for (size_t pos = text.find(needle); pos != std::string::npos; pos = text.find(needle, pos + with.size())) {
@@ -1216,6 +1219,9 @@ std::string without(std::string text, std::string_view needle, std::string_view 
 std::string without_flip(std::string text) {
   text = without(std::move(text), FrontFacing);
   text = without(std::move(text), FlipLet);
+  text = without(std::move(text), "mv_nrm: vec4f,", "mv_nrm: vec3f,");
+  text = without(std::move(text), FacingOut, "\n    out.mv_nrm = mv_nrm;");
+  text = without(std::move(text), "in.mv_nrm.xyz", "in.mv_nrm");
   text = without(std::move(text), "select(unit_nrm, -unit_nrm, uflip)", "unit_nrm");
   return without(std::move(text), "select(mapped_nrm, -mapped_nrm, uflip)", "mapped_nrm");
 }
@@ -1587,8 +1593,8 @@ TEST_F(GxShaderExtTest, CompanionNormalSelectKeepsLegacyExpression) {
   EXPECT_NE(text.find("ubuf.mat0.y > 0.0 && (u32(ubuf.mat0.x) & 6u) != 0u && ubuf.proj[3].w == 0.0"),
             std::string::npos);
   const std::string lets =
-      "\n    let nrm_len_sq = dot(in.mv_nrm, in.mv_nrm);"
-      "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm), nrm_len_sq > 1e-10);";
+      "\n    let nrm_len_sq = dot(in.mv_nrm.xyz, in.mv_nrm.xyz);"
+      "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm.xyz), nrm_len_sq > 1e-10);";
   EXPECT_EQ(count(plain, lets), 1u);
   EXPECT_EQ(count(text, lets), 1u);
   const std::string body = fs_body(text);

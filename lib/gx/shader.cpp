@@ -1197,7 +1197,14 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
       "\n    let mv_nrm = select(nrm_tmp, normalize(nrm_tmp), dot(nrm_tmp, nrm_tmp) > 1e-10);",
       vtx_attr(config, GX_VA_NRM));
   const bool useNormalTarget = nrmTarget != UINT32_MAX && config.attrs[GX_VA_NRM].attrType != GX_NONE;
-  if (useNormalTarget || EnableNormalVisualization) {
+  const bool backFaceText = useNormalTarget && uses_unlit(config, info, targets);
+  if (backFaceText) {
+    // w is n.v at the vertex, so the back-face flip leaves alone game normals that face the viewer from both sides
+    vtxOutAttrs += fmt::format("\n    @location({}) mv_nrm: vec4f,", vtxOutIdx++);
+    vtxXfrAttrsPre +=
+        "\n    out.mv_nrm = vec4f(mv_nrm, dot(mv_nrm, select(vec3f(0.0, 0.0, 1.0), -mv_pos, ubuf.proj[3].w == "
+        "0.0)));";
+  } else if (useNormalTarget || EnableNormalVisualization) {
     vtxOutAttrs += fmt::format("\n    @location({}) mv_nrm: vec3f,", vtxOutIdx++);
     vtxXfrAttrsPre += "\n    out.mv_nrm = mv_nrm;";
   }
@@ -1841,7 +1848,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     }
   }
   if constexpr (EnableNormalVisualization) {
-    fragmentFn += "\n    prev = vec4f(in.mv_nrm, prev.a);";
+    fragmentFn += "\n    prev = vec4f(in.mv_nrm.xyz, prev.a);";
   }
   if (targets.reactive != UINT32_MAX) {
     // Coverage is the TEV alpha that blends, not the destination alpha the Replace override writes
@@ -1927,11 +1934,13 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
   }
 
   CHECK(vtxOutIdx <= info.varyings, "GX shader emits {} inter-stage locations, planned {}", vtxOutIdx, info.varyings);
-  const bool backFaceText = unlitText && useNormalTarget;
-  const std::string flipLet = backFaceText
-                                  ? fmt::format("\n    let uflip = !gx_ff && (gx_record_word({}u) & {:#x}u) != 0u;",
-                                                render_ext::DrawRecordFlagsWord, render_ext::RecordFlagBackFaceFlip)
-                                  : std::string{};
+  const std::string_view nrmIn = backFaceText ? "in.mv_nrm.xyz"sv : "in.mv_nrm"sv;
+  const std::string flipLet =
+      backFaceText ? fmt::format(
+                         "\n    let uflip = !gx_ff && in.mv_nrm.w < 0.0 && (gx_record_word({}u) & {:#x}u) "
+                         "!= 0u;",
+                         render_ext::DrawRecordFlagsWord, render_ext::RecordFlagBackFaceFlip)
+                   : std::string{};
   const auto flipped = [backFaceText](std::string_view n) {
     return backFaceText ? fmt::format("select({0}, -{0}, uflip)", n) : std::string{n};
   };
@@ -1942,17 +1951,17 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
   if (nrmTarget != UINT32_MAX) {
     const std::string_view alpha =
         receiverNormal ? "gbuffer_rx_alpha(imm._pad, nrm_len_sq)"sv : "select(0.0, 1.0, nrm_len_sq > 1e-10)"sv;
-    std::string assignment =
-        useNormalTarget ? fmt::format(
-                              "\n    let nrm_len_sq = dot(in.mv_nrm, in.mv_nrm);"
-                              "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm), nrm_len_sq > 1e-10);{}"
-                              "\n    out.normal = vec4f({} * 0.5 + 0.5, {});",
-                              flipLet, flipped("unit_nrm"), alpha)
-                        : "\n    out.normal = vec4f(0.5, 0.5, 0.5, 0.0);"s;
+    std::string assignment = useNormalTarget
+                                 ? fmt::format(
+                                       "\n    let nrm_len_sq = dot({0}, {0});"
+                                       "\n    let unit_nrm = select(vec3f(0.0), normalize({0}), nrm_len_sq > 1e-10);{1}"
+                                       "\n    out.normal = vec4f({2} * 0.5 + 0.5, {3});",
+                                       nrmIn, flipLet, flipped("unit_nrm"), alpha)
+                                 : "\n    out.normal = vec4f(0.5, 0.5, 0.5, 0.0);"s;
     if (useNormalTarget && companionText) {
       assignment = fmt::format(
-          "\n    let nrm_len_sq = dot(in.mv_nrm, in.mv_nrm);"
-          "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm), nrm_len_sq > 1e-10);{1}"
+          "\n    let nrm_len_sq = dot({4}, {4});"
+          "\n    let unit_nrm = select(vec3f(0.0), normalize({4}), nrm_len_sq > 1e-10);{1}"
           "\n    let legacy_normal = vec4f({2} * 0.5 + 0.5, {0});"
           "\n    // Perspective only: mo_cur carries clip xyw, so an orthographic view depth is not recoverable"
           "\n    let use_mapped = ubuf.mat0.y > 0.0 && (u32(ubuf.mat0.x) & 6u) != 0u && ubuf.proj[3].w == 0.0 && "
@@ -1960,7 +1969,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
           "\n    let mapped_nrm = gx_perturb(unit_nrm, cmp_dp1, cmp_dp2, cmp_duv1, cmp_duv2, "
           "gx_companion_tangent(cmp_nrm, ubuf.mat0));"
           "\n    out.normal = select(legacy_normal, vec4f({3} * 0.5 + 0.5, {0}), use_mapped);",
-          alpha, flipLet, flipped("unit_nrm"), flipped("mapped_nrm"));
+          alpha, flipLet, flipped("unit_nrm"), flipped("mapped_nrm"), nrmIn);
     }
     if (useNormalTarget && receiverNormal) {
       uniformPre += "\n" + receiver_alpha_wgsl();
