@@ -169,6 +169,8 @@ void run_stage(const wgpu::CommandEncoder& encoder, const StageData& stage) {
     // A pass skipped at bind time wrote nothing, so its histories must not flip
     if (encode_timed(encoder, stage, *graph, nodeId)) {
       after_pass(stage, nodeId);
+    } else {
+      mark_not_encoded(*graph, nodeId, g_frameCull);
     }
   }
 #endif

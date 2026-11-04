@@ -938,6 +938,53 @@ TEST_F(GraphBindTest, SkippedOwnerLeavesHistoryStale) {
   EXPECT_EQ(count_logs(LOG_WARNING, "imports 'hs.gate'"), 1u);
 }
 
+TEST_F(GraphBindTest, BindFailureInvalidatesNextPrev) {
+  const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::Storage, .size = 256};
+  Gate gate{.buffer = m_device->device.CreateBuffer(&descriptor)};
+  const PersistentHandle handle = create_persistent_buffer_source("bf.gate", &gate_source, &gate);
+  std::vector<TestPass> passes{
+      {.name = "bf.own",
+       .order = 0,
+       .declare =
+           [handle](InternalPassBuilder& b) {
+             b.history("bf.tex", absolute(TextureFormat::RGBA8Unorm), Access::StorageWrite);
+             b.import_persistent("bf.gate", handle, Access::StorageRead);
+           }},
+      {.name = "bf.read",
+       .order = 1,
+       .declare =
+           [](InternalPassBuilder& b) {
+             b.use_prev("bf.tex");
+             b.side_effect();
+           }},
+  };
+  const TestFrame frame{compile(passes)};
+  const uint16_t history = frame.graph->resources[frame.use("bf.read", 0).resource].historySlot;
+  ASSERT_NE(history, InvalidResource);
+  // Only the real cull carries one frame's ran bits into the next, so every frame goes through build_stage_data
+  const auto run = [&](uint64_t frameId) {
+    g_uniforms.clear();
+    on_worker_frame_begin(frameId, &frame.state);
+    StageData begin{.stage = Stage::SceneBegin, .frameId = frameId, .markerSeen = true, .frame = &frame.state};
+    build_stage_data(begin);
+    StageData opaque{.stage = Stage::OpaqueDone, .frameId = frameId, .markerSeen = true, .frame = &frame.state};
+    EXPECT_TRUE(build_stage_data(opaque));
+    const bool valid = test_bit(opaque.prevValid, history);
+    EXPECT_EQ(execute(opaque), std::nullopt);
+    return valid;
+  };
+  EXPECT_FALSE(run(1));
+  EXPECT_TRUE(run(2));
+  gate.open = false;
+  EXPECT_TRUE(run(3));
+  EXPECT_EQ(passes[0].calls, 2);
+  gate.open = true;
+  EXPECT_FALSE(run(4));
+  EXPECT_EQ(passes[0].calls, 3);
+  EXPECT_TRUE(run(5));
+  EXPECT_EQ(count_logs(LOG_WARNING, "imports 'bf.gate'"), 1u);
+}
+
 TEST_F(GraphBindTest, MissedReleaseShowsStale) {
   const auto passes = steady_passes();
   const TestFrame frame{compile(passes)};
