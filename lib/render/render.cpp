@@ -31,6 +31,7 @@
 #include "post/upscale/upscale.hpp"
 #include "scene/identity.hpp"
 #include "scene/motion.hpp"
+#include "scene/streamout.hpp"
 #include "systems/dispatch.hpp"
 #include "systems/systems.hpp"
 
@@ -106,6 +107,7 @@ void initialize() {
   jobs::initialize(webgpu::g_backendType == wgpu::BackendType::WebGPU ? 0 : jobs::default_worker_count());
   shaders::initialize();
   compact::initialize();
+  scene::streamout::initialize();
   hzb::initialize();
   taa::initialize();
   ao::initialize();
@@ -149,6 +151,7 @@ void shutdown() noexcept {
   systems::shutdown();
   debug::shutdown_classification();
   debug::shutdown();
+  scene::streamout::shutdown();
   compact::shutdown();
   // Compile jobs use the device, so they finish before the job pool and the device go away
   shaders::shutdown();
@@ -180,6 +183,7 @@ void on_worker_frame_begin([[maybe_unused]] uint64_t frameId, [[maybe_unused]] c
   transient_pool_tick(frame != nullptr ? frame->graph : nullptr, TransientPool::Clock::now());
   bind_cache_tick(frameId);
   compact::worker_frame_begin(frameId);
+  scene::streamout::worker_frame_begin(frameId, frame);
   hzb::worker_tick(frameId);
   // Before any pass of the frame publishes, so no frame reuses last frame's textures
   gx_ext::fwd_env::worker_frame_begin(frameId);

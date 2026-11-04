@@ -37,6 +37,10 @@ namespace aurora::render::scene {
 struct DrawClass;
 } // namespace aurora::render::scene
 
+namespace aurora::render::scene::streamout {
+struct Plan;
+} // namespace aurora::render::scene::streamout
+
 namespace aurora::render::scene::retained {
 inline constexpr uint32_t MaxSlots = 16384;
 inline constexpr uint32_t IndexSlots = 32768;
@@ -150,6 +154,7 @@ struct Frame {
   std::vector<gx::PnMtx> matrices;
   std::vector<Layout> layouts;
   std::vector<Event> events;
+  std::shared_ptr<const streamout::Plan> plan;
 };
 
 struct FrameCounts {
@@ -204,6 +209,7 @@ void hold_coverage(bool hold) noexcept;
 void add_settle_predicate(SettlePredicate predicate) noexcept;
 
 [[nodiscard]] bool active() noexcept;
+[[nodiscard]] bool check_window(uint64_t& first, uint64_t& last) noexcept;
 // Any thread
 void report_lost(uint32_t count) noexcept;
 [[nodiscard]] bool capture_active() noexcept;

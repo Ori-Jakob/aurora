@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "gx_shader_corpus.hpp"
 #include "render_test_device.hpp"
 
 #include "gfx/encoding.hpp"
@@ -19,6 +20,7 @@
 #include "render/lighting/sky_probe.hpp"
 #include "render/lighting/tonemap.hpp"
 #include "render/post/composite.hpp"
+#include "render/scene/streamout.hpp"
 #include "render/shader_resolve.hpp"
 #include "render/shaders.hpp"
 #include "render/systems/dispatch.hpp"
@@ -1753,6 +1755,97 @@ TEST_F(RenderShaders, ModuleInitRequestsNoPipelines) {
   EXPECT_EQ(after.pending, 0u);
   EXPECT_EQ(after.ready, 0u);
   EXPECT_EQ(after.failed, 0u);
+}
+TEST_F(RenderShaders, RetainedReaderCompiles) {
+  const std::optional<std::string_view> library = library_text("aurora/retained");
+  ASSERT_TRUE(library.has_value());
+  EXPECT_EQ(library->find("@group"), std::string_view::npos);
+  EXPECT_EQ(library->find("@binding"), std::string_view::npos);
+  EXPECT_EQ(library->find("var<"), std::string_view::npos);
+  constexpr std::string_view Reader = R"(//#import aurora/retained
+@group(0) @binding(0) var<storage, read> inst: array<u32>;
+@group(0) @binding(1) var<storage, read> frame_words: array<u32>;
+@group(0) @binding(2) var<storage, read> verts: array<u32>;
+@group(0) @binding(3) var<storage, read_write> out_words: array<vec4f>;
+
+@compute @workgroup_size(1)
+fn main() {
+  let cam = retained_camera(&frame_words);
+  let rel = retained_world_rel(retained_world(&inst, 1u), cam.hi, cam.lo);
+  let prev = retained_prev_world(&inst, 1u, cam.frame);
+  var raw: array<u32, 8>;
+  for (var i = 0u; i < 8u; i++) {
+    raw[i] = verts[i];
+  }
+  let v = retained_unpack_vertex(raw);
+  let uv = retained_uv(retained_uv_xform(&inst, 1u, false), v.uv0);
+  let box = retained_aabb(&inst, 1u, retained_prev_is_last_frame(&inst, 1u, cam.frame));
+  let n = retained_normal_matrix(&inst, 1u);
+  out_words[0] = vec4f(v.pos, retained_alpha_uv(v, inst[0]).x) * rel[0] + prev.rows[1] + n[2] +
+                 vec4f(uv, box[0].x, box[1].y);
+}
+)";
+  ASSERT_TRUE(register_source("test/retained_reader", Reader));
+  std::string error;
+  EXPECT_TRUE(validate_module("test/retained_reader", {}, error)) << error;
+  EXPECT_TRUE(validate_module("aurora/retained", {}, error)) << error;
+  EXPECT_TRUE(validate_module("scene/streamout", {}, error)) << error;
+}
+
+TEST_F(RenderShaders, StreamoutVariantsValidateForCorpus) {
+  std::set<std::string> seen;
+  size_t validated = 0;
+  for (const auto& entry : gx::corpus::generate_synthetic()) {
+    const gx::ShaderConfig config = gx::corpus::decode(entry.record);
+    if (config.attrs[GX_VA_POS].attrType == GX_NONE || config.lineMode != 0) {
+      continue;
+    }
+    std::array<uint8_t, 2> tex{0xFF, 0xFF};
+    size_t found = 0;
+    for (uint8_t t = 0; t < 8 && found < tex.size(); ++t) {
+      if (config.attrs[GX_VA_TEX0 + t].attrType != GX_NONE) {
+        tex[found++] = t;
+      }
+    }
+    const std::string source = scene::streamout::variant_source(config.attrs, config.vtxStride, tex[0], tex[1]);
+    if (!seen.insert(source).second) {
+      continue;
+    }
+    const std::string id = fmt::format("test/streamout_variant_{}", validated++);
+    ASSERT_TRUE(register_source(id, source, SourceScope::Isolated));
+    std::string error;
+    EXPECT_TRUE(validate_module(id, {}, error)) << entry.label << ": " << error;
+  }
+  EXPECT_GE(validated, 4u);
+}
+
+TEST_F(RenderShaders, IsolatedSourceKeepsSharedPipelineIds) {
+  const PipelineId before = request_compute({.shader = "test/fill_pattern", .defines = Squares, .constants = Scale3});
+  ASSERT_TRUE(
+      register_source("test/isolated_variant", "@compute @workgroup_size(1) fn main() {}", SourceScope::Isolated));
+  const PipelineId isolated = request_compute({.shader = "test/isolated_variant"});
+  EXPECT_EQ(request_compute({.shader = "test/fill_pattern", .defines = Squares, .constants = Scale3}), before);
+  ASSERT_TRUE(
+      register_source("test/isolated_variant", "@compute @workgroup_size(2) fn main() {}", SourceScope::Isolated));
+  EXPECT_EQ(request_compute({.shader = "test/fill_pattern", .defines = Squares, .constants = Scale3}), before);
+  const PipelineId rebuilt = request_compute({.shader = "test/isolated_variant"});
+  EXPECT_NE(rebuilt, isolated);
+  EXPECT_EQ(wait(rebuilt, WaitNs), PipelineStatus::Ready);
+  ASSERT_TRUE(register_source("test/shared_extra", "@compute @workgroup_size(1) fn main() {}"));
+  EXPECT_NE(request_compute({.shader = "test/fill_pattern", .defines = Squares, .constants = Scale3}), before);
+  EXPECT_EQ(wait(before, WaitNs), PipelineStatus::Ready);
+  EXPECT_EQ(wait(isolated, WaitNs), PipelineStatus::Ready);
+}
+
+TEST_F(RenderShaders, IsolatedSourceCannotBeImported) {
+  ASSERT_TRUE(register_source("test/isolated_lib", "fn isolated_value() -> u32 { return 1u; }", SourceScope::Isolated));
+  ASSERT_TRUE(register_source("test/imports_isolated",
+                              "//#import test/isolated_lib\n"
+                              "@compute @workgroup_size(1) fn main() { _ = isolated_value(); }\n"));
+  std::string error;
+  EXPECT_FALSE(validate_module("test/imports_isolated", {}, error));
+  EXPECT_NE(error.find("test/isolated_lib"), std::string::npos) << error;
+  EXPECT_TRUE(validate_module("test/isolated_lib", {}, error)) << error;
 }
 } // namespace
 } // namespace aurora::render::shaders

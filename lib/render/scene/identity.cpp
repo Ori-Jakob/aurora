@@ -2,6 +2,7 @@
 
 #include "classify.hpp"
 #include "gc.hpp"
+#include "streamout.hpp"
 #include "../hints.hpp"
 #include "../stage_data.hpp"
 #include "../../gfx/hash.hpp"
@@ -223,6 +224,7 @@ bool g_resetPending = false;
 bool g_warnedOverflow = false;
 bool g_warnedEntries = false;
 Pending g_pending;
+bool g_newGeometry = false;
 FifoFrame g_frame;
 std::array<std::shared_ptr<Frame>, FramePoolSize> g_pool;
 std::shared_ptr<Frame> g_tentative;
@@ -243,6 +245,16 @@ uint32_t key_home(const Key& key) noexcept {
   const uint64_t mixed = splitmix64(key.id ^ (uint64_t{key.subId} << 32) ^ (uint64_t{key.generation} << 16) ^
                                     (uint64_t{key.ordinal} << 48) ^ (uint64_t{key.occurrence} << 40));
   return static_cast<uint32_t>(mixed) & IndexMask;
+}
+
+uint32_t identity_hash(const Key& key) noexcept {
+  Hasher hasher;
+  hasher.update(key.id);
+  hasher.update(key.subId);
+  hasher.update(key.generation);
+  hasher.update(key.ordinal);
+  hasher.update(key.occurrence);
+  return static_cast<uint32_t>(hasher.digest());
 }
 
 bool read_check_env(std::string_view text) noexcept {
@@ -829,6 +841,7 @@ uint32_t create(const Pending& pending, const Key& key, uint32_t classBits, uint
     }
   }
   slot.createdPending = true;
+  g_newGeometry = true;
   queue_event(EventType::Created, index);
   ++counts.created;
   ++g_totals.created;
@@ -853,6 +866,7 @@ void check_static(Slot& slot, const Pending& pending, uint64_t layoutKey) noexce
     ++g_totals.churn;
     slot.info.topologyHash = topology;
     slot.info.geometryHash = geometry;
+    g_newGeometry = true;
     queue_event(EventType::GeometryChanged, slot.info.slot);
   }
   slot.signature = sig;
@@ -956,6 +970,7 @@ void record(const DrawRef& draw) noexcept {
   Affine world = multiply(g_frame.invView, to_affine(position_matrix(pnSlot)));
   const uint32_t classBits = class_bits(pending, palette);
   uint32_t slot = TransientSlot;
+  g_newGeometry = false;
   if (pending.object.valid) {
     slot = find_or_create(pending, classBits, g_layouts[layout].key, world);
   }
@@ -999,6 +1014,31 @@ void record(const DrawRef& draw) noexcept {
     g_matrices.push_back(
         {.pos = position_matrix(pnSlot), .nrm = pnSlot < gx::MaxPnMtx ? state.pnMtx[pnSlot].nrm : Mat3x4<float>{}});
   }
+  const Slot* seen = slot != TransientSlot ? &g_slots[slot] : nullptr;
+  streamout::on_capture({
+      .slot = slot,
+      .slotGeneration = seen != nullptr ? seen->generation : 0,
+      .identityHash = seen != nullptr ? identity_hash(seen->info.key) : 0,
+      .newGeometry = g_newGeometry,
+      .latched = seen != nullptr && seen->latched,
+      .teleport = (pending.objectFlags & object_flag::Teleport) != 0,
+      .gpuArrays = state.gpuArrayMask != 0,
+      .entryFlags = flags,
+      .classBits = classBits,
+      .categories = pending.categories,
+      .objectFlags = pending.objectFlags,
+      .attrs = draw.attrs,
+      .stride = draw.stride,
+      .immediates = &entry.immediates,
+      .prim = entry.prim,
+      .vtxCount = entry.vtxCount,
+      .idxRange = entry.idxRange,
+      .indexCount = entry.indexCount,
+      .pnSlot = pnSlot,
+      .world = &world,
+      .invView = &g_frame.invView,
+      .eye = g_frame.eye,
+  });
   ++counts.entries;
   counts.captureOnly += (flags & entry_flag::CaptureOnly) != 0 ? 1 : 0;
   counts.transient += slot == TransientSlot ? 1 : 0;
@@ -1006,6 +1046,7 @@ void record(const DrawRef& draw) noexcept {
 }
 
 void drop_log() noexcept {
+  streamout::drop_pending();
   for (const Entry& entry : g_log) {
     drop(entry.flags);
   }
@@ -1118,6 +1159,7 @@ void evict_slot(uint32_t index, EvictReason reason) noexcept {
   slot = {};
   slot.generation = generation;
   g_lives[index] = {};
+  streamout::on_freed(index);
   // Frames sealed before the eviction may still name the slot on the worker
   gc::quarantine(index);
   ++g_totals.evicted;
@@ -1211,8 +1253,9 @@ void publish() {
 
 void latch_gate(const Settings&, const Caps& caps) noexcept {
   read_env();
-  const bool next = detail::hints_enabled() && caps.core && g_demand != 0;
+  const bool next = detail::hints_enabled() && caps.core && streamout::supported(caps) && g_demand != 0;
   if (next != g_active) {
+    streamout::reset();
     if (next) {
       allocate();
       g_resetPending = true;
@@ -1231,7 +1274,7 @@ void latch_gate(const Settings&, const Caps& caps) noexcept {
   latch_resources(next);
 }
 
-void latch_resources(bool) noexcept {}
+void latch_resources(bool active) noexcept { streamout::latch_resources(active); }
 
 void set_demand(Demand demand, bool on) noexcept {
   const auto bit = static_cast<uint8_t>(demand);
@@ -1240,13 +1283,19 @@ void set_demand(Demand demand, bool on) noexcept {
 
 void apply_frame_state(const detail::FrameState&) noexcept {
   gx::fifo::set_release_listener(g_active ? &gc::on_release : nullptr);
+  const uint64_t hintFrame = detail::live_scene_hints().hintFrame;
+  const bool resynced = streamout::begin_frame(g_active, hintFrame);
   if (!g_active) {
     return;
   }
   g_frame = {};
-  g_frame.hintFrame = detail::live_scene_hints().hintFrame;
+  g_frame.hintFrame = hintFrame;
   g_frame.sceneFrame = g_sceneClock;
   g_pending = {};
+  if (resynced) {
+    ++g_frame.counts.resyncs;
+    ++g_totals.resyncs;
+  }
 }
 
 void end_frame() noexcept {
@@ -1259,6 +1308,7 @@ void end_frame() noexcept {
     }
     g_pending = {};
     g_tentative.reset();
+    streamout::end_frame();
     const bool epochChanged = collect(scene);
     g_frame.counts.lostCaptures += static_cast<uint32_t>(reported);
     g_totals.lostCaptures += reported;
@@ -1279,6 +1329,7 @@ void reset() noexcept {
   if (g_allocated) {
     clear_tables();
   }
+  streamout::reset();
   g_resetPending = g_active;
   g_sceneClock = 0;
   g_lastDisturb = 0;
@@ -1317,6 +1368,12 @@ void add_settle_predicate(SettlePredicate predicate) noexcept {
 }
 
 bool active() noexcept { return g_active; }
+
+bool check_window(uint64_t& first, uint64_t& last) noexcept {
+  first = g_checkFirst;
+  last = g_checkLast;
+  return g_checkMode;
+}
 
 void report_lost(uint32_t count) noexcept { g_reportedLost.fetch_add(count, std::memory_order_relaxed); }
 
@@ -1408,6 +1465,8 @@ void prepare(detail::StageData& stage) noexcept {
   frame->matrices.assign(g_matrices.begin(), g_matrices.end());
   frame->layouts.assign(g_layouts.begin(), g_layouts.end());
   build_events(frame->events);
+  frame->plan.reset();
+  streamout::seal(*frame, stage);
   g_tentative = frame;
   stage.retained = std::move(frame);
 }
@@ -1417,6 +1476,7 @@ void skip(detail::StageData& stage) noexcept {
     return;
   }
   const Zone zone;
+  streamout::skip(stage);
   stage.retained.reset();
   g_tentative.reset();
   if (stage.stage == Stage::PrePost) {
@@ -1453,6 +1513,7 @@ void seal(detail::StageData& stage) noexcept {
   g_totals.capturedOnly += static_cast<uint64_t>(std::ranges::count_if(
       g_tentative->entries, [](const Entry& entry) { return (entry.flags & entry_flag::CaptureOnly) != 0; }));
   commit_events();
+  streamout::sealed(stage);
   g_log.clear();
   g_matrices.clear();
   g_layouts.clear();
@@ -1493,6 +1554,7 @@ void reset() noexcept {
   g_settleCount = 0;
   g_reportedLost.store(0, std::memory_order_relaxed);
   g_captureActive.store(false, std::memory_order_relaxed);
+  streamout::testing::reset();
   retained::reset();
 }
 

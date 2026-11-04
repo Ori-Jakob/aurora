@@ -227,6 +227,11 @@ bool apply_ssil_check(Options& options, std::string_view) {
   return true;
 }
 
+bool apply_retained_check(Options& options, std::string_view) {
+  options.retainedCheck = true;
+  return true;
+}
+
 bool apply_no_hints(Options& options, std::string_view) {
   options.hints = false;
   return true;
@@ -317,7 +322,7 @@ struct Flag {
   bool frameLoop = false;
 };
 
-constexpr std::array<Flag, 38> Flags{{
+constexpr std::array<Flag, 39> Flags{{
     {"--frames", true, apply_frames, true},
     {"--timeout", true, apply_timeout, true},
     {"--backend", true, apply_backend},
@@ -343,6 +348,7 @@ constexpr std::array<Flag, 38> Flags{{
     {"--overlay-check", false, apply_overlay_check, true},
     {"--class-check", false, apply_class_check, true},
     {"--ssil-check", false, apply_ssil_check, true},
+    {"--retained-check", false, apply_retained_check, true},
     {"--no-hints", false, apply_no_hints, true},
     {"--check-hints", false, apply_check_hints, true},
     {"--custom-draw-probe", false, apply_custom_draw_probe, true},
@@ -519,6 +525,10 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
     error = "--class-check needs at least 40 frames";
     return std::nullopt;
   }
+  if (options.retainedCheck && !options.hints) {
+    error = "--retained-check cannot be combined with --no-hints";
+    return std::nullopt;
+  }
   if (options.ssilCheck && (!options.hints || options.msaa > 1)) {
     error = "--ssil-check cannot be combined with --no-hints or --msaa above 1";
     return std::nullopt;
@@ -601,6 +611,8 @@ std::string_view usage() noexcept {
          "                      from the composite's radiance and upsampled by ao.upsample, carries the wall's red\n"
          "                      onto the floor at its foot and the fin's green only to the floor its lit face\n"
          "                      points at (needs at least 90 frames)\n"
+         "  --retained-check    turn the retained scene and its check mode on, write retained_wire.png to the data\n"
+         "                      directory and log the check result at shutdown\n"
          "  --no-hints          emit no render hints and no capture-only draw\n"
 
          "  --check-hints       exit with code 8 unless aurora decoded or skipped every emitted hint as expected\n"

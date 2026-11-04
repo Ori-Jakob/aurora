@@ -313,6 +313,7 @@ if (AURORA_ENABLE_GX)
     target_sources(render_tests PRIVATE render_history_reset_test.cpp)
     target_sources(render_tests PRIVATE render_motion_test.cpp)
     target_sources(render_tests PRIVATE render_retained_test.cpp)
+    target_sources(render_tests PRIVATE render_streamout_test.cpp)
     target_sources(render_tests PRIVATE render_texture_inspector_test.cpp)
     target_sources(render_tests PRIVATE render_fake_shadow_test.cpp)
     target_sources(render_tests PRIVATE render_fake_shadows_tab_test.cpp)
@@ -414,7 +415,7 @@ if (AURORA_ENABLE_GX)
       render_upscale_test.cpp render_upscale_gpu_test.cpp render_native_test.cpp gfx_stream_spill_test.cpp
       render_ao_test.cpp render_ao_reference.cpp render_depth_device.cpp render_composite_test.cpp
       render_lighting_test.cpp render_lighting_reference.cpp render_openpbr_test.cpp render_sky_probe_test.cpp
-      render_exposure_test.cpp render_ssil_test.cpp)
+      render_exposure_test.cpp render_ssil_test.cpp render_streamout_gpu_test.cpp)
     target_include_directories(render_gpu_tests PRIVATE ../include ../lib)
     target_compile_definitions(render_gpu_tests PRIVATE AURORA TARGET_PC=1 AURORA_ENABLE_RENDER=1
       AURORA_ENABLE_NATIVE_D3D12=$<BOOL:${AURORA_ENABLE_NATIVE_D3D12}> AURORA_ENABLE_XESS=$<BOOL:${AURORA_ENABLE_XESS}>
@@ -522,6 +523,10 @@ if (TARGET render_demo)
               --fail-on-error --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_smoke/${_profile})
     set_tests_properties(render_demo_smoke_${_profile} PROPERTIES LABELS smoke TIMEOUT 180)
   endforeach ()
+  add_test(NAME render_demo_retained_check
+    COMMAND $<TARGET_FILE:render_demo> --backend null --retained-check --frames 60 --timeout 60 --fail-on-error
+            --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_smoke/retained_check)
+  set_tests_properties(render_demo_retained_check PROPERTIES LABELS smoke TIMEOUT 180)
   add_test(NAME render_demo_smoke_streaming_growth
     COMMAND $<TARGET_FILE:render_demo> --backend null --profile compat --frames 90 --timeout 60
             --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_smoke/streaming)

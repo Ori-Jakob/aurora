@@ -120,6 +120,7 @@ struct Resources {
   AuroraStats stats{};
   StreamingSizes deviceSizes;
   uint32_t residentCapacity = 0;
+  uint32_t streamingGeneration = 0;
 };
 
 Resources& resources() noexcept;

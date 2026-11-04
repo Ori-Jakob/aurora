@@ -406,6 +406,9 @@ void ensure_device_buffers(const StreamingSizes& sizes, uint32_t residentCapacit
     g_resources.residentCapacity = residentCapacity;
     rebuildStaticGroup = true;
   }
+  if (rebuildStaticGroup || resized) {
+    ++g_resources.streamingGeneration;
+  }
   if (rebuildStaticGroup) {
     create_static_bind_group();
   }

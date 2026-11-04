@@ -963,6 +963,14 @@ int main(int argc, char* argv[]) {
   if (options.classCheck) {
     SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_PBR", "on", false);
   }
+  if (options.retainedCheck) {
+    const std::string wire = (options.dataDir.empty() ? std::filesystem::path{"retained_wire.png"}
+                                                      : std::filesystem::path{options.dataDir} / "retained_wire.png")
+                                 .string();
+    SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_RETAINED", "1", true);
+    SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_RETAINED_CHECK", "1", true);
+    SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_RETAINED_WIRE", wire.c_str(), true);
+  }
 
   AuroraConfig config{};
   config.appName = "render_demo";

@@ -107,6 +107,7 @@ uint32_t g_lastRecordedUniformSize = 0;
 std::atomic_uint64_t g_residentRequest{0};
 uint64_t g_channelStorageBytes = 0;
 uint64_t g_lastChannelStorageBytes = 0;
+uint64_t g_lastFrameStorage = 0;
 
 std::string pass_label(std::string_view kind) {
 #ifdef AURORA_GFX_DEBUG_GROUPS
@@ -1184,6 +1185,7 @@ RecordedFrame end_recording() {
   g_lastRecordedUniformSize = frame.stats.lastUniformSize;
   frame.stats.lastIndexSize = frame.indices.size();
   frame.stats.lastStorageSize = frame.storage.size();
+  g_lastFrameStorage = frame.stats.lastStorageSize;
   frame.stats.lastTextureUploadSize = frame.textureUpload.size();
   g_lastChannelStorageBytes = g_channelStorageBytes;
   if (g_keepShapes) {
@@ -1235,6 +1237,7 @@ void shutdown_recording() {
   g_lastRecordedUniformSize = 0;
   g_channelStorageBytes = 0;
   g_lastChannelStorageBytes = 0;
+  g_lastFrameStorage = 0;
   g_recorder.suppressRenderWorker = false;
   g_recorder.normalRequested = false;
   g_recorder.normalRequestSeen = false;
@@ -2126,6 +2129,19 @@ bool frame_overrun() noexcept {
   }
   const FramePacket& frame = current_frame_packet();
   return frame.vertexOverrun != 0 || frame.indexOverrun != 0 || frame.uniformOverrun != 0 || frame.storageOverrun != 0;
+}
+
+detail::StreamRoom detail::stream_room() noexcept {
+  StreamRoom room{.lastFrameStorage = g_lastFrameStorage};
+  if (!g_recorder.active()) {
+    return room;
+  }
+  const FramePacket& frame = current_frame_packet();
+  room.storageUsed = frame.storage.size();
+  room.storageCapacity = frame.storage.capacity();
+  room.storageOwned = frame.storage.owned();
+  room.overrun = frame_overrun();
+  return room;
 }
 
 uint64_t uniform_space_left() noexcept {

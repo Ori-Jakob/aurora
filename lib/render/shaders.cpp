@@ -91,6 +91,7 @@ std::atomic_uint64_t g_session = 0;
 std::atomic_uint64_t g_sourceGeneration = 0;
 std::vector<std::string_view> g_implicitDefines;
 std::map<std::string, std::shared_ptr<const std::string>, std::less<>> g_runtime;
+std::map<std::string, uint64_t, std::less<>> g_isolated;
 std::vector<std::shared_ptr<SlotState>> g_slots;
 absl::flat_hash_map<uint64_t, PipelineId> g_dedup;
 absl::flat_hash_map<uint64_t, ModuleEntry> g_modules;
@@ -123,15 +124,28 @@ std::optional<std::string_view> library_source(std::string_view id) {
   return it != shaders.end() && it->id == id ? std::optional{it->text} : std::nullopt;
 }
 
-RuntimeSources runtime_sources() {
+RuntimeSources runtime_sources(std::string_view root) {
   std::lock_guard lock{g_mutex};
-  return {g_runtime.begin(), g_runtime.end()};
+  RuntimeSources out;
+  out.reserve(g_runtime.size());
+  for (const auto& [id, text] : g_runtime) {
+    if (id == root || !g_isolated.contains(id)) {
+      out.emplace_back(id, text);
+    }
+  }
+  return out;
+}
+
+std::optional<uint64_t> isolated_generation(std::string_view id) {
+  std::lock_guard lock{g_mutex};
+  const auto it = g_isolated.find(id);
+  return it != g_isolated.end() ? std::optional{it->second} : std::nullopt;
 }
 
 bool resolve(std::string_view shader, std::span<const std::string_view> defines, ResolvedSource& out,
              std::string& error) {
   // Owning copies keep a text alive while a concurrent register_source replaces it
-  const RuntimeSources runtime = runtime_sources();
+  const RuntimeSources runtime = runtime_sources(shader);
   const SourceLookup lookup = [&runtime](std::string_view id) -> std::optional<std::string_view> {
     if (const auto text = library_source(id)) {
       return text;
@@ -517,7 +531,10 @@ std::string rejection(std::string_view shader, const wgpu::PipelineLayout& layou
 
 PipelineId submit_request(std::shared_ptr<Request> request, std::string_view label, uint64_t layoutKey,
                           std::string rejected) {
-  const uint64_t key = request_key(*request, layoutKey, g_sourceGeneration.load(std::memory_order_acquire));
+  const std::optional<uint64_t> isolated = isolated_generation(request->shader);
+  const uint64_t generation =
+      isolated ? (*isolated | uint64_t{1} << 63) : g_sourceGeneration.load(std::memory_order_acquire);
+  const uint64_t key = request_key(*request, layoutKey, generation);
   PipelineId id;
   bool reused = false;
   {
@@ -646,6 +663,7 @@ void shutdown() {
   g_dedup.clear();
   g_modules.clear();
   g_runtime.clear();
+  g_isolated.clear();
   g_warned.clear();
   g_failures.clear();
   g_implicitDefines.clear();
@@ -659,7 +677,7 @@ void shutdown() {
   g_shuttingDown = false;
 }
 
-bool register_source(std::string_view id, std::string_view source) {
+bool register_source(std::string_view id, std::string_view source, SourceScope scope) {
   if (!is_valid_shader_id(id)) {
     Log.error("register_source: invalid shader id '{}'", id);
     return false;
@@ -671,6 +689,13 @@ bool register_source(std::string_view id, std::string_view source) {
   auto text = std::make_shared<const std::string>(normalize_source(source));
   std::lock_guard lock{g_mutex};
   g_runtime.insert_or_assign(std::string{id}, std::move(text));
+  if (scope == SourceScope::Isolated) {
+    ++g_isolated[std::string{id}];
+    return true;
+  }
+  if (const auto it = g_isolated.find(id); it != g_isolated.end()) {
+    g_isolated.erase(it);
+  }
   g_sourceGeneration.fetch_add(1, std::memory_order_acq_rel);
   return true;
 }

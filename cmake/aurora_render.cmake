@@ -191,11 +191,17 @@ if (AURORA_ENABLE_RENDER)
         lib/render/scene/gc.hpp
         lib/render/scene/identity.cpp
         lib/render/scene/identity.hpp
+        lib/render/scene/map_pick.cpp
+        lib/render/scene/map_pick.hpp
         lib/render/scene/motion.cpp
         lib/render/scene/motion.hpp
         lib/render/scene/overlay.cpp
         lib/render/scene/overlay.hpp
         lib/render/scene/receiver_category.hpp
+        lib/render/scene/streamout.cpp
+        lib/render/scene/streamout.hpp
+        lib/render/scene/streamout_layout.hpp
+        lib/render/scene/streamout_wgsl.cpp
         lib/render/shader_resolve.cpp
         lib/render/shader_resolve.hpp
         lib/render/shaders.cpp

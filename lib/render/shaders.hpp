@@ -15,6 +15,8 @@ namespace aurora::render::shaders {
 inline constexpr uint32_t MaxColorTargets = 8;
 
 enum class PipelineStatus : uint8_t { Pending, Ready, Failed };
+// Stream-out registers a source per vertex format, which must not re-key every pass pipeline
+enum class SourceScope : uint8_t { Shared, Isolated };
 
 struct PipelineId {
   uint32_t value = 0;
@@ -81,7 +83,7 @@ void initialize();
 void quiesce();
 void shutdown();
 
-bool register_source(std::string_view id, std::string_view source);
+bool register_source(std::string_view id, std::string_view source, SourceScope scope = SourceScope::Shared);
 [[nodiscard]] bool has_source(std::string_view id);
 [[nodiscard]] std::span<const std::string_view> implicit_defines() noexcept;
 

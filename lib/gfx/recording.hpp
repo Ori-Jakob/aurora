@@ -45,6 +45,16 @@ uint64_t take_resident_request() noexcept;
 bool take_mod_normal_request() noexcept;
 bool should_arm_mod_normal(bool requested, bool offscreen, bool normalPresent, bool core, uint32_t msaa) noexcept;
 
+// Stream-out sizes its block from this, so a retained push never starves a later GX array
+struct StreamRoom {
+  uint64_t storageUsed = 0;
+  uint64_t storageCapacity = 0;
+  uint64_t lastFrameStorage = 0;
+  bool storageOwned = false;
+  bool overrun = false;
+};
+StreamRoom stream_room() noexcept;
+
 namespace testing {
 struct OffscreenCacheStats {
   uint64_t bytes;
