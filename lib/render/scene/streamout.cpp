@@ -500,11 +500,15 @@ void rebuild_live() {
   g_live = std::move(live);
 }
 
-void clear_stream_state() noexcept {
+void clear_stream_state(bool keepStatics = false) noexcept {
+  g_pendingStatics = 0;
   for (SlotState& st : g_slots) {
     const uint32_t generation = st.generation;
+    const bool pending = keepStatics && (st.staticPending || (st.streamed && (st.classBits & StaticBits) != 0));
     st = {};
     st.generation = generation;
+    st.staticPending = pending;
+    g_pendingStatics += pending ? 1 : 0;
   }
   if (g_allocated) {
     g_vertexPool.emplace(g_vertexPoolBytes, PoolGranule);
@@ -514,7 +518,6 @@ void clear_stream_state() noexcept {
   g_freed.clear();
   g_clusterDirty.clear();
   g_tentative = {};
-  g_pendingStatics = 0;
   g_streamedCount = 0;
   g_clearPending = true;
   g_liveChanged = true;
@@ -1570,10 +1573,13 @@ void commit_plan(Tentative& t) {
 void resync() noexcept {
   uint32_t lost = 0;
   for (const SlotState& st : g_slots) {
-    lost += st.recordSent && st.lastCaptureOnly ? 1 : 0;
+    // A dropped static the game no longer draws comes back only if the producer captures it again
+    const bool droppedStatic = st.streamed && (st.classBits & StaticBits) != 0;
+    lost += (st.recordSent && st.lastCaptureOnly) || droppedStatic ? 1 : 0;
   }
   report(lost);
-  clear_stream_state();
+  // Statics stay pending across the resync, so coverage waits until their geometry is back in the pools
+  clear_stream_state(true);
   ++g_stats.resyncs;
   Log.warn("Retained scene: the stream-out chain broke; every instance streams again");
 }

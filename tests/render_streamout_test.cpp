@@ -493,6 +493,44 @@ TEST_F(RetainedStreamout, DroppedPlanStopsLaterDeltas) {
   EXPECT_EQ(testing::slot(slot_of(0x70)).streams, 1u);
 }
 
+TEST_F(RetainedStreamout, ResyncKeepsUndrawnStaticsPending) {
+  begin_frame();
+  object_draw(0x78, 3, AURORA_CAT_STATIC);
+  object_draw(0x79, 3, AURORA_CAT_STATIC, AURORA_OBJ_CAPTURE_ONLY);
+  object_draw(0x7A);
+  ASSERT_NE(stage(), nullptr);
+  end();
+  EXPECT_TRUE(settled());
+  EXPECT_EQ(coverage().pending, 0u);
+
+  testing::break_chain();
+  begin_frame();
+  object_draw(0x7A);
+  ASSERT_NE(stage(), nullptr);
+  const retained::FrameCounts counts = end();
+  EXPECT_EQ(counts.resyncs, 1u);
+  EXPECT_EQ(counts.lostCaptures, 2u);
+  EXPECT_FALSE(settled());
+  EXPECT_EQ(coverage().pending, 2u);
+  EXPECT_TRUE(testing::slot(slot_of(0x7A)).streamed);
+
+  begin_frame();
+  object_draw(0x78, 3, AURORA_CAT_STATIC);
+  ASSERT_NE(stage(), nullptr);
+  end();
+  EXPECT_FALSE(settled());
+  EXPECT_EQ(coverage().pending, 1u);
+
+  begin_frame();
+  object_draw(0x79, 3, AURORA_CAT_STATIC, AURORA_OBJ_CAPTURE_ONLY);
+  ASSERT_NE(stage(), nullptr);
+  end();
+  EXPECT_TRUE(settled());
+  EXPECT_EQ(coverage().pending, 0u);
+  EXPECT_TRUE(testing::slot(slot_of(0x78)).streamed);
+  EXPECT_TRUE(testing::slot(slot_of(0x79)).streamed);
+}
+
 TEST_F(RetainedStreamout, FreedSlotWritesInvalidationInSamePlan) {
   begin_frame();
   object_draw(0x80);
