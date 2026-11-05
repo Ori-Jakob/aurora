@@ -1115,6 +1115,9 @@ int main(int argc, char* argv[]) {
     aurora::render::Settings settings = aurora::render::effective_settings();
     settings.debugView = debugView->id;
     aurora::render::apply_settings(settings);
+    if (debugView->bit != 0) {
+      aurora::render::debug::set_view_bit(debugView->bit);
+    }
   }
   ClassRun classRun;
   if (options.classCheck) {
