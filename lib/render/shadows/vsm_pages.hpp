@@ -92,6 +92,7 @@ inline constexpr uint32_t Producing = 1u << 0;
 inline constexpr uint32_t Full = 1u << 1;
 inline constexpr uint32_t Exempt = 1u << 2;
 inline constexpr uint32_t Relatch = 1u << 3;
+inline constexpr uint32_t Held = 1u << 4;
 } // namespace header_flag
 
 namespace full_reason {
@@ -102,7 +103,11 @@ inline constexpr uint32_t PoolGeneration = 1u << 3;
 inline constexpr uint32_t KeyLight = 1u << 4;
 inline constexpr uint32_t Anchor = 1u << 5;
 inline constexpr uint32_t Check = 1u << 6;
-inline constexpr uint32_t Count = 7;
+inline constexpr uint32_t RetainedReset = 1u << 7;
+inline constexpr uint32_t ClearInstances = 1u << 8;
+inline constexpr uint32_t Unapplied = 1u << 9;
+inline constexpr uint32_t SceneEpoch = 1u << 10;
+inline constexpr uint32_t Count = 11;
 } // namespace full_reason
 
 namespace stat {
@@ -110,10 +115,29 @@ inline constexpr uint32_t FreedWrap = 0;
 inline constexpr uint32_t FreedRelatch = 1;
 inline constexpr uint32_t FreedRecentre = 2;
 inline constexpr uint32_t FreedFull = 3;
+inline constexpr uint32_t ScanValid = 4;
+inline constexpr uint32_t ScanCasters = 5;
+inline constexpr uint32_t Changed = 6;
+inline constexpr uint32_t ChangedStatic = 7;
+inline constexpr uint32_t ChangedImmobile = 8;
+inline constexpr uint32_t ChangedPlayer = 9;
+inline constexpr uint32_t ChangedPalette = 10;
+inline constexpr uint32_t PendingStream = 11;
+inline constexpr uint32_t PendingCasters = 12;
+inline constexpr uint32_t ChunkNeed = 13;
+inline constexpr uint32_t ReasonFirst = 14;
+inline constexpr uint32_t NonPlayerOther = 23;
+inline constexpr uint32_t FootprintPages = 24;
+inline constexpr uint32_t FootprintPriority = 25;
+inline constexpr uint32_t DirtiedPages = 26;
+inline constexpr uint32_t DirtiedPriority = 27;
 } // namespace stat
 
 namespace chain_bit {
 inline constexpr uint32_t Update = 1u << 0;
+inline constexpr uint32_t Scan = 1u << 1;
+inline constexpr uint32_t ScanList = 1u << 2;
+inline constexpr uint32_t Dirty = 1u << 3;
 } // namespace chain_bit
 
 struct ViewsHeader {
@@ -311,6 +335,47 @@ struct FrameFlags {
 [[nodiscard]] std::array<double, 3> frame_direction(const detail::SceneHints* hints, uint32_t lightId,
                                                     const std::array<double, 3>& planDir) noexcept;
 
+struct FrameSignals {
+  bool retainedReset = false;
+  bool clearInstances = false;
+  bool unapplied = false;
+  bool sceneEpoch = false;
+};
+
+struct FrameInput {
+  uint32_t frameIndex = 0;
+  uint64_t hintFrame = 0;
+  const detail::SceneHints* hints = nullptr;
+  std::array<double, 3> eye{};
+  std::array<double, 3> planDir{};
+  uint32_t lightId = 0;
+  double texel0 = 0.0;
+  bool producing = false;
+  bool coverageComplete = false;
+  uint32_t pages = 0;
+  uint32_t pagesX = 0;
+  uint32_t budget = 0;
+  float levelBias = 0.f;
+  uint32_t generation = 0;
+  uint32_t chainMask = 0;
+  FrameSignals signals;
+};
+
+struct FrameDecision {
+  Views views{};
+  uint32_t reasons = 0;
+  bool full = false;
+  bool exempt = false;
+  bool held = false;
+  bool cut = false;
+  SunClipmap::Result clipmap;
+};
+
+// Worker: the CPU half of vsm.update, which also restarts the frame's chain mask
+[[nodiscard]] FrameDecision decide_frame(const FrameInput& in) noexcept;
+// Worker: an unapplied stream-out plan holds the scan until a plan lands, so one break costs one Full
+[[nodiscard]] bool frame_held() noexcept;
+
 struct UpdateStats {
   uint32_t freedWrap = 0;
   uint32_t freedRelatch = 0;
@@ -341,12 +406,14 @@ void mark_encoded(uint32_t bit) noexcept;
 [[nodiscard]] uint32_t encoded_mask() noexcept;
 
 [[nodiscard]] detail::PersistentHandle handle(std::string_view name) noexcept;
-[[nodiscard]] std::array<detail::PassDesc, 2> pass_descs();
+inline constexpr size_t PassCount = 5;
+[[nodiscard]] std::array<detail::PassDesc, PassCount> pass_descs();
 
 namespace testing {
 struct WorkerCounts {
   uint64_t frames = 0;
   uint64_t fulls = 0;
+  uint64_t held = 0;
   uint64_t exempt = 0;
   uint64_t exemptCut = 0;
   uint64_t exemptCoverage = 0;

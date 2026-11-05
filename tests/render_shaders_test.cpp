@@ -23,6 +23,7 @@
 #include "render/post/composite.hpp"
 #include "render/scene/streamout.hpp"
 #include "render/shader_resolve.hpp"
+#include "render/shadows/vsm_invalidate.hpp"
 #include "render/shadows/vsm_pages.hpp"
 #include "render/shaders.hpp"
 #include "render/systems/dispatch.hpp"
@@ -1783,6 +1784,9 @@ fn main() {
   let usable = vsm_page_usable(e) && !vsm_page_stale(e) && kept;
   out_words[0] = vec4f(c + vsm_view_dir(v), f32(vsm_entry_phys(e) + vsm_entry_render_index(e) + h.clock)) +
                  vec4f(select(0.0, 1.0, usable), h.texel0, v.texel, v.depth_scale);
+  let rect = vsm_box_rect(v, array<vec3f, 2>(vec3f(-1.0), vec3f(2.0)));
+  let caster = vsm_is_caster(views[VSM_HIST_FLAGS], views[VSM_HIST_HASH] | VSM_CAT_PLAYER);
+  out_words[1] = vec4f(vec4i(rect)) + vec4f(select(0.0, 1.0, caster), f32(VSM_DIRTY_PLANE_WORDS), 0.0, 0.0);
 }
 )";
   ASSERT_TRUE(register_source("test/vsm_reader", Reader));
@@ -1790,6 +1794,13 @@ fn main() {
   EXPECT_TRUE(validate_module("test/vsm_reader", {}, error)) << error;
   EXPECT_TRUE(validate_module("aurora/vsm", {}, error)) << error;
   EXPECT_TRUE(validate_module(shadows::vsm::Shader, {}, error)) << error;
+}
+
+TEST_F(RenderShaders, VsmInvalidateCompiles) {
+  const std::array<std::string_view, 1> dirty{"VSM_DIRTY"};
+  std::string error;
+  EXPECT_TRUE(validate_module(shadows::vsm::InvalidateShader, {}, error)) << error;
+  EXPECT_TRUE(validate_module(shadows::vsm::InvalidateShader, dirty, error)) << error;
 }
 
 TEST_F(RenderShaders, RetainedReaderCompiles) {

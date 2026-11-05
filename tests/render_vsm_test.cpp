@@ -7,12 +7,15 @@
 #include "render/hints.hpp"
 #include "render/scene/identity.hpp"
 #include "render/scene/streamout.hpp"
+#include "render/graph_bind.hpp"
 #include "render/shadows/vsm_check.hpp"
+#include "render/shadows/vsm_invalidate.hpp"
 #include "render/shadows/vsm_pages.hpp"
 #include "render/stage_data.hpp"
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -597,11 +600,16 @@ TEST(RenderVsmCheck, ParsesEnvForms) {
 
 TEST_F(RenderVsmGraph, ChainFitsStorageLimit) {
   initialize();
+  const std::array scene{detail::create_persistent("scene.instances", detail::PersistentKind::Buffer),
+                         detail::create_persistent("scene.materials", detail::PersistentKind::Buffer)};
+  testing::set_scene_handles(scene);
   testing::set_active(true);
   check::testing::set_config(check::Config{.on = true});
-  const Caps caps = test::full_caps();
+  Caps caps = test::full_caps();
+  caps.limits.maxComputeWorkgroupSizeX = 256;
+  caps.limits.maxComputeWorkgroupsPerDimension = 65535;
   const Settings settings;
-  const std::array<detail::PassDesc, 2> passes = pass_descs();
+  const std::array<detail::PassDesc, PassCount> passes = pass_descs();
   const auto compile = [&](uint32_t computeStorage, bool retained) {
     detail::GraphInputs inputs{.passes = passes, .settings = &settings, .caps = &caps};
     inputs.env.limits.compute.storageBuffers = computeStorage;
@@ -624,12 +632,24 @@ TEST_F(RenderVsmGraph, ChainFitsStorageLimit) {
       EXPECT_LE(node.bindings[2].storageBuffers, MaxPassStorageBuffers) << node.name;
       EXPECT_EQ(node.stage, Stage::OpaqueDone) << node.name;
     }
-    EXPECT_EQ(nodes, 2u);
+    EXPECT_EQ(nodes, PassCount);
+    const auto storage = [&](std::string_view name) {
+      const detail::NodeId node = graph->find_node(name);
+      EXPECT_NE(node, detail::InvalidNode) << name;
+      return node != detail::InvalidNode ? graph->nodes[node].bindings[2].storageBuffers : 0u;
+    };
+    EXPECT_EQ(storage(UpdatePass), 4u);
+    EXPECT_EQ(storage(ScanPass), 8u);
+    EXPECT_EQ(storage(DirtyPass), 6u);
     const detail::NodeId update = graph->find_node(UpdatePass);
     ASSERT_NE(update, detail::InvalidNode);
-    EXPECT_EQ(graph->nodes[update].bindings[2].storageBuffers, 4u);
     EXPECT_TRUE(graph->nodes[update].sink);
-    for (const std::string_view name : {Table, Phys, ViewsName, StatsName}) {
+    EXPECT_TRUE(graph->nodes[graph->find_node(ScanPass)].sink);
+    EXPECT_TRUE(graph->nodes[graph->find_node(DirtyPass)].sink);
+    const detail::NodeId list = graph->find_node(ScanListPass);
+    ASSERT_NE(list, detail::InvalidNode);
+    EXPECT_TRUE(graph->nodes[list].manualBindings);
+    for (const std::string_view name : {Table, Phys, ViewsName, StatsName, History, CastBits}) {
       const detail::ResourceId id = graph->find_resource(name);
       ASSERT_NE(id, detail::InvalidResource) << name;
       EXPECT_EQ(graph->resources[id].kind, detail::ResourceKind::Persistent) << name;
@@ -642,7 +662,12 @@ TEST_F(RenderVsmGraph, ChainFitsStorageLimit) {
   testing::set_active(false);
   const auto inactive = compile(10, true);
   EXPECT_NE(inactive->nodes[inactive->find_node(UpdatePass)].status, detail::CullReason::None);
+  EXPECT_NE(inactive->nodes[inactive->find_node(ScanPass)].status, detail::CullReason::None);
   shutdown();
+  for (detail::PersistentHandle h : scene) {
+    detail::destroy_persistent(h);
+  }
+  testing::set_scene_handles(std::nullopt);
 }
 
 bool g_pendingSecond = true;
@@ -660,7 +685,7 @@ TEST_F(RenderVsmGraph, ChainIsAllOrNothing) {
   g_pendingSecond = true;
   testing::set_pipeline_query([](uint32_t id) noexcept { return id != 2 || !g_pendingSecond; });
   check::testing::set_config(check::Config{.on = true});
-  const std::array<detail::PassDesc, 2> passes = pass_descs();
+  const std::array<detail::PassDesc, PassCount> passes = pass_descs();
   const StageData frame1 = producing_stage(1);
   for (int i = 0; i < 3; ++i) {
     EXPECT_FALSE(chain_enabled(frame1));
@@ -693,7 +718,7 @@ TEST_F(RenderVsmGraph, ChainOffWithoutConsumer) {
   testing::set_compact_ready(true);
   testing::set_pipeline_query([](uint32_t) noexcept { return true; });
   check::testing::set_config(check::Config{.on = true});
-  const std::array<detail::PassDesc, 2> passes = pass_descs();
+  const std::array<detail::PassDesc, PassCount> passes = pass_descs();
   const StageData stage = producing_stage(1, check::DefaultFirst);
   ASSERT_TRUE(check::check_frame(check::DefaultFirst));
   for (const detail::PassDesc& pass : passes) {
@@ -712,9 +737,178 @@ TEST_F(RenderVsmGraph, ChainOffWithoutConsumer) {
   for (const detail::PassDesc& pass : passes) {
     EXPECT_TRUE(pass.enabled(stage, pass.state)) << pass.name;
   }
-  const StageData other = producing_stage(2, check::DefaultFirst + 1);
+  const detail::PassDesc& checkPass = passes[PassCount - 1];
+  const StageData window = producing_stage(2, check::DefaultFirst + 1);
+  EXPECT_TRUE(checkPass.enabled(window, checkPass.state)) << "the check copies stats on every frame in its window";
+  const StageData other = producing_stage(3, check::DefaultLast + 2);
   EXPECT_TRUE(passes[0].enabled(other, passes[0].state));
-  EXPECT_FALSE(passes[1].enabled(other, passes[1].state));
+  EXPECT_FALSE(checkPass.enabled(other, checkPass.state));
+}
+
+constexpr uint32_t FullChain = chain_bit::Update | chain_bit::Scan | chain_bit::ScanList | chain_bit::Dirty;
+
+FrameInput frame_input(uint32_t frame) {
+  return {
+      .frameIndex = frame,
+      .hintFrame = frame,
+      .eye = {500.0, 120.0, -2300.0},
+      .planDir = sun_dir(40.0, 30.0),
+      .lightId = 7,
+      .texel0 = Texel0,
+      .producing = true,
+      .coverageComplete = true,
+      .pages = 1024,
+      .pagesX = 32,
+      .budget = 64,
+      .generation = 1,
+      .chainMask = FullChain,
+  };
+}
+
+FrameDecision step(const FrameInput& in, bool complete = true) {
+  const FrameDecision d = decide_frame(in);
+  if (complete) {
+    mark_encoded(FullChain);
+  }
+  return d;
+}
+
+class RenderVsmInvalidate : public ::testing::Test {
+protected:
+  void SetUp() override { testing::reset(); }
+  void TearDown() override { testing::reset(); }
+};
+
+TEST_F(RenderVsmInvalidate, FullReasons) {
+  uint32_t frame = 1;
+  EXPECT_EQ(step(frame_input(frame++)).reasons, full_reason::First);
+  const FrameDecision steady = step(frame_input(frame++));
+  EXPECT_FALSE(steady.full);
+  EXPECT_EQ(steady.reasons, 0u);
+  EXPECT_EQ(steady.views.header.fullReason, 0u);
+
+  const auto with = [&](FrameSignals signals) {
+    FrameInput in = frame_input(frame++);
+    in.signals = signals;
+    return step(in);
+  };
+  EXPECT_EQ(with({.retainedReset = true}).reasons, full_reason::RetainedReset);
+  EXPECT_EQ(with({.clearInstances = true}).reasons, full_reason::ClearInstances);
+  const FrameDecision held = with({.unapplied = true});
+  EXPECT_FALSE(held.full);
+  EXPECT_TRUE(held.held);
+  EXPECT_TRUE(frame_held());
+  EXPECT_NE(held.views.header.flags & header_flag::Held, 0u);
+  EXPECT_NE(held.views.header.flags & header_flag::Exempt, 0u);
+  const FrameDecision landed = step(frame_input(frame++));
+  EXPECT_EQ(landed.reasons, full_reason::Unapplied);
+  EXPECT_FALSE(frame_held());
+  const FrameDecision epoch = with({.sceneEpoch = true});
+  EXPECT_NE(epoch.reasons & full_reason::SceneEpoch, 0u);
+  EXPECT_EQ(epoch.reasons & ~(full_reason::SceneEpoch | full_reason::Anchor), 0u);
+  EXPECT_EQ(step(frame_input(frame++)).reasons, 0u);
+
+  ++frame;
+  EXPECT_EQ(step(frame_input(frame++)).reasons, full_reason::Gap);
+  (void)step(frame_input(frame++), false);
+  EXPECT_EQ(step(frame_input(frame++)).reasons, full_reason::ChainIncomplete);
+  FrameInput pool = frame_input(frame++);
+  pool.generation = 2;
+  EXPECT_EQ(step(pool).reasons, full_reason::PoolGeneration);
+  FrameInput light = frame_input(frame++);
+  light.generation = 2;
+  light.lightId = 8;
+  EXPECT_EQ(step(light).reasons, full_reason::KeyLight);
+  FrameInput far = frame_input(frame++);
+  far.generation = 2;
+  far.lightId = 8;
+  far.eye[0] += 2.0 * AnchorReach;
+  EXPECT_EQ(step(far).reasons, full_reason::Anchor);
+  FrameInput quiet = far;
+  quiet.frameIndex = quiet.hintFrame = frame++;
+  const FrameDecision last = step(quiet);
+  EXPECT_FALSE(last.full);
+  EXPECT_EQ(last.views.header.clock, 2u);
+  const testing::WorkerCounts counts = testing::worker_counts();
+  EXPECT_EQ(counts.held, 1u);
+  for (const uint32_t bit :
+       {full_reason::RetainedReset, full_reason::ClearInstances, full_reason::Unapplied, full_reason::SceneEpoch}) {
+    EXPECT_EQ(counts.reasons[static_cast<size_t>(std::countr_zero(bit))], 1u) << bit;
+  }
+}
+
+TEST_F(RenderVsmInvalidate, BreakThenSteadyFreesOnce) {
+  uint32_t frame = 1;
+  (void)step(frame_input(frame++));
+  (void)step(frame_input(frame++));
+  uint32_t fulls = 0;
+  FrameInput broken = frame_input(frame++);
+  broken.signals.unapplied = true;
+  fulls += step(broken).full ? 1 : 0;
+  broken = frame_input(frame++);
+  broken.signals.unapplied = true;
+  fulls += step(broken).full ? 1 : 0;
+  FrameInput resync = frame_input(frame++);
+  resync.signals.clearInstances = true;
+  const FrameDecision first = step(resync);
+  EXPECT_TRUE(first.full);
+  EXPECT_EQ(first.reasons, full_reason::Unapplied | full_reason::ClearInstances);
+  fulls += first.full ? 1 : 0;
+
+  std::vector<uint32_t> table(MaxVirtualPages, 0);
+  std::vector<uint32_t> phys(MaxPoolPages * PhysWords, 0);
+  (void)apply_update(first.views, table, phys);
+  uint32_t next = 0;
+  for (uint32_t v = 0; v < SunLevels * PagesPerView && next < MaxPoolPages; v += 3) {
+    table[v] = next | entry::Allocated | entry::Cached;
+    phys[next * PhysWords] = v + 1;
+    ++next;
+  }
+  UpdateStats freed;
+  for (int i = 0; i < 10; ++i) {
+    const FrameDecision d = step(frame_input(frame++));
+    fulls += d.full ? 1 : 0;
+    EXPECT_FALSE(d.exempt) << i;
+    const UpdateStats s = apply_update(d.views, table, phys);
+    freed.freedWrap += s.freedWrap;
+    freed.freedRelatch += s.freedRelatch;
+    freed.freedRecentre += s.freedRecentre;
+    freed.freedFull += s.freedFull;
+  }
+  EXPECT_EQ(fulls, 1u);
+  EXPECT_EQ(freed.freedWrap + freed.freedRelatch + freed.freedRecentre + freed.freedFull, 0u);
+}
+
+TEST(RenderVsmInvalidateRules, CasterPredicateExcludesClassesAndCategories) {
+  namespace class_bit = scene::retained::class_bit;
+  namespace flag = scene::streamout::instance_flag;
+  const std::array<std::pair<uint32_t, uint32_t>, 5> classes{{
+      {0, 0},
+      {class_bit::CpuDeformed, flag::CpuDeformed},
+      {class_bit::Billboard, flag::Billboard},
+      {class_bit::Water, flag::Water},
+      {class_bit::Blended, flag::Blended},
+  }};
+  const std::array<uint32_t, 10> categories{AURORA_CAT_DYNAMIC,     AURORA_CAT_STATIC | AURORA_CAT_TERRAIN,
+                                            AURORA_CAT_PLAYER,      AURORA_CAT_NO_SHADOW_CAST,
+                                            AURORA_CAT_SKY,         AURORA_CAT_DECAL,
+                                            AURORA_CAT_FAKE_SHADOW, AURORA_CAT_UI,
+                                            AURORA_CAT_OVERLAY,     AURORA_CAT_PARTICLE};
+  for (const auto& [classBit, recordFlag] : classes) {
+    for (const uint32_t category : categories) {
+      const scene::retained::InstanceInfo info{
+          .slot = 3, .classBits = classBit | class_bit::Dynamic, .categories = category};
+      constexpr uint32_t Excluded = AURORA_CAT_NO_SHADOW_CAST | AURORA_CAT_SKY | AURORA_CAT_DECAL |
+                                    AURORA_CAT_FAKE_SHADOW | AURORA_CAT_UI | AURORA_CAT_OVERLAY | AURORA_CAT_PARTICLE;
+      const bool expected = classBit == 0 && (category & Excluded) == 0;
+      EXPECT_EQ(is_caster(info), expected) << classBit << " " << category;
+      EXPECT_EQ(record_is_caster(flag::Valid | recordFlag | flag::Latched, category), expected)
+          << classBit << " " << category;
+      EXPECT_FALSE(record_is_caster(recordFlag, category));
+    }
+  }
+  EXPECT_FALSE(is_caster({.categories = AURORA_CAT_DYNAMIC}));
+  EXPECT_TRUE(record_is_caster(flag::Valid | flag::GpuArrays | flag::Palette, AURORA_CAT_DYNAMIC));
 }
 } // namespace
 } // namespace aurora::render::shadows::vsm

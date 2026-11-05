@@ -38,6 +38,7 @@ struct Options {
   bool classCheck = false;
   bool ssilCheck = false;
   bool retainedCheck = false;
+  bool vsmCheck = false;
   bool captureListCheck = false;
   std::string debugView;
   bool hints = true;

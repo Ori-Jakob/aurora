@@ -846,7 +846,8 @@ void latch_resources(bool active) noexcept {
   };
   g_page = device.CreateTexture(&page);
   const wgpu::BufferDescriptor materials{.label = "scene.materials",
-                                         .usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                                         .usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst |
+                                                  wgpu::BufferUsage::CopySrc,
                                          .size = MaterialsBytes};
   g_materialsBuffer = device.CreateBuffer(&materials);
   const wgpu::BufferDescriptor means{.label = "scene.atlas_means",

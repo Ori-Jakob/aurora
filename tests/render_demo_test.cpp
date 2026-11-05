@@ -336,6 +336,18 @@ TEST(RenderDemoOptions, ParsesRetainedCheck) {
   EXPECT_EQ(parse_error({"--retained-check", "--no-hints"}), "--retained-check cannot be combined with --no-hints");
 }
 
+TEST(RenderDemoOptions, ParsesVsmCheck) {
+  const auto check = parse({"--vsm-check"});
+  ASSERT_TRUE(check);
+  EXPECT_TRUE(check->vsmCheck);
+  EXPECT_TRUE(check->retainedCheck);
+  EXPECT_FALSE(parse({"--retained-check"})->vsmCheck);
+  EXPECT_EQ(parse_error({"--vsm-check", "--frames", "39"}), "--vsm-check needs at least 40 frames");
+  EXPECT_TRUE(parse({"--vsm-check", "--frames", "120"}));
+  EXPECT_EQ(parse_error({"--vsm-check", "--no-hints"}), "--vsm-check cannot be combined with --no-hints");
+  EXPECT_EQ(parse_error({"--capture-list-check", "--vsm-check"}).substr(0, 20), "--capture-list-check");
+}
+
 namespace {
 std::vector<SsilSample> ssil_samples(std::array<f32, 4> wall, std::array<f32, 4> back, std::array<f32, 4> front,
                                      std::array<f32, 4> open) {

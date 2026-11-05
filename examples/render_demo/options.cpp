@@ -234,6 +234,12 @@ bool apply_retained_check(Options& options, std::string_view) {
   return true;
 }
 
+bool apply_vsm_check(Options& options, std::string_view) {
+  options.vsmCheck = true;
+  options.retainedCheck = true;
+  return true;
+}
+
 bool apply_capture_list_check(Options& options, std::string_view) {
   options.captureListCheck = true;
   return true;
@@ -334,7 +340,7 @@ struct Flag {
   bool frameLoop = false;
 };
 
-constexpr std::array<Flag, 41> Flags{{
+constexpr std::array<Flag, 42> Flags{{
     {"--frames", true, apply_frames, true},
     {"--timeout", true, apply_timeout, true},
     {"--backend", true, apply_backend},
@@ -361,6 +367,7 @@ constexpr std::array<Flag, 41> Flags{{
     {"--class-check", false, apply_class_check, true},
     {"--ssil-check", false, apply_ssil_check, true},
     {"--retained-check", false, apply_retained_check, true},
+    {"--vsm-check", false, apply_vsm_check, true},
     {"--capture-list-check", false, apply_capture_list_check, true},
     {"--debug-view", true, apply_debug_view, true},
     {"--no-hints", false, apply_no_hints, true},
@@ -539,12 +546,13 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
     error = "--class-check needs at least 40 frames";
     return std::nullopt;
   }
+  const std::string_view retainedFlag = options.vsmCheck ? "--vsm-check" : "--retained-check";
   if (options.retainedCheck && !options.hints) {
-    error = "--retained-check cannot be combined with --no-hints";
+    error = std::string{retainedFlag} + " cannot be combined with --no-hints";
     return std::nullopt;
   }
   if (options.retainedCheck && options.frames != 0 && options.frames < RetainedCheckMinFrames) {
-    error = "--retained-check needs at least 40 frames";
+    error = std::string{retainedFlag} + " needs at least 40 frames";
     return std::nullopt;
   }
   if (options.ssilCheck && (!options.hints || options.msaa > 1)) {
@@ -647,6 +655,9 @@ std::string_view usage() noexcept {
          "                      points at (needs at least 90 frames)\n"
          "  --retained-check    turn the retained scene and its check mode on, write retained_wire.png to the data\n"
          "                      directory and log the check result at shutdown (needs at least 40 frames)\n"
+         "  --vsm-check         --retained-check plus the G-buffer, Shadows at High, the forced shadow chain and its\n"
+         "                      check mode, which compares the page tables and the invalidation dirty set with their\n"
+         "                      CPU references and logs the result at shutdown (needs at least 40 frames)\n"
          "  --capture-list-check\n"
          "                      duplicate every draw before OPAQUE_DONE into capture.check, replay the list offscreen\n"
          "                      and exit with code 20 unless it matches gx.color texel for texel and every duplicate\n"

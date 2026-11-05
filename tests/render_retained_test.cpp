@@ -11,6 +11,7 @@
 #include "render/scene/gc.hpp"
 #include "render/scene/identity.hpp"
 #include "render/settings.hpp"
+#include "render/shadows/vsm_invalidate.hpp"
 #include "render/stage_data.hpp"
 #include "render_test_caps.hpp"
 
@@ -957,6 +958,52 @@ TEST_F(RenderRetainedTest, CoverageLostCapture) {
   }
   EXPECT_TRUE(capture().coverageComplete);
   EXPECT_EQ(stats().lostCaptures, 3u);
+}
+
+class RenderVsmCasterObjects : public RenderRetainedTest {};
+
+TEST_F(RenderVsmCasterObjects, FilteredByIsCaster) {
+  using shadows::vsm::CasterCover;
+  want_covered_objects(true);
+  set_cover_filter(&shadows::vsm::is_caster);
+  begin_frame();
+  object_draw(0x41, AURORA_CAT_DYNAMIC, AURORA_OBJ_CPU_DEFORMED);
+  object_draw(0x42, AURORA_CAT_DYNAMIC);
+  begin_object(0x43, AURORA_CAT_DYNAMIC, 0, 0);
+  draw(3, 1);
+  end_object();
+  begin_object(0x43, AURORA_CAT_DYNAMIC, AURORA_OBJ_CPU_DEFORMED, 1);
+  draw(3, 2);
+  end_object();
+  object_draw(0x44, AURORA_CAT_DYNAMIC | AURORA_CAT_NO_SHADOW_CAST);
+  ASSERT_NE(seal_stage(), nullptr);
+  (void)end();
+
+  const std::shared_ptr<const std::vector<uint64_t>> covered = covered_objects();
+  ASSERT_NE(covered, nullptr);
+  EXPECT_EQ(*covered, (std::vector<uint64_t>{0x41, 0x42, 0x43, 0x44}));
+  const shadows::vsm::CasterObjects objects = shadows::vsm::caster_objects();
+  ASSERT_TRUE(objects.valid());
+  EXPECT_EQ(objects.size(), 4u);
+  const shadows::vsm::CasterObject deformed = objects.find(0x41);
+  EXPECT_EQ(deformed.cover, CasterCover::ExcludedOnly);
+  ASSERT_EQ(deformed.slots.size(), 1u);
+  EXPECT_EQ(deformed.slots[0], slot_of(0x41));
+  EXPECT_EQ(objects.find(0x42).cover, CasterCover::Full);
+  const shadows::vsm::CasterObject mixed = objects.find(0x43);
+  EXPECT_EQ(mixed.cover, CasterCover::Partial);
+  EXPECT_EQ(mixed.slots.size(), 2u);
+  EXPECT_EQ(objects.find(0x44).cover, CasterCover::ExcludedOnly);
+  EXPECT_EQ(objects.find(0x45).cover, CasterCover::Missing);
+  EXPECT_TRUE(objects.find(0x45).slots.empty());
+
+  set_cover_filter(nullptr);
+  begin_frame();
+  object_draw(0x42, AURORA_CAT_DYNAMIC);
+  ASSERT_NE(seal_stage(), nullptr);
+  (void)end();
+  EXPECT_FALSE(shadows::vsm::caster_objects().valid());
+  EXPECT_NE(covered_objects(), nullptr);
 }
 } // namespace
 } // namespace aurora::render::scene::retained

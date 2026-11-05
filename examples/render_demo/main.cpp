@@ -1020,6 +1020,12 @@ int main(int argc, char* argv[]) {
     SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_RETAINED_CHECK", "1", true);
     SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_RETAINED_WIRE", wire.c_str(), true);
   }
+  if (options.vsmCheck) {
+    SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_GBUFFER", "on", true);
+    SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_SHADOWS", "high", true);
+    SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_VSM_FORCE", "1", true);
+    SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_VSM_CHECK", "1", true);
+  }
 
   AuroraConfig config{};
   config.appName = "render_demo";

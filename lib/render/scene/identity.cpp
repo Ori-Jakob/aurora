@@ -248,6 +248,8 @@ std::mutex g_publishMutex;
 RetainedStats g_published;
 FrameCounts g_publishedCounts;
 std::shared_ptr<const std::vector<uint64_t>> g_covered;
+CoverFilter g_coverFilter = nullptr;
+std::shared_ptr<const FilteredObjects> g_filtered;
 
 constexpr uint64_t splitmix64(uint64_t x) noexcept {
   x += 0x9E3779B97F4A7C15ull;
@@ -1338,6 +1340,30 @@ bool settled(bool epochChanged) noexcept {
   return true;
 }
 
+std::shared_ptr<const FilteredObjects> filter_covered(CoverFilter filter) {
+  std::vector<std::pair<uint64_t, uint32_t>> live;
+  live.reserve(g_liveList.size());
+  for (const uint32_t index : g_liveList) {
+    const Slot& slot = g_slots[index];
+    if (slot.live && slot.delivered) {
+      live.emplace_back(slot.info.key.id, index);
+    }
+  }
+  std::sort(live.begin(), live.end());
+  auto out = std::make_shared<FilteredObjects>();
+  out->slots.reserve(live.size());
+  for (const auto& [id, index] : live) {
+    if (out->objects.empty() || out->objects.back().id != id) {
+      out->objects.push_back({.id = id, .firstSlot = static_cast<uint32_t>(out->slots.size())});
+    }
+    FilteredObject& object = out->objects.back();
+    ++(filter(g_slots[index].info) ? object.passing : object.failing);
+    ++object.slotCount;
+    out->slots.push_back(index);
+  }
+  return out;
+}
+
 void publish() {
   FrameCounts counts = g_frame.counts;
   counts.hintFrame = g_frame.hintFrame;
@@ -1366,8 +1392,10 @@ void publish() {
       .capturedOnly = g_totals.capturedOnly,
   };
   std::shared_ptr<const std::vector<uint64_t>> covered;
-  const bool rebuild = g_wantCovered && g_active && std::exchange(g_lifecycleChanged, false);
-  if (rebuild) {
+  std::shared_ptr<const FilteredObjects> filtered;
+  const bool rebuild =
+      (g_wantCovered || g_coverFilter != nullptr) && g_active && std::exchange(g_lifecycleChanged, false);
+  if (rebuild && g_wantCovered) {
     auto ids = std::make_shared<std::vector<uint64_t>>();
     for (const Slot& slot : g_slots) {
       if (slot.live && slot.delivered) {
@@ -1378,13 +1406,22 @@ void publish() {
     ids->erase(std::unique(ids->begin(), ids->end()), ids->end());
     covered = std::move(ids);
   }
+  if (rebuild && g_coverFilter != nullptr) {
+    filtered = filter_covered(g_coverFilter);
+  }
   std::lock_guard lock{g_publishMutex};
   g_published = stats;
   g_publishedCounts = counts;
   if (rebuild) {
     g_covered = std::move(covered);
-  } else if (!g_wantCovered || !g_active) {
+    g_filtered = std::move(filtered);
+    return;
+  }
+  if (!g_wantCovered || !g_active) {
     g_covered.reset();
+  }
+  if (g_coverFilter == nullptr || !g_active) {
+    g_filtered.reset();
   }
 }
 } // namespace
@@ -1492,11 +1529,18 @@ void reset() noexcept {
   g_published = {.active = g_active};
   g_publishedCounts = {};
   g_covered.reset();
+  g_filtered.reset();
 }
 
 void want_covered_objects(bool want) noexcept {
   g_wantCovered = want;
   g_lifecycleChanged = true;
+}
+
+void set_cover_filter(CoverFilter filter) noexcept {
+  if (std::exchange(g_coverFilter, filter) != filter) {
+    g_lifecycleChanged = true;
+  }
 }
 
 void hold_coverage(bool hold) noexcept {
@@ -1693,6 +1737,11 @@ std::shared_ptr<const std::vector<uint64_t>> covered_objects() noexcept {
   return g_covered;
 }
 
+std::shared_ptr<const FilteredObjects> covered_filtered() noexcept {
+  std::lock_guard lock{g_publishMutex};
+  return g_filtered;
+}
+
 namespace testing {
 void reset() noexcept {
   release();
@@ -1704,6 +1753,7 @@ void reset() noexcept {
   g_checkLast = UINT64_MAX;
   g_overrun = -1;
   g_wantCovered = false;
+  g_coverFilter = nullptr;
   g_producerCalled = false;
   g_holdCalled = true;
   g_producer = false;

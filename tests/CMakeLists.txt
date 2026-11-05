@@ -532,6 +532,10 @@ if (TARGET render_demo)
     COMMAND $<TARGET_FILE:render_demo> --backend null --retained-check --frames 60 --timeout 60 --fail-on-error
             --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_smoke/retained_check)
   set_tests_properties(render_demo_retained_check PROPERTIES LABELS smoke TIMEOUT 180)
+  add_test(NAME render_demo_vsm_check
+    COMMAND $<TARGET_FILE:render_demo> --backend null --vsm-check --frames 60 --timeout 60 --fail-on-error
+            --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_smoke/vsm_check)
+  set_tests_properties(render_demo_vsm_check PROPERTIES LABELS smoke TIMEOUT 180)
   add_test(NAME render_demo_smoke_streaming_growth
     COMMAND $<TARGET_FILE:render_demo> --backend null --profile compat --frames 90 --timeout 60
             --data-dir ${CMAKE_CURRENT_BINARY_DIR}/render_demo_smoke/streaming)

@@ -1,6 +1,7 @@
 #include "vsm_pages.hpp"
 
 #include "vsm_check.hpp"
+#include "vsm_invalidate.hpp"
 
 #include "../graph_bind.hpp"
 #include "../hints.hpp"
@@ -38,8 +39,18 @@ constexpr double DegreesPerRadian = 180.0 / std::numbers::pi;
 constexpr double ScreenHeightReference = 1440.0;
 constexpr uint32_t NoRef = UINT16_MAX;
 
-enum Persistent : uint32_t { TableHandle, PhysHandle, ViewsHandle, StatsHandle, PoolHandle, HandleCount };
-constexpr std::array<std::string_view, HandleCount> HandleNames{Table, Phys, ViewsName, StatsName, Pool};
+enum Persistent : uint32_t {
+  TableHandle,
+  PhysHandle,
+  ViewsHandle,
+  StatsHandle,
+  HistoryHandle,
+  CastBitsHandle,
+  PoolHandle,
+  HandleCount
+};
+constexpr std::array<std::string_view, HandleCount> HandleNames{Table,   Phys,     ViewsName, StatsName,
+                                                                History, CastBits, Pool};
 
 struct UpdateParams {
   uint32_t producing = 0;
@@ -91,19 +102,20 @@ struct SunRate {
 
 struct Worker {
   bool started = false;
+  bool held = false;
   uint32_t lastFrameIndex = 0;
   uint32_t generation = 0;
   uint32_t clock = 0;
   uint32_t mask = 0;
   uint32_t expected = 0;
+  uint32_t pendingReasons = 0;
   SunClipmap clipmap;
   detail::history_reset::Camera camera;
   testing::WorkerCounts counts;
 };
 
 std::array<PersistentHandle, HandleCount> g_handles{};
-PassId g_updatePass = detail::InvalidPassId;
-PassId g_checkPass = detail::InvalidPassId;
+std::array<PassId, PassCount> g_passes{};
 bool g_wanted = false;
 bool g_active = false;
 std::optional<bool> g_activeOverride;
@@ -116,6 +128,8 @@ wgpu::Buffer g_table;
 wgpu::Buffer g_phys;
 wgpu::Buffer g_views;
 wgpu::Buffer g_stats;
+wgpu::Buffer g_history;
+wgpu::Buffer g_castBits;
 wgpu::Texture g_pool;
 LatchedHints g_hints;
 bool g_lowSunOn = false;
@@ -297,79 +311,32 @@ void encode_update(detail::PassContext& ctx, const void*) {
   const StageData& stage = ctx.stage_data();
   if (!pipeline || !views.buffer || !table.buffer || !phys.buffer || !stats.buffer || views.size < ViewsBytes ||
       stage.retained == nullptr || params.fifoSet == 0) {
+    // Later passes test the Update bit, so a bail must not leave last frame's mask behind
+    g_worker.mask = 0;
     return;
   }
-  Worker& w = g_worker;
-  uint32_t reasons = 0;
-  if (!w.started) {
-    reasons |= full_reason::First;
-  } else {
-    if (stage.frameIndex != w.lastFrameIndex + 1) {
-      reasons |= full_reason::Gap;
-    }
-    if ((w.mask & w.expected) != w.expected) {
-      reasons |= full_reason::ChainIncomplete;
-    }
-    if (params.generation != w.generation) {
-      reasons |= full_reason::PoolGeneration;
-    }
-  }
-  if (check::force_full(params.hintFrame)) {
-    reasons |= full_reason::Check;
-  }
   // Views come from the frozen hints on the worker, so every VSM pass in the frame sees one camera and one latch
-  const SceneHints* hints = stage.sceneHints.get();
   const auto& inv = stage.retained->invView.m;
-  const SunClipmap::Input input{
+  const FrameDecision decision = decide_frame({
+      .frameIndex = stage.frameIndex,
+      .hintFrame = params.hintFrame,
+      .hints = stage.sceneHints.get(),
       .eye = {inv[0][3], inv[1][3], inv[2][3]},
-      .dir = frame_direction(hints, params.lightId, {params.dir[0], params.dir[1], params.dir[2]}),
+      .planDir = {params.dir[0], params.dir[1], params.dir[2]},
       .lightId = params.lightId,
       .texel0 = params.texel0,
-      .full = reasons != 0,
-      .sceneEpochChanged = hints != nullptr && hints->sceneEpochChanged,
-  };
-  const SunClipmap::Result result = w.clipmap.update(input);
-  if (result.keyLight) {
-    reasons |= full_reason::KeyLight;
-  }
-  if (result.anchorMoved) {
-    reasons |= full_reason::Anchor;
-  }
-  const bool full = reasons != 0;
-  bool cut = false;
-  if (hints != nullptr) {
-    detail::history_reset::Camera next;
-    cut = detail::history_reset::classify(w.camera, *hints, next) != detail::history_reset::Reason::None;
-    w.camera = next;
-  }
-  const bool relatched = result.relatchAll || result.level >= 0;
-  const bool exempt = exempt_frame(result, {.full = full,
-                                            .sceneEpochChanged = input.sceneEpochChanged,
-                                            .cut = cut,
-                                            .coverageComplete = params.coverageComplete != 0});
-  w.clock = full ? 1 : w.clock + 1;
-
-  Views out{};
-  w.clipmap.fill(out);
-  ViewsHeader& h = out.header;
-  h.frameIndex = stage.frameIndex;
-  h.clock = w.clock;
-  h.flags = (params.producing != 0 ? header_flag::Producing : 0u) | (full ? header_flag::Full : 0u) |
-            (exempt ? header_flag::Exempt : 0u) | (relatched ? header_flag::Relatch : 0u);
-  h.fullReason = reasons;
-  h.budget = exempt ? params.pages : params.budget;
-  h.poolPages = params.pages;
-  h.poolPagesX = params.pagesX;
-  h.levelBias = params.levelBias;
-  for (size_t i = 0; i < 3; ++i) {
-    h.sunDir[i] = static_cast<float>(input.dir[i]);
-  }
-  h.lightId = params.lightId;
-  h.maxPairs = MaxPairs;
-  h.generation = params.generation;
-
+      .producing = params.producing != 0,
+      .coverageComplete = params.coverageComplete != 0,
+      .pages = params.pages,
+      .pagesX = params.pagesX,
+      .budget = params.budget,
+      .levelBias = params.levelBias,
+      .generation = params.generation,
+      .chainMask = params.chainMask,
+      .signals = frame_signals(stage),
+  });
   const wgpu::CommandEncoder& encoder = ctx.encoder();
-  encoder.WriteBuffer(views.buffer, views.offset, reinterpret_cast<const uint8_t*>(&out), ViewsBytes);
+  encoder.WriteBuffer(views.buffer, views.offset, reinterpret_cast<const uint8_t*>(&decision.views), ViewsBytes);
   encoder.ClearBuffer(stats.buffer, stats.offset, std::min(stats.size, StatsBytes));
   const wgpu::ComputePassEncoder pass = ctx.begin_compute();
   if (!pass) {
@@ -378,31 +345,7 @@ void encode_update(detail::PassContext& ctx, const void*) {
   pass.SetPipeline(pipeline);
   pass.DispatchWorkgroups(MaxVirtualPages / UpdateWorkgroup);
   pass.End();
-
-  w.started = true;
-  w.lastFrameIndex = stage.frameIndex;
-  w.generation = params.generation;
-  w.mask = 0;
-  w.expected = params.chainMask;
   mark_encoded(chain_bit::Update);
-  testing::WorkerCounts& c = w.counts;
-  ++c.frames;
-  c.fulls += full ? 1 : 0;
-  c.exempt += exempt ? 1 : 0;
-  c.exemptCut += cut ? 1 : 0;
-  c.exemptCoverage += params.coverageComplete == 0 ? 1 : 0;
-  c.exemptEpoch += input.sceneEpochChanged ? 1 : 0;
-  for (uint32_t i = 0; i < full_reason::Count; ++i) {
-    c.reasons[i] += (reasons >> i) & 1u;
-  }
-  if (result.relatchAll) {
-    for (uint64_t& n : c.relatches) {
-      ++n;
-    }
-  } else if (result.level >= 0) {
-    ++(result.recentre ? c.recentres : c.relatches)[static_cast<size_t>(result.level)];
-  }
-  check::record_views(out, params.hintFrame);
 }
 
 void create_resources() {
@@ -418,10 +361,14 @@ void create_resources() {
     g_phys = buffer("vsm.phys", PhysBytes, Common);
     g_views = buffer("vsm.views", ViewsBytes, Common | wgpu::BufferUsage::Uniform);
     g_stats = buffer("vsm.stats", StatsBytes, Common);
+    g_history = buffer("vsm.history", HistoryBytes, Common);
+    g_castBits = buffer("vsm.cast_bits", CastBitsBytes, Common);
     detail::set_persistent_buffer(g_handles[TableHandle], g_table, 0, TableBytes);
     detail::set_persistent_buffer(g_handles[PhysHandle], g_phys, 0, PhysBytes);
     detail::set_persistent_buffer(g_handles[ViewsHandle], g_views, 0, ViewsBytes);
     detail::set_persistent_buffer(g_handles[StatsHandle], g_stats, 0, StatsBytes);
+    detail::set_persistent_buffer(g_handles[HistoryHandle], g_history, 0, HistoryBytes);
+    detail::set_persistent_buffer(g_handles[CastBitsHandle], g_castBits, 0, CastBitsBytes);
   }
   if (g_pool && g_liveExtent.width == g_extent.width && g_liveExtent.height == g_extent.height) {
     return;
@@ -453,6 +400,8 @@ void destroy_resources() noexcept {
   g_phys = {};
   g_views = {};
   g_stats = {};
+  g_history = {};
+  g_castBits = {};
   g_pool = {};
   g_liveExtent = {};
   g_resourcesLive = false;
@@ -462,8 +411,18 @@ uint32_t expected_mask(const detail::CompiledGraph* graph) noexcept {
   if (graph == nullptr) {
     return 0;
   }
-  const detail::NodeId node = graph->find_node(UpdatePass);
-  return node != detail::InvalidNode && graph->nodes[node].status == detail::CullReason::None ? chain_bit::Update : 0u;
+  constexpr std::array<std::pair<std::string_view, uint32_t>, 4> Chain{{
+      {UpdatePass, chain_bit::Update},
+      {ScanPass, chain_bit::Scan},
+      {ScanListPass, chain_bit::ScanList},
+      {DirtyPass, chain_bit::Dirty},
+  }};
+  uint32_t mask = 0;
+  for (const auto& [name, bit] : Chain) {
+    const detail::NodeId node = graph->find_node(name);
+    mask |= node != detail::InvalidNode && graph->nodes[node].status == detail::CullReason::None ? bit : 0u;
+  }
+  return mask;
 }
 
 void record_rate(const SunSelection& sun) noexcept {
@@ -510,16 +469,17 @@ void log_summary() {
       "{:.5f} deg, total {:.4f} deg",
       r.moving, r.samples, r.moving != 0 ? r.sum / static_cast<double>(r.moving) : 0.0, r.max, r.sum);
   constexpr std::array<std::string_view, full_reason::Count> Reasons{
-      "first", "gap", "chain incomplete", "pool", "key light", "anchor", "check"};
+      "first",           "gap",       "chain incomplete", "pool", "key light", "anchor", "check", "retained reset",
+      "clear instances", "unapplied", "scene epoch"};
   std::string reasons;
   for (size_t i = 0; i < Reasons.size(); ++i) {
     reasons += fmt::format("{}{} {}", i == 0 ? "" : ", ", Reasons[i], c.reasons[i]);
   }
   Log.info(
-      "VSM: {} chain frames, {} fulls ({}), {} exempt (cut {}, coverage incomplete {}, scene epoch {}); "
+      "VSM: {} chain frames, {} fulls ({}), {} held, {} exempt (cut {}, coverage incomplete {}, scene epoch {}); "
       "relatches per level [{}], re-centres per level [{}]",
-      c.frames, c.fulls, reasons, c.exempt, c.exemptCut, c.exemptCoverage, c.exemptEpoch, level_list(c.relatches),
-      level_list(c.recentres));
+      c.frames, c.fulls, reasons, c.held, c.exempt, c.exemptCut, c.exemptCoverage, c.exemptEpoch,
+      level_list(c.relatches), level_list(c.recentres));
 }
 } // namespace
 
@@ -851,6 +811,113 @@ std::array<double, 3> frame_direction(const SceneHints* hints, uint32_t lightId,
   return normalize3(planDir);
 }
 
+FrameDecision decide_frame(const FrameInput& in) noexcept {
+  Worker& w = g_worker;
+  FrameDecision d;
+  uint32_t reasons = 0;
+  if (!w.started) {
+    reasons |= full_reason::First;
+  } else {
+    if (in.frameIndex != w.lastFrameIndex + 1) {
+      reasons |= full_reason::Gap;
+    }
+    if ((w.mask & w.expected) != w.expected) {
+      reasons |= full_reason::ChainIncomplete;
+    }
+    if (in.generation != w.generation) {
+      reasons |= full_reason::PoolGeneration;
+    }
+  }
+  if (check::force_full(in.hintFrame)) {
+    reasons |= full_reason::Check;
+  }
+  const FrameSignals& sig = in.signals;
+  reasons |= (sig.retainedReset ? full_reason::RetainedReset : 0u) |
+             (sig.clearInstances ? full_reason::ClearInstances : 0u) | (sig.sceneEpoch ? full_reason::SceneEpoch : 0u);
+  d.held = sig.unapplied;
+  if (d.held) {
+    w.pendingReasons |= full_reason::Unapplied;
+  } else {
+    reasons |= std::exchange(w.pendingReasons, 0u);
+  }
+  const SunClipmap::Input input{
+      .eye = in.eye,
+      .dir = frame_direction(in.hints, in.lightId, in.planDir),
+      .lightId = in.lightId,
+      .texel0 = in.texel0,
+      .full = reasons != 0,
+      .sceneEpochChanged = sig.sceneEpoch,
+  };
+  d.clipmap = w.clipmap.update(input);
+  if (d.clipmap.keyLight) {
+    reasons |= full_reason::KeyLight;
+  }
+  if (d.clipmap.anchorMoved) {
+    reasons |= full_reason::Anchor;
+  }
+  d.reasons = reasons;
+  d.full = reasons != 0;
+  if (in.hints != nullptr) {
+    detail::history_reset::Camera next;
+    d.cut = detail::history_reset::classify(w.camera, *in.hints, next) != detail::history_reset::Reason::None;
+    w.camera = next;
+  }
+  const bool relatched = d.clipmap.relatchAll || d.clipmap.level >= 0;
+  d.exempt = d.held || exempt_frame(d.clipmap, {.full = d.full,
+                                                .sceneEpochChanged = sig.sceneEpoch,
+                                                .cut = d.cut,
+                                                .coverageComplete = in.coverageComplete});
+  w.clock = d.full ? 1 : w.clock + 1;
+
+  w.clipmap.fill(d.views);
+  ViewsHeader& h = d.views.header;
+  h.frameIndex = in.frameIndex;
+  h.clock = w.clock;
+  h.flags = (in.producing ? header_flag::Producing : 0u) | (d.full ? header_flag::Full : 0u) |
+            (d.exempt ? header_flag::Exempt : 0u) | (relatched ? header_flag::Relatch : 0u) |
+            (d.held ? header_flag::Held : 0u);
+  h.fullReason = reasons;
+  h.budget = d.exempt ? in.pages : in.budget;
+  h.poolPages = in.pages;
+  h.poolPagesX = in.pagesX;
+  h.levelBias = in.levelBias;
+  for (size_t i = 0; i < 3; ++i) {
+    h.sunDir[i] = static_cast<float>(input.dir[i]);
+  }
+  h.lightId = in.lightId;
+  h.maxPairs = MaxPairs;
+  h.generation = in.generation;
+
+  w.started = true;
+  w.held = d.held;
+  w.lastFrameIndex = in.frameIndex;
+  w.generation = in.generation;
+  w.mask = 0;
+  w.expected = in.chainMask;
+  testing::WorkerCounts& c = w.counts;
+  ++c.frames;
+  c.fulls += d.full ? 1 : 0;
+  c.held += d.held ? 1 : 0;
+  c.exempt += d.exempt ? 1 : 0;
+  c.exemptCut += d.cut ? 1 : 0;
+  c.exemptCoverage += in.coverageComplete ? 0 : 1;
+  c.exemptEpoch += sig.sceneEpoch ? 1 : 0;
+  for (uint32_t i = 0; i < full_reason::Count; ++i) {
+    c.reasons[i] += (reasons >> i) & 1u;
+  }
+  if (d.clipmap.relatchAll) {
+    for (uint64_t& n : c.relatches) {
+      ++n;
+    }
+  } else if (d.clipmap.level >= 0) {
+    ++(d.clipmap.recentre ? c.recentres : c.relatches)[static_cast<size_t>(d.clipmap.level)];
+  }
+  check::record_views(d.views, in.hintFrame);
+  return d;
+}
+
+bool frame_held() noexcept { return g_worker.held; }
+
 UpdateStats apply_update(const Views& views, std::span<uint32_t> table, std::span<uint32_t> phys) noexcept {
   UpdateStats stats;
   const auto free_entry = [&](uint32_t i, uint32_t e, uint32_t& counter) {
@@ -909,22 +976,21 @@ void initialize() {
                                                                                : detail::PersistentKind::Buffer);
     }
   }
-  const std::array<detail::PassDesc, 2> descs = pass_descs();
-  if (g_updatePass == detail::InvalidPassId) {
-    g_updatePass = detail::register_pass(descs[0]);
-  }
-  if (g_checkPass == detail::InvalidPassId) {
-    g_checkPass = detail::register_pass(descs[1]);
+  const std::array<detail::PassDesc, PassCount> descs = pass_descs();
+  for (size_t i = 0; i < PassCount; ++i) {
+    if (g_passes[i] == detail::InvalidPassId) {
+      g_passes[i] = detail::register_pass(descs[i]);
+    }
   }
 }
 
 void shutdown() {
   check::shutdown();
   log_summary();
-  for (PassId* pass : {&g_updatePass, &g_checkPass}) {
-    if (*pass != detail::InvalidPassId) {
-      detail::unregister_pass(*pass);
-      *pass = detail::InvalidPassId;
+  for (PassId& pass : g_passes) {
+    if (pass != detail::InvalidPassId) {
+      detail::unregister_pass(pass);
+      pass = detail::InvalidPassId;
     }
   }
   destroy_resources();
@@ -951,6 +1017,7 @@ void latch_hints() noexcept {
 void latch_demand(const Settings& settings) noexcept {
   g_wanted = settings.shadows.quality != Quality::Off;
   scene::retained::set_demand(scene::retained::Demand::Consumer, g_wanted);
+  scene::retained::set_cover_filter(g_wanted ? &is_caster : nullptr);
 }
 
 void latch_gate(const Settings& settings, const Caps& caps) noexcept {
@@ -1007,9 +1074,10 @@ void on_latch(const detail::PassSetup& setup, const detail::CompiledGraph* graph
         },
         g_lowSunOn);
   }
-  if (!active() || g_updatePass == detail::InvalidPassId) {
-    if (g_updatePass != detail::InvalidPassId) {
-      detail::clear_pass_params(g_updatePass);
+  const PassId updatePass = g_passes[0];
+  if (!active() || updatePass == detail::InvalidPassId) {
+    if (updatePass != detail::InvalidPassId) {
+      detail::clear_pass_params(updatePass);
     }
     return;
   }
@@ -1039,7 +1107,7 @@ void on_latch(const detail::PassSetup& setup, const detail::CompiledGraph* graph
   params.generation = g_generation;
   params.chainMask = g_expectedMask;
   params.planFrame = p.frame;
-  detail::set_pass_params(g_updatePass, std::as_bytes(std::span{&params, 1}));
+  detail::set_pass_params(updatePass, std::as_bytes(std::span{&params, 1}));
 }
 
 bool active() noexcept { return g_activeOverride.value_or(g_active); }
@@ -1099,7 +1167,7 @@ PersistentHandle handle(std::string_view name) noexcept {
   return {};
 }
 
-std::array<detail::PassDesc, 2> pass_descs() {
+std::array<detail::PassDesc, PassCount> pass_descs() {
   return {
       detail::PassDesc{
           .name = std::string{UpdatePass},
@@ -1114,6 +1182,9 @@ std::array<detail::PassDesc, 2> pass_descs() {
           .pipelines = update_pipelines,
           .stageParams = update_stage_params,
       },
+      scan_pass_desc(),
+      scan_list_pass_desc(),
+      dirty_pass_desc(),
       check::pass_desc(),
   };
 }

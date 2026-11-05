@@ -215,3 +215,98 @@ fn vsm_page_usable(e: u32) -> bool {
 fn vsm_page_stale(e: u32) -> bool {
   return vsm_page_usable(e) && (e & VSM_ENTRY_DIRTY) != 0u;
 }
+
+const VSM_HDR_FLAG_HELD: u32 = 16u;
+
+const VSM_STAT_SCAN_VALID: u32 = 4u;
+const VSM_STAT_SCAN_CASTERS: u32 = 5u;
+const VSM_STAT_CHANGED: u32 = 6u;
+const VSM_STAT_CHANGED_STATIC: u32 = 7u;
+const VSM_STAT_CHANGED_IMMOBILE: u32 = 8u;
+const VSM_STAT_CHANGED_PLAYER: u32 = 9u;
+const VSM_STAT_CHANGED_PALETTE: u32 = 10u;
+const VSM_STAT_PENDING_STREAM: u32 = 11u;
+const VSM_STAT_PENDING_CASTERS: u32 = 12u;
+const VSM_STAT_CHUNK_NEED: u32 = 13u;
+const VSM_STAT_REASON_FIRST: u32 = 14u;
+const VSM_STAT_NON_PLAYER_OTHER: u32 = 23u;
+const VSM_STAT_FOOTPRINT: u32 = 24u;
+const VSM_STAT_FOOTPRINT_PRIORITY: u32 = 25u;
+const VSM_STAT_DIRTIED: u32 = 26u;
+const VSM_STAT_DIRTIED_PRIORITY: u32 = 27u;
+
+const VSM_SLOTS: u32 = 16384u;
+const VSM_HIST_WORDS: u32 = 32u;
+const VSM_HIST_FLAGS: u32 = 0u;
+const VSM_HIST_HASH: u32 = 1u;
+const VSM_HIST_STREAM_FRAME: u32 = 2u;
+const VSM_HIST_WORLD_FRAME: u32 = 3u;
+const VSM_HIST_MATERIAL_FRAME: u32 = 4u;
+const VSM_HIST_UV_FRAME: u32 = 5u;
+const VSM_HIST_CLUSTER_FIRST: u32 = 6u;
+const VSM_HIST_CLUSTER_COUNT: u32 = 7u;
+const VSM_HIST_INDEX_FIRST: u32 = 8u;
+const VSM_HIST_INDEX_COUNT: u32 = 9u;
+const VSM_HIST_BOX: u32 = 10u;
+const VSM_HIST_XFORM: u32 = 16u;
+
+const VSM_HIST_VALID: u32 = 1u;
+const VSM_HIST_CASTER: u32 = 2u;
+const VSM_HIST_CUTOUT: u32 = 4u;
+const VSM_HIST_ALPHA_PENDING: u32 = 8u;
+const VSM_HIST_PLAYER: u32 = 16u;
+const VSM_HIST_CHUNKED: u32 = 32u;
+const VSM_HIST_PENDING_STREAM: u32 = 64u;
+const VSM_HIST_SEEN: u32 = 128u;
+const VSM_HIST_BOX_VALID: u32 = 256u;
+
+const VSM_SLOT_CHANGED: u32 = 1u;
+const VSM_SLOT_CHUNK_NEED: u32 = 2u;
+
+const VSM_DIRTY_BOX_WORDS: u32 = 16u;
+const VSM_DIRTY_BOX_OLD: u32 = 0u;
+const VSM_DIRTY_BOX_NEW: u32 = 6u;
+const VSM_DIRTY_BOX_FLAGS: u32 = 12u;
+const VSM_DIRTY_HAS_OLD: u32 = 1u;
+const VSM_DIRTY_HAS_NEW: u32 = 2u;
+const VSM_DIRTY_OLD_PLAYER: u32 = 4u;
+const VSM_DIRTY_NEW_PLAYER: u32 = 8u;
+const VSM_DIRTY_PLANE_WORDS: u32 = 512u;
+
+const VSM_REASON_CASTER: u32 = 1u;
+const VSM_REASON_HASH: u32 = 2u;
+const VSM_REASON_STREAM: u32 = 4u;
+const VSM_REASON_WORLD: u32 = 8u;
+const VSM_REASON_MATERIAL: u32 = 16u;
+const VSM_REASON_UV: u32 = 32u;
+const VSM_REASON_ALPHA: u32 = 64u;
+const VSM_REASON_CUTOUT: u32 = 128u;
+const VSM_REASON_ARRAYS: u32 = 256u;
+const VSM_REASON_COUNT: u32 = 9u;
+
+const VSM_CAT_STATIC: u32 = 1u;
+const VSM_CAT_PLAYER: u32 = 1024u;
+const VSM_OBJ_IMMOBILE: u32 = 64u;
+
+// Bit for bit vsm::is_caster's exclusions, so the GPU and CPU caster sets cannot drift apart
+const VSM_EXCLUDED_CLASSES: u32 = 0xA24u;
+const VSM_EXCLUDED_CATEGORIES: u32 = 0x4113C0u;
+
+fn vsm_is_caster(flags: u32, categories: u32) -> bool {
+  return (flags & 1u) != 0u && (flags & VSM_EXCLUDED_CLASSES) == 0u && (categories & VSM_EXCLUDED_CATEGORIES) == 0u;
+}
+
+fn vsm_box_rect(v: VsmView, box: array<vec3f, 2>) -> vec4i {
+  var lo = vec2f(3.4e38);
+  var hi = vec2f(-3.4e38);
+  for (var i = 0u; i < 8u; i++) {
+    let corner = select(box[0], box[1], vec3<bool>((i & 1u) != 0u, (i & 2u) != 0u, (i & 4u) != 0u));
+    let t = vsm_view_coords_anchor(v, corner).xy;
+    lo = min(lo, t);
+    hi = max(hi, t);
+  }
+  let limit = vec2f(v.pages) - 1.0;
+  let p0 = clamp(floor(lo / f32(VSM_PAGE_TEXELS)), vec2f(-1.0), limit + 1.0);
+  let p1 = clamp(floor(hi / f32(VSM_PAGE_TEXELS)), vec2f(-1.0), limit + 1.0);
+  return vec4i(vec2i(max(p0, vec2f(0.0))), vec2i(min(p1, limit)));
+}

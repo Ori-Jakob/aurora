@@ -217,6 +217,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/shaders_embed.hpp
         lib/render/shadows/vsm_check.cpp
         lib/render/shadows/vsm_check.hpp
+        lib/render/shadows/vsm_invalidate.cpp
+        lib/render/shadows/vsm_invalidate.hpp
         lib/render/shadows/vsm_pages.cpp
         lib/render/shadows/vsm_pages.hpp
         lib/render/stage_camera.cpp

@@ -198,8 +198,22 @@ struct FrameCounts {
   bool coverageComplete = false;
 };
 
+struct FilteredObject {
+  uint64_t id = 0;
+  uint32_t passing = 0;
+  uint32_t failing = 0;
+  uint32_t firstSlot = 0;
+  uint32_t slotCount = 0;
+};
+
+struct FilteredObjects {
+  std::vector<FilteredObject> objects;
+  std::vector<uint32_t> slots;
+};
+
 // Game thread at end_frame; false holds coverage back
 using SettlePredicate = bool (*)() noexcept;
+using CoverFilter = bool (*)(const InstanceInfo& info) noexcept;
 
 [[nodiscard]] bool available(const Caps& caps) noexcept;
 // Game thread while the FIFO is idle
@@ -210,6 +224,8 @@ void apply_frame_state(const detail::FrameState& state) noexcept;
 void end_frame() noexcept;
 void reset() noexcept;
 void want_covered_objects(bool want) noexcept;
+// While set, end_frame also publishes covered_filtered(), each id's delivered instances split by the filter
+void set_cover_filter(CoverFilter filter) noexcept;
 // The first call registers the caller as the producer; latched with the gate
 void hold_coverage(bool hold) noexcept;
 void add_settle_predicate(SettlePredicate predicate) noexcept;
@@ -236,6 +252,7 @@ void seal(detail::StageData& stage) noexcept;
 [[nodiscard]] RetainedStats stats() noexcept;
 [[nodiscard]] FrameCounts frame_counts() noexcept;
 [[nodiscard]] std::shared_ptr<const std::vector<uint64_t>> covered_objects() noexcept;
+[[nodiscard]] std::shared_ptr<const FilteredObjects> covered_filtered() noexcept;
 
 namespace testing {
 struct Instance {
