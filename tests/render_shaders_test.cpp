@@ -23,8 +23,10 @@
 #include "render/post/composite.hpp"
 #include "render/scene/streamout.hpp"
 #include "render/shader_resolve.hpp"
+#include "render/shadows/sun_visibility.hpp"
 #include "render/shadows/vsm_alloc.hpp"
 #include "render/shadows/vsm_cull.hpp"
+#include "render/shadows/vsm_filter.hpp"
 #include "render/shadows/vsm_invalidate.hpp"
 #include "render/shadows/vsm_pages.hpp"
 #include "render/shadows/vsm_raster.hpp"
@@ -1838,6 +1840,62 @@ TEST_F(RenderShaders, VsmCullCompiles) {
     const std::span<const std::string_view> defines{variant.data(), variant[1].empty() ? 1u : 2u};
     EXPECT_TRUE(validate_module(shadows::vsm::CullShader, defines, error)) << variant[0] << " " << error;
   }
+}
+
+TEST_F(RenderShaders, SunVisibilityCompiles) {
+  std::string error;
+  EXPECT_TRUE(validate_module(shadows::sun_visibility::Shader, {}, error)) << error;
+  EXPECT_TRUE(validate_module(shadows::vsm::FilterShader, {}, error)) << error;
+  const std::optional<std::string_view> filter = library_text(shadows::vsm::FilterShader);
+  ASSERT_TRUE(filter.has_value());
+  EXPECT_EQ(filter->find("@group"), std::string_view::npos);
+  EXPECT_EQ(filter->find("@binding"), std::string_view::npos);
+  EXPECT_NE(filter->find("fn vsm_visibility("), std::string_view::npos);
+  const std::optional<std::string_view> pass = library_text(shadows::sun_visibility::Shader);
+  ASSERT_TRUE(pass.has_value());
+  EXPECT_NE(pass->find("//#import shadows/vsm_filter"), std::string_view::npos);
+  const shaders::RenderPipelineDesc desc = shadows::sun_visibility::pipeline_desc();
+  EXPECT_EQ(desc.colorCount, 1u);
+  EXPECT_EQ(desc.colors[0].format, wgpu::TextureFormat::RG8Unorm);
+  EXPECT_EQ(desc.depthFormat, wgpu::TextureFormat::Undefined);
+}
+
+TEST_F(RenderShaders, DeferredDefaultTextChangesOnlyByTheHook) {
+  namespace deferred = detail::lighting::deferred;
+  const std::optional<std::string_view> text = library_text(deferred::Shader);
+  ASSERT_TRUE(text.has_value());
+  EXPECT_NE(text->find("@group(1) @binding(15) var sun_vis: texture_2d<f32>;"), std::string_view::npos);
+  EXPECT_NE(text->find("const DEFERRED_FLAG_SUN_SHADOW: u32 = 32u;"), std::string_view::npos);
+  EXPECT_NE(text->find("var<private> deferred_sun_v: f32 = 1.0;"), std::string_view::npos);
+  const std::string add = function_body(*text, "fn deferred_add_light(");
+  EXPECT_NE(add.find("var w = f * atten;"), std::string::npos);
+  EXPECT_NE(add.find("if (v != 1.0) {\n    w = w * v;\n  }"), std::string::npos);
+  EXPECT_NE(add.find("*h += l.v2.rgb * w;"), std::string::npos);
+  EXPECT_EQ(add.find("deferred_light_visibility(l, pos, p.n))"), std::string::npos);
+  const std::string visibility = function_body(*text, "fn deferred_light_visibility(");
+  EXPECT_NE(visibility.find("select(1.0, deferred_sun_v, (l.v4.z >> 8u) == deferred_params.reserved.x)"),
+            std::string::npos);
+  EXPECT_NE(text->find("if ((deferred_params.flags & DEFERRED_FLAG_SUN_SHADOW) != 0u && "
+                       "gbuf_receiver_code(normal_texel.a) >= 2u) {"),
+            std::string_view::npos);
+  size_t uses = 0;
+  for (size_t at = text->find("deferred_sun_v"); at != std::string_view::npos;
+       at = text->find("deferred_sun_v", at + 1)) {
+    ++uses;
+  }
+  EXPECT_EQ(uses, 3u);
+  EXPECT_EQ(deferred::BindSunVisibility, 15u);
+  EXPECT_EQ(deferred::FlagSunShadow, 32u);
+  EXPECT_EQ(deferred::FlagSunShadow & (deferred::ModeMask | deferred::FlagSsil | deferred::FlagSurfaceAmbient), 0u);
+  deferred::Params plain;
+  deferred::fill_params(nullptr, true, deferred::Mode::Full, plain);
+  deferred::Params none;
+  deferred::fill_params(nullptr, true, deferred::Mode::Full, none, false, deferred::NoSunLight);
+  EXPECT_EQ(std::memcmp(&plain, &none, sizeof(plain)), 0);
+  deferred::Params sun;
+  deferred::fill_params(nullptr, true, deferred::Mode::Full, sun, false, 4);
+  EXPECT_EQ(sun.flags, plain.flags | deferred::FlagSunShadow);
+  EXPECT_EQ(sun.reserved[0], 4u);
 }
 
 TEST_F(RenderShaders, VsmRasterVariantsCompile) {

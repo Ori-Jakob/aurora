@@ -62,6 +62,7 @@ enum Binding : uint32_t {
   BindSkyProbe = 12,
   BindSkySh9 = 13,
   BindSsil = 14,
+  BindSunVisibility = 15,
 };
 
 enum class Mode : uint32_t {
@@ -77,7 +78,9 @@ enum class Mode : uint32_t {
 enum ParamFlags : uint32_t {
   FlagSurfaceAmbient = 1u << 0,
   FlagSsil = 1u << 4,
+  FlagSunShadow = 1u << 5,
 };
+inline constexpr uint32_t NoSunLight = UINT32_MAX;
 inline constexpr uint32_t ModeShift = 1;
 inline constexpr uint32_t ModeMask = 7u << ModeShift;
 
@@ -94,8 +97,10 @@ static_assert(offsetof(Params, ambient) == 48 && offsetof(Params, viewToWorld) =
 
 [[nodiscard]] std::optional<Mode> parse_mode(std::string_view text) noexcept;
 [[nodiscard]] std::array<float, 3> srgb_to_linear(const float (&stored)[3]) noexcept;
-void fill_params(const SceneHints* hints, bool surfaceAmbient, Mode mode, Params& out, bool ssil = false) noexcept;
+void fill_params(const SceneHints* hints, bool surfaceAmbient, Mode mode, Params& out, bool ssil = false,
+                 uint32_t sunLight = NoSunLight) noexcept;
 [[nodiscard]] bool ssil_bound(const CompiledGraph& graph) noexcept;
+[[nodiscard]] bool sun_bound(const CompiledGraph& graph) noexcept;
 
 // The pass's enabled hook and the composite's per-frame term, so H exists exactly when the composite expects it
 [[nodiscard]] bool frame_enabled(const StageData& stage) noexcept;

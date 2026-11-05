@@ -185,6 +185,10 @@ TEST_F(RenderViews, GbufViewTableFollowsClassRange) {
       EXPECT_EQ(view.mode, 5u) << view.name;
       continue;
     }
+    if (shadow_view(view)) {
+      EXPECT_EQ(view.mode, 7u) << view.name;
+      continue;
+    }
     EXPECT_TRUE(targetModes.insert(view.mode).second) << view.name;
     EXPECT_EQ(view.uintSource, view.resource == "gbuf.fog" || view.resource == resource::SurfaceV1) << view.name;
     const bool gx = view.resource.starts_with("gbuf.") || view.resource.starts_with("gx.");
@@ -194,7 +198,7 @@ TEST_F(RenderViews, GbufViewTableFollowsClassRange) {
       EXPECT_EQ(view.mode, static_cast<uint32_t>(view.id - FirstGbufView));
     }
   }
-  EXPECT_EQ(expected, 48u);
+  EXPECT_EQ(expected, 49u);
   EXPECT_EQ(targetModes, (std::set<uint32_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}));
   EXPECT_EQ(find_gbuf_view(LastReservedClassView), nullptr);
   EXPECT_EQ(find_gbuf_view(35), nullptr);
@@ -759,11 +763,34 @@ TEST_F(RenderViews, RetainedRowsHaveFreshIds) {
     EXPECT_TRUE(view->label.starts_with("Retained: ")) << view->label;
     EXPECT_EQ(find_view(row.id), nullptr);
   }
-  EXPECT_EQ(find_gbuf_view(48), nullptr);
   EXPECT_LE(GbufViews.back().id, MaxDebugViewId);
   EXPECT_EQ(retained_view::mode_entries(RetainedMode::AtlasPage).size(), 1u);
   EXPECT_EQ(retained_view::mode_entries(RetainedMode::Albedo).size(), 1u);
   EXPECT_LE(retained_view::mode_entries(RetainedMode::Wireframe).size(), detail::MaxPassPipelines);
+}
+
+TEST_F(RenderViews, VisSunRowHasFreshId) {
+  const GbufView* view = find_gbuf_view(48);
+  ASSERT_NE(view, nullptr);
+  EXPECT_EQ(view->name, "vis.sun");
+  EXPECT_EQ(view->label, "Sun shadows: visibility");
+  EXPECT_EQ(view->resource, resource::SunVisibility);
+  EXPECT_EQ(view->anchor, "phase.composite");
+  EXPECT_EQ(view->stage, Stage::OpaqueDone);
+  EXPECT_EQ(view->mode, 7u);
+  EXPECT_FALSE(view->uintSource);
+  EXPECT_EQ(view->kind, GbufViewKind::Target);
+  EXPECT_TRUE(shadow_view(*view));
+  EXPECT_EQ(find_view(48), nullptr);
+  EXPECT_EQ(find_gbuf_view(49), nullptr);
+  EXPECT_EQ(parse_view("vis.sun")->id, 48u);
+  EXPECT_EQ(parse_view("sun")->id, 48u);
+  for (const GbufView& other : GbufViews) {
+    EXPECT_EQ(shadow_view(other), other.id == 48) << other.name;
+  }
+  const std::optional<std::string> blocked = view_blocked(*view, nullptr);
+  ASSERT_TRUE(blocked.has_value());
+  EXPECT_EQ(*blocked, "needs real-time shadows");
 }
 
 TEST_F(RenderViews, RegistryListsEveryBuiltView) {
@@ -788,7 +815,7 @@ TEST_F(RenderViews, RegistryListsEveryBuiltView) {
   ASSERT_EQ(api.size(), views.size());
   EXPECT_EQ(api.data(), views.data());
   EXPECT_TRUE(known_view(0));
-  for (const uint16_t reserved : {uint16_t{9}, uint16_t{15}, uint16_t{35}, uint16_t{48}, uint16_t{100}}) {
+  for (const uint16_t reserved : {uint16_t{9}, uint16_t{15}, uint16_t{35}, uint16_t{49}, uint16_t{100}}) {
     EXPECT_FALSE(known_view(reserved)) << reserved;
   }
 }

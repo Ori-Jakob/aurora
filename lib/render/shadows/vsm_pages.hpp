@@ -150,6 +150,12 @@ inline constexpr uint32_t PlayerDeferred = 40;
 inline constexpr uint32_t Evicted = 41;
 inline constexpr uint32_t Committed = 42;
 inline constexpr uint32_t CommitSkipped = 43;
+inline constexpr uint32_t SunUnshadowed = 64;
+inline constexpr uint32_t SunSamples = 65;
+inline constexpr uint32_t SunSampledUnshadowed = 66;
+inline constexpr uint32_t SunSampledFallback = 67;
+inline constexpr uint32_t SunSampledStale = 68;
+inline constexpr uint32_t SunSampledOutOfRange = 69;
 } // namespace stat
 
 namespace chain_bit {
@@ -436,6 +442,8 @@ void register_consumer_term(ConsumerTerm term) noexcept;
 
 [[nodiscard]] bool frame_producing(const detail::StageData& stage) noexcept;
 [[nodiscard]] bool consumed(const detail::StageData& stage) noexcept;
+[[nodiscard]] bool deferred_consumes() noexcept;
+[[nodiscard]] bool shadow_view_selected() noexcept;
 [[nodiscard]] bool chain_enabled(const detail::StageData& stage) noexcept;
 
 void mark_encoded(uint32_t bit) noexcept;
@@ -465,6 +473,8 @@ void set_active(std::optional<bool> active) noexcept;
 void set_plan(const SunPlan& plan) noexcept;
 void set_pipeline_query(bool (*query)(uint32_t id) noexcept) noexcept;
 void set_compact_ready(std::optional<bool> ready) noexcept;
+void set_sun_bound(std::optional<bool> bound) noexcept;
+void set_shadow_view(std::optional<bool> selected) noexcept;
 [[nodiscard]] std::span<const uint32_t> chain_pipelines() noexcept;
 [[nodiscard]] WorkerCounts worker_counts() noexcept;
 } // namespace testing

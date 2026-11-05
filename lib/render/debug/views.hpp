@@ -111,7 +111,7 @@ struct GbufView {
 }
 
 // Target rows snapshot one scene target and decomposition rows decode several; both replace RGB before the HUD
-inline constexpr std::array<GbufView, 31> GbufViews{{
+inline constexpr std::array<GbufView, 32> GbufViews{{
     {16, "gbuf.motion", "G-buffer: motion", "gbuf.motion", "phase.post_taa", Stage::PrePost, 0, false},
     {17, "gbuf.reactive", "G-buffer: reactive", "gbuf.reactive", "phase.post_taa", Stage::PrePost, 1, false},
     {18, "gbuf.fog", "Fog record: weight", "gbuf.fog", "phase.composite", Stage::OpaqueDone, 2, true},
@@ -157,6 +157,7 @@ inline constexpr std::array<GbufView, 31> GbufViews{{
     retained_row(45, "retained.coverage", "Retained: coverage from above", RetainedMode::Coverage),
     retained_row(46, "retained.atlas", "Retained: material atlas page", RetainedMode::AtlasPage),
     retained_row(47, "retained.albedo", "Retained: atlas albedo (unlit)", RetainedMode::Albedo),
+    {48, "vis.sun", "Sun shadows: visibility", "vis.sun", "phase.composite", Stage::OpaqueDone, 7, false},
 }};
 
 inline constexpr uint16_t MaxDebugViewId = 63;
@@ -304,6 +305,10 @@ inline constexpr Rgb8 RetainedCameraColor{255, 255, 255};
     }
   }
   return nullptr;
+}
+
+[[nodiscard]] constexpr bool shadow_view(const GbufView& view) noexcept {
+  return view.resource == "vis.sun" || view.resource.starts_with("vsm.");
 }
 
 [[nodiscard]] constexpr std::optional<uint32_t> category_bit(std::string_view name) noexcept {

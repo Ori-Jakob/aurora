@@ -23,6 +23,7 @@ struct DeferredParams {
 
 const DEFERRED_FLAG_SURFACE_AMBIENT: u32 = 1u;
 const DEFERRED_FLAG_SSIL: u32 = 16u;
+const DEFERRED_FLAG_SUN_SHADOW: u32 = 32u;
 const DEFERRED_MODE_FULL: u32 = 0u;
 const DEFERRED_MODE_GREY: u32 = 1u;
 const DEFERRED_MODE_DIRECT: u32 = 2u;
@@ -49,12 +50,14 @@ const DEFERRED_HDR_MAX: f32 = 65504.0;
 @group(1) @binding(12) var sky_probe: texture_2d<f32>;
 @group(1) @binding(13) var<uniform> sky_sh9: SkySh9;
 @group(1) @binding(14) var ssil_irr: texture_2d<f32>;
+@group(1) @binding(15) var sun_vis: texture_2d<f32>;
 
 var<workgroup> deferred_union: array<atomic<u32>, 8>;
+var<private> deferred_sun_v: f32 = 1.0;
 
-// M13 (sun VSM), M14 (local VSM and RT) and M15 replace this
+// M14 adds local light visibility here
 fn deferred_light_visibility(l: GpuLight, p: vec3f, n: vec3f) -> f32 {
-  return 1.0;
+  return select(1.0, deferred_sun_v, (l.v4.z >> 8u) == deferred_params.reserved.x);
 }
 
 // M11 ssil.irr and M21 gi.irr replace this in their ranges; nothing is ever added on top of it
@@ -99,7 +102,13 @@ fn deferred_add_light(h: ptr<function, vec3f>, p: OpenPbrPrepared, l: GpuLight, 
                       pos: vec3f) {
   let specular = (light_flags(l) & LIGHT_FLAG_NO_SPECULAR) == 0u;
   let f = openpbr_eval_light(p, to_light, specular, light_lut3d, light_lut2d, linear_clamp);
-  *h += l.v2.rgb * (f * atten * deferred_light_visibility(l, pos, p.n));
+  var w = f * atten;
+  let v = deferred_light_visibility(l, pos, p.n);
+  // A visible light keeps M11's exact expression, so unshadowed pixels stay bit-identical
+  if (v != 1.0) {
+    w = w * v;
+  }
+  *h += l.v2.rgb * w;
 }
 
 @compute @workgroup_size(8, 8)
@@ -144,6 +153,10 @@ fn shade(@builtin(global_invocation_id) id: vec3u, @builtin(local_invocation_ind
   let pos = camera_view_position_fwd(cam, (vec2f(px) + 0.5) / full, z, full);
   let v = normalize(-pos);
   let normal_texel = deferred_texel(scene_normal, px);
+  if ((deferred_params.flags & DEFERRED_FLAG_SUN_SHADOW) != 0u && gbuf_receiver_code(normal_texel.a) >= 2u) {
+    let s = deferred_texel(sun_vis, px).rg;
+    deferred_sun_v = s.r * s.g;
+  }
   let n = deferred_bend_normal(camera_gx_normal_fwd(normal_texel.rgb * 2.0 - 1.0), v);
   var ext = vec4u(0u);
   if (gbuf_surface_reads_ext(entry)) {

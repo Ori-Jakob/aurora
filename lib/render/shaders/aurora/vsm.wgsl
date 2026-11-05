@@ -631,6 +631,12 @@ const VSM_STAT_CHECK_FIRST: u32 = 55u;
 const VSM_STAT_CHECK_SKIPPED: u32 = 56u;
 const VSM_STAT_PROBE_FOUND: u32 = 60u;
 const VSM_STAT_PROBE_OCCLUDED: u32 = 61u;
+const VSM_STAT_SUN_UNSHADOWED: u32 = 64u;
+const VSM_STAT_SUN_SAMPLES: u32 = 65u;
+const VSM_STAT_SUN_SAMPLED_UNSHADOWED: u32 = 66u;
+const VSM_STAT_SUN_SAMPLED_FALLBACK: u32 = 67u;
+const VSM_STAT_SUN_SAMPLED_STALE: u32 = 68u;
+const VSM_STAT_SUN_SAMPLED_OUT_OF_RANGE: u32 = 69u;
 
 fn vsm_render_count(render_list: ptr<storage, array<u32>, read>) -> u32 {
   if (VSM_RL_CHECK_COUNT >= arrayLength(render_list)) {

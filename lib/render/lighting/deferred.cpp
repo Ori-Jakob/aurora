@@ -11,6 +11,7 @@
 #include "../pass_context.hpp"
 #include "../post/composite.hpp"
 #include "../shaders.hpp"
+#include "../shadows/sun_visibility.hpp"
 #include "../stage_data.hpp"
 
 #include "../../gx/hints.hpp"
@@ -64,6 +65,7 @@ std::mutex g_slotMutex;
 LatchSlot g_slot;
 std::atomic_bool g_surfaceAmbient{true};
 std::atomic_bool g_ssil{false};
+std::atomic_bool g_sun{false};
 std::shared_ptr<const SceneHints> g_hintsOverride;
 std::optional<Mode> g_modeOverride;
 std::optional<bool> g_forceEnabled;
@@ -130,7 +132,8 @@ void fill_stage_params(const StageData& stage, const void*, std::span<std::byte>
   Params params;
   // Until the composite applies exposure the radiance SSIL gathers is in legacy units, which H cannot take
   fill_params(stage_hints(stage), g_surfaceAmbient.load(std::memory_order_relaxed), current_mode(), params,
-              g_ssil.load(std::memory_order_relaxed) && composite::exposure_units());
+              g_ssil.load(std::memory_order_relaxed) && composite::exposure_units(),
+              g_sun.load(std::memory_order_relaxed) ? shadows::sun_visibility::light_index(stage) : NoSunLight);
   std::memcpy(bytes.data(), &params, sizeof(Params));
 }
 
@@ -187,6 +190,7 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
   builder.use_buffer(sky_probe::Sh9, Access::Uniform,
                      UseOptions{.missing = Missing::BindDummyBlack, .dummySize = sky_probe::Sh9Bytes});
   builder.use(resource::SsilIrradiance, Access::Sampled, Missing::BindDummyBlack);
+  builder.use(resource::SunVisibility, Access::Sampled, Missing::BindDummyWhite);
 }
 
 void request_pipelines(const PipelineSetup& setup, const void*, std::span<uint32_t, MaxPassPipelines> ids) {
@@ -240,6 +244,20 @@ void encode(PassContext& ctx, const void*) {
   }
 }
 
+bool bound_input(const CompiledGraph& graph, std::string_view name) noexcept {
+  const NodeId node = graph.find_node(Pass);
+  const ResourceId id = graph.find_resource(name);
+  if (node == InvalidNode || id == InvalidResource || graph.nodes[node].status != CullReason::None) {
+    return false;
+  }
+  for (const CompiledUse& use : graph.node_uses(node)) {
+    if (use.resource == id) {
+      return !use.staticDummy;
+    }
+  }
+  return false;
+}
+
 using Vec3 = testing::Vec3;
 
 material::classes::GpuRow furnace_ao_row(material::classes::GpuRow row) noexcept {
@@ -285,7 +303,8 @@ std::array<float, 3> srgb_to_linear(const float (&stored)[3]) noexcept {
   return out;
 }
 
-void fill_params(const SceneHints* hints, bool surfaceAmbient, Mode mode, Params& out, bool ssil) noexcept {
+void fill_params(const SceneHints* hints, bool surfaceAmbient, Mode mode, Params& out, bool ssil,
+                 uint32_t sunLight) noexcept {
   out = {};
   fill_stage_camera(hints, out.camera);
   fill_view_rotation(hints, out.viewToWorld);
@@ -297,21 +316,15 @@ void fill_params(const SceneHints* hints, bool surfaceAmbient, Mode mode, Params
   if (ssil) {
     out.flags |= FlagSsil;
   }
+  if (sunLight != NoSunLight) {
+    out.flags |= FlagSunShadow;
+    out.reserved[0] = sunLight;
+  }
 }
 
-bool ssil_bound(const CompiledGraph& graph) noexcept {
-  const NodeId node = graph.find_node(Pass);
-  const ResourceId id = graph.find_resource(resource::SsilIrradiance);
-  if (node == InvalidNode || id == InvalidResource || graph.nodes[node].status != CullReason::None) {
-    return false;
-  }
-  for (const CompiledUse& use : graph.node_uses(node)) {
-    if (use.resource == id) {
-      return !use.staticDummy;
-    }
-  }
-  return false;
-}
+bool ssil_bound(const CompiledGraph& graph) noexcept { return bound_input(graph, resource::SsilIrradiance); }
+
+bool sun_bound(const CompiledGraph& graph) noexcept { return bound_input(graph, resource::SunVisibility); }
 
 bool frame_enabled(const StageData& stage) noexcept {
   if (g_forceEnabled) {
@@ -412,6 +425,7 @@ void on_latch(const PassSetup&, const CompiledGraph* graph) {
   }
   g_surfaceAmbient.store(gx_ext::unlit::classes_enabled(), std::memory_order_relaxed);
   g_ssil.store(graph != nullptr && ssil_bound(*graph), std::memory_order_relaxed);
+  g_sun.store(graph != nullptr && sun_bound(*graph), std::memory_order_relaxed);
   std::lock_guard lock{g_slotMutex};
   g_slot = slot;
 }

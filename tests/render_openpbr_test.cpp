@@ -29,6 +29,7 @@
 #include "render/scene_depth.hpp"
 #include "render/settings.hpp"
 #include "render/shaders.hpp"
+#include "render/shadows/sun_visibility.hpp"
 #include "render/stage.hpp"
 #include "render/stage_camera.hpp"
 #include "render/stage_data.hpp"
@@ -1277,12 +1278,13 @@ TEST_F(LightDeferredGraph, DeclaresOnPbrSurface) {
   ASSERT_EQ(status(*graph, clusters::Pass), CullReason::None);
   const NodeId node = graph->find_node(deferred::Pass);
   const auto uses = graph->node_uses(node);
-  const std::array<std::string_view, 15> names{
+  const std::array<std::string_view, 16> names{
       resource::Surface,          resource::GxNormal,       resource::GxDepth,
       resource::AoFinal,          clusters::List,           clusters::Grid,
       openpbr::Classes,           openpbr::Lut3d,           openpbr::Lut2d,
       resource::SceneHdr,         resource::SurfaceExt,     resource::SurfaceTable,
-      lighting::sky_probe::Probe, lighting::sky_probe::Sh9, resource::SsilIrradiance};
+      lighting::sky_probe::Probe, lighting::sky_probe::Sh9, resource::SsilIrradiance,
+      resource::SunVisibility};
   ASSERT_EQ(uses.size(), names.size());
   for (size_t i = 0; i < names.size(); ++i) {
     EXPECT_EQ(graph->resources[uses[i].resource].name, names[i]) << i;
@@ -1479,6 +1481,35 @@ PassDesc stub_texture_desc(StubTexture& stub) {
       .encode = encode_stub_texture,
       .state = &stub,
   };
+}
+
+class RenderLightingGraph : public LightDeferredGraph {};
+
+TEST_F(RenderLightingGraph, DeferredBindsVisSunAt15) {
+  composite::initialize();
+  composite::testing::set_pbr_producers_override(true);
+  const auto graph = compile(pbr_settings());
+  const NodeId node = graph->find_node(deferred::Pass);
+  ASSERT_NE(node, InvalidNode);
+  const auto uses = graph->node_uses(node);
+  ASSERT_EQ(uses.size(), deferred::BindSunVisibility + 1u);
+  EXPECT_EQ(deferred::BindSunVisibility, 15u);
+  const CompiledUse& use = uses[deferred::BindSunVisibility];
+  EXPECT_EQ(graph->resources[use.resource].name, resource::SunVisibility);
+  EXPECT_EQ(use.access, Access::Sampled);
+  EXPECT_EQ(use.missing, Missing::BindDummyWhite);
+  EXPECT_TRUE(use.staticDummy);
+  EXPECT_FALSE(deferred::sun_bound(*graph));
+  StubTexture stub{.name = "t.vis_sun", .resource = resource::SunVisibility, .format = wgpu::TextureFormat::RG8Unorm};
+  const PassId stubId = register_pass(stub_texture_desc(stub));
+  const auto produced = compile(pbr_settings());
+  unregister_pass(stubId);
+  EXPECT_TRUE(deferred::sun_bound(*produced));
+  EXPECT_FALSE(deferred::ssil_bound(*produced));
+  deferred::Params params;
+  deferred::fill_params(nullptr, true, deferred::Mode::Full, params, false, deferred::NoSunLight);
+  EXPECT_EQ(params.flags & deferred::FlagSunShadow, 0u);
+  EXPECT_EQ(params.reserved[0], 0u);
 }
 
 class LightDeferredGpu : public DeferredDeviceTest {
@@ -2073,6 +2104,91 @@ TEST_F(LightDeferredGpu, SsilWaitsForCompositeExposure) {
   unregister_pass(ssilId);
   EXPECT_EQ(off, unexposed);
   EXPECT_NE(off, exposed);
+}
+
+class RenderLighting : public LightDeferredGpu {
+protected:
+  PassId stage_vis_sun(uint32_t width, uint32_t height, uint8_t value) {
+    m_vis =
+        StubTexture{.name = "t.vis_sun", .resource = resource::SunVisibility, .format = wgpu::TextureFormat::RG8Unorm};
+    m_vis.rowBytes = (width * 2 + 255) & ~255u;
+    std::vector<uint8_t> staged(size_t{m_vis.rowBytes} * height, 0);
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x) {
+        staged[size_t{y} * m_vis.rowBytes + x * 2] = value;
+        staged[size_t{y} * m_vis.rowBytes + x * 2 + 1] = 255;
+      }
+    }
+    const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                            .size = staged.size()};
+    m_vis.staging = m_device->device.CreateBuffer(&descriptor);
+    m_device->queue.WriteBuffer(m_vis.staging, 0, staged.data(), staged.size());
+    return register_pass(stub_texture_desc(m_vis));
+  }
+
+  void TearDown() override {
+    shadows::sun_visibility::testing::set_light_index(std::nullopt);
+    LightDeferredGpu::TearDown();
+  }
+
+  StubTexture m_vis;
+};
+
+TEST_F(RenderLighting, SunVisibilityScalesOnlyTheShadowedLight) {
+  std::mt19937 rng{0x5C15u};
+  std::vector<AuroraLight> lights{make_light(AURORA_LIGHT_DIRECTIONAL, {}, {0.3f, -0.5f, -0.8f}, 0.f),
+                                  make_light(AURORA_LIGHT_DIRECTIONAL, {}, {-0.4f, -0.6f, -0.7f}, 0.f)};
+  lights[1].id = 2;
+  lights[1].color[0] = 0.8f;
+  lights[1].color[2] = 1.4f;
+  set_hints(scene_hints(lights));
+  std::vector<GpuPixel> pixels(size_t{64} * 48);
+  for (size_t i = 0; i < pixels.size(); ++i) {
+    pixels[i] = random_gpu_pixel(rng);
+    pixels[i].receiver = static_cast<uint8_t>(i % 3 == 0 ? 1 : 2 + i % 2);
+  }
+  const std::vector<deferred::testing::Pixel> inputs = stage_pixels(64, 48, pixels);
+  deferred::testing::force_enabled(true);
+  const auto off = run_hdr(pbr_settings(), 1);
+  shadows::sun_visibility::testing::set_light_index(1);
+  const PassId white = stage_vis_sun(64, 48, 255);
+  const auto lit = run_hdr(pbr_settings(), 2);
+  unregister_pass(white);
+  EXPECT_EQ(lit, off) << "an all-white vis.sun under FlagSunShadow keeps the unshadowed bits";
+  const PassId half = stage_vis_sun(64, 48, 128);
+  std::array<std::vector<std::array<uint16_t, 4>>, 2> shadowed;
+  for (uint32_t index = 0; index < 2; ++index) {
+    shadows::sun_visibility::testing::set_light_index(index);
+    shadowed[index] = run_hdr(pbr_settings(), 3 + index);
+  }
+  unregister_pass(half);
+  const double v = 128.0 / 255.0;
+  const deferred::Params params = mirror_params();
+  for (uint32_t index = 0; index < 2; ++index) {
+    Mirror m = mirror_lights();
+    for (size_t c = 0; c < 3; ++c) {
+      m.lights[index].v2[c] = static_cast<float>(m.lights[index].v2[c] * v);
+    }
+    size_t checked = 0;
+    size_t darker = 0;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+      if (pixels[i].receiver < 2) {
+        EXPECT_EQ(shadowed[index][i], off[i]) << "code 1 pixel " << i << " light " << index;
+        continue;
+      }
+      const deferred::testing::Result want =
+          deferred::testing::shade(inputs[i], m.header, m.lights, params, class_rows());
+      for (size_t c = 0; c < 3; ++c) {
+        ASSERT_NEAR(openpbr::from_half(shadowed[index][i][c]), want.rgb[c], 2e-3 + 5e-3 * want.rgb[c])
+            << i << " light " << index;
+      }
+      ++checked;
+      darker += shadowed[index][i] != off[i] ? 1 : 0;
+    }
+    EXPECT_GT(checked, 1000u);
+    EXPECT_GT(darker, checked / 2);
+  }
+  EXPECT_NE(shadowed[0], shadowed[1]);
 }
 
 TEST_F(LightDeferredGpu, AoDummyClamps) {

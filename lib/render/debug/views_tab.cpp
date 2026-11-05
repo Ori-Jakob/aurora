@@ -182,6 +182,10 @@ std::optional<std::string> view_blocked(const GbufView& view, const detail::Fram
     return retained_view::supported(caps()) ? std::nullopt : std::optional<std::string>{"needs the retained scene"};
   }
   const Settings settings = frame != nullptr ? frame->settings : Settings{};
+  if (shadow_view(view)) {
+    return feature_enabled(settings, Feature::Shadows) ? std::nullopt
+                                                       : std::optional<std::string>{"needs real-time shadows"};
+  }
   if (view.kind == GbufViewKind::Decomposition) {
     if (decomp_view::available(view, settings, frame != nullptr ? frame->graph.get() : nullptr)) {
       return std::nullopt;

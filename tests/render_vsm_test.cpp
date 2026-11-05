@@ -8,9 +8,11 @@
 #include "render/scene/identity.hpp"
 #include "render/scene/streamout.hpp"
 #include "render/graph_bind.hpp"
+#include "render/post/composite.hpp"
 #include "render/shadows/vsm_alloc.hpp"
 #include "render/shadows/vsm_check.hpp"
 #include "render/shadows/vsm_cull.hpp"
+#include "render/shadows/vsm_filter.hpp"
 #include "render/shadows/vsm_invalidate.hpp"
 #include "render/shadows/vsm_pages.hpp"
 #include "render/shadows/vsm_raster.hpp"
@@ -1548,6 +1550,117 @@ TEST(RenderVsmCull, SkipIsADeterministicSuffix) {
       EXPECT_NE(counts[first] + counts[MaxRenderPages + first], 0u);
     }
   }
+}
+
+TEST(RenderVsm, ReceiverRefIsClamped) {
+  bool outOfRange = true;
+  EXPECT_EQ(receiver_ref(0.25f, outOfRange), 0.25f);
+  EXPECT_FALSE(outOfRange);
+  EXPECT_EQ(receiver_ref(1.f, outOfRange), 1.f);
+  EXPECT_FALSE(outOfRange);
+  EXPECT_EQ(receiver_ref(1.5f, outOfRange), 1.f);
+  EXPECT_TRUE(outOfRange);
+  EXPECT_EQ(receiver_ref(-0.5f, outOfRange), 0.f);
+  EXPECT_TRUE(outOfRange);
+  const Views views = clipmap_views({100.0, 20.0, -300.0}, sun_dir(40.0, 30.0));
+  const ViewRecord& v = views.views[level_view(2)];
+  const std::array<float, 3> near{0.f, 0.f, 0.f};
+  const ReceiverPage inside = receiver_page(v, near, DefaultDepthBias);
+  EXPECT_FALSE(inside.outOfRange);
+  EXPECT_NEAR(inside.ref, view_coords(v, near)[2] + v.texel * v.depthScale, 1e-6f);
+  EXPECT_GE(inside.local[0], 0.f);
+  EXPECT_LT(inside.local[0], static_cast<float>(PageTexels));
+  const std::array<float, 3> c = view_coords(v, near);
+  EXPECT_EQ(inside.page[0], v.origin[0] + static_cast<int32_t>(std::floor(c[0] / PageTexels)));
+  EXPECT_EQ(inside.page[1], v.origin[1] + static_cast<int32_t>(std::floor(c[1] / PageTexels)));
+  const auto along = [&](double distance) {
+    const std::array<double, 3> d = sun_dir(40.0, 30.0);
+    return std::array<float, 3>{static_cast<float>(d[0] * distance), static_cast<float>(d[1] * distance),
+                                static_cast<float>(d[2] * distance)};
+  };
+  const double range = depth_range(Texel0, 2);
+  const ReceiverPage beyond = receiver_page(v, along(range), DefaultDepthBias);
+  EXPECT_TRUE(beyond.outOfRange);
+  EXPECT_EQ(beyond.ref, 0.f);
+  const ReceiverPage before = receiver_page(v, along(-range), DefaultDepthBias);
+  EXPECT_TRUE(before.outOfRange);
+  EXPECT_EQ(before.ref, 1.f);
+}
+
+TEST(RenderVsm, FilterTapsStayInsidePage) {
+  for (const Quality quality : {Quality::Low, Quality::Medium, Quality::High, Quality::Ultra}) {
+    const FilterParams params = filter_params(quality);
+    const float reach = tap_radius(params.taps) + normal_offset_texels(params, 0.f);
+    EXPECT_LE(reach, static_cast<float>(FilterMarginTexels)) << static_cast<int>(quality);
+    EXPECT_EQ(tap_offsets(params.taps).size(), params.taps);
+    EXPECT_LE(normal_offset_texels(params, 1.f), normal_offset_texels(params, 0.f));
+    EXPECT_EQ(normal_offset_texels(params, -1.f), normal_offset_texels(params, 0.f));
+  }
+  EXPECT_EQ(filter_params(Quality::Low).taps, 1u);
+  EXPECT_EQ(filter_params(Quality::Medium).taps, 4u);
+  EXPECT_EQ(filter_params(Quality::High).taps, 9u);
+  EXPECT_EQ(filter_params(Quality::Ultra).taps, 9u);
+  const Views views = clipmap_views({100.0, 20.0, -300.0}, sun_dir(40.0, 30.0));
+  const ViewRecord& v = views.views[level_view(1)];
+  for (const std::array<float, 2> texel :
+       {std::array{1000.3f, 2047.6f}, std::array{1023.9f, 1024.1f}, std::array{127.5f, 3968.4f}}) {
+    for (const std::array<float, 2>& o : tap_offsets(MaxFilterTaps)) {
+      const TapPage tap = tap_page(v, texel, o);
+      for (size_t i = 0; i < 2; ++i) {
+        EXPECT_GE(tap.local[i], TapInset);
+        EXPECT_LE(tap.local[i], static_cast<float>(PageTexels) - TapInset);
+        const float c = texel[i] + o[i];
+        EXPECT_EQ(tap.page[i], v.origin[i] + static_cast<int32_t>(std::floor(c / PageTexels)));
+      }
+    }
+  }
+  EXPECT_EQ(parse_bias("0.5,2")->normal, 0.5f);
+  EXPECT_EQ(parse_bias("0.5,2")->depth, 2.f);
+  EXPECT_FALSE(parse_bias("1"));
+  EXPECT_FALSE(parse_bias("a,1"));
+  EXPECT_FALSE(parse_bias("1,-1"));
+  const FilterParams biased = filter_params(Quality::High, Bias{.normal = 0.f, .depth = 3.f});
+  EXPECT_EQ(biased.normalScale, 0.f);
+  EXPECT_EQ(biased.depthBias, 3.f);
+}
+
+TEST_F(RenderVsmGraph, DeferredIsTheConsumer) {
+  testing::set_active(true);
+  testing::set_plan(producing_plan());
+  testing::set_compact_ready(true);
+  testing::set_pipeline_query([](uint32_t) noexcept { return true; });
+  const std::array<detail::PassDesc, PassCount> passes = pass_descs();
+  const StageData stage = producing_stage(1);
+  const auto chain_on = [&] {
+    return std::ranges::all_of(std::span{passes}.first(PassCount - 3),
+                               [&](const detail::PassDesc& pass) { return pass.enabled(stage, pass.state); });
+  };
+  const auto chain_off = [&] {
+    return std::ranges::none_of(passes, [&](const detail::PassDesc& pass) { return pass.enabled(stage, pass.state); });
+  };
+  testing::set_sun_bound(true);
+  for (const float blend : {0.5f, 1.f}) {
+    Settings settings;
+    settings.pbr = true;
+    settings.legacyBlend = blend;
+    const bool flagPbr = detail::composite::pbr_term_wanted(settings);
+    EXPECT_EQ(flagPbr, blend < 1.f);
+    detail::composite::testing::set_exposure_units(flagPbr);
+    EXPECT_EQ(deferred_consumes(), flagPbr) << blend;
+    EXPECT_EQ(consumed(stage), flagPbr) << blend;
+    EXPECT_EQ(chain_on(), flagPbr) << blend;
+    EXPECT_EQ(chain_off(), !flagPbr) << blend;
+  }
+  EXPECT_FALSE(detail::composite::pbr_term_wanted(Settings{}));
+  detail::composite::testing::set_exposure_units(true);
+  testing::set_sun_bound(false);
+  EXPECT_FALSE(consumed(stage)) << "light.deferred bound to the white dummy reads no shadow";
+  testing::set_shadow_view(true);
+  EXPECT_TRUE(consumed(stage)) << "selecting the vis.sun row is a consumer";
+  EXPECT_TRUE(chain_on());
+  testing::set_shadow_view(std::nullopt);
+  detail::composite::testing::set_exposure_units(std::nullopt);
+  EXPECT_FALSE(consumed(stage));
 }
 } // namespace
 } // namespace aurora::render::shadows::vsm

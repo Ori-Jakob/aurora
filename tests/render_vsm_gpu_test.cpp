@@ -1,15 +1,21 @@
 #include <gtest/gtest.h>
 
+#include "render_depth_device.hpp"
 #include "render_test_device.hpp"
 
 #include "gfx/pipeline_cache.hpp"
 #include "gfx/recording.hpp"
 #include "gx/gx.hpp"
+#include "gx/hints.hpp"
+#include "render/hints.hpp"
 #include "render/jobs.hpp"
+#include "render/lighting/deferred.hpp"
+#include "render/post/composite.hpp"
 #include "render/scene/atlas.hpp"
 #include "render/scene/identity.hpp"
 #include "render/scene/streamout.hpp"
 #include "render/shaders.hpp"
+#include "render/shadows/sun_visibility.hpp"
 #include "render/shadows/vsm_alloc.hpp"
 #include "render/shadows/vsm_check.hpp"
 #include "render/shadows/vsm_cull.hpp"
@@ -2932,6 +2938,444 @@ TEST_F(RenderVsmRasterGpu, SmallClustersCastDepth) {
     EXPECT_EQ(hit, centres.size()) << "clip " << variant.clip;
     EXPECT_EQ(written, centres.size()) << "clip " << variant.clip;
   }
+}
+
+constexpr uint32_t SunPoolPagesX = 4;
+constexpr uint32_t SunPoolPages = 8;
+constexpr uint64_t SunLayoutKey = 0x76736D73756E0001ull;
+constexpr uint32_t Usable = entry::Allocated | entry::Cached;
+
+struct SunOut {
+  std::vector<std::array<uint8_t, 2>> vis;
+  std::vector<uint32_t> stats;
+};
+
+class RenderVsmSunGpu : public RenderVsmGpuDevice {
+protected:
+  void SetUp() override {
+    RenderVsmGpuDevice::SetUp();
+    if (IsSkipped()) {
+      return;
+    }
+    testing::reset();
+    const wgpu::Device& device = m_device->device;
+    constexpr auto Fragment = wgpu::ShaderStage::Fragment;
+    const std::array frameEntries{
+        wgpu::BindGroupLayoutEntry{
+            .binding = 1, .visibility = Fragment, .buffer = {.type = wgpu::BufferBindingType::Uniform}},
+        wgpu::BindGroupLayoutEntry{
+            .binding = 5, .visibility = Fragment, .sampler = {.type = wgpu::SamplerBindingType::Comparison}},
+    };
+    const wgpu::BindGroupLayoutDescriptor frameDescriptor{.entryCount = frameEntries.size(),
+                                                          .entries = frameEntries.data()};
+    m_frameLayout = device.CreateBindGroupLayout(&frameDescriptor);
+    const auto tex = [&](uint32_t binding, wgpu::TextureSampleType type) {
+      return wgpu::BindGroupLayoutEntry{
+          .binding = binding,
+          .visibility = Fragment,
+          .texture = {.sampleType = type, .viewDimension = wgpu::TextureViewDimension::e2D}};
+    };
+    const auto buf = [&](uint32_t binding, wgpu::BufferBindingType type) {
+      return wgpu::BindGroupLayoutEntry{.binding = binding, .visibility = Fragment, .buffer = {.type = type}};
+    };
+    const std::array passEntries{
+        tex(0, wgpu::TextureSampleType::UnfilterableFloat),
+        tex(1, wgpu::TextureSampleType::UnfilterableFloat),
+        tex(2, wgpu::TextureSampleType::Depth),
+        buf(3, wgpu::BufferBindingType::ReadOnlyStorage),
+        buf(4, wgpu::BufferBindingType::Uniform),
+        buf(5, wgpu::BufferBindingType::Storage),
+    };
+    const wgpu::BindGroupLayoutDescriptor passDescriptor{.entryCount = passEntries.size(),
+                                                         .entries = passEntries.data()};
+    m_passLayout = device.CreateBindGroupLayout(&passDescriptor);
+    const std::array layouts{m_frameLayout, m_passLayout};
+    const wgpu::PipelineLayoutDescriptor layoutDescriptor{.bindGroupLayoutCount = layouts.size(),
+                                                          .bindGroupLayouts = layouts.data()};
+    shaders::RenderPipelineDesc desc = sun_visibility::pipeline_desc();
+    desc.layout = device.CreatePipelineLayout(&layoutDescriptor);
+    desc.layoutKey = SunLayoutKey;
+    const shaders::PipelineId id = shaders::request_render(desc);
+    ASSERT_EQ(shaders::wait(id), shaders::PipelineStatus::Ready);
+    m_pipeline = shaders::render_pipeline(id);
+    const wgpu::SamplerDescriptor sampler{
+        .addressModeU = wgpu::AddressMode::ClampToEdge,
+        .addressModeV = wgpu::AddressMode::ClampToEdge,
+        .magFilter = wgpu::FilterMode::Linear,
+        .minFilter = wgpu::FilterMode::Linear,
+        .compare = wgpu::CompareFunction::GreaterEqual,
+    };
+    m_sampler = device.CreateSampler(&sampler);
+    m_table = buffer(TableBytes);
+    m_stats = buffer(StatsBytes);
+    const wgpu::BufferDescriptor uniform{.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst,
+                                         .size = ViewsBytes};
+    m_views = device.CreateBuffer(&uniform);
+    const wgpu::BufferDescriptor params{.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst,
+                                        .size = sizeof(sun_visibility::Params)};
+    m_params = device.CreateBuffer(&params);
+    m_pool = test::make_depth(*m_device, SunPoolPagesX * PageTexels, SunPoolPages / SunPoolPagesX * PageTexels);
+    fill_pool({});
+  }
+
+  void TearDown() override {
+    testing::reset();
+    sun_visibility::testing::reset();
+    detail::composite::testing::set_exposure_units(std::nullopt);
+    RenderVsmGpuDevice::TearDown();
+  }
+
+  void fill_pool(const std::array<float, SunPoolPages>& pageDepth) {
+    const uint32_t width = m_pool.GetWidth();
+    std::vector<float> texels(size_t{width} * m_pool.GetHeight());
+    for (size_t i = 0; i < texels.size(); ++i) {
+      const auto x = static_cast<uint32_t>(i % width) / PageTexels;
+      const auto y = static_cast<uint32_t>(i / width) / PageTexels;
+      texels[i] = pageDepth[y * SunPoolPagesX + x];
+    }
+    test::fill_depth(*m_device, m_pool, texels);
+  }
+
+  static Views sun_views() {
+    Views views = test_views(false);
+    views.header.poolPages = SunPoolPages;
+    views.header.poolPagesX = SunPoolPagesX;
+    return views;
+  }
+
+  static std::vector<uint32_t> level_table(const std::array<uint32_t, SunLevels>& perLevel) {
+    std::vector<uint32_t> table(MaxVirtualPages, 0);
+    for (uint32_t level = 0; level < SunLevels; ++level) {
+      std::fill_n(table.begin() + level_view(level) * PagesPerView, PagesPerView, perLevel[level]);
+    }
+    return table;
+  }
+
+  wgpu::Texture upload(wgpu::TextureFormat format, const void* data, uint32_t texelBytes) const {
+    const wgpu::TextureDescriptor descriptor{.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
+                                             .size = {MarkWidth, MarkHeight, 1},
+                                             .format = format};
+    const wgpu::Texture texture = m_device->device.CreateTexture(&descriptor);
+    const wgpu::TexelCopyTextureInfo destination{.texture = texture};
+    const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = MarkWidth * texelBytes, .rowsPerImage = MarkHeight};
+    const wgpu::Extent3D extent{MarkWidth, MarkHeight, 1};
+    m_device->queue.WriteTexture(&destination, data, size_t{MarkWidth} * MarkHeight * texelBytes, &layout, &extent);
+    return texture;
+  }
+
+  SunOut run(const Views& views, std::span<const uint32_t> table, std::span<const float> depth,
+             std::span<const uint8_t> codes, uint32_t taps = MaxFilterTaps) {
+    const wgpu::Device& device = m_device->device;
+    std::vector<float> normal(size_t{MarkWidth} * MarkHeight * 4, 0.5f);
+    for (size_t i = 0; i < codes.size(); ++i) {
+      normal[i * 4 + 3] = static_cast<float>(codes[i]) / 3.f;
+    }
+    const wgpu::Texture depthTexture = upload(wgpu::TextureFormat::R32Float, depth.data(), 4);
+    const wgpu::Texture normalTexture = upload(wgpu::TextureFormat::RGBA32Float, normal.data(), 16);
+    const MarkParams mark = mark_params();
+    sun_visibility::Params params;
+    params.camera = mark.camera;
+    params.rotation = mark.rotation;
+    params.flags = sun_visibility::flag::Producing | sun_visibility::flag::Counters;
+    params.taps = taps;
+    m_device->queue.WriteBuffer(m_params, 0, &params, sizeof(params));
+    m_device->queue.WriteBuffer(m_views, 0, &views, ViewsBytes);
+    m_device->queue.WriteBuffer(m_table, 0, table.data(), table.size_bytes());
+    const std::vector<uint32_t> zero(StatCount, 0);
+    m_device->queue.WriteBuffer(m_stats, 0, zero.data(), StatsBytes);
+    const std::array frameEntries{
+        wgpu::BindGroupEntry{.binding = 1, .buffer = m_params, .size = sizeof(params)},
+        wgpu::BindGroupEntry{.binding = 5, .sampler = m_sampler},
+    };
+    const wgpu::BindGroupDescriptor frameGroup{
+        .layout = m_frameLayout, .entryCount = frameEntries.size(), .entries = frameEntries.data()};
+    const wgpu::TextureViewDescriptor depthOnly{.aspect = wgpu::TextureAspect::DepthOnly};
+    const std::array passEntries{
+        wgpu::BindGroupEntry{.binding = 0, .textureView = depthTexture.CreateView()},
+        wgpu::BindGroupEntry{.binding = 1, .textureView = normalTexture.CreateView()},
+        wgpu::BindGroupEntry{.binding = 2, .textureView = m_pool.CreateView(&depthOnly)},
+        wgpu::BindGroupEntry{.binding = 3, .buffer = m_table, .size = TableBytes},
+        wgpu::BindGroupEntry{.binding = 4, .buffer = m_views, .size = ViewsBytes},
+        wgpu::BindGroupEntry{.binding = 5, .buffer = m_stats, .size = StatsBytes},
+    };
+    const wgpu::BindGroupDescriptor passGroup{
+        .layout = m_passLayout, .entryCount = passEntries.size(), .entries = passEntries.data()};
+    const wgpu::TextureDescriptor targetDescriptor{
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc,
+        .size = {MarkWidth, MarkHeight, 1},
+        .format = sun_visibility::Format,
+    };
+    const wgpu::Texture target = device.CreateTexture(&targetDescriptor);
+    const wgpu::RenderPassColorAttachment color{
+        .view = target.CreateView(),
+        .loadOp = wgpu::LoadOp::Clear,
+        .storeOp = wgpu::StoreOp::Store,
+        .clearValue = {0.0, 0.0, 0.0, 0.0},
+    };
+    const wgpu::RenderPassDescriptor passDescriptor{.colorAttachmentCount = 1, .colorAttachments = &color};
+    constexpr uint32_t Row = 256;
+    const wgpu::BufferDescriptor readDescriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                                .size = uint64_t{Row} * MarkHeight};
+    const wgpu::Buffer readback = device.CreateBuffer(&readDescriptor);
+    const wgpu::CommandEncoder encoder = device.CreateCommandEncoder();
+    const wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&passDescriptor);
+    pass.SetPipeline(m_pipeline);
+    pass.SetBindGroup(0, device.CreateBindGroup(&frameGroup));
+    pass.SetBindGroup(1, device.CreateBindGroup(&passGroup));
+    pass.Draw(3);
+    pass.End();
+    const wgpu::TexelCopyTextureInfo source{.texture = target};
+    const wgpu::TexelCopyBufferInfo destination{.layout = {.bytesPerRow = Row, .rowsPerImage = MarkHeight},
+                                                .buffer = readback};
+    const wgpu::Extent3D extent{MarkWidth, MarkHeight, 1};
+    encoder.CopyTextureToBuffer(&source, &destination, &extent);
+    EXPECT_TRUE(test::submit_and_wait(*m_device, encoder.Finish()));
+    SunOut out;
+    const std::vector<uint32_t> words = read(readback, uint64_t{Row} * MarkHeight);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(words.data());
+    out.vis.resize(size_t{MarkWidth} * MarkHeight);
+    if (words.size() * 4 >= size_t{Row} * MarkHeight) {
+      for (uint32_t y = 0; y < MarkHeight; ++y) {
+        for (uint32_t x = 0; x < MarkWidth; ++x) {
+          out.vis[size_t{y} * MarkWidth + x] = {bytes[y * Row + x * 2], bytes[y * Row + x * 2 + 1]};
+        }
+      }
+    }
+    out.stats = read(m_stats, StatsBytes);
+    return out;
+  }
+
+  static std::vector<float> flat_depth(float z) { return std::vector<float>(size_t{MarkWidth} * MarkHeight, 10.f / z); }
+
+  static std::vector<uint8_t> receivers(uint8_t code = 3) {
+    return std::vector<uint8_t>(size_t{MarkWidth} * MarkHeight, code);
+  }
+
+  static uint32_t single_level(const Views& views, std::span<const float> depth) {
+    const MarkParams params = mark_params();
+    uint32_t level = SunLevels;
+    for (uint32_t y = 0; y < MarkHeight; ++y) {
+      for (uint32_t x = 0; x < MarkWidth; ++x) {
+        const Receiver r = mark_receiver(params, x, y, depth[size_t{y} * MarkWidth + x], 1.f);
+        const uint32_t l = select_level(views, r.footprint, r.pRel, views.header.levelBias);
+        if (level != SunLevels && l != level) {
+          ADD_FAILURE() << "receivers select levels " << level << " and " << l;
+        }
+        level = l;
+      }
+    }
+    return level;
+  }
+
+  wgpu::BindGroupLayout m_frameLayout, m_passLayout;
+  wgpu::RenderPipeline m_pipeline;
+  wgpu::Sampler m_sampler;
+  wgpu::Buffer m_table, m_stats, m_views, m_params;
+  wgpu::Texture m_pool;
+};
+
+uint32_t count_r(const SunOut& out, uint8_t value) {
+  return static_cast<uint32_t>(std::ranges::count_if(out.vis, [&](const auto& t) { return t[0] == value; }));
+}
+
+constexpr uint32_t SunSamples =
+    (MarkWidth / sun_visibility::SampleStride) * (MarkHeight / sun_visibility::SampleStride);
+
+TEST_F(RenderVsmSunGpu, SunVisibilityLitIsExactlyOne) {
+  const Views inside = sun_views();
+  const std::vector<uint32_t> table(MaxVirtualPages, Usable);
+  std::vector<float> depth(size_t{MarkWidth} * MarkHeight);
+  for (size_t i = 0; i < depth.size(); ++i) {
+    depth[i] = static_cast<float>(10.0 / (20.0 * std::exp2(0.1 * static_cast<double>(i % 97))));
+  }
+  const std::vector<uint8_t> codes = receivers();
+  for (const float shift : {0.f, 0.9f, -0.9f}) {
+    Views views = inside;
+    for (ViewRecord& v : views.views) {
+      v.camRel[11] += shift;
+    }
+    for (const uint32_t taps : {1u, 4u, 9u}) {
+      SCOPED_TRACE(::testing::Message() << "shift " << shift << ", taps " << taps);
+      const SunOut out = run(views, table, depth, codes, taps);
+      ASSERT_EQ(out.stats.size(), StatCount);
+      EXPECT_EQ(count_r(out, 255), out.vis.size());
+      EXPECT_TRUE(std::ranges::all_of(out.vis, [](const auto& t) { return t[1] == 255; }));
+      EXPECT_EQ(out.stats[stat::SunUnshadowed], 0u);
+      EXPECT_EQ(out.stats[stat::SunSamples], SunSamples);
+      EXPECT_EQ(out.stats[stat::SunSampledOutOfRange], shift == 0.f ? 0u : SunSamples);
+    }
+  }
+}
+
+TEST_F(RenderVsmSunGpu, SunVisibilityCodeRule) {
+  std::array<float, SunPoolPages> pages{};
+  pages.fill(1.f);
+  fill_pool(pages);
+  const std::vector<uint32_t> table(MaxVirtualPages, Usable);
+  std::vector<float> depth = flat_depth(100.f);
+  std::vector<uint8_t> codes(depth.size());
+  for (size_t i = 0; i < depth.size(); ++i) {
+    codes[i] = static_cast<uint8_t>(i % 4);
+    if (i % 7 == 0) {
+      depth[i] = 0.f;
+    }
+  }
+  const SunOut out = run(sun_views(), table, depth, codes);
+  uint32_t shadowed = 0;
+  for (size_t i = 0; i < depth.size(); ++i) {
+    const bool receiver = depth[i] > 0.f && codes[i] >= 2;
+    EXPECT_EQ(out.vis[i][0], receiver ? 0 : 255) << i;
+    EXPECT_EQ(out.vis[i][1], 255) << i;
+    shadowed += receiver ? 1 : 0;
+  }
+  EXPECT_GT(shadowed, depth.size() / 3);
+}
+
+TEST_F(RenderVsmSunGpu, StaleBeforeCoarser) {
+  fill_pool({1.f, 0.f});
+  const Views views = sun_views();
+  const std::vector<float> depth = flat_depth(100.f);
+  const uint32_t level = single_level(views, depth);
+  ASSERT_LT(level + FallbackLevels + 1, SunLevels);
+  const std::vector<uint8_t> codes = receivers();
+
+  std::array<uint32_t, SunLevels> levels{};
+  levels.fill(Usable | 1u);
+  levels[level] = Usable | entry::Dirty;
+  const SunOut stale = run(views, level_table(levels), depth, codes);
+  EXPECT_EQ(count_r(stale, 0), stale.vis.size()) << "a stale page is used before a coarser one";
+  EXPECT_EQ(stale.stats[stat::SunSampledStale], SunSamples);
+  EXPECT_EQ(stale.stats[stat::SunSampledFallback], 0u);
+  EXPECT_EQ(stale.stats[stat::SunUnshadowed], 0u);
+
+  levels[level] = Usable | entry::RenderNow | 1u;
+  levels[level + 1] = Usable;
+  const SunOut coarser = run(views, level_table(levels), depth, codes);
+  EXPECT_EQ(count_r(coarser, 0), coarser.vis.size()) << "an unusable page falls back to the next level";
+  EXPECT_EQ(coarser.stats[stat::SunSampledFallback], SunSamples);
+  EXPECT_EQ(coarser.stats[stat::SunUnshadowed], 0u);
+
+  levels.fill(Usable);
+  for (uint32_t k = 0; k <= FallbackLevels; ++k) {
+    levels[level + k] = k == 0 ? 0u : Usable | entry::RenderNow;
+  }
+  const SunOut none = run(views, level_table(levels), depth, codes);
+  EXPECT_EQ(count_r(none, 255), none.vis.size()) << "no usable level within reach leaves the pixel lit";
+  EXPECT_EQ(none.stats[stat::SunUnshadowed], 1u);
+  EXPECT_EQ(none.stats[stat::SunSampledUnshadowed], SunSamples);
+}
+
+detail::StageData sun_stage(uint64_t frameId) {
+  detail::StageData stage{.stage = Stage::OpaqueDone, .frameId = frameId, .markerSeen = true};
+  auto hints = std::make_shared<detail::SceneHints>();
+  hints->present = detail::SceneHasMainCamera | detail::SceneHasLights;
+  Mat4x4<float> proj{};
+  proj.m0[0] = 1.2990381f;
+  proj.m1[1] = 1.7320508f;
+  proj.m2[2] = -1.f / 999.f;
+  proj.m2[3] = -1000.f / 999.f;
+  proj.m3[2] = -1.f;
+  hints->mainCamera = {
+      .role = AURORA_CAMERA_MAIN,
+      .view = {{1.f, 0.f, 0.f, 0.f}, {0.f, 1.f, 0.f, 0.f}, {0.f, 0.f, 1.f, 0.f}},
+      .proj = proj,
+      .type = GX_PERSPECTIVE,
+      .gxProj = gx::hints::gx_projection(proj, GX_PERSPECTIVE),
+  };
+  AuroraLight fill{};
+  fill.id = 3;
+  fill.type = AURORA_LIGHT_DIRECTIONAL;
+  AuroraLight sun = fill;
+  sun.id = 7;
+  hints->lights = {fill, sun};
+  stage.sceneHints = std::move(hints);
+  auto frame = std::make_shared<scene::retained::Frame>();
+  frame->plan = std::make_shared<const scene::streamout::Plan>();
+  stage.retained = std::move(frame);
+  return stage;
+}
+
+TEST_F(RenderVsmSunGpu, UnshadowedLeavesPlanAndLightIndex) {
+  namespace deferred = detail::lighting::deferred;
+  testing::set_active(true);
+  testing::set_plan(
+      {.producing = true, .lightId = 7, .dirWorld = sun_dir(38.0, 140.0), .elevationDeg = 38.0, .idle = Idle::None});
+  testing::set_compact_ready(true);
+  testing::set_pipeline_query([](uint32_t) noexcept { return true; });
+  testing::set_sun_bound(true);
+  detail::composite::testing::set_exposure_units(true);
+  register_chain_pipeline(shaders::PipelineId{1});
+  on_latch({}, nullptr);
+  const detail::StageData before = sun_stage(1);
+  ASSERT_TRUE(chain_enabled(before));
+  ASSERT_EQ(sun_visibility::light_index(before), 1u);
+  deferred::Params params;
+  deferred::fill_params(nullptr, true, deferred::Mode::Full, params, false, sun_visibility::light_index(before));
+
+  fill_pool({1.f});
+  const Views views = sun_views();
+  const std::vector<float> depth = flat_depth(100.f);
+  const uint32_t level = single_level(views, depth);
+  ASSERT_LT(level + FallbackLevels, SunLevels);
+  std::array<uint32_t, SunLevels> levels{};
+  levels.fill(Usable);
+  for (uint32_t k = 0; k <= FallbackLevels; ++k) {
+    levels[level + k] = 0;
+  }
+  const SunOut out = run(views, level_table(levels), depth, receivers());
+  EXPECT_EQ(out.stats[stat::SunUnshadowed], 1u);
+  EXPECT_EQ(count_r(out, 255), out.vis.size());
+
+  on_latch({}, nullptr);
+  const detail::StageData after = sun_stage(2);
+  EXPECT_TRUE(plan().producing);
+  EXPECT_EQ(plan().lightId, 7u);
+  EXPECT_EQ(sun_visibility::light_index(after), 1u);
+  deferred::Params again;
+  deferred::fill_params(nullptr, true, deferred::Mode::Full, again, false, sun_visibility::light_index(after));
+  EXPECT_NE(again.flags & deferred::FlagSunShadow, 0u);
+  EXPECT_EQ(again.flags, params.flags);
+  EXPECT_EQ(again.reserved[0], params.reserved[0]);
+}
+
+TEST_F(RenderVsmSunGpu, BailedFrameFallsBackCoarser) {
+  fill_pool({1.f, 0.f});
+  const Views views = sun_views();
+  const std::vector<float> depth = flat_depth(100.f);
+  const uint32_t level = single_level(views, depth);
+  ASSERT_LT(level + 1, SunLevels);
+  std::array<uint32_t, SunLevels> levels{};
+  levels.fill(Usable | 1u);
+  levels[level] = Usable | entry::RenderNow | entry::Dirty | 1u;
+  levels[level + 1] = Usable;
+  const SunOut out = run(views, level_table(levels), depth, receivers());
+  EXPECT_EQ(count_r(out, 0), out.vis.size()) << "RenderNow pages left by a bailed frame are skipped";
+  EXPECT_EQ(out.stats[stat::SunSampledFallback], SunSamples);
+  EXPECT_EQ(out.stats[stat::SunUnshadowed], 0u);
+
+  constexpr uint32_t Chain = chain_bit::Update | chain_bit::Raster | chain_bit::Commit;
+  const auto input = [](uint32_t frame) {
+    return FrameInput{
+        .frameIndex = frame,
+        .hintFrame = frame,
+        .eye = TestEye,
+        .planDir = sun_dir(38.0, 140.0),
+        .lightId = 2,
+        .texel0 = TestTexel0,
+        .producing = true,
+        .coverageComplete = true,
+        .pages = 1024,
+        .pagesX = 32,
+        .budget = 64,
+        .generation = 1,
+        .chainMask = Chain,
+    };
+  };
+  (void)decide_frame(input(1));
+  mark_encoded(Chain);
+  EXPECT_EQ(decide_frame(input(2)).reasons, 0u);
+  mark_encoded(chain_bit::Update);
+  EXPECT_EQ(decide_frame(input(3)).reasons, full_reason::ChainIncomplete);
 }
 } // namespace
 } // namespace aurora::render::shadows::vsm
