@@ -50,13 +50,21 @@ constexpr uint32_t MaxCheckLog = 32;
 constexpr uint32_t MaxCheckErrors = 8;
 constexpr uint32_t WireWidth = 640;
 constexpr uint32_t WireHeight = 480;
-constexpr uint32_t HeaderJobWords = frame::LateFrame;
+constexpr uint32_t HeaderWords = frame::LateFrame + 1;
 constexpr uint64_t ShutdownWaitMs = 2000;
 constexpr uint32_t PoolCount = 5;
 constexpr uint32_t PersistentCount = 8;
 constexpr std::array<std::string_view, 3> PipelineEntries{"write_jobs", "roll_jobs", "write_indices"};
 constexpr std::string_view LibraryShader = "scene/streamout";
 constexpr std::string_view PassName = "scene.streamout";
+constexpr std::string_view LatePassName = "scene.streamout_late";
+
+struct PassPhases {
+  std::string_view after;
+  std::string_view before;
+};
+constexpr PassPhases OpaquePhases{phase::Capture, phase::Geometry};
+constexpr PassPhases LatePhases{phase::PreTaa, phase::Taa};
 constexpr std::array<std::string_view, PersistentCount> PersistentNames{
     "scene.gx_vertex", "scene.gx_storage", "scene.gx_index", "scene.vertices",
     "scene.indices",   "scene.instances",  "scene.palettes", "scene.frame",
@@ -153,6 +161,12 @@ struct CameraState {
   uint32_t cutEpoch = 0;
 };
 
+struct FrameUse {
+  uint32_t pieces = 0;
+  uint32_t streamVertices = 0;
+  uint32_t newVertices = 0;
+};
+
 struct Tentative {
   std::shared_ptr<Plan> plan;
   std::vector<Tlsf::BlockId> vtxAllocs;
@@ -167,6 +181,7 @@ struct Tentative {
   uint32_t pieces = 0;
   CameraState camera;
   uint64_t movedLatched = 0;
+  FrameUse use;
 };
 
 struct Pick {
@@ -208,15 +223,25 @@ bool g_clearPending = true;
 uint32_t g_seenBreaks = 0;
 uint32_t g_pendingStatics = 0;
 uint32_t g_streamedCount = 0;
-uint32_t g_owedOpaque = 0;
-uint32_t g_owedLate = 0;
+uint32_t g_owed = 0;
+uint32_t g_refusedLost = 0;
+uint32_t g_undelivered = 0;
 uint64_t g_hintFrame = 0;
-std::array<uint64_t, ReserveFrames> g_reserve{};
+
+struct SealRoom {
+  std::array<uint64_t, ReserveFrames> after{};
+  uint32_t ring = 0;
+  uint64_t end = 0;
+  bool sealed = false;
+};
+std::array<SealRoom, 2> g_seals{};
 std::array<uint64_t, ReserveFrames> g_blocks{};
-uint32_t g_ring = 0;
-uint64_t g_lastSealEnd = 0;
-bool g_sealedLastFrame = false;
+uint32_t g_blockRing = 0;
+uint64_t g_frameBlocks = 0;
 CameraState g_prevCamera;
+CameraState g_framePrevCamera;
+bool g_frameReset = false;
+FrameUse g_frameUse;
 bool g_liveChanged = true;
 Stats g_stats;
 std::vector<uint32_t> g_block;
@@ -241,6 +266,7 @@ wgpu::Device g_device;
 wgpu::BindGroupLayout g_groupLayout;
 wgpu::PipelineLayout g_pipelineLayout;
 detail::PassId g_pass = detail::InvalidPassId;
+detail::PassId g_latePass = detail::InvalidPassId;
 std::array<detail::PersistentHandle, PersistentCount> g_handles{};
 std::array<wgpu::Buffer, PoolCount> g_pools;
 bool g_poolsLive = false;
@@ -612,6 +638,8 @@ struct BuildInput {
   uint32_t frameIndex = 0;
   uint32_t serial = 0;
   bool clearInstances = false;
+  bool reset = false;
+  bool late = false;
 };
 
 struct BuildOutput {
@@ -650,10 +678,11 @@ void record_words(const Pending& p, const Pick& pick, uint32_t frameIndex, const
   out[record::BoundsOffset] = NoBounds;
 }
 
-void header_words(const BuildInput& in, std::array<uint32_t, HeaderJobWords>& out) {
+void header_words(const BuildInput& in, std::array<uint32_t, HeaderWords>& out) {
   out.fill(0);
   out[frame::FrameIndex] = in.frameIndex;
-  out[frame::Flags] = (in.camera.valid ? frame::CameraValid : 0) | (in.clearInstances ? frame::Reset : 0);
+  out[frame::Flags] = (in.camera.valid ? frame::CameraValid : 0) | (in.reset ? frame::Reset : 0);
+  out[frame::LateFrame] = in.late ? in.frameIndex : 0;
   out[frame::Serial] = in.serial;
   for (int i = 0; i < 3; ++i) {
     split(in.camera.eye[i], out[frame::CamHi + i], out[frame::CamLo + i]);
@@ -673,9 +702,10 @@ BuildOutput build_block(const BuildInput& in) {
     uint32_t target, dst, src, count;
   };
   std::vector<Job> jobs;
-  std::array<uint32_t, HeaderJobWords> header{};
+  std::array<uint32_t, HeaderWords> header{};
   header_words(in, header);
-  jobs.push_back({block::TargetFrame, 0, writer.add_data(header.data(), HeaderJobWords), HeaderJobWords});
+  const uint32_t headerWords = in.late ? HeaderWords : frame::LateFrame;
+  jobs.push_back({block::TargetFrame, 0, writer.add_data(header.data(), headerWords), headerWords});
   const uint32_t zero = 0;
   const uint32_t zeroWord = writer.add_data(&zero, 1);
 
@@ -921,9 +951,9 @@ bool place_piece(const Pending& p, const SlotState& st, bool countsChanged, Pick
 }
 
 void plan_pieces(Tentative& t, bool overrun, bool cut, bool epochChanged, std::vector<Pick>& picks) {
-  uint32_t streamVertices = 0;
-  uint32_t newVertices = 0;
-  uint32_t pieces = 0;
+  uint32_t streamVertices = g_frameUse.streamVertices;
+  uint32_t newVertices = g_frameUse.newVertices;
+  uint32_t pieces = g_frameUse.pieces;
   for (int pass = 0; pass < 3; ++pass) {
     for (uint32_t i = 0; i < g_pending.size(); ++i) {
       const Pending& p = g_pending[i];
@@ -997,6 +1027,7 @@ void plan_pieces(Tentative& t, bool overrun, bool cut, bool epochChanged, std::v
       picks.push_back(pick);
     }
   }
+  t.use = {.pieces = pieces, .streamVertices = streamVertices, .newVertices = newVertices};
 }
 
 void commit_plan(Tentative& t) {
@@ -1032,10 +1063,16 @@ void commit_plan(Tentative& t) {
   g_lastCommitted = t.plan->serial;
   if (t.plan->clearInstances) {
     g_clearPending = false;
+    g_frameReset = true;
   }
   g_prevCamera = t.camera;
+  g_frameUse = t.use;
   ++g_stats.committed;
   g_stats.pieces += t.pieces;
+  if (t.plan->late) {
+    ++g_stats.latePlans;
+    g_stats.latePieces += t.pieces;
+  }
   for (const PlanEvent& event : t.plan->events) {
     g_stats.moved += event.type == EventType::Moved ? 1 : 0;
     g_stats.uvChanged += event.type == EventType::UvChanged ? 1 : 0;
@@ -1055,6 +1092,22 @@ void resync() noexcept {
   clear_stream_state();
   ++g_stats.resyncs;
   Log.warn("Retained scene: the stream-out chain broke; every instance streams again");
+}
+
+bool late_work(const Tentative& t, const std::vector<Pick>& picks) noexcept {
+  if (!g_freed.empty() || t.captureOnly + t.lostAtCommit != 0 || g_undelivered != 0) {
+    return true;
+  }
+  return std::ranges::any_of(picks, [](const Pick& pick) { return pick.stream || pick.full || pick.moved || pick.uv; });
+}
+
+void touch(const std::vector<Pick>& picks) noexcept {
+  for (const Pick& pick : picks) {
+    const Pending& p = g_pending[pick.pending];
+    SlotState& st = g_slots[p.slot];
+    st.lastSeen = g_hintFrame;
+    st.lastCaptureOnly = capture_only(p);
+  }
 }
 
 std::array<wgpu::Buffer, PoolCount> make_pools(const wgpu::Device& device) {
@@ -1088,14 +1141,15 @@ bool gx_buffer_source(void* context, detail::PersistentBuffer& out) {
   return true;
 }
 
-void declare(detail::InternalPassBuilder& builder, const detail::PassSetup& setup, const void*) {
+void declare(detail::InternalPassBuilder& builder, const detail::PassSetup& setup, const void* state) {
   if (setup.env == nullptr || !setup.env->retained || setup.caps == nullptr || !supported(*setup.caps) ||
       !g_pipelineLayout || g_handles[0].id == 0) {
     builder.skip();
     return;
   }
-  builder.after(phase::Capture);
-  builder.before(phase::Geometry);
+  const auto* phases = static_cast<const PassPhases*>(state);
+  builder.after(phases->after);
+  builder.before(phases->before);
   builder.manual_bindings();
   Local local;
   for (uint32_t i = 0; i < PersistentCount; ++i) {
@@ -1246,6 +1300,7 @@ void verify(const CheckRequest& request, const CheckLayout& layout, const uint8_
   };
   const uint32_t frameIndex = word(layout.frameOffset + frame::FrameIndex * 4);
   const uint32_t breaks = word(layout.frameOffset + frame::BreakCount * 4);
+  const uint32_t lateFrame = word(layout.frameOffset + frame::LateFrame * 4);
   if (frameIndex != request.frame) {
     fail(fmt::format("header frame {} is not {}", frameIndex, request.frame));
   }
@@ -1285,6 +1340,7 @@ void verify(const CheckRequest& request, const CheckLayout& layout, const uint8_
       hi[k] = ordered_to_f32(field(record::CurAabb + 3 + k));
     }
     const bool noNormal = (flags & instance_flag::NoNormal) != 0;
+    const bool noColor = (flags & instance_flag::NoColor) != 0;
     std::vector<std::array<double, 3>> positions(range.vertexCount);
     for (uint32_t v = 0; v < range.vertexCount; ++v) {
       const uint64_t at = layout.vertexOffsets[i] + uint64_t{v} * vertex::Bytes;
@@ -1300,6 +1356,10 @@ void verify(const CheckRequest& request, const CheckLayout& layout, const uint8_
       }
       if (((aux & vertex::HasNormal) != 0) == noNormal) {
         fail(fmt::format("slot {} vertex {} normal presence disagrees with NoNormal", range.slot, v));
+        break;
+      }
+      if (((aux & vertex::HasColor) != 0) == noColor) {
+        fail(fmt::format("slot {} vertex {} colour presence disagrees with NoColor", range.slot, v));
         break;
       }
       positions[v] = {p[0], p[1], p[2]};
@@ -1364,8 +1424,10 @@ void verify(const CheckRequest& request, const CheckLayout& layout, const uint8_
   g_check.vertices += vertices;
   g_check.indices += indices;
   g_check.failures += failures;
-  Log.info("Retained: check frame {}: {} instances, {} with this frame's world, {} streamed this frame, breakCount {}",
-           request.frame, layout.ranges, worldCurrent, streamCurrent, breaks);
+  Log.info(
+      "Retained: check frame {}: {} instances, {} with this frame's world, {} streamed this frame, breakCount {}, "
+      "lateFrame {}",
+      request.frame, layout.ranges, worldCurrent, streamCurrent, breaks, lateFrame);
   if (wire && !g_wirePath.empty()) {
     if (!gfx::png::write_rgba8_png(g_wirePath, WireWidth, WireHeight, {wire->pixels.data(), wire->pixels.size()})) {
       Log.error("Retained: the wireframe check image could not be written to {}", g_wirePath);
@@ -1457,7 +1519,7 @@ void encode_stream(const wgpu::CommandEncoder& encoder, std::string_view name,
     w.chain.broken = true;
   }
   const uint32_t breaks = g_breakCount.load(std::memory_order_relaxed) + (chain == testing::Chain::Break ? 1 : 0);
-  const wgpu::ComputePassDescriptor descriptor{.label = "scene.streamout",
+  const wgpu::ComputePassDescriptor descriptor{.label = wgpu::StringView{name.data(), name.size()},
                                                .timestampWrites = webgpu::gpu_prof::pass_writes(name)};
   if (chain != testing::Chain::Accept) {
     if (chain == testing::Chain::Break) {
@@ -1547,15 +1609,14 @@ void log_stats() {
   }
   Log.info(
       "Retained: stream-out plans {} committed {} uncommitted {} header-only {} pieces {} vertices {} moved {} uv "
-      "{} freed {} resyncs {} variants {}",
+      "{} freed {} resyncs {} variants {} late plans {} late pieces {}",
       s.plans, s.committed, s.uncommitted, s.headerOnly, s.pieces, s.streamedVertices, s.moved, s.uvChanged, s.freed,
-      s.resyncs, g_variants.size());
+      s.resyncs, g_variants.size(), s.latePlans, s.latePieces);
   Log.info(
-      "Retained: stream-out skipped late {} transient {} palette {} line {} large {} slot {}; deferred variant "
+      "Retained: stream-out skipped transient {} palette {} line {} large {} slot {}; deferred variant "
       "{} failed {} cap {} pool {} overrun {} headroom {} refused {}; lost {}",
-      s.lateDropped, s.transientSkipped, s.paletteDeferred, s.lineSkipped, s.largeSkipped, s.slotSkipped,
-      s.variantPending, s.variantFailed, s.capDeferred, s.poolFull, s.overrunDeferred, s.headroomDeferred, s.refused,
-      s.lost);
+      s.transientSkipped, s.paletteDeferred, s.lineSkipped, s.largeSkipped, s.slotSkipped, s.variantPending,
+      s.variantFailed, s.capDeferred, s.poolFull, s.overrunDeferred, s.headroomDeferred, s.refused, s.lost);
 }
 
 void log_check_result() {
@@ -1639,15 +1700,20 @@ void initialize() {
   if (g_pass == detail::InvalidPassId) {
     g_pass = detail::register_pass(pass_desc());
   }
+  if (g_latePass == detail::InvalidPassId) {
+    g_latePass = detail::register_pass(late_pass_desc());
+  }
   retained::add_settle_predicate(&settled);
 }
 
 void shutdown() {
   log_stats();
   log_check_result();
-  if (g_pass != detail::InvalidPassId) {
-    detail::unregister_pass(g_pass);
-    g_pass = detail::InvalidPassId;
+  for (detail::PassId* pass : {&g_pass, &g_latePass}) {
+    if (*pass != detail::InvalidPassId) {
+      detail::unregister_pass(*pass);
+      *pass = detail::InvalidPassId;
+    }
   }
   destroy_pools();
   for (detail::PersistentHandle& handle : g_handles) {
@@ -1710,10 +1776,19 @@ bool begin_frame(bool gate, uint64_t frame) noexcept {
     return false;
   }
   g_hintFrame = frame;
+  g_framePrevCamera = g_prevCamera;
+  g_frameReset = false;
+  g_frameUse = {};
   const gfx::detail::StreamRoom room = g_room != nullptr ? *g_room : gfx::detail::stream_room();
-  if (std::exchange(g_sealedLastFrame, false)) {
-    g_reserve[g_ring] = room.lastFrameStorage > g_lastSealEnd ? room.lastFrameStorage - g_lastSealEnd : 0;
-    g_ring = (g_ring + 1) % ReserveFrames;
+  for (SealRoom& seal : g_seals) {
+    if (std::exchange(seal.sealed, false)) {
+      seal.after[seal.ring] = room.lastFrameStorage > seal.end ? room.lastFrameStorage - seal.end : 0;
+      seal.ring = (seal.ring + 1) % ReserveFrames;
+    }
+  }
+  if (g_frameBlocks != 0) {
+    g_blocks[g_blockRing] = std::exchange(g_frameBlocks, 0);
+    g_blockRing = (g_blockRing + 1) % ReserveFrames;
   }
   const uint64_t largest = *std::ranges::max_element(g_blocks);
   if (largest != 0 && g_room == nullptr) {
@@ -1735,8 +1810,9 @@ void end_frame() noexcept {
   }
   rollback();
   g_pending.clear();
-  g_owedOpaque = 0;
-  g_owedLate = 0;
+  g_owed = 0;
+  g_refusedLost = 0;
+  g_undelivered = 0;
   g_stats.breakCount = g_breakCount.load(std::memory_order_relaxed);
   g_stats.variants = static_cast<uint32_t>(g_variants.size());
   g_stats.live = g_streamedCount;
@@ -1750,11 +1826,17 @@ void reset() noexcept {
     clear_stream_state();
   }
   g_pending.clear();
-  g_owedOpaque = 0;
-  g_owedLate = 0;
-  g_reserve = {};
+  g_owed = 0;
+  g_refusedLost = 0;
+  g_undelivered = 0;
+  g_seals = {};
   g_blocks = {};
+  g_blockRing = 0;
+  g_frameBlocks = 0;
   g_prevCamera = {};
+  g_framePrevCamera = {};
+  g_frameReset = false;
+  g_frameUse = {};
   g_coverage.store(0, std::memory_order_relaxed);
   std::lock_guard lock{g_publishMutex};
   g_published = {};
@@ -1769,16 +1851,13 @@ void on_capture(const Capture& c) noexcept {
     return;
   }
   const bool only = (c.entryFlags & retained::entry_flag::CaptureOnly) != 0;
-  if ((c.entryFlags & retained::entry_flag::Late) != 0) {
-    ++g_stats.lateDropped;
-    g_owedLate += only ? 1 : 0;
-    return;
-  }
+  const bool transient = (c.entryFlags & retained::entry_flag::Transient) != 0 || c.slot >= InstanceSlots;
+  g_undelivered += !transient && !c.delivered ? 1 : 0;
   const auto skip = [&](uint64_t& counter) {
     ++counter;
-    g_owedOpaque += only ? 1 : 0;
+    g_owed += only ? 1 : 0;
   };
-  if ((c.entryFlags & retained::entry_flag::Transient) != 0 || c.slot >= InstanceSlots) {
+  if (transient) {
     return skip(g_stats.transientSkipped);
   }
   if (c.prim == GX_LINES || c.prim == GX_LINESTRIP || c.prim == GX_POINTS) {
@@ -1845,9 +1924,11 @@ void on_capture(const Capture& c) noexcept {
   set((c.classBits & retained::class_bit::Billboard) != 0, instance_flag::Billboard);
   set(!p.hasNormalAttr || !rigidNormal, instance_flag::NoNormal);
   set((c.classBits & retained::class_bit::Water) != 0, instance_flag::Water);
+  set((c.entryFlags & retained::entry_flag::Late) != 0, instance_flag::Late);
   set((c.classBits & retained::class_bit::Blended) != 0, instance_flag::Blended);
   set(determinant(p.world) < 0.0, instance_flag::NegativeDeterminant);
   set(alphaSame, instance_flag::AlphaUvIsUv0);
+  set(c.attrs[GX_VA_CLR0].attrType == GX_NONE, instance_flag::NoColor);
   flags |= (static_cast<uint32_t>(gx::g_gxState.cullMode) << instance_flag::CullShift) & instance_flag::CullMask;
   std::array<double, 6> xform{};
   if (uvTex != NoTex) {
@@ -1910,18 +1991,25 @@ void seal(retained::Frame& out, const detail::StageData& stage) noexcept {
     return;
   }
   rollback();
-  if (stage.stage != Stage::OpaqueDone) {
+  g_refusedLost = 0;
+  const bool late = stage.stage == Stage::PrePost;
+  if (!late && stage.stage != Stage::OpaqueDone) {
     return;
   }
-  ++g_stats.plans;
   const gfx::detail::StreamRoom room = g_room != nullptr ? *g_room : gfx::detail::stream_room();
   Tentative t;
   t.camera = current_camera();
-  const bool cut = g_prevCamera.valid && t.camera.cutEpoch != g_prevCamera.cutEpoch;
+  const bool cut = g_framePrevCamera.valid && t.camera.cutEpoch != g_framePrevCamera.cutEpoch;
   const bool epochChanged = detail::live_scene_hints().sceneEpochChanged;
   std::vector<Pick> picks;
   plan_pieces(t, room.overrun, cut, epochChanged, picks);
-  const uint64_t reserve = *std::ranges::max_element(g_reserve);
+  if (late && !late_work(t, picks)) {
+    touch(picks);
+    return;
+  }
+  ++g_stats.plans;
+  SealRoom& sealRoom = g_seals[late ? 1 : 0];
+  const uint64_t reserve = *std::ranges::max_element(sealRoom.after);
 
   auto plan = std::make_shared<Plan>();
   plan->frame = g_hintFrame;
@@ -1929,12 +2017,15 @@ void seal(retained::Frame& out, const detail::StageData& stage) noexcept {
   plan->serial = ++g_serial == 0 ? ++g_serial : g_serial;
   plan->clearInstances = g_clearPending;
   plan->baseSerial = g_clearPending ? 0 : g_lastCommitted;
+  plan->late = late;
   const BuildInput base{
       .camera = t.camera,
-      .prevCamera = g_prevCamera.valid ? g_prevCamera : t.camera,
+      .prevCamera = g_framePrevCamera.valid ? g_framePrevCamera : t.camera,
       .frameIndex = stage.frameIndex,
       .serial = plan->serial,
       .clearInstances = plan->clearInstances,
+      .reset = plan->clearInstances || (late && g_frameReset),
+      .late = late,
   };
   BuildInput input = base;
   input.picks = std::move(picks);
@@ -1952,6 +2043,7 @@ void seal(retained::Frame& out, const detail::StageData& stage) noexcept {
     undo_allocations(t);
     t.lostAtCommit += t.captureOnly;
     t.captureOnly = 0;
+    t.use = g_frameUse;
     input = base;
     input.frees = g_freed;
     built = build_block(input);
@@ -1963,7 +2055,7 @@ void seal(retained::Frame& out, const detail::StageData& stage) noexcept {
   plan->idxChunks = built.idxChunks;
   plan->variants = std::move(built.variants);
   plan->events = std::move(built.events);
-  if (check_frame()) {
+  if (!late && check_frame()) {
     plan->check = make_check(stage.frameIndex, built.commits);
   }
   const std::span<const uint8_t> bytes{reinterpret_cast<const uint8_t*>(built.block.data()), built.block.size() * 4};
@@ -1972,7 +2064,7 @@ void seal(retained::Frame& out, const detail::StageData& stage) noexcept {
   if (range.size == 0) {
     ++g_stats.refused;
     undo_allocations(t);
-    g_owedOpaque += t.captureOnly + t.lostAtCommit;
+    g_refusedLost = t.captureOnly + t.lostAtCommit;
     if (g_room == nullptr) {
       gfx::detail::request_streaming_sizes(
           {.vertex = 0, .index = 0, .storage = room.storageCapacity + blockBytes + reserve, .uniform = 0});
@@ -1988,41 +2080,34 @@ void seal(retained::Frame& out, const detail::StageData& stage) noexcept {
   t.blockBytes = static_cast<uint32_t>(bytes.size());
   t.pieces = built.pieces;
   t.sealStorage = room.storageUsed + bytes.size();
-  g_lastSealEnd = t.sealStorage;
-  g_sealedLastFrame = true;
-  g_blocks[g_ring] = bytes.size();
+  sealRoom.end = t.sealStorage;
+  sealRoom.sealed = true;
+  g_frameBlocks += bytes.size();
   g_tentative = std::move(t);
   g_lastPlan = plan;
   out.plan = std::move(plan);
 }
 
 void skip(const detail::StageData& stage) noexcept {
-  if (!g_active || stage.stage != Stage::OpaqueDone || !g_tentative.plan || g_tentative.committed) {
+  if (!g_active || stage.stage != Stage::OpaqueDone) {
     return;
   }
-  g_owedOpaque += g_tentative.captureOnly + g_tentative.lostAtCommit;
+  g_refusedLost = 0;
   rollback();
 }
 
 void sealed(const detail::StageData& stage) noexcept {
-  if (!g_active) {
+  if (!g_active || (stage.stage != Stage::OpaqueDone && stage.stage != Stage::PrePost)) {
     return;
   }
-  if (stage.stage == Stage::OpaqueDone) {
-    uint32_t lost = g_owedOpaque;
-    if (g_tentative.plan) {
-      lost += g_tentative.committed ? g_tentative.lostAtCommit : g_tentative.captureOnly + g_tentative.lostAtCommit;
-      rollback();
-    }
-    g_owedOpaque = 0;
-    g_pending.clear();
-    report(lost);
-    return;
+  uint32_t lost = std::exchange(g_owed, 0) + std::exchange(g_refusedLost, 0);
+  if (g_tentative.plan) {
+    lost += g_tentative.committed ? g_tentative.lostAtCommit : g_tentative.captureOnly + g_tentative.lostAtCommit;
+    rollback();
   }
-  report(g_owedOpaque + g_owedLate);
-  g_owedOpaque = 0;
-  g_owedLate = 0;
   g_pending.clear();
+  g_undelivered = 0;
+  report(lost);
 }
 
 void drop_pending() noexcept {
@@ -2031,8 +2116,9 @@ void drop_pending() noexcept {
   }
   rollback();
   g_pending.clear();
-  g_owedOpaque = 0;
-  g_owedLate = 0;
+  g_owed = 0;
+  g_refusedLost = 0;
+  g_undelivered = 0;
 }
 
 void commit_stage_params(const detail::StageData& stage, const void*, std::span<std::byte> params) {
@@ -2088,6 +2174,24 @@ detail::PassDesc pass_desc() {
       .encode = encode,
       .pipelines = pass_pipelines,
       .stageParams = commit_stage_params,
+      .state = &OpaquePhases,
+  };
+}
+
+detail::PassDesc late_pass_desc() {
+  return {
+      .name = std::string{LatePassName},
+      .stage = Stage::PrePost,
+      .kind = PassKind::Compute,
+      .cls = detail::PassClass::Required,
+      .order = 0,
+      .paramsSize = ParamsSize,
+      .declare = declare,
+      .enabled = enabled,
+      .encode = encode,
+      .pipelines = pass_pipelines,
+      .stageParams = commit_stage_params,
+      .state = &LatePhases,
   };
 }
 
@@ -2112,8 +2216,6 @@ void reset() noexcept {
   g_appliedSerial.store(0, std::memory_order_relaxed);
   g_block.clear();
   g_lastPlan.reset();
-  g_sealedLastFrame = false;
-  g_lastSealEnd = 0;
 }
 
 void set_push(PushFn push) noexcept { g_push = push; }

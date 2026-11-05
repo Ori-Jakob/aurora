@@ -23,6 +23,7 @@ std::string variant_source(std::span<const gx::AttrConfig, gx::MaxVtxAttr> attrs
   config.attrs[GX_VA_NRM] = attrs[GX_VA_NRM];
   config.attrs[GX_VA_CLR0] = attrs[GX_VA_CLR0];
   const bool hasNormal = attrs[GX_VA_NRM].attrType != GX_NONE;
+  const bool hasColor = attrs[GX_VA_CLR0].attrType != GX_NONE;
   const bool hasUv = uvTex < 8 && attrs[GX_VA_TEX0 + uvTex].attrType != GX_NONE;
   const bool hasAlpha = alphaTex < 8 && attrs[GX_VA_TEX0 + alphaTex].attrType != GX_NONE;
   if (hasUv) {
@@ -43,6 +44,14 @@ std::string variant_source(std::span<const gx::AttrConfig, gx::MaxVtxAttr> attrs
         "\n      aux = aux | {}u;"
         "\n    }}",
         block::PieceHasNormal, vertex::HasNormal);
+  }
+  if (hasColor) {
+    loads += fmt::format("\n    let in_clr0 = {};", gx::vertex_fetch::attr_load(config, GX_VA_CLR0, "vidx"));
+    body += fmt::format(
+        "\n    let alpha8 = u32(round(saturate(in_clr0.a) * 255.0));"
+        "\n    let luma8 = u32(round(saturate(dot(in_clr0.rgb, vec3f(0.2126, 0.7152, 0.0722))) * 255.0));"
+        "\n    aux = aux | alpha8 | (luma8 << 8u) | {}u;",
+        vertex::HasColor);
   }
   if (hasUv) {
     loads += fmt::format("\n    let {} = {};", tex_name(uvTex),

@@ -1023,6 +1023,7 @@ void record(const DrawRef& draw) noexcept {
       .latched = seen != nullptr && seen->latched,
       .teleport = (pending.objectFlags & object_flag::Teleport) != 0,
       .gpuArrays = state.gpuArrayMask != 0,
+      .delivered = seen != nullptr && seen->delivered,
       .entryFlags = flags,
       .classBits = classBits,
       .categories = pending.categories,

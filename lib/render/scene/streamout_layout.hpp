@@ -3,7 +3,7 @@
 #include <cstdint>
 
 namespace aurora::render::scene::streamout {
-inline constexpr uint32_t GeneratorRevision = 1;
+inline constexpr uint32_t GeneratorRevision = 2;
 inline constexpr uint32_t WorkgroupSize = 64;
 inline constexpr uint32_t ImmediateSize = 16;
 inline constexpr uint32_t ParamsSize = 16;

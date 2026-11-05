@@ -41,6 +41,7 @@ struct Capture {
   bool latched = false;
   bool teleport = false;
   bool gpuArrays = false;
+  bool delivered = false;
   uint16_t entryFlags = 0;
   uint32_t classBits = 0;
   uint32_t categories = 0;
@@ -138,7 +139,8 @@ struct Stats {
   uint64_t largeSkipped = 0;
   uint64_t paletteDeferred = 0;
   uint64_t slotSkipped = 0;
-  uint64_t lateDropped = 0;
+  uint64_t latePlans = 0;
+  uint64_t latePieces = 0;
   uint64_t transientSkipped = 0;
   uint64_t variantPending = 0;
   uint64_t variantFailed = 0;
@@ -180,6 +182,7 @@ void commit_stage_params(const detail::StageData& stage, const void* state, std:
 void worker_frame_begin(uint64_t frameId, const detail::FrameState* frame);
 
 [[nodiscard]] detail::PassDesc pass_desc();
+[[nodiscard]] detail::PassDesc late_pass_desc();
 [[nodiscard]] std::string variant_source(std::span<const gx::AttrConfig, gx::MaxVtxAttr> attrs, uint8_t stride,
                                          uint8_t uvTex, uint8_t alphaTex);
 [[nodiscard]] std::string_view variant_shader_prefix() noexcept;

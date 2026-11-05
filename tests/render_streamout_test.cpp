@@ -166,6 +166,7 @@ protected:
     sink().stage(sink().userData, Stage::SceneBegin);
     gx::g_gxState.proj = main.gxProj;
     m_offset = 0;
+    ++m_frameIndex;
   }
 
   static void begin_object(uint64_t id, uint32_t categories = AURORA_CAT_DYNAMIC, uint32_t flags = 0) {
@@ -228,8 +229,10 @@ protected:
     end_object();
   }
 
-  std::shared_ptr<const Plan> stage(bool commit = true) {
-    detail::StageData data{.stage = Stage::OpaqueDone, .frameIndex = ++m_frameIndex};
+  std::shared_ptr<const Plan> stage(bool commit = true) { return stage_at(Stage::OpaqueDone, commit); }
+
+  std::shared_ptr<const Plan> stage_at(Stage which, bool commit = true, bool marker = true) {
+    detail::StageData data{.stage = which, .frameIndex = m_frameIndex, .markerSeen = marker};
     retained::prepare(data);
     if (commit) {
       std::array<std::byte, ParamsSize> params{};
@@ -649,6 +652,154 @@ TEST_F(RetainedStreamout, FollowerIndicesAreInstanceLocal) {
   EXPECT_NE(view.piece(0, block::PieceInstance), view.piece(1, block::PieceInstance));
   EXPECT_EQ(view.at(block::IdxChunkCount), 2u);
   end();
+}
+
+TEST_F(RetainedStreamout, LatePiecesSealAtPrePost) {
+  constexpr uint32_t Water = AURORA_CAT_DYNAMIC | AURORA_CAT_WATER;
+  begin_frame();
+  object_draw(0x100);
+  const auto opaque = stage();
+  ASSERT_NE(opaque, nullptr);
+  EXPECT_FALSE(opaque->late);
+  EXPECT_EQ(block().job(0)[3], frame::LateFrame);
+  object_draw(0x101, 6, Water);
+  const auto late = stage_at(Stage::PrePost);
+  ASSERT_NE(late, nullptr);
+  EXPECT_TRUE(late->late);
+  EXPECT_FALSE(late->clearInstances);
+  EXPECT_EQ(late->baseSerial, opaque->serial);
+  const BlockView view = block();
+  ASSERT_EQ(view.pieces(), 1u);
+  EXPECT_EQ(view.piece(0, block::PieceInstance), slot_of(0x101));
+  const auto header = view.job(0);
+  EXPECT_EQ(header[0], block::TargetFrame);
+  EXPECT_EQ(header[1], 0u);
+  ASSERT_EQ(header[3], frame::LateFrame + 1);
+  EXPECT_EQ(*view.data(header[2] + frame::LateFrame), m_frameIndex);
+  EXPECT_EQ(*view.data(header[2] + frame::FrameIndex), m_frameIndex);
+  EXPECT_NE(*view.data(header[2] + frame::Flags) & frame::Reset, 0u);
+  const retained::FrameCounts counts = end();
+  EXPECT_EQ(counts.late, 1u);
+  const uint32_t lateSlot = slot_of(0x101);
+  EXPECT_TRUE(testing::slot(lateSlot).streamed);
+  EXPECT_EQ(testing::slot(lateSlot).flags & (instance_flag::Late | instance_flag::Water),
+            instance_flag::Late | instance_flag::Water);
+  EXPECT_EQ(testing::slot(slot_of(0x100)).flags & instance_flag::Late, 0u);
+  EXPECT_EQ(stats().latePlans, 1u);
+  EXPECT_EQ(stats().latePieces, 1u);
+
+  begin_frame();
+  object_draw(0x100);
+  ASSERT_NE(stage(), nullptr);
+  object_draw(0x101, 6, Water);
+  EXPECT_EQ(stage_at(Stage::PrePost), nullptr);
+  end();
+  EXPECT_EQ(testing::slot(lateSlot).streams, 1u);
+  EXPECT_EQ(stats().latePlans, 1u);
+}
+
+TEST_F(RetainedStreamout, SkippedOpaqueDoneStreamsAtPrePost) {
+  begin_frame();
+  object_draw(0x110, 3, AURORA_CAT_STATIC);
+  object_draw(0x111, 30, AURORA_CAT_STATIC, AURORA_OBJ_CAPTURE_ONLY);
+  detail::StageData opaque{.stage = Stage::OpaqueDone, .frameIndex = m_frameIndex, .markerSeen = true};
+  retained::prepare(opaque);
+  ASSERT_NE(opaque.retained, nullptr);
+  ASSERT_NE(opaque.retained->plan, nullptr);
+  const uint32_t opaqueFirst = block().piece(0, block::PieceOutVertexFirst);
+  retained::skip(opaque);
+  EXPECT_FALSE(testing::slot(slot_of(0x110)).streamed);
+  const auto late = stage_at(Stage::PrePost);
+  ASSERT_NE(late, nullptr);
+  EXPECT_TRUE(late->late);
+  EXPECT_TRUE(late->clearInstances);
+  EXPECT_EQ(late->baseSerial, 0u);
+  EXPECT_EQ(block().pieces(), 2u);
+  EXPECT_EQ(block().piece(0, block::PieceOutVertexFirst), opaqueFirst);
+  const retained::FrameCounts counts = end();
+  EXPECT_EQ(counts.late, 0u);
+  EXPECT_EQ(counts.lostCaptures, 0u);
+  EXPECT_EQ(counts.undeliveredStatics, 0u);
+  for (const uint64_t id : {uint64_t{0x110}, uint64_t{0x111}}) {
+    EXPECT_TRUE(testing::slot(slot_of(id)).streamed) << id;
+    EXPECT_EQ(testing::slot(slot_of(id)).flags & instance_flag::Late, 0u) << id;
+  }
+  EXPECT_TRUE(settled());
+  EXPECT_EQ(stats().uncommitted, 1u);
+  EXPECT_EQ(stats().latePieces, 2u);
+}
+
+TEST_F(RetainedStreamout, OpaqueDoneMissingMarkerKeepsPiecesOpaque) {
+  EXPECT_TRUE(pass_desc().runsWithoutMarker);
+  const detail::PassDesc lateDesc = late_pass_desc();
+  EXPECT_EQ(lateDesc.stage, Stage::PrePost);
+  EXPECT_EQ(lateDesc.paramsSize, ParamsSize);
+  EXPECT_EQ(lateDesc.stageParams, pass_desc().stageParams);
+  begin_frame();
+  object_draw(0x120);
+  object_draw(0x121, 3, AURORA_CAT_DYNAMIC | AURORA_CAT_WATER);
+  const auto opaque = stage_at(Stage::OpaqueDone, true, false);
+  ASSERT_NE(opaque, nullptr);
+  EXPECT_FALSE(opaque->late);
+  EXPECT_EQ(block().pieces(), 2u);
+  EXPECT_EQ(stage_at(Stage::PrePost), nullptr);
+  const retained::FrameCounts counts = end();
+  EXPECT_EQ(counts.late, 0u);
+  EXPECT_TRUE(testing::slot(slot_of(0x121)).streamed);
+  EXPECT_EQ(testing::slot(slot_of(0x121)).flags & instance_flag::Late, 0u);
+  EXPECT_NE(testing::slot(slot_of(0x121)).flags & instance_flag::Water, 0u);
+  EXPECT_EQ(stats().latePlans, 0u);
+}
+
+TEST_F(RetainedStreamout, LatePlanChainsAfterOpaquePlan) {
+  testing::ChainState chain;
+  uint32_t previousLate = 0;
+  for (uint32_t frame = 0; frame < 3; ++frame) {
+    begin_frame();
+    gx::g_gxState.pnMtx[0].pos = affine(0.f, 0.f, -5.f);
+    object_draw(0x130, 3, AURORA_CAT_STATIC);
+    const auto opaque = stage();
+    gx::g_gxState.pnMtx[0].pos = affine(static_cast<float>(frame), 0.f, -5.f);
+    object_draw(0x131);
+    const auto late = stage_at(Stage::PrePost);
+    ASSERT_NE(opaque, nullptr);
+    ASSERT_NE(late, nullptr);
+    EXPECT_TRUE(late->late);
+    EXPECT_FALSE(late->clearInstances);
+    EXPECT_EQ(late->baseSerial, opaque->serial);
+    EXPECT_GT(late->serial, opaque->serial);
+    if (frame > 0) {
+      EXPECT_EQ(opaque->baseSerial, previousLate);
+      EXPECT_TRUE(has_event(*late, EventType::Moved, slot_of(0x131)));
+    }
+    EXPECT_EQ(testing::chain_step(chain, opaque->serial, opaque->baseSerial, opaque->clearInstances),
+              testing::Chain::Accept);
+    EXPECT_EQ(testing::chain_step(chain, late->serial, late->baseSerial, late->clearInstances), testing::Chain::Accept);
+    previousLate = late->serial;
+    end();
+  }
+  EXPECT_EQ(testing::slot(slot_of(0x131)).streams, 1u);
+  EXPECT_EQ(stats().latePlans, 3u);
+}
+
+TEST_F(RetainedStreamout, UndeliveredLateEntriesOpenPrePost) {
+  gx::g_gxState.vtxDesc[GX_VA_PNMTXIDX] = GX_DIRECT;
+  m_config.shaderConfig.attrs[GX_VA_PNMTXIDX] = {.attrType = GX_DIRECT, .cnt = 1, .compType = GX_U8};
+  begin_frame();
+  ASSERT_NE(stage(), nullptr);
+  object_draw(0x140, 3, AURORA_CAT_STATIC);
+  const auto late = stage_at(Stage::PrePost);
+  ASSERT_NE(late, nullptr);
+  EXPECT_TRUE(late->header_only());
+  EXPECT_EQ(end().undeliveredStatics, 0u);
+  EXPECT_FALSE(testing::slot(slot_of(0x140)).streamed);
+
+  begin_frame();
+  ASSERT_NE(stage(), nullptr);
+  object_draw(0x140, 3, AURORA_CAT_STATIC);
+  EXPECT_EQ(stage_at(Stage::PrePost), nullptr);
+  end();
+  EXPECT_EQ(stats().paletteDeferred, 2u);
 }
 
 TEST(RetainedMapPick, SelectsFirstColourMapAndLastAlphaMap) {

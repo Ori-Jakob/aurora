@@ -161,8 +161,9 @@ protected:
     m_device->queue.WriteBuffer(target, offset, padded.data(), padded.size());
   }
 
-  std::shared_ptr<const Plan> seal_and_commit(std::shared_ptr<retained::Frame>& frame) {
-    detail::StageData data{.stage = Stage::OpaqueDone, .frameIndex = FrameIndex};
+  std::shared_ptr<const Plan> seal_and_commit(std::shared_ptr<retained::Frame>& frame,
+                                              Stage stage = Stage::OpaqueDone) {
+    detail::StageData data{.stage = stage, .frameIndex = FrameIndex};
     frame = std::make_shared<retained::Frame>();
     seal(*frame, data);
     data.retained = frame;
@@ -473,8 +474,159 @@ TEST_F(RetainedStreamoutGpu, AlphaUvFixedPointAndClampFlag) {
   end_frame();
 }
 
+TEST_F(RetainedStreamoutGpu, AuxPacksAlphaAndLuma) {
+  struct Case {
+    GXCompType type;
+    uint32_t bytes;
+    std::array<uint8_t, 4> raw;
+    uint32_t alpha;
+    uint32_t luma;
+  };
+  const std::array<Case, 5> cases{{
+      {GX_RGBA8, 4, {10, 20, 30, 40}, 40, 19},
+      {GX_RGBA8, 4, {255, 255, 255, 255}, 255, 255},
+      {GX_RGB565, 2, {0xFF, 0xFF, 0, 0}, 255, 255},
+      {GX_RGBA4, 2, {0x9A, 0xC8, 0, 0}, 136, 169},
+      {GX_RGBA8, 0, {}, 0, 0},
+  }};
+  gx::g_gxState = {};
+  gx::g_gxState.pnMtx[0].pos = {{1.f, 0.f, 0.f, 0.f}, {0.f, 1.f, 0.f, 0.f}, {0.f, 0.f, 1.f, -10.f}};
+  const Affine invView = to_affine(Mat3x4<float>{{1.f, 0.f, 0.f, 0.f}, {0.f, 1.f, 0.f, 0.f}, {0.f, 0.f, 1.f, 0.f}});
+  const Affine world = to_affine(gx::g_gxState.pnMtx[0].pos);
+  std::vector<std::array<gx::AttrConfig, gx::MaxVtxAttr>> attrs(cases.size());
+  std::vector<gx::DrawImmediateData> immediates(cases.size());
+  std::vector<uint8_t> vertexBytes;
+  ASSERT_FALSE(begin_frame(true, 1));
+  for (size_t i = 0; i < cases.size(); ++i) {
+    const Case& c = cases[i];
+    const uint32_t stride = 12 + c.bytes;
+    attrs[i][GX_VA_POS] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32};
+    if (c.bytes != 0) {
+      attrs[i][GX_VA_CLR0] = {.attrType = GX_DIRECT, .cnt = 4, .compType = static_cast<u8>(c.type), .offset = 12};
+    }
+    immediates[i].vtxStart = static_cast<uint32_t>(vertexBytes.size());
+    vertexBytes.resize(vertexBytes.size() + 3 * stride, 0);
+    for (uint32_t v = 0; v < 3; ++v) {
+      const size_t at = immediates[i].vtxStart + v * stride;
+      put_be32(vertexBytes, at, std::bit_cast<uint32_t>(static_cast<float>(v)));
+      put_be32(vertexBytes, at + 4, std::bit_cast<uint32_t>(static_cast<float>(i)));
+      std::copy_n(c.raw.begin(), c.bytes, vertexBytes.begin() + static_cast<std::ptrdiff_t>(at + 12));
+    }
+    vertexBytes.resize((vertexBytes.size() + 3) / 4 * 4, 0);
+    on_capture({
+        .slot = static_cast<uint32_t>(i + 1),
+        .slotGeneration = 1,
+        .identityHash = 0x200 + static_cast<uint32_t>(i),
+        .newGeometry = true,
+        .classBits = retained::class_bit::Dynamic,
+        .attrs = attrs[i].data(),
+        .stride = static_cast<uint8_t>(stride),
+        .immediates = &immediates[i],
+        .prim = GX_TRIANGLES,
+        .vtxCount = 3,
+        .world = &world,
+        .invView = &invView,
+    });
+  }
+  std::shared_ptr<retained::Frame> frame;
+  const auto plan = seal_and_commit(frame);
+  ASSERT_NE(plan, nullptr);
+  EXPECT_EQ(plan->variants.size(), 4u);
+  const Pools pools = make_pools(vertexBytes, {}, {});
+  ASSERT_TRUE(run(pools, *plan));
+  for (size_t i = 0; i < cases.size(); ++i) {
+    const Case& c = cases[i];
+    const std::vector<uint32_t> rec = read(pools.instances, (i + 1) * record::Bytes, record::Bytes);
+    ASSERT_EQ(rec.size(), record::Words);
+    EXPECT_EQ((rec[record::Flags] & instance_flag::NoColor) != 0, c.bytes == 0) << i;
+    const std::vector<uint32_t> vertices =
+        read(pools.vertices, uint64_t{rec[record::VertexFirst]} * vertex::Bytes, 3 * vertex::Bytes);
+    ASSERT_EQ(vertices.size(), 3 * vertex::Words);
+    for (uint32_t v = 0; v < 3; ++v) {
+      const uint32_t aux = vertices[v * vertex::Words + vertex::Aux];
+      EXPECT_EQ(aux & 0xFFFFu, c.alpha | c.luma << 8) << i << " vertex " << v;
+      EXPECT_EQ((aux & vertex::HasColor) != 0, c.bytes != 0) << i << " vertex " << v;
+      EXPECT_EQ(aux & (vertex::HasNormal | 0x00FF0000u), 0u) << i << " vertex " << v;
+    }
+  }
+  end_frame();
+}
+
+TEST_F(RetainedStreamoutGpu, WaterIsGeometryOnly) {
+  constexpr uint32_t WaterStride = 12;
+  constexpr std::array<std::array<float, 3>, 4> Quad{{
+      {-24.f, 0.05f, 8.f},
+      {-12.f, 0.05f, 8.f},
+      {-12.f, 0.05f, 20.f},
+      {-24.f, 0.05f, 20.f},
+  }};
+  std::array<gx::AttrConfig, gx::MaxVtxAttr> attrs{};
+  attrs[GX_VA_POS] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32};
+  std::vector<uint8_t> vertexBytes(Quad.size() * WaterStride, 0);
+  for (size_t v = 0; v < Quad.size(); ++v) {
+    for (size_t c = 0; c < 3; ++c) {
+      put_be32(vertexBytes, v * WaterStride + c * 4, std::bit_cast<uint32_t>(Quad[v][c]));
+    }
+  }
+  gx::g_gxState = {};
+  gx::g_gxState.pnMtx[0].pos = {{1.f, 0.f, 0.f, 0.f}, {0.f, 1.f, 0.f, 0.f}, {0.f, 0.f, 1.f, 0.f}};
+  const Affine invView = to_affine(gx::g_gxState.pnMtx[0].pos);
+  const Affine world = invView;
+  const gx::DrawImmediateData immediates{};
+  ASSERT_FALSE(begin_frame(true, 1));
+  on_capture({
+      .slot = 6,
+      .slotGeneration = 1,
+      .identityHash = 0x66,
+      .newGeometry = true,
+      .entryFlags = retained::entry_flag::Late,
+      .classBits = retained::class_bit::Dynamic | retained::class_bit::Water | retained::class_bit::Blended,
+      .attrs = attrs.data(),
+      .stride = WaterStride,
+      .immediates = &immediates,
+      .prim = GX_QUADS,
+      .vtxCount = static_cast<uint32_t>(Quad.size()),
+      .world = &world,
+      .invView = &invView,
+  });
+  std::shared_ptr<retained::Frame> frame;
+  const auto plan = seal_and_commit(frame, Stage::PrePost);
+  ASSERT_NE(plan, nullptr);
+  EXPECT_TRUE(plan->late);
+  const Pools pools = make_pools(vertexBytes, {}, {});
+  ASSERT_TRUE(run(pools, *plan));
+  const std::vector<uint32_t> rec = read(pools.instances, 6 * record::Bytes, record::Bytes);
+  const std::vector<uint32_t> header = read(pools.frame, 0, FramePoolBytes);
+  ASSERT_EQ(rec.size(), record::Words);
+  ASSERT_EQ(header.size(), frame::Words);
+  EXPECT_EQ(rec[record::Material] & 0xFFFFu, NoMaterial);
+  constexpr uint32_t Want = instance_flag::Valid | instance_flag::Water | instance_flag::Late |
+                            instance_flag::NoNormal | instance_flag::NoColor;
+  EXPECT_EQ(rec[record::Flags] & Want, Want);
+  EXPECT_NE(rec[record::Flags] & instance_flag::UvNonTex, 0u);
+  EXPECT_EQ(rec[record::StreamFrame], FrameIndex);
+  EXPECT_EQ(rec[record::WorldFrame], FrameIndex);
+  EXPECT_EQ(rec[record::IndexCount], 6u);
+  EXPECT_EQ(header[frame::LateFrame], FrameIndex);
+  EXPECT_EQ(header[frame::FrameIndex], FrameIndex);
+  EXPECT_NE(header[frame::Flags] & frame::Reset, 0u);
+  const std::array<float, 3> lo{-24.f, 0.05f, 8.f};
+  const std::array<float, 3> hi{-12.f, 0.05f, 20.f};
+  for (int c = 0; c < 3; ++c) {
+    EXPECT_NEAR(ordered_to_f32(rec[record::CurAabb + c]), lo[c], 1e-4f) << c;
+    EXPECT_NEAR(ordered_to_f32(rec[record::CurAabb + 3 + c]), hi[c], 1e-4f) << c;
+  }
+  const std::vector<uint32_t> vertices =
+      read(pools.vertices, uint64_t{rec[record::VertexFirst]} * vertex::Bytes, Quad.size() * vertex::Bytes);
+  ASSERT_EQ(vertices.size(), Quad.size() * vertex::Words);
+  for (size_t v = 0; v < Quad.size(); ++v) {
+    EXPECT_EQ(vertices[v * vertex::Words + vertex::Aux], 0u) << v;
+  }
+  end_frame();
+}
+
 TEST_F(RetainedStreamoutGpu, DeclarationCompilesInGraph) {
-  const std::array passes{pass_desc()};
+  const std::array passes{pass_desc(), late_pass_desc()};
   const auto compile = [&](bool retained) {
     detail::GraphInputs inputs = detail::planned::planned_inputs(detail::planned::full_limits(), passes, {});
     inputs.caps = &caps();
@@ -493,6 +645,13 @@ TEST_F(RetainedStreamoutGpu, DeclarationCompilesInGraph) {
   EXPECT_EQ(compiled.paramsSize, ParamsSize);
   const auto& program = graph->stages[static_cast<size_t>(Stage::OpaqueDone)].passes;
   EXPECT_NE(std::ranges::find(program, node), program.end());
+  const detail::NodeId lateNode = graph->find_node("scene.streamout_late");
+  ASSERT_NE(lateNode, detail::InvalidNode);
+  EXPECT_EQ(graph->nodes[lateNode].status, detail::CullReason::None);
+  EXPECT_EQ(graph->nodes[lateNode].stage, Stage::PrePost);
+  EXPECT_EQ(graph->nodes[lateNode].paramsSize, ParamsSize);
+  const auto& lateProgram = graph->stages[static_cast<size_t>(Stage::PrePost)].passes;
+  EXPECT_NE(std::ranges::find(lateProgram, lateNode), lateProgram.end());
   for (const std::string_view name : {"scene.gx_vertex", "scene.gx_storage", "scene.gx_index", "scene.vertices",
                                       "scene.indices", "scene.instances", "scene.palettes", "scene.frame"}) {
     const detail::ResourceId resource = graph->find_resource(name);
