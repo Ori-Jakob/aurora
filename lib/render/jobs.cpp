@@ -349,6 +349,8 @@ bool synchronous() noexcept { return g_synchronous.load(std::memory_order_acquir
 
 bool is_job_thread() noexcept { return t_jobThread; }
 
+uint32_t worker_count() noexcept { return g_workerCount.load(std::memory_order_acquire); }
+
 JobStats stats() noexcept {
   JobStats out;
   out.workers = g_startedWorkers.load(std::memory_order_relaxed);

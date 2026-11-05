@@ -30,6 +30,7 @@
 #include "post/temporal_resolve.hpp"
 #include "post/upscale/upscale.hpp"
 #include "scene/identity.hpp"
+#include "scene/meshlets.hpp"
 #include "scene/motion.hpp"
 #include "scene/streamout.hpp"
 #include "systems/dispatch.hpp"
@@ -108,6 +109,7 @@ void initialize() {
   shaders::initialize();
   compact::initialize();
   scene::streamout::initialize();
+  scene::meshlets::initialize();
   hzb::initialize();
   taa::initialize();
   ao::initialize();
@@ -152,6 +154,7 @@ void shutdown() noexcept {
   debug::shutdown_classification();
   debug::shutdown();
   scene::streamout::shutdown();
+  scene::meshlets::shutdown();
   compact::shutdown();
   // Compile jobs use the device, so they finish before the job pool and the device go away
   shaders::shutdown();
@@ -180,6 +183,7 @@ void on_worker_frame_begin([[maybe_unused]] uint64_t frameId, [[maybe_unused]] c
   // Heap generations bump here, before anything later in the frame compares them
   gpu_heap::begin_frame_worker(frameId);
   retire_heap_blocks();
+  scene::meshlets::worker_frame_begin(frameId);
   transient_pool_tick(frame != nullptr ? frame->graph : nullptr, TransientPool::Clock::now());
   bind_cache_tick(frameId);
   compact::worker_frame_begin(frameId);
@@ -199,6 +203,7 @@ void on_worker_frame_begin([[maybe_unused]] uint64_t frameId, [[maybe_unused]] c
 void on_frame_recording([[maybe_unused]] uint64_t frameId) noexcept {
 #if AURORA_ENABLE_RENDER
   gpu_heap::set_recording_frame(frameId);
+  scene::meshlets::set_recording_frame(frameId);
 #endif
 }
 } // namespace detail

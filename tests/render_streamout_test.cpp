@@ -7,9 +7,11 @@
 #include "gx/pipeline.hpp"
 #include "render/frame_state.hpp"
 #include "render/hints.hpp"
+#include "render/jobs.hpp"
 #include "render/scene/classify.hpp"
 #include "render/scene/identity.hpp"
 #include "render/scene/map_pick.hpp"
+#include "render/scene/meshlets.hpp"
 #include "render/scene/streamout.hpp"
 #include "render/settings.hpp"
 #include "render/stage_data.hpp"
@@ -581,6 +583,37 @@ TEST_F(RetainedStreamout, UvChangesEmitEvents) {
   ASSERT_NE(still, nullptr);
   EXPECT_TRUE(still->events.empty());
   end();
+}
+
+TEST_F(RetainedStreamout, ReadyClustersReachTheRecord) {
+  jobs::initialize(1);
+  jobs::set_synchronous(true);
+  constexpr auto Building = static_cast<uint32_t>(meshlets::State::Building);
+  constexpr auto Ready = static_cast<uint32_t>(meshlets::State::Ready);
+  begin_frame();
+  object_draw(0xD0, 3, AURORA_CAT_STATIC);
+  ASSERT_NE(stage(), nullptr);
+  const uint32_t slot = slot_of(0xD0);
+  EXPECT_EQ(testing::slot(slot).clusterWord >> 24, Building);
+  end();
+
+  begin_frame();
+  const auto plan = stage();
+  ASSERT_NE(plan, nullptr);
+  EXPECT_TRUE(has_event(*plan, EventType::ClustersChanged, slot));
+  EXPECT_TRUE(writes(block(), slot, record::ClusterFirst, 3));
+  EXPECT_EQ(testing::slot(slot).clusterWord, Ready << 24 | 1u);
+  end();
+
+  begin_frame();
+  object_draw(0xD0, 3, AURORA_CAT_STATIC);
+  const auto again = stage();
+  ASSERT_NE(again, nullptr);
+  EXPECT_FALSE(has_event(*again, EventType::ClustersChanged, slot));
+  end();
+  EXPECT_EQ(meshlets::pending_static(), 0u);
+  retained::testing::reset();
+  jobs::shutdown();
 }
 
 TEST_F(RetainedStreamout, UvTransformComposesTexMtxAndPostMtx) {

@@ -3,6 +3,8 @@
 #include "../internal.hpp"
 #include "gx_fmt.hpp"
 
+#include <algorithm>
+#include <bit>
 #include <string>
 #include <string_view>
 
@@ -418,6 +420,151 @@ auto attr_address(const AttrConfig& mapping, GXAttr attr, std::string_view vidx,
   }
   return {fmt::format("imm.vtx_start + {} * {}u + {}u", vidx, vtxStride, dlOffset + within), "vbuf"sv, false};
 }
+
+struct CpuSource {
+  std::span<const uint8_t> bytes;
+  uint32_t first = 0;
+  bool le = false;
+};
+
+const uint8_t* cpu_bytes(const CpuSource& src, uint32_t offset, uint32_t size) noexcept {
+  if (offset < src.first) {
+    return nullptr;
+  }
+  const size_t at = offset - src.first;
+  if (at > src.bytes.size() || size > src.bytes.size() - at) {
+    return nullptr;
+  }
+  return src.bytes.data() + at;
+}
+
+uint32_t cpu_load(const uint8_t* p, uint32_t size, bool le) noexcept {
+  uint32_t value = 0;
+  for (uint32_t i = 0; i < size; ++i) {
+    value |= uint32_t{p[le ? i : size - 1 - i]} << (8 * i);
+  }
+  return value;
+}
+
+bool cpu_address(const AttrConfig& mapping, GXAttr attr, const CpuVertexSource& source, uint32_t vidx, uint32_t stride,
+                 CpuSource& out, uint32_t& offset) noexcept {
+  const uint32_t at = vidx * stride + mapping.offset;
+  if (mapping.attrType == GX_DIRECT) {
+    out = {.bytes = source.records};
+    offset = at;
+    return true;
+  }
+  if (attr < GX_VA_POS || attr > GX_VA_TEX7) {
+    return false;
+  }
+  const uint32_t idxSize = mapping.attrType == GX_INDEX8 ? 1 : 2;
+  const uint8_t* p = cpu_bytes({.bytes = source.records}, at, idxSize);
+  if (p == nullptr) {
+    return false;
+  }
+  const uint32_t idx = idxSize == 1 ? p[0] : cpu_load(p, 2, false);
+  const CpuArray& array = source.arrays[attr - GX_VA_POS];
+  out = {.bytes = array.bytes, .first = array.first, .le = mapping.le};
+  offset = idx * mapping.stride;
+  return true;
+}
+
+bool cpu_fetch(const AttrConfig& mapping, const CpuSource& src, uint32_t offset, uint32_t cnt, float* out) noexcept {
+  const float scale = static_cast<float>(1u << mapping.frac);
+  for (uint32_t i = 0; i < cnt; ++i) {
+    const uint8_t* p = nullptr;
+    switch (mapping.compType) {
+    case GX_U8:
+    case GX_S8:
+      p = cpu_bytes(src, offset + i, 1);
+      if (p == nullptr) {
+        return false;
+      }
+      out[i] = (mapping.compType == GX_U8 ? static_cast<float>(p[0]) : static_cast<float>(static_cast<int8_t>(p[0]))) /
+               scale;
+      break;
+    case GX_U16:
+    case GX_S16: {
+      p = cpu_bytes(src, offset + i * 2, 2);
+      if (p == nullptr) {
+        return false;
+      }
+      const uint32_t raw = cpu_load(p, 2, src.le);
+      out[i] = (mapping.compType == GX_U16 ? static_cast<float>(raw)
+                                           : static_cast<float>(static_cast<int16_t>(static_cast<uint16_t>(raw)))) /
+               scale;
+      break;
+    }
+    case GX_F32:
+      p = cpu_bytes(src, offset + i * 4, 4);
+      if (p == nullptr) {
+        return false;
+      }
+      out[i] = std::bit_cast<float>(cpu_load(p, 4, src.le));
+      break;
+    case GX_RGBA8:
+      p = cpu_bytes(src, offset + i, 1);
+      if (p == nullptr) {
+        return false;
+      }
+      out[i] = static_cast<float>(p[0]) / 255.f;
+      break;
+    default:
+      return false;
+    }
+  }
+  return true;
+}
+
+bool cpu_color(const AttrConfig& mapping, const CpuSource& src, uint32_t offset, std::array<float, 4>& out) noexcept {
+  const auto unorm = [](uint32_t value, uint32_t shift, uint32_t mask) {
+    return static_cast<float>((value >> shift) & mask) / static_cast<float>(mask);
+  };
+  const uint8_t* p = nullptr;
+  switch (mapping.compType) {
+  case GX_RGB565: {
+    if ((p = cpu_bytes(src, offset, 2)) == nullptr) {
+      return false;
+    }
+    const uint32_t v = cpu_load(p, 2, src.le);
+    out = {unorm(v, 11, 0x1F), unorm(v, 5, 0x3F), unorm(v, 0, 0x1F), 1.f};
+    return true;
+  }
+  case GX_RGB8:
+  case GX_RGBX8:
+    if ((p = cpu_bytes(src, offset, mapping.compType == GX_RGB8 ? 3 : 4)) == nullptr) {
+      return false;
+    }
+    out = {static_cast<float>(p[0]) / 255.f, static_cast<float>(p[1]) / 255.f, static_cast<float>(p[2]) / 255.f, 1.f};
+    return true;
+  case GX_RGBA4: {
+    if ((p = cpu_bytes(src, offset, 2)) == nullptr) {
+      return false;
+    }
+    const uint32_t v = cpu_load(p, 2, src.le);
+    out = {unorm(v, 12, 0xF), unorm(v, 8, 0xF), unorm(v, 4, 0xF), unorm(v, 0, 0xF)};
+    return true;
+  }
+  case GX_RGBA6: {
+    if ((p = cpu_bytes(src, offset, 3)) == nullptr) {
+      return false;
+    }
+    const uint32_t v = cpu_load(p, 3, src.le);
+    out = {unorm(v, 18, 0x3F), unorm(v, 12, 0x3F), unorm(v, 6, 0x3F), unorm(v, 0, 0x3F)};
+    return true;
+  }
+  case GX_RGBA8:
+    if ((p = cpu_bytes(src, offset, 4)) == nullptr) {
+      return false;
+    }
+    for (int i = 0; i < 4; ++i) {
+      out[i] = static_cast<float>(p[i]) / 255.f;
+    }
+    return true;
+  default:
+    return false;
+  }
+}
 } // namespace
 
 std::string_view wgsl_helpers() noexcept { return HelpersWgsl; }
@@ -541,4 +688,46 @@ auto attr_load_nbt_slice(const ShaderConfig& config, NbtSlice slice, std::string
 }
 
 std::string_view nbt_slice_local(NbtSlice slice) noexcept { return slice == NbtSlice::B ? "in_binrm" : "in_tangent"; }
+
+bool decode_vertex(const ShaderConfig& config, const CpuVertexSource& source, uint32_t vidx, CpuVertex& out) noexcept {
+  out = {};
+  out.pnMtx = source.currentPnMtx;
+  for (uint32_t a = GX_VA_PNMTXIDX; a <= GX_VA_TEX7; ++a) {
+    const auto attr = static_cast<GXAttr>(a);
+    const AttrConfig& mapping = config.attrs[attr];
+    if (mapping.attrType == GX_NONE || (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX)) {
+      continue;
+    }
+    CpuSource src;
+    uint32_t offset = 0;
+    if (!cpu_address(mapping, attr, source, vidx, config.vtxStride, src, offset)) {
+      return false;
+    }
+    bool ok = true;
+    if (attr == GX_VA_PNMTXIDX) {
+      const uint8_t* p = cpu_bytes(src, offset, 1);
+      ok = p != nullptr;
+      out.pnMtx = ok ? p[0] / 3u : 0u;
+    } else if (attr == GX_VA_POS) {
+      ok = (mapping.cnt == 2 || mapping.cnt == 3) && cpu_fetch(mapping, src, offset, mapping.cnt, out.pos.data());
+      if (mapping.cnt == 2) {
+        out.pos[2] = 0.f;
+      }
+    } else if (attr == GX_VA_NRM) {
+      ok = cpu_fetch(mapping, src, offset, std::min<uint32_t>(mapping.cnt, 3), out.nrm.data());
+    } else if (attr == GX_VA_CLR0 || attr == GX_VA_CLR1) {
+      ok = cpu_color(mapping, src, offset, out.clr[attr - GX_VA_CLR0]);
+    } else {
+      auto& tex = out.tex[attr - GX_VA_TEX0];
+      ok = (mapping.cnt == 1 || mapping.cnt == 2) && cpu_fetch(mapping, src, offset, mapping.cnt, tex.data());
+      if (mapping.cnt == 1) {
+        tex[1] = 0.f;
+      }
+    }
+    if (!ok) {
+      return false;
+    }
+  }
+  return true;
+}
 } // namespace aurora::gx::vertex_fetch

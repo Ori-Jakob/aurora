@@ -1792,6 +1792,29 @@ fn main() {
   EXPECT_TRUE(validate_module("scene/streamout", {}, error)) << error;
 }
 
+TEST_F(RenderShaders, RetainedClusterHelpersCompile) {
+  constexpr std::string_view Reader = R"(//#import aurora/retained
+@group(0) @binding(0) var<storage, read> inst: array<u32>;
+@group(0) @binding(1) var<storage, read> clusters: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out_words: array<vec4f>;
+
+@compute @workgroup_size(1)
+fn main() {
+  let range = retained_cluster_range(&inst, 1u);
+  let state = inst[1u * RETAINED_RECORD_WORDS + RETAINED_REC_CLUSTER_COUNT] >> RETAINED_CLUSTER_STATE_SHIFT;
+  let c = retained_cluster(&clusters, range.x);
+  let tri = retained_cluster_triangle(&clusters, c, 0u);
+  let v = retained_cluster_vertex(&clusters, c, tri.y);
+  out_words[0] = vec4f(c.center, c.radius) + vec4f(c.aabb_min, c.cone_cutoff) + vec4f(c.aabb_max, f32(v)) +
+                 vec4f(c.cone_axis, f32(c.vertex_count + c.triangle_count + c.bounds_space + state +
+                                        select(0u, 1u, (state & 0xFu) == RETAINED_CLUSTERS_READY)));
+}
+)";
+  ASSERT_TRUE(register_source("test/retained_clusters", Reader));
+  std::string error;
+  EXPECT_TRUE(validate_module("test/retained_clusters", {}, error)) << error;
+}
+
 TEST_F(RenderShaders, StreamoutVariantsValidateForCorpus) {
   std::set<std::string> seen;
   size_t validated = 0;

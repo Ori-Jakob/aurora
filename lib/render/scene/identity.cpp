@@ -2,6 +2,7 @@
 
 #include "classify.hpp"
 #include "gc.hpp"
+#include "meshlets.hpp"
 #include "streamout.hpp"
 #include "../hints.hpp"
 #include "../stage_data.hpp"
@@ -69,6 +70,9 @@ struct Slot {
   uint32_t createdEvent = NoIndex;
   uint32_t object = NoIndex;
   uint32_t livePos = NoIndex;
+  meshlets::Key meshKey{};
+  meshlets::ClusterRange mesh{};
+  uint8_t meshChurn = 0;
   bool live = false;
   bool delivered = false;
   bool createdPending = false;
@@ -342,7 +346,10 @@ void clear_tables() noexcept {
   g_resync = false;
   g_pending = {};
   g_tentative.reset();
+  meshlets::reset();
 }
+
+bool clusters_settled() noexcept { return meshlets::pending_static() == 0; }
 
 void allocate() {
   if (g_allocated) {
@@ -363,11 +370,14 @@ void allocate() {
   g_layouts.reserve(MaxLayouts);
   g_events.reserve(MaxPendingEvents);
   g_allocated = true;
+  meshlets::set_active(true);
+  add_settle_predicate(&clusters_settled);
   clear_tables();
 }
 
 void release() noexcept {
   gx::fifo::set_release_listener(nullptr);
+  meshlets::set_active(false);
   g_slots = {};
   g_lives = {};
   g_liveList = {};
@@ -943,6 +953,37 @@ void drop(uint16_t flags) noexcept {
   }
 }
 
+void request_clusters(Slot& slot, const Pending& pending, const DrawRef& draw, uint32_t classBits, uint32_t pnSlot,
+                      bool relatched) noexcept {
+  const bool retry = slot.mesh.state == meshlets::State::None || slot.mesh.state == meshlets::State::Deferred;
+  if (!g_newGeometry && !relatched && !retry) {
+    return;
+  }
+  const gx::GXState& state = gx::g_gxState;
+  uint32_t flags = (classBits & StaticBits) != 0 ? meshlets::piece_flag::Static : 0u;
+  flags |= (classBits & class_bit::Palette) != 0 ? meshlets::piece_flag::Posed : 0u;
+  flags |= (classBits & class_bit::CpuDeformed) != 0 ? meshlets::piece_flag::Deformed : 0u;
+  slot.mesh = meshlets::request(
+      {
+          .prim = pending.prim,
+          .vtxCount = pending.vtxCount,
+          .vtxStride = draw.stride,
+          .records = pending.vertices,
+          .pos = draw.attrs[GX_VA_POS],
+          .pnmtx = draw.attrs[GX_VA_PNMTXIDX],
+          .posArray = &state.arrays[GX_VA_POS],
+          .palette = state.pnMtx,
+          .currentPnMtx = pnSlot,
+          .flags = static_cast<uint8_t>(flags),
+          .indexed = pending.indexed,
+          .indices = pending.indices,
+      },
+      &slot.meshKey, &slot.meshChurn);
+  if (slot.mesh.state == meshlets::State::Deferred) {
+    drop(pending.flags);
+  }
+}
+
 void record(const DrawRef& draw) noexcept {
   const Zone zone;
   const Pending pending = g_pending;
@@ -979,10 +1020,12 @@ void record(const DrawRef& draw) noexcept {
     Slot& seen = g_slots[slot];
     seen.captureOnlySeen = seen.captureOnlySeen || (pending.flags & entry_flag::CaptureOnly) != 0;
     seen.visibleSeen = seen.visibleSeen || (pending.flags & entry_flag::CaptureOnly) == 0;
+    const uint32_t relatched = counts.relatched;
     world = instance_world(slot, world, origin);
     if ((pending.objectFlags & object_flag::Teleport) != 0) {
       queue_event(EventType::Teleported, slot);
     }
+    request_clusters(seen, pending, draw, classBits, pnSlot, counts.relatched != relatched);
   }
 
   uint16_t flags = pending.flags;
@@ -1039,6 +1082,8 @@ void record(const DrawRef& draw) noexcept {
       .world = &world,
       .invView = &g_frame.invView,
       .eye = g_frame.eye,
+      .clusterFirst = seen != nullptr ? seen->mesh.first : 0,
+      .clusterWord = seen != nullptr ? meshlets::count_word(seen->mesh) : 0,
   });
   ++counts.entries;
   counts.captureOnly += (flags & entry_flag::CaptureOnly) != 0 ? 1 : 0;
@@ -1156,6 +1201,7 @@ void evict_slot(uint32_t index, EvictReason reason) noexcept {
       --g_staticObjects;
     }
   }
+  meshlets::release(slot.meshKey);
   const uint32_t generation = slot.generation;
   slot = {};
   slot.generation = generation;
@@ -1181,6 +1227,20 @@ bool collect(bool scene) noexcept {
   }
   gc::free_quarantined(g_free);
   return result.epochChanged;
+}
+
+void refresh_clusters() noexcept {
+  for (const uint32_t index : g_liveList) {
+    Slot& slot = g_slots[index];
+    if (!slot.meshKey.valid()) {
+      continue;
+    }
+    const meshlets::ClusterRange range = meshlets::lookup(slot.meshKey);
+    if (range != slot.mesh) {
+      slot.mesh = range;
+      streamout::on_clusters(index, slot.generation, range.first, meshlets::count_word(range));
+    }
+  }
 }
 
 bool settled(bool epochChanged) noexcept {
@@ -1275,7 +1335,10 @@ void latch_gate(const Settings&, const Caps& caps) noexcept {
   latch_resources(next);
 }
 
-void latch_resources(bool active) noexcept { streamout::latch_resources(active); }
+void latch_resources(bool active) noexcept {
+  streamout::latch_resources(active);
+  meshlets::latch_resources(active);
+}
 
 void set_demand(Demand demand, bool on) noexcept {
   const auto bit = static_cast<uint8_t>(demand);
@@ -1311,6 +1374,9 @@ void end_frame() noexcept {
     g_tentative.reset();
     streamout::end_frame();
     const bool epochChanged = collect(scene);
+    if (meshlets::latch()) {
+      refresh_clusters();
+    }
     g_frame.counts.lostCaptures += static_cast<uint32_t>(reported);
     g_totals.lostCaptures += reported;
     g_coverage = settled(epochChanged);
@@ -1556,6 +1622,7 @@ void reset() noexcept {
   g_reportedLost.store(0, std::memory_order_relaxed);
   g_captureActive.store(false, std::memory_order_relaxed);
   streamout::testing::reset();
+  meshlets::testing::reset();
   retained::reset();
 }
 

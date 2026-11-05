@@ -70,6 +70,12 @@ const RETAINED_FRAME_LATE_FRAME: u32 = 56u;
 const RETAINED_CAMERA_VALID: u32 = 1u;
 const RETAINED_RESET: u32 = 2u;
 
+const RETAINED_CLUSTER_WORDS: u32 = 16u;
+const RETAINED_CLUSTER_COUNT_MASK: u32 = 0x00FFFFFFu;
+const RETAINED_CLUSTER_STATE_SHIFT: u32 = 24u;
+const RETAINED_CLUSTER_REASON_SHIFT: u32 = 28u;
+const RETAINED_CLUSTERS_READY: u32 = 3u;
+
 struct RetainedVertex {
   pos: vec3f,
   nrm: vec3f,
@@ -100,6 +106,20 @@ struct RetainedCamera {
 struct RetainedWorld {
   rows: mat3x4f,
   lo: vec3f,
+}
+
+struct RetainedCluster {
+  ref_word: u32,
+  tri_word: u32,
+  vertex_count: u32,
+  triangle_count: u32,
+  bounds_space: u32,
+  cone_axis: vec3f,
+  cone_cutoff: f32,
+  center: vec3f,
+  radius: f32,
+  aabb_min: vec3f,
+  aabb_max: vec3f,
 }
 
 fn retained_oct_decode(w: u32) -> vec3f {
@@ -221,4 +241,41 @@ fn retained_uv_xform(inst: ptr<storage, array<u32>, read>, slot: u32, alpha: boo
 fn retained_uv(xform: array<vec3f, 2>, src: vec2f) -> vec2f {
   let p = vec3f(src, 1.0);
   return vec2f(dot(xform[0], p), dot(xform[1], p));
+}
+
+fn retained_cluster_range(inst: ptr<storage, array<u32>, read>, slot: u32) -> vec2u {
+  return vec2u(retained_record_word(inst, slot, RETAINED_REC_CLUSTER_FIRST),
+               retained_record_word(inst, slot, RETAINED_REC_CLUSTER_COUNT) & RETAINED_CLUSTER_COUNT_MASK);
+}
+
+fn retained_cluster(clusters: ptr<storage, array<u32>, read>, index: u32) -> RetainedCluster {
+  let base = index * RETAINED_CLUSTER_WORDS;
+  var c: RetainedCluster;
+  c.ref_word = base + clusters[base];
+  c.tri_word = base + clusters[base + 1u];
+  let counts = clusters[base + 2u];
+  c.vertex_count = counts & 0xFFu;
+  c.triangle_count = (counts >> 8u) & 0xFFu;
+  c.bounds_space = (counts >> 16u) & 0xFFu;
+  let cone = unpack4x8snorm(clusters[base + 3u]);
+  c.cone_axis = cone.xyz;
+  c.cone_cutoff = cone.w;
+  let sphere = vec4f(bitcast<f32>(clusters[base + 4u]), bitcast<f32>(clusters[base + 5u]),
+                     bitcast<f32>(clusters[base + 6u]), bitcast<f32>(clusters[base + 7u]));
+  c.center = sphere.xyz;
+  c.radius = sphere.w;
+  c.aabb_min = vec3f(bitcast<f32>(clusters[base + 8u]), bitcast<f32>(clusters[base + 9u]),
+                     bitcast<f32>(clusters[base + 10u]));
+  c.aabb_max = vec3f(bitcast<f32>(clusters[base + 12u]), bitcast<f32>(clusters[base + 13u]),
+                     bitcast<f32>(clusters[base + 14u]));
+  return c;
+}
+
+fn retained_cluster_vertex(clusters: ptr<storage, array<u32>, read>, c: RetainedCluster, i: u32) -> u32 {
+  return clusters[c.ref_word + i];
+}
+
+fn retained_cluster_triangle(clusters: ptr<storage, array<u32>, read>, c: RetainedCluster, t: u32) -> vec3u {
+  let w = clusters[c.tri_word + t];
+  return vec3u(w & 0xFFu, (w >> 8u) & 0xFFu, (w >> 16u) & 0xFFu);
 }

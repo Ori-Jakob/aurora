@@ -57,6 +57,8 @@ struct Capture {
   const Affine* world = nullptr;
   const Affine* invView = nullptr;
   double eye = 0.0;
+  uint32_t clusterFirst = 0;
+  uint32_t clusterWord = 0;
 };
 
 enum class EventType : uint8_t { Created, Restreamed, Moved, MaterialChanged, UvChanged, ClustersChanged, Freed };
@@ -135,6 +137,7 @@ struct Stats {
   uint64_t moved = 0;
   uint64_t uvChanged = 0;
   uint64_t freed = 0;
+  uint64_t clustersChanged = 0;
   uint64_t lineSkipped = 0;
   uint64_t largeSkipped = 0;
   uint64_t paletteDeferred = 0;
@@ -167,6 +170,7 @@ void reset() noexcept;
 
 void on_capture(const Capture& capture) noexcept;
 void on_freed(uint32_t slot) noexcept;
+void on_clusters(uint32_t slot, uint32_t slotGeneration, uint32_t first, uint32_t word) noexcept;
 [[nodiscard]] bool streamed(uint32_t slot) noexcept;
 void seal(retained::Frame& frame, const detail::StageData& stage) noexcept;
 void skip(const detail::StageData& stage) noexcept;
@@ -201,6 +205,8 @@ struct SlotState {
   uint32_t streams = 0;
   uint32_t recordWrites = 0;
   Affine lastSent{};
+  uint32_t clusterFirst = 0;
+  uint32_t clusterWord = 0;
 };
 
 void reset() noexcept;

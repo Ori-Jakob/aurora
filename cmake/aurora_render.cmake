@@ -193,6 +193,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/scene/identity.hpp
         lib/render/scene/map_pick.cpp
         lib/render/scene/map_pick.hpp
+        lib/render/scene/meshlets.cpp
+        lib/render/scene/meshlets.hpp
         lib/render/scene/motion.cpp
         lib/render/scene/motion.hpp
         lib/render/scene/overlay.cpp
@@ -224,7 +226,7 @@ if (AURORA_ENABLE_RENDER)
         OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/aurora_render_wgsl.cpp"
         SOURCES ${_aurora_render_wgsl})
     target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_RENDER=1)
-    target_link_libraries(aurora_gx PRIVATE yyjson::yyjson aurora_bccodec aurora_openpbr_data)
+    target_link_libraries(aurora_gx PRIVATE yyjson::yyjson aurora_bccodec aurora_openpbr_data aurora_meshopt)
 else ()
     target_sources(aurora_gx PRIVATE lib/render/graph_api_off.cpp lib/render/material/registry_off.cpp
         lib/render/native/native.hpp lib/render/native/native_off.cpp)

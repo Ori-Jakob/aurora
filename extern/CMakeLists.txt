@@ -329,6 +329,26 @@ if (AURORA_ENABLE_GX)
     target_include_directories(aurora_openpbr_data SYSTEM INTERFACE ${_openpbr_dir})
   endif ()
 
+  if (AURORA_ENABLE_RENDER AND NOT TARGET aurora_meshopt)
+    message(STATUS "aurora: Fetching meshoptimizer")
+    # MIT; only the clusterizer, its bounds and the vertex remap are built
+    FetchContent_Declare(meshoptimizer
+      URL https://github.com/zeux/meshoptimizer/archive/refs/tags/v1.3.tar.gz
+      URL_HASH SHA256=ca4f47d451201593904b9e3067fa54b65db94bc34ab5173864950862b748a145
+      SOURCE_SUBDIR src
+      DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+      EXCLUDE_FROM_ALL
+    )
+    FetchContent_MakeAvailable(meshoptimizer)
+    add_library(aurora_meshopt STATIC
+      ${meshoptimizer_SOURCE_DIR}/src/allocator.cpp
+      ${meshoptimizer_SOURCE_DIR}/src/clusterizer.cpp
+      ${meshoptimizer_SOURCE_DIR}/src/indexgenerator.cpp
+      ${meshoptimizer_SOURCE_DIR}/src/meshletutils.cpp)
+    target_include_directories(aurora_meshopt SYSTEM PUBLIC ${meshoptimizer_SOURCE_DIR}/src)
+    set_target_properties(aurora_meshopt PROPERTIES FOLDER "extern")
+  endif ()
+
   if (AURORA_CACHE_USE_ZSTD)
     aurora_find_package_global(zstd CONFIG QUIET)
     if (NOT TARGET zstd::libzstd)

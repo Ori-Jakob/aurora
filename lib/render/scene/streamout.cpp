@@ -96,6 +96,9 @@ struct SlotState {
   std::array<uint32_t, 12> uv{};
   uint32_t streams = 0;
   uint32_t recordWrites = 0;
+  std::array<uint32_t, 2> clusters{};
+  std::array<uint32_t, 2> clusterWant{};
+  bool clusterQueued = false;
 };
 
 struct Variant {
@@ -136,6 +139,7 @@ struct Pending {
   Affine world{};
   std::array<uint32_t, record::NormalWords> normal{};
   std::array<uint32_t, 12> uv{};
+  std::array<uint32_t, 2> clusters{};
   double eye = 0.0;
 };
 
@@ -182,6 +186,7 @@ struct Tentative {
   CameraState camera;
   uint64_t movedLatched = 0;
   FrameUse use;
+  std::vector<std::pair<uint32_t, std::array<uint32_t, 2>>> clusterCommits;
 };
 
 struct Pick {
@@ -191,6 +196,7 @@ struct Pick {
   bool full = false;
   bool moved = false;
   bool uv = false;
+  bool clusters = false;
   bool prevValid = false;
   uint32_t vertexFirst = 0;
   uint32_t indexFirst = 0;
@@ -216,6 +222,7 @@ std::vector<Variant> g_variants;
 uint16_t g_lastVariant = NoVariant;
 bool g_warnedVariants = false;
 std::vector<Freed> g_freed;
+std::vector<std::pair<uint32_t, uint32_t>> g_clusterDirty;
 Tentative g_tentative;
 uint32_t g_serial = 0;
 uint32_t g_lastCommitted = 0;
@@ -356,6 +363,7 @@ void release_state() noexcept {
   g_indexPool.reset();
   g_pending = {};
   g_freed = {};
+  g_clusterDirty = {};
   g_tentative = {};
   g_allocated = false;
   g_pendingStatics = 0;
@@ -377,7 +385,11 @@ void rebuild_live() {
   for (uint32_t slot = 0; slot < g_slots.size(); ++slot) {
     const SlotState& st = g_slots[slot];
     if (st.streamed) {
-      live->push_back({.slot = slot, .indexCount = st.indexCount, .flags = st.flags});
+      live->push_back({.slot = slot,
+                       .indexCount = st.indexCount,
+                       .clusterFirst = st.clusters[0],
+                       .clusterCount = st.clusters[1] & 0xFFFFFFu,
+                       .flags = st.flags});
     }
   }
   std::lock_guard lock{g_publishMutex};
@@ -395,6 +407,7 @@ void clear_stream_state() noexcept {
     g_indexPool.emplace(IndexPoolBytes, PoolGranule);
   }
   g_freed.clear();
+  g_clusterDirty.clear();
   g_tentative = {};
   g_pendingStatics = 0;
   g_streamedCount = 0;
@@ -633,6 +646,7 @@ public:
 struct BuildInput {
   std::vector<Pick> picks;
   std::vector<Freed> frees;
+  std::vector<uint32_t> clusterSlots;
   CameraState camera;
   CameraState prevCamera;
   uint32_t frameIndex = 0;
@@ -646,6 +660,7 @@ struct BuildOutput {
   std::vector<uint32_t> block;
   std::vector<VariantDispatch> variants;
   std::vector<Commit> commits;
+  std::vector<std::pair<uint32_t, std::array<uint32_t, 2>>> clusterCommits;
   std::vector<PlanEvent> events;
   uint32_t writeJobs = 0;
   uint32_t rollJobs = 0;
@@ -675,6 +690,8 @@ void record_words(const Pending& p, const Pick& pick, uint32_t frameIndex, const
   std::copy(p.uv.begin(), p.uv.end(), out.begin() + record::UvBase);
   out[record::UvFrame] = frameIndex;
   out[record::MaterialFrame] = frameIndex;
+  out[record::ClusterFirst] = p.clusters[0];
+  out[record::ClusterCount] = p.clusters[1];
   out[record::BoundsOffset] = NoBounds;
 }
 
@@ -748,9 +765,12 @@ BuildOutput build_block(const BuildInput& in) {
       next.flags = p.flags;
       next.material = p.material;
       next.uv = p.uv;
+      next.clusters = p.clusters;
       ++next.recordWrites;
       if (!prev.recordSent) {
         out.events.push_back({EventType::Created, p.slot});
+      } else if (prev.clusters != p.clusters) {
+        out.events.push_back({EventType::ClustersChanged, p.slot});
       }
     } else {
       if (pick.moved) {
@@ -780,6 +800,12 @@ BuildOutput build_block(const BuildInput& in) {
         ++next.recordWrites;
         out.events.push_back({EventType::UvChanged, p.slot});
       }
+      if (pick.clusters) {
+        const std::array<uint32_t, 3> words{p.clusters[0], p.clusters[1], NoBounds};
+        jobs.push_back({block::TargetInstances, base + record::ClusterFirst, writer.add_data(words.data(), 3), 3});
+        next.clusters = p.clusters;
+        out.events.push_back({EventType::ClustersChanged, p.slot});
+      }
     }
     if (pick.stream) {
       if (prev.streamed) {
@@ -799,6 +825,15 @@ BuildOutput build_block(const BuildInput& in) {
         commit.freeIdx = prev.idxBlock;
       }
     }
+  }
+
+  for (const uint32_t slot : in.clusterSlots) {
+    const SlotState& st = g_slots[slot];
+    const std::array<uint32_t, 3> words{st.clusterWant[0], st.clusterWant[1], NoBounds};
+    jobs.push_back(
+        {block::TargetInstances, slot * record::Words + record::ClusterFirst, writer.add_data(words.data(), 3), 3});
+    out.clusterCommits.emplace_back(slot, st.clusterWant);
+    out.events.push_back({EventType::ClustersChanged, slot});
   }
 
   std::vector<uint32_t> pieces;
@@ -1021,6 +1056,7 @@ void plan_pieces(Tentative& t, bool overrun, bool cut, bool epochChanged, std::v
           p.latched ? !same_affine(p.world, st.lastSent) : retained::world_moved(p.world, st.lastSent, p.eye);
       pick.moved = !pick.full && st.worldSent && moved;
       pick.uv = !pick.full && p.uv != st.uv;
+      pick.clusters = !pick.full && st.recordSent && p.clusters != st.clusters;
       const bool seenLast = st.lastSeen != Never && st.lastSeen + 1 == g_hintFrame;
       pick.prevValid = st.worldSent && seenLast && !cut && !epochChanged && !p.teleport;
       t.movedLatched += pick.moved && p.latched ? 1 : 0;
@@ -1043,11 +1079,26 @@ void commit_plan(Tentative& t) {
       --g_pendingStatics;
     }
     if (st.streamed != commit.next.streamed || st.indexCount != commit.next.indexCount ||
-        st.flags != commit.next.flags) {
+        st.flags != commit.next.flags || st.clusters != commit.next.clusters) {
       g_liveChanged = true;
     }
     g_streamedCount += commit.next.streamed && !st.streamed ? 1 : 0;
     st = commit.next;
+  }
+  for (const auto& [slot, words] : t.clusterCommits) {
+    g_slots[slot].clusters = words;
+    g_liveChanged = true;
+  }
+  if (!g_clusterDirty.empty()) {
+    std::erase_if(g_clusterDirty, [](const std::pair<uint32_t, uint32_t>& item) {
+      SlotState& st = g_slots[item.first];
+      if (st.generation != item.second) {
+        return true;
+      }
+      const bool done = !st.recordSent || st.clusterWant == st.clusters;
+      st.clusterQueued = st.clusterQueued && !done;
+      return done;
+    });
   }
   for (const Freed& freed : t.frees) {
     if (freed.vtx != NoBlock) {
@@ -1077,6 +1128,7 @@ void commit_plan(Tentative& t) {
     g_stats.moved += event.type == EventType::Moved ? 1 : 0;
     g_stats.uvChanged += event.type == EventType::UvChanged ? 1 : 0;
     g_stats.freed += event.type == EventType::Freed ? 1 : 0;
+    g_stats.clustersChanged += event.type == EventType::ClustersChanged ? 1 : 0;
   }
   t.committed = true;
   publish_coverage();
@@ -1094,11 +1146,33 @@ void resync() noexcept {
   Log.warn("Retained scene: the stream-out chain broke; every instance streams again");
 }
 
-bool late_work(const Tentative& t, const std::vector<Pick>& picks) noexcept {
-  if (!g_freed.empty() || t.captureOnly + t.lostAtCommit != 0 || g_undelivered != 0) {
+std::vector<uint32_t> dirty_clusters(const std::vector<Pick>& picks) {
+  std::vector<uint32_t> out;
+  if (g_clusterDirty.empty()) {
+    return out;
+  }
+  std::vector<uint32_t> picked;
+  picked.reserve(picks.size());
+  for (const Pick& pick : picks) {
+    picked.push_back(g_pending[pick.pending].slot);
+  }
+  std::ranges::sort(picked);
+  for (const auto& [slot, generation] : g_clusterDirty) {
+    const SlotState& st = g_slots[slot];
+    if (st.generation == generation && st.recordSent && st.clusterWant != st.clusters &&
+        !std::ranges::binary_search(picked, slot)) {
+      out.push_back(slot);
+    }
+  }
+  return out;
+}
+
+bool late_work(const Tentative& t, const std::vector<Pick>& picks, const std::vector<uint32_t>& clusterSlots) noexcept {
+  if (!g_freed.empty() || !clusterSlots.empty() || t.captureOnly + t.lostAtCommit != 0 || g_undelivered != 0) {
     return true;
   }
-  return std::ranges::any_of(picks, [](const Pick& pick) { return pick.stream || pick.full || pick.moved || pick.uv; });
+  return std::ranges::any_of(
+      picks, [](const Pick& pick) { return pick.stream || pick.full || pick.moved || pick.uv || pick.clusters; });
 }
 
 void touch(const std::vector<Pick>& picks) noexcept {
@@ -1609,9 +1683,9 @@ void log_stats() {
   }
   Log.info(
       "Retained: stream-out plans {} committed {} uncommitted {} header-only {} pieces {} vertices {} moved {} uv "
-      "{} freed {} resyncs {} variants {} late plans {} late pieces {}",
+      "{} freed {} clusters {} resyncs {} variants {} late plans {} late pieces {}",
       s.plans, s.committed, s.uncommitted, s.headerOnly, s.pieces, s.streamedVertices, s.moved, s.uvChanged, s.freed,
-      s.resyncs, g_variants.size(), s.latePlans, s.latePieces);
+      s.clustersChanged, s.resyncs, g_variants.size(), s.latePlans, s.latePieces);
   Log.info(
       "Retained: stream-out skipped transient {} palette {} line {} large {} slot {}; deferred variant "
       "{} failed {} cap {} pool {} overrun {} headroom {} refused {}; lost {}",
@@ -1914,6 +1988,8 @@ void on_capture(const Capture& c) noexcept {
   p.immediates = *c.immediates;
   p.world = *c.world;
   p.eye = c.eye;
+  p.clusters = {c.clusterFirst, c.clusterWord};
+  st.clusterWant = p.clusters;
 
   const bool rigidNormal = c.pnSlot < gx::MaxPnMtx;
   uint32_t flags = instance_flag::Valid;
@@ -1984,6 +2060,20 @@ void on_freed(uint32_t slot) noexcept {
   g_liveChanged = true;
 }
 
+void on_clusters(uint32_t slot, uint32_t slotGeneration, uint32_t first, uint32_t word) noexcept {
+  if (!g_active || !g_allocated || slot >= InstanceSlots) {
+    return;
+  }
+  SlotState& st = g_slots[slot];
+  if (st.generation != slotGeneration) {
+    return;
+  }
+  st.clusterWant = {first, word};
+  if (st.recordSent && st.clusterWant != st.clusters && !std::exchange(st.clusterQueued, true)) {
+    g_clusterDirty.emplace_back(slot, slotGeneration);
+  }
+}
+
 bool streamed(uint32_t slot) noexcept { return g_allocated && slot < g_slots.size() && g_slots[slot].streamed; }
 
 void seal(retained::Frame& out, const detail::StageData& stage) noexcept {
@@ -2003,7 +2093,8 @@ void seal(retained::Frame& out, const detail::StageData& stage) noexcept {
   const bool epochChanged = detail::live_scene_hints().sceneEpochChanged;
   std::vector<Pick> picks;
   plan_pieces(t, room.overrun, cut, epochChanged, picks);
-  if (late && !late_work(t, picks)) {
+  const std::vector<uint32_t> clusterSlots = dirty_clusters(picks);
+  if (late && !late_work(t, picks, clusterSlots)) {
     touch(picks);
     return;
   }
@@ -2019,6 +2110,7 @@ void seal(retained::Frame& out, const detail::StageData& stage) noexcept {
   plan->baseSerial = g_clearPending ? 0 : g_lastCommitted;
   plan->late = late;
   const BuildInput base{
+      .clusterSlots = clusterSlots,
       .camera = t.camera,
       .prevCamera = g_framePrevCamera.valid ? g_framePrevCamera : t.camera,
       .frameIndex = stage.frameIndex,
@@ -2075,6 +2167,7 @@ void seal(retained::Frame& out, const detail::StageData& stage) noexcept {
   g_stats.streamedVertices += built.vertices;
   t.plan = plan;
   t.commits = std::move(built.commits);
+  t.clusterCommits = std::move(built.clusterCommits);
   t.frees = std::move(input.frees);
   g_freed.clear();
   t.blockBytes = static_cast<uint32_t>(bytes.size());
@@ -2240,7 +2333,9 @@ SlotState slot(uint32_t slot) noexcept {
           .flags = st.flags,
           .streams = st.streams,
           .recordWrites = st.recordWrites,
-          .lastSent = st.lastSent};
+          .lastSent = st.lastSent,
+          .clusterFirst = st.clusters[0],
+          .clusterWord = st.clusters[1]};
 }
 
 std::span<const uint32_t> last_block() noexcept { return g_block; }

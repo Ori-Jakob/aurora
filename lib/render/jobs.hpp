@@ -107,4 +107,5 @@ void set_synchronous(bool synchronous) noexcept;
 [[nodiscard]] bool synchronous() noexcept;
 [[nodiscard]] bool is_job_thread() noexcept;
 [[nodiscard]] JobStats stats() noexcept;
+[[nodiscard]] uint32_t worker_count() noexcept;
 } // namespace aurora::render::jobs
