@@ -38,6 +38,7 @@ constexpr uint32_t ClassCheckMinFrames = 40;
 constexpr uint32_t OverlayCheckMinFrames = 40;
 constexpr uint32_t SsilCheckMinFrames = 90;
 constexpr uint32_t CaptureListCheckMinFrames = 40;
+constexpr uint32_t RetainedCheckMinFrames = 40;
 constexpr uint32_t MaxGpuPadMiB = 1024;
 
 std::optional<uint32_t> parse_u32(std::string_view text) noexcept {
@@ -542,6 +543,10 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
     error = "--retained-check cannot be combined with --no-hints";
     return std::nullopt;
   }
+  if (options.retainedCheck && options.frames != 0 && options.frames < RetainedCheckMinFrames) {
+    error = "--retained-check needs at least 40 frames";
+    return std::nullopt;
+  }
   if (options.ssilCheck && (!options.hints || options.msaa > 1)) {
     error = "--ssil-check cannot be combined with --no-hints or --msaa above 1";
     return std::nullopt;
@@ -641,7 +646,7 @@ std::string_view usage() noexcept {
          "                      onto the floor at its foot and the fin's green only to the floor its lit face\n"
          "                      points at (needs at least 90 frames)\n"
          "  --retained-check    turn the retained scene and its check mode on, write retained_wire.png to the data\n"
-         "                      directory and log the check result at shutdown\n"
+         "                      directory and log the check result at shutdown (needs at least 40 frames)\n"
          "  --capture-list-check\n"
          "                      duplicate every draw before OPAQUE_DONE into capture.check, replay the list offscreen\n"
          "                      and exit with code 20 unless it matches gx.color texel for texel and every duplicate\n"

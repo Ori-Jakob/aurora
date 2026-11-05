@@ -2187,6 +2187,16 @@ bool register_capture_list_check(std::string& error) {
   return true;
 }
 
+constexpr u32 RetainedCheckWaitFrame = 20;
+bool sRetainedCheck = false;
+
+void update_retained_check(u32 frame) {
+  // A stream-out variant still compiling at the first check frame leaves its pieces, the skinned ones too, unchecked
+  if (sRetainedCheck && frame == RetainedCheckWaitFrame) {
+    wait_for_pipelines();
+  }
+}
+
 void update_capture_list_check(u32 frame) {
   if (!sCaptureListCheck) {
     return;
@@ -2583,6 +2593,7 @@ bool register_graph_passes(const GraphPassOptions& options, std::string& error) 
   if (options.captureListCheck && !register_capture_list_check(error)) {
     return false;
   }
+  sRetainedCheck = options.retainedCheck;
   return options.gpuCull == 0 ||
          register_cull_passes(
              {.instances = options.gpuCull, .check = options.cullCheck, .timings = options.cullTimings}, error);
@@ -2597,6 +2608,7 @@ void update_graph_passes(u32 frame) {
   update_class_check(frame);
   update_overlay_check(frame);
   update_capture_list_check(frame);
+  update_retained_check(frame);
   if (sProbe.id != aurora::render::InvalidPass && frame >= DepthCheckFrame &&
       sProbe.armedFrame.load(std::memory_order_relaxed) == UINT32_MAX) {
     // Draws whose pipeline is still compiling are skipped, so depth read before they finish misses part of the scene
@@ -2896,6 +2908,7 @@ GraphPassReport graph_pass_report() {
 }
 
 void unregister_graph_passes() {
+  sRetainedCheck = false;
   if (std::exchange(sCaptureListCheck, false)) {
     aurora::gfx::synchronize();
     aurora::render::scene::capture_list::testing::remove_check();

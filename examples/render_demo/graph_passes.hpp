@@ -121,6 +121,7 @@ struct GraphPassOptions {
   bool classCheck = false;
   bool ssilCheck = false;
   bool captureListCheck = false;
+  bool retainedCheck = false;
 };
 
 struct GraphPassReport {

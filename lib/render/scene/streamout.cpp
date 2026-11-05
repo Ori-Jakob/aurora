@@ -370,6 +370,7 @@ struct CheckResults {
   uint64_t indices = 0;
   uint64_t failures = 0;
   uint64_t skipped = 0;
+  uint64_t frames = 0;
   bool busy = false;
   wgpu::Buffer buffer;
   uint64_t bufferSize = 0;
@@ -389,6 +390,7 @@ struct ParityResults {
   uint64_t oob = 0;
   uint64_t missing = 0;
   uint64_t failures = 0;
+  uint64_t captured = 0;
   double skippedRatio = 0.0;
 };
 ParityResults g_parity;
@@ -811,6 +813,10 @@ uint32_t add_parity(const Capture& c, const PaletteCapture& pc) {
   }
   g_parityVertices += c.vtxCount;
   g_paritySnaps.push_back(std::move(snap));
+  {
+    std::lock_guard lock{g_checkMutex};
+    ++g_parity.captured;
+  }
   return static_cast<uint32_t>(g_paritySnaps.size() - 1);
 }
 
@@ -2220,6 +2226,12 @@ void log_stats() {
 
 void log_parity() {
   std::lock_guard lock{g_checkMutex};
+  // Palettes drawn on check frames whose pieces were all deferred or never read back leave the bones unchecked
+  if (g_parity.entries == 0 && g_parity.failures == 0 && g_parity.captured != 0) {
+    Log.error("Retained: parity FAILED (none of {} palette pieces captured on check frames was checked)",
+              g_parity.captured);
+    return;
+  }
   if (g_parity.entries == 0 && g_parity.failures == 0 && g_parity.missing == 0) {
     return;
   }
@@ -2271,7 +2283,12 @@ void log_check_result() {
     return;
   }
   if (g_check.readbacks == 0 && g_check.failures == 0) {
-    Log.warn("Retained: check mode ran no readback");
+    // Only a run that ended before its first check frame has nothing to read back
+    if (g_check.frames != 0) {
+      Log.error("Retained: check FAILED (no readback over {} check frames)", g_check.frames);
+    } else {
+      Log.warn("Retained: check mode ran no readback");
+    }
     return;
   }
   const uint64_t moved = g_stats.moved;
@@ -2416,6 +2433,10 @@ bool begin_frame(bool gate, uint64_t frame) noexcept {
     return false;
   }
   g_hintFrame = frame;
+  if (g_checkMode && check_frame()) {
+    std::lock_guard lock{g_checkMutex};
+    ++g_check.frames;
+  }
   g_framePrevCamera = g_prevCamera;
   g_frameReset = false;
   g_frameUse = {};

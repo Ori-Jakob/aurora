@@ -1097,7 +1097,8 @@ int main(int argc, char* argv[]) {
                                                                    .overlayCheck = options.overlayCheck,
                                                                    .classCheck = options.classCheck,
                                                                    .ssilCheck = options.ssilCheck,
-                                                                   .captureListCheck = options.captureListCheck},
+                                                                   .captureListCheck = options.captureListCheck,
+                                                                   .retainedCheck = options.retainedCheck},
                                                                   graphError)) {
     std::fprintf(stderr, "render_demo: render graph setup failed: %s\n", graphError.c_str());
     render_demo::shutdown_scene();

@@ -326,6 +326,16 @@ TEST(RenderDemoOptions, ParsesCaptureListCheck) {
   EXPECT_EQ(parse_error({"--capture-list-check", "--trace", "x"}), "render graph passes cannot be traced");
 }
 
+TEST(RenderDemoOptions, ParsesRetainedCheck) {
+  const auto check = parse({"--retained-check"});
+  ASSERT_TRUE(check);
+  EXPECT_TRUE(check->retainedCheck);
+  EXPECT_EQ(parse_error({"--retained-check", "--frames", "39"}), "--retained-check needs at least 40 frames");
+  EXPECT_TRUE(parse({"--retained-check", "--frames", "40"}));
+  EXPECT_TRUE(parse({"--retained-check", "--frames", "0"}));
+  EXPECT_EQ(parse_error({"--retained-check", "--no-hints"}), "--retained-check cannot be combined with --no-hints");
+}
+
 namespace {
 std::vector<SsilSample> ssil_samples(std::array<f32, 4> wall, std::array<f32, 4> back, std::array<f32, 4> front,
                                      std::array<f32, 4> open) {
