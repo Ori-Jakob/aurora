@@ -2113,9 +2113,10 @@ void encode_stream(const wgpu::CommandEncoder& encoder, std::string_view name,
   const wgpu::BindGroup group = bound ? bind_group(views) : wgpu::BindGroup{};
   resolved = resolved && static_cast<bool>(group);
   WorkerState& w = g_worker;
+  const bool acknowledged = plan.seenBreaks == g_breakCount.load(std::memory_order_relaxed);
   testing::Chain chain = testing::Chain::Break;
   if (resolved) {
-    chain = testing::chain_step(w.chain, serial, baseSerial, clearInstances);
+    chain = testing::chain_step(w.chain, serial, baseSerial, clearInstances, acknowledged);
   } else if (w.chain.broken) {
     chain = testing::Chain::Skip;
   } else {
@@ -2713,6 +2714,7 @@ void seal(retained::Frame& out, const detail::StageData& stage) noexcept {
   plan->serial = ++g_serial == 0 ? ++g_serial : g_serial;
   plan->clearInstances = g_clearPending;
   plan->baseSerial = g_clearPending ? 0 : g_lastCommitted;
+  plan->seenBreaks = g_seenBreaks;
   plan->late = late;
   const BuildInput base{
       .clusterSlots = clusterSlots,
@@ -2993,14 +2995,16 @@ bool wait_variants(const Plan& plan) {
   });
 }
 
-Chain chain_step(ChainState& state, uint32_t serial, uint32_t baseSerial, bool clearInstances) noexcept {
+Chain chain_step(ChainState& state, uint32_t serial, uint32_t baseSerial, bool clearInstances,
+                 bool acknowledged) noexcept {
   if (clearInstances && baseSerial == 0) {
     state.broken = false;
     state.lastEncoded = serial;
     return Chain::Accept;
   }
   if (state.broken) {
-    return Chain::Skip;
+    // A delta built after the FIFO saw this break means its reset plan was lost, and only a new break resyncs
+    return acknowledged ? Chain::Break : Chain::Skip;
   }
   if (baseSerial != state.lastEncoded) {
     state.broken = true;

@@ -493,6 +493,41 @@ TEST_F(RetainedStreamout, DroppedPlanStopsLaterDeltas) {
   EXPECT_EQ(testing::slot(slot_of(0x70)).streams, 1u);
 }
 
+TEST_F(RetainedStreamout, LostResetPlanBreaksAgain) {
+  testing::ChainState state;
+  EXPECT_EQ(testing::chain_step(state, 1, 0, true), testing::Chain::Accept);
+  EXPECT_EQ(testing::chain_step(state, 3, 2, false), testing::Chain::Break);
+  EXPECT_EQ(testing::chain_step(state, 4, 3, false), testing::Chain::Skip);
+  EXPECT_EQ(testing::chain_step(state, 6, 5, false, true), testing::Chain::Break);
+  EXPECT_EQ(testing::chain_step(state, 7, 6, false), testing::Chain::Skip);
+  EXPECT_EQ(testing::chain_step(state, 8, 0, true, true), testing::Chain::Accept);
+  EXPECT_EQ(testing::chain_step(state, 9, 8, false, true), testing::Chain::Accept);
+
+  begin_frame();
+  object_draw(0x74);
+  const auto before = stage();
+  ASSERT_NE(before, nullptr);
+  end();
+  testing::break_chain();
+  begin_frame();
+  object_draw(0x74);
+  const auto reset = stage();
+  ASSERT_NE(reset, nullptr);
+  EXPECT_TRUE(reset->clearInstances);
+  end();
+  const uint32_t breaks = stats().breakCount;
+  EXPECT_NE(before->seenBreaks, breaks);
+  EXPECT_EQ(reset->seenBreaks, breaks);
+  begin_frame();
+  object_draw(0x74);
+  const auto delta = stage();
+  ASSERT_NE(delta, nullptr);
+  EXPECT_FALSE(delta->clearInstances);
+  EXPECT_EQ(delta->baseSerial, reset->serial);
+  EXPECT_EQ(delta->seenBreaks, breaks);
+  end();
+}
+
 TEST_F(RetainedStreamout, ResyncKeepsUndrawnStaticsPending) {
   begin_frame();
   object_draw(0x78, 3, AURORA_CAT_STATIC);

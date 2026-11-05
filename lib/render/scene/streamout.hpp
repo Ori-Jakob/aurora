@@ -137,6 +137,7 @@ struct Plan {
   uint32_t frameIndex = 0;
   uint32_t serial = 0;
   uint32_t baseSerial = 0;
+  uint32_t seenBreaks = 0;
   bool clearInstances = false;
   bool late = false;
   bool headerOnly = false;
@@ -269,6 +270,7 @@ struct ChainState {
   uint32_t lastEncoded = 0;
   bool broken = false;
 };
-[[nodiscard]] Chain chain_step(ChainState& state, uint32_t serial, uint32_t baseSerial, bool clearInstances) noexcept;
+[[nodiscard]] Chain chain_step(ChainState& state, uint32_t serial, uint32_t baseSerial, bool clearInstances,
+                               bool acknowledged = false) noexcept;
 } // namespace testing
 } // namespace aurora::render::scene::streamout
