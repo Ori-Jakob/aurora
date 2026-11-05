@@ -65,6 +65,7 @@ struct RenderPipelineDesc {
   bool depthWrite = false;
   wgpu::CompareFunction depthCompare = wgpu::CompareFunction::Always;
   uint32_t sampleCount = 1;
+  bool unclippedDepth = false;
 };
 
 struct PipelineStats {
@@ -103,5 +104,6 @@ bool validate_module(std::string_view id, std::span<const std::string_view> defi
 
 namespace testing {
 uint32_t waiters() noexcept;
+[[nodiscard]] uint64_t render_key(const RenderPipelineDesc& desc);
 } // namespace testing
 } // namespace aurora::render::shaders

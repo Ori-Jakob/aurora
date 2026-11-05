@@ -2,7 +2,9 @@
 #include "shaders.hpp"
 #include "stage.hpp"
 #include "debug/views.hpp"
+#include "scene/atlas.hpp"
 #include "scene/capture_list.hpp"
+#include "shadows/vsm_check.hpp"
 
 #include "../logging.hpp"
 
@@ -134,3 +136,13 @@ void arm_check(uint32_t) noexcept {}
 CheckResult check_result() noexcept { return {}; }
 } // namespace testing
 } // namespace aurora::render::scene::capture_list
+
+namespace aurora::render::scene::atlas {
+Stats published_stats() noexcept { return {}; }
+} // namespace aurora::render::scene::atlas
+
+namespace aurora::render::shadows::vsm::check::testing {
+void set_probes(std::span<const std::array<double, 3>>) noexcept {}
+
+std::vector<FrameCounters> frame_stats() { return {}; }
+} // namespace aurora::render::shadows::vsm::check::testing

@@ -6,6 +6,7 @@
 #include "gfx/recording.hpp"
 #include "gx/gx.hpp"
 #include "render/jobs.hpp"
+#include "render/scene/atlas.hpp"
 #include "render/scene/identity.hpp"
 #include "render/scene/streamout.hpp"
 #include "render/shaders.hpp"
@@ -14,6 +15,7 @@
 #include "render/shadows/vsm_cull.hpp"
 #include "render/shadows/vsm_invalidate.hpp"
 #include "render/shadows/vsm_pages.hpp"
+#include "render/shadows/vsm_raster.hpp"
 #include "render/stage_data.hpp"
 #include "webgpu/gpu.hpp"
 
@@ -2089,6 +2091,846 @@ TEST_F(RenderVsmCullGpu, PairOverflowSkipsWholePages) {
   EXPECT_EQ(counts.priority, skippedPages.size());
   for (uint32_t i = 0; i < skippedPages.size(); ++i) {
     EXPECT_EQ(list[render_list::Pages + 2 * i], skippedPages[i]) << i;
+  }
+}
+
+constexpr uint64_t CompareLayoutKey = 0x76736D636D700001ull;
+constexpr uint32_t AtlasPagesX = 8;
+constexpr uint32_t AtlasRows = 8;
+constexpr uint32_t AtlasWidth = AtlasPagesX * PageTexels;
+constexpr uint32_t AtlasHeight = AtlasRows * PageTexels;
+constexpr uint32_t PayloadBase = TestClusters * 16;
+constexpr int32_t TestPage = 16;
+constexpr uint32_t CutoutMaterial = 5;
+
+struct Vtx {
+  std::array<float, 3> pos{};
+  std::array<float, 2> uv{};
+};
+
+using Tri = std::array<uint32_t, 3>;
+
+struct RasterScene {
+  CullScene cull;
+  std::vector<uint32_t> records = std::vector<uint32_t>(size_t{TestSlots} * RecordWords, 0);
+  std::vector<uint32_t> vertices;
+  std::vector<uint32_t> indices;
+  std::vector<uint32_t> payload;
+
+  explicit RasterScene(const Views& views) : cull{.views = views} {
+    cull.views.header.poolPages = AtlasPagesX * AtlasRows;
+    cull.views.header.poolPagesX = AtlasPagesX;
+  }
+
+  [[nodiscard]] std::vector<uint32_t> cluster_words() const {
+    std::vector<uint32_t> out = cull.clusters;
+    out.insert(out.end(), payload.begin(), payload.end());
+    return out;
+  }
+
+  [[nodiscard]] const ViewRecord& view(uint32_t level = 0) const { return cull.views.views[level_view(level)]; }
+
+  [[nodiscard]] std::array<double, 3> anchor() const {
+    const ViewsHeader& h = cull.views.header;
+    return {double{h.anchorHi[0]} + h.anchorLo[0], double{h.anchorHi[1]} + h.anchorLo[1],
+            double{h.anchorHi[2]} + h.anchorLo[2]};
+  }
+
+  // Inverts the level's anchor-space rows, which are orthogonal, so a test can author casters in texel space
+  [[nodiscard]] std::array<float, 3> at(double x, double y, double z, uint32_t level = 0) const {
+    const ViewRecord& v = view(level);
+    const std::array<double, 3> c{x, y, z};
+    std::array<double, 3> p{};
+    for (uint32_t r = 0; r < 3; ++r) {
+      const float* row = v.anchorRel + r * 4;
+      const double norm = double{row[0]} * row[0] + double{row[1]} * row[1] + double{row[2]} * row[2];
+      for (uint32_t k = 0; k < 3; ++k) {
+        p[k] += row[k] * (c[r] - row[3]) / norm;
+      }
+    }
+    return {static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2])};
+  }
+
+  [[nodiscard]] uint32_t page_index_of(int32_t px, int32_t py, uint32_t level = 0) const {
+    const ViewRecord& v = view(level);
+    return page_index(v.table_offset(), v.origin[0] + px, v.origin[1] + py);
+  }
+
+  Record base_record(uint32_t hash) const {
+    Record rec{};
+    rec[record::Flags] = instance_flag::Valid;
+    rec[record::Categories] = AURORA_CAT_STATIC;
+    rec[record::IdentityHash] = hash;
+    rec[record::Material] = scene::streamout::NoMaterial | 0xFF0000u;
+    rec[record::WorldFrame] = 1;
+    rec[record::UvFrame] = 1;
+    rec[record::MaterialFrame] = 1;
+    rec[record::StreamFrame] = 1;
+    place(std::span{rec}, anchor());
+    for (const uint32_t base : {record::UvBase, record::UvAlpha}) {
+      rec[base + 0] = std::bit_cast<uint32_t>(1.f);
+      rec[base + 4] = std::bit_cast<uint32_t>(1.f);
+    }
+    return rec;
+  }
+
+  static Box box_of(const std::vector<Vtx>& verts) {
+    Box box{.lo = {3.4e38f, 3.4e38f, 3.4e38f}, .hi = {-3.4e38f, -3.4e38f, -3.4e38f}};
+    for (const Vtx& v : verts) {
+      for (uint32_t k = 0; k < 3; ++k) {
+        box.lo[k] = std::min(box.lo[k], v.pos[k]);
+        box.hi[k] = std::max(box.hi[k], v.pos[k]);
+      }
+    }
+    return box;
+  }
+
+  void add_cluster(uint32_t index, uint32_t firstVertex, const std::vector<Vtx>& verts, const std::vector<Tri>& tris) {
+    ASSERT_LE(verts.size(), 64u);
+    ASSERT_LE(tris.size(), size_t{ChunkTriangles});
+    ASSERT_LT(index, TestClusters);
+    uint32_t* c = &cull.clusters[size_t{index} * 16];
+    const uint32_t at = index * 16;
+    c[0] = PayloadBase + static_cast<uint32_t>(payload.size()) - at;
+    for (uint32_t i = 0; i < verts.size(); ++i) {
+      payload.push_back(firstVertex + i);
+    }
+    c[1] = PayloadBase + static_cast<uint32_t>(payload.size()) - at;
+    for (const Tri& t : tris) {
+      payload.push_back(t[0] | t[1] << 8 | t[2] << 16);
+    }
+    c[2] = static_cast<uint32_t>(verts.size()) | static_cast<uint32_t>(tris.size()) << 8;
+    const Box box = box_of(verts);
+    for (uint32_t k = 0; k < 3; ++k) {
+      c[8 + k] = std::bit_cast<uint32_t>(box.lo[k]);
+      c[12 + k] = std::bit_cast<uint32_t>(box.hi[k]);
+    }
+  }
+
+  void push_vertices(const std::vector<Vtx>& verts) {
+    for (const Vtx& v : verts) {
+      for (uint32_t k = 0; k < 3; ++k) {
+        vertices.push_back(std::bit_cast<uint32_t>(v.pos[k]));
+      }
+      vertices.push_back(0);
+      vertices.push_back(std::bit_cast<uint32_t>(v.uv[0]));
+      vertices.push_back(std::bit_cast<uint32_t>(v.uv[1]));
+      vertices.push_back(0);
+      vertices.push_back(0xFFu);
+    }
+  }
+
+  void finish(uint32_t slot, Record& rec, const Box& box) {
+    for (uint32_t k = 0; k < 3; ++k) {
+      rec[record::CurAabb + k] = ordered(box.lo[k]);
+      rec[record::CurAabb + 3 + k] = ordered(box.hi[k]);
+    }
+    cull.add(slot, rec);
+    std::ranges::copy(rec, records.begin() + size_t{slot} * RecordWords);
+  }
+
+  void add_mesh(uint32_t slot, Record rec, const std::vector<Vtx>& verts, const std::vector<Tri>& tris, bool clustered,
+                uint32_t clusterIndex = 0) {
+    const auto base = static_cast<uint32_t>(vertices.size() / scene::streamout::vertex::Words);
+    rec[record::VertexFirst] = base;
+    rec[record::VertexCount] = static_cast<uint32_t>(verts.size());
+    push_vertices(verts);
+    const Box box = box_of(verts);
+    if (clustered) {
+      add_cluster(clusterIndex, 0, verts, tris);
+      rec[record::ClusterFirst] = clusterIndex;
+      rec[record::ClusterCount] = 1;
+      finish(slot, rec, box);
+      return;
+    }
+    {
+      indices.resize((indices.size() + IndexGranule - 1) / IndexGranule * IndexGranule, 0);
+      rec[record::IndexFirst] = static_cast<uint32_t>(indices.size());
+      rec[record::IndexCount] = static_cast<uint32_t>(tris.size() * 3);
+      for (const Tri& t : tris) {
+        indices.insert(indices.end(), t.begin(), t.end());
+      }
+      rec[record::ClusterFirst] = 0;
+      rec[record::ClusterCount] = 0;
+    }
+    finish(slot, rec, box);
+    {
+      const Box bounds = history_box(cull.hist(slot));
+      for (uint32_t ch = 0; ch < chunk_count(rec[record::IndexCount]); ++ch) {
+        Box cb{.lo = {3.4e38f, 3.4e38f, 3.4e38f}, .hi = {-3.4e38f, -3.4e38f, -3.4e38f}};
+        for (uint32_t t = ch * ChunkTriangles; t < std::min<uint32_t>((ch + 1) * ChunkTriangles, tris.size()); ++t) {
+          for (const uint32_t i : tris[t]) {
+            for (uint32_t k = 0; k < 3; ++k) {
+              cb.lo[k] = std::min(cb.lo[k], verts[i].pos[k]);
+              cb.hi[k] = std::max(cb.hi[k], verts[i].pos[k]);
+            }
+          }
+        }
+        const std::array<uint32_t, 2> words = chunk_box_pack(cb, bounds);
+        const uint32_t cs = chunk_slot(rec[record::IndexFirst], ch);
+        cull.chunkBoxes[size_t{cs} * 2] = words[0];
+        cull.chunkBoxes[size_t{cs} * 2 + 1] = words[1];
+      }
+    }
+  }
+
+  // A quad over window texels [x0, x1) x [y0, y1) of level 0, its depth linear from z0 at x0 to z1 at x1
+  void add_quad(uint32_t slot, Record rec, double x0, double y0, double x1, double y1, double z0, double z1,
+                bool clustered, uint32_t clusterIndex) {
+    const std::vector<Vtx> verts{
+        {.pos = at(x0, y0, z0), .uv = {0.f, 0.f}},
+        {.pos = at(x1, y0, z1), .uv = {1.f, 0.f}},
+        {.pos = at(x0, y1, z0), .uv = {0.f, 1.f}},
+        {.pos = at(x1, y1, z1), .uv = {1.f, 1.f}},
+    };
+    add_mesh(slot, rec, verts, {{0, 1, 2}, {2, 1, 3}}, clustered, clusterIndex);
+  }
+
+  void list(const std::vector<std::pair<uint32_t, uint32_t>>& pages, bool check = false) {
+    std::ranges::fill(cull.renderList, 0u);
+    std::ranges::fill(cull.table, 0u);
+    const auto n = static_cast<uint32_t>(pages.size());
+    cull.renderList[render_list::Count] = check ? 0 : n;
+    cull.renderList[render_list::CheckCount] = check ? n : 0;
+    cull.renderList[render_list::PagesX] = AtlasPagesX;
+    cull.renderList[render_list::Rows] = AtlasRows;
+    for (uint32_t i = 0; i < n; ++i) {
+      const auto [v, phys] = pages[i];
+      cull.renderList[render_list::Pages + 2 * i] = v | (check ? render_list::CheckOnly : 0u);
+      cull.renderList[render_list::Pages + 2 * i + 1] = phys;
+      const ViewRecord& record = cull.views.views[v / PagesPerView];
+      const uint32_t s = v % PagesPerView;
+      const uint32_t lx = (s % WindowPages - static_cast<uint32_t>(record.origin[0])) & (WindowPages - 1);
+      const uint32_t ly = (s / WindowPages - static_cast<uint32_t>(record.origin[1])) & (WindowPages - 1);
+      cull.renderList[render_list::RowMasks + (v / PagesPerView) * WindowPages + ly] |= 1u << lx;
+      cull.table[v] = phys | entry::Allocated | i << entry::RenderIndexShift |
+                      (check ? entry::Cached | entry::Check : entry::RenderNow | entry::Fresh);
+    }
+  }
+};
+
+Views raster_views() {
+  SunClipmap clipmap;
+  (void)clipmap.update({.eye = TestEye, .dir = sun_dir(40.0, 30.0), .lightId = 2, .texel0 = TestTexel0});
+  Views views{};
+  clipmap.fill(views);
+  views.header.clock = 2;
+  views.header.budget = MaxPoolPages;
+  return views;
+}
+
+struct Variant {
+  bool cutout = false;
+  bool clip = false;
+  bool unclipped = false;
+};
+
+class RenderVsmRasterGpu : public RenderVsmCullGpu {
+protected:
+  void SetUp() override {
+    RenderVsmCullGpu::SetUp();
+    if (IsSkipped()) {
+      return;
+    }
+    const wgpu::Device& device = m_device->device;
+    m_hasClip = device.HasFeature(wgpu::FeatureName::ClipDistances);
+    m_hasUnclipped = device.HasFeature(wgpu::FeatureName::DepthClipControl);
+    std::array<wgpu::BindGroupLayoutEntry, 2> clear{};
+    for (uint32_t i = 0; i < clear.size(); ++i) {
+      clear[i] = {.binding = i,
+                  .visibility = wgpu::ShaderStage::Vertex,
+                  .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage}};
+    }
+    const wgpu::BindGroupLayoutDescriptor clearDescriptor{.entryCount = clear.size(), .entries = clear.data()};
+    m_clearGroup = device.CreateBindGroupLayout(&clearDescriptor);
+    const wgpu::PipelineLayoutDescriptor clearLayout{.bindGroupLayoutCount = 1, .bindGroupLayouts = &m_clearGroup};
+    static constexpr std::array<std::string_view, 1> Clear{"VSM_CLEAR"};
+    const shaders::PipelineId clearId = shaders::request_render({
+        .label = "vsm.clear raster test",
+        .shader = AllocShader,
+        .vertexEntry = "vs_clear",
+        .fragmentEntry = {},
+        .defines = Clear,
+        .layout = device.CreatePipelineLayout(&clearLayout),
+        .layoutKey = ClearTestLayoutKey,
+        .depthFormat = wgpu::TextureFormat::Depth32Float,
+        .depthWrite = true,
+        .depthCompare = wgpu::CompareFunction::Always,
+    });
+    ASSERT_EQ(shaders::wait(clearId), shaders::PipelineStatus::Ready);
+    m_clear = shaders::render_pipeline(clearId);
+    std::vector<wgpu::BindGroupLayoutEntry> compare(7);
+    for (uint32_t i = 0; i < compare.size(); ++i) {
+      compare[i] = {.binding = i, .visibility = wgpu::ShaderStage::Compute};
+      if (i < 2) {
+        compare[i].texture = {.sampleType = wgpu::TextureSampleType::Depth,
+                              .viewDimension = wgpu::TextureViewDimension::e2D};
+      } else {
+        compare[i].buffer = {.type = i == 4 || i == 6 ? wgpu::BufferBindingType::Storage
+                                                      : wgpu::BufferBindingType::ReadOnlyStorage};
+      }
+    }
+    const wgpu::BindGroupLayoutDescriptor compareDescriptor{.entryCount = compare.size(), .entries = compare.data()};
+    m_compareGroup = device.CreateBindGroupLayout(&compareDescriptor);
+    m_compare = pipeline(m_emptyLayout, m_compareGroup, check::CheckShader, "vsm_check_cmp", CompareLayoutKey, {});
+    const auto make = [&](uint64_t size, wgpu::BufferUsage usage) {
+      const wgpu::BufferDescriptor descriptor{.usage = usage | wgpu::BufferUsage::CopyDst, .size = size};
+      return device.CreateBuffer(&descriptor);
+    };
+    m_uniformViews = make(ViewsBytes, wgpu::BufferUsage::Uniform);
+    m_indirect = make(RasterArgsBytes, wgpu::BufferUsage::Indirect);
+    m_clearIndirect = make(16, wgpu::BufferUsage::Indirect);
+    m_instancesBuffer = buffer(uint64_t{TestSlots} * RecordWords * 4);
+    m_materialsBuffer = buffer(MaterialBytes);
+    m_colorAtlas = texture(wgpu::TextureFormat::RGBA8Unorm, 1, 1,
+                           wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst);
+  }
+
+  void TearDown() override {
+    raster_shutdown();
+    RenderVsmCullGpu::TearDown();
+  }
+
+  wgpu::RenderPipeline raster_pipeline(const Variant& v) const {
+    shaders::RenderPipelineDesc desc{
+        .label = "vsm.raster test",
+        .shader = RasterShader,
+        .layout = testing::raster_layout(),
+        .layoutKey = RasterLayoutKey,
+    };
+    caster_variant(desc, v.cutout, v.clip, v.unclipped);
+    const shaders::PipelineId id = shaders::request_render(desc);
+    EXPECT_EQ(shaders::wait(id), shaders::PipelineStatus::Ready) << v.cutout << v.clip << v.unclipped;
+    return shaders::render_pipeline(id);
+  }
+
+  wgpu::Texture depth_atlas() const {
+    return texture(wgpu::TextureFormat::Depth32Float, AtlasWidth, AtlasHeight,
+                   wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst |
+                       wgpu::TextureUsage::TextureBinding);
+  }
+
+  void fill(const wgpu::Texture& atlas, float value) const {
+    const wgpu::CommandEncoder encoder = m_device->device.CreateCommandEncoder();
+    const wgpu::RenderPassDepthStencilAttachment depth{
+        .view = atlas.CreateView(),
+        .depthLoadOp = wgpu::LoadOp::Clear,
+        .depthStoreOp = wgpu::StoreOp::Store,
+        .depthClearValue = value,
+    };
+    const wgpu::RenderPassDescriptor descriptor{.depthStencilAttachment = &depth};
+    encoder.BeginRenderPass(&descriptor).End();
+    EXPECT_TRUE(test::submit_and_wait(*m_device, encoder.Finish()));
+  }
+
+  std::vector<float> read_atlas(const wgpu::Texture& atlas) const {
+    const wgpu::Buffer readback = buffer(uint64_t{AtlasWidth} * AtlasHeight * 4);
+    const wgpu::CommandEncoder encoder = m_device->device.CreateCommandEncoder();
+    const wgpu::TexelCopyTextureInfo source{.texture = atlas, .aspect = wgpu::TextureAspect::DepthOnly};
+    const wgpu::TexelCopyBufferInfo destination{.layout = {.bytesPerRow = AtlasWidth * 4, .rowsPerImage = AtlasHeight},
+                                                .buffer = readback};
+    const wgpu::Extent3D extent{AtlasWidth, AtlasHeight, 1};
+    encoder.CopyTextureToBuffer(&source, &destination, &extent);
+    EXPECT_TRUE(test::submit_and_wait(*m_device, encoder.Finish()));
+    const std::vector<uint32_t> words = read(readback, readback.GetSize());
+    std::vector<float> out(words.size());
+    std::ranges::transform(words, out.begin(), [](uint32_t w) { return std::bit_cast<float>(w); });
+    return out;
+  }
+
+  // Culls, clears the listed pages and rasterises them into the atlas
+  CullOut draw(RasterScene& rs, const wgpu::Texture& atlas, const Variant& opaque, bool withCutout = false) {
+    const CullOut out = run_cull(rs.cull);
+    const wgpu::Device& device = m_device->device;
+    const auto upload_or = [&](const wgpu::Buffer& target, std::span<const uint32_t> words) {
+      if (!words.empty()) {
+        m_device->queue.WriteBuffer(target, 0, words.data(), words.size_bytes());
+      }
+    };
+    std::vector<uint32_t> vertices = rs.vertices;
+    vertices.resize(std::max<size_t>(vertices.size(), 8), 0);
+    std::vector<uint32_t> indices = rs.indices;
+    indices.resize(std::max<size_t>(indices.size(), 4), 0);
+    const wgpu::Buffer vertexBuffer = buffer(vertices.size() * 4);
+    const wgpu::Buffer indexBuffer = buffer(indices.size() * 4);
+    upload_or(vertexBuffer, vertices);
+    upload_or(indexBuffer, indices);
+    upload_or(m_instancesBuffer, rs.records);
+    upload_or(m_materialsBuffer, rs.cull.materials);
+    const std::vector<uint32_t> clusterWords = rs.cluster_words();
+    const wgpu::Buffer clusters = buffer(clusterWords.size() * 4);
+    upload_or(clusters, clusterWords);
+    Views views = rs.cull.views;
+    views.header.maxPairs = MaxPairs;
+    m_device->queue.WriteBuffer(m_uniformViews, 0, &views, ViewsBytes);
+    m_device->queue.WriteBuffer(m_indirect, 0, out.args.data(), RasterArgsBytes);
+    const std::array<uint32_t, 4> clearArgs{6, render_entries(rs.cull.renderList), 0, 0};
+    m_device->queue.WriteBuffer(m_clearIndirect, 0, clearArgs.data(), sizeof(clearArgs));
+    const std::array clearBuffers{m_renderList, m_table};
+    const wgpu::BindGroup clearBind = group(m_clearGroup, clearBuffers);
+    std::array<wgpu::BindGroupEntry, raster_binding::Count> entries{};
+    const std::array<wgpu::Buffer, raster_binding::Buffers> buffers{vertexBuffer,   indexBuffer,      m_instancesBuffer,
+                                                                    clusters,       m_renderList,     m_pairs,
+                                                                    m_uniformViews, m_materialsBuffer};
+    for (uint32_t i = 0; i < buffers.size(); ++i) {
+      entries[i] = {.binding = i, .buffer = buffers[i], .size = buffers[i].GetSize()};
+    }
+    entries[raster_binding::Atlas] = {.binding = raster_binding::Atlas, .textureView = m_colorAtlas.CreateView()};
+    const wgpu::SamplerDescriptor samplerDescriptor{.magFilter = wgpu::FilterMode::Linear,
+                                                    .minFilter = wgpu::FilterMode::Linear};
+    entries[raster_binding::Sampler] = {.binding = raster_binding::Sampler,
+                                        .sampler = device.CreateSampler(&samplerDescriptor)};
+    const wgpu::BindGroupDescriptor descriptor{
+        .layout = testing::raster_group_layout(), .entryCount = entries.size(), .entries = entries.data()};
+    const wgpu::BindGroup rasterBind = device.CreateBindGroup(&descriptor);
+    const wgpu::RenderPipeline opaquePipe = raster_pipeline(opaque);
+    const wgpu::RenderPipeline cutoutPipe =
+        raster_pipeline({.cutout = true, .clip = opaque.clip, .unclipped = opaque.unclipped});
+    const wgpu::CommandEncoder encoder = device.CreateCommandEncoder();
+    const wgpu::RenderPassDepthStencilAttachment depth{
+        .view = atlas.CreateView(),
+        .depthLoadOp = wgpu::LoadOp::Load,
+        .depthStoreOp = wgpu::StoreOp::Store,
+    };
+    const wgpu::RenderPassDescriptor passDescriptor{.depthStencilAttachment = &depth};
+    {
+      const wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&passDescriptor);
+      pass.SetPipeline(m_clear);
+      pass.SetBindGroup(0, clearBind);
+      pass.DrawIndirect(m_clearIndirect, 0);
+      pass.End();
+    }
+    {
+      const wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&passDescriptor);
+      pass.SetBindGroup(0, rasterBind);
+      pass.SetPipeline(opaquePipe);
+      pass.DrawIndirect(m_indirect, 0);
+      if (withCutout) {
+        pass.SetPipeline(cutoutPipe);
+        pass.DrawIndirect(m_indirect, 16);
+      }
+      pass.End();
+    }
+    EXPECT_TRUE(test::submit_and_wait(*m_device, encoder.Finish()));
+    return out;
+  }
+
+  std::vector<uint32_t> compare(const RasterScene& rs, const wgpu::Texture& atlas, const wgpu::Texture& copy) {
+    const std::vector<uint32_t> zero(StatCount, 0);
+    upload(m_stats, zero);
+    const wgpu::Buffer probes = buffer(64);
+    std::vector<wgpu::BindGroupEntry> entries{
+        {.binding = 0, .textureView = atlas.CreateView()},
+        {.binding = 1, .textureView = copy.CreateView()},
+        {.binding = 2, .buffer = m_renderList, .size = m_renderList.GetSize()},
+        {.binding = 3, .buffer = m_table, .size = m_table.GetSize()},
+        {.binding = 4, .buffer = m_stats, .size = m_stats.GetSize()},
+        {.binding = 5, .buffer = m_views, .size = m_views.GetSize()},
+        {.binding = 6, .buffer = probes, .size = probes.GetSize()},
+    };
+    (void)rs;
+    const wgpu::BindGroupDescriptor descriptor{
+        .layout = m_compareGroup, .entryCount = entries.size(), .entries = entries.data()};
+    dispatch(m_compare, m_empty, m_device->device.CreateBindGroup(&descriptor), MaxRenderPages);
+    return read(m_stats, StatsBytes);
+  }
+
+  void copy_texture(const wgpu::Texture& from, const wgpu::Texture& to) const {
+    const wgpu::CommandEncoder encoder = m_device->device.CreateCommandEncoder();
+    const wgpu::TexelCopyTextureInfo source{.texture = from};
+    const wgpu::TexelCopyTextureInfo destination{.texture = to};
+    const wgpu::Extent3D extent{AtlasWidth, AtlasHeight, 1};
+    encoder.CopyTextureToTexture(&source, &destination, &extent);
+    EXPECT_TRUE(test::submit_and_wait(*m_device, encoder.Finish()));
+  }
+
+  [[nodiscard]] std::vector<Variant> opaque_variants() const {
+    std::vector<Variant> out;
+    for (const bool unclipped : {false, true}) {
+      for (const bool clip : {false, true}) {
+        if ((!clip || m_hasClip) && (!unclipped || m_hasUnclipped)) {
+          out.push_back({.clip = clip, .unclipped = unclipped});
+        }
+      }
+    }
+    return out;
+  }
+
+  static float texel(const std::vector<float>& atlas, uint32_t phys, uint32_t x, uint32_t y) {
+    const uint32_t ax = (phys % AtlasPagesX) * PageTexels + x;
+    const uint32_t ay = (phys / AtlasPagesX) * PageTexels + y;
+    return atlas[size_t{ay} * AtlasWidth + ax];
+  }
+
+  // The level-0 depth of a plane through the quad corners, in double at a texel centre
+  static double plane_depth(double x0, double x1, double z0, double z1, double x) {
+    return z0 + (z1 - z0) * (x - x0) / (x1 - x0);
+  }
+
+  wgpu::BindGroupLayout m_clearGroup, m_compareGroup;
+  wgpu::RenderPipeline m_clear;
+  wgpu::ComputePipeline m_compare;
+  wgpu::Buffer m_uniformViews, m_indirect, m_clearIndirect, m_instancesBuffer, m_materialsBuffer;
+  wgpu::Texture m_colorAtlas;
+  bool m_hasClip = false;
+  bool m_hasUnclipped = false;
+};
+
+int64_t ulp_distance(float a, float b) {
+  const auto ia = static_cast<int64_t>(std::bit_cast<int32_t>(a));
+  const auto ib = static_cast<int64_t>(std::bit_cast<int32_t>(b));
+  return std::abs(ia - ib);
+}
+
+TEST_F(RenderVsmRasterGpu, RasterStaysInsideListedPages) {
+  const auto x0 = static_cast<double>((TestPage - 1) * PageTexels) + 7.3;
+  const auto x1 = static_cast<double>((TestPage + 2) * PageTexels) - 5.1;
+  for (const Variant& variant : opaque_variants()) {
+    RasterScene rs{raster_views()};
+    rs.add_quad(1, rs.base_record(41), x0, x0, x1, x1, 0.62, 0.64, true, 100);
+    constexpr uint32_t Inside = 9;
+    constexpr uint32_t Far = 10;
+    rs.list({{rs.page_index_of(TestPage, TestPage), Inside}, {rs.page_index_of(TestPage + 6, TestPage + 6), Far}});
+    const wgpu::Texture atlas = depth_atlas();
+    constexpr float Sentinel = 0.25f;
+    fill(atlas, Sentinel);
+    const CullOut out = draw(rs, atlas, variant);
+    EXPECT_GT(out.pairs[pairs_header::OpaqueCount], 0u);
+    const std::vector<float> texels = read_atlas(atlas);
+    uint32_t leaks = 0;
+    uint32_t holes = 0;
+    for (uint32_t p = 0; p < AtlasPagesX * AtlasRows; ++p) {
+      for (uint32_t y = 0; y < PageTexels; ++y) {
+        for (uint32_t x = 0; x < PageTexels; ++x) {
+          const float d = texel(texels, p, x, y);
+          if (p == Inside) {
+            holes += d > 0.6f && d < 0.65f ? 0 : 1;
+          } else {
+            leaks += d == (p == Far ? 0.f : Sentinel) ? 0 : 1;
+          }
+        }
+      }
+    }
+    EXPECT_EQ(holes, 0u) << "clip " << variant.clip << " unclipped " << variant.unclipped;
+    EXPECT_EQ(leaks, 0u) << "clip " << variant.clip << " unclipped " << variant.unclipped;
+  }
+}
+
+TEST_F(RenderVsmRasterGpu, ClipAndDiscardAgree) {
+  if (!m_hasClip) {
+    GTEST_SKIP() << "the device has no clip distances";
+  }
+  std::mt19937 rng{7};
+  std::uniform_real_distribution<double> coord(static_cast<double>((TestPage - 1) * PageTexels),
+                                               static_cast<double>((TestPage + 2) * PageTexels));
+  std::uniform_real_distribution<double> depth(0.499, 0.501);
+  RasterScene rs{raster_views()};
+  std::vector<Vtx> verts;
+  std::vector<Tri> tris;
+  for (uint32_t t = 0; t < 20; ++t) {
+    for (uint32_t k = 0; k < 3; ++k) {
+      verts.push_back({.pos = rs.at(coord(rng), coord(rng), depth(rng))});
+    }
+    tris.push_back({3 * t, 3 * t + 1, 3 * t + 2});
+  }
+  rs.add_mesh(1, rs.base_record(42), verts, tris, true, 100);
+  rs.list({{rs.page_index_of(TestPage, TestPage), 9}});
+  std::array<std::vector<float>, 2> results;
+  for (const bool clip : {false, true}) {
+    const wgpu::Texture atlas = depth_atlas();
+    fill(atlas, 0.f);
+    (void)draw(rs, atlas, {.clip = clip});
+    results[clip ? 1 : 0] = read_atlas(atlas);
+  }
+  uint32_t covered = 0;
+  uint32_t bitwise = 0;
+  int64_t worst = 0;
+  for (size_t i = 0; i < results[0].size(); ++i) {
+    const float a = results[0][i];
+    const float b = results[1][i];
+    ASSERT_EQ(a > 0.f, b > 0.f) << "coverage differs at texel " << i;
+    if (a > 0.f) {
+      ++covered;
+      bitwise += a == b ? 1 : 0;
+      worst = std::max(worst, ulp_distance(a, b));
+    }
+  }
+  EXPECT_GT(covered, 1000u);
+  EXPECT_LE(worst, 4);
+  std::printf("clip and discard: %u covered texels, %.2f%% bitwise equal, worst %lld ulp\n", covered,
+              100.0 * bitwise / std::max(covered, 1u), static_cast<long long>(worst));
+}
+
+TEST_F(RenderVsmRasterGpu, CutoutCastsHoles) {
+  m_colorAtlas = texture(wgpu::TextureFormat::RGBA8Unorm, scene::atlas::PageSize, scene::atlas::PageSize,
+                         wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst);
+  constexpr uint32_t Tile = scene::atlas::TileSize;
+  std::vector<uint32_t> tile(size_t{Tile} * Tile, 0);
+  for (uint32_t y = 0; y < Tile; ++y) {
+    for (uint32_t x = 0; x < Tile; ++x) {
+      const bool open = ((x / 16) + (y / 16)) % 2 != 0;
+      tile[size_t{y} * Tile + x] = open ? 0x00FFFFFFu : 0xFFFFFFFFu;
+    }
+  }
+  const wgpu::TexelCopyTextureInfo destination{.texture = m_colorAtlas};
+  const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = Tile * 4, .rowsPerImage = Tile};
+  const wgpu::Extent3D extent{Tile, Tile, 1};
+  m_device->queue.WriteTexture(&destination, tile.data(), tile.size() * 4, &layout, &extent);
+  RasterScene rs{raster_views()};
+  uint32_t* m = &rs.cull.materials[size_t{CutoutMaterial} * 8];
+  m[0] = scene::atlas::NoTile | 0u << 16;
+  m[1] = 3u << 8 | scene::atlas::material_flag::AlphaTest << 16;
+  m[2] = 4u | 7u << 3 | 0u << 6 | 128u << 8;
+  Record rec = rs.base_record(43);
+  rec[record::Material] = CutoutMaterial | 0xFF0000u;
+  rec[record::Flags] |= instance_flag::AlphaUvIsUv0;
+  const auto x0 = static_cast<double>(TestPage * PageTexels);
+  const double x1 = x0 + PageTexels;
+  rs.add_quad(1, rec, x0, x0, x1, x1, 0.55, 0.55, true, 100);
+  ASSERT_NE(rs.cull.hist(1)[hist::Flags] & hist::Cutout, 0u);
+  rs.list({{rs.page_index_of(TestPage, TestPage), 9}});
+  for (const Variant& variant : opaque_variants()) {
+    const wgpu::Texture atlas = depth_atlas();
+    fill(atlas, 0.f);
+    const CullOut out = draw(rs, atlas, variant, true);
+    EXPECT_EQ(out.pairs[pairs_header::OpaqueCount], 0u);
+    EXPECT_GT(out.pairs[pairs_header::CutoutCount], 0u);
+    const std::vector<float> texels = read_atlas(atlas);
+    uint32_t wrong = 0;
+    uint32_t open = 0;
+    for (uint32_t y = 0; y < PageTexels; ++y) {
+      for (uint32_t x = 0; x < PageTexels; ++x) {
+        const bool hole = ((x / 16) + (y / 16)) % 2 != 0;
+        const float d = texel(texels, 9, x, y);
+        open += hole ? 1 : 0;
+        wrong += (hole ? d == 0.f : std::abs(d - 0.55f) < 1e-4f) ? 0 : 1;
+      }
+    }
+    EXPECT_EQ(open, PageTexels * PageTexels / 2);
+    EXPECT_EQ(wrong, 0u) << "clip " << variant.clip << " unclipped " << variant.unclipped;
+  }
+}
+
+TEST_F(RenderVsmRasterGpu, PancakeKeepsCastersBeyondTheLightSide) {
+  const auto x0 = static_cast<double>(TestPage * PageTexels) - 3.0;
+  const double x1 = x0 + PageTexels + 6.0;
+  for (const Variant& variant : opaque_variants()) {
+    RasterScene rs{raster_views()};
+    rs.add_quad(1, rs.base_record(44), x0, x0, x1, x1, 1.3, 1.4, true, 100);
+    rs.list({{rs.page_index_of(TestPage, TestPage), 9}});
+    const wgpu::Texture atlas = depth_atlas();
+    fill(atlas, 0.f);
+    (void)draw(rs, atlas, variant);
+    const std::vector<float> texels = read_atlas(atlas);
+    uint32_t wrong = 0;
+    for (uint32_t y = 0; y < PageTexels; ++y) {
+      for (uint32_t x = 0; x < PageTexels; ++x) {
+        wrong += texel(texels, 9, x, y) == 1.f ? 0 : 1;
+      }
+    }
+    EXPECT_EQ(wrong, 0u) << "clip " << variant.clip << " unclipped " << variant.unclipped;
+  }
+}
+
+TEST_F(RenderVsmRasterGpu, PancakeStraddlingTriangleKeepsPlane) {
+  const auto x0 = static_cast<double>(TestPage * PageTexels);
+  const double x1 = x0 + PageTexels;
+  struct Case {
+    double z0;
+    double z1;
+    bool lightSide;
+  };
+  for (const Case c : {Case{0.6, 1.4, true}, Case{-0.4, 0.4, false}}) {
+    for (const Variant& variant : opaque_variants()) {
+      RasterScene rs{raster_views()};
+      rs.add_quad(1, rs.base_record(45), x0, x0, x1, x1, c.z0, c.z1, true, 100);
+      rs.list({{rs.page_index_of(TestPage, TestPage), 9}});
+      const wgpu::Texture atlas = depth_atlas();
+      fill(atlas, 0.f);
+      (void)draw(rs, atlas, variant);
+      const std::vector<float> texels = read_atlas(atlas);
+      int64_t worst = 0;
+      double residual = 0.0;
+      uint32_t outside = 0;
+      for (uint32_t y = 0; y < PageTexels; ++y) {
+        for (uint32_t x = 2; x + 2 < PageTexels; ++x) {
+          const double plane = plane_depth(x0, x1, c.z0, c.z1, x0 + x + 0.5);
+          const float d = texel(texels, 9, x, y);
+          if (plane > 1.0 + 1e-3) {
+            outside += d == 1.f ? 0 : 1;
+          } else if (plane < -1e-3) {
+            outside += d == 0.f ? 0 : 1;
+          } else if (plane > 1e-3 && plane < 1.0 - 1e-3) {
+            residual = std::max(residual, std::abs(d - plane));
+            if (plane > 0.25) {
+              worst = std::max(worst, ulp_distance(d, static_cast<float>(plane)));
+            }
+          }
+        }
+      }
+      const bool exact = variant.unclipped || !c.lightSide;
+      const double slope = std::abs(c.z1 - c.z0) / (x1 - x0);
+      if (exact && !variant.clip) {
+        EXPECT_LE(worst, 4) << "light side " << c.lightSide << " unclipped " << variant.unclipped;
+      }
+      if (exact && variant.clip) {
+        EXPECT_LE(residual, slope / 64.0 + 2.5e-7)
+            << "light side " << c.lightSide << " unclipped " << variant.unclipped;
+      }
+      if (exact) {
+        EXPECT_EQ(outside, 0u) << "light side " << c.lightSide << " unclipped " << variant.unclipped;
+      }
+      std::printf("straddling the %s bound, clip %d unclipped %d: worst %lld ulp, residual %.3g\n",
+                  c.lightSide ? "light" : "far", variant.clip, variant.unclipped, static_cast<long long>(worst),
+                  residual);
+    }
+  }
+}
+
+TEST_F(RenderVsmRasterGpu, DegenerateTailDrawsNothing) {
+  const auto x0 = static_cast<double>(TestPage * PageTexels);
+  RasterScene rs{raster_views()};
+  const std::vector<Vtx> one{{.pos = rs.at(x0 + 10, x0 + 10, 0.5)},
+                             {.pos = rs.at(x0 + 30, x0 + 10, 0.5)},
+                             {.pos = rs.at(x0 + 10, x0 + 30, 0.5)}};
+  rs.add_mesh(1, rs.base_record(46), one, {{0, 1, 2}}, true, 100);
+  const std::vector<Vtx> chunk{{.pos = rs.at(x0 + 60, x0 + 60, 0.5)},
+                               {.pos = rs.at(x0 + 90, x0 + 60, 0.5)},
+                               {.pos = rs.at(x0 + 60, x0 + 90, 0.5)}};
+  rs.add_mesh(2, rs.base_record(47), chunk, {{0, 1, 2}}, false);
+  const std::vector<Vtx> gone{{.pos = rs.at(x0 + 10, x0 + 80, 0.5)},
+                              {.pos = rs.at(x0 + 40, x0 + 80, 0.5)},
+                              {.pos = rs.at(x0 + 10, x0 + 110, 0.5)}};
+  rs.add_mesh(3, rs.base_record(48), gone, {{0, 1, 2}}, true, 101);
+  rs.records[size_t{3} * RecordWords + record::Flags] = 0;
+  rs.list({{rs.page_index_of(TestPage, TestPage), 9}});
+  for (const Variant& variant : opaque_variants()) {
+    const wgpu::Texture atlas = depth_atlas();
+    fill(atlas, 0.f);
+    const CullOut out = draw(rs, atlas, variant);
+    EXPECT_EQ(out.pairs[pairs_header::OpaqueCount], 3u);
+    const std::vector<float> texels = read_atlas(atlas);
+    uint32_t stray = 0;
+    uint32_t drawn = 0;
+    for (uint32_t y = 0; y < PageTexels; ++y) {
+      for (uint32_t x = 0; x < PageTexels; ++x) {
+        const double fx = x + 0.5;
+        const double fy = y + 0.5;
+        const bool first = fx > 10 && fy > 10 && fx + fy < 40;
+        const bool second = fx > 60 && fy > 60 && fx + fy < 150;
+        const bool edge = std::abs(fx + fy - 40) < 1 || std::abs(fx + fy - 150) < 1;
+        const float d = texel(texels, 9, x, y);
+        if (first || second) {
+          drawn += d > 0.f ? 1 : 0;
+        } else if (!edge) {
+          stray += d != 0.f ? 1 : 0;
+        }
+      }
+    }
+    EXPECT_EQ(stray, 0u) << "clip " << variant.clip;
+    EXPECT_GT(drawn, 300u) << "clip " << variant.clip;
+  }
+}
+
+TEST_F(RenderVsmRasterGpu, InPlaceRerenderMatches) {
+  RasterScene rs{raster_views()};
+  std::vector<Vtx> verts;
+  std::vector<Tri> tris;
+  const auto x0 = static_cast<double>(TestPage * PageTexels);
+  std::mt19937 rng{11};
+  std::uniform_real_distribution<double> coord(x0 - 40.0, x0 + PageTexels + 40.0);
+  std::uniform_real_distribution<double> depth(0.4, 0.6);
+  for (uint32_t t = 0; t < 21; ++t) {
+    for (uint32_t k = 0; k < 3; ++k) {
+      verts.push_back({.pos = rs.at(coord(rng), coord(rng), depth(rng))});
+    }
+    tris.push_back({3 * t, 3 * t + 1, 3 * t + 2});
+  }
+  rs.add_mesh(1, rs.base_record(49), verts, tris, true, 100);
+  const uint32_t v = rs.page_index_of(TestPage, TestPage);
+  const Variant variant = opaque_variants().back();
+  const wgpu::Texture atlas = depth_atlas();
+  const wgpu::Texture copy = depth_atlas();
+  fill(atlas, 0.f);
+  rs.list({{v, 9}});
+  (void)draw(rs, atlas, variant);
+  const auto rerender = [&] {
+    copy_texture(atlas, copy);
+    rs.list({{v, 9}}, true);
+    const CullOut out = draw(rs, atlas, variant);
+    EXPECT_GT(out.pairs[pairs_header::OpaqueCount], 0u);
+    return compare(rs, atlas, copy);
+  };
+  const std::vector<uint32_t> same = rerender();
+  EXPECT_EQ(same[stat::CheckCompared], 1u);
+  EXPECT_EQ(same[stat::CheckMismatched], 0u);
+  EXPECT_EQ(same[stat::CheckTexels], 0u);
+  const ViewRecord& view = rs.view();
+  for (uint32_t k = 0; k < 3; ++k) {
+    const float shift = 0.3f * view.anchorRel[k] * view.texel * view.texel;
+    const uint32_t w = size_t{1} * RecordWords + record::World + k * 4 + 3;
+    rs.records[w] = std::bit_cast<uint32_t>(std::bit_cast<float>(rs.records[w]) + shift);
+  }
+  const std::vector<uint32_t> moved = rerender();
+  EXPECT_EQ(moved[stat::CheckCompared], 1u);
+  EXPECT_EQ(moved[stat::CheckMismatched], 1u);
+  EXPECT_GT(moved[stat::CheckTexels], 0u);
+  const uint32_t key = ~moved[stat::CheckFirst];
+  EXPECT_EQ(key & entry::PhysMask, 9u);
+  EXPECT_EQ(key >> 22, 0u);
+}
+
+TEST_F(RenderVsmRasterGpu, SmallClustersCastDepth) {
+  RasterScene rs{raster_views()};
+  const auto x0 = static_cast<double>(TestPage * PageTexels);
+  constexpr std::array<double, 4> Fractions{0.15, 0.35, 0.6, 0.65};
+  constexpr uint32_t First = 100;
+  Record rec = rs.base_record(21);
+  std::vector<Vtx> all;
+  std::vector<std::pair<uint32_t, uint32_t>> centres;
+  for (uint32_t j = 0; j < 32; ++j) {
+    for (uint32_t i = 0; i < 32; ++i) {
+      const double fx = Fractions[(i * 3 + j) % 4];
+      const double fy = Fractions[(j * 5 + i) % 4];
+      const double x = x0 + 4.0 * i + fx;
+      const double y = x0 + 4.0 * j + fy;
+      const std::vector<Vtx> quad{{.pos = rs.at(x, y, 0.5)},
+                                  {.pos = rs.at(x + 0.4, y, 0.5)},
+                                  {.pos = rs.at(x, y + 0.4, 0.5)},
+                                  {.pos = rs.at(x + 0.4, y + 0.4, 0.5)}};
+      rs.add_cluster(First + j * 32 + i, static_cast<uint32_t>(all.size()), quad, {{0, 1, 2}, {2, 1, 3}});
+      all.insert(all.end(), quad.begin(), quad.end());
+      if (fx < 0.5 && fy < 0.5) {
+        centres.emplace_back(4 * i, 4 * j);
+      }
+    }
+  }
+  rec[record::VertexFirst] = 0;
+  rec[record::VertexCount] = static_cast<uint32_t>(all.size());
+  rec[record::ClusterFirst] = First;
+  rec[record::ClusterCount] = 1024;
+  rs.push_vertices(all);
+  rs.finish(1, rec, RasterScene::box_of(all));
+  rs.list({{rs.page_index_of(TestPage, TestPage), 9}});
+  for (const Variant& variant : opaque_variants()) {
+    const wgpu::Texture atlas = depth_atlas();
+    fill(atlas, 0.f);
+    const CullOut out = draw(rs, atlas, variant);
+    EXPECT_GE(out.pairs[pairs_header::OpaqueCount], centres.size());
+    const std::vector<float> texels = read_atlas(atlas);
+    uint32_t written = 0;
+    for (uint32_t y = 0; y < PageTexels; ++y) {
+      for (uint32_t x = 0; x < PageTexels; ++x) {
+        written += texel(texels, 9, x, y) > 0.f ? 1 : 0;
+      }
+    }
+    uint32_t hit = 0;
+    for (const auto& [cx, cy] : centres) {
+      hit += texel(texels, 9, cx, cy) > 0.f ? 1 : 0;
+    }
+    EXPECT_EQ(centres.size(), 256u);
+    EXPECT_EQ(hit, centres.size()) << "clip " << variant.clip;
+    EXPECT_EQ(written, centres.size()) << "clip " << variant.clip;
   }
 }
 } // namespace

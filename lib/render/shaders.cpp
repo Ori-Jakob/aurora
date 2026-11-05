@@ -54,6 +54,7 @@ struct RenderState {
   bool depthWrite = false;
   wgpu::CompareFunction depthCompare = wgpu::CompareFunction::Always;
   uint32_t sampleCount = 1;
+  bool unclippedDepth = false;
 };
 
 // Owns copies of everything a desc views, because creation outlives the caller's arrays
@@ -407,7 +408,10 @@ void create_render(const Request& request, const wgpu::ShaderModule& module, boo
               .constantCount = constants.size(),
               .constants = constants.data(),
           },
-      .primitive = {.topology = state.topology, .frontFace = state.frontFace, .cullMode = state.cullMode},
+      .primitive = {.topology = state.topology,
+                    .frontFace = state.frontFace,
+                    .cullMode = state.cullMode,
+                    .unclippedDepth = state.unclippedDepth},
       .depthStencil = state.depthFormat != wgpu::TextureFormat::Undefined ? &depth : nullptr,
       .multisample = {.count = state.sampleCount},
       .fragment = request.fragmentEntry.empty() ? nullptr : &fragment,
@@ -512,6 +516,10 @@ uint64_t request_key(const Request& request, uint64_t layoutKey, uint64_t genera
     hasher.update(static_cast<uint8_t>(state.depthWrite));
     hasher.update(state.depthCompare);
     hasher.update(state.sampleCount);
+    // Folded only when set, so every pipeline key from before unclipped depth stays valid in the disk cache
+    if (state.unclippedDepth) {
+      hasher.update(static_cast<uint8_t>(1));
+    }
   }
   return hasher.digest();
 }
@@ -722,9 +730,9 @@ PipelineId request_compute(const ComputePipelineDesc& desc) {
   return submit_request(std::move(request), desc.label, desc.layoutKey, std::move(rejected));
 }
 
-PipelineId request_render(const RenderPipelineDesc& desc) {
-  std::string rejected = rejection(desc.shader, desc.layout, desc.layoutKey, desc.colorCount);
-  auto request = std::make_shared<Request>(Request{
+namespace {
+std::shared_ptr<Request> render_request(const RenderPipelineDesc& desc) {
+  return std::make_shared<Request>(Request{
       .render = true,
       .shader = std::string{desc.shader},
       .entry = std::string{desc.vertexEntry},
@@ -743,9 +751,15 @@ PipelineId request_render(const RenderPipelineDesc& desc) {
               .depthWrite = desc.depthWrite,
               .depthCompare = desc.depthCompare,
               .sampleCount = desc.sampleCount,
+              .unclippedDepth = desc.unclippedDepth,
           },
   });
-  return submit_request(std::move(request), desc.label, desc.layoutKey, std::move(rejected));
+}
+} // namespace
+
+PipelineId request_render(const RenderPipelineDesc& desc) {
+  std::string rejected = rejection(desc.shader, desc.layout, desc.layoutKey, desc.colorCount);
+  return submit_request(render_request(desc), desc.label, desc.layoutKey, std::move(rejected));
 }
 
 PipelineStatus status(PipelineId id) noexcept {
@@ -827,5 +841,7 @@ bool validate_module(std::string_view id, std::span<const std::string_view> defi
 
 namespace testing {
 uint32_t waiters() noexcept { return g_waiters.load(std::memory_order_relaxed); }
+
+uint64_t render_key(const RenderPipelineDesc& desc) { return request_key(*render_request(desc), desc.layoutKey, 0); }
 } // namespace testing
 } // namespace aurora::render::shaders

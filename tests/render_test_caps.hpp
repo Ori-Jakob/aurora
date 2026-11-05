@@ -38,6 +38,7 @@ inline Caps full_caps() {
   result.primitiveIndex = true;
   result.atomic64 = true;
   result.clipDistances = true;
+  result.depthClipControl = true;
   result.textureFormatsTier1 = true;
   result.textureFormatsTier2 = true;
   result.float32Filterable = true;

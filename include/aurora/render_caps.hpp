@@ -80,6 +80,7 @@ struct Caps {
   bool primitiveIndex = false;
   bool atomic64 = false;
   bool clipDistances = false;
+  bool depthClipControl = false;
   bool textureFormatsTier1 = false;
   bool textureFormatsTier2 = false;
   bool float32Filterable = false;

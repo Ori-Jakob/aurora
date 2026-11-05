@@ -32,7 +32,18 @@ struct SceneOptions {
   bool overlayCheck = false;
   bool classCheck = false;
   bool ssilCheck = false;
+  bool vsmCheck = false;
   bool hud = true;
+};
+
+inline constexpr u32 VsmCheckFrames = 150;
+inline constexpr u32 VsmFrozenFrame = 120;
+inline constexpr u32 VsmCardFrame = 60;
+inline constexpr u32 VsmProbesPerSide = 4;
+
+struct VsmProbe {
+  std::array<double, 3> world{};
+  bool open = false;
 };
 
 struct OverlayColors {
@@ -119,5 +130,6 @@ FogResolveCounts fog_resolve_counts() noexcept;
 uint32_t gpu_uploads_per_frame(const SceneOptions& options) noexcept;
 bool init_scene();
 void draw_scene(u32 frame, const SceneOptions& options);
+std::vector<VsmProbe> vsm_card_probes();
 void shutdown_scene();
 } // namespace render_demo

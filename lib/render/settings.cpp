@@ -993,6 +993,13 @@ FeatureSupport evaluate_support(Feature feature, uint8_t option, const Settings&
   const uint32_t fragmentStorage = stage_binding_limits(deviceCaps, ShaderStage::Fragment).storageBuffers;
   switch (feature) {
   case Feature::Shadows:
+    if (fragmentStorage == 0) {
+      return {false, Reason::NoFragmentStorage};
+    }
+    if (stage_binding_limits(deviceCaps, ShaderStage::Vertex).storageBuffers < shadows::vsm::RasterVertexStorage) {
+      return {false, Reason::NoVertexStorage};
+    }
+    break;
   case Feature::Clouds:
     if (fragmentStorage == 0) {
       return {false, Reason::NoFragmentStorage};

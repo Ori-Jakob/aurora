@@ -225,6 +225,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/shadows/vsm_invalidate.hpp
         lib/render/shadows/vsm_pages.cpp
         lib/render/shadows/vsm_pages.hpp
+        lib/render/shadows/vsm_raster.cpp
+        lib/render/shadows/vsm_raster.hpp
         lib/render/stage_camera.cpp
         lib/render/stage_camera.hpp
         lib/render/systems/dispatch.cpp

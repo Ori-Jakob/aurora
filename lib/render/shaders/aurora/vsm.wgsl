@@ -615,3 +615,34 @@ fn vsm_row_bits(x0: u32, x1: u32) -> u32 {
   let upper = select((1u << (x1 + 1u)) - 1u, 0xFFFFFFFFu, x1 >= 31u);
   return upper & ~((1u << x0) - 1u);
 }
+
+const VSM_ENTRY_CHECK: u32 = 0x80000000u;
+const VSM_HDR_FLAG_CHECK: u32 = 32u;
+const VSM_NEED_CHECK: u32 = 3u;
+const VSM_RL_CHECK_COUNT: u32 = 8u;
+const VSM_RL_CHECK_ONLY: u32 = 0x80000000u;
+
+const VSM_STAT_CHECK_PAGES: u32 = 50u;
+const VSM_STAT_CHECK_LISTED: u32 = 51u;
+const VSM_STAT_CHECK_COMPARED: u32 = 52u;
+const VSM_STAT_CHECK_TEXELS: u32 = 53u;
+const VSM_STAT_CHECK_MISMATCHED: u32 = 54u;
+const VSM_STAT_CHECK_FIRST: u32 = 55u;
+const VSM_STAT_CHECK_SKIPPED: u32 = 56u;
+const VSM_STAT_PROBE_FOUND: u32 = 60u;
+const VSM_STAT_PROBE_OCCLUDED: u32 = 61u;
+
+fn vsm_render_count(render_list: ptr<storage, array<u32>, read>) -> u32 {
+  if (VSM_RL_CHECK_COUNT >= arrayLength(render_list)) {
+    return 0u;
+  }
+  return min((*render_list)[VSM_RL_COUNT] + (*render_list)[VSM_RL_CHECK_COUNT], VSM_MAX_RENDER_PAGES);
+}
+
+fn vsm_render_virtual(word: u32) -> u32 {
+  return select(word & ~VSM_RL_CHECK_ONLY, VSM_NO_PAGE, word == VSM_NO_PAGE);
+}
+
+fn vsm_entry_listed(e: u32) -> bool {
+  return (e & VSM_ENTRY_SKIP) == 0u && (e & (VSM_ENTRY_RENDER_NOW | VSM_ENTRY_CHECK)) != 0u;
+}

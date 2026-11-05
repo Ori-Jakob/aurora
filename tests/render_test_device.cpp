@@ -33,6 +33,8 @@ constexpr std::array OptionalFeatures{
     wgpu::FeatureName::TextureCompressionBC,
     wgpu::FeatureName::MultiDrawIndirect,
     wgpu::FeatureName::IndirectFirstInstance,
+    wgpu::FeatureName::ClipDistances,
+    wgpu::FeatureName::DepthClipControl,
 };
 
 std::string to_string(wgpu::StringView text) { return std::string{std::string_view{text}}; }

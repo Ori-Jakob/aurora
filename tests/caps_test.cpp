@@ -41,6 +41,7 @@ constexpr std::array FeatureFlags{
     FeatureFlag{FeatureName::PrimitiveIndex, &Caps::primitiveIndex},
     FeatureFlag{FeatureName::AtomicVec2uMinMax, &Caps::atomic64},
     FeatureFlag{FeatureName::ClipDistances, &Caps::clipDistances},
+    FeatureFlag{FeatureName::DepthClipControl, &Caps::depthClipControl},
     FeatureFlag{FeatureName::TextureFormatsTier1, &Caps::textureFormatsTier1},
     FeatureFlag{FeatureName::TextureFormatsTier2, &Caps::textureFormatsTier2},
     FeatureFlag{FeatureName::Float32Filterable, &Caps::float32Filterable},
@@ -158,7 +159,7 @@ Caps caps_with(std::span<const FeatureName> features, wgpu::BackendType backend 
 
 TEST(CapsTest, FeatureTableNamesAndOrder) {
   const auto table = requested_features();
-  ASSERT_EQ(table.size(), 21u);
+  ASSERT_EQ(table.size(), 22u);
   std::set<std::string_view> names;
   std::set<FeatureName> features;
   for (const auto& entry : table) {
@@ -168,7 +169,7 @@ TEST(CapsTest, FeatureTableNamesAndOrder) {
   }
   EXPECT_EQ(names.size(), table.size());
   EXPECT_EQ(features.size(), table.size());
-  const std::array<std::pair<FeatureName, std::string_view>, 21> expected{{
+  const std::array<std::pair<FeatureName, std::string_view>, 22> expected{{
       {FeatureName::CoreFeaturesAndLimits, "CoreFeaturesAndLimits"},
       {FeatureName::TextureCompressionBC, "TextureCompressionBC"},
       {FeatureName::TextureCompressionASTC, "TextureCompressionASTC"},
@@ -182,6 +183,7 @@ TEST(CapsTest, FeatureTableNamesAndOrder) {
       {FeatureName::PrimitiveIndex, "PrimitiveIndex"},
       {FeatureName::AtomicVec2uMinMax, "AtomicVec2uMinMax"},
       {FeatureName::ClipDistances, "ClipDistances"},
+      {FeatureName::DepthClipControl, "DepthClipControl"},
       {FeatureName::TextureFormatsTier1, "TextureFormatsTier1"},
       {FeatureName::TextureFormatsTier2, "TextureFormatsTier2"},
       {FeatureName::Float32Filterable, "Float32Filterable"},
@@ -208,7 +210,7 @@ TEST(CapsTest, FeatureTableNamesAndOrder) {
 TEST(CapsTest, FeatureNameLookup) {
   EXPECT_EQ(requested_feature_name(FeatureName::MultiDrawIndirect), "MultiDrawIndirect");
   EXPECT_EQ(requested_feature_name(FeatureName::CoreFeaturesAndLimits), "CoreFeaturesAndLimits");
-  EXPECT_EQ(requested_feature_name(FeatureName::DepthClipControl), "");
+  EXPECT_EQ(requested_feature_name(FeatureName::SubgroupSizeControl), "");
 }
 
 TEST(CapsTest, SelectFollowsTableOrder) {
@@ -222,13 +224,13 @@ TEST(CapsTest, SelectSkipsUnsupported) {
   const auto selected = select_device_features(adapter, FEATURE_PROFILE_FULL);
   EXPECT_FALSE(contains(selected, FeatureName::Subgroups));
   EXPECT_FALSE(contains(selected, FeatureName::ShaderF16));
-  EXPECT_EQ(selected.size(), 19u);
+  EXPECT_EQ(selected.size(), 20u);
   EXPECT_EQ(selected, adapter);
 }
 
 TEST(CapsTest, SelectIgnoresUnlistedFeatures) {
   const std::array adapter{
-      FeatureName::DepthClipControl,
+      FeatureName::Float32Blendable,
       FeatureName::ChromiumExperimentalSamplingResourceTable,
       FeatureName::SubgroupSizeControl,
   };

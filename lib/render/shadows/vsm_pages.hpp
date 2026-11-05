@@ -41,6 +41,7 @@ inline constexpr double LowSunOnDegrees = 3.0;
 inline constexpr double LowSunOffDegrees = 2.5;
 inline constexpr uint32_t FilterMarginTexels = 4;
 inline constexpr uint32_t MaxPassStorageBuffers = 8;
+inline constexpr uint32_t RasterVertexStorage = 6;
 inline constexpr double MinDepthRange = 32768.0;
 inline constexpr double MaxDepthRange = 1048576.0;
 inline constexpr double DepthRangePerRadius = 64.0;
@@ -73,6 +74,7 @@ inline constexpr uint32_t RenderNow = 1u << 17;
 inline constexpr uint32_t RenderIndexShift = 18;
 inline constexpr uint32_t RenderIndexMask = 0xFFFu;
 inline constexpr uint32_t Skip = 1u << 30;
+inline constexpr uint32_t Check = 1u << 31;
 } // namespace entry
 
 namespace view_flag {
@@ -93,6 +95,7 @@ inline constexpr uint32_t Full = 1u << 1;
 inline constexpr uint32_t Exempt = 1u << 2;
 inline constexpr uint32_t Relatch = 1u << 3;
 inline constexpr uint32_t Held = 1u << 4;
+inline constexpr uint32_t Check = 1u << 5;
 } // namespace header_flag
 
 namespace full_reason {
@@ -167,6 +170,9 @@ inline constexpr uint32_t CullCount = 1u << 13;
 inline constexpr uint32_t CullScan = 1u << 14;
 inline constexpr uint32_t CullSkip = 1u << 15;
 inline constexpr uint32_t CullEmit = 1u << 16;
+inline constexpr uint32_t Raster = 1u << 17;
+inline constexpr uint32_t CheckCopy = 1u << 18;
+inline constexpr uint32_t CheckCompare = 1u << 19;
 } // namespace chain_bit
 
 struct ViewsHeader {
@@ -437,7 +443,7 @@ void mark_encoded(uint32_t bit) noexcept;
 [[nodiscard]] uint32_t expected_chain() noexcept;
 
 [[nodiscard]] detail::PersistentHandle handle(std::string_view name) noexcept;
-inline constexpr size_t PassCount = 18;
+inline constexpr size_t PassCount = 21;
 [[nodiscard]] std::array<detail::PassDesc, PassCount> pass_descs();
 
 namespace testing {

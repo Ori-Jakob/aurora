@@ -27,6 +27,8 @@
 #include "render/shadows/vsm_cull.hpp"
 #include "render/shadows/vsm_invalidate.hpp"
 #include "render/shadows/vsm_pages.hpp"
+#include "render/shadows/vsm_raster.hpp"
+#include "render/shadows/vsm_check.hpp"
 #include "render/shaders.hpp"
 #include "render/systems/dispatch.hpp"
 #include "render/systems/systems.hpp"
@@ -1836,6 +1838,39 @@ TEST_F(RenderShaders, VsmCullCompiles) {
     const std::span<const std::string_view> defines{variant.data(), variant[1].empty() ? 1u : 2u};
     EXPECT_TRUE(validate_module(shadows::vsm::CullShader, defines, error)) << variant[0] << " " << error;
   }
+}
+
+TEST_F(RenderShaders, VsmRasterVariantsCompile) {
+  std::string error;
+  for (uint32_t i = 0; i < 8; ++i) {
+    shaders::RenderPipelineDesc desc{.shader = shadows::vsm::RasterShader};
+    shadows::vsm::caster_variant(desc, (i & 4) != 0, (i & 2) != 0, (i & 1) != 0);
+    EXPECT_TRUE(validate_module(shadows::vsm::RasterShader, desc.defines, error)) << i << " " << error;
+    EXPECT_EQ(desc.unclippedDepth, (i & 1) != 0) << i;
+    EXPECT_EQ(desc.depthCompare, wgpu::CompareFunction::Greater) << i;
+    EXPECT_EQ(desc.cullMode, wgpu::CullMode::None) << i;
+    EXPECT_EQ(desc.fragmentEntry.empty(), (i & 6) == 2) << i;
+  }
+  EXPECT_TRUE(validate_module(shadows::vsm::CasterShader, {}, error)) << error;
+  EXPECT_TRUE(validate_module(shadows::vsm::check::CheckShader, {}, error)) << error;
+}
+
+TEST_F(RenderShaders, UnclippedDepthKeepsExistingKeys) {
+  shaders::RenderPipelineDesc desc{
+      .label = "key probe",
+      .shader = shadows::vsm::RasterShader,
+      .vertexEntry = "vs_caster",
+      .fragmentEntry = "fs_rect",
+      .depthFormat = wgpu::TextureFormat::Depth32Float,
+      .depthWrite = true,
+      .depthCompare = wgpu::CompareFunction::Greater,
+  };
+  const uint64_t plain = shaders::testing::render_key(desc);
+  EXPECT_EQ(plain, 0xde87623e06cbfddcull) << std::hex << plain;
+  desc.unclippedDepth = true;
+  EXPECT_NE(shaders::testing::render_key(desc), plain);
+  desc.unclippedDepth = false;
+  EXPECT_EQ(shaders::testing::render_key(desc), plain);
 }
 
 TEST_F(RenderShaders, RetainedReaderCompiles) {

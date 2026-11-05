@@ -4,6 +4,7 @@
 #include "vsm_check.hpp"
 #include "vsm_cull.hpp"
 #include "vsm_invalidate.hpp"
+#include "vsm_raster.hpp"
 
 #include "../graph_bind.hpp"
 #include "../hints.hpp"
@@ -418,7 +419,7 @@ uint32_t expected_mask(const detail::CompiledGraph* graph) noexcept {
   if (graph == nullptr) {
     return 0;
   }
-  constexpr std::array<std::pair<std::string_view, uint32_t>, 17> Chain{{
+  constexpr std::array<std::pair<std::string_view, uint32_t>, 18> Chain{{
       {UpdatePass, chain_bit::Update},
       {ScanPass, chain_bit::Scan},
       {ScanListPass, chain_bit::ScanList},
@@ -436,6 +437,7 @@ uint32_t expected_mask(const detail::CompiledGraph* graph) noexcept {
       {CullScanPass, chain_bit::CullScan},
       {CullSkipPass, chain_bit::CullSkip},
       {CullEmitPass, chain_bit::CullEmit},
+      {RasterPass, chain_bit::Raster},
   }};
   uint32_t mask = 0;
   for (const auto& [name, bit] : Chain) {
@@ -904,7 +906,7 @@ FrameDecision decide_frame(const FrameInput& in) noexcept {
   h.clock = w.clock;
   h.flags = (in.producing ? header_flag::Producing : 0u) | (d.full ? header_flag::Full : 0u) |
             (d.exempt ? header_flag::Exempt : 0u) | (relatched ? header_flag::Relatch : 0u) |
-            (d.held ? header_flag::Held : 0u);
+            (d.held ? header_flag::Held : 0u) | (check::config().on ? header_flag::Check : 0u);
   h.fullReason = reasons;
   h.budget = d.exempt ? in.pages : in.budget;
   h.poolPages = in.pages;
@@ -1017,6 +1019,7 @@ void shutdown() {
   check::shutdown();
   log_summary();
   alloc_shutdown();
+  raster_shutdown();
   for (PassId& pass : g_passes) {
     if (pass != detail::InvalidPassId) {
       detail::unregister_pass(pass);
@@ -1059,6 +1062,7 @@ void latch_gate(const Settings& settings, const Caps& caps) noexcept {
   }
   const bool next = g_wanted && scene::retained::active() && caps.core &&
                     stage_binding_limits(caps, ShaderStage::Compute).storageBuffers >= MaxPassStorageBuffers &&
+                    stage_binding_limits(caps, ShaderStage::Vertex).storageBuffers >= RasterVertexStorage &&
                     gfx::layout_has_gbuffer(gfx::scene_render_target_layout()) && g_extent.fits;
   if (next != g_active) {
     Log.info("VSM: sun virtual shadow maps {}", next ? "active" : "inactive");
@@ -1229,7 +1233,10 @@ std::array<detail::PassDesc, PassCount> pass_descs() {
       cull_skip_pass_desc(),
       cull_emit_pass_desc(),
       clear_pass_desc(),
+      raster_pass_desc(),
       commit_pass_desc(),
+      check::copy_pass_desc(),
+      check::compare_pass_desc(),
       check::pass_desc(),
   };
 }
@@ -1265,6 +1272,7 @@ void reset() noexcept {
   g_fifoReady.store(false, std::memory_order_relaxed);
   g_worker = {};
   check::testing::reset();
+  set_atlas_handle(std::nullopt);
 }
 
 void force_consumed(std::optional<bool> force) noexcept { g_forceOverride = force; }

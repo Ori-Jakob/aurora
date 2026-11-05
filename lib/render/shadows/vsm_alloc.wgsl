@@ -117,6 +117,12 @@ fn vsm_classify(@builtin(global_invocation_id) id: vec3u) {
   vsm_need[VSM_NEED_PRIORITY * VSM_MAX_VIRTUAL_PAGES + v] = select(0u, 1u, priority);
   vsm_need[VSM_NEED_NEW * VSM_MAX_VIRTUAL_PAGES + v] = select(0u, 1u, fresh);
   vsm_need[VSM_NEED_REUSE * VSM_MAX_VIRTUAL_PAGES + v] = select(0u, 1u, reuse);
+  if ((vsm_views[VSM_HDR_FLAGS] & VSM_HDR_FLAG_CHECK) != 0u &&
+      (VSM_NEED_CHECK + 1u) * VSM_MAX_VIRTUAL_PAGES <= arrayLength(&vsm_need)) {
+    let cached = allocated && (e & (VSM_ENTRY_CACHED | VSM_ENTRY_DIRTY)) == VSM_ENTRY_CACHED;
+    vsm_need[VSM_NEED_CHECK * VSM_MAX_VIRTUAL_PAGES + v] = select(0u, 1u, cached);
+    vsm_classify_count(VSM_STAT_CHECK_PAGES, cached);
+  }
   vsm_classify_count(VSM_STAT_REQUESTED, req != 0u);
   vsm_classify_count(VSM_STAT_NEED_PRIORITY, priority);
   vsm_classify_count(VSM_STAT_NEED_NEW, fresh);
@@ -172,6 +178,12 @@ fn vsm_assign_row(v: u32) {
   }
 }
 
+fn vsm_assign_checks(count: u32, held: bool) -> u32 {
+  let on = (vsm_views[VSM_HDR_FLAGS] & VSM_HDR_FLAG_CHECK) != 0u && !held &&
+           (VSM_NEED_CHECK + 1u) * VSM_MAX_VIRTUAL_PAGES <= arrayLength(&vsm_need_list);
+  return select(0u, min(atomicLoad(&vsm_stats[VSM_STAT_CHECK_PAGES]), VSM_MAX_RENDER_PAGES - count), on);
+}
+
 @compute @workgroup_size(64)
 fn vsm_assign(@builtin(global_invocation_id) id: vec3u) {
   let i = id.x;
@@ -193,9 +205,11 @@ fn vsm_assign(@builtin(global_invocation_id) id: vec3u) {
     vsm_assign_put(VSM_RL_PAGES_X, pages_x);
     vsm_assign_put(VSM_RL_ROWS, (pages + pages_x - 1u) / pages_x);
     vsm_assign_put(VSM_RL_FLAGS, select(0u, VSM_HDR_FLAG_HELD, held));
+    let checks = vsm_assign_checks(b.count, held);
+    vsm_assign_put(VSM_RL_CHECK_COUNT, checks);
     if (arrayLength(&vsm_clear_args) >= 4u) {
       vsm_clear_args[0] = 6u;
-      vsm_clear_args[1] = b.count;
+      vsm_clear_args[1] = b.count + checks;
       vsm_clear_args[2] = 0u;
       vsm_clear_args[3] = 0u;
     }
@@ -242,6 +256,38 @@ fn vsm_assign(@builtin(global_invocation_id) id: vec3u) {
     vsm_assign_row(v);
   }
 }
+
+// Runs after vsm_assign, so a cached page evicted for a new one this frame is never re-rendered in place
+@compute @workgroup_size(64)
+fn vsm_assign_check(@builtin(global_invocation_id) id: vec3u) {
+  let k = id.x;
+  let count = atomicLoad(&vsm_render_list[VSM_RL_COUNT]);
+  if (k >= atomicLoad(&vsm_render_list[VSM_RL_CHECK_COUNT])) {
+    return;
+  }
+  let i = count + k;
+  let w = VSM_NEED_CHECK * VSM_MAX_VIRTUAL_PAGES + k;
+  if (i >= VSM_MAX_RENDER_PAGES || w >= arrayLength(&vsm_need_list)) {
+    return;
+  }
+  let v = vsm_need_list[w] % VSM_MAX_VIRTUAL_PAGES;
+  var page = VSM_NO_PAGE;
+  if (v < arrayLength(&vsm_pt)) {
+    let e = vsm_pt[v];
+    let want = VSM_ENTRY_ALLOCATED | VSM_ENTRY_CACHED;
+    if ((e & (want | VSM_ENTRY_DIRTY | VSM_ENTRY_RENDER_NOW)) == want) {
+      page = vsm_entry_phys(e);
+      vsm_pt[v] = (e & ~(VSM_ENTRY_RENDER_INDEX_MASK << VSM_ENTRY_RENDER_INDEX_SHIFT)) | VSM_ENTRY_CHECK |
+                  (i << VSM_ENTRY_RENDER_INDEX_SHIFT);
+      atomicAdd(&vsm_stats[VSM_STAT_CHECK_LISTED], 1u);
+    }
+  }
+  vsm_assign_put(VSM_RL_PAGES + 2u * i, select(v | VSM_RL_CHECK_ONLY, VSM_NO_PAGE, page == VSM_NO_PAGE));
+  vsm_assign_put(VSM_RL_PAGES + 2u * i + 1u, page);
+  if (page != VSM_NO_PAGE) {
+    vsm_assign_row(v);
+  }
+}
 //#endif
 
 //#if VSM_COMMIT
@@ -252,15 +298,18 @@ fn vsm_assign(@builtin(global_invocation_id) id: vec3u) {
 @compute @workgroup_size(64)
 fn vsm_commit(@builtin(global_invocation_id) id: vec3u) {
   let i = id.x;
-  if (i >= min(vsm_render_list[VSM_RL_COUNT], VSM_MAX_RENDER_PAGES) ||
-      VSM_RL_PAGES + 2u * i >= arrayLength(&vsm_render_list)) {
+  if (i >= vsm_render_count(&vsm_render_list) || VSM_RL_PAGES + 2u * i >= arrayLength(&vsm_render_list)) {
     return;
   }
-  let v = vsm_render_list[VSM_RL_PAGES + 2u * i];
+  let v = vsm_render_virtual(vsm_render_list[VSM_RL_PAGES + 2u * i]);
   if (v >= min(VSM_MAX_VIRTUAL_PAGES, arrayLength(&vsm_pt))) {
     return;
   }
   let e = vsm_pt[v];
+  if ((e & VSM_ENTRY_CHECK) != 0u) {
+    vsm_pt[v] = e & ~(VSM_ENTRY_CHECK | VSM_ENTRY_SKIP | (VSM_ENTRY_RENDER_INDEX_MASK << VSM_ENTRY_RENDER_INDEX_SHIFT));
+    return;
+  }
   if ((e & VSM_ENTRY_RENDER_NOW) == 0u) {
     return;
   }
@@ -284,11 +333,10 @@ fn vsm_commit(@builtin(global_invocation_id) id: vec3u) {
 @vertex
 fn vs_clear(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> @builtin(position) vec4f {
   let hidden = vec4f(2.0, 2.0, 0.0, 1.0);
-  if (ii >= min(vsm_render_list[VSM_RL_COUNT], VSM_MAX_RENDER_PAGES) ||
-      VSM_RL_PAGES + 2u * ii + 1u >= arrayLength(&vsm_render_list)) {
+  if (ii >= vsm_render_count(&vsm_render_list) || VSM_RL_PAGES + 2u * ii + 1u >= arrayLength(&vsm_render_list)) {
     return hidden;
   }
-  let v = vsm_render_list[VSM_RL_PAGES + 2u * ii];
+  let v = vsm_render_virtual(vsm_render_list[VSM_RL_PAGES + 2u * ii]);
   let page = vsm_render_list[VSM_RL_PAGES + 2u * ii + 1u];
   if (v >= min(VSM_MAX_VIRTUAL_PAGES, arrayLength(&vsm_pt)) || page >= VSM_MAX_POOL_PAGES ||
       (vsm_pt[v] & VSM_ENTRY_SKIP) != 0u) {

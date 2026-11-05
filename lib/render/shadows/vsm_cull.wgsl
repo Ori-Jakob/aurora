@@ -219,7 +219,7 @@ fn vsm_cull_pairs(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_in
             continue;
           }
           let e = vsm_pt[index];
-          if ((e & (VSM_ENTRY_RENDER_NOW | VSM_ENTRY_SKIP)) != VSM_ENTRY_RENDER_NOW) {
+          if (!vsm_entry_listed(e)) {
             continue;
           }
           let ri = vsm_entry_render_index(e);
@@ -291,9 +291,12 @@ fn vsm_cull_skip(@builtin(global_invocation_id) id: vec3u) {
   }
   atomicMax(&vsm_pairs[VSM_PAIRS_SKIP_KEY], VSM_MAX_RENDER_PAGES - r);
   atomicAdd(&vsm_stats[VSM_STAT_SKIPPED_PAGES], 1u);
-  let v = vsm_render_page(&vsm_render_list, r).x;
+  let word = vsm_render_page(&vsm_render_list, r).x;
+  let v = vsm_render_virtual(word);
+  // A page re-rendered only for the check keeps its clean state, so the check never moves allocation
+  let check_only = word != VSM_NO_PAGE && (word & VSM_RL_CHECK_ONLY) != 0u;
   if (v < arrayLength(&vsm_pt)) {
-    atomicOr(&vsm_pt[v], VSM_ENTRY_SKIP | VSM_ENTRY_DIRTY | VSM_ENTRY_PRIORITY);
+    atomicOr(&vsm_pt[v], select(VSM_ENTRY_SKIP | VSM_ENTRY_DIRTY | VSM_ENTRY_PRIORITY, VSM_ENTRY_SKIP, check_only));
   }
 }
 

@@ -60,6 +60,7 @@ struct ListsLocal {
   uint16_t needScratch = NoRef;
   uint16_t freeList = NoRef;
   uint16_t freeScratch = NoRef;
+  uint16_t checkScratch = NoRef;
 };
 static_assert(sizeof(ListsLocal) <= detail::PassLocalSize);
 
@@ -235,7 +236,10 @@ void declare_classify(detail::InternalPassBuilder& builder, const PassSetup& set
   local.table = builder.import_persistent(Table, handle(Table), Access::StorageRW).index;
   local.phys = builder.import_persistent(Phys, handle(Phys), Access::StorageRW).index;
   local.stats = builder.import_persistent(StatsName, handle(StatsName), Access::StorageRW).index;
-  local.need = builder.create_buffer(NeedWords, {.size = NeedWordsBytes}, Access::StorageWrite).index;
+  local.need = builder
+                   .create_buffer(NeedWords, {.size = check::config().on ? NeedCheckBytes : NeedWordsBytes},
+                                  Access::StorageWrite)
+                   .index;
   local.physWords = builder.create_buffer(PhysWordsName, {.size = PhysWordsBytes}, Access::StorageWrite).index;
   write_local(builder, local);
 }
@@ -263,7 +267,8 @@ void declare_lists(detail::InternalPassBuilder& builder, const PassSetup& setup,
   }
   const compact::Plan needPlan = compact::make_plan(compact::Op::Compact, NeedItems, *setup.caps);
   const compact::Plan physPlan = compact::make_plan(compact::Op::Compact, PhysItems, *setup.caps);
-  if (!needPlan.valid() || !physPlan.valid()) {
+  const compact::Plan checkPlan = compact::make_plan(compact::Op::Compact, MaxVirtualPages, *setup.caps);
+  if (!needPlan.valid() || !physPlan.valid() || !checkPlan.valid()) {
     builder.skip();
     return;
   }
@@ -276,10 +281,14 @@ void declare_lists(detail::InternalPassBuilder& builder, const PassSetup& setup,
     return builder.create_buffer(name, {.size = size, .extraUsage = wgpu::BufferUsage::CopyDst}, Access::StorageWrite)
         .index;
   };
-  local.needList = create(NeedList, uint64_t{NeedItems} * 4);
+  const bool checking = check::config().on;
+  local.needList = create(NeedList, checking ? NeedCheckBytes : NeedWordsBytes);
   local.needScratch = create(NeedScratch, needPlan.scratchBytes);
   local.freeList = create(FreeList, uint64_t{PhysItems} * 4);
   local.freeScratch = create(FreeScratch, physPlan.scratchBytes);
+  if (checking) {
+    local.checkScratch = create(CheckScratch, checkPlan.scratchBytes);
+  }
   write_local(builder, local);
 }
 
@@ -288,12 +297,19 @@ void encode_lists(detail::PassContext& ctx, const void*) {
   if ((encoded_mask() & chain_bit::Classify) == 0) {
     return;
   }
-  const auto view = [&](uint16_t ref) { return ctx.buffer(BufRef{ref}); };
+  const auto view = [&](uint16_t ref) { return ref != NoRef ? ctx.buffer(BufRef{ref}) : BufferView{}; };
+  const auto band = [](BufferView v, uint64_t offset, uint64_t size) {
+    v.offset += offset;
+    v.size = std::min(size, v.size - std::min(offset, v.size));
+    return v;
+  };
+  const BufferView need = view(local.need);
+  const BufferView needList = view(local.needList);
   const std::array jobs{
       compact::Job{
           .plan = compact::make_plan(compact::Op::Compact, NeedItems, caps()),
-          .input = view(local.need),
-          .output = view(local.needList),
+          .input = band(need, 0, NeedWordsBytes),
+          .output = band(needList, 0, NeedWordsBytes),
           .scratch = view(local.needScratch),
           .keepMask = 1,
       },
@@ -304,8 +320,16 @@ void encode_lists(detail::PassContext& ctx, const void*) {
           .scratch = view(local.freeScratch),
           .keepMask = 1,
       },
+      compact::Job{
+          .plan = compact::make_plan(compact::Op::Compact, MaxVirtualPages, caps()),
+          .input = band(need, NeedWordsBytes, CheckWordsBytes),
+          .output = band(needList, NeedWordsBytes, CheckWordsBytes),
+          .scratch = view(local.checkScratch),
+          .keepMask = 1,
+      },
   };
-  if (compact::encode(ctx, jobs)) {
+  const size_t count = local.checkScratch != NoRef ? jobs.size() : jobs.size() - 1;
+  if (compact::encode(ctx, std::span{jobs}.first(count))) {
     mark_encoded(chain_bit::AllocLists);
   }
 }
@@ -340,18 +364,19 @@ void declare_assign(detail::InternalPassBuilder& builder, const PassSetup& setup
 void assign_pipelines(const detail::PipelineSetup& setup, const void*,
                       std::span<uint32_t, detail::MaxPassPipelines> ids) {
   ids[0] = compute(setup, AssignPass, "vsm_assign", AssignDefines).value;
+  ids[1] = compute(setup, AssignPass, "vsm_assign_check", AssignDefines).value;
 }
 
 void encode_assign(detail::PassContext& ctx, const void*) {
   const auto local = read_local<AssignLocal>(ctx);
-  const std::array pipelines{shaders::compute_pipeline(ctx.pipeline(0))};
+  const std::array pipelines{shaders::compute_pipeline(ctx.pipeline(0)), shaders::compute_pipeline(ctx.pipeline(1))};
   const BufferView renderList = ctx.buffer(BufRef{local.renderList});
-  if (!pipelines[0] || !renderList.buffer || (encoded_mask() & chain_bit::AllocLists) == 0) {
+  if (!pipelines[0] || !pipelines[1] || !renderList.buffer || (encoded_mask() & chain_bit::AllocLists) == 0) {
     return;
   }
   ctx.encoder().ClearBuffer(renderList.buffer, renderList.offset, std::min(renderList.size, render_list::Bytes));
-  constexpr std::array<uint32_t, 1> Groups{MaxRenderPages / AllocWorkgroup};
-  dispatch(ctx, pipelines, Groups);
+  constexpr std::array<uint32_t, 2> Groups{MaxRenderPages / AllocWorkgroup, MaxRenderPages / AllocWorkgroup};
+  dispatch(ctx, std::span{pipelines}.first(check::config().on ? 2 : 1), Groups);
   mark_encoded(chain_bit::Assign);
 }
 
@@ -485,7 +510,9 @@ void commit_pipelines(const detail::PipelineSetup& setup, const void*,
 void encode_commit(detail::PassContext& ctx, const void*) {
   const std::array pipelines{shaders::compute_pipeline(ctx.pipeline(0))};
   const uint32_t want = expected_chain() & ~chain_bit::Commit;
-  if (!pipelines[0] || (encoded_mask() & want) != want) {
+  const uint32_t mask = encoded_mask();
+  // A cleared page that no raster filled must never turn Cached, even when the raster dropped out of the graph
+  if (!pipelines[0] || (mask & want) != want || ((mask & chain_bit::Clear) != 0 && (mask & chain_bit::Raster) == 0)) {
     return;
   }
   constexpr std::array<uint32_t, 1> Groups{MaxRenderPages / AllocWorkgroup};
@@ -682,12 +709,21 @@ AllocBudget alloc_budget(uint32_t priority, uint32_t fresh, uint32_t reuse, uint
   return b;
 }
 
+uint32_t render_entries(std::span<const uint32_t> renderList) noexcept {
+  if (renderList.size() < render_list::HeaderWords) {
+    return 0;
+  }
+  return std::min(renderList[render_list::Count] + renderList[render_list::CheckCount], MaxRenderPages);
+}
+
 AllocCounts allocate(const Views& views, std::span<const uint32_t> requests, std::span<uint32_t> table,
                      std::span<uint32_t> phys, std::span<uint32_t> renderList) noexcept {
   AllocCounts out;
   const ViewsHeader& h = views.header;
   const uint32_t clock = h.clock;
   const bool held = (h.flags & header_flag::Held) != 0;
+  const bool checking = (h.flags & header_flag::Check) != 0;
+  std::vector<uint32_t> checkList;
   if (table.size() < MaxVirtualPages || phys.size() < size_t{MaxPoolPages} * PhysWords ||
       renderList.size() < render_list::Words) {
     return out;
@@ -699,6 +735,9 @@ AllocCounts allocate(const Views& views, std::span<const uint32_t> requests, std
     const bool allocated = (e & entry::Allocated) != 0;
     const size_t p = size_t{e & entry::PhysMask} * PhysWords;
     const bool stale = (e & entry::Dirty) != 0 || (e & entry::Cached) == 0;
+    if (checking && allocated && !stale) {
+      checkList.push_back(v);
+    }
     if (req != 0) {
       ++out.requested;
       if (allocated) {
@@ -791,6 +830,27 @@ AllocCounts allocate(const Views& views, std::span<const uint32_t> requests, std
     const uint32_t ly = (slot / WindowPages - static_cast<uint32_t>(record.origin[1])) & (WindowPages - 1);
     renderList[render_list::RowMasks + view * WindowPages + ly] |= 1u << lx;
   }
+  const uint32_t checks = held ? 0u : std::min(static_cast<uint32_t>(checkList.size()), MaxRenderPages - b.count);
+  renderList[render_list::CheckCount] = checks;
+  for (uint32_t k = 0; k < checks; ++k) {
+    const uint32_t i = b.count + k;
+    const uint32_t v = checkList[k];
+    const uint32_t e = table[v];
+    constexpr uint32_t Want = entry::Allocated | entry::Cached;
+    if ((e & (Want | entry::Dirty | entry::RenderNow)) != Want) {
+      renderList[render_list::Pages + 2 * i] = NoPage;
+      renderList[render_list::Pages + 2 * i + 1] = NoPage;
+      continue;
+    }
+    table[v] = (e & ~(entry::RenderIndexMask << entry::RenderIndexShift)) | entry::Check | i << entry::RenderIndexShift;
+    renderList[render_list::Pages + 2 * i] = v | render_list::CheckOnly;
+    renderList[render_list::Pages + 2 * i + 1] = e & entry::PhysMask;
+    const ViewRecord& record = views.views[v / PagesPerView];
+    const uint32_t slot = v % PagesPerView;
+    const uint32_t lx = (slot % WindowPages - static_cast<uint32_t>(record.origin[0])) & (WindowPages - 1);
+    const uint32_t ly = (slot / WindowPages - static_cast<uint32_t>(record.origin[1])) & (WindowPages - 1);
+    renderList[render_list::RowMasks + (v / PagesPerView) * WindowPages + ly] |= 1u << lx;
+  }
   return out;
 }
 
@@ -799,13 +859,20 @@ uint32_t commit(std::span<const uint32_t> renderList, std::span<uint32_t> table)
     return 0;
   }
   uint32_t committed = 0;
-  const uint32_t count = std::min(renderList[render_list::Count], MaxRenderPages);
+  const uint32_t count = render_entries(renderList);
   for (uint32_t i = 0; i < count; ++i) {
-    const uint32_t v = renderList[render_list::Pages + 2 * i];
-    if (v >= MaxVirtualPages || (table[v] & entry::RenderNow) == 0) {
+    const uint32_t v = render_list::virtual_page(renderList[render_list::Pages + 2 * i]);
+    if (v >= MaxVirtualPages) {
       continue;
     }
     const uint32_t e = table[v];
+    if ((e & entry::Check) != 0) {
+      table[v] = e & ~(entry::Check | entry::Skip | entry::RenderIndexMask << entry::RenderIndexShift);
+      continue;
+    }
+    if ((e & entry::RenderNow) == 0) {
+      continue;
+    }
     const uint32_t keep =
         e & ~(entry::RenderNow | entry::Skip | entry::Fresh | entry::RenderIndexMask << entry::RenderIndexShift);
     if ((e & entry::Skip) != 0) {

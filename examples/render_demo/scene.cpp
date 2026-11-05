@@ -59,6 +59,12 @@ constexpr u64 FwdEnvStripBObject = 0x611;
 constexpr u64 FwdEnvCardObject = 0x612;
 constexpr u64 SsilWallObject = 0x800;
 constexpr u64 SsilFinObject = 0x801;
+constexpr u64 VsmCardObject = 0x900;
+constexpr f32 VsmSunElevationDegrees = 40.f;
+constexpr Vec VsmCardCentre{2.f, 2.f, 1.f};
+constexpr f32 VsmCardHalf = 1.5f;
+constexpr u32 VsmCardCells = 8;
+constexpr u32 VsmCardTexels = 32;
 constexpr u32 GroundMaterial = 1;
 constexpr u32 SceneEpoch = 1;
 constexpr u32 GroundTextureSize = 64;
@@ -169,6 +175,8 @@ aurora::render::gpu::Handle sBoxPositions = aurora::render::gpu::InvalidHandle;
 std::vector<u8> sGroundTexture;
 GXTexObj sGroundTexObj;
 std::vector<std::vector<SkinnedVertex>> sTentacle;
+std::vector<u8> sVsmCardTexture;
+GXTexObj sVsmCardTexObj;
 FogResolveCounts sFogResolves;
 std::array<std::vector<u8>, ClassTextureCount> sClassTextures;
 std::array<GXTexObj, ClassTextureCount> sClassTexObjs{};
@@ -274,13 +282,18 @@ Vec to_view(const Mtx view, const Vec& world) {
   return out;
 }
 
-Lights setup_lights(const Mtx view, f32 t, bool dimSun) {
+Vec vsm_sun_dir() noexcept {
+  const f32 e = VsmSunElevationDegrees * Pi / 180.f;
+  return {-0.8f * std::cos(e), -std::sin(e), -0.6f * std::cos(e)};
+}
+
+Lights setup_lights(const Mtx view, f32 t, bool dimSun, bool vsmSun) {
   Lights lights{};
   // Only the spot light sets a direction; the others must not load stack garbage into XF
   GXLightObj light{};
 
   Vec& sunDir = lights.sunDir;
-  sunDir = Vec{-0.4f, -1.f, -0.3f};
+  sunDir = vsmSun ? vsm_sun_dir() : Vec{-0.4f, -1.f, -0.3f};
   C_VECNormalize(&sunDir, &sunDir);
   lights.positions[0] = Vec{-sunDir.x * 1e5f, -sunDir.y * 1e5f, -sunDir.z * 1e5f};
   // Dim enough that the point and spot lights still read on sunlit ground
@@ -923,7 +936,7 @@ void draw_class_quads() {
   GXSetCullMode(GX_CULL_BACK);
 }
 
-void emit_frame_hints(u32 frame, const Mtx view, const Mtx44 projection, const Lights& lights) {
+void emit_frame_hints(u32 frame, const Mtx view, const Mtx44 projection, const Lights& lights, bool keySun) {
   if (!hint_emission()) {
     return;
   }
@@ -934,8 +947,10 @@ void emit_frame_hints(u32 frame, const Mtx view, const Mtx44 projection, const L
   hint_array_immutable(BoxNormals, sizeof(BoxNormals));
   hint_array_immutable(BoxColors, sizeof(BoxColors));
 
+  AuroraLight sun = directional_light(1, lights.sunDir, lights.colors[0]);
+  sun.shadowPriority = keySun ? 255 : sun.shadowPriority;
   const std::array<AuroraLight, 4> sceneLights{
-      directional_light(1, lights.sunDir, lights.colors[0]),
+      sun,
       point_light(2, lights.positions[1], lights.colors[1], PointRefDistance, PointRefBrightness, GX_DA_MEDIUM),
       point_light(3, lights.positions[2], lights.colors[2], PointRefDistance, PointRefBrightness, GX_DA_MEDIUM),
       spot_light(4, lights.positions[3], lights.spotDir, lights.colors[3], SpotCutoff, SpotRefDistance,
@@ -1018,9 +1033,59 @@ void resolve_fog_records() {
     ++sFogResolves.mismatches;
   }
 }
+void draw_vsm_card(const Mtx view) {
+  begin_object(VsmCardObject, AURORA_CAT_STATIC, 0);
+  set_ground_format();
+  GXLoadTexObj(&sVsmCardTexObj, GX_TEXMAP0);
+  GXSetNumTevStages(1);
+  GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
+  GXSetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+  set_lit_channel(GX_SRC_REG);
+  load_matrices(view, GX_PNMTX0);
+  GXSetCurrentMtx(GX_PNMTX0);
+  GXSetCullMode(GX_CULL_NONE);
+  GXSetAlphaCompare(GX_GREATER, 128, GX_AOP_AND, GX_ALWAYS, 0);
+  GXSetZCompLoc(GX_FALSE);
+  const Vec& c = VsmCardCentre;
+  const f32 corners[4][2] = {{-1.f, -1.f}, {1.f, -1.f}, {1.f, 1.f}, {-1.f, 1.f}};
+  GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+  for (const auto& [x, z] : corners) {
+    GXPosition3f32(c.x + x * VsmCardHalf, c.y, c.z + z * VsmCardHalf);
+    GXNormal3f32(0.f, 1.f, 0.f);
+    GXTexCoord2f32(0.5f * (x + 1.f), 0.5f * (z + 1.f));
+  }
+  GXEnd();
+  GXSetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
+  GXSetZCompLoc(GX_TRUE);
+  GXSetCullMode(GX_CULL_BACK);
+  end_object();
+}
+
+bool vsm_cell_open(u32 cx, u32 cz) noexcept { return (cx + cz) % 2 != 0; }
+
+std::vector<u8> vsm_card_texture() {
+  std::vector<u8> rgba(size_t{VsmCardTexels} * VsmCardTexels * 4, 255);
+  constexpr u32 PerCell = VsmCardTexels / VsmCardCells;
+  for (u32 y = 0; y < VsmCardTexels; ++y) {
+    for (u32 x = 0; x < VsmCardTexels; ++x) {
+      u8* texel = &rgba[(size_t{y} * VsmCardTexels + x) * 4];
+      texel[0] = 200;
+      texel[1] = 180;
+      texel[2] = 60;
+      texel[3] = vsm_cell_open(x / PerCell, y / PerCell) ? 0 : 255;
+    }
+  }
+  std::vector<u8> out(rgba8_tiled_size(VsmCardTexels, VsmCardTexels));
+  encode_rgba8_tiled(rgba, VsmCardTexels, VsmCardTexels, out);
+  return out;
+}
 } // namespace
 
 bool init_scene() {
+  sVsmCardTexture = vsm_card_texture();
+  GXInitTexObj(&sVsmCardTexObj, sVsmCardTexture.data(), VsmCardTexels, VsmCardTexels, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP,
+               GX_FALSE);
+  GXInitTexObjLOD(&sVsmCardTexObj, GX_NEAR, GX_NEAR, 0.f, 0.f, 0.f, GX_FALSE, GX_FALSE, GX_ANISO_1);
   sGroundTexture = make_ground_texture(GroundTextureSize, GroundMipCount);
   if (sGroundTexture.size() !=
       GXGetTexBufferSize(GroundTextureSize, GroundTextureSize, GX_TF_RGBA8, GX_TRUE, GroundMipCount)) {
@@ -1375,10 +1440,10 @@ void draw_scene(u32 frame, const SceneOptions& options) {
   // Not gated on hints_enabled() so the off capture proves emitters add only hint bytes; real producers do gate on it
   set_hint_emission(options.hints);
   upload_gpu_arrays(options);
-  const u32 clock = options.aoCheck || options.fwdEnvCheck || options.unlitCheck || options.companionCheck ||
-                            options.overlayCheck || options.classCheck || options.ssilCheck
-                        ? AoCheckClock
-                        : frame;
+  const bool fixedClock = options.aoCheck || options.fwdEnvCheck || options.unlitCheck || options.companionCheck ||
+                          options.overlayCheck || options.classCheck || options.ssilCheck;
+  // The frozen tail leaves every page cached, so the in-place re-render check compares untouched content
+  const u32 clock = fixedClock ? AoCheckClock : options.vsmCheck ? std::min(frame, VsmFrozenFrame) : frame;
   const f32 t = static_cast<f32>(clock) / 60.f;
   const SceneCamera camera = scene_camera(clock);
   GXSetCopyClear(ClearColor, GX_MAX_Z24);
@@ -1392,9 +1457,9 @@ void draw_scene(u32 frame, const SceneOptions& options) {
   const Point3d& target = camera.target;
 
   set_fog(Fog);
-  const Lights lights = setup_lights(view, t, options.unlitCheck && frame >= UnlitSunFrame);
+  const Lights lights = setup_lights(view, t, options.unlitCheck && frame >= UnlitSunFrame, options.vsmCheck);
   // Every frame-level hint goes out before SCENE_BEGIN, where aurora freezes the frame's values
-  emit_frame_hints(clock, view, projection, lights);
+  emit_frame_hints(clock, view, projection, lights, options.vsmCheck);
   hint_stage(AURORA_STAGE_SCENE_BEGIN);
 
   if (options.fogBands) {
@@ -1434,10 +1499,14 @@ void draw_scene(u32 frame, const SceneOptions& options) {
 
   Mtx bones[TentacleBones];
   tentacle_bones(t, bones);
-  begin_object(TentacleObject, AURORA_CAT_DYNAMIC | AURORA_CAT_SKINNED, 0);
+  begin_object(TentacleObject, AURORA_CAT_DYNAMIC | AURORA_CAT_SKINNED | (options.vsmCheck ? AURORA_CAT_PLAYER : 0u),
+               0);
   hint_skeleton(TentacleObject, bones);
   draw_tentacle(view, bones);
   end_object();
+  if (options.vsmCheck && frame >= VsmCardFrame) {
+    draw_vsm_card(view);
+  }
 
   draw_light_markers(view, lights);
   if (options.captureOnlyBox) {
@@ -1477,6 +1546,22 @@ void draw_scene(u32 frame, const SceneOptions& options) {
   hint_stage(AURORA_STAGE_FRAME_END);
 }
 
+std::vector<VsmProbe> vsm_card_probes() {
+  Vec dir = vsm_sun_dir();
+  C_VECNormalize(&dir, &dir);
+  const double reach = static_cast<double>(VsmCardCentre.y) / -static_cast<double>(dir.y);
+  const f32 cell = 2.f * VsmCardHalf / static_cast<f32>(VsmCardCells);
+  std::vector<VsmProbe> probes;
+  for (u32 cz = 2; cz < VsmCardCells - 2 && probes.size() < 2 * VsmProbesPerSide; ++cz) {
+    for (u32 cx = 2; cx < VsmCardCells - 2; ++cx) {
+      const double x = VsmCardCentre.x - VsmCardHalf + (static_cast<f32>(cx) + 0.5f) * cell;
+      const double z = VsmCardCentre.z - VsmCardHalf + (static_cast<f32>(cz) + 0.5f) * cell;
+      probes.push_back({.world = {x + dir.x * reach, 0.0, z + dir.z * reach}, .open = vsm_cell_open(cx, cz)});
+    }
+  }
+  return probes;
+}
+
 void shutdown_scene() {
   sBoxArrays = aurora::render::gpu::InvalidHandle;
   sBoxPositions = aurora::render::gpu::InvalidHandle;
@@ -1487,6 +1572,8 @@ void shutdown_scene() {
     sClassTextures[i] = {};
   }
   sTentacle = {};
+  GXDestroyTexObj(&sVsmCardTexObj);
+  sVsmCardTexture = {};
   sBoxDisplayListSize = 0;
 }
 } // namespace render_demo

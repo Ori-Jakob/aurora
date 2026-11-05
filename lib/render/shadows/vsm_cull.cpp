@@ -268,7 +268,6 @@ void declare_pairs(detail::InternalPassBuilder& builder, const PassSetup& setup,
   local.views = builder.import_persistent(ViewsName, handle(ViewsName), Access::StorageRead).index;
   local.table = builder.import_persistent(Table, handle(Table), Access::StorageRead).index;
   if (emit) {
-    builder.side_effect();
     local.target = builder.use_buffer(PageOffsets, Access::StorageRW).index;
     local.pairs = builder.use_buffer(Pairs, Access::StorageRW).index;
   } else {
@@ -535,9 +534,9 @@ CullReference cull_reference(const Views& views, std::span<const uint32_t> histo
     return out;
   }
   std::vector<uint32_t> rendered(MaxVirtualPages, NoPage);
-  const uint32_t count = std::min(renderList[render_list::Count], MaxRenderPages);
+  const uint32_t count = render_entries(renderList);
   for (uint32_t i = 0; i < count; ++i) {
-    const uint32_t v = renderList[render_list::Pages + 2 * i];
+    const uint32_t v = render_list::virtual_page(renderList[render_list::Pages + 2 * i]);
     if (v < MaxVirtualPages) {
       rendered[v] = i;
     }

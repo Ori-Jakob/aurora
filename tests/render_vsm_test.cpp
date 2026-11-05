@@ -13,6 +13,7 @@
 #include "render/shadows/vsm_cull.hpp"
 #include "render/shadows/vsm_invalidate.hpp"
 #include "render/shadows/vsm_pages.hpp"
+#include "render/shadows/vsm_raster.hpp"
 #include "render/stage_data.hpp"
 
 #include <algorithm>
@@ -475,11 +476,100 @@ TEST(RenderVsmPages, PoolExtentFollowsPages) {
   EXPECT_FALSE(pool_extent(1024, 0).fits);
 }
 
+TEST(RenderVsm, AtlasLayoutFitsLimits) {
+  const auto check = [](uint32_t pages, uint32_t maxDim, uint32_t pagesX, uint32_t width, uint32_t height) {
+    const AtlasLayout a = atlas_layout(pages, maxDim);
+    EXPECT_EQ(a.pagesX, pagesX) << pages;
+    EXPECT_EQ(a.width, width) << pages;
+    EXPECT_EQ(a.height, height) << pages;
+    EXPECT_EQ(a.pagesY * PageTexels, a.height) << pages;
+    EXPECT_LE(std::max(a.width, a.height), maxDim) << pages;
+  };
+  check(1024, 16384, 32, 4096, 4096);
+  check(2048, 16384, 32, 4096, 8192);
+  check(4096, 16384, 64, 8192, 8192);
+  check(256, 16384, 32, 4096, 1024);
+  check(1000, 16384, 32, 4096, 4096);
+  check(3000, 16384, 64, 8192, 6016);
+  check(4096, 4096, 32, 4096, 4096);
+  check(2048, 4096, 32, 4096, 4096);
+  const AtlasLayout tiny = atlas_layout(1024, 2048);
+  EXPECT_EQ(tiny.width, 0u);
+  EXPECT_EQ(raster_binding::Views, RasterVertexStorage);
+  EXPECT_EQ(raster_binding::Materials, RasterVertexStorage + 1);
+  EXPECT_EQ(raster_binding::Buffers - RasterVertexStorage - 1, RasterFragmentStorage);
+}
+
+TEST(RenderVsmAlloc, CheckEntriesFollowTheBudget) {
+  SunClipmap clipmap;
+  (void)clipmap.update({.eye = {300.0, 20.0, -800.0}, .dir = sun_dir(45.0, 10.0), .lightId = 1, .texel0 = Texel0});
+  Views views{};
+  clipmap.fill(views);
+  views.header.poolPages = 4;
+  views.header.poolPagesX = 8;
+  views.header.budget = 2;
+  views.header.clock = 9;
+  views.header.flags = header_flag::Check;
+  std::vector<uint32_t> table(MaxVirtualPages, 0);
+  std::vector<uint32_t> phys(size_t{MaxPoolPages} * PhysWords, 0);
+  std::vector<uint32_t> requests(MaxVirtualPages, 0);
+  const uint32_t base = level_view(0) * PagesPerView;
+  const auto own = [&](uint32_t v, uint32_t p, uint32_t bits, uint32_t lastUsed) {
+    table[v] = p | entry::Allocated | bits;
+    phys[size_t{p} * PhysWords] = v + 1;
+    phys[size_t{p} * PhysWords + 1] = lastUsed;
+  };
+  own(base + 3, 0, entry::Cached, 9);
+  own(base + 4, 1, entry::Cached | entry::Dirty, 9);
+  own(base + 5, 2, entry::Cached, 1);
+  own(base + 6, 3, entry::Cached, 9);
+  requests[base + 3] = request_bit::Pixel;
+  requests[base + 4] = request_bit::Pixel;
+  requests[base + 6] = request_bit::Pixel;
+  for (uint32_t i = 0; i < 60; ++i) {
+    requests[base + 100 + i] = request_bit::Pixel;
+  }
+  std::vector<uint32_t> list(render_list::Words, 0);
+  const AllocCounts counts = allocate(views, requests, table, phys, list);
+  const uint32_t count = list[render_list::Count];
+  EXPECT_EQ(count, counts.rendered);
+  EXPECT_EQ(count, 2u);
+  ASSERT_EQ(list[render_list::CheckCount], 3u);
+  EXPECT_EQ(render_entries(list), count + 3);
+  std::vector<uint32_t> listed;
+  for (uint32_t i = count; i < count + 3; ++i) {
+    const uint32_t word = list[render_list::Pages + 2 * i];
+    if (word == NoPage) {
+      continue;
+    }
+    EXPECT_NE(word & render_list::CheckOnly, 0u) << i;
+    const uint32_t v = render_list::virtual_page(word);
+    listed.push_back(v);
+    EXPECT_EQ((table[v] >> entry::RenderIndexShift) & entry::RenderIndexMask, i);
+    EXPECT_NE(table[v] & entry::Check, 0u);
+    EXPECT_EQ(table[v] & entry::RenderNow, 0u);
+  }
+  EXPECT_EQ(std::ranges::count(listed, base + 3), 1);
+  EXPECT_EQ(std::ranges::count(listed, base + 6), 1);
+  EXPECT_EQ(std::ranges::count(listed, base + 4), 0) << "a dirty page is not clean content to check";
+  EXPECT_EQ(std::ranges::count(listed, base + 5), 0) << "the new page evicted it this frame";
+  const std::vector<uint32_t> before = table;
+  (void)commit(list, table);
+  for (const uint32_t v : listed) {
+    EXPECT_EQ(table[v], before[v] & ~(entry::Check | entry::RenderIndexMask << entry::RenderIndexShift)) << v;
+  }
+  views.header.flags = 0;
+  std::vector<uint32_t> plain(render_list::Words, 0);
+  std::vector<uint32_t> table2 = before;
+  (void)allocate(views, requests, table2, phys, plain);
+  EXPECT_EQ(plain[render_list::CheckCount], 0u);
+}
+
 TEST(RenderVsmPages, EntryBitsRoundTrip) {
-  const std::array<uint32_t, 9> masks{
+  const std::array<uint32_t, 10> masks{
       entry::PhysMask, entry::Fresh,    entry::Allocated, entry::Cached,
       entry::Dirty,    entry::Priority, entry::RenderNow, entry::RenderIndexMask << entry::RenderIndexShift,
-      entry::Skip};
+      entry::Skip,     entry::Check};
   uint32_t all = 0;
   for (const uint32_t mask : masks) {
     EXPECT_EQ(all & mask, 0u) << std::hex << mask;
@@ -609,6 +699,9 @@ TEST_F(RenderVsmGraph, ChainFitsStorageLimit) {
                             detail::create_persistent("scene.vertices", detail::PersistentKind::Buffer),
                             detail::create_persistent("scene.clusters", detail::PersistentKind::Buffer)};
   testing::set_geometry_handles(geometry);
+  const detail::PersistentHandle atlasPage =
+      detail::create_persistent("scene.atlas_page", detail::PersistentKind::Texture);
+  testing::set_atlas_handle(atlasPage);
   testing::set_active(true);
   check::testing::set_config(check::Config{.on = true});
   Caps caps = test::full_caps();
@@ -663,13 +756,17 @@ TEST_F(RenderVsmGraph, ChainFitsStorageLimit) {
     EXPECT_EQ(storage(CullCountPass), 7u);
     EXPECT_EQ(storage(CullSkipPass), 8u);
     EXPECT_EQ(storage(CullEmitPass), 8u);
-    for (const std::string_view name : {AllocListsPass, ClearPass, CullListPass, CullScanPass}) {
+    EXPECT_EQ(storage(check::ComparePass), 5u);
+    for (const std::string_view name : {AllocListsPass, ClearPass, CullListPass, CullScanPass, RasterPass}) {
       const detail::NodeId node = graph->find_node(name);
       ASSERT_NE(node, detail::InvalidNode) << name;
       EXPECT_TRUE(graph->nodes[node].manualBindings) << name;
     }
     EXPECT_TRUE(graph->nodes[graph->find_node(ClearPass)].sink);
     EXPECT_EQ(graph->nodes[graph->find_node(ClearPass)].passKind, PassKind::Encoder);
+    EXPECT_TRUE(graph->nodes[graph->find_node(RasterPass)].sink);
+    EXPECT_EQ(graph->nodes[graph->find_node(RasterPass)].passKind, PassKind::Encoder);
+    EXPECT_FALSE(graph->nodes[graph->find_node(CullEmitPass)].sink) << "the raster reads the pairs";
     const auto& order = graph->stages[static_cast<size_t>(Stage::OpaqueDone)].passes;
     const auto position = [&](std::string_view name) {
       return std::ranges::find(order, graph->find_node(name)) - order.begin();
@@ -681,7 +778,11 @@ TEST_F(RenderVsmGraph, ChainFitsStorageLimit) {
     EXPECT_LT(position(ScanListPass), position(ChunkBoundsPass));
     EXPECT_LT(position(ChunkBoundsPass), position(DirtyPass));
     EXPECT_LT(position(AssignPass), position(ClearPass));
-    EXPECT_LT(position(ClearPass), position(CommitPass));
+    EXPECT_LT(position(CullEmitPass), position(check::CopyPass));
+    EXPECT_LT(position(check::CopyPass), position(ClearPass));
+    EXPECT_LT(position(ClearPass), position(RasterPass));
+    EXPECT_LT(position(RasterPass), position(check::ComparePass));
+    EXPECT_LT(position(check::ComparePass), position(CommitPass));
     EXPECT_LT(position(CommitPass), position(CheckPass));
     const detail::NodeId update = graph->find_node(UpdatePass);
     ASSERT_NE(update, detail::InvalidNode);
@@ -712,6 +813,7 @@ TEST_F(RenderVsmGraph, ChainFitsStorageLimit) {
   for (detail::PersistentHandle h : geometry) {
     detail::destroy_persistent(h);
   }
+  detail::destroy_persistent(atlasPage);
   testing::set_scene_handles(std::nullopt);
   testing::set_geometry_handles(std::nullopt);
 }
@@ -725,6 +827,9 @@ TEST_F(RenderVsmGraph, CullRunsBeforeClear) {
                            detail::create_persistent("scene.clusters", detail::PersistentKind::Buffer)};
   testing::set_scene_handles(std::array{handles[0], handles[1]});
   testing::set_geometry_handles(std::array{handles[2], handles[3], handles[4]});
+  const detail::PersistentHandle atlasPage =
+      detail::create_persistent("scene.atlas_page", detail::PersistentKind::Texture);
+  testing::set_atlas_handle(atlasPage);
   testing::set_active(true);
   Caps caps = test::full_caps();
   caps.limits.maxComputeWorkgroupSizeX = 256;
@@ -754,7 +859,7 @@ TEST_F(RenderVsmGraph, CullRunsBeforeClear) {
   const std::vector<std::string_view> want{
       UpdatePass,   ScanPass,       ScanListPass, ChunkBoundsPass,    DirtyPass,    MarkPass,
       ClassifyPass, AllocListsPass, AssignPass,   CullCandidatesPass, CullListPass, CullCountPass,
-      CullScanPass, CullSkipPass,   CullEmitPass, ClearPass,          CommitPass};
+      CullScanPass, CullSkipPass,   CullEmitPass, ClearPass,          RasterPass,   CommitPass};
   EXPECT_EQ(names, want);
   for (const std::string_view name : want) {
     EXPECT_EQ(graph->nodes[graph->find_node(name)].status, detail::CullReason::None) << name;
@@ -763,6 +868,7 @@ TEST_F(RenderVsmGraph, CullRunsBeforeClear) {
   for (detail::PersistentHandle h : handles) {
     detail::destroy_persistent(h);
   }
+  detail::destroy_persistent(atlasPage);
   testing::set_scene_handles(std::nullopt);
   testing::set_geometry_handles(std::nullopt);
 }

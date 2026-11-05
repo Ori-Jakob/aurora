@@ -111,6 +111,7 @@ std::vector<FrameStats> g_frames;
 uint64_t g_seq = 0;
 MarkParams g_markParams;
 uint64_t g_markFrame = NoFrame;
+std::vector<std::array<double, 3>> g_probes;
 
 struct Capture {
   Views views;
@@ -246,9 +247,10 @@ void finish_readback(const wgpu::Buffer& buffer, const Capture& capture, std::sp
       return cull.gpuPairs != 0 ? 100.0 * static_cast<double>(part) / static_cast<double>(cull.gpuPairs) : 0.0;
     };
     Log.info(
-        "VSM: cull frame {}: {} pairs on {} pages (max {} per page), {} exact, amplification {:.2f}, loose {}; "
-        "{} skipped pages; cutout {:.1f}%, chunk {:.1f}%, posed {:.1f}%; {} caster slots",
-        hintFrame, cull.gpuPairs, cull.pages, cull.maxPerPage, cull.exactPairs,
+        "VSM: cull frame {}: {} pairs on {} pages (max {} per page, {} on in-place check pages), {} exact, "
+        "amplification {:.2f}, loose {}; {} skipped pages; cutout {:.1f}%, chunk {:.1f}%, posed {:.1f}%; {} caster "
+        "slots",
+        hintFrame, cull.gpuPairs, cull.pages, cull.maxPerPage, cull.checkPairs, cull.exactPairs,
         cull.exactPairs != 0 ? static_cast<double>(cull.gpuPairs) / static_cast<double>(cull.exactPairs) : 0.0,
         cull.loosePairs, cull.skipped, share(cull.cutout), share(cull.chunk), share(cull.posed),
         stats[stat::CullSlots]);
@@ -861,6 +863,34 @@ std::string verify_alloc(const Views& expected, const AllocReadback& in, AllocSu
   if (sentinels != budget.overflowPool) {
     return fmt::format("{} render entries overflowed the pool, the stats say {}", sentinels, budget.overflowPool);
   }
+  const uint32_t checks = rl[render_list::CheckCount];
+  if (checks != 0 && (h.flags & header_flag::Check) == 0) {
+    return fmt::format("{} check entries on a frame without the check flag", checks);
+  }
+  for (uint32_t i = count; i < std::min(count + checks, MaxRenderPages); ++i) {
+    const uint32_t word = rl[render_list::Pages + 2 * i];
+    if (word == NoPage) {
+      continue;
+    }
+    const uint32_t v = render_list::virtual_page(word);
+    const uint32_t p = rl[render_list::Pages + 2 * i + 1];
+    if ((word & render_list::CheckOnly) == 0 || v >= MaxVirtualPages || p >= h.poolPages || seenPage[v] ||
+        seenPhys[p]) {
+      return fmt::format("check entry {} names page {:#x} and physical page {} twice or out of range", i, word, p);
+    }
+    seenPage[v] = true;
+    seenPhys[p] = true;
+    const uint32_t e = in.table[v];
+    if ((e & (entry::Allocated | entry::Cached | entry::Dirty)) != (entry::Allocated | entry::Cached) ||
+        (e & entry::PhysMask) != p) {
+      return fmt::format("check entry {} names page {} on {}, but the entry is {:#x}", i, v, p, e);
+    }
+    const ViewRecord& view = expected.views[v / PagesPerView];
+    const uint32_t slot = v % PagesPerView;
+    const uint32_t lx = (slot % WindowPages - static_cast<uint32_t>(view.origin[0])) & (WindowPages - 1);
+    const uint32_t ly = (slot / WindowPages - static_cast<uint32_t>(view.origin[1])) & (WindowPages - 1);
+    rows[size_t{v / PagesPerView} * WindowPages + ly] |= 1u << lx;
+  }
   for (uint32_t w = 0; w < rows.size(); ++w) {
     if (rl[render_list::RowMasks + w] != rows[w]) {
       return fmt::format("row mask {} is {:#x}, the render list gives {:#x}", w, rl[render_list::RowMasks + w],
@@ -873,7 +903,7 @@ std::string verify_alloc(const Views& expected, const AllocReadback& in, AllocSu
   for (uint32_t v = 0; v < MaxVirtualPages; ++v) {
     const uint32_t e = in.table[v];
     const uint32_t level = SunLevels - 1 - std::min(v / PagesPerView, SunLevels - 1);
-    if (out.committed && (e & entry::RenderNow) != 0) {
+    if (out.committed && (e & (entry::RenderNow | entry::Check)) != 0) {
       return fmt::format("entry {} is {:#x} after commit", v, e);
     }
     if ((e & (entry::Allocated | entry::Cached | entry::RenderNow)) == (entry::Allocated | entry::Cached)) {
@@ -960,6 +990,7 @@ std::string verify_cull(const Views& expected, const CullReadback& in, CullSumma
     gpu.push_back(pair_key(pair.renderIndex, w[0], pair.slot));
     out.cutout += wantCutout ? 1 : 0;
     out.chunk += pair.chunk ? 1 : 0;
+    out.checkPairs += pair.renderIndex >= in.renderList[render_list::Count] ? 1 : 0;
   }
   for (uint32_t r = 0; r < first; ++r) {
     if (perPage[r] != counts[r] + counts[MaxRenderPages + r]) {
@@ -996,6 +1027,190 @@ std::string verify_cull(const Views& expected, const CullReadback& in, CullSumma
   return {};
 }
 
+RasterSummary raster_summary(std::span<const std::array<uint32_t, StatCount>> frames,
+                             std::span<const uint64_t> hintFrames) noexcept {
+  RasterSummary out;
+  for (size_t i = 0; i < frames.size(); ++i) {
+    const std::array<uint32_t, StatCount>& c = frames[i];
+    if (c[stat::CheckListed] == 0 && c[stat::CheckCompared] == 0) {
+      continue;
+    }
+    ++out.frames;
+    out.pages += c[stat::CheckCompared];
+    out.mismatched += c[stat::CheckMismatched];
+    out.texels += c[stat::CheckTexels];
+    out.skipped += c[stat::CheckSkipped];
+    const uint64_t frame = i < hintFrames.size() ? hintFrames[i] : i;
+    if (c[stat::CheckMismatched] != 0 && (out.firstFrame == UINT64_MAX || frame < out.firstFrame)) {
+      out.firstFrame = frame;
+      out.firstKey = ~c[stat::CheckFirst];
+    }
+  }
+  return out;
+}
+
+std::string raster_mismatch(uint32_t key) {
+  const uint32_t slot = (key >> 12) & (PagesPerView - 1);
+  return fmt::format("level {} slot ({}, {}) physical page {}", key >> 22, slot % WindowPages, slot / WindowPages,
+                     key & entry::PhysMask);
+}
+
+namespace {
+struct CopyLocal {
+  uint16_t pool = NoRef;
+  uint16_t copy = NoRef;
+};
+static_assert(sizeof(CopyLocal) <= detail::PassLocalSize);
+
+struct CompareLocal {
+  uint16_t pool = NoRef;
+  uint16_t copy = NoRef;
+  uint16_t renderList = NoRef;
+  uint16_t table = NoRef;
+  uint16_t stats = NoRef;
+  uint16_t views = NoRef;
+  uint16_t probes = NoRef;
+};
+
+constexpr uint64_t ProbesBytes = uint64_t{MaxProbes + 1} * 16;
+static_assert(sizeof(CompareLocal) <= detail::PassLocalSize);
+
+bool raster_declarable(const detail::PassSetup& setup) noexcept {
+  return config().on && active() && setup.env != nullptr && setup.env->retained && handle(Table).id != 0 &&
+         handle(Pool).id != 0;
+}
+
+bool chain_pass_enabled(const detail::StageData& stage, const void*) {
+  return config().on && webgpu::g_backendType != wgpu::BackendType::Null && chain_enabled(stage);
+}
+
+void declare_copy(detail::InternalPassBuilder& builder, const detail::PassSetup& setup, const void*) {
+  if (!raster_declarable(setup)) {
+    builder.skip();
+    return;
+  }
+  builder.after(phase::Shadows);
+  CopyLocal local;
+  local.pool = builder.import_persistent_texture(Pool, handle(Pool), pool_desc(), Access::CopySrc).index;
+  local.copy = builder.create(CopyName, pool_desc(), Access::CopyDst).index;
+  std::memcpy(builder.local().data(), &local, sizeof(local));
+}
+
+void encode_copy(detail::PassContext& ctx, const void*) {
+  CopyLocal local;
+  std::memcpy(&local, ctx.local().data(), sizeof(local));
+  const wgpu::Texture pool = ctx.texture(TexRef{local.pool});
+  const wgpu::Texture copy = ctx.texture(TexRef{local.copy});
+  if (!pool || !copy || pool.GetWidth() != copy.GetWidth() || pool.GetHeight() != copy.GetHeight() ||
+      (encoded_mask() & chain_bit::Assign) == 0) {
+    return;
+  }
+  const wgpu::TexelCopyTextureInfo source{.texture = pool};
+  const wgpu::TexelCopyTextureInfo destination{.texture = copy};
+  const wgpu::Extent3D extent{pool.GetWidth(), pool.GetHeight(), 1};
+  ctx.encoder().CopyTextureToTexture(&source, &destination, &extent);
+  mark_encoded(chain_bit::CheckCopy);
+}
+
+void declare_compare(detail::InternalPassBuilder& builder, const detail::PassSetup& setup, const void*) {
+  if (!raster_declarable(setup)) {
+    builder.skip();
+    return;
+  }
+  builder.after(phase::Shadows);
+  CompareLocal local;
+  local.pool = builder.import_persistent_texture(Pool, handle(Pool), pool_desc(), Access::Sampled).index;
+  local.copy = builder.use(CopyName, Access::Sampled).index;
+  local.renderList = builder.use_buffer(RenderList, Access::StorageRead).index;
+  local.table = builder.import_persistent(Table, handle(Table), Access::StorageRead).index;
+  local.stats = builder.import_persistent(StatsName, handle(StatsName), Access::StorageRW).index;
+  local.views = builder.import_persistent(ViewsName, handle(ViewsName), Access::StorageRead).index;
+  local.probes = builder
+                     .create_buffer(ProbesName, {.size = ProbesBytes, .extraUsage = wgpu::BufferUsage::CopyDst},
+                                    Access::StorageWrite)
+                     .index;
+  std::memcpy(builder.local().data(), &local, sizeof(local));
+}
+
+void compare_pipelines(const detail::PipelineSetup& setup, const void*,
+                       std::span<uint32_t, detail::MaxPassPipelines> ids) {
+  for (uint32_t i = 0; i < 2; ++i) {
+    const shaders::PipelineId id = shaders::request_compute({
+        .label = ComparePass,
+        .shader = CheckShader,
+        .entryPoint = i == 0 ? "vsm_check_cmp" : "vsm_check_probe",
+        .layout = setup.layout,
+        .layoutKey = setup.layoutHash,
+    });
+    ids[i] = id.value;
+    register_chain_pipeline(id);
+  }
+}
+
+void encode_compare(detail::PassContext& ctx, const void*) {
+  CompareLocal local;
+  std::memcpy(&local, ctx.local().data(), sizeof(local));
+  const std::array pipelines{shaders::compute_pipeline(ctx.pipeline(0)), shaders::compute_pipeline(ctx.pipeline(1))};
+  const BufferView probes = ctx.buffer(BufRef{local.probes});
+  constexpr uint32_t Need = chain_bit::CheckCopy | chain_bit::Raster;
+  if (!pipelines[0] || !pipelines[1] || !probes.buffer || (encoded_mask() & Need) != Need) {
+    return;
+  }
+  std::array<std::array<float, 4>, MaxProbes + 1> points{};
+  {
+    std::lock_guard lock{g_mutex};
+    const ViewsHeader& h = g_lastViews.header;
+    const size_t count = std::min<size_t>(g_probes.size(), MaxProbes);
+    points[0][0] = static_cast<float>(count);
+    for (size_t i = 0; i < count; ++i) {
+      for (size_t k = 0; k < 3; ++k) {
+        const double anchor = double{h.anchorHi[k]} + double{h.anchorLo[k]};
+        points[i + 1][k] = static_cast<float>(g_probes[i][k] - anchor);
+      }
+    }
+  }
+  ctx.encoder().WriteBuffer(probes.buffer, probes.offset, reinterpret_cast<const uint8_t*>(points.data()),
+                            std::min(probes.size, ProbesBytes));
+  const wgpu::ComputePassEncoder pass = ctx.begin_compute();
+  if (!pass) {
+    return;
+  }
+  pass.SetPipeline(pipelines[0]);
+  pass.DispatchWorkgroups(MaxRenderPages);
+  pass.SetPipeline(pipelines[1]);
+  pass.DispatchWorkgroups(1);
+  pass.End();
+  mark_encoded(chain_bit::CheckCompare);
+}
+} // namespace
+
+detail::PassDesc copy_pass_desc() {
+  return {
+      .name = std::string{CopyPass},
+      .stage = Stage::OpaqueDone,
+      .kind = PassKind::Copy,
+      .cls = detail::PassClass::Required,
+      .order = 38,
+      .declare = declare_copy,
+      .enabled = chain_pass_enabled,
+      .encode = encode_copy,
+  };
+}
+
+detail::PassDesc compare_pass_desc() {
+  return {
+      .name = std::string{ComparePass},
+      .stage = Stage::OpaqueDone,
+      .kind = PassKind::Compute,
+      .cls = detail::PassClass::Required,
+      .order = 57,
+      .declare = declare_compare,
+      .enabled = chain_pass_enabled,
+      .encode = encode_compare,
+      .pipelines = compare_pipelines,
+  };
+}
+
 detail::PassDesc pass_desc() {
   return {
       .name = std::string{CheckPass},
@@ -1025,14 +1240,46 @@ void shutdown() noexcept {
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
     lock.lock();
   }
-  const Result r = g_result;
+  Result r = g_result;
   std::vector<FrameStats> frames = std::move(g_frames);
   g_frames.clear();
   g_buffer = {};
   g_ring = {};
   lock.unlock();
+  std::vector<std::array<uint32_t, StatCount>> counters;
+  std::vector<uint64_t> hintFrames;
+  for (const FrameStats& f : frames) {
+    counters.push_back(f.counters);
+    hintFrames.push_back(f.hintFrame);
+  }
+  const RasterSummary raster = raster_summary(counters, hintFrames);
   if (!frames.empty()) {
     log_runs(std::move(frames));
+  }
+  r.rasterFrames = raster.frames;
+  r.rasterPages = raster.pages;
+  r.rasterMismatched = raster.mismatched;
+  r.rasterTexels = raster.texels;
+  r.rasterSkipped = raster.skipped;
+  if (raster.frames != 0) {
+    Log.info(
+        "VSM: raster check on {} frames: {} cached pages re-rendered in place and compared, {} mismatched ({} "
+        "texels), {} skipped past the pair cap",
+        raster.frames, raster.pages, raster.mismatched, raster.texels, raster.skipped);
+  }
+  if (raster.mismatched != 0) {
+    ++r.failures;
+    Log.error("VSM: check frame {} FAILED: a cached page differs from its in-place re-render at {}", raster.firstFrame,
+              raster_mismatch(raster.firstKey));
+  }
+  {
+    std::lock_guard relock{g_mutex};
+    g_result.rasterFrames = r.rasterFrames;
+    g_result.rasterPages = r.rasterPages;
+    g_result.rasterMismatched = r.rasterMismatched;
+    g_result.rasterTexels = r.rasterTexels;
+    g_result.rasterSkipped = r.rasterSkipped;
+    g_result.failures = r.failures;
   }
   if (!config().on && r.readbacks == 0) {
     return;
@@ -1049,10 +1296,11 @@ void shutdown() noexcept {
         "VSM: check passed ({} readbacks, {} allocated entries, {} full frames, {} skipped; dirty reference on {} "
         "frames, {} changed slots, {} footprint pages; mark twin on {} frames, {} receivers, {} near a boundary; "
         "{} requested and {} rendered pages, {} frames uncommitted; cull reference on {} frames, {} pairs, {} "
-        "exact, {} skipped pages; {} stats frames skipped)",
+        "exact, {} skipped pages; raster check on {} frames, {} pages compared, {} mismatched; {} stats frames "
+        "skipped)",
         r.readbacks, r.entries, r.fulls, r.skipped, r.referenced, r.changed, r.footprint, r.marked, r.receivers,
         r.ambiguous, r.requested, r.rendered, r.uncommitted, r.culled, r.pairs, r.exactPairs, r.skippedPages,
-        r.statsSkipped);
+        r.rasterFrames, r.rasterPages, r.rasterMismatched, r.statsSkipped);
   }
 }
 
@@ -1071,9 +1319,38 @@ void reset() noexcept {
   g_seq = 0;
   g_markParams = {};
   g_markFrame = NoFrame;
+  g_probes.clear();
 }
 
 void set_config(const std::optional<Config>& config) noexcept { g_override = config; }
+
+void set_probes(std::span<const std::array<double, 3>> worldPoints) noexcept {
+  std::lock_guard lock{g_mutex};
+  g_probes.assign(worldPoints.begin(), worldPoints.begin() + std::min<size_t>(worldPoints.size(), MaxProbes));
+}
+
+std::vector<FrameCounters> frame_stats() {
+  std::unique_lock lock{g_mutex};
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{ShutdownWaitMs};
+  while (std::ranges::any_of(g_ring, [](const RingSlot& slot) { return slot.busy; }) &&
+         std::chrono::steady_clock::now() < deadline) {
+    lock.unlock();
+    if (webgpu::g_instance) {
+      webgpu::g_instance.ProcessEvents();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    lock.lock();
+  }
+  std::vector<FrameStats> frames = g_frames;
+  lock.unlock();
+  std::ranges::sort(frames, {}, &FrameStats::seq);
+  std::vector<FrameCounters> out;
+  out.reserve(frames.size());
+  for (const FrameStats& f : frames) {
+    out.push_back({.hintFrame = f.hintFrame, .counters = f.counters});
+  }
+  return out;
+}
 
 Result result() noexcept {
   std::lock_guard lock{g_mutex};

@@ -8,7 +8,11 @@
 #include "indirect_bench.hpp"
 #include "options.hpp"
 #include "render/debug/views.hpp"
+#include "render/scene/atlas.hpp"
 #include "render/scene/capture_list.hpp"
+#include "render/shadows/vsm_alloc.hpp"
+#include "render/shadows/vsm_check.hpp"
+#include "render/shadows/vsm_cull.hpp"
 #include "scene.hpp"
 
 #include <aurora/aurora.h>
@@ -65,6 +69,7 @@ enum ExitCode : int {
   ExitClassCheck = 18,
   ExitSsilCheck = 19,
   ExitCaptureListCheck = 20,
+  ExitVsmCheck = 21,
 };
 
 std::atomic_uint32_t g_errorCount = 0;
@@ -105,6 +110,97 @@ void log_callback(AuroraLogLevel level, const char* module, const char* message,
     std::fflush(out);
     std::abort();
   }
+}
+
+struct VsmOutcome {
+  std::optional<std::string> failure;
+  uint32_t frames = 0;
+  uint64_t cardFrom = 0;
+  uint64_t holesFrom = 0;
+  uint64_t compared = 0;
+  uint64_t mismatched = 0;
+  uint64_t playerDeferred = 0;
+};
+
+template <typename... Args>
+std::string format_text(const char* format, Args... args) {
+  std::array<char, 256> text{};
+  std::snprintf(text.data(), text.size(), format, args...);
+  return text.data();
+}
+
+VsmOutcome vsm_outcome(const std::vector<aurora::render::shadows::vsm::check::testing::FrameCounters>& frames,
+                       const std::vector<render_demo::VsmProbe>& probes, bool nullBackend) {
+  namespace stat = aurora::render::shadows::vsm::stat;
+  VsmOutcome out;
+  out.frames = static_cast<uint32_t>(frames.size());
+  if (nullBackend) {
+    return out;
+  }
+  uint32_t open = 0;
+  uint32_t solid = 0;
+  for (size_t i = 0; i < probes.size() && i < aurora::render::shadows::vsm::check::MaxProbes; ++i) {
+    (probes[i].open ? open : solid) |= 1u << i;
+  }
+  const uint32_t all = open | solid;
+  size_t first = frames.size();
+  size_t holes = frames.size();
+  for (size_t i = 0; i < frames.size(); ++i) {
+    const auto& c = frames[i].counters;
+    out.compared += c[stat::CheckCompared];
+    out.mismatched += c[stat::CheckMismatched];
+    out.playerDeferred += c[stat::PlayerDeferred];
+    const uint32_t found = c[stat::ProbeFound] & all;
+    const uint32_t occluded = c[stat::ProbeOccluded] & all;
+    if (first == frames.size() && found == all && (occluded & solid) == solid) {
+      first = i;
+    }
+    if (first != frames.size() && holes == frames.size() && c[stat::CutoutPairs] != 0) {
+      holes = i;
+    }
+    const uint64_t hint = frames[i].hintFrame;
+    if (first == frames.size()) {
+      if (occluded != 0 && !out.failure) {
+        out.failure = format_text("probes %#x were shadowed at hint frame %llu, before the card", occluded,
+                                  static_cast<unsigned long long>(hint));
+      }
+      continue;
+    }
+    if (found != all && !out.failure) {
+      out.failure = format_text("probes %#x found no shadow page at hint frame %llu", all & ~found,
+                                static_cast<unsigned long long>(hint));
+    }
+    if (i < holes && occluded != all && !out.failure) {
+      out.failure = format_text("the pending card left probes %#x lit at hint frame %llu", all & ~occluded,
+                                static_cast<unsigned long long>(hint));
+    }
+    if (i >= holes && occluded != solid && !out.failure) {
+      out.failure = format_text("open cells %#x and solid cells %#x disagree with the card at hint frame %llu",
+                                occluded & open, solid & ~occluded, static_cast<unsigned long long>(hint));
+    }
+  }
+  out.cardFrom = first < frames.size() ? frames[first].hintFrame : 0;
+  out.holesFrom = holes < frames.size() ? frames[holes].hintFrame : 0;
+  if (out.failure) {
+    return out;
+  }
+  if (frames.empty() || all == 0) {
+    out.failure = "no stats frames or no probes";
+  } else if (first == frames.size()) {
+    out.failure = "the card never cast";
+  } else if (holes == frames.size()) {
+    out.failure = "the card never reached the cutout list";
+  } else if (holes == first) {
+    out.failure = "no frame showed the card while its alpha tile was pending";
+  } else if (out.compared == 0) {
+    out.failure = "no cached page was re-rendered in place";
+  } else if (out.mismatched != 0) {
+    out.failure = format_text("%llu cached pages differ from their in-place re-render",
+                              static_cast<unsigned long long>(out.mismatched));
+  } else if (out.playerDeferred != 0) {
+    out.failure = format_text("%llu player pages were deferred", static_cast<unsigned long long>(out.playerDeferred));
+  }
+  return out;
 }
 
 std::string_view depth_source_name(aurora::render::DepthSource source) noexcept {
@@ -1024,7 +1120,7 @@ int main(int argc, char* argv[]) {
     SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_GBUFFER", "on", true);
     SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_SHADOWS", "high", true);
     SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_VSM_FORCE", "1", true);
-    SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_VSM_CHECK", "1", true);
+    SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_VSM_CHECK", "1,20,150", true);
   }
 
   AuroraConfig config{};
@@ -1077,7 +1173,18 @@ int main(int argc, char* argv[]) {
                                          .overlayCheck = options.overlayCheck,
                                          .classCheck = options.classCheck,
                                          .ssilCheck = options.ssilCheck,
+                                         .vsmCheck = options.vsmCheck,
                                          .hud = !options.captureListCheck};
+  const std::vector<render_demo::VsmProbe> vsmProbes =
+      options.vsmCheck ? render_demo::vsm_card_probes() : std::vector<render_demo::VsmProbe>{};
+  if (options.vsmCheck) {
+    std::vector<std::array<double, 3>> points;
+    for (const render_demo::VsmProbe& probe : vsmProbes) {
+      points.push_back(probe.world);
+    }
+    aurora::render::shadows::vsm::check::testing::set_probes(points);
+  }
+  uint32_t vsmAtlasReady = 0;
   bool decodingChanged = false;
 
   GXInit(nullptr, 0);
@@ -1239,6 +1346,10 @@ int main(int argc, char* argv[]) {
     update_gpu_demo(gpuDemo, frame);
     render_demo::draw_scene(frame, sceneOptions);
     aurora_end_frame();
+    if (options.vsmCheck && vsmAtlasReady == 0 && frame > render_demo::VsmCardFrame &&
+        aurora::render::scene::atlas::published_stats().tilesPending == 0) {
+      vsmAtlasReady = frame;
+    }
     ++frame;
     if (options.frames != 0 && frame >= options.frames) {
       break;
@@ -1273,6 +1384,10 @@ int main(int argc, char* argv[]) {
     aurora::gfx::detail::testing::keep_frame_shapes(false);
   }
   HintCounterSnapshot hintCounters = read_hint_counters();
+  const VsmOutcome vsmOutcome = options.vsmCheck
+                                    ? vsm_outcome(aurora::render::shadows::vsm::check::testing::frame_stats(),
+                                                  vsmProbes, info.backend == BACKEND_NULL)
+                                    : VsmOutcome{};
   const bool gpuChannel = options.gpuArrays || options.gpuPadMiB != 0;
   const GpuReport gpuReport = gpuChannel ? finish_gpu_demo(gpuDemo) : GpuReport{};
   render_demo::unregister_graph_passes();
@@ -1449,6 +1564,19 @@ int main(int argc, char* argv[]) {
         back.receivers, back.mean[0], back.mean[1], back.mean[2], front.receivers, front.mean[0], front.mean[1],
         front.mean[2], open.receivers, open.coverage);
   }
+  if (options.vsmCheck) {
+    const std::string status = vsmOutcome.failure             ? "FAILED: " + *vsmOutcome.failure
+                               : info.backend == BACKEND_NULL ? std::string{"skipped (null backend)"}
+                                                              : std::string{"passed"};
+    std::printf(
+        "render_demo: vsm check %s: %u stats frames, card solid from hint frame %llu, holes from hint frame %llu "
+        "(atlas ready after demo frame %u), %llu cached pages re-rendered in place, %llu mismatched, %llu player "
+        "pages deferred\n",
+        status.c_str(), vsmOutcome.frames, static_cast<unsigned long long>(vsmOutcome.cardFrom),
+        static_cast<unsigned long long>(vsmOutcome.holesFrom), vsmAtlasReady,
+        static_cast<unsigned long long>(vsmOutcome.compared), static_cast<unsigned long long>(vsmOutcome.mismatched),
+        static_cast<unsigned long long>(vsmOutcome.playerDeferred));
+  }
   const char* overlayEnv = SDL_getenv("AURORA_RENDER_OVERLAY_DEFER");
   const std::string_view overlayMode = overlayEnv != nullptr ? overlayEnv : "unset";
   const std::optional<std::string> overlayFailure =
@@ -1576,6 +1704,9 @@ int main(int argc, char* argv[]) {
   }
   if (captureListFailure) {
     return ExitCaptureListCheck;
+  }
+  if (vsmOutcome.failure) {
+    return ExitVsmCheck;
   }
 
   if (cullFailure) {
