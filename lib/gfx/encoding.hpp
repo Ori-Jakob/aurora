@@ -22,6 +22,8 @@ namespace testing {
 uint32_t compute_segments_encoded() noexcept;
 WGPURenderPipeline current_pipeline() noexcept;
 void set_current_pipeline(WGPURenderPipeline pipeline) noexcept;
+// Runs where a replay's first command would, so a test sees the state that command inherits
+void set_replay_hook(void (*hook)()) noexcept;
 } // namespace testing
 } // namespace detail
 

@@ -37,6 +37,7 @@ using webgpu::g_queue;
 namespace {
 constexpr Module Log{"aurora::gfx"};
 WGPURenderPipeline g_currentPipeline = nullptr;
+void (*g_replayHook)() = nullptr;
 
 void apply_viewport(const wgpu::RenderPassEncoder& pass, const Viewport& vp) {
   const float minDepth = gx::UseReversedZ ? 1.f - vp.zfar : vp.znear;
@@ -640,6 +641,9 @@ void encode_command_list(const wgpu::RenderPassEncoder& pass, std::span<const Co
                          const RenderPass& passInfo) {
   // Without it bind_pipeline would skip SetPipeline for a first draw matching the last pipeline of another pass
   reset_encoder_state();
+  if (g_replayHook != nullptr) {
+    g_replayHook();
+  }
   if (!commands.empty()) {
     pass.SetBindGroup(0, resources().staticBindGroup);
     pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
@@ -675,6 +679,7 @@ namespace testing {
 uint32_t compute_segments_encoded() noexcept { return g_computeSegments; }
 WGPURenderPipeline current_pipeline() noexcept { return g_currentPipeline; }
 void set_current_pipeline(WGPURenderPipeline pipeline) noexcept { g_currentPipeline = pipeline; }
+void set_replay_hook(void (*hook)()) noexcept { g_replayHook = hook; }
 } // namespace testing
 } // namespace detail
 

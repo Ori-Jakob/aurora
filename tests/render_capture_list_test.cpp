@@ -54,6 +54,14 @@ void hook_warm(const gx::PipelineConfig& config, const gfx::RenderTargetLayout&)
 
 constexpr testing::PipelineHooks Hooks{.ready = hook_ready, .warm = hook_warm};
 
+WGPURenderPipeline g_replayPipeline = nullptr;
+bool g_replayReset = false;
+
+void observe_replay() {
+  g_replayPipeline = gfx::detail::testing::current_pipeline();
+  g_replayReset = gx::testing::pass_bindings_reset();
+}
+
 bool always(const detail::StageData&, const void*) { return true; }
 
 void encode_nothing(detail::PassContext&, const void*) {}
@@ -337,8 +345,14 @@ TEST_F(CaptureListTest, ReplayResetsEncoderState) {
   const gfx::detail::RenderPass info = gfx::detail::replay_pass_info({64, 32, 1});
   EXPECT_EQ(info.colorAttachments[gfx::SceneColorAttachmentIndex].size.width, 64u);
   EXPECT_EQ(info.colorAttachments[gfx::SceneColorAttachmentIndex].size.height, 32u);
+  g_replayPipeline = reinterpret_cast<WGPURenderPipeline>(uintptr_t{0x20});
+  g_replayReset = false;
+  gfx::detail::testing::set_replay_hook(&observe_replay);
   // A first clone whose pipeline matches the last one bound elsewhere must still set it
   gfx::detail::encode_command_list(wgpu::RenderPassEncoder{}, {}, info);
+  gfx::detail::testing::set_replay_hook(nullptr);
+  EXPECT_EQ(g_replayPipeline, nullptr);
+  EXPECT_TRUE(g_replayReset);
   EXPECT_EQ(gfx::detail::testing::current_pipeline(), nullptr);
   EXPECT_TRUE(gx::testing::pass_bindings_reset());
 }

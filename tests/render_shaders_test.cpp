@@ -1757,6 +1757,7 @@ TEST_F(RenderShaders, ModuleInitRequestsNoPipelines) {
   EXPECT_EQ(after.ready, 0u);
   EXPECT_EQ(after.failed, 0u);
 }
+
 TEST_F(RenderShaders, RetainedReaderCompiles) {
   const std::optional<std::string_view> library = library_text("aurora/retained");
   ASSERT_TRUE(library.has_value());

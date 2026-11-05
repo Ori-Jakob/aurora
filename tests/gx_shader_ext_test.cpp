@@ -1662,6 +1662,30 @@ TEST_F(GxShaderExtTest, CompanionLaneIsLastUniform) {
   EXPECT_EQ(bothUniforms.substr(bothUniforms.rfind("\n    ")), "\n    mat0: vec4f,\n");
 }
 
+TEST_F(GxShaderExtTest, ZeroedExtReadsExtendedUniformPrefix) {
+  // A capture-list clone on another layout keeps its draw's uniform block but runs with the extensions zeroed
+  ShaderConfig ext = layered(staged(unlit_base(), {unlit_tev(GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASC, GX_CC_ZERO),
+                                                   unlit_tev(GX_CC_ZERO, GX_CC_CPREV, GX_CC_TEXC, GX_CC_ZERO, 1, 1)}));
+  ext.ext.stochasticMask = 0b10;
+  ShaderConfig legacy = ext;
+  legacy.ext = {};
+  const ShaderInfo extInfo = build_shader_info(ext);
+  ASSERT_TRUE(extInfo.companionLane);
+  ASSERT_TRUE(extInfo.stochasticTextures.test(1));
+  const std::string legacyStruct = uniform_struct(wgsl(legacy));
+  const std::string extStruct = uniform_struct(companion_text(ext));
+  ASSERT_FALSE(legacyStruct.empty());
+  EXPECT_TRUE(extStruct.starts_with(legacyStruct));
+  EXPECT_GT(extStruct.size(), legacyStruct.size());
+  render_ext::g_stochasticUniforms[1] = {0.5f, 0.25f, 0.6f, 7.f};
+  render_ext::g_companionLane = {.v = {3.f, 0.5f, -1.f, 0.f}};
+  const std::vector<uint8_t> legacyBytes = testing::uniform_bytes(build_shader_info(legacy));
+  const std::vector<uint8_t> extBytes = testing::uniform_bytes(extInfo);
+  render_ext::g_companionLane = {};
+  ASSERT_EQ(extBytes.size(), legacyBytes.size() + 32);
+  EXPECT_TRUE(std::equal(legacyBytes.begin(), legacyBytes.end(), extBytes.begin()));
+}
+
 TEST_F(GxShaderExtTest, AlbedoSubstitutesOnlyLayerPair) {
   ShaderConfig config = staged(unlit_base(), {unlit_tev(GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASC, GX_CC_ZERO, 0, 0),
                                               unlit_tev(GX_CC_ZERO, GX_CC_CPREV, GX_CC_TEXC, GX_CC_ZERO, 0, 1),
