@@ -322,6 +322,39 @@ TEST_F(RenderRetainedTest, Rekeyed) {
   EXPECT_EQ(counts.newSubId, 1u);
 }
 
+TEST_F(RenderRetainedTest, FullObjectTablesForgetEvictedObjects) {
+  m_fifo.assign(1 << 20, 0);
+  constexpr uint32_t PerFrame = 2000;
+  constexpr uint32_t Frames = 16;
+  for (uint32_t f = 0; f < Frames; ++f) {
+    begin_frame();
+    for (uint32_t i = 0; i < PerFrame; ++i) {
+      object_draw(0x100000 + uint64_t{f} * PerFrame + i);
+    }
+    ASSERT_NE(seal_stage(), nullptr);
+    EXPECT_EQ(end().overflow, 0u) << f;
+  }
+
+  begin_frame();
+  begin_object(0x30);
+  draw();
+  draw();
+  end_object();
+  EXPECT_EQ(end().created, 2u);
+  begin_frame();
+  begin_object(0x30);
+  draw();
+  draw();
+  draw();
+  end_object();
+  EXPECT_EQ(end().rekeyed, 1u);
+  begin_frame();
+  begin_object(0x30, AURORA_CAT_DYNAMIC, 0, 1);
+  draw();
+  end_object();
+  EXPECT_EQ(end().newSubId, 1u);
+}
+
 TEST_F(RenderRetainedTest, Latch) {
   const auto immobile = [&](uint64_t id, const Mat3x4<float>& pn, uint32_t flags = AURORA_OBJ_IMMOBILE) {
     gx::g_gxState.pnMtx[0].pos = pn;

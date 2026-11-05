@@ -222,6 +222,7 @@ std::vector<ModelEntry> g_models;
 std::vector<ArrayHash> g_arrayHashes;
 uint32_t g_objectCount = 0;
 uint32_t g_modelCount = 0;
+uint64_t g_compactFrame = Never;
 uint32_t g_lastObject = NoIndex;
 uint32_t g_live = 0;
 uint32_t g_liveStatics = 0;
@@ -768,6 +769,42 @@ void touch_object(uint32_t object) noexcept {
   }
 }
 
+// Long sessions keep making objects and models, so a full table drops the entries no live instance still names
+void compact_tables() noexcept {
+  std::vector<bool> named(ObjectSlots, false);
+  for (const uint32_t index : g_liveList) {
+    if (g_slots[index].object != NoIndex) {
+      named[g_slots[index].object] = true;
+    }
+  }
+  std::vector<ObjectEntry> objects(ObjectSlots);
+  objects.swap(g_objects);
+  std::fill(g_models.begin(), g_models.end(), ModelEntry{});
+  g_objectCount = 0;
+  g_modelCount = 0;
+  g_lastObject = NoIndex;
+  std::vector<uint32_t> moved(ObjectSlots, NoIndex);
+  for (uint32_t pos = 0; pos < ObjectSlots; ++pos) {
+    const ObjectEntry& entry = objects[pos];
+    // Rekeying is judged against the last scene frame, so objects seen then stay too
+    if (!entry.used || (!named[pos] && !seen_last_scene_frame(entry))) {
+      continue;
+    }
+    const ObjectRef ref{.id = entry.id, .subId = entry.subId, .generation = entry.generation, .valid = true};
+    bool created = false;
+    moved[pos] = object_lookup(ref, created);
+    g_objects[moved[pos]] = entry;
+    static_cast<void>(model_known(ref));
+  }
+  for (const uint32_t index : g_liveList) {
+    Slot& slot = g_slots[index];
+    if (slot.object != NoIndex) {
+      slot.object = moved[slot.object];
+    }
+  }
+  g_lastObject = NoIndex;
+}
+
 std::array<double, 3> translation(const Affine& a) noexcept { return {a.m[0][3], a.m[1][3], a.m[2][3]}; }
 
 double distance(const std::array<double, 3>& a, const std::array<double, 3>& b) noexcept {
@@ -798,6 +835,11 @@ uint32_t create(const Pending& pending, const Key& key, uint32_t classBits, uint
       Log.warn("Retained scene: {} live instances; further draws are not retained", g_live);
     }
     return TransientSlot;
+  }
+  // A table still full after compacting stays so until the next scene frame, which bounds the cost
+  if ((g_objectCount >= MaxObjects || g_modelCount >= MaxModels) && g_compactFrame != g_frame.sceneFrame) {
+    g_compactFrame = g_frame.sceneFrame;
+    compact_tables();
   }
   bool objectCreated = false;
   const uint32_t object = object_lookup(pending.object, objectCreated);
