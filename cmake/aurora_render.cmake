@@ -219,6 +219,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/shadows/vsm_alloc.hpp
         lib/render/shadows/vsm_check.cpp
         lib/render/shadows/vsm_check.hpp
+        lib/render/shadows/vsm_cull.cpp
+        lib/render/shadows/vsm_cull.hpp
         lib/render/shadows/vsm_invalidate.cpp
         lib/render/shadows/vsm_invalidate.hpp
         lib/render/shadows/vsm_pages.cpp

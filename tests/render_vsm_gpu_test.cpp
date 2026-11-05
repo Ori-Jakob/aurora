@@ -11,6 +11,7 @@
 #include "render/shaders.hpp"
 #include "render/shadows/vsm_alloc.hpp"
 #include "render/shadows/vsm_check.hpp"
+#include "render/shadows/vsm_cull.hpp"
 #include "render/shadows/vsm_invalidate.hpp"
 #include "render/shadows/vsm_pages.hpp"
 #include "render/stage_data.hpp"
@@ -1601,6 +1602,494 @@ TEST_F(RenderVsmAllocGpu, CommitNeedsWholeChain) {
   EXPECT_TRUE(next.full);
   EXPECT_EQ(next.reasons, full_reason::ChainIncomplete);
   testing::reset();
+}
+constexpr uint64_t ChunkLayoutKey = 0x76736D63686B0001ull;
+constexpr uint64_t CandidateLayoutKey = 0x76736D63616E0001ull;
+constexpr uint64_t CountLayoutKey = 0x76736D636E740001ull;
+constexpr uint64_t EmitLayoutKey = 0x76736D656D740001ull;
+constexpr uint64_t SkipLayoutKey = 0x76736D736B700001ull;
+constexpr uint32_t TestClusters = 4096;
+
+struct CullScene {
+  Views views;
+  std::vector<uint32_t> history = std::vector<uint32_t>(size_t{Slots} * HistoryWords, 0);
+  std::vector<uint32_t> clusters = std::vector<uint32_t>(size_t{TestClusters} * 16, 0);
+  std::vector<uint32_t> chunkBoxes = std::vector<uint32_t>(size_t{ChunkBoxCount} * 2, 0);
+  std::vector<uint32_t> materials = std::vector<uint32_t>(MaterialBytes / 4, 0);
+  std::vector<uint32_t> requests = std::vector<uint32_t>(MaxVirtualPages, 0);
+  std::vector<uint32_t> table = std::vector<uint32_t>(MaxVirtualPages, 0);
+  std::vector<uint32_t> phys = std::vector<uint32_t>(size_t{MaxPoolPages} * PhysWords, 0);
+  std::vector<uint32_t> renderList = std::vector<uint32_t>(render_list::Words, 0);
+
+  std::span<uint32_t, HistoryWords> hist(uint32_t slot) {
+    return std::span{history}.subspan(size_t{slot} * HistoryWords).first<HistoryWords>();
+  }
+  void add(uint32_t slot, const Record& rec) {
+    const std::array<uint32_t, HistoryWords> prev{};
+    const SlotScan scan = scan_slot(prev, rec, materials, views.header);
+    std::ranges::copy(scan.history, hist(slot).begin());
+  }
+  void cluster(uint32_t index, const Box& local, bool posed) {
+    uint32_t* c = &clusters[size_t{index} * 16];
+    c[2] = 64u | 124u << 8 | (posed ? 1u : 0u) << 16;
+    for (uint32_t k = 0; k < 3; ++k) {
+      c[8 + k] = std::bit_cast<uint32_t>(local.lo[k]);
+      c[12 + k] = std::bit_cast<uint32_t>(local.hi[k]);
+    }
+  }
+  void request_level(uint32_t level) {
+    for (uint32_t i = 0; i < PagesPerView; ++i) {
+      requests[level_view(level) * PagesPerView + i] = request_bit::Pixel;
+    }
+  }
+  void allocate_pages() { (void)allocate(views, requests, table, phys, renderList); }
+};
+
+struct CullOut {
+  std::vector<uint32_t> pairs;
+  std::vector<uint32_t> args;
+  std::vector<uint32_t> counts;
+  std::vector<uint32_t> table;
+  std::vector<uint32_t> stats;
+  uint32_t listed = 0;
+};
+
+Views cull_views() {
+  Views views = test_views(false);
+  views.header.poolPages = MaxPoolPages;
+  views.header.poolPagesX = 64;
+  views.header.budget = MaxPoolPages;
+  views.header.clock = 2;
+  return views;
+}
+
+Record cluster_record(uint32_t hash, const std::array<double, 3>& t, float half, uint32_t first, uint32_t count,
+                      uint32_t categories = AURORA_CAT_STATIC, uint32_t flags = 0) {
+  Record rec = make_record(hash, t, half, categories, flags);
+  rec[record::ClusterFirst] = first;
+  rec[record::ClusterCount] = count;
+  return rec;
+}
+
+class RenderVsmCullGpu : public RenderVsmAllocGpu {
+protected:
+  void SetUp() override {
+    RenderVsmAllocGpu::SetUp();
+    if (IsSkipped()) {
+      return;
+    }
+    m_chunkGroup = pattern_layout("rrrrww");
+    m_candidateGroup = pattern_layout("wrrww");
+    m_countGroup = pattern_layout("rrrrrrw");
+    m_emitGroup = pattern_layout("rrrrrrww");
+    m_skipGroup = pattern_layout("rrrrwwww");
+    static constexpr std::array<std::string_view, 1> Chunk{"VSM_CHUNK_BOUNDS"};
+    static constexpr std::array<std::string_view, 1> Candidates{"VSM_CULL_CANDIDATES"};
+    static constexpr std::array<std::string_view, 1> Count{"VSM_CULL_PAIRS"};
+    static constexpr std::array<std::string_view, 2> Emit{"VSM_CULL_EMIT", "VSM_CULL_PAIRS"};
+    static constexpr std::array<std::string_view, 1> Skip{"VSM_CULL_SKIP"};
+    m_chunkBounds = pipeline(m_emptyLayout, m_chunkGroup, CullShader, "vsm_chunk_bounds", ChunkLayoutKey, Chunk);
+    m_candidates =
+        pipeline(m_emptyLayout, m_candidateGroup, CullShader, "vsm_cull_candidates", CandidateLayoutKey, Candidates);
+    m_count = pipeline(m_emptyLayout, m_countGroup, CullShader, "vsm_cull_pairs", CountLayoutKey, Count);
+    m_emit = pipeline(m_emptyLayout, m_emitGroup, CullShader, "vsm_cull_pairs", EmitLayoutKey, Emit);
+    m_skip = pipeline(m_emptyLayout, m_skipGroup, CullShader, "vsm_cull_skip", SkipLayoutKey, Skip);
+    m_skipArgs = pipeline(m_emptyLayout, m_skipGroup, CullShader, "vsm_cull_args", SkipLayoutKey, Skip);
+    m_history = buffer(HistoryBytes);
+    m_clusters = buffer(uint64_t{TestClusters} * 64);
+    m_chunkBoxes = buffer(ChunkBoxesBytes);
+    m_cullWords = buffer(CullWordsBytes);
+    m_cullList = buffer(CullWordsBytes);
+    m_counts = buffer(PageCountBytes);
+    m_offsets = buffer(PageCountBytes);
+    m_pairs = buffer(pairs_header::Bytes);
+    m_rasterArgs = buffer(RasterArgsBytes);
+  }
+
+  wgpu::BindGroupLayout pattern_layout(std::string_view pattern) const {
+    std::vector<wgpu::BindGroupLayoutEntry> entries(pattern.size());
+    for (uint32_t i = 0; i < pattern.size(); ++i) {
+      entries[i] = {
+          .binding = i,
+          .visibility = wgpu::ShaderStage::Compute,
+          .buffer = {.type = pattern[i] == 'r' ? wgpu::BufferBindingType::ReadOnlyStorage
+                                               : wgpu::BufferBindingType::Storage},
+      };
+    }
+    const wgpu::BindGroupLayoutDescriptor descriptor{.entryCount = entries.size(), .entries = entries.data()};
+    return m_device->device.CreateBindGroupLayout(&descriptor);
+  }
+
+  CullOut run_cull(const CullScene& sc, uint32_t maxPairs = MaxPairs) {
+    Views views = sc.views;
+    views.header.maxPairs = maxPairs;
+    upload(m_views, std::span{reinterpret_cast<const uint32_t*>(&views), ViewsBytes / 4});
+    upload(m_history, sc.history);
+    upload(m_table, sc.table);
+    upload(m_renderList, sc.renderList);
+    upload(m_clusters, sc.clusters);
+    upload(m_chunkBoxes, sc.chunkBoxes);
+    upload(m_stats, std::vector<uint32_t>(StatCount, 0));
+    const std::array candidateBuffers{m_history, m_views, m_renderList, m_cullWords, m_stats};
+    dispatch(m_candidates, m_empty, group(m_candidateGroup, candidateBuffers), Slots / CullWorkgroup);
+    const std::vector<uint32_t> list = compact_on_cpu(read(m_cullWords, CullWordsBytes));
+    upload(m_cullList, list);
+    CullOut out;
+    out.listed = static_cast<uint32_t>(list.size());
+    upload(m_counts, std::vector<uint32_t>(PageCountWords, 0));
+    const std::array countBuffers{m_cullList, m_history, m_clusters, m_chunkBoxes, m_views, m_table, m_counts};
+    dispatch(m_count, m_empty, group(m_countGroup, countBuffers), out.listed);
+    out.counts = read(m_counts, PageCountBytes);
+    std::vector<uint32_t> offsets(PageCountWords, 0);
+    uint32_t running = 0;
+    for (uint32_t i = 0; i < PageCountWords; ++i) {
+      offsets[i] = running;
+      running += out.counts[i];
+    }
+    upload(m_offsets, offsets);
+    upload(m_pairs, std::vector<uint32_t>(pairs_header::Words, 0));
+    const std::array skipBuffers{m_counts, m_offsets, m_renderList, m_views, m_table, m_stats, m_pairs, m_rasterArgs};
+    const wgpu::BindGroup skipGroup = group(m_skipGroup, skipBuffers);
+    dispatch(m_skip, m_empty, skipGroup, MaxRenderPages / CullWorkgroup);
+    dispatch(m_skipArgs, m_empty, skipGroup, 1);
+    const std::array emitBuffers{m_cullList, m_history, m_clusters, m_chunkBoxes, m_views, m_table, m_offsets, m_pairs};
+    dispatch(m_emit, m_empty, group(m_emitGroup, emitBuffers), out.listed);
+    out.pairs = read(m_pairs, pairs_header::Bytes);
+    out.args = read(m_rasterArgs, RasterArgsBytes);
+    out.table = read(m_table, TableBytes);
+    out.stats = read(m_stats, StatsBytes);
+    return out;
+  }
+
+  static std::vector<uint64_t> pair_keys(const CullOut& out) {
+    std::vector<uint64_t> keys;
+    const uint32_t total = out.pairs[pairs_header::OpaqueCount] + out.pairs[pairs_header::CutoutCount];
+    for (uint32_t i = 0; i < total; ++i) {
+      const std::array<uint32_t, 2> w{out.pairs[pairs_header::Words + 2 * i],
+                                      out.pairs[pairs_header::Words + 2 * i + 1]};
+      const Pair p = pair_unpack(w);
+      keys.push_back(pair_key(p.renderIndex, w[0], p.slot));
+    }
+    std::ranges::sort(keys);
+    return keys;
+  }
+
+  CullScene mixed_scene() {
+    CullScene sc{.views = cull_views()};
+    sc.materials[5 * 8 + 1] = 1u << 16;
+    sc.materials[6 * 8 + 1] = (1u | 16u) << 16;
+    sc.add(1, cluster_record(11, offset(0.0, 0.0, 0.0), 150.f, 100, 4));
+    for (uint32_t k = 0; k < 4; ++k) {
+      const float x0 = (k & 1) != 0 ? 0.f : -150.f;
+      const float z0 = (k & 2) != 0 ? 0.f : -150.f;
+      sc.cluster(100 + k, {.lo = {x0, -150.f, z0}, .hi = {x0 + 150.f, 150.f, z0 + 150.f}}, false);
+    }
+    sc.add(2, cluster_record(12, offset(400.0, 0.0, 200.0), 60.f, 200, 3, AURORA_CAT_PLAYER, instance_flag::Palette));
+    for (uint32_t k = 0; k < 3; ++k) {
+      sc.cluster(200 + k, {.lo = {-60.f, -60.f, -60.f}, .hi = {60.f, 60.f, 60.f}}, true);
+    }
+    Record chunked = cluster_record(13, offset(-500.0, 20.0, -300.0), 80.f, 0, 0, AURORA_CAT_DYNAMIC);
+    chunked[record::IndexFirst] = 640;
+    chunked[record::IndexCount] = 600;
+    sc.add(3, chunked);
+    const std::span<const uint32_t, 12> xform = sc.hist(3).subspan<hist::Xform, 12>();
+    const Box bounds = history_box(sc.hist(3));
+    for (uint32_t c = 0; c < 2; ++c) {
+      const Box local{.lo = {-80.f, -80.f + 80.f * static_cast<float>(c), -80.f},
+                      .hi = {80.f, static_cast<float>(c) * 80.f, 80.f}};
+      const std::array<uint32_t, 2> words = chunk_box_pack(box_through(local, xform), bounds);
+      sc.chunkBoxes[size_t{chunk_slot(640, c)} * 2] = words[0];
+      sc.chunkBoxes[size_t{chunk_slot(640, c)} * 2 + 1] = words[1];
+    }
+    Record cutout = cluster_record(14, offset(200.0, 0.0, -400.0), 40.f, 300, 1, AURORA_CAT_DYNAMIC);
+    cutout[record::Material] = 5 | 0xFF0000u;
+    sc.add(4, cutout);
+    Record pending = cluster_record(15, offset(-200.0, 0.0, 400.0), 40.f, 301, 1, AURORA_CAT_DYNAMIC);
+    pending[record::Material] = 6 | 0xFF0000u;
+    sc.add(5, pending);
+    sc.add(6, cluster_record(16, offset(0.0, 0.0, 600.0), 40.f, 302, 1, AURORA_CAT_NO_SHADOW_CAST));
+    Record freed = cluster_record(17, offset(0.0, 0.0, -700.0), 40.f, 303, 1);
+    freed[record::Flags] = 0;
+    sc.add(7, freed);
+    for (uint32_t k = 300; k < 304; ++k) {
+      sc.cluster(k, {.lo = {-40.f, -40.f, -40.f}, .hi = {40.f, 40.f, 40.f}}, false);
+    }
+    sc.request_level(2);
+    sc.request_level(3);
+    sc.allocate_pages();
+    return sc;
+  }
+
+  wgpu::BindGroupLayout m_chunkGroup, m_candidateGroup, m_countGroup, m_emitGroup, m_skipGroup;
+  wgpu::ComputePipeline m_chunkBounds, m_candidates, m_count, m_emit, m_skip, m_skipArgs;
+  wgpu::Buffer m_history, m_clusters, m_chunkBoxes, m_cullWords, m_cullList, m_counts, m_offsets, m_pairs, m_rasterArgs;
+};
+
+TEST_F(RenderVsmCullGpu, CullMatchesCpuReference) {
+  const CullScene sc = mixed_scene();
+  ASSERT_EQ(sc.renderList[render_list::Count], 2 * PagesPerView);
+  const CullOut out = run_cull(sc);
+  const std::vector<uint64_t> gpu = pair_keys(out);
+  ASSERT_FALSE(gpu.empty());
+  const CullReference ref = cull_reference(sc.views, sc.history, sc.clusters, sc.chunkBoxes, sc.renderList, 2.f);
+  for (const uint64_t k : ref.exact) {
+    EXPECT_TRUE(std::ranges::binary_search(gpu, k)) << "missing " << std::hex << k;
+  }
+  for (const uint64_t k : gpu) {
+    EXPECT_TRUE(std::ranges::binary_search(ref.loose, k)) << "beyond the margin " << std::hex << k;
+  }
+  EXPECT_GE(gpu.size(), ref.exact.size());
+  const uint32_t opaque = out.pairs[pairs_header::OpaqueCount];
+  const uint32_t cutout = out.pairs[pairs_header::CutoutCount];
+  std::array<uint32_t, 8> perSlot{};
+  uint32_t chunkPairs = 0;
+  for (uint32_t i = 0; i < opaque + cutout; ++i) {
+    const Pair p = pair_unpack({out.pairs[pairs_header::Words + 2 * i], out.pairs[pairs_header::Words + 2 * i + 1]});
+    ASSERT_LT(p.slot, perSlot.size());
+    ++perSlot[p.slot];
+    EXPECT_EQ(p.slot == 4, i >= opaque) << i;
+    EXPECT_EQ(p.chunk, p.slot == 3) << i;
+    chunkPairs += p.chunk ? 1 : 0;
+  }
+  for (const uint32_t slot : {1u, 2u, 3u, 4u, 5u}) {
+    EXPECT_GT(perSlot[slot], 0u) << slot;
+  }
+  EXPECT_EQ(perSlot[6], 0u);
+  EXPECT_EQ(perSlot[7], 0u);
+  EXPECT_EQ(out.pairs[pairs_header::ChunkPairs], chunkPairs);
+  EXPECT_EQ(out.pairs[pairs_header::PosedPairs], perSlot[2]);
+  EXPECT_EQ(out.pairs[pairs_header::Skipped], 0u);
+  EXPECT_EQ(out.pairs[pairs_header::Dropped], 0u);
+  EXPECT_EQ(out.args, (std::vector<uint32_t>{VerticesPerPair, opaque, 0, 0, VerticesPerPair, cutout, 0, 0}));
+  uint64_t sum = 0;
+  for (const uint32_t c : out.counts) {
+    sum += c;
+  }
+  EXPECT_EQ(sum, opaque + cutout);
+  EXPECT_EQ(out.stats[stat::OpaquePairs], opaque);
+  EXPECT_EQ(out.stats[stat::CutoutPairs], cutout);
+  EXPECT_EQ(out.stats[stat::CullSlots], 5u);
+  check::CullSummary summary;
+  const check::CullReadback readback{.history = sc.history,
+                                     .clusters = sc.clusters,
+                                     .chunkBoxes = sc.chunkBoxes,
+                                     .renderList = sc.renderList,
+                                     .pairs = out.pairs,
+                                     .pageCounts = out.counts};
+  Views views = sc.views;
+  views.header.maxPairs = MaxPairs;
+  EXPECT_EQ(check::verify_cull(views, readback, summary), "");
+  EXPECT_EQ(summary.gpuPairs, gpu.size());
+}
+
+TEST_F(RenderVsmCullGpu, SmallClustersCast) {
+  CullScene sc{.views = cull_views()};
+  SunClipmap overhead;
+  (void)overhead.update({.eye = TestEye, .dir = {0.0, -1.0, 0.0}, .lightId = 2, .texel0 = TestTexel0});
+  overhead.fill(sc.views);
+  const ViewRecord& view = sc.views.views[level_view(0)];
+  std::array<std::array<double, 3>, 3> basis{};
+  for (uint32_t i = 0; i < 3; ++i) {
+    basis[0][i] = double{view.anchorRel[i]} * view.texel;
+    basis[1][i] = double{view.anchorRel[4 + i]} * view.texel;
+    basis[2][i] = -double{view.anchorRel[8 + i]} / view.depthScale;
+  }
+  const double a = (2048.0 - view.anchorRel[3]) * view.texel;
+  const double b = (2048.0 - view.anchorRel[7]) * view.texel;
+  std::array<double, 3> origin{};
+  for (uint32_t i = 0; i < 3; ++i) {
+    const double anchor = double{sc.views.header.anchorHi[i]} + double{sc.views.header.anchorLo[i]};
+    origin[i] = anchor + a * basis[0][i] + b * basis[1][i];
+  }
+  Record rec = cluster_record(21, origin, 1.f, 1000, 1024);
+  for (uint32_t r = 0; r < 3; ++r) {
+    for (uint32_t c = 0; c < 3; ++c) {
+      rec[record::World + r * 4 + c] = std::bit_cast<uint32_t>(static_cast<float>(basis[c][r]));
+    }
+  }
+  const float t = view.texel;
+  for (uint32_t c = 0; c < 3; ++c) {
+    rec[record::CurAabb + c] = ordered(0.f);
+    rec[record::CurAabb + 3 + c] = ordered(c == 2 ? t : 128.f * t);
+  }
+  sc.add(1, rec);
+  constexpr std::array<float, 4> Fractions{0.15f, 0.35f, 0.6f, 0.65f};
+  std::vector<uint32_t> want;
+  for (uint32_t j = 0; j < 32; ++j) {
+    for (uint32_t i = 0; i < 32; ++i) {
+      const float fx = Fractions[(i * 3 + j) % 4];
+      const float fy = Fractions[(j * 5 + i) % 4];
+      const float x = 4.f * static_cast<float>(i) + fx;
+      const float y = 4.f * static_cast<float>(j) + fy;
+      const uint32_t index = 1000 + j * 32 + i;
+      sc.cluster(index, {.lo = {x * t, y * t, 0.f}, .hi = {(x + 0.4f) * t, (y + 0.4f) * t, t}}, false);
+      if (fx < 0.5f && fy < 0.5f) {
+        want.push_back(index);
+      }
+    }
+  }
+  const uint32_t page = page_index(view.table_offset(), view.origin[0] + 16, view.origin[1] + 16);
+  sc.requests[page] = request_bit::Pixel;
+  sc.allocate_pages();
+  ASSERT_EQ(sc.renderList[render_list::Count], 1u);
+  const CullOut out = run_cull(sc);
+  std::vector<uint32_t> got;
+  for (uint32_t i = 0; i < out.pairs[pairs_header::OpaqueCount]; ++i) {
+    const Pair p = pair_unpack({out.pairs[pairs_header::Words + 2 * i], out.pairs[pairs_header::Words + 2 * i + 1]});
+    EXPECT_EQ(p.renderIndex, 0u);
+    got.push_back(p.item);
+  }
+  std::ranges::sort(got);
+  EXPECT_EQ(got, want);
+  EXPECT_EQ(want.size(), 256u);
+}
+
+TEST_F(RenderVsmCullGpu, ChunkBoundsMatchCpu) {
+  CullScene sc{.views = cull_views()};
+  constexpr uint32_t VertexFirst = 40;
+  constexpr uint32_t Vertices = 300;
+  std::mt19937 rng{3};
+  std::uniform_real_distribution<float> coord(-70.f, 70.f);
+  std::vector<uint32_t> vertexWords(size_t{1024} * scene::streamout::vertex::Words, 0);
+  std::vector<std::array<float, 3>> local(Vertices);
+  for (uint32_t v = 0; v < Vertices; ++v) {
+    local[v] = {coord(rng), coord(rng) * 0.5f, coord(rng)};
+    for (uint32_t k = 0; k < 3; ++k) {
+      vertexWords[size_t{VertexFirst + v} * scene::streamout::vertex::Words + k] = std::bit_cast<uint32_t>(local[v][k]);
+    }
+  }
+  std::vector<uint32_t> indexWords(2048, 0);
+  std::uniform_int_distribution<uint32_t> pick(0, Vertices - 1);
+  for (uint32_t i = 0; i < 900; ++i) {
+    indexWords[128 + i] = pick(rng);
+    indexWords[1130 + i % 300] = pick(rng);
+  }
+  const double yaw = 0.7;
+  Record rec = cluster_record(31, offset(100.0, 0.0, 50.0), 70.f, 0, 0, AURORA_CAT_DYNAMIC);
+  rec[record::World + 0] = std::bit_cast<uint32_t>(static_cast<float>(std::cos(yaw)));
+  rec[record::World + 2] = std::bit_cast<uint32_t>(static_cast<float>(std::sin(yaw)));
+  rec[record::World + 8] = std::bit_cast<uint32_t>(static_cast<float>(-std::sin(yaw)));
+  rec[record::World + 10] = std::bit_cast<uint32_t>(static_cast<float>(std::cos(yaw)));
+  rec[record::IndexFirst] = 128;
+  rec[record::IndexCount] = 900;
+  rec[record::VertexFirst] = VertexFirst;
+  sc.add(1, rec);
+  Record misaligned = rec;
+  misaligned[record::IndexFirst] = 1130;
+  misaligned[record::IndexCount] = 300;
+  sc.add(2, misaligned);
+  sc.add(3, cluster_record(32, offset(0.0, 0.0, 0.0), 10.f, 100, 1));
+  ASSERT_NE(sc.hist(1)[hist::Flags] & hist::Chunked, 0u);
+  EXPECT_EQ(sc.hist(1)[hist::VertexFirst], VertexFirst);
+  const wgpu::Buffer indices = buffer(indexWords.size() * 4);
+  const wgpu::Buffer vertices = buffer(vertexWords.size() * 4);
+  upload(indices, indexWords);
+  upload(vertices, vertexWords);
+  upload(m_history, sc.history);
+  upload(m_chunkBoxes, sc.chunkBoxes);
+  upload(m_stats, std::vector<uint32_t>(StatCount, 0));
+  const std::vector<uint32_t> list{1, 2, 3};
+  upload(m_cullList, list);
+  const std::array chunkBuffers{m_cullList, m_history, indices, vertices, m_chunkBoxes, m_stats};
+  dispatch(m_chunkBounds, m_empty, group(m_chunkGroup, chunkBuffers), 3);
+  const std::vector<uint32_t> boxes = read(m_chunkBoxes, ChunkBoxesBytes);
+  const std::vector<uint32_t> stats = read(m_stats, StatsBytes);
+  EXPECT_EQ(stats[stat::ChunkBoxes], 3u);
+  EXPECT_EQ(stats[stat::ChunkMisaligned], 1u);
+  const std::span<const uint32_t, 12> xform = sc.hist(1).subspan<hist::Xform, 12>();
+  const Box bounds = history_box(sc.hist(1));
+  for (uint32_t c = 0; c < 3; ++c) {
+    Box cpu{.lo = {3.4e38f, 3.4e38f, 3.4e38f}, .hi = {-3.4e38f, -3.4e38f, -3.4e38f}};
+    std::vector<std::array<float, 3>> points;
+    for (uint32_t i = c * ChunkIndices; i < std::min((c + 1) * ChunkIndices, 900u); ++i) {
+      const std::array<float, 3>& p = local[indexWords[128 + i]];
+      const Box one = box_through({.lo = p, .hi = p}, xform);
+      points.push_back(one.lo);
+      for (uint32_t k = 0; k < 3; ++k) {
+        cpu.lo[k] = std::min(cpu.lo[k], one.lo[k]);
+        cpu.hi[k] = std::max(cpu.hi[k], one.hi[k]);
+      }
+    }
+    const uint32_t slot = chunk_slot(128, c);
+    const std::array<uint32_t, 2> gpuWords{boxes[size_t{slot} * 2], boxes[size_t{slot} * 2 + 1]};
+    const std::array<uint32_t, 2> cpuWords = chunk_box_pack(cpu, bounds);
+    for (uint32_t w = 0; w < 2; ++w) {
+      for (uint32_t k = 0; k < 3; ++k) {
+        const auto g = static_cast<int32_t>((gpuWords[w] >> (10 * k)) & 1023u);
+        const auto e = static_cast<int32_t>((cpuWords[w] >> (10 * k)) & 1023u);
+        EXPECT_LE(std::abs(g - e), 1) << "chunk " << c << " word " << w << " axis " << k;
+      }
+    }
+    const Box decoded = chunk_box_unpack(gpuWords, bounds);
+    for (const std::array<float, 3>& p : points) {
+      for (uint32_t k = 0; k < 3; ++k) {
+        EXPECT_GE(p[k], decoded.lo[k] - 1e-3f) << c;
+        EXPECT_LE(p[k], decoded.hi[k] + 1e-3f) << c;
+      }
+    }
+  }
+  for (uint32_t s = 0; s < ChunkBoxCount * 2; ++s) {
+    const bool written = s >= chunk_slot(128, 0) * 2 && s < chunk_slot(128, 3) * 2;
+    if (!written) {
+      EXPECT_EQ(boxes[s], 0u) << s;
+    }
+  }
+}
+
+TEST_F(RenderVsmCullGpu, PairOverflowSkipsWholePages) {
+  CullScene sc = mixed_scene();
+  constexpr uint32_t Max = 16;
+  std::vector<uint32_t> firstTable;
+  for (int run = 0; run < 3; ++run) {
+    const CullOut out = run_cull(sc, Max);
+    const uint32_t first = skip_first(out.counts, Max);
+    ASSERT_LT(first, MaxRenderPages);
+    EXPECT_EQ(out.pairs[pairs_header::SkipKey], MaxRenderPages - first);
+    EXPECT_LE(out.pairs[pairs_header::OpaqueCount] + out.pairs[pairs_header::CutoutCount], Max);
+    EXPECT_EQ(out.pairs[pairs_header::Dropped], 0u);
+    uint32_t skipped = 0;
+    for (uint32_t r = 0; r < sc.renderList[render_list::Count]; ++r) {
+      const uint32_t v = sc.renderList[render_list::Pages + 2 * r];
+      const bool skip = r >= first && out.counts[r] + out.counts[MaxRenderPages + r] != 0;
+      const uint32_t e = out.table[v];
+      EXPECT_EQ((e & entry::Skip) != 0, skip) << r;
+      if (skip) {
+        EXPECT_EQ(e & (entry::Dirty | entry::Priority), entry::Dirty | entry::Priority) << r;
+        ++skipped;
+      }
+    }
+    EXPECT_GT(skipped, 0u);
+    EXPECT_EQ(out.pairs[pairs_header::Skipped], skipped);
+    for (uint32_t i = 0; i < out.pairs[pairs_header::OpaqueCount] + out.pairs[pairs_header::CutoutCount]; ++i) {
+      EXPECT_LT(
+          pair_unpack({out.pairs[pairs_header::Words + 2 * i], out.pairs[pairs_header::Words + 2 * i + 1]}).renderIndex,
+          first);
+    }
+    if (run == 0) {
+      firstTable = out.table;
+    } else {
+      EXPECT_EQ(out.table, firstTable) << run;
+    }
+  }
+  std::vector<uint32_t> table = firstTable;
+  (void)commit(sc.renderList, table);
+  std::vector<uint32_t> skippedPages;
+  for (uint32_t v = 0; v < MaxVirtualPages; ++v) {
+    if ((table[v] & (entry::Allocated | entry::Priority)) == (entry::Allocated | entry::Priority)) {
+      EXPECT_EQ(table[v] & (entry::Cached | entry::Skip | entry::RenderNow), 0u) << v;
+      skippedPages.push_back(v);
+    }
+  }
+  ASSERT_FALSE(skippedPages.empty());
+  Views next = sc.views;
+  next.header.clock = 3;
+  next.header.budget = 8;
+  std::vector<uint32_t> list(render_list::Words, 0);
+  const AllocCounts counts = allocate(next, sc.requests, table, sc.phys, list);
+  EXPECT_EQ(counts.priority, skippedPages.size());
+  for (uint32_t i = 0; i < skippedPages.size(); ++i) {
+    EXPECT_EQ(list[render_list::Pages + 2 * i], skippedPages[i]) << i;
+  }
 }
 } // namespace
 } // namespace aurora::render::shadows::vsm

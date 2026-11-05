@@ -213,7 +213,7 @@ fn vsm_scan(@builtin(global_invocation_id) id: vec3u) {
   // Frees zero only word 0, so a freed slot keeps its old AABB and the Valid bit is what stops it casting
   let changed = !full && (cast_now || was_caster) && reasons != 0u;
   let chunked = cast_now && (cluster_count & RETAINED_CLUSTER_COUNT_MASK) == 0u;
-  let chunk_need = chunked && (changed || full);
+  let chunk_need = chunked && (changed || full || (hflags & VSM_HIST_CHUNKED) == 0u);
 
   if (changed || chunk_need) {
     let db = s * VSM_DIRTY_BOX_WORDS;
@@ -256,7 +256,8 @@ fn vsm_scan(@builtin(global_invocation_id) id: vec3u) {
   vsm_scan_row(hb + VSM_HIST_XFORM, box.xform[0]);
   vsm_scan_row(hb + VSM_HIST_XFORM + 4u, box.xform[1]);
   vsm_scan_row(hb + VSM_HIST_XFORM + 8u, box.xform[2]);
-  for (var k = 28u; k < VSM_HIST_WORDS; k++) {
+  vsm_history[hb + VSM_HIST_VERTEX_FIRST] = vsm_instances[rec + RETAINED_REC_VERTEX_FIRST];
+  for (var k = VSM_HIST_CULL_MASK; k < VSM_HIST_WORDS; k++) {
     vsm_history[hb + k] = 0u;
   }
   let bit = 1u << (s & 31u);

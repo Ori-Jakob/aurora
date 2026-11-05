@@ -701,7 +701,7 @@ void latch_resources(bool active) noexcept {
   }
   const wgpu::BufferDescriptor descriptor{
       .label = "scene.clusters",
-      .usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+      .usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::CopySrc,
       .size = PoolBytes,
   };
   g_buffer = webgpu::g_device.CreateBuffer(&descriptor);

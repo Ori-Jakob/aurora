@@ -54,6 +54,8 @@ inline constexpr uint32_t IndexFirst = 8;
 inline constexpr uint32_t IndexCount = 9;
 inline constexpr uint32_t Box = 10;
 inline constexpr uint32_t Xform = 16;
+inline constexpr uint32_t VertexFirst = 28;
+inline constexpr uint32_t CullMask = 29;
 
 inline constexpr uint32_t Valid = 1u << 0;
 inline constexpr uint32_t Caster = 1u << 1;

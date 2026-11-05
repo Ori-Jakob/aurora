@@ -361,7 +361,7 @@ SlotScan scan_slot(std::span<const uint32_t, HistoryWords> prev, std::span<const
   out.reasons = reasons;
   out.changed = !full && (out.castNow || wasCaster) && reasons != 0;
   const bool chunked = out.castNow && (rec[record::ClusterCount] & ClusterCountMask) == 0;
-  out.chunkNeed = chunked && (out.changed || full);
+  out.chunkNeed = chunked && (out.changed || full || (hflags & hist::Chunked) == 0);
 
   if (out.changed || out.chunkNeed) {
     uint32_t boxFlags = 0;
@@ -396,6 +396,7 @@ SlotScan scan_slot(std::span<const uint32_t, HistoryWords> prev, std::span<const
   h[hist::ClusterCount] = rec[record::ClusterCount];
   h[hist::IndexFirst] = rec[record::IndexFirst];
   h[hist::IndexCount] = rec[record::IndexCount];
+  h[hist::VertexFirst] = rec[record::VertexFirst];
   if (boxValid) {
     put_box(std::span{h}.subspan(hist::Box, 6), box);
   }

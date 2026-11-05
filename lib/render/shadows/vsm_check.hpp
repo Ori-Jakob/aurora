@@ -40,6 +40,10 @@ struct Result {
   uint64_t requested = 0;
   uint64_t rendered = 0;
   uint64_t uncommitted = 0;
+  uint64_t culled = 0;
+  uint64_t pairs = 0;
+  uint64_t exactPairs = 0;
+  uint64_t skippedPages = 0;
   bool busy = false;
 };
 
@@ -85,6 +89,28 @@ struct AllocSummary {
   uint64_t hash = 0;
 };
 
+struct CullReadback {
+  std::span<const uint32_t> history;
+  std::span<const uint32_t> clusters;
+  std::span<const uint32_t> chunkBoxes;
+  std::span<const uint32_t> renderList;
+  std::span<const uint32_t> pairs;
+  std::span<const uint32_t> pageCounts;
+};
+
+struct CullSummary {
+  bool checked = false;
+  uint64_t gpuPairs = 0;
+  uint64_t exactPairs = 0;
+  uint64_t loosePairs = 0;
+  uint32_t pages = 0;
+  uint32_t maxPerPage = 0;
+  uint32_t skipped = 0;
+  uint32_t cutout = 0;
+  uint32_t chunk = 0;
+  uint32_t posed = 0;
+};
+
 [[nodiscard]] std::optional<Config> parse(std::string_view text) noexcept;
 [[nodiscard]] const Config& config() noexcept;
 [[nodiscard]] bool check_frame(uint64_t hintFrame) noexcept;
@@ -96,6 +122,7 @@ void record_mark(const MarkParams& params, uint64_t hintFrame) noexcept;
 // prevHistory empty skips the dirty reference and checks only the cast bits against the history
 [[nodiscard]] std::string verify_scan(const Views& expected, const ScanReadback& in, ScanCounts& counts);
 [[nodiscard]] std::string verify_alloc(const Views& expected, const AllocReadback& in, AllocSummary& out);
+[[nodiscard]] std::string verify_cull(const Views& expected, const CullReadback& in, CullSummary& out);
 [[nodiscard]] detail::PassDesc pass_desc();
 void shutdown() noexcept;
 

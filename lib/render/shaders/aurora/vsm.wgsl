@@ -494,3 +494,124 @@ fn vsm_alloc_budget(priority: u32, fresh: u32, reuse: u32, evictable: u32, budge
   b.player_deferred = priority - b.priority;
   return b;
 }
+
+const VSM_HIST_VERTEX_FIRST: u32 = 28u;
+const VSM_HIST_CULL_MASK: u32 = 29u;
+
+const VSM_MAX_PAIRS: u32 = 524288u;
+const VSM_VERTICES_PER_PAIR: u32 = 372u;
+const VSM_PAIR_CHUNK: u32 = 0x80000000u;
+const VSM_PAIR_SLOT_BITS: u32 = 14u;
+const VSM_PAIRS_HEADER_WORDS: u32 = 16u;
+const VSM_PAIRS_OPAQUE_COUNT: u32 = 0u;
+const VSM_PAIRS_CUTOUT_BASE: u32 = 1u;
+const VSM_PAIRS_CUTOUT_COUNT: u32 = 2u;
+const VSM_PAIRS_SKIPPED: u32 = 3u;
+const VSM_PAIRS_CHUNK_PAIRS: u32 = 4u;
+const VSM_PAIRS_POSED_PAIRS: u32 = 5u;
+const VSM_PAIRS_TOTAL_OPAQUE: u32 = 6u;
+const VSM_PAIRS_SKIP_KEY: u32 = 7u;
+const VSM_PAIRS_DROPPED: u32 = 8u;
+const VSM_PAIRS_MAX: u32 = 9u;
+const VSM_PAIRS_ENDS: u32 = 1048592u;
+const VSM_CHUNK_TRIANGLES: u32 = 124u;
+const VSM_CHUNK_INDICES: u32 = 372u;
+const VSM_INDEX_GRANULE: u32 = 64u;
+const VSM_CHUNK_BOXES: u32 = 65536u;
+const VSM_NO_CHUNK: u32 = 0xFFFFFFFFu;
+const VSM_CHUNK_QUANTA: f32 = 1023.0;
+const VSM_CENTRE_SLACK: f32 = 1e-3;
+
+const VSM_STAT_CULL_SLOTS: u32 = 44u;
+const VSM_STAT_SKIPPED_PAGES: u32 = 45u;
+const VSM_STAT_OPAQUE_PAIRS: u32 = 46u;
+const VSM_STAT_CUTOUT_PAIRS: u32 = 47u;
+const VSM_STAT_CHUNK_BOXES: u32 = 48u;
+const VSM_STAT_CHUNK_MISALIGNED: u32 = 49u;
+
+struct VsmPair {
+  item: u32,
+  chunk: bool,
+  slot: u32,
+  render_index: u32,
+}
+
+fn vsm_pair_pack(item: u32, slot: u32, render_index: u32) -> vec2u {
+  return vec2u(item, (slot & ((1u << VSM_PAIR_SLOT_BITS) - 1u)) | (render_index << VSM_PAIR_SLOT_BITS));
+}
+
+fn vsm_pair_unpack(w: vec2u) -> VsmPair {
+  var p: VsmPair;
+  p.chunk = (w.x & VSM_PAIR_CHUNK) != 0u;
+  p.item = w.x & ~VSM_PAIR_CHUNK;
+  p.slot = w.y & ((1u << VSM_PAIR_SLOT_BITS) - 1u);
+  p.render_index = w.y >> VSM_PAIR_SLOT_BITS;
+  return p;
+}
+
+fn vsm_chunk_count(index_count: u32) -> u32 {
+  return (index_count / 3u + VSM_CHUNK_TRIANGLES - 1u) / VSM_CHUNK_TRIANGLES;
+}
+
+fn vsm_chunk_slot(index_first: u32, chunk: u32) -> u32 {
+  if (index_first % VSM_INDEX_GRANULE != 0u) {
+    return VSM_NO_CHUNK;
+  }
+  return index_first / VSM_INDEX_GRANULE + chunk;
+}
+
+fn vsm_chunk_box_pack(box: array<vec3f, 2>, bounds: array<vec3f, 2>) -> vec2u {
+  let extent = max(bounds[1] - bounds[0], vec3f(1e-30));
+  let lo = vec3u(clamp(floor((box[0] - bounds[0]) / extent * VSM_CHUNK_QUANTA), vec3f(0.0), vec3f(VSM_CHUNK_QUANTA)));
+  let hi = vec3u(clamp(ceil((box[1] - bounds[0]) / extent * VSM_CHUNK_QUANTA), vec3f(0.0), vec3f(VSM_CHUNK_QUANTA)));
+  return vec2u(lo.x | (lo.y << 10u) | (lo.z << 20u), hi.x | (hi.y << 10u) | (hi.z << 20u));
+}
+
+fn vsm_chunk_box(words: vec2u, bounds: array<vec3f, 2>) -> array<vec3f, 2> {
+  let extent = bounds[1] - bounds[0];
+  let lo = vec3f(vec3u(words.x, words.x >> 10u, words.x >> 20u) & vec3u(1023u)) / VSM_CHUNK_QUANTA;
+  let hi = vec3f(vec3u(words.y, words.y >> 10u, words.y >> 20u) & vec3u(1023u)) / VSM_CHUNK_QUANTA;
+  return array<vec3f, 2>(bounds[0] + lo * extent, bounds[0] + hi * extent);
+}
+
+fn vsm_box_through(lo: vec3f, hi: vec3f, xform: mat3x4f) -> array<vec3f, 2> {
+  var bmin = vec3f(3.4e38);
+  var bmax = vec3f(-3.4e38);
+  for (var i = 0u; i < 8u; i++) {
+    let corner = select(lo, hi, vec3<bool>((i & 1u) != 0u, (i & 2u) != 0u, (i & 4u) != 0u));
+    let p = vec4f(corner, 1.0) * xform;
+    bmin = min(bmin, p);
+    bmax = max(bmax, p);
+  }
+  return array<vec3f, 2>(bmin, bmax);
+}
+
+fn vsm_texel_rect(v: VsmView, box: array<vec3f, 2>) -> vec4f {
+  var lo = vec2f(3.4e38);
+  var hi = vec2f(-3.4e38);
+  for (var i = 0u; i < 8u; i++) {
+    let corner = select(box[0], box[1], vec3<bool>((i & 1u) != 0u, (i & 2u) != 0u, (i & 4u) != 0u));
+    let t = vsm_view_coords_anchor(v, corner).xy;
+    lo = min(lo, t);
+    hi = max(hi, t);
+  }
+  return vec4f(lo, hi);
+}
+
+fn vsm_rect_holds_centre(t: vec4f) -> bool {
+  let lo = t.xy - vec2f(VSM_CENTRE_SLACK);
+  let hi = t.zw + vec2f(VSM_CENTRE_SLACK);
+  return all(ceil(lo - 0.5) <= floor(hi - 0.5));
+}
+
+fn vsm_page_rect(v: VsmView, t: vec4f) -> vec4i {
+  let limit = vec2f(v.pages) - 1.0;
+  let p0 = clamp(floor((t.xy - vec2f(VSM_CENTRE_SLACK)) / f32(VSM_PAGE_TEXELS)), vec2f(-1.0), limit + 1.0);
+  let p1 = clamp(floor((t.zw + vec2f(VSM_CENTRE_SLACK)) / f32(VSM_PAGE_TEXELS)), vec2f(-1.0), limit + 1.0);
+  return vec4i(vec2i(max(p0, vec2f(0.0))), vec2i(min(p1, limit)));
+}
+
+fn vsm_row_bits(x0: u32, x1: u32) -> u32 {
+  let upper = select((1u << (x1 + 1u)) - 1u, 0xFFFFFFFFu, x1 >= 31u);
+  return upper & ~((1u << x0) - 1u);
+}

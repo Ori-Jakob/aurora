@@ -1,5 +1,6 @@
 #include "vsm_check.hpp"
 
+#include "vsm_cull.hpp"
 #include "vsm_invalidate.hpp"
 
 #include "../graph_bind.hpp"
@@ -7,6 +8,7 @@
 #include "../pass_context.hpp"
 #include "../stage_data.hpp"
 #include "../scene/atlas.hpp"
+#include "../scene/meshlets.hpp"
 #include "../scene/streamout_layout.hpp"
 #include "../../logging.hpp"
 #include "../../webgpu/gpu.hpp"
@@ -46,7 +48,11 @@ constexpr uint64_t CastBitsOffset = PrevHistoryOffset + HistoryBytes;
 constexpr uint64_t DirtyOffset = CastBitsOffset + CastBitsBytes;
 constexpr uint64_t RequestsOffset = DirtyOffset + DirtyPagesBytes;
 constexpr uint64_t RenderListOffset = RequestsOffset + RequestsBytes;
-constexpr uint64_t ReadbackBytes = RenderListOffset + render_list::Bytes;
+constexpr uint64_t ClustersOffset = RenderListOffset + render_list::Bytes;
+constexpr uint64_t ChunkBoxesOffset = ClustersOffset + scene::meshlets::PoolBytes;
+constexpr uint64_t PairsOffset = ChunkBoxesOffset + ChunkBoxesBytes;
+constexpr uint64_t PageCountsOffset = PairsOffset + pairs_header::Bytes;
+constexpr uint64_t ReadbackBytes = PageCountsOffset + PageCountBytes;
 
 enum Ref : uint32_t {
   ViewsRef,
@@ -61,12 +67,15 @@ enum Ref : uint32_t {
   RequestsRef,
   RenderListRef,
   ReceiversRef,
+  ClustersRef,
+  ChunkBoxesRef,
+  PairsRef,
+  PageCountsRef,
   RefCount
 };
 
 struct CheckLocal {
-  std::array<uint16_t, RefCount> refs{NoRef, NoRef, NoRef, NoRef, NoRef, NoRef,
-                                      NoRef, NoRef, NoRef, NoRef, NoRef, NoRef};
+  std::array<uint16_t, RefCount> refs{};
 };
 static_assert(sizeof(CheckLocal) <= detail::PassLocalSize);
 
@@ -172,6 +181,7 @@ void finish_readback(const wgpu::Buffer& buffer, const Capture& capture, std::sp
   uint32_t allocated = 0;
   ScanCounts scan;
   AllocSummary alloc;
+  CullSummary cull;
   std::array<uint32_t, StatCount> stats{};
   if (bytes != nullptr) {
     std::vector<uint32_t> words(ReadbackBytes / 4);
@@ -208,6 +218,17 @@ void finish_readback(const wgpu::Buffer& buffer, const Capture& capture, std::sp
       };
       error = verify_alloc(expected, readback, alloc);
     }
+    if (error.empty()) {
+      const CullReadback culled{
+          .history = region(HistoryOffset, HistoryBytes),
+          .clusters = region(ClustersOffset, scene::meshlets::PoolBytes),
+          .chunkBoxes = region(ChunkBoxesOffset, ChunkBoxesBytes),
+          .renderList = renderList,
+          .pairs = region(PairsOffset, pairs_header::Bytes),
+          .pageCounts = region(PageCountsOffset, PageCountBytes),
+      };
+      error = verify_cull(expected, culled, cull);
+    }
     allocated = allocated_entries(table);
   }
   Log.info(
@@ -220,9 +241,25 @@ void finish_readback(const wgpu::Buffer& buffer, const Capture& capture, std::sp
       (expected.header.flags & header_flag::Exempt) != 0 ? ", exempt" : "", stats[stat::DeferredNew],
       stats[stat::DeferredReuse], stats[stat::OverflowPool], stats[stat::PlayerDeferred], stats[stat::Evicted],
       stats[stat::FreedDirty], stats[stat::Hits], alloc.receivers, alloc.ambiguous, alloc.hash);
+  if (cull.checked) {
+    const auto share = [&](uint64_t part) {
+      return cull.gpuPairs != 0 ? 100.0 * static_cast<double>(part) / static_cast<double>(cull.gpuPairs) : 0.0;
+    };
+    Log.info(
+        "VSM: cull frame {}: {} pairs on {} pages (max {} per page), {} exact, amplification {:.2f}, loose {}; "
+        "{} skipped pages; cutout {:.1f}%, chunk {:.1f}%, posed {:.1f}%; {} caster slots",
+        hintFrame, cull.gpuPairs, cull.pages, cull.maxPerPage, cull.exactPairs,
+        cull.exactPairs != 0 ? static_cast<double>(cull.gpuPairs) / static_cast<double>(cull.exactPairs) : 0.0,
+        cull.loosePairs, cull.skipped, share(cull.cutout), share(cull.chunk), share(cull.posed),
+        stats[stat::CullSlots]);
+  }
   std::lock_guard lock{g_mutex};
   ++g_result.readbacks;
   g_result.entries += allocated;
+  g_result.culled += cull.checked ? 1 : 0;
+  g_result.pairs += cull.gpuPairs;
+  g_result.exactPairs += cull.exactPairs;
+  g_result.skippedPages += cull.skipped;
   g_result.fulls += (expected.header.flags & header_flag::Full) != 0 ? 1 : 0;
   g_result.referenced += scan.referenced ? 1 : 0;
   g_result.changed += scan.changed;
@@ -242,13 +279,14 @@ void finish_readback(const wgpu::Buffer& buffer, const Capture& capture, std::sp
 void declare(detail::InternalPassBuilder& builder, const detail::PassSetup& setup, const void*) {
   const std::array<detail::PersistentHandle, 2> scene = scene_handles();
   if (!config().on || !active() || setup.env == nullptr || !setup.env->retained || handle(Table).id == 0 ||
-      scene[0].id == 0 || scene[1].id == 0) {
+      scene[0].id == 0 || scene[1].id == 0 || geometry_handles()[2].id == 0) {
     builder.skip();
     return;
   }
   builder.after(phase::Shadows);
   builder.side_effect();
   CheckLocal local;
+  local.refs.fill(NoRef);
   const auto copy = [&](std::string_view name, detail::PersistentHandle h) {
     return builder.import_persistent(name, h, Access::CopySrc).index;
   };
@@ -264,6 +302,10 @@ void declare(detail::InternalPassBuilder& builder, const detail::PassSetup& setu
   local.refs[RequestsRef] = builder.use_buffer(Requests, Access::CopySrc).index;
   local.refs[RenderListRef] = builder.use_buffer(RenderList, Access::CopySrc).index;
   local.refs[ReceiversRef] = builder.use_buffer(MarkReceivers, Access::CopySrc).index;
+  local.refs[ClustersRef] = copy("scene.clusters", geometry_handles()[2]);
+  local.refs[ChunkBoxesRef] = copy(ChunkBoxes, handle(ChunkBoxes));
+  local.refs[PairsRef] = builder.use_buffer(Pairs, Access::CopySrc).index;
+  local.refs[PageCountsRef] = builder.use_buffer(PageCounts, Access::CopySrc).index;
   std::memcpy(builder.local().data(), &local, sizeof(local));
 }
 
@@ -408,6 +450,10 @@ void encode(detail::PassContext& ctx, const void*) {
   copy(DirtyRef, DirtyOffset, DirtyPagesBytes, buffer);
   copy(RequestsRef, RequestsOffset, RequestsBytes, buffer);
   copy(RenderListRef, RenderListOffset, render_list::Bytes, buffer);
+  copy(ClustersRef, ClustersOffset, scene::meshlets::PoolBytes, buffer);
+  copy(ChunkBoxesRef, ChunkBoxesOffset, ChunkBoxesBytes, buffer);
+  copy(PairsRef, PairsOffset, pairs_header::Bytes, buffer);
+  copy(PageCountsRef, PageCountsOffset, PageCountBytes, buffer);
   if (capture->receiverBytes != 0) {
     copy(ReceiversRef, ReadbackBytes, capture->receiverBytes, buffer);
   }
@@ -679,6 +725,9 @@ std::string verify_scan(const Views& expected, const ScanReadback& in, ScanCount
     const auto got = in.history.subspan(size_t{s} * HistoryWords).first<HistoryWords>();
     SlotScan twin = scan_slot(prev, rec, in.materials, expected.header);
     for (uint32_t k = 0; k < HistoryWords; ++k) {
+      if (k == hist::CullMask) {
+        continue;
+      }
       const bool approx = k >= hist::Box && k < hist::Xform + 12;
       if (approx ? !near(got[k], twin.history[k]) : got[k] != twin.history[k]) {
         return fmt::format("slot {} history word {} is {:#x}, the twin has {:#x}", s, k, got[k], twin.history[k]);
@@ -857,6 +906,96 @@ std::string verify_alloc(const Views& expected, const AllocReadback& in, AllocSu
   return {};
 }
 
+std::string verify_cull(const Views& expected, const CullReadback& in, CullSummary& out) {
+  if (in.history.size() < size_t{Slots} * HistoryWords || in.renderList.size() < render_list::Words ||
+      in.pairs.size() < pairs_header::PairsWords || in.pageCounts.size() < PageCountWords) {
+    return "the cull readback is short";
+  }
+  out.checked = true;
+  const std::span<const uint32_t> hdr = in.pairs.first(pairs_header::Words);
+  const std::span<const uint32_t> counts = in.pageCounts;
+  const uint32_t maxPairs = std::min(expected.header.maxPairs, MaxPairs);
+  const uint32_t first = skip_first(counts, maxPairs);
+  const uint32_t key = hdr[pairs_header::SkipKey];
+  const uint32_t gpuFirst = key != 0 ? MaxRenderPages - std::min(key, MaxRenderPages) : MaxRenderPages;
+  if (gpuFirst != first) {
+    return fmt::format("the first skipped page is {}, the counts give {}", gpuFirst, first);
+  }
+  uint32_t opaque = 0;
+  uint32_t cutout = 0;
+  for (uint32_t r = 0; r < MaxRenderPages; ++r) {
+    const uint32_t n = counts[r] + counts[MaxRenderPages + r];
+    if (r >= first) {
+      out.skipped += n != 0 ? 1 : 0;
+      continue;
+    }
+    opaque += counts[r];
+    cutout += counts[MaxRenderPages + r];
+  }
+  if (hdr[pairs_header::Skipped] != out.skipped) {
+    return fmt::format("{} pages skipped, the counts give {}", hdr[pairs_header::Skipped], out.skipped);
+  }
+  if (hdr[pairs_header::Dropped] != 0) {
+    return fmt::format("the emit dropped {} pairs its count had", hdr[pairs_header::Dropped]);
+  }
+  if (hdr[pairs_header::OpaqueCount] != opaque || hdr[pairs_header::CutoutBase] != opaque ||
+      hdr[pairs_header::CutoutCount] != cutout) {
+    return fmt::format("the pair header says {} opaque from 0 and {} cutout from {}, the counts give {} and {}",
+                       hdr[pairs_header::OpaqueCount], hdr[pairs_header::CutoutCount], hdr[pairs_header::CutoutBase],
+                       opaque, cutout);
+  }
+  std::vector<uint64_t> gpu;
+  gpu.reserve(size_t{opaque} + cutout);
+  std::vector<uint32_t> perPage(MaxRenderPages, 0);
+  for (uint32_t i = 0; i < opaque + cutout; ++i) {
+    const std::array<uint32_t, 2> w{in.pairs[pairs_header::Words + 2 * i], in.pairs[pairs_header::Words + 2 * i + 1]};
+    const Pair pair = pair_unpack(w);
+    const bool wantCutout = i >= opaque;
+    const uint32_t flags = in.history[size_t{pair.slot} * HistoryWords + hist::Flags];
+    if (pair.renderIndex >= first || ((flags & hist::Cutout) != 0) != wantCutout) {
+      return fmt::format("pair {} names slot {} on page {} in the {} list", i, pair.slot, pair.renderIndex,
+                         wantCutout ? "cutout" : "opaque");
+    }
+    ++perPage[pair.renderIndex];
+    gpu.push_back(pair_key(pair.renderIndex, w[0], pair.slot));
+    out.cutout += wantCutout ? 1 : 0;
+    out.chunk += pair.chunk ? 1 : 0;
+  }
+  for (uint32_t r = 0; r < first; ++r) {
+    if (perPage[r] != counts[r] + counts[MaxRenderPages + r]) {
+      return fmt::format("page {} holds {} pairs, its count is {}", r, perPage[r],
+                         counts[r] + counts[MaxRenderPages + r]);
+    }
+    out.pages += perPage[r] != 0 ? 1 : 0;
+    out.maxPerPage = std::max(out.maxPerPage, perPage[r]);
+  }
+  out.gpuPairs = gpu.size();
+  out.posed = hdr[pairs_header::PosedPairs];
+  if (hdr[pairs_header::ChunkPairs] != out.chunk) {
+    return fmt::format("the header counts {} chunk pairs, the list holds {}", hdr[pairs_header::ChunkPairs], out.chunk);
+  }
+  std::ranges::sort(gpu);
+  if (std::ranges::adjacent_find(gpu) != gpu.end()) {
+    return "a pair appears twice";
+  }
+  constexpr float Margin = 2.f;
+  const CullReference ref = cull_reference(expected, in.history, in.clusters, in.chunkBoxes, in.renderList, Margin);
+  out.exactPairs = ref.exact.size();
+  out.loosePairs = ref.loose.size();
+  for (const uint64_t k : gpu) {
+    if (!std::ranges::binary_search(ref.loose, k)) {
+      return fmt::format("page {} pairs item {:#x} of slot {}, which lies more than {} texels outside it", k >> 46,
+                         (k >> 14) & 0xFFFFFFFFu, k & 0x3FFFu, Margin);
+    }
+  }
+  for (const uint64_t k : ref.exact) {
+    if ((k >> 46) < first && !std::ranges::binary_search(gpu, k)) {
+      return fmt::format("page {} misses item {:#x} of slot {}", k >> 46, (k >> 14) & 0xFFFFFFFFu, k & 0x3FFFu);
+    }
+  }
+  return {};
+}
+
 detail::PassDesc pass_desc() {
   return {
       .name = std::string{CheckPass},
@@ -909,9 +1048,11 @@ void shutdown() noexcept {
     Log.info(
         "VSM: check passed ({} readbacks, {} allocated entries, {} full frames, {} skipped; dirty reference on {} "
         "frames, {} changed slots, {} footprint pages; mark twin on {} frames, {} receivers, {} near a boundary; "
-        "{} requested and {} rendered pages, {} frames uncommitted; {} stats frames skipped)",
+        "{} requested and {} rendered pages, {} frames uncommitted; cull reference on {} frames, {} pairs, {} "
+        "exact, {} skipped pages; {} stats frames skipped)",
         r.readbacks, r.entries, r.fulls, r.skipped, r.referenced, r.changed, r.footprint, r.marked, r.receivers,
-        r.ambiguous, r.requested, r.rendered, r.uncommitted, r.statsSkipped);
+        r.ambiguous, r.requested, r.rendered, r.uncommitted, r.culled, r.pairs, r.exactPairs, r.skippedPages,
+        r.statsSkipped);
   }
 }
 

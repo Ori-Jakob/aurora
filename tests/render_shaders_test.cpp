@@ -24,6 +24,7 @@
 #include "render/scene/streamout.hpp"
 #include "render/shader_resolve.hpp"
 #include "render/shadows/vsm_alloc.hpp"
+#include "render/shadows/vsm_cull.hpp"
 #include "render/shadows/vsm_invalidate.hpp"
 #include "render/shadows/vsm_pages.hpp"
 #include "render/shaders.hpp"
@@ -1818,6 +1819,22 @@ TEST_F(RenderShaders, VsmAllocCompiles) {
   for (const auto& variant : variants) {
     const std::span<const std::string_view> defines{variant.data(), variant[1].empty() ? 1u : 2u};
     EXPECT_TRUE(validate_module(shadows::vsm::AllocShader, defines, error)) << variant[0] << " " << error;
+  }
+}
+
+TEST_F(RenderShaders, VsmCullCompiles) {
+  const std::array<std::array<std::string_view, 2>, 5> variants{{
+      {"VSM_CHUNK_BOUNDS", ""},
+      {"VSM_CULL_CANDIDATES", ""},
+      {"VSM_CULL_PAIRS", ""},
+      {"VSM_CULL_EMIT", "VSM_CULL_PAIRS"},
+      {"VSM_CULL_SKIP", ""},
+  }};
+  std::string error;
+  EXPECT_TRUE(validate_module(shadows::vsm::CullShader, {}, error)) << error;
+  for (const auto& variant : variants) {
+    const std::span<const std::string_view> defines{variant.data(), variant[1].empty() ? 1u : 2u};
+    EXPECT_TRUE(validate_module(shadows::vsm::CullShader, defines, error)) << variant[0] << " " << error;
   }
 }
 

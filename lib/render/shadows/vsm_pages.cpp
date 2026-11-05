@@ -2,6 +2,7 @@
 
 #include "vsm_alloc.hpp"
 #include "vsm_check.hpp"
+#include "vsm_cull.hpp"
 #include "vsm_invalidate.hpp"
 
 #include "../graph_bind.hpp"
@@ -47,11 +48,12 @@ enum Persistent : uint32_t {
   StatsHandle,
   HistoryHandle,
   CastBitsHandle,
+  ChunkBoxesHandle,
   PoolHandle,
   HandleCount
 };
-constexpr std::array<std::string_view, HandleCount> HandleNames{Table,   Phys,     ViewsName, StatsName,
-                                                                History, CastBits, Pool};
+constexpr std::array<std::string_view, HandleCount> HandleNames{Table,   Phys,     ViewsName,  StatsName,
+                                                                History, CastBits, ChunkBoxes, Pool};
 
 struct UpdateParams {
   uint32_t producing = 0;
@@ -131,6 +133,7 @@ wgpu::Buffer g_views;
 wgpu::Buffer g_stats;
 wgpu::Buffer g_history;
 wgpu::Buffer g_castBits;
+wgpu::Buffer g_chunkBoxes;
 wgpu::Texture g_pool;
 LatchedHints g_hints;
 bool g_lowSunOn = false;
@@ -364,12 +367,14 @@ void create_resources() {
     g_stats = buffer("vsm.stats", StatsBytes, Common);
     g_history = buffer("vsm.history", HistoryBytes, Common);
     g_castBits = buffer("vsm.cast_bits", CastBitsBytes, Common);
+    g_chunkBoxes = buffer("vsm.chunk_boxes", ChunkBoxesBytes, Common);
     detail::set_persistent_buffer(g_handles[TableHandle], g_table, 0, TableBytes);
     detail::set_persistent_buffer(g_handles[PhysHandle], g_phys, 0, PhysBytes);
     detail::set_persistent_buffer(g_handles[ViewsHandle], g_views, 0, ViewsBytes);
     detail::set_persistent_buffer(g_handles[StatsHandle], g_stats, 0, StatsBytes);
     detail::set_persistent_buffer(g_handles[HistoryHandle], g_history, 0, HistoryBytes);
     detail::set_persistent_buffer(g_handles[CastBitsHandle], g_castBits, 0, CastBitsBytes);
+    detail::set_persistent_buffer(g_handles[ChunkBoxesHandle], g_chunkBoxes, 0, ChunkBoxesBytes);
   }
   if (g_pool && g_liveExtent.width == g_extent.width && g_liveExtent.height == g_extent.height) {
     return;
@@ -403,6 +408,7 @@ void destroy_resources() noexcept {
   g_stats = {};
   g_history = {};
   g_castBits = {};
+  g_chunkBoxes = {};
   g_pool = {};
   g_liveExtent = {};
   g_resourcesLive = false;
@@ -412,7 +418,7 @@ uint32_t expected_mask(const detail::CompiledGraph* graph) noexcept {
   if (graph == nullptr) {
     return 0;
   }
-  constexpr std::array<std::pair<std::string_view, uint32_t>, 10> Chain{{
+  constexpr std::array<std::pair<std::string_view, uint32_t>, 17> Chain{{
       {UpdatePass, chain_bit::Update},
       {ScanPass, chain_bit::Scan},
       {ScanListPass, chain_bit::ScanList},
@@ -423,6 +429,13 @@ uint32_t expected_mask(const detail::CompiledGraph* graph) noexcept {
       {AssignPass, chain_bit::Assign},
       {ClearPass, chain_bit::Clear},
       {CommitPass, chain_bit::Commit},
+      {ChunkBoundsPass, chain_bit::ChunkBounds},
+      {CullCandidatesPass, chain_bit::CullCandidates},
+      {CullListPass, chain_bit::CullList},
+      {CullCountPass, chain_bit::CullCount},
+      {CullScanPass, chain_bit::CullScan},
+      {CullSkipPass, chain_bit::CullSkip},
+      {CullEmitPass, chain_bit::CullEmit},
   }};
   uint32_t mask = 0;
   for (const auto& [name, bit] : Chain) {
@@ -1203,11 +1216,18 @@ std::array<detail::PassDesc, PassCount> pass_descs() {
       },
       scan_pass_desc(),
       scan_list_pass_desc(),
+      chunk_bounds_pass_desc(),
       dirty_pass_desc(),
       mark_pass_desc(),
       classify_pass_desc(),
       alloc_lists_pass_desc(),
       assign_pass_desc(),
+      cull_candidates_pass_desc(),
+      cull_list_pass_desc(),
+      cull_count_pass_desc(),
+      cull_scan_pass_desc(),
+      cull_skip_pass_desc(),
+      cull_emit_pass_desc(),
       clear_pass_desc(),
       commit_pass_desc(),
       check::pass_desc(),

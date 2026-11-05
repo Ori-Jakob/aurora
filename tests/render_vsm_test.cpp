@@ -10,6 +10,7 @@
 #include "render/graph_bind.hpp"
 #include "render/shadows/vsm_alloc.hpp"
 #include "render/shadows/vsm_check.hpp"
+#include "render/shadows/vsm_cull.hpp"
 #include "render/shadows/vsm_invalidate.hpp"
 #include "render/shadows/vsm_pages.hpp"
 #include "render/stage_data.hpp"
@@ -604,6 +605,10 @@ TEST_F(RenderVsmGraph, ChainFitsStorageLimit) {
   const std::array scene{detail::create_persistent("scene.instances", detail::PersistentKind::Buffer),
                          detail::create_persistent("scene.materials", detail::PersistentKind::Buffer)};
   testing::set_scene_handles(scene);
+  const std::array geometry{detail::create_persistent("scene.indices", detail::PersistentKind::Buffer),
+                            detail::create_persistent("scene.vertices", detail::PersistentKind::Buffer),
+                            detail::create_persistent("scene.clusters", detail::PersistentKind::Buffer)};
+  testing::set_geometry_handles(geometry);
   testing::set_active(true);
   check::testing::set_config(check::Config{.on = true});
   Caps caps = test::full_caps();
@@ -653,7 +658,12 @@ TEST_F(RenderVsmGraph, ChainFitsStorageLimit) {
     EXPECT_EQ(storage(ClassifyPass), 7u);
     EXPECT_EQ(storage(AssignPass), 8u);
     EXPECT_EQ(storage(CommitPass), 3u);
-    for (const std::string_view name : {AllocListsPass, ClearPass}) {
+    EXPECT_EQ(storage(ChunkBoundsPass), 6u);
+    EXPECT_EQ(storage(CullCandidatesPass), 5u);
+    EXPECT_EQ(storage(CullCountPass), 7u);
+    EXPECT_EQ(storage(CullSkipPass), 8u);
+    EXPECT_EQ(storage(CullEmitPass), 8u);
+    for (const std::string_view name : {AllocListsPass, ClearPass, CullListPass, CullScanPass}) {
       const detail::NodeId node = graph->find_node(name);
       ASSERT_NE(node, detail::InvalidNode) << name;
       EXPECT_TRUE(graph->nodes[node].manualBindings) << name;
@@ -668,6 +678,8 @@ TEST_F(RenderVsmGraph, ChainFitsStorageLimit) {
     EXPECT_LT(position(MarkPass), position(ClassifyPass));
     EXPECT_LT(position(ClassifyPass), position(AllocListsPass));
     EXPECT_LT(position(AllocListsPass), position(AssignPass));
+    EXPECT_LT(position(ScanListPass), position(ChunkBoundsPass));
+    EXPECT_LT(position(ChunkBoundsPass), position(DirtyPass));
     EXPECT_LT(position(AssignPass), position(ClearPass));
     EXPECT_LT(position(ClearPass), position(CommitPass));
     EXPECT_LT(position(CommitPass), position(CheckPass));
@@ -697,7 +709,62 @@ TEST_F(RenderVsmGraph, ChainFitsStorageLimit) {
   for (detail::PersistentHandle h : scene) {
     detail::destroy_persistent(h);
   }
+  for (detail::PersistentHandle h : geometry) {
+    detail::destroy_persistent(h);
+  }
   testing::set_scene_handles(std::nullopt);
+  testing::set_geometry_handles(std::nullopt);
+}
+
+TEST_F(RenderVsmGraph, CullRunsBeforeClear) {
+  initialize();
+  const std::array handles{detail::create_persistent("scene.instances", detail::PersistentKind::Buffer),
+                           detail::create_persistent("scene.materials", detail::PersistentKind::Buffer),
+                           detail::create_persistent("scene.indices", detail::PersistentKind::Buffer),
+                           detail::create_persistent("scene.vertices", detail::PersistentKind::Buffer),
+                           detail::create_persistent("scene.clusters", detail::PersistentKind::Buffer)};
+  testing::set_scene_handles(std::array{handles[0], handles[1]});
+  testing::set_geometry_handles(std::array{handles[2], handles[3], handles[4]});
+  testing::set_active(true);
+  Caps caps = test::full_caps();
+  caps.limits.maxComputeWorkgroupSizeX = 256;
+  caps.limits.maxComputeWorkgroupsPerDimension = 65535;
+  const Settings settings;
+  const std::array<detail::PassDesc, PassCount> passes = pass_descs();
+  detail::GraphInputs inputs{.passes = passes, .settings = &settings, .caps = &caps};
+  for (const detail::GxResource gx : {detail::GxResource::Depth, detail::GxResource::Normal}) {
+    inputs.env.gxFormats[static_cast<size_t>(gx)] =
+        gx == detail::GxResource::Depth ? wgpu::TextureFormat::Depth32Float : wgpu::TextureFormat::RGB10A2Unorm;
+    inputs.env.gxUsage[static_cast<size_t>(gx)] = wgpu::TextureUsage::TextureBinding;
+  }
+  inputs.sceneDepthSource = DepthSource::Direct;
+  inputs.env.efbSize = {1280, 720};
+  inputs.env.outputSize = {1280, 720};
+  inputs.env.sceneSize = {1280, 720};
+  inputs.env.retained = true;
+  const auto graph = detail::compile_graph(inputs);
+  ASSERT_NE(graph, nullptr);
+  const auto& order = graph->stages[static_cast<size_t>(Stage::OpaqueDone)].passes;
+  std::vector<std::string_view> names;
+  for (const detail::NodeId node : order) {
+    if (graph->nodes[node].name.starts_with("vsm.")) {
+      names.emplace_back(graph->nodes[node].name);
+    }
+  }
+  const std::vector<std::string_view> want{
+      UpdatePass,   ScanPass,       ScanListPass, ChunkBoundsPass,    DirtyPass,    MarkPass,
+      ClassifyPass, AllocListsPass, AssignPass,   CullCandidatesPass, CullListPass, CullCountPass,
+      CullScanPass, CullSkipPass,   CullEmitPass, ClearPass,          CommitPass};
+  EXPECT_EQ(names, want);
+  for (const std::string_view name : want) {
+    EXPECT_EQ(graph->nodes[graph->find_node(name)].status, detail::CullReason::None) << name;
+  }
+  shutdown();
+  for (detail::PersistentHandle h : handles) {
+    detail::destroy_persistent(h);
+  }
+  testing::set_scene_handles(std::nullopt);
+  testing::set_geometry_handles(std::nullopt);
 }
 
 bool g_pendingSecond = true;
@@ -1228,6 +1295,153 @@ TEST_F(RenderVsmGraph, CommitNeedsEveryChainBit) {
   in = frame_input(3);
   in.chainMask = FullChain | chain_bit::Commit;
   EXPECT_EQ(decide_frame(in).reasons, 0u);
+}
+TEST(RenderVsmCull, RectCoversCorners) {
+  const Views views = alloc_views();
+  const ViewRecord& view = views.views[level_view(2)];
+  const TexelRect corner{.lo = {128.f * 16 - 3.f, 128.f * 9 - 2.f}, .hi = {128.f * 16 + 2.f, 128.f * 9 + 3.f}};
+  EXPECT_EQ(page_rect(view, corner), (std::array<int32_t, 4>{15, 8, 16, 9}));
+  EXPECT_TRUE(rect_holds_centre(corner));
+  const TexelRect inside{.lo = {128.f * 16 + 3.f, 128.f * 9 + 3.f}, .hi = {128.f * 16 + 9.f, 128.f * 9 + 9.f}};
+  EXPECT_EQ(page_rect(view, inside), (std::array<int32_t, 4>{16, 9, 16, 9}));
+  const TexelRect edge{.lo = {-40.f, 4090.f}, .hi = {-1.f, 4200.f}};
+  const std::array<int32_t, 4> clamped = page_rect(view, edge);
+  EXPECT_GT(clamped[0], clamped[2]);
+  EXPECT_EQ(clamped[1], 31);
+  EXPECT_EQ(clamped[3], 31);
+  const Views overhead = clipmap_views({500.0, 120.0, -2300.0}, {0.0, -1.0, 0.0});
+  const ViewRecord& top = overhead.views[level_view(2)];
+  std::array<uint32_t, 12> xform{};
+  for (uint32_t r = 0; r < 3; ++r) {
+    for (uint32_t c = 0; c < 2; ++c) {
+      xform[r * 4 + c] = std::bit_cast<uint32_t>(top.anchorRel[c * 4 + r] * top.texel);
+    }
+  }
+  const Box local{.lo = {10.f, 20.f, 0.f}, .hi = {11.f, 21.f, 0.f}};
+  const TexelRect t = texel_rect(top, box_through(local, xform));
+  EXPECT_NEAR(t.hi[0] - t.lo[0], 1.f, 1e-3f);
+  EXPECT_NEAR(t.hi[1] - t.lo[1], 1.f, 1e-3f);
+  EXPECT_EQ(row_bits(0, 31), 0xFFFFFFFFu);
+  EXPECT_EQ(row_bits(3, 5), 0x38u);
+  EXPECT_EQ(row_bits(31, 31), 0x80000000u);
+  EXPECT_EQ(row_bits(0, 0), 1u);
+}
+
+TEST(RenderVsmCull, TexelCentreSkipIsExact) {
+  EXPECT_TRUE(rect_holds_centre({.lo = {10.3f, 4.3f}, .hi = {10.7f, 4.7f}}));
+  EXPECT_FALSE(rect_holds_centre({.lo = {10.55f, 4.3f}, .hi = {10.95f, 4.7f}}));
+  EXPECT_FALSE(rect_holds_centre({.lo = {10.3f, 4.55f}, .hi = {10.7f, 4.95f}}));
+  EXPECT_TRUE(rect_holds_centre({.lo = {10.5f, 4.5f}, .hi = {10.5f, 4.5f}}));
+  EXPECT_TRUE(rect_holds_centre({.lo = {10.5005f, 4.3f}, .hi = {10.9f, 4.7f}}));
+  EXPECT_FALSE(rect_holds_centre({.lo = {10.502f, 4.3f}, .hi = {10.9f, 4.7f}}));
+  EXPECT_TRUE(rect_holds_centre({.lo = {-3.6f, -0.7f}, .hi = {-3.4f, -0.4f}}));
+  EXPECT_FALSE(rect_holds_centre({.lo = {-3.4f, -0.7f}, .hi = {-3.0f, -0.4f}}));
+  EXPECT_TRUE(rect_holds_centre({.lo = {0.f, 0.f}, .hi = {300.f, 300.f}}));
+}
+
+TEST(RenderVsmCull, ChunkCountCoversIndexRange) {
+  for (uint32_t triangles = 0; triangles < 2000; ++triangles) {
+    const uint32_t n = triangles * 3;
+    const uint32_t chunks = chunk_count(n);
+    EXPECT_GE(chunks * ChunkTriangles, triangles);
+    EXPECT_LT(chunks == 0 ? 0 : (chunks - 1) * ChunkTriangles, std::max(triangles, 1u));
+    EXPECT_LE(chunks, (n + IndexGranule - 1) / IndexGranule);
+  }
+  EXPECT_EQ(chunk_count(372), 1u);
+  EXPECT_EQ(chunk_count(375), 2u);
+  EXPECT_EQ(chunk_slot(128, 3), 5u);
+  EXPECT_EQ(chunk_slot(130, 0), NoChunk);
+}
+
+TEST(RenderVsmCull, ChunkBoxSlotsAreUnique) {
+  std::mt19937 rng{91};
+  std::uniform_int_distribution<uint32_t> size(3, 6000);
+  std::vector<bool> used(ChunkBoxCount, false);
+  uint32_t first = 0;
+  uint32_t instances = 0;
+  while (true) {
+    const uint32_t n = size(rng) / 3 * 3;
+    const uint32_t granules = (n + IndexGranule - 1) / IndexGranule;
+    if (first / IndexGranule + granules > ChunkBoxCount) {
+      break;
+    }
+    for (uint32_t c = 0; c < chunk_count(n); ++c) {
+      const uint32_t slot = chunk_slot(first, c);
+      ASSERT_LT(slot, ChunkBoxCount);
+      EXPECT_FALSE(used[slot]) << first << " " << c;
+      used[slot] = true;
+    }
+    first += granules * IndexGranule;
+    ++instances;
+  }
+  EXPECT_GT(instances, 100u);
+  const Box bounds{.lo = {-50.f, 3.f, 1000.f}, .hi = {20.f, 90.f, 1400.f}};
+  std::uniform_real_distribution<float> unit(0.f, 1.f);
+  for (int i = 0; i < 500; ++i) {
+    Box box;
+    for (uint32_t k = 0; k < 3; ++k) {
+      const float a = bounds.lo[k] + unit(rng) * (bounds.hi[k] - bounds.lo[k]);
+      const float b = bounds.lo[k] + unit(rng) * (bounds.hi[k] - bounds.lo[k]);
+      box.lo[k] = std::min(a, b);
+      box.hi[k] = std::max(a, b);
+    }
+    const Box out = chunk_box_unpack(chunk_box_pack(box, bounds), bounds);
+    for (uint32_t k = 0; k < 3; ++k) {
+      EXPECT_LE(out.lo[k], box.lo[k] + 1e-4f) << i;
+      EXPECT_GE(out.hi[k], box.hi[k] - 1e-4f) << i;
+      EXPECT_LE(out.hi[k] - out.lo[k],
+                box.hi[k] - box.lo[k] + 2.f * (bounds.hi[k] - bounds.lo[k]) / ChunkQuanta + 1e-3f);
+    }
+  }
+}
+
+TEST(RenderVsmCull, PairPackRoundTrips) {
+  for (const uint32_t slot : {0u, 1u, 9000u, Slots - 1}) {
+    for (const uint32_t ri : {0u, 7u, MaxRenderPages - 1}) {
+      for (const uint32_t item : {0u, 262143u, PairChunk | 5u, PairChunk | 65535u}) {
+        const Pair p = pair_unpack(pair_pack(item, slot, ri));
+        EXPECT_EQ(p.slot, slot);
+        EXPECT_EQ(p.renderIndex, ri);
+        EXPECT_EQ(p.chunk, (item & PairChunk) != 0);
+        EXPECT_EQ(p.item, item & ~PairChunk);
+        EXPECT_EQ(pair_key(ri, item, slot) >> 46, ri);
+      }
+    }
+  }
+}
+
+TEST(RenderVsmCull, SkipIsADeterministicSuffix) {
+  std::mt19937 rng{5};
+  std::uniform_int_distribution<uint32_t> count(0, 40);
+  std::uniform_int_distribution<uint32_t> empty(0, 3);
+  for (int trial = 0; trial < 50; ++trial) {
+    std::vector<uint32_t> counts(PageCountWords, 0);
+    const uint32_t pages = 50 + trial * 7;
+    for (uint32_t r = 0; r < pages; ++r) {
+      if (empty(rng) != 0) {
+        counts[r] = count(rng);
+        counts[MaxRenderPages + r] = count(rng) / 4;
+      }
+    }
+    const uint32_t maxPairs = 200 + trial * 31;
+    const uint32_t first = skip_first(counts, maxPairs);
+    EXPECT_EQ(skip_first(counts, maxPairs), first);
+    uint64_t kept = 0;
+    uint64_t prefix = 0;
+    for (uint32_t r = 0; r < MaxRenderPages; ++r) {
+      const uint32_t n = counts[r] + counts[MaxRenderPages + r];
+      if (r < first) {
+        kept += n;
+      } else if (n != 0) {
+        EXPECT_GT(prefix + n, maxPairs) << trial << " page " << r;
+      }
+      prefix += n;
+    }
+    EXPECT_LE(kept, maxPairs) << trial;
+    if (first < MaxRenderPages) {
+      EXPECT_NE(counts[first] + counts[MaxRenderPages + first], 0u);
+    }
+  }
 }
 } // namespace
 } // namespace aurora::render::shadows::vsm

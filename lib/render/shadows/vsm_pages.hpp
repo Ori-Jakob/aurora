@@ -160,6 +160,13 @@ inline constexpr uint32_t AllocLists = 1u << 6;
 inline constexpr uint32_t Assign = 1u << 7;
 inline constexpr uint32_t Clear = 1u << 8;
 inline constexpr uint32_t Commit = 1u << 9;
+inline constexpr uint32_t ChunkBounds = 1u << 10;
+inline constexpr uint32_t CullCandidates = 1u << 11;
+inline constexpr uint32_t CullList = 1u << 12;
+inline constexpr uint32_t CullCount = 1u << 13;
+inline constexpr uint32_t CullScan = 1u << 14;
+inline constexpr uint32_t CullSkip = 1u << 15;
+inline constexpr uint32_t CullEmit = 1u << 16;
 } // namespace chain_bit
 
 struct ViewsHeader {
@@ -430,7 +437,7 @@ void mark_encoded(uint32_t bit) noexcept;
 [[nodiscard]] uint32_t expected_chain() noexcept;
 
 [[nodiscard]] detail::PersistentHandle handle(std::string_view name) noexcept;
-inline constexpr size_t PassCount = 11;
+inline constexpr size_t PassCount = 18;
 [[nodiscard]] std::array<detail::PassDesc, PassCount> pass_descs();
 
 namespace testing {
