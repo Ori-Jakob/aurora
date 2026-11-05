@@ -7,6 +7,7 @@
 #include "hints.hpp"
 #include "indirect_bench.hpp"
 #include "options.hpp"
+#include "render/debug/views.hpp"
 #include "render/scene/capture_list.hpp"
 #include "scene.hpp"
 
@@ -967,6 +968,12 @@ int main(int argc, char* argv[]) {
     std::printf("%.*s", static_cast<int>(render_demo::usage().size()), render_demo::usage().data());
     return ExitSuccess;
   }
+  const auto debugView =
+      options.debugView.empty() ? std::nullopt : aurora::render::debug::parse_view(options.debugView);
+  if (!options.debugView.empty() && (!debugView || !aurora::render::debug::known_view(debugView->id))) {
+    std::fprintf(stderr, "render_demo: unknown debug view: %s\n", options.debugView.c_str());
+    return ExitUsage;
+  }
   if (!options.dataDir.empty()) {
     std::error_code ec;
     std::filesystem::create_directories(options.dataDir, ec);
@@ -1102,6 +1109,11 @@ int main(int argc, char* argv[]) {
   CompanionRun companionRun;
   if (options.companionCheck) {
     render_demo::prepare_companion_loads();
+  }
+  if (debugView) {
+    aurora::render::Settings settings = aurora::render::effective_settings();
+    settings.debugView = debugView->id;
+    aurora::render::apply_settings(settings);
   }
   ClassRun classRun;
   if (options.classCheck) {

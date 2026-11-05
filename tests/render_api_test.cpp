@@ -402,6 +402,17 @@ TEST_F(RenderApiTest, ClampKeepsTuningValues) {
   }
 }
 
+#if AURORA_ENABLE_RENDER
+TEST_F(RenderApiTest, UnknownDebugViewReadsOff) {
+  for (const uint16_t unknown : {uint16_t{9}, uint16_t{35}, uint16_t{100}}) {
+    EXPECT_EQ(sanitize_settings(Settings{.debugView = unknown}).debugView, 0) << unknown;
+  }
+  for (const uint16_t known : {uint16_t{3}, uint16_t{16}, uint16_t{43}}) {
+    EXPECT_EQ(sanitize_settings(Settings{.debugView = known}).debugView, known) << known;
+  }
+}
+#endif
+
 TEST_F(RenderApiTest, SanitizeReplacesInvalidValues) {
   Settings request;
   request.legacyBlend = NaN;

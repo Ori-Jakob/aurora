@@ -17,6 +17,7 @@
 
 #if AURORA_ENABLE_RENDER
 #include "debug/debug.hpp"
+#include "debug/views.hpp"
 #include "gx_ext/ext_provider.hpp"
 #include "hints.hpp"
 #include "lighting/clusters.hpp"
@@ -1092,6 +1093,11 @@ Settings sanitize_settings(const Settings& requested) noexcept {
   sanitize_non_negative(s.terrain.strength, Defaults.terrain.strength);
   sanitize_non_negative(s.terrain.distance, Defaults.terrain.distance);
 
+#if AURORA_ENABLE_RENDER
+  if (!debug::known_view(s.debugView)) {
+    s.debugView = 0;
+  }
+#endif
   if (s.shadows.pages == 0) {
     s.shadows.pages = Defaults.shadows.pages;
   }

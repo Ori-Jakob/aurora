@@ -4,6 +4,7 @@
 #include "decomp_view.hpp"
 #include "dual_source.hpp"
 #include "gbuf_view.hpp"
+#include "retained_view.hpp"
 
 #include "../frame_state.hpp"
 #include "../graph.hpp"
@@ -46,6 +47,16 @@ constexpr std::array<LegendEntry, 6> IdentityLegend{{
     {identity_class_color(IdentityClass::Brightened), "brightened, not explained by S"},
     {identity_class_color(IdentityClass::CodeZero), "changed on receiver code 0"},
     {identity_class_color(IdentityClass::AlphaChanged), "alpha changed"},
+}};
+constexpr std::array<LegendEntry, 8> RetainedLegend{{
+    {retained_class_color(RetainedClass::StaticClustered), "static, clustered"},
+    {retained_class_color(RetainedClass::StaticUnclustered), "static, no clusters"},
+    {retained_class_color(RetainedClass::Dynamic), "dynamic"},
+    {retained_class_color(RetainedClass::Palette), "skinned palette"},
+    {retained_class_color(RetainedClass::Deformed), "CPU-deformed"},
+    {retained_class_color(RetainedClass::Other), "skipped or other"},
+    {{30, 110, 30}, "half intensity: not drawn this frame"},
+    {RetainedCameraColor, "camera (coverage view)"},
 }};
 constexpr std::array<LegendEntry, 9> CoverageLegend{{
     {coverage_class_color(CoverageClass::Untouched), "untouched"},
@@ -167,6 +178,9 @@ void draw_layout() {
 } // namespace
 
 std::optional<std::string> view_blocked(const GbufView& view, const detail::FrameState* frame) {
+  if (view.kind == GbufViewKind::Retained) {
+    return retained_view::supported(caps()) ? std::nullopt : std::optional<std::string>{"needs the retained scene"};
+  }
   const Settings settings = frame != nullptr ? frame->settings : Settings{};
   if (view.kind == GbufViewKind::Decomposition) {
     if (decomp_view::available(view, settings, frame != nullptr ? frame->graph.get() : nullptr)) {
@@ -225,6 +239,27 @@ void draw_legend(std::span<const LegendEntry> entries) {
   ImGui::Unindent();
 }
 
+void draw_retained(const GbufView& view) {
+  if (retained_mode(view) != RetainedMode::Clusters) {
+    draw_legend(RetainedLegend);
+  }
+  const retained_view::Shown shown = retained_view::shown();
+  ImGui::Indent();
+  ImGui::Text("%u instances, %u clusters", shown.instances, shown.clusters);
+  if (shown.overInstances != 0 || shown.overPairs != 0) {
+    ImGui::TextColored(WarningColor, "%u instances over the view cap, %u clusters over the pair cap",
+                       shown.overInstances, shown.overPairs);
+  }
+  if (retained_mode(view) == RetainedMode::Coverage) {
+    float extent = retained_view::coverage_extent();
+    if (ImGui::SliderFloat("Half-extent (0 = fit)", &extent, 0.f, retained_view::MaxCoverageExtent, "%.0f")) {
+      retained_view::set_coverage_extent(extent);
+    }
+    ImGui::Text("Showing %.0f units each way", shown.extent);
+  }
+  ImGui::Unindent();
+}
+
 void draw_view_buttons() {
   ImGui::SeparatorText("G-buffer view");
   const uint16_t current = view_override();
@@ -249,6 +284,9 @@ void draw_view_buttons() {
       } else if (decomp_mode(view) == DecompMode::Coverage) {
         draw_legend(CoverageLegend);
       }
+    }
+    if (view.kind == GbufViewKind::Retained && current == view.id) {
+      draw_retained(view);
     }
   }
   if (const GbufView* active = gbuf_view::active_view()) {

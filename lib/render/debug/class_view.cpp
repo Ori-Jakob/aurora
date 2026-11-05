@@ -2,6 +2,7 @@
 
 #include "../frame_state.hpp"
 #include "../scene/classify.hpp"
+#include "../scene/identity.hpp"
 #include "../../gfx/pipeline_cache.hpp"
 #include "../../gfx/recording.hpp"
 #include "../../gfx/resources.hpp"
@@ -238,6 +239,7 @@ void reset_views() noexcept {
   g_assumeReady = false;
   g_budgetOverride = 0;
   scene::set_identity_demand(false);
+  scene::retained::set_demand(scene::retained::Demand::View, false);
 }
 
 ClassView active_view() noexcept { return g_view; }

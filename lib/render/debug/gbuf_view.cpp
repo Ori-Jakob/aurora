@@ -1,6 +1,7 @@
 #include "gbuf_view.hpp"
 
 #include "decomp_view.hpp"
+#include "retained_view.hpp"
 
 #include "../hints.hpp"
 #include "../pass_context.hpp"
@@ -47,6 +48,9 @@ bool source_available(const GbufView& view, const detail::PassSetup& setup) noex
   if (view.kind == GbufViewKind::Decomposition) {
     return decomp_view::declarable(view, setup);
   }
+  if (view.kind == GbufViewKind::Retained) {
+    return retained_view::declarable(setup);
+  }
   const std::optional<detail::GxResource> gx = detail::find_gx_resource(view.resource);
   return !gx || setup.gx_available(*gx);
 }
@@ -63,6 +67,10 @@ void declare_snapshot(detail::InternalPassBuilder& builder, const detail::PassSe
     decomp_view::declare(builder, setup, view);
     return;
   }
+  if (view.kind == GbufViewKind::Retained) {
+    retained_view::declare(builder, setup, view);
+    return;
+  }
   builder.use(
       view.resource, Access::Sampled,
       detail::UseOptions{
@@ -73,7 +81,10 @@ void declare_snapshot(detail::InternalPassBuilder& builder, const detail::PassSe
                  Access::ColorWrite);
 }
 
-bool snapshot_enabled(const detail::StageData& stage, const void*) {
+bool snapshot_enabled(const detail::StageData& stage, const void* state) {
+  if (static_cast<const GbufView*>(state)->kind == GbufViewKind::Retained) {
+    return retained_view::enabled(stage);
+  }
   return stage.markerSeen && stage.sceneHints != nullptr && stage.sceneHints->has(detail::SceneHasMainCamera);
 }
 
@@ -82,6 +93,10 @@ void snapshot_pipelines(const detail::PipelineSetup& setup, const void* state,
   const auto& view = *static_cast<const GbufView*>(state);
   if (view.kind == GbufViewKind::Decomposition) {
     decomp_view::pipelines(setup, view, ids);
+    return;
+  }
+  if (view.kind == GbufViewKind::Retained) {
+    retained_view::pipelines(setup, view, ids);
     return;
   }
   shaders::RenderPipelineDesc desc = snapshot_pipeline_desc(view);
@@ -107,7 +122,16 @@ void draw_fullscreen(detail::PassContext& ctx) {
   pass.End();
 }
 
-void encode_snapshot(detail::PassContext& ctx, const void*) { draw_fullscreen(ctx); }
+void encode_snapshot(detail::PassContext& ctx, const void* state) {
+  const auto& view = *static_cast<const GbufView*>(state);
+  if (view.kind == GbufViewKind::Retained) {
+    if (current(ctx)) {
+      retained_view::encode(ctx, view);
+    }
+    return;
+  }
+  draw_fullscreen(ctx);
+}
 
 void declare_blit(detail::InternalPassBuilder& builder, const detail::PassSetup& setup, const void* state) {
   if (!source_available(*static_cast<const GbufView*>(state), setup)) {
@@ -189,7 +213,7 @@ void on_latch(uint16_t selected) {
   g_snapshot = detail::register_pass({
       .name = std::string{SnapshotPass},
       .stage = g_view->stage,
-      .kind = PassKind::Render,
+      .kind = g_view->kind == GbufViewKind::Retained ? PassKind::Encoder : PassKind::Render,
       .cls = detail::PassClass::Optional,
       .order = LastPassOrder,
       .declare = declare_snapshot,

@@ -8,6 +8,7 @@
 #include "gfx/pipeline_cache.hpp"
 #include "logging.hpp"
 #include "render/debug/decomp_view.hpp"
+#include "render/debug/retained_view.hpp"
 #include "render/debug/gbuf_view.hpp"
 #include "render/geometry/compact.hpp"
 #include "render/geometry/hzb.hpp"
@@ -1815,6 +1816,23 @@ fn main() {
   ASSERT_TRUE(register_source("test/retained_clusters", Reader));
   std::string error;
   EXPECT_TRUE(validate_module("test/retained_clusters", {}, error)) << error;
+}
+
+TEST_F(RenderShaders, RetainedViewVariantsCompile) {
+  std::string error;
+  EXPECT_TRUE(validate_module(debug::retained_view::Shader, {}, error)) << error;
+  for (uint32_t i = 0; i < 3; ++i) {
+    SCOPED_TRACE(i);
+    const RenderPipelineDesc desc = debug::retained_view::pipeline_desc(i);
+    EXPECT_EQ(desc.shader, debug::retained_view::Shader);
+    ASSERT_EQ(desc.colorCount, 1u);
+    EXPECT_EQ(desc.colors[0].format, wgpu::TextureFormat::RGBA8Unorm);
+    EXPECT_EQ(desc.depthFormat, wgpu::TextureFormat::Depth32Float);
+    EXPECT_EQ(desc.depthWrite, i < 2);
+    const PipelineId id = request_render(desc);
+    ASSERT_TRUE(id);
+    EXPECT_EQ(wait(id, WaitNs), PipelineStatus::Ready);
+  }
 }
 
 TEST_F(RenderShaders, StreamoutVariantsValidateForCorpus) {

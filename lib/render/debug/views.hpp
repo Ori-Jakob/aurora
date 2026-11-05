@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -54,8 +55,9 @@ inline constexpr std::array<DebugView, 8> ClassViews{{
     {8, "class.bit", "Classification: one category"},
 }};
 
-enum class GbufViewKind : uint8_t { Target, Decomposition };
+enum class GbufViewKind : uint8_t { Target, Decomposition, Retained };
 enum class DecompMode : uint32_t { Defog, Identity, Coverage, Multiply };
+enum class RetainedMode : uint32_t { Wireframe, Clusters, Coverage, AtlasPage, Albedo };
 
 struct GbufView {
   uint16_t id = 0;
@@ -89,8 +91,27 @@ struct GbufView {
   };
 }
 
+[[nodiscard]] constexpr RetainedMode retained_mode(const GbufView& view) noexcept {
+  return static_cast<RetainedMode>(view.mode);
+}
+
+[[nodiscard]] constexpr GbufView retained_row(uint16_t id, std::string_view name, std::string_view label,
+                                              RetainedMode mode) noexcept {
+  return {
+      id,
+      name,
+      label,
+      "scene.instances",
+      "phase.composite",
+      Stage::OpaqueDone,
+      static_cast<uint32_t>(mode),
+      false,
+      GbufViewKind::Retained,
+  };
+}
+
 // Target rows snapshot one scene target and decomposition rows decode several; both replace RGB before the HUD
-inline constexpr std::array<GbufView, 26> GbufViews{{
+inline constexpr std::array<GbufView, 29> GbufViews{{
     {16, "gbuf.motion", "G-buffer: motion", "gbuf.motion", "phase.post_taa", Stage::PrePost, 0, false},
     {17, "gbuf.reactive", "G-buffer: reactive", "gbuf.reactive", "phase.post_taa", Stage::PrePost, 1, false},
     {18, "gbuf.fog", "Fog record: weight", "gbuf.fog", "phase.composite", Stage::OpaqueDone, 2, true},
@@ -131,7 +152,56 @@ inline constexpr std::array<GbufView, 26> GbufViews{{
      Stage::OpaqueDone, 17, false},
     {42, "ssil.radiance.normal", "Indirect light: facing normals (mip 0)", "ssil.normal", "phase.ao", Stage::OpaqueDone,
      18, false},
+    retained_row(43, "retained.wireframe", "Retained: wireframe", RetainedMode::Wireframe),
+    retained_row(44, "retained.clusters", "Retained: clusters", RetainedMode::Clusters),
+    retained_row(45, "retained.coverage", "Retained: coverage from above", RetainedMode::Coverage),
 }};
+
+inline constexpr uint16_t MaxDebugViewId = 63;
+
+[[nodiscard]] consteval bool view_ids_ascend() noexcept {
+  uint16_t last = 0;
+  for (const DebugView& view : ClassViews) {
+    if (view.id <= last || view.id > LastReservedClassView) {
+      return false;
+    }
+    last = view.id;
+  }
+  for (const GbufView& view : GbufViews) {
+    if (view.id <= last || view.id < FirstGbufView || view.id > MaxDebugViewId) {
+      return false;
+    }
+    last = view.id;
+  }
+  return true;
+}
+static_assert(view_ids_ascend(), "view ids ascend, stay in their ranges and never pass MaxDebugViewId");
+
+inline constexpr std::array<DebugViewInfo, ClassViews.size() + GbufViews.size()> Registry = [] {
+  std::array<DebugViewInfo, ClassViews.size() + GbufViews.size()> out{};
+  size_t i = 0;
+  for (const DebugView& view : ClassViews) {
+    out[i++] = {view.id, view.name, view.label};
+  }
+  for (const GbufView& view : GbufViews) {
+    out[i++] = {view.id, view.name, view.label};
+  }
+  return out;
+}();
+
+[[nodiscard]] constexpr std::span<const DebugViewInfo> registry() noexcept { return Registry; }
+
+[[nodiscard]] constexpr bool known_view(uint16_t id) noexcept {
+  if (id == 0) {
+    return true;
+  }
+  for (const DebugViewInfo& view : Registry) {
+    if (view.id == id) {
+      return true;
+    }
+  }
+  return false;
+}
 
 struct ViewSelection {
   uint16_t id = 0;
@@ -188,6 +258,16 @@ inline constexpr std::array<Rgb8, 5> IdentityColors{
 inline constexpr std::array<Rgb8, 6> CoverageColors{
     {{64, 64, 64}, {40, 40, 110}, {80, 160, 255}, {60, 200, 60}, {255, 160, 0}, {255, 0, 255}}};
 inline constexpr Rgb8 DefogBadColor{255, 0, 255};
+
+enum class RetainedClass : uint8_t { StaticClustered, StaticUnclustered, Dynamic, Palette, Deformed, Other };
+
+inline constexpr std::array<Rgb8, 6> RetainedClassColors{
+    {{60, 200, 60}, {255, 240, 80}, {0, 220, 220}, {255, 160, 0}, {255, 80, 255}, {128, 128, 128}}};
+inline constexpr Rgb8 RetainedCameraColor{255, 255, 255};
+
+[[nodiscard]] constexpr Rgb8 retained_class_color(RetainedClass cls) noexcept {
+  return RetainedClassColors[static_cast<size_t>(cls)];
+}
 
 [[nodiscard]] constexpr Rgb8 identity_class_color(IdentityClass cls) noexcept {
   return IdentityColors[static_cast<size_t>(cls)];
@@ -253,8 +333,10 @@ inline constexpr Rgb8 DefogBadColor{255, 0, 255};
       return select(view.id);
     }
   }
+  // retained.coverage would share composite.coverage's short name, so retained rows answer to their full names only
   for (const GbufView& view : GbufViews) {
-    if (text == view.name || text == view.name.substr(view.name.find('.') + 1)) {
+    if (text == view.name ||
+        (view.kind != GbufViewKind::Retained && text == view.name.substr(view.name.find('.') + 1))) {
       return select(view.id);
     }
   }

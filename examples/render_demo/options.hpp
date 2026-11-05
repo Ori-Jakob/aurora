@@ -39,6 +39,7 @@ struct Options {
   bool ssilCheck = false;
   bool retainedCheck = false;
   bool captureListCheck = false;
+  std::string debugView;
   bool hints = true;
 
   bool checkHints = false;

@@ -19,6 +19,7 @@
 #include "render/jobs.hpp"
 #include "render/scene/classify.hpp"
 #include "render/scene/identity.hpp"
+#include "render/scene/meshlets.hpp"
 #endif
 #include "webgpu/gpu.hpp"
 #include "webgpu/gpu_prof.hpp"
@@ -499,6 +500,7 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
       }
       if (retainedLines.is_open()) {
         const auto counts = render::scene::retained::frame_counts();
+        const auto meshlets = render::scene::meshlets::published_stats();
         const RetainedFrame line{
             .frame = index,
             .active = counts.active,
@@ -532,6 +534,14 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
             .pendingSweeps = counts.pendingSweeps,
             .releaseOverflow = counts.releaseOverflow,
             .coverageComplete = counts.coverageComplete,
+            .meshlets =
+                {
+                    .built = meshlets.built,
+                    .pending = meshlets.pending,
+                    .failed = meshlets.failedIndexPastArray + meshlets.failedDecode + meshlets.failedPoolFull,
+                    .skipped = meshlets.skippedDeformedDirect + meshlets.skippedGpuArray + meshlets.skippedChurn,
+                    .poolUsed = meshlets.poolUsed,
+                },
         };
         retainedLines << format_retained_line(line);
         if (!retainedLines) {

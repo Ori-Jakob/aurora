@@ -101,6 +101,7 @@ struct SlotState {
   Tlsf::BlockId vtxBlock = NoBlock;
   Tlsf::BlockId idxBlock = NoBlock;
   uint32_t flags = 0;
+  uint32_t classBits = 0;
   uint32_t material = 0;
   Affine lastSent{};
   uint64_t lastSeen = Never;
@@ -487,7 +488,9 @@ void rebuild_live() {
                        .indexCount = st.indexCount,
                        .clusterFirst = st.clusters[0],
                        .clusterCount = st.clusters[1] & 0xFFFFFFu,
-                       .flags = st.flags});
+                       .flags = st.flags,
+                       .classBits = st.classBits,
+                       .origin = {st.lastSent.m[0][3], st.lastSent.m[1][3], st.lastSent.m[2][3]}});
     }
   }
   std::lock_guard lock{g_publishMutex};
@@ -929,6 +932,7 @@ BuildOutput build_block(const BuildInput& in) {
     next.generation = p.generation;
     next.lastSeen = g_hintFrame;
     next.lastCaptureOnly = capture_only(p);
+    next.classBits = p.classBits;
     const uint32_t flags = p.flags | (pick.prevValid ? instance_flag::PrevWorldValid : 0);
     const uint32_t base = p.slot * record::Words;
     if (pick.full) {
@@ -1477,7 +1481,8 @@ void commit_plan(Tentative& t) {
       --g_pendingStatics;
     }
     if (st.streamed != commit.next.streamed || st.indexCount != commit.next.indexCount ||
-        st.flags != commit.next.flags || st.clusters != commit.next.clusters) {
+        st.flags != commit.next.flags || st.clusters != commit.next.clusters || st.classBits != commit.next.classBits ||
+        (commit.next.worldSent && !st.worldSent)) {
       g_liveChanged = true;
     }
     g_streamedCount += commit.next.streamed && !st.streamed ? 1 : 0;
@@ -2700,6 +2705,7 @@ void seal(retained::Frame& out, const detail::StageData& stage) noexcept {
   plan->idxChunks = built.idxChunks;
   plan->variants = std::move(built.variants);
   plan->events = std::move(built.events);
+  plan->live = g_live;
   if (!late && check_frame()) {
     plan->check = make_check(stage.frameIndex, built.commits, parity_entries(input.picks));
   }
@@ -2796,6 +2802,10 @@ Stats stats() noexcept {
 }
 
 bool applied(uint32_t serial) noexcept { return g_appliedSerial.load(std::memory_order_acquire) == serial; }
+
+detail::PersistentHandle pool_handle(uint32_t binding) noexcept {
+  return binding < g_handles.size() ? g_handles[binding] : detail::PersistentHandle{};
+}
 
 void worker_frame_begin(uint64_t frameId, const detail::FrameState*) {
   WorkerState& w = g_worker;

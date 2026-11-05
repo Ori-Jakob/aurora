@@ -48,6 +48,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/debug/overview_tab.cpp
         lib/render/debug/pick.cpp
         lib/render/debug/pick.hpp
+        lib/render/debug/retained_view.cpp
+        lib/render/debug/retained_view.hpp
         lib/render/debug/scene_tab.cpp
         lib/render/debug/surface_expand.cpp
         lib/render/debug/surface_expand.hpp

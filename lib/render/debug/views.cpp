@@ -4,8 +4,10 @@
 #include "debug.hpp"
 #include "dual_source.hpp"
 #include "gbuf_view.hpp"
+#include "retained_view.hpp"
 
 #include "../scene/classify.hpp"
+#include "../scene/identity.hpp"
 #include "../settings.hpp"
 
 #include <atomic>
@@ -33,7 +35,10 @@ uint16_t selected_view_id(const Settings& settings) noexcept {
 }
 
 void views_on_latch() {
-  gbuf_view::on_latch(selected_view_id(detail::latched_settings()));
+  const uint16_t selected = selected_view_id(detail::latched_settings());
+  const GbufView* row = find_gbuf_view(selected);
+  scene::retained::set_demand(scene::retained::Demand::View, row != nullptr && row->kind == GbufViewKind::Retained);
+  gbuf_view::on_latch(selected);
   capture::on_latch();
   dual_source::on_latch();
 }
@@ -44,6 +49,7 @@ void initialize_classification() {
   scene::set_view_hooks(&g_hooks);
   capture::initialize();
   dual_source::initialize();
+  retained_view::initialize();
 }
 
 void shutdown_classification() noexcept {
@@ -54,6 +60,7 @@ void shutdown_classification() noexcept {
   capture::shutdown();
   dual_source::shutdown();
   gbuf_view::shutdown();
+  retained_view::shutdown();
   testing::reset_views();
 }
 } // namespace aurora::render::debug

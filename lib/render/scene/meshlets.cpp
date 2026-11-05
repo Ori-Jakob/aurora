@@ -845,6 +845,8 @@ Stats published_stats() noexcept {
   return g_published;
 }
 
+detail::PersistentHandle clusters_handle() noexcept { return g_handle; }
+
 void worker_frame_begin(uint64_t frameId) {
   std::vector<Staged> due;
   wgpu::Buffer buffer;

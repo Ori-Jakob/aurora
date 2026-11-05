@@ -622,6 +622,7 @@ TEST(GxReplayReport, FormatsRetainedLine) {
       .pendingSweeps = 19,
       .releaseOverflow = 20,
       .coverageComplete = true,
+      .meshlets = {.built = 21, .pending = 22, .failed = 23, .skipped = 24, .poolUsed = 25},
   };
   EXPECT_EQ(format_retained_line(frame),
             "{\"frame\": 4, \"active\": true, \"sceneFrame\": 3, \"epoch\": 2, \"entries\": 10, \"captureOnly\": 1, "
@@ -630,7 +631,8 @@ TEST(GxReplayReport, FormatsRetainedLine) {
             "\"reorigins\": 7, \"overflow\": 8, \"droppedEntries\": 9, \"undeliveredStatics\": 10, "
             "\"lostCaptures\": 11, \"resyncs\": 12, \"eventsPending\": 13, \"evictedDynamic\": 14, "
             "\"evictedStatic\": 15, \"evictedReleased\": 16, \"recreatedStatic\": 17, \"recreatedDynamic\": 18, "
-            "\"pendingSweeps\": 19, \"releaseOverflow\": 20, \"coverageComplete\": true}\n");
+            "\"pendingSweeps\": 19, \"releaseOverflow\": 20, \"coverageComplete\": true, \"meshlets\": {\"built\": 21, "
+            "\"pending\": 22, \"failed\": 23, \"skipped\": 24, \"poolUsed\": 25}}\n");
 }
 
 TEST(GxReplayReport, RetainedSummaryGatesFromFrame30) {

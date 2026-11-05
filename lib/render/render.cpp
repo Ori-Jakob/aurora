@@ -355,6 +355,14 @@ void retained_hold_coverage([[maybe_unused]] bool hold) noexcept {
 #endif
 }
 
+std::span<const DebugViewInfo> debug_views() noexcept {
+#if AURORA_ENABLE_RENDER
+  return debug::registry();
+#else
+  return {};
+#endif
+}
+
 #if AURORA_ENABLE_RENDER
 void draw_debug_window(bool* open) { debug::draw_window(open); }
 

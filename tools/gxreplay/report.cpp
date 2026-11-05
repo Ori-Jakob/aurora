@@ -323,13 +323,15 @@ std::string format_retained_line(const RetainedFrame& frame) {
       "\"reorigins\": {}, \"overflow\": {}, \"droppedEntries\": {}, \"undeliveredStatics\": {}, "
       "\"lostCaptures\": {}, \"resyncs\": {}, \"eventsPending\": {}, \"evictedDynamic\": {}, \"evictedStatic\": {}, "
       "\"evictedReleased\": {}, \"recreatedStatic\": {}, \"recreatedDynamic\": {}, \"pendingSweeps\": {}, "
-      "\"releaseOverflow\": {}, \"coverageComplete\": {}}}\n",
+      "\"releaseOverflow\": {}, \"coverageComplete\": {}, \"meshlets\": {{\"built\": {}, \"pending\": {}, "
+      "\"failed\": {}, \"skipped\": {}, \"poolUsed\": {}}}}}\n",
       frame.frame, frame.active, frame.sceneFrame, frame.epoch, frame.entries, frame.captureOnly, frame.transient,
       frame.late, frame.instances, frame.statics, frame.created, frame.rekeyed, frame.newSubId, frame.newOccurrence,
       frame.relatched, frame.staticRestream, frame.signatureMisses, frame.reorigins, frame.overflow,
       frame.droppedEntries, frame.undeliveredStatics, frame.lostCaptures, frame.resyncs, frame.eventsPending,
       frame.evictedDynamic, frame.evictedStatic, frame.evictedReleased, frame.recreatedStatic, frame.recreatedDynamic,
-      frame.pendingSweeps, frame.releaseOverflow, frame.coverageComplete);
+      frame.pendingSweeps, frame.releaseOverflow, frame.coverageComplete, frame.meshlets.built, frame.meshlets.pending,
+      frame.meshlets.failed, frame.meshlets.skipped, frame.meshlets.poolUsed);
 }
 
 std::string format_retained_summary(std::span<const RetainedFrame> frames) {

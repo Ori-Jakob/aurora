@@ -109,6 +109,14 @@ struct ReportContext {
   bool deterministic = true;
 };
 
+struct RetainedMeshlets {
+  uint64_t built = 0;
+  uint32_t pending = 0;
+  uint64_t failed = 0;
+  uint64_t skipped = 0;
+  uint64_t poolUsed = 0;
+};
+
 struct RetainedFrame {
   uint32_t frame = 0;
   bool active = false;
@@ -142,6 +150,7 @@ struct RetainedFrame {
   uint32_t pendingSweeps = 0;
   uint32_t releaseOverflow = 0;
   bool coverageComplete = false;
+  RetainedMeshlets meshlets;
 };
 
 inline constexpr uint32_t RetainedGateFirstFrame = 30;

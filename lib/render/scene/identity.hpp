@@ -196,6 +196,7 @@ struct FrameCounts {
 // Game thread at end_frame; false holds coverage back
 using SettlePredicate = bool (*)() noexcept;
 
+[[nodiscard]] bool available(const Caps& caps) noexcept;
 // Game thread while the FIFO is idle
 void latch_gate(const Settings& settings, const Caps& caps) noexcept;
 void latch_resources(bool active) noexcept;
@@ -244,6 +245,7 @@ struct Instance {
   Affine world{};
 };
 void reset() noexcept;
+[[nodiscard]] uint8_t demand() noexcept;
 void set_check(bool on, uint64_t first = 0, uint64_t last = UINT64_MAX) noexcept;
 void set_overrun(int overrun) noexcept;
 [[nodiscard]] Instance instance(uint32_t slot) noexcept;

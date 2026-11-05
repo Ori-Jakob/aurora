@@ -120,6 +120,16 @@ struct CheckRequest {
   Mat4x4<float> proj{};
 };
 
+struct LiveInstance {
+  uint32_t slot = NoSlot;
+  uint32_t indexCount = 0;
+  uint32_t clusterFirst = 0;
+  uint32_t clusterCount = 0;
+  uint32_t flags = 0;
+  uint32_t classBits = 0;
+  std::array<double, 3> origin{};
+};
+
 struct Plan {
   uint64_t frame = 0;
   uint32_t frameIndex = 0;
@@ -135,6 +145,7 @@ struct Plan {
   std::vector<VariantDispatch> variants;
   std::vector<PlanEvent> events;
   std::shared_ptr<const CheckRequest> check;
+  std::shared_ptr<const std::vector<LiveInstance>> live;
 
   [[nodiscard]] bool header_only() const noexcept { return headerOnly; }
 };
@@ -143,14 +154,6 @@ struct Coverage {
   uint32_t frame = 0;
   uint32_t pending = 0;
   uint32_t streamed = 0;
-};
-
-struct LiveInstance {
-  uint32_t slot = NoSlot;
-  uint32_t indexCount = 0;
-  uint32_t clusterFirst = 0;
-  uint32_t clusterCount = 0;
-  uint32_t flags = 0;
 };
 
 struct Stats {
@@ -213,6 +216,7 @@ void commit_stage_params(const detail::StageData& stage, const void* state, std:
 [[nodiscard]] std::shared_ptr<const std::vector<LiveInstance>> live() noexcept;
 [[nodiscard]] Stats stats() noexcept;
 [[nodiscard]] bool applied(uint32_t serial) noexcept;
+[[nodiscard]] detail::PersistentHandle pool_handle(uint32_t binding) noexcept;
 
 void worker_frame_begin(uint64_t frameId, const detail::FrameState* frame);
 

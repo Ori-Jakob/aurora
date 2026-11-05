@@ -238,6 +238,11 @@ bool apply_capture_list_check(Options& options, std::string_view) {
   return true;
 }
 
+bool apply_debug_view(Options& options, std::string_view value) {
+  options.debugView = value;
+  return !value.empty();
+}
+
 bool apply_no_hints(Options& options, std::string_view) {
   options.hints = false;
   return true;
@@ -328,7 +333,7 @@ struct Flag {
   bool frameLoop = false;
 };
 
-constexpr std::array<Flag, 40> Flags{{
+constexpr std::array<Flag, 41> Flags{{
     {"--frames", true, apply_frames, true},
     {"--timeout", true, apply_timeout, true},
     {"--backend", true, apply_backend},
@@ -356,6 +361,7 @@ constexpr std::array<Flag, 40> Flags{{
     {"--ssil-check", false, apply_ssil_check, true},
     {"--retained-check", false, apply_retained_check, true},
     {"--capture-list-check", false, apply_capture_list_check, true},
+    {"--debug-view", true, apply_debug_view, true},
     {"--no-hints", false, apply_no_hints, true},
     {"--check-hints", false, apply_check_hints, true},
     {"--custom-draw-probe", false, apply_custom_draw_probe, true},
@@ -587,6 +593,7 @@ std::string_view usage() noexcept {
          "  --trace-start N     first frame to capture (default 2)\n"
          "  --trace-frames N    number of frames to capture (default 4)\n"
          "  --fail-on-error     exit with code 3 if any error is logged\n"
+         "  --debug-view NAME   select a debug view by name, such as retained.wireframe\n"
          "  --vignette          register the demo.vignette render graph pass\n"
          "  --vignette-anchor NAME\n"
          "                      anchor demo.vignette after NAME (implies --vignette)\n"

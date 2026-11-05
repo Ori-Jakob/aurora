@@ -310,6 +310,15 @@ bool retained_coverage_complete() noexcept;
 // Game thread; true while the caller is still capturing, and the first call makes it the producer
 void retained_hold_coverage(bool hold) noexcept;
 
+struct DebugViewInfo {
+  uint16_t id = 0;
+  std::string_view name;
+  std::string_view label;
+};
+
+// Every built view in id order; Settings::debugView takes these ids and 0, anything else reads as 0
+std::span<const DebugViewInfo> debug_views() noexcept;
+
 // M10
 struct OpenPbrParams {
   float baseWeight = 1.f;

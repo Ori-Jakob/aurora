@@ -8,6 +8,10 @@
 #include <span>
 #include <vector>
 
+namespace aurora::render::detail {
+struct PersistentHandle;
+} // namespace aurora::render::detail
+
 namespace aurora::render::scene::meshlets {
 inline constexpr uint32_t MaxVertices = 64;
 inline constexpr uint32_t MaxTriangles = 124;
@@ -133,6 +137,7 @@ void latch_resources(bool active) noexcept;
 void reset() noexcept;
 void set_recording_frame(uint64_t frameId) noexcept;
 [[nodiscard]] Stats published_stats() noexcept;
+[[nodiscard]] detail::PersistentHandle clusters_handle() noexcept;
 
 // Render worker
 void worker_frame_begin(uint64_t frameId);

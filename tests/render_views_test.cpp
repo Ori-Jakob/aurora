@@ -5,10 +5,12 @@
 #include "gx/pipeline.hpp"
 #include "gx/shader_info.hpp"
 #include "render/debug/decomp_view.hpp"
+#include "render/debug/retained_view.hpp"
 #include "render/debug/views.hpp"
 #include "render/frame_state.hpp"
 #include "render/graph.hpp"
 #include "render/scene/classify.hpp"
+#include "render/scene/identity.hpp"
 
 #include <algorithm>
 #include <array>
@@ -174,6 +176,11 @@ TEST_F(RenderViews, GbufViewTableFollowsClassRange) {
       EXPECT_TRUE(view.name.starts_with("composite.")) << view.name;
       continue;
     }
+    if (view.kind == GbufViewKind::Retained) {
+      EXPECT_FALSE(view.uintSource) << view.name;
+      EXPECT_TRUE(view.name.starts_with("retained.")) << view.name;
+      continue;
+    }
     if (view.resource.starts_with("light.") || view.resource.starts_with("sky.")) {
       EXPECT_EQ(view.mode, 5u) << view.name;
       continue;
@@ -187,7 +194,7 @@ TEST_F(RenderViews, GbufViewTableFollowsClassRange) {
       EXPECT_EQ(view.mode, static_cast<uint32_t>(view.id - FirstGbufView));
     }
   }
-  EXPECT_EQ(expected, 43u);
+  EXPECT_EQ(expected, 46u);
   EXPECT_EQ(targetModes, (std::set<uint32_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}));
   EXPECT_EQ(find_gbuf_view(LastReservedClassView), nullptr);
   EXPECT_EQ(find_gbuf_view(35), nullptr);
@@ -203,7 +210,9 @@ TEST_F(RenderViews, ParseGbufViewNames) {
   };
   for (const GbufView& view : GbufViews) {
     EXPECT_EQ(id(view.name), view.id) << view.name;
-    EXPECT_EQ(id(view.name.substr(view.name.find('.') + 1)), view.id) << view.name;
+    if (view.kind != GbufViewKind::Retained) {
+      EXPECT_EQ(id(view.name.substr(view.name.find('.') + 1)), view.id) << view.name;
+    }
   }
   EXPECT_EQ(id("motion"), 16u);
   EXPECT_EQ(id("fog"), 18u);
@@ -375,7 +384,7 @@ TEST_F(RenderViews, SsilRowsAppendFrom39) {
     EXPECT_EQ(parse_view(row.name)->id, row.id);
     EXPECT_EQ(view_blocked(*view, nullptr), std::optional<std::string>{"needs Indirect Light"});
   }
-  EXPECT_EQ(GbufViews.back().id, 42u);
+  EXPECT_EQ(find_gbuf_view(43)->kind, GbufViewKind::Retained);
 }
 
 TEST_F(RenderViews, ShortNamesAreUnique) {
@@ -384,11 +393,16 @@ TEST_F(RenderViews, ShortNamesAreUnique) {
     EXPECT_TRUE(names.insert(view.name).second) << view.name;
     EXPECT_TRUE(names.insert(view.name.substr(std::string_view{"class."}.size())).second) << view.name;
   }
+  size_t retained = 0;
   for (const GbufView& view : GbufViews) {
     EXPECT_TRUE(names.insert(view.name).second) << view.name;
+    if (view.kind == GbufViewKind::Retained) {
+      ++retained;
+      continue;
+    }
     EXPECT_TRUE(names.insert(view.name.substr(view.name.find('.') + 1)).second) << view.name;
   }
-  EXPECT_EQ(names.size(), 2 * (ClassViews.size() + GbufViews.size()));
+  EXPECT_EQ(names.size(), 2 * (ClassViews.size() + GbufViews.size()) - retained);
 }
 
 TEST_F(RenderViews, ParseDecompositionViewNames) {
@@ -720,6 +734,183 @@ TEST_F(RenderViews, UnknownIdSelectsNothing) {
   EXPECT_FALSE(scene::identity_collecting());
   begin_view_frame(frame_with_view(LastReservedClassView));
   EXPECT_EQ(testing::active_view(), ClassView::Off);
+}
+
+TEST_F(RenderViews, RetainedRowsHaveFreshIds) {
+  struct Row {
+    uint16_t id;
+    std::string_view name;
+    RetainedMode mode;
+  };
+  constexpr std::array<Row, 3> Rows{{
+      {43, "retained.wireframe", RetainedMode::Wireframe},
+      {44, "retained.clusters", RetainedMode::Clusters},
+      {45, "retained.coverage", RetainedMode::Coverage},
+  }};
+  for (const Row& row : Rows) {
+    const GbufView* view = find_gbuf_view(row.id);
+    ASSERT_NE(view, nullptr) << row.id;
+    EXPECT_EQ(view->name, row.name);
+    EXPECT_EQ(view->kind, GbufViewKind::Retained);
+    EXPECT_EQ(retained_mode(*view), row.mode);
+    EXPECT_EQ(view->stage, Stage::OpaqueDone);
+    EXPECT_TRUE(view->label.starts_with("Retained: ")) << view->label;
+    EXPECT_EQ(find_view(row.id), nullptr);
+  }
+  EXPECT_EQ(find_gbuf_view(46), nullptr);
+  EXPECT_LE(GbufViews.back().id, MaxDebugViewId);
+}
+
+TEST_F(RenderViews, RegistryListsEveryBuiltView) {
+  const std::span<const DebugViewInfo> views = registry();
+  ASSERT_EQ(views.size(), ClassViews.size() + GbufViews.size());
+  uint16_t last = 0;
+  std::set<std::string_view> names;
+  for (const DebugViewInfo& view : views) {
+    EXPECT_GT(view.id, last) << view.name;
+    last = view.id;
+    EXPECT_LE(view.id, MaxDebugViewId);
+    EXPECT_FALSE(view.id >= 9 && view.id <= 15) << view.id;
+    EXPECT_NE(view.id, 35u);
+    EXPECT_TRUE(names.insert(view.name).second) << view.name;
+    EXPECT_TRUE(known_view(view.id));
+    const DebugView* cls = find_view(view.id);
+    const GbufView* gbuf = find_gbuf_view(view.id);
+    ASSERT_TRUE(cls != nullptr || gbuf != nullptr) << view.id;
+    EXPECT_EQ(view.label, cls != nullptr ? cls->label : gbuf->label);
+  }
+  const std::span<const DebugViewInfo> api = debug_views();
+  ASSERT_EQ(api.size(), views.size());
+  EXPECT_EQ(api.data(), views.data());
+  EXPECT_TRUE(known_view(0));
+  for (const uint16_t reserved : {uint16_t{9}, uint16_t{15}, uint16_t{35}, uint16_t{46}, uint16_t{100}}) {
+    EXPECT_FALSE(known_view(reserved)) << reserved;
+  }
+}
+
+TEST_F(RenderViews, ParseSelectsRetainedRowsByName) {
+  const auto id = [](std::string_view text) {
+    const auto selection = parse_view(text);
+    return selection ? std::optional{selection->id} : std::nullopt;
+  };
+  EXPECT_EQ(id("retained.wireframe"), 43u);
+  EXPECT_EQ(id("retained.clusters"), 44u);
+  EXPECT_EQ(id("retained.coverage"), 45u);
+  EXPECT_EQ(id("wireframe"), std::nullopt);
+  EXPECT_EQ(id("clusters"), std::nullopt);
+  EXPECT_EQ(id("coverage"), 26u);
+  EXPECT_EQ(id("45"), 45u);
+  EXPECT_EQ(parse_view("retained.coverage")->bit, 0u);
+  EXPECT_EQ(id("retained."), std::nullopt);
+  EXPECT_EQ(id("retained.wire"), std::nullopt);
+}
+
+TEST_F(RenderViews, RetainedRowBlockedWithoutRetainedScene) {
+  ASSERT_FALSE(scene::retained::available(caps()));
+  for (const uint16_t row : {uint16_t{43}, uint16_t{44}, uint16_t{45}}) {
+    const std::optional<std::string> blocked = view_blocked(*find_gbuf_view(row), nullptr);
+    ASSERT_TRUE(blocked.has_value()) << row;
+    EXPECT_EQ(*blocked, "needs the retained scene");
+  }
+}
+
+TEST_F(RenderViews, RetainedRowSetsAndClearsDemand) {
+  constexpr auto View = static_cast<uint8_t>(scene::retained::Demand::View);
+  const auto demanded = [] { return (scene::retained::testing::demand() & View) != 0; };
+  ASSERT_FALSE(demanded());
+  set_view_override(43);
+  views_on_latch();
+  EXPECT_TRUE(demanded());
+  set_view_override(16);
+  views_on_latch();
+  EXPECT_FALSE(demanded());
+  set_view_override(1);
+  views_on_latch();
+  EXPECT_FALSE(demanded());
+  set_view_override(45);
+  views_on_latch();
+  EXPECT_TRUE(demanded());
+  testing::reset_views();
+  EXPECT_FALSE(demanded());
+  views_on_latch();
+  EXPECT_TRUE(demanded());
+  shutdown_classification();
+  EXPECT_FALSE(demanded());
+}
+
+TEST_F(RenderViews, RetainedViewClampsToCaps) {
+  namespace flag = scene::streamout::instance_flag;
+  std::vector<scene::streamout::LiveInstance> live(20000);
+  for (uint32_t i = 0; i < live.size(); ++i) {
+    live[i] = {.slot = i % scene::retained::MaxSlots,
+               .indexCount = 3,
+               .clusterFirst = i * 10,
+               .clusterCount = 10,
+               .flags = flag::Valid,
+               .classBits = scene::retained::class_bit::Static};
+  }
+  const std::vector<uint64_t> seen(scene::retained::MaxSlots / 64, ~uint64_t{0});
+  const retained_view::Packed clusters = retained_view::pack(live, seen, RetainedMode::Clusters);
+  EXPECT_EQ(clusters.instances.size(), retained_view::MaxViewInstances);
+  EXPECT_EQ(clusters.overInstances, live.size() - retained_view::MaxViewInstances);
+  EXPECT_LE(clusters.pairs.size(), retained_view::MaxViewPairs);
+  EXPECT_EQ(clusters.pairs.size() + clusters.overPairs, uint64_t{retained_view::MaxViewInstances} * 10);
+  EXPECT_GT(clusters.overPairs, 0u);
+  uint32_t clustered = 0;
+  for (const retained_view::ViewInstance& view : clusters.instances) {
+    clustered += (view.flags & retained_view::instance_flag::Clustered) != 0 ? 1 : 0;
+  }
+  EXPECT_EQ(clustered * 10, clusters.pairs.size());
+  EXPECT_EQ(clusters.pairs.front(), (std::array<uint32_t, 2>{0, 0}));
+  EXPECT_EQ(clusters.pairs[11], (std::array<uint32_t, 2>{1, 11}));
+  const retained_view::Packed wire =
+      retained_view::pack(std::span{live}.first(10), seen, RetainedMode::Wireframe, {.instances = 4, .pairs = 8});
+  EXPECT_EQ(wire.instances.size(), 4u);
+  EXPECT_EQ(wire.overInstances, 6u);
+  EXPECT_TRUE(wire.pairs.empty());
+  EXPECT_EQ(wire.overPairs, 0u);
+}
+
+TEST_F(RenderViews, RetainedViewColoursFollowClass) {
+  namespace flag = scene::streamout::instance_flag;
+  namespace bit = scene::retained::class_bit;
+  using scene::streamout::LiveInstance;
+  const auto cls = [](uint32_t flags, uint32_t classBits, uint32_t clusterCount) {
+    return retained_view::classify({.clusterCount = clusterCount, .flags = flags, .classBits = classBits});
+  };
+  EXPECT_EQ(cls(flag::Valid, bit::Static, 4), RetainedClass::StaticClustered);
+  EXPECT_EQ(cls(flag::Valid, bit::Immobile, 0), RetainedClass::StaticUnclustered);
+  EXPECT_EQ(cls(flag::Valid, bit::Dynamic, 0), RetainedClass::Dynamic);
+  EXPECT_EQ(cls(flag::Valid | flag::Palette, bit::Dynamic | bit::Palette, 2), RetainedClass::Palette);
+  EXPECT_EQ(cls(flag::Valid | flag::CpuDeformed | flag::Palette, bit::Dynamic, 0), RetainedClass::Deformed);
+  EXPECT_EQ(cls(flag::Valid | flag::GpuArrays, bit::Static, 0), RetainedClass::Other);
+  EXPECT_EQ(cls(flag::Valid, 0, 0), RetainedClass::Other);
+  EXPECT_TRUE(all_distinct(RetainedClassColors));
+
+  std::vector<uint64_t> seen(scene::retained::MaxSlots / 64, 0);
+  seen[0] = uint64_t{1} << 3;
+  const std::array<LiveInstance, 3> live{{
+      {.slot = 3, .indexCount = 6, .flags = flag::Valid, .classBits = bit::Dynamic},
+      {.slot = 4, .indexCount = 6, .flags = flag::Valid, .classBits = bit::Dynamic},
+      {.slot = 5, .indexCount = 6, .flags = flag::Valid | flag::Late, .classBits = bit::Dynamic},
+  }};
+  const retained_view::Packed packed = retained_view::pack(live, seen, RetainedMode::Coverage);
+  ASSERT_EQ(packed.instances.size(), 3u);
+  const Rgb8 dynamic = retained_class_color(RetainedClass::Dynamic);
+  EXPECT_EQ(packed.instances[0].color, retained_view::pack_color(dynamic, true));
+  EXPECT_EQ(packed.instances[1].color, retained_view::pack_color(dynamic, false));
+  EXPECT_EQ(packed.instances[2].color, retained_view::pack_color(dynamic, true));
+  EXPECT_EQ(retained_view::pack_color({255, 160, 0}, false), 0xFF00507Fu);
+  EXPECT_EQ(packed.instances[1].slot, 4u);
+  EXPECT_EQ(packed.instances[1].indexCount, 6u);
+
+  const std::array<LiveInstance, 2> statics{{
+      {.classBits = bit::Static, .origin = {120.0, 9000.0, -300.0}},
+      {.classBits = bit::Dynamic, .origin = {90000.0, 0.0, 0.0}},
+  }};
+  EXPECT_FLOAT_EQ(retained_view::fit_extent(statics, {0.0, 0.0, 0.0}), retained_view::MinCoverageExtent);
+  EXPECT_FLOAT_EQ(retained_view::fit_extent(statics, {0.0, 0.0, -4300.0}), 4200.f);
+  EXPECT_FLOAT_EQ(retained_view::fit_extent(statics, {-1.0e5, 0.0, 0.0}), retained_view::MaxCoverageExtent);
 }
 
 TEST_F(RenderViews, OverrideWinsOverSettings) {

@@ -3,6 +3,8 @@
 #include "debug.hpp"
 
 #include "../scene/classify.hpp"
+#include "../scene/identity.hpp"
+#include "../scene/meshlets.hpp"
 #include "../../gx/hints.hpp"
 
 #include <aurora/gfx.h>
@@ -380,12 +382,37 @@ void draw_records(const scene::FrameReport& report) {
   }
   ImGui::EndTable();
 }
+void draw_retained() {
+  ImGui::SeparatorText("Retained");
+  // FIFO counters move while the tab draws, so it reads the copies taken at the latch
+  const RetainedStats stats = scene::retained::stats();
+  const scene::meshlets::Stats meshlets = scene::meshlets::published_stats();
+  if (!stats.active) {
+    ImGui::TextUnformatted("Inactive");
+    return;
+  }
+  ImGui::Text("Instances: %u, %u static (%u objects), %u undelivered", stats.instances, stats.staticInstances,
+              stats.staticObjects, stats.undeliveredStatics);
+  ImGui::Text("Coverage: %s", stats.coverageComplete ? "complete" : "incomplete");
+  count_line("Created", stats.created);
+  count_line("Evicted", stats.evicted);
+  count_line("Captured only", stats.capturedOnly);
+  count_line("Churn", stats.churn, true);
+  count_line("Lost captures", stats.lostCaptures, true);
+  count_line("Resyncs", stats.resyncs, true);
+  ImGui::Text("Meshlets: %llu built, %u pending, %llu clusters, %llu KiB of the pool",
+              static_cast<unsigned long long>(meshlets.built), meshlets.pending,
+              static_cast<unsigned long long>(meshlets.clusters),
+              static_cast<unsigned long long>(meshlets.poolUsed >> 10));
+  count_line("Meshlet failures", meshlets.failedIndexPastArray + meshlets.failedDecode + meshlets.failedPoolFull, true);
+}
 } // namespace
 
 void draw_scene_tab() {
   // One copy of the pointer per draw; the report itself is immutable and never copied
   const std::shared_ptr<const scene::FrameReport> report = scene::latest_report();
   draw_view_controls();
+  draw_retained();
   if (report == nullptr) {
     ImGui::TextUnformatted("No classified frame yet");
     return;

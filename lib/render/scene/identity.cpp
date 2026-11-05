@@ -1314,9 +1314,11 @@ void publish() {
 }
 } // namespace
 
+bool available(const Caps& caps) noexcept { return detail::hints_enabled() && caps.core && streamout::supported(caps); }
+
 void latch_gate(const Settings&, const Caps& caps) noexcept {
   read_env();
-  const bool next = detail::hints_enabled() && caps.core && streamout::supported(caps) && g_demand != 0;
+  const bool next = available(caps) && g_demand != 0;
   if (next != g_active) {
     streamout::reset();
     if (next) {
@@ -1627,6 +1629,8 @@ void reset() noexcept {
   meshlets::testing::reset();
   retained::reset();
 }
+
+uint8_t demand() noexcept { return g_demand; }
 
 void set_check(bool on, uint64_t first, uint64_t last) noexcept {
   g_checkMode = on;
