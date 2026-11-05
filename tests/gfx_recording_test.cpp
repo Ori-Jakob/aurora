@@ -999,6 +999,19 @@ TEST_F(GfxDispatchTest, SegmentFlagResetsAtOps) {
   EXPECT_EQ(types(), (std::vector{RenderPassOp, ComputeOp, RenderPassOp}));
 }
 
+TEST_F(GfxDispatchTest, RefusedWhileDiverted) {
+  const Range output = reserve_channel_storage(16, false);
+  const Range staged = push_channel_storage(std::array<uint8_t, 8>{1, 2, 3, 4, 5, 6, 7, 8});
+  const uint64_t before = overlay_stats().divertedRecords;
+  ASSERT_TRUE(set_overlay_target(true));
+  EXPECT_EQ(dispatch(1, output), RecordResult::Diverted);
+  EXPECT_EQ(copy(2, staged), RecordResult::Diverted);
+  set_overlay_target(false);
+  EXPECT_EQ(dispatch(3, output), RecordResult::Recorded);
+  EXPECT_EQ(overlay_stats().divertedRecords - before, 2u);
+  EXPECT_EQ(detail::testing::pending_compute_entries(), 1u);
+}
+
 TEST_F(GfxDispatchTest, CopyEntriesKeepOrder) {
   const Range output = reserve_channel_storage(16, false);
   const Range staged = push_channel_storage(std::array<uint8_t, 8>{1, 2, 3, 4, 5, 6, 7, 8});

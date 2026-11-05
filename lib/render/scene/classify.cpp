@@ -1,4 +1,5 @@
 #include "classify.hpp"
+#include "capture_list.hpp"
 #include "identity.hpp"
 #include "overlay.hpp"
 
@@ -62,6 +63,8 @@ bool g_demand = false;
 ReportRequest g_request;
 const ViewHooks* g_hooks = nullptr;
 const ObserverHooks* g_observer = nullptr;
+// Set by each route and read by that draw's push, the only one that can follow it
+uint8_t g_duplicate = 0;
 
 std::mutex g_reportMutex;
 std::shared_ptr<const FrameReport> g_report;
@@ -134,6 +137,7 @@ gx::draw_route::Decision route(void*, const gx::draw_route::Query& query) noexce
       .vertices = query.vtxCount,
   };
   const DrawClass& cls = g_classifier.route(inputs);
+  g_duplicate = 0;
   if (cls.suppressed) {
     // Every other role keeps suppressing, so a stamped shape stays out of shadow and reflection passes
     if (retained::captures(cls, query)) {
@@ -145,16 +149,17 @@ gx::draw_route::Decision route(void*, const gx::draw_route::Query& query) noexce
   // Each command carries one draw record, so a changed class must start its own command
   const bool records = gx_ext::records::on_route(cls);
   retained::route(cls, query);
+  g_duplicate = capture_list::select(cls, query);
   // Its colour would be mixed away by the PBR term, so it draws after the composite instead
   if (overlay::defers(cls, inputs.depthWrite)) {
-    return {.route = gx::draw_route::Route::Defer};
+    return {.route = gx::draw_route::Route::Defer, .duplicate = g_duplicate};
   }
   // A merged follower skips the push hook, so a changed class after a flagged lead must start its own command
   const bool breakMerge = cls.keyChanged && (identity_collecting() || records || fakeshadow::lead_flagged());
   if (breakMerge) {
     g_classifier.count_merge_break();
   }
-  return {.route = gx::draw_route::Route::Push, .breakMerge = breakMerge};
+  return {.route = gx::draw_route::Route::Push, .breakMerge = breakMerge || g_duplicate != 0, .duplicate = g_duplicate};
 }
 
 // The router ran first for this same draw, so the classifier's last draw is the one being pushed
@@ -167,6 +172,10 @@ bool push(void*, gx::DrawData& draw, const gx::PipelineConfig& config, const gx:
   // Before the inspector's observer, which reads the record locator
   gx_ext::records::stamp(draw, config, info, cls);
   retained::on_push(draw, config);
+  // After the record stamp, so a clone keeps the original's record locator
+  if (g_duplicate != 0) {
+    capture_list::on_push(draw, config, cls, std::exchange(g_duplicate, 0));
+  }
   // Last, so the inspector records the draw that is actually pushed
   if (g_observer != nullptr && g_observer->observe != nullptr) {
     g_observer->observe(draw, config, info, cls);
@@ -207,6 +216,7 @@ void reset() noexcept {
   fakeshadow::reset_frame();
   retained::reset();
   g_sealed = false;
+  g_duplicate = 0;
   std::shared_ptr<const FrameReport> previous;
   std::lock_guard lock{g_reportMutex};
   g_report.swap(previous);
@@ -231,6 +241,7 @@ void apply_frame_state(const detail::FrameState& state) noexcept {
   overlay::apply_frame_state(state);
   retained::apply_frame_state(state);
   g_classifier.set_count_captured(retained::active());
+  capture_list::apply_frame_state();
 }
 
 void seal_frame() noexcept {

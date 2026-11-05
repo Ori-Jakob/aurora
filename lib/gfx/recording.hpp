@@ -8,12 +8,17 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <optional>
 #include <span>
 #include <string>
 #include <type_traits>
 #include <vector>
+
+namespace aurora::gx {
+struct DrawData;
+} // namespace aurora::gx
 
 namespace aurora::render::detail {
 struct StageData;
@@ -183,6 +188,7 @@ enum class RecordResult : uint8_t {
   UniformSpace,
   ParamsBudget,
   SegmentReadsState,
+  Diverted,
 };
 namespace detail {
 RecordResult record_dispatch(ComputeBinder bind, std::span<const std::byte> payload, const DispatchArgs& args) noexcept;
@@ -268,8 +274,16 @@ struct OverlayStats {
   uint64_t refused = 0;
   uint64_t dropped = 0;
   uint64_t inPlaceAfter = 0;
+  uint64_t divertedRecords = 0;
 };
 OverlayStats overlay_stats() noexcept;
+inline constexpr uint32_t MaxCaptureLists = 4;
+struct CaptureListFrame;
+// Refused once OPAQUE_DONE has run; the clone replays later in its consumer's own pass, never in the EFB
+[[nodiscard]] bool append_capture_draw(uint32_t list, uint64_t layoutKey, const gx::DrawData& draw) noexcept;
+// Null when no list holds a draw; lists still held at frame end are discarded
+std::shared_ptr<const CaptureListFrame> take_capture_lists();
+uint64_t discarded_capture_draws() noexcept;
 EfbMode current_efb_mode() noexcept;
 bool in_scene_pass() noexcept;
 render::DepthSource current_scene_depth_source() noexcept;

@@ -482,10 +482,11 @@ protected:
     if (test.capture_only()) {
       return {.route = test.captureMode ? route::Route::Capture : route::Route::Suppress};
     }
+    const uint8_t duplicate = test.queries.size() == test.duplicateAt ? 1 : 0;
     if (std::ranges::find(test.deferAt, test.queries.size()) != test.deferAt.end()) {
-      return {.route = route::Route::Defer};
+      return {.route = route::Route::Defer, .duplicate = duplicate};
     }
-    return {.route = route::Route::Push, .breakMerge = test.queries.size() == test.breakAt};
+    return {.route = route::Route::Push, .breakMerge = test.queries.size() == test.breakAt, .duplicate = duplicate};
   }
 
   static bool on_push(void* userData, aurora::gx::DrawData& draw, const aurora::gx::PipelineConfig&,
@@ -545,6 +546,7 @@ protected:
   bool captureMode = false;
   // 1-based query and push numbers; 0 never matches
   size_t breakAt = 0;
+  size_t duplicateAt = 0;
   size_t substituteAt = 0;
   size_t emptyAt = 0;
   // Breaks the router contract on purpose so merge_target's own empty-draw test is what stops the merge
@@ -783,6 +785,60 @@ TEST_F(GXDrawRouteTest, BreakMergeOnIndexedDrawNotCounted) {
   EXPECT_EQ(gfx::g_testDrawCount, 2u);
   EXPECT_EQ(gfx::g_testLastDraw.indexCount, 3u);
   EXPECT_EQ(fifo::draw_route_stats().mergeBreaks, 0u);
+}
+
+TEST_F(GXDrawRouteTest, DuplicateBreaksBeforeAndAfter) {
+  duplicateAt = 2;
+  install_router(true);
+  triangle();
+  triangle();
+  triangle();
+  decode();
+  // B neither joins A nor takes C, so its clone is exactly one GX draw
+  EXPECT_EQ(gfx::g_testDrawCount, 3u);
+  EXPECT_EQ(gfx::g_testMergedDrawCount, 0u);
+  EXPECT_EQ(pushes, 3u);
+  const fifo::DrawRouteStats stats = fifo::draw_route_stats();
+  EXPECT_EQ(stats.routed, 3u);
+  EXPECT_EQ(stats.mergeBreaks, 1u);
+  EXPECT_EQ(stats.captureResets, 1u);
+  EXPECT_EQ(stats.substituted, 0u);
+  EXPECT_EQ(g_gxState.dirty, 0u);
+}
+
+TEST_F(GXDrawRouteTest, DeferredDuplicateResets) {
+  deferAt = {2};
+  duplicateAt = 2;
+  install_router(true);
+  for (int i = 0; i < 4; ++i) {
+    triangle();
+  }
+  decode();
+  ASSERT_EQ(gfx::g_testOverlayDraws.size(), 1u);
+  EXPECT_EQ(gfx::g_testOverlayDraws[0].vertRange.offset, 3 * kVtxSize);
+  // The deferral already split the chain, so the duplicate prevents no further merge
+  EXPECT_EQ(gfx::g_testDrawCount, 2u);
+  EXPECT_EQ(gfx::g_testMergedDrawCount, 1u);
+  EXPECT_EQ(gfx::g_testLastDraw.vertRange.offset, 6 * kVtxSize);
+  const fifo::DrawRouteStats stats = fifo::draw_route_stats();
+  EXPECT_EQ(stats.deferred, 1u);
+  EXPECT_EQ(stats.mergeBreaks, 0u);
+  EXPECT_EQ(stats.captureResets, 1u);
+}
+
+TEST_F(GXDrawRouteTest, DuplicatedIndexedDrawResets) {
+  duplicateAt = 1;
+  install_router();
+  indexed_triangle();
+  triangle();
+  triangle();
+  decode();
+  // The indexed draw never merges, and the reset after it keeps the next clean draw from merging into it
+  EXPECT_EQ(gfx::g_testDrawCount, 2u);
+  EXPECT_EQ(gfx::g_testMergedDrawCount, 1u);
+  const fifo::DrawRouteStats stats = fifo::draw_route_stats();
+  EXPECT_EQ(stats.mergeBreaks, 0u);
+  EXPECT_EQ(stats.captureResets, 1u);
 }
 
 TEST_F(GXDrawRouteTest, DeferredDrawGoesToOverlayList) {

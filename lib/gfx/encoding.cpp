@@ -109,24 +109,58 @@ void execute_encoder_task(wgpu::CommandEncoder& cmd, FramePacket& frame, const E
   }
 }
 
+struct EncodeState {
+  DrawEncoder lastEncoder = nullptr;
+  Viewport viewport{};
+  ClipRect scissor{};
+  bool hasViewport = false;
+  bool hasScissor = false;
+};
+
+void encode_command(const wgpu::RenderPassEncoder& pass, CommandType type, Command::Data& data,
+                    const RenderPass& passInfo, EncodeState& state) {
+  switch (type) {
+  case CommandType::SetViewport: {
+    const auto& vp = data.setViewport;
+    apply_viewport(pass, vp);
+    state.viewport = vp;
+    state.hasViewport = true;
+  } break;
+  case CommandType::SetScissor: {
+    const auto& sc = data.setScissor;
+    apply_scissor(pass, sc, passInfo.colorAttachments[SceneColorAttachmentIndex].size);
+    state.scissor = sc;
+    state.hasScissor = true;
+  } break;
+  case CommandType::Draw: {
+    auto& draw = data.draw;
+    if (draw.encoder != nullptr) {
+      if (draw.encoder != state.lastEncoder) {
+        gx::reset_pass_bindings();
+        state.lastEncoder = draw.encoder;
+      }
+      draw.encoder(draw.payload.data(), pass, passInfo);
+    }
+  } break;
+  case CommandType::CustomDraw:
+  case CommandType::DebugMarker:
+    break;
+  }
+}
+
 void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, RenderPass& passInfo) {
   ZoneScoped;
   const auto encodeStart = std::chrono::steady_clock::now();
-  DrawEncoder lastEncoder = nullptr;
+  EncodeState state;
   // Everything the encoders skip as already bound must be bound again once other code may have changed it
-  const auto reset_encoder_state = [&] {
-    g_currentPipeline = nullptr;
-    lastEncoder = nullptr;
-    gx::reset_pass_bindings();
+  const auto reset_state = [&] {
+    reset_encoder_state();
+    state.lastEncoder = nullptr;
   };
-  reset_encoder_state();
+  reset_state();
 #ifdef AURORA_GFX_DEBUG_GROUPS
   std::vector<std::string> lastDebugGroupStack;
 #endif
-  Viewport currentViewport{};
-  ClipRect currentScissor{};
-  bool hasViewport = false;
-  bool hasScissor = false;
 
   // Bind bind group for the whole pass
   pass.SetBindGroup(0, resources().staticBindGroup);
@@ -152,38 +186,21 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
     }
 #endif
     switch (cmd.type) {
-    case CommandType::SetViewport: {
-      const auto& vp = cmd.data.setViewport;
-      apply_viewport(pass, vp);
-      currentViewport = vp;
-      hasViewport = true;
-    } break;
-    case CommandType::SetScissor: {
-      const auto& sc = cmd.data.setScissor;
-      apply_scissor(pass, sc, passInfo.colorAttachments[SceneColorAttachmentIndex].size);
-      currentScissor = sc;
-      hasScissor = true;
-    } break;
-    case CommandType::Draw: {
-      auto& draw = cmd.data.draw;
-      if (draw.encoder != nullptr) {
-        if (draw.encoder != lastEncoder) {
-          gx::reset_pass_bindings();
-          lastEncoder = draw.encoder;
-        }
-        draw.encoder(draw.payload.data(), pass, passInfo);
-      }
-    } break;
+    case CommandType::SetViewport:
+    case CommandType::SetScissor:
+    case CommandType::Draw:
+      encode_command(pass, cmd.type, cmd.data, passInfo, state);
+      break;
     case CommandType::CustomDraw: {
       render_custom_draw(cmd.data.customDraw, pass, passInfo);
-      reset_encoder_state();
+      reset_state();
       pass.SetBindGroup(0, resources().staticBindGroup);
       pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
-      if (hasViewport) {
-        apply_viewport(pass, currentViewport);
+      if (state.hasViewport) {
+        apply_viewport(pass, state.viewport);
       }
-      if (hasScissor) {
-        apply_scissor(pass, currentScissor, passInfo.colorAttachments[SceneColorAttachmentIndex].size);
+      if (state.hasScissor) {
+        apply_scissor(pass, state.scissor, passInfo.colorAttachments[SceneColorAttachmentIndex].size);
       }
     } break;
     case CommandType::DebugMarker: {
@@ -614,6 +631,37 @@ void release_compute_encoding() noexcept {
   g_warnedCopy = false;
 }
 
+void reset_encoder_state() noexcept {
+  g_currentPipeline = nullptr;
+  gx::reset_pass_bindings();
+}
+
+void encode_command_list(const wgpu::RenderPassEncoder& pass, std::span<const Command> commands,
+                         const RenderPass& passInfo) {
+  // Without it bind_pipeline would skip SetPipeline for a first draw matching the last pipeline of another pass
+  reset_encoder_state();
+  if (!commands.empty()) {
+    pass.SetBindGroup(0, resources().staticBindGroup);
+    pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
+  }
+  EncodeState state;
+  for (const Command& cmd : commands) {
+    AURORA_ASSERT(cmd.type != CommandType::CustomDraw && cmd.type != CommandType::DebugMarker,
+                  "A replayed command list holds a custom draw or debug marker");
+    // Encoders take their payload mutably, and the list is shared and immutable
+    Command::Data data = cmd.data;
+    encode_command(pass, cmd.type, data, passInfo, state);
+  }
+  reset_encoder_state();
+}
+
+RenderPass replay_pass_info(wgpu::Extent3D extent) {
+  RenderPass info;
+  info.colorAttachmentCount = 1;
+  info.colorAttachments[SceneColorAttachmentIndex].size = extent;
+  return info;
+}
+
 void set_compute_scratch(wgpu::Buffer buffer) noexcept { g_computeScratch = std::move(buffer); }
 
 ComputeFailures compute_failures() noexcept {
@@ -625,6 +673,8 @@ ComputeFailures compute_failures() noexcept {
 
 namespace testing {
 uint32_t compute_segments_encoded() noexcept { return g_computeSegments; }
+WGPURenderPipeline current_pipeline() noexcept { return g_currentPipeline; }
+void set_current_pipeline(WGPURenderPipeline pipeline) noexcept { g_currentPipeline = pipeline; }
 } // namespace testing
 } // namespace detail
 

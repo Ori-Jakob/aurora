@@ -1,6 +1,7 @@
 #include "graph_api.hpp"
 #include "shaders.hpp"
 #include "stage.hpp"
+#include "scene/capture_list.hpp"
 
 #include "../logging.hpp"
 
@@ -112,3 +113,18 @@ namespace aurora::render::shaders {
 // Nothing compiles graph pipelines without the render module, so callers waiting on them return at once
 bool wait_idle(uint64_t) { return true; }
 } // namespace aurora::render::shaders
+
+namespace aurora::render::scene::capture_list {
+Stats stats() noexcept { return {}; }
+
+namespace testing {
+// Without the render module no draw is routed, so there is nothing to duplicate or replay
+ConsumerId install_check(const wgpu::Color&, float) { return InvalidConsumer; }
+
+void remove_check() noexcept {}
+
+void arm_check(uint32_t) noexcept {}
+
+CheckResult check_result() noexcept { return {}; }
+} // namespace testing
+} // namespace aurora::render::scene::capture_list

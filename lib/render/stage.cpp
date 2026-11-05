@@ -146,6 +146,9 @@ bool build_stage_data(StageData& stage) {
     scene::retained::skip(stage);
     return false;
   }
+  if (stage.stage == Stage::OpaqueDone) {
+    stage.captureList = gfx::take_capture_lists();
+  }
   build_stage_bindings(stage);
   scene::retained::seal(stage);
   return true;

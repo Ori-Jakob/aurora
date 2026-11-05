@@ -350,3 +350,14 @@ struct FramePacket {
 };
 
 } // namespace aurora::gfx::detail
+
+namespace aurora::gfx {
+struct CaptureListFrame {
+  struct List {
+    detail::CommandList commands;
+    uint64_t layoutKey = 0;
+    uint32_t draws = 0;
+  };
+  std::array<List, MaxCaptureLists> lists;
+};
+} // namespace aurora::gfx

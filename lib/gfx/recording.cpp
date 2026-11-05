@@ -71,7 +71,7 @@ struct FrameRecorder {
   EfbMode efbMode = EfbMode::Scene;
   bool composeWanted = false;
   bool composed = false;
-  // One list per deferral target; M12's capture list adds its own
+  // One list per deferral target, and one per capture-list consumer
   struct SideList {
     CommandList commands;
     std::vector<std::pair<uint32_t, uint32_t>> draws;
@@ -82,6 +82,7 @@ struct FrameRecorder {
     OverlayDisposition kept = OverlayDisposition::Restore;
     bool keep = false;
   } overlay;
+  std::array<SideList, MaxCaptureLists> capture;
   bool overlayTarget = false;
 #ifdef AURORA_GFX_DEBUG_GROUPS
   std::vector<std::string> debugGroupStack;
@@ -99,6 +100,7 @@ struct FrameRecorder {
 
 FrameRecorder g_recorder;
 OverlayStats g_overlayStats;
+uint64_t g_discardedCaptureDraws = 0;
 std::atomic<OverlayPolicy> g_overlayPolicy{nullptr};
 bool g_keepShapes = false;
 std::mutex g_shapeMutex;
@@ -760,14 +762,46 @@ bool overlay_pass_open() noexcept {
   return is_efb_depth_pass(pass) && !pass.sealed;
 }
 
-void clear_overlays() noexcept {
-  auto& list = g_recorder.overlay;
+void clear_side_list(FrameRecorder::SideList& list) noexcept {
   list.commands.clear();
   list.draws.clear();
   list.hasState = false;
   list.layoutKey = 0;
   list.kept = OverlayDisposition::Restore;
   list.keep = false;
+}
+
+void clear_overlays() noexcept { clear_side_list(g_recorder.overlay); }
+
+void discard_capture_lists() noexcept {
+  for (auto& list : g_recorder.capture) {
+    g_discardedCaptureDraws += list.draws.size();
+    clear_side_list(list);
+  }
+}
+
+// A side list replays away from the pass it was recorded in, so it carries the viewport and scissor of each draw
+void append_side_draw(FrameRecorder::SideList& list, const DrawCommand& draw, uint32_t passCommand) {
+  const auto append = [&list](CommandType type, const Command::Data& data) {
+    list.commands.push_back({
+        .type = type,
+#ifdef AURORA_GFX_DEBUG_GROUPS
+        .debugGroupStack = g_recorder.debugGroupStack,
+#endif
+        .data = data,
+    });
+  };
+  if (!list.hasState || list.viewport != g_recorder.cachedViewport) {
+    list.viewport = g_recorder.cachedViewport;
+    append(CommandType::SetViewport, Command::Data{.setViewport = list.viewport});
+  }
+  if (!list.hasState || list.scissor != g_recorder.cachedScissor) {
+    list.scissor = g_recorder.cachedScissor;
+    append(CommandType::SetScissor, Command::Data{.setScissor = list.scissor});
+  }
+  list.hasState = true;
+  list.draws.emplace_back(static_cast<uint32_t>(list.commands.size()), passCommand);
+  append(CommandType::Draw, Command::Data{.draw = draw});
 }
 
 void restore_overlays(RestoreReason reason) {
@@ -1144,6 +1178,14 @@ void begin_recording(FramePacket& packet, size_t frameSlot) {
     g_recorder.overlay.commands.reserve(256);
     g_recorder.overlay.draws.reserve(256);
   }
+  for (auto& list : g_recorder.capture) {
+    clear_side_list(list);
+    // A taken list leaves with its storage, so the next one would otherwise grow from nothing
+    if (list.draws.capacity() < 256) {
+      list.commands.reserve(256);
+      list.draws.reserve(256);
+    }
+  }
   note_scene_pass_change();
   g_channelStorageBytes = 0;
 
@@ -1176,6 +1218,7 @@ RecordedFrame end_recording() {
     g_overlayStats.dropped += g_recorder.overlay.draws.size();
     clear_overlays();
   }
+  discard_capture_lists();
   g_recorder.overlayTarget = false;
   auto& frame = g_recorder.frame();
   frame.stats.drawCallCount = g_recorder.drawCallCount;
@@ -1249,6 +1292,9 @@ void shutdown_recording() {
   g_recorder.composed = false;
   g_recorder.overlayTarget = false;
   clear_overlays();
+  for (auto& list : g_recorder.capture) {
+    clear_side_list(list);
+  }
 }
 
 namespace testing {
@@ -1846,29 +1892,41 @@ void push_draw_command(gx::DrawData data) {
   if (list.draws.empty()) {
     list.layoutKey = pass.target_layout().key;
   }
-  const auto append = [&list](CommandType type, const Command::Data& data) {
-    list.commands.push_back({
-        .type = type,
-#ifdef AURORA_GFX_DEBUG_GROUPS
-        .debugGroupStack = g_recorder.debugGroupStack,
-#endif
-        .data = data,
-    });
-  };
-  if (!list.hasState || list.viewport != g_recorder.cachedViewport) {
-    list.viewport = g_recorder.cachedViewport;
-    append(CommandType::SetViewport, Command::Data{.setViewport = list.viewport});
-  }
-  if (!list.hasState || list.scissor != g_recorder.cachedScissor) {
-    list.scissor = g_recorder.cachedScissor;
-    append(CommandType::SetScissor, Command::Data{.setScissor = list.scissor});
-  }
-  list.hasState = true;
-  list.draws.emplace_back(static_cast<uint32_t>(list.commands.size()), static_cast<uint32_t>(pass.commands.size()));
-  append(CommandType::Draw, Command::Data{.draw = make_draw_command<gx::render>(data)});
+  append_side_draw(list, make_draw_command<gx::render>(data), static_cast<uint32_t>(pass.commands.size()));
   ++g_recorder.drawCallCount;
   ++g_overlayStats.draws;
 }
+
+bool append_capture_draw(uint32_t list, uint64_t layoutKey, const gx::DrawData& draw) noexcept {
+  if (list >= MaxCaptureLists || !g_recorder.active() || g_recorder.nextStage > OpaqueStage) {
+    return false;
+  }
+  auto& side = g_recorder.capture[list];
+  if (side.draws.empty()) {
+    side.layoutKey = layoutKey;
+  }
+  append_side_draw(side, make_draw_command<gx::render>(draw), 0);
+  return true;
+}
+
+std::shared_ptr<const CaptureListFrame> take_capture_lists() {
+  if (std::ranges::all_of(g_recorder.capture, [](const auto& list) { return list.draws.empty(); })) {
+    return nullptr;
+  }
+  auto frame = std::make_shared<CaptureListFrame>();
+  for (uint32_t i = 0; i < MaxCaptureLists; ++i) {
+    auto& list = g_recorder.capture[i];
+    frame->lists[i] = {
+        .commands = std::move(list.commands),
+        .layoutKey = list.layoutKey,
+        .draws = static_cast<uint32_t>(list.draws.size()),
+    };
+    clear_side_list(list);
+  }
+  return frame;
+}
+
+uint64_t discarded_capture_draws() noexcept { return g_discardedCaptureDraws; }
 
 bool set_overlay_target(bool on) noexcept {
   if (!on) {
@@ -2176,6 +2234,11 @@ RecordResult check_segment(std::string_view what) noexcept {
   }
   if (g_recorder.currentRenderPass == UINT32_MAX) {
     return refuse_record(what, RecordResult::NoOpenPass);
+  }
+  // Work recorded from inside a diverted draw would land outside the order the diversion keeps
+  if (g_recorder.overlayTarget) {
+    ++g_overlayStats.divertedRecords;
+    return refuse_record(what, RecordResult::Diverted);
   }
   if (current_frame_packet().segmentReadsGpuState) {
     return refuse_record(what, RecordResult::SegmentReadsState);

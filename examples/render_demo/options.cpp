@@ -37,6 +37,7 @@ constexpr uint32_t CompanionCheckMinFrames = 92;
 constexpr uint32_t ClassCheckMinFrames = 40;
 constexpr uint32_t OverlayCheckMinFrames = 40;
 constexpr uint32_t SsilCheckMinFrames = 90;
+constexpr uint32_t CaptureListCheckMinFrames = 40;
 constexpr uint32_t MaxGpuPadMiB = 1024;
 
 std::optional<uint32_t> parse_u32(std::string_view text) noexcept {
@@ -232,6 +233,11 @@ bool apply_retained_check(Options& options, std::string_view) {
   return true;
 }
 
+bool apply_capture_list_check(Options& options, std::string_view) {
+  options.captureListCheck = true;
+  return true;
+}
+
 bool apply_no_hints(Options& options, std::string_view) {
   options.hints = false;
   return true;
@@ -322,7 +328,7 @@ struct Flag {
   bool frameLoop = false;
 };
 
-constexpr std::array<Flag, 39> Flags{{
+constexpr std::array<Flag, 40> Flags{{
     {"--frames", true, apply_frames, true},
     {"--timeout", true, apply_timeout, true},
     {"--backend", true, apply_backend},
@@ -349,6 +355,7 @@ constexpr std::array<Flag, 39> Flags{{
     {"--class-check", false, apply_class_check, true},
     {"--ssil-check", false, apply_ssil_check, true},
     {"--retained-check", false, apply_retained_check, true},
+    {"--capture-list-check", false, apply_capture_list_check, true},
     {"--no-hints", false, apply_no_hints, true},
     {"--check-hints", false, apply_check_hints, true},
     {"--custom-draw-probe", false, apply_custom_draw_probe, true},
@@ -450,7 +457,7 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
   // Graph passes and custom draws record GPU work outside the GX FIFO, so the capture would be discarded
   if ((options.vignette || options.depthCheck || options.motionCheck || options.motionView || options.fogCheck ||
        options.aoCheck || options.fwdEnvCheck || options.unlitCheck || options.companionCheck || options.overlayCheck ||
-       options.classCheck || options.ssilCheck || options.gpuCull != 0) &&
+       options.classCheck || options.ssilCheck || options.captureListCheck || options.gpuCull != 0) &&
       !options.tracePath.empty()) {
     error = "render graph passes cannot be traced";
     return std::nullopt;
@@ -537,6 +544,21 @@ std::optional<Options> parse_options(int argc, const char* const* argv, const ch
     error = "--ssil-check needs at least 90 frames";
     return std::nullopt;
   }
+  // The replay matches gx.color only on the single-target legacy layout and only for draws the list may hold
+  if (options.captureListCheck &&
+      (!options.hints || options.msaa > 1 || options.customDrawProbe || options.gpuArrays || options.depthCheck ||
+       options.motionCheck || options.motionView || options.fogCheck || options.aoCheck || options.fwdEnvCheck ||
+       options.unlitCheck || options.companionCheck || options.overlayCheck || options.classCheck ||
+       options.ssilCheck || options.retainedCheck || options.gpuCull != 0)) {
+    error =
+        "--capture-list-check cannot be combined with --no-hints, --msaa above 1, --custom-draw-probe, "
+        "--gpu-arrays, --gpu-cull or another check";
+    return std::nullopt;
+  }
+  if (options.captureListCheck && options.frames != 0 && options.frames < CaptureListCheckMinFrames) {
+    error = "--capture-list-check needs at least 40 frames";
+    return std::nullopt;
+  }
   if ((options.cullCheck || options.cullTimings) && options.gpuCull == 0) {
     error = options.cullCheck ? "--cull-check needs --gpu-cull" : "--cull-timings needs --gpu-cull";
     return std::nullopt;
@@ -613,6 +635,10 @@ std::string_view usage() noexcept {
          "                      points at (needs at least 90 frames)\n"
          "  --retained-check    turn the retained scene and its check mode on, write retained_wire.png to the data\n"
          "                      directory and log the check result at shutdown\n"
+         "  --capture-list-check\n"
+         "                      duplicate every draw before OPAQUE_DONE into capture.check, replay the list offscreen\n"
+         "                      and exit with code 20 unless it matches gx.color texel for texel and every duplicate\n"
+         "                      was cloned and reset its merge (needs at least 40 frames)\n"
          "  --no-hints          emit no render hints and no capture-only draw\n"
 
          "  --check-hints       exit with code 8 unless aurora decoded or skipped every emitted hint as expected\n"

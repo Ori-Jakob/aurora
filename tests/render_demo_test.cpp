@@ -310,6 +310,22 @@ TEST(RenderDemoOptions, ParsesSsilCheck) {
   EXPECT_EQ(parse_error({"--ssil-check", "--trace", "x"}), "render graph passes cannot be traced");
 }
 
+TEST(RenderDemoOptions, ParsesCaptureListCheck) {
+  const auto check = parse({"--capture-list-check"});
+  ASSERT_TRUE(check);
+  EXPECT_TRUE(check->captureListCheck);
+  EXPECT_EQ(parse_error({"--capture-list-check", "--frames", "39"}), "--capture-list-check needs at least 40 frames");
+  EXPECT_TRUE(parse({"--capture-list-check", "--frames", "40"}));
+  constexpr std::string_view Combined =
+      "--capture-list-check cannot be combined with --no-hints, --msaa above 1, "
+      "--custom-draw-probe, --gpu-arrays, --gpu-cull or another check";
+  EXPECT_EQ(parse_error({"--capture-list-check", "--no-hints"}), Combined);
+  EXPECT_EQ(parse_error({"--capture-list-check", "--msaa", "4"}), Combined);
+  EXPECT_EQ(parse_error({"--capture-list-check", "--gpu-arrays"}), Combined);
+  EXPECT_EQ(parse_error({"--capture-list-check", "--overlay-check"}), Combined);
+  EXPECT_EQ(parse_error({"--capture-list-check", "--trace", "x"}), "render graph passes cannot be traced");
+}
+
 namespace {
 std::vector<SsilSample> ssil_samples(std::array<f32, 4> wall, std::array<f32, 4> back, std::array<f32, 4> front,
                                      std::array<f32, 4> open) {

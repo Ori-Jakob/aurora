@@ -7,6 +7,7 @@
 #include "hints.hpp"
 #include "indirect_bench.hpp"
 #include "options.hpp"
+#include "render/scene/capture_list.hpp"
 #include "scene.hpp"
 
 #include <aurora/aurora.h>
@@ -62,6 +63,7 @@ enum ExitCode : int {
   ExitOverlayCheck = 17,
   ExitClassCheck = 18,
   ExitSsilCheck = 19,
+  ExitCaptureListCheck = 20,
 };
 
 std::atomic_uint32_t g_errorCount = 0;
@@ -914,6 +916,42 @@ bool cull_failed(const render_demo::CullReport& report, uint32_t requestedFrames
   return report.check == render_demo::CullCheck::Failed ||
          (report.check == render_demo::CullCheck::NotReady && !nullBackend);
 }
+
+struct CaptureListRun {
+  aurora::render::scene::capture_list::Stats before;
+  uint64_t resetsBefore = 0;
+};
+
+std::optional<std::string> capture_list_failure(const aurora::render::scene::capture_list::testing::CheckResult& result,
+                                                const aurora::render::scene::capture_list::Stats& stats,
+                                                uint64_t resets, uint32_t errors, bool nullBackend) {
+  using aurora::render::scene::capture_list::testing::CheckState;
+  if (stats.selected == 0) {
+    return "no draw was selected";
+  }
+  if (stats.cloned != stats.selected || resets != stats.selected) {
+    return "selected, cloned and captureResets differ";
+  }
+  if (stats.pending != 0 || stats.lateRefused != 0 || stats.gpuRefused != 0) {
+    return "a duplicate was pending or refused";
+  }
+  if (errors != 0) {
+    return "errors were logged";
+  }
+  if (nullBackend) {
+    return std::nullopt;
+  }
+  if (result.state != CheckState::Ready) {
+    return "the checked frame was never read back";
+  }
+  if (result.draws == 0) {
+    return "the checked frame replayed no draw";
+  }
+  if (result.mismatches != 0) {
+    return "the replay differs from gx.color";
+  }
+  return std::nullopt;
+}
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -959,6 +997,10 @@ int main(int argc, char* argv[]) {
   if (options.overlayCheck) {
     // Deferral arms only on a G-buffer layout, which the demo's own settings never request
     SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_GBUFFER", "on", false);
+  }
+  if (options.captureListCheck) {
+    // The check's replay target has one colour target, so gx.color must too
+    SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_GBUFFER", "off", true);
   }
   if (options.classCheck) {
     SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "AURORA_RENDER_PBR", "on", false);
@@ -1021,7 +1063,8 @@ int main(int argc, char* argv[]) {
                                          .companionCheck = options.companionCheck,
                                          .overlayCheck = options.overlayCheck,
                                          .classCheck = options.classCheck,
-                                         .ssilCheck = options.ssilCheck};
+                                         .ssilCheck = options.ssilCheck,
+                                         .hud = !options.captureListCheck};
   bool decodingChanged = false;
 
   GXInit(nullptr, 0);
@@ -1046,7 +1089,8 @@ int main(int argc, char* argv[]) {
                                                                    .companionCheck = options.companionCheck,
                                                                    .overlayCheck = options.overlayCheck,
                                                                    .classCheck = options.classCheck,
-                                                                   .ssilCheck = options.ssilCheck},
+                                                                   .ssilCheck = options.ssilCheck,
+                                                                   .captureListCheck = options.captureListCheck},
                                                                   graphError)) {
     std::fprintf(stderr, "render_demo: render graph setup failed: %s\n", graphError.c_str());
     render_demo::shutdown_scene();
@@ -1069,6 +1113,8 @@ int main(int argc, char* argv[]) {
   if (options.overlayCheck) {
     aurora::gfx::detail::testing::keep_frame_shapes(true);
   }
+  const CaptureListRun captureListRun{.before = aurora::render::scene::capture_list::stats(),
+                                      .resetsBefore = aurora::render::draw_route_counters().captureResets};
 
   const auto start = std::chrono::steady_clock::now();
   const auto timeout = std::chrono::seconds{options.timeoutSeconds};
@@ -1189,6 +1235,16 @@ int main(int argc, char* argv[]) {
     aurora::texture::unregister_material_manifest(classRun.manifest);
   }
   const aurora::gfx::OverlayStats overlayStats = aurora::gfx::overlay_stats();
+  const auto captureListResult = aurora::render::scene::capture_list::testing::check_result();
+  aurora::render::scene::capture_list::Stats captureListStats = aurora::render::scene::capture_list::stats();
+  captureListStats.selected -= captureListRun.before.selected;
+  captureListStats.cloned -= captureListRun.before.cloned;
+  captureListStats.pending -= captureListRun.before.pending;
+  captureListStats.lateRefused -= captureListRun.before.lateRefused;
+  captureListStats.gpuRefused -= captureListRun.before.gpuRefused;
+  captureListStats.discarded -= captureListRun.before.discarded;
+  captureListStats.replayed -= captureListRun.before.replayed;
+  const uint64_t captureResets = aurora::render::draw_route_counters().captureResets - captureListRun.resetsBefore;
   const OverlayShape overlayShape =
       options.overlayCheck ? overlay_shape(aurora::gfx::detail::testing::take_frame_shapes()) : OverlayShape{};
   if (options.overlayCheck) {
@@ -1403,6 +1459,26 @@ int main(int argc, char* argv[]) {
         render_demo::OverlayCheckFrame, overlayShape.checkFrame.c_str(), render_demo::OverlayLateFrame,
         overlayShape.lateFrame.c_str());
   }
+  const std::optional<std::string> captureListFailure =
+      options.captureListCheck ? capture_list_failure(captureListResult, captureListStats, captureResets, errors,
+                                                      info.backend == BACKEND_NULL)
+                               : std::nullopt;
+  if (options.captureListCheck) {
+    const std::string status = captureListFailure             ? "FAILED: " + *captureListFailure
+                               : info.backend == BACKEND_NULL ? std::string{"skipped (null backend)"}
+                                                              : std::string{"passed"};
+    const auto& s = captureListStats;
+    const auto& r = captureListResult;
+    std::printf(
+        "render_demo: capture-list check %s: frame %u replayed %u draws, %u mismatched texels of %ux%u (last %u); "
+        "selected %llu, cloned %llu, captureResets %llu, pending %llu, late %llu, gpu %llu, discarded %llu, "
+        "replayed %llu\n",
+        status.c_str(), r.frame, r.draws, r.mismatches, r.width, r.height, r.lastMismatch,
+        static_cast<unsigned long long>(s.selected), static_cast<unsigned long long>(s.cloned),
+        static_cast<unsigned long long>(captureResets), static_cast<unsigned long long>(s.pending),
+        static_cast<unsigned long long>(s.lateRefused), static_cast<unsigned long long>(s.gpuRefused),
+        static_cast<unsigned long long>(s.discarded), static_cast<unsigned long long>(s.replayed));
+  }
   if (options.gpuCull != 0) {
     print_cull_report(graphReport.cull, frame, options.cullTimings);
   }
@@ -1475,6 +1551,9 @@ int main(int argc, char* argv[]) {
   }
   if (ssilOutcome.failure) {
     return ExitSsilCheck;
+  }
+  if (captureListFailure) {
+    return ExitCaptureListCheck;
   }
 
   if (cullFailure) {

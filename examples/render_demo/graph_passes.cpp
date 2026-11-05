@@ -3,6 +3,7 @@
 #include "graph_checks.hpp"
 #include "scene.hpp"
 
+#include "render/scene/capture_list.hpp"
 #include "render/shaders.hpp"
 
 #include <aurora/gfx.h>
@@ -2168,6 +2169,37 @@ void update_overlay_check(u32 frame) {
   }
 }
 
+constexpr u32 CaptureListWaitFrame = 4;
+constexpr u32 CaptureListCheckFrame = 30;
+bool sCaptureListCheck = false;
+
+bool register_capture_list_check(std::string& error) {
+  namespace capture_list = aurora::render::scene::capture_list;
+  const std::array<u8, 4> clear = clear_color();
+  const wgpu::Color color{clear[0] / 255.0, clear[1] / 255.0, clear[2] / 255.0, clear[3] / 255.0};
+  // GX_MAX_Z24 is the far plane, which reversed Z puts at 0
+  const float depth = aurora::gfx::uses_reversed_z() ? 0.f : 1.f;
+  if (capture_list::testing::install_check(color, depth) == capture_list::InvalidConsumer) {
+    error = "the capture.check consumer could not be installed";
+    return false;
+  }
+  sCaptureListCheck = true;
+  return true;
+}
+
+void update_capture_list_check(u32 frame) {
+  if (!sCaptureListCheck) {
+    return;
+  }
+  // A draw still compiling is skipped in both targets, but the compare pass drops out until its pipeline is ready
+  if (frame == CaptureListWaitFrame) {
+    wait_for_pipelines();
+  }
+  if (frame == CaptureListCheckFrame) {
+    aurora::render::scene::capture_list::testing::arm_check(aurora::gfx::current_frame());
+  }
+}
+
 bool overlay_pending(const OverlayProbePass& probe) {
   if (probe.id == aurora::render::InvalidPass || probe.encodes.load(std::memory_order_relaxed) == 0) {
     return false;
@@ -2548,6 +2580,9 @@ bool register_graph_passes(const GraphPassOptions& options, std::string& error) 
   if (options.ssilCheck && !register_ssil_check(error)) {
     return false;
   }
+  if (options.captureListCheck && !register_capture_list_check(error)) {
+    return false;
+  }
   return options.gpuCull == 0 ||
          register_cull_passes(
              {.instances = options.gpuCull, .check = options.cullCheck, .timings = options.cullTimings}, error);
@@ -2561,6 +2596,7 @@ void update_graph_passes(u32 frame) {
   update_companion_check(frame);
   update_class_check(frame);
   update_overlay_check(frame);
+  update_capture_list_check(frame);
   if (sProbe.id != aurora::render::InvalidPass && frame >= DepthCheckFrame &&
       sProbe.armedFrame.load(std::memory_order_relaxed) == UINT32_MAX) {
     // Draws whose pipeline is still compiling are skipped, so depth read before they finish misses part of the scene
@@ -2860,6 +2896,10 @@ GraphPassReport graph_pass_report() {
 }
 
 void unregister_graph_passes() {
+  if (std::exchange(sCaptureListCheck, false)) {
+    aurora::gfx::synchronize();
+    aurora::render::scene::capture_list::testing::remove_check();
+  }
   const bool cull = unregister_cull_passes();
   if (!cull && sVignette.id == aurora::render::InvalidPass && sProbe.id == aurora::render::InvalidPass &&
       sMotion.id == aurora::render::InvalidPass && sMotionView.id == aurora::render::InvalidPass &&

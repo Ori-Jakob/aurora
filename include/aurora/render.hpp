@@ -278,6 +278,8 @@ struct DrawRouteCounters {
   uint64_t mergeBreaks = 0;
   uint64_t substituted = 0;
   uint64_t captured = 0;
+  // Merges ended after a draw a capture-list consumer duplicated
+  uint64_t captureResets = 0;
   bool operator==(const DrawRouteCounters&) const = default;
 };
 

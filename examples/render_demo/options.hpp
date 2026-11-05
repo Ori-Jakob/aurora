@@ -38,6 +38,7 @@ struct Options {
   bool classCheck = false;
   bool ssilCheck = false;
   bool retainedCheck = false;
+  bool captureListCheck = false;
   bool hints = true;
 
   bool checkHints = false;

@@ -36,6 +36,8 @@ struct Query {
 struct Decision {
   Route route = Route::Push;
   bool breakMerge = false;
+  // One bit per capture-list consumer; a clone copies the whole command, so the draw must be a command of its own
+  uint8_t duplicate = 0;
 };
 
 struct MergedDraw {

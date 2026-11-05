@@ -120,6 +120,7 @@ struct GraphPassOptions {
   bool overlayCheck = false;
   bool classCheck = false;
   bool ssilCheck = false;
+  bool captureListCheck = false;
 };
 
 struct GraphPassReport {

@@ -29,6 +29,7 @@
 #include "post/taa.hpp"
 #include "post/temporal_resolve.hpp"
 #include "post/upscale/upscale.hpp"
+#include "scene/capture_list.hpp"
 #include "scene/identity.hpp"
 #include "scene/meshlets.hpp"
 #include "scene/motion.hpp"
@@ -153,6 +154,7 @@ void shutdown() noexcept {
   systems::shutdown();
   debug::shutdown_classification();
   debug::shutdown();
+  scene::capture_list::shutdown();
   scene::streamout::shutdown();
   scene::meshlets::shutdown();
   compact::shutdown();
@@ -319,6 +321,7 @@ DrawRouteCounters draw_route_counters() noexcept {
       .mergeBreaks = stats.mergeBreaks,
       .substituted = stats.substituted,
       .captured = stats.captured,
+      .captureResets = stats.captureResets,
   };
 }
 

@@ -278,4 +278,17 @@ DstAlphaCounts dst_alpha_counts() noexcept {
   };
 }
 
+namespace testing {
+void mark_pass_bindings() noexcept {
+  g_bound.uniformOffset = 0;
+  g_bound.textureGroup = 1;
+  g_bound.indexBuffer = true;
+  g_bound.group2Kind = Group2Companion;
+}
+
+bool pass_bindings_reset() noexcept {
+  return g_bound.uniformOffset == UINT32_MAX && g_bound.textureGroup == 0 && !g_bound.indexBuffer &&
+         g_bound.group3 == nullptr && g_bound.group2Kind == 0;
+}
+} // namespace testing
 } // namespace aurora::gx

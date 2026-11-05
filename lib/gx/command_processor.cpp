@@ -224,6 +224,7 @@ std::atomic<uint64_t> g_mergeBreaks{0};
 std::atomic<uint64_t> g_substituted{0};
 std::atomic<uint64_t> g_deferred{0};
 std::atomic<uint64_t> g_captured{0};
+std::atomic<uint64_t> g_captureResets{0};
 std::atomic_uint32_t g_cpuZoneTimed{0};
 std::array<std::atomic_uint64_t, CpuZoneCount> g_cpuZoneCalls{};
 std::array<std::atomic_uint64_t, CpuZoneCount> g_cpuZoneNs{};
@@ -1156,38 +1157,52 @@ static DrawData* merge_target(GXPrimitive prim, GXVtxFmt fmt) noexcept {
 
 enum class RouteAction : uint8_t { Push, Skip, Defer, Capture };
 
+struct Routed {
+  RouteAction action = RouteAction::Push;
+  // A clone copies the whole command, so no later draw may merge into the original after its push
+  bool breakAfter = false;
+};
+
 // A diverted draw ends the merge chain, so no later draw can merge across what was left out
-static RouteAction route_draw(const draw_route::Query& query) noexcept {
+static Routed route_draw(const draw_route::Query& query) noexcept {
   const auto* router = draw_route::router();
   if (router == nullptr || router->route == nullptr) {
-    return RouteAction::Push;
+    return {};
   }
   g_routed.fetch_add(1, std::memory_order_relaxed);
   const draw_route::Decision decision = router->route(router->userData, query);
   if (decision.route == draw_route::Route::Suppress) {
     break_draw_merge();
     g_suppressed.fetch_add(1, std::memory_order_relaxed);
-    return RouteAction::Skip;
+    return {.action = RouteAction::Skip};
   }
+  const bool duplicate = decision.duplicate != 0;
   if (decision.route == draw_route::Route::Defer) {
     break_draw_merge();
-    return RouteAction::Defer;
+    return {.action = RouteAction::Defer, .breakAfter = duplicate};
   }
   if (decision.route == draw_route::Route::Capture) {
     break_draw_merge();
     if (router->capture == nullptr) {
       g_suppressed.fetch_add(1, std::memory_order_relaxed);
-      return RouteAction::Skip;
+      return {.action = RouteAction::Skip};
     }
     g_captured.fetch_add(1, std::memory_order_relaxed);
-    return RouteAction::Capture;
+    return {.action = RouteAction::Capture};
   }
   // Only a break that prevents a merge counts; an indexed draw always starts its own command
-  if (decision.breakMerge && !query.indexed && merge_target(query.prim, query.fmt) != nullptr) {
+  if ((decision.breakMerge || duplicate) && !query.indexed && merge_target(query.prim, query.fmt) != nullptr) {
     break_draw_merge();
     g_mergeBreaks.fetch_add(1, std::memory_order_relaxed);
   }
-  return RouteAction::Push;
+  return {.breakAfter = duplicate};
+}
+
+static void end_duplicate(const Routed& routed) noexcept {
+  if (routed.breakAfter) {
+    break_draw_merge();
+    g_captureResets.fetch_add(1, std::memory_order_relaxed);
+  }
 }
 
 // No draw may merge into or across a deferred one, so replay and restore both keep the original order
@@ -1295,8 +1310,9 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
       return;
     }
 
-  const RouteAction action = route_draw(
+  const Routed routed = route_draw(
       {.prim = prim, .fmt = fmt, .vtxCount = vtxCount, .vertices = {reader.data() + reader.offset(), totalVtxBytes}});
+  const RouteAction action = routed.action;
   if (action == RouteAction::Skip) {
     reader.skip(totalVtxBytes);
     return;
@@ -1356,6 +1372,7 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
   }
 
   handle_draw_unmerged(prim, fmt, vtxCount, vertRange);
+  end_duplicate(routed);
 }
 
 static void handle_draw(u8 cmd, ByteReader& reader) noexcept {
@@ -1389,13 +1406,14 @@ static void handle_draw_indexed(ByteReader& reader) noexcept {
       return;
     }
   const u8* fifoBytes = reader.data() + reader.offset();
-  const RouteAction action = indexCount != 0 ? route_draw({.prim = prim,
-                                                           .fmt = fmt,
-                                                           .vtxCount = vtxCount,
-                                                           .indexed = true,
-                                                           .vertices = {fifoBytes + idxBytes, totalVtxBytes},
-                                                           .indices = {fifoBytes, idxBytes}})
-                                             : RouteAction::Push;
+  const Routed routed = indexCount != 0 ? route_draw({.prim = prim,
+                                                      .fmt = fmt,
+                                                      .vtxCount = vtxCount,
+                                                      .indexed = true,
+                                                      .vertices = {fifoBytes + idxBytes, totalVtxBytes},
+                                                      .indices = {fifoBytes, idxBytes}})
+                                        : Routed{};
+  const RouteAction action = routed.action;
   if (action == RouteAction::Skip) {
     reader.skip(idxBytes + totalVtxBytes);
     return;
@@ -1413,6 +1431,7 @@ static void handle_draw_indexed(ByteReader& reader) noexcept {
   const gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), 4);
   if (indexCount != 0) {
     push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, indexCount);
+    end_duplicate(routed);
   }
 }
 
@@ -1641,6 +1660,7 @@ DrawRouteStats draw_route_stats() noexcept {
       .substituted = g_substituted.load(std::memory_order_relaxed),
       .deferred = g_deferred.load(std::memory_order_relaxed),
       .captured = g_captured.load(std::memory_order_relaxed),
+      .captureResets = g_captureResets.load(std::memory_order_relaxed),
   };
 }
 
@@ -1846,6 +1866,7 @@ void reset_draw_route_stats() noexcept {
   g_substituted.store(0, std::memory_order_relaxed);
   g_deferred.store(0, std::memory_order_relaxed);
   g_captured.store(0, std::memory_order_relaxed);
+  g_captureResets.store(0, std::memory_order_relaxed);
 }
 
 void reset_array_upload_stats() noexcept {

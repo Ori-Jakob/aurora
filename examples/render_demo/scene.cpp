@@ -1367,6 +1367,8 @@ OverlayColors overlay_colors() noexcept {
   return {.quad = rgba(OverlayQuadColor), .box = rgba(OverlayBoxColor)};
 }
 
+std::array<u8, 4> clear_color() noexcept { return {ClearColor.r, ClearColor.g, ClearColor.b, ClearColor.a}; }
+
 FogResolveCounts fog_resolve_counts() noexcept { return sFogResolves; }
 
 void draw_scene(u32 frame, const SceneOptions& options) {
@@ -1469,7 +1471,9 @@ void draw_scene(u32 frame, const SceneOptions& options) {
   hint_stage(AURORA_STAGE_PRE_POST);
   hint_stage(AURORA_STAGE_SCENE_END);
   hint_stage(AURORA_STAGE_BEFORE_HUD);
-  draw_hud_panel();
+  if (options.hud) {
+    draw_hud_panel();
+  }
   hint_stage(AURORA_STAGE_FRAME_END);
 }
 

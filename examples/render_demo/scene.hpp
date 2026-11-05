@@ -32,6 +32,7 @@ struct SceneOptions {
   bool overlayCheck = false;
   bool classCheck = false;
   bool ssilCheck = false;
+  bool hud = true;
 };
 
 struct OverlayColors {
@@ -113,6 +114,7 @@ std::string class_manifest(bool edited);
 std::span<const u8> ground_texture_base() noexcept;
 std::array<f32, 2> overlay_probe() noexcept;
 OverlayColors overlay_colors() noexcept;
+std::array<u8, 4> clear_color() noexcept;
 FogResolveCounts fog_resolve_counts() noexcept;
 uint32_t gpu_uploads_per_frame(const SceneOptions& options) noexcept;
 bool init_scene();

@@ -110,6 +110,10 @@ struct DstAlphaCounts {
   uint64_t dstAlphaDraws, prepassDraws, dualSourcePipelines, prepassPipelines;
 };
 DstAlphaCounts dst_alpha_counts() noexcept;
+namespace testing {
+void mark_pass_bindings() noexcept;
+bool pass_bindings_reset() noexcept;
+} // namespace testing
 
 void queue_surface(const u8* dlStart, uint32_t dlSize, bool bigEndian) noexcept;
 } // namespace aurora::gx
