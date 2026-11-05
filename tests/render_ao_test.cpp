@@ -3639,6 +3639,8 @@ TEST_F(SsilGraph, PyramidsFollowHizChain) {
         EXPECT_EQ(pyramid.extent.height, hiz.extent.height) << name;
         EXPECT_EQ(ao::ssil_radiance::written_levels(pyramid.mipLevels), ao::hiz::written_levels(hiz.mipLevels)) << name;
       }
+      // The next size rebuilds the device globals, which pipelines still compiling for this one would read
+      wait_all(*graph);
     }
   }
 }
