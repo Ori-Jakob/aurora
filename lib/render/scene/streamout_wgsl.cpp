@@ -22,10 +22,14 @@ std::string variant_source(std::span<const gx::AttrConfig, gx::MaxVtxAttr> attrs
   config.attrs[GX_VA_POS] = attrs[GX_VA_POS];
   config.attrs[GX_VA_NRM] = attrs[GX_VA_NRM];
   config.attrs[GX_VA_CLR0] = attrs[GX_VA_CLR0];
+  const bool palette = attrs[GX_VA_PNMTXIDX].attrType != GX_NONE;
   const bool hasNormal = attrs[GX_VA_NRM].attrType != GX_NONE;
   const bool hasColor = attrs[GX_VA_CLR0].attrType != GX_NONE;
   const bool hasUv = uvTex < 8 && attrs[GX_VA_TEX0 + uvTex].attrType != GX_NONE;
   const bool hasAlpha = alphaTex < 8 && attrs[GX_VA_TEX0 + alphaTex].attrType != GX_NONE;
+  if (palette) {
+    config.attrs[GX_VA_PNMTXIDX] = attrs[GX_VA_PNMTXIDX];
+  }
   if (hasUv) {
     config.attrs[GX_VA_TEX0 + uvTex] = attrs[GX_VA_TEX0 + uvTex];
   }
@@ -35,15 +39,38 @@ std::string variant_source(std::span<const gx::AttrConfig, gx::MaxVtxAttr> attrs
 
   std::string loads = fmt::format("\n    let in_pos = {};", gx::vertex_fetch::attr_load(config, GX_VA_POS, "vidx"));
   std::string body;
+  if (palette) {
+    // The VS indexes postex without a clamp; J3D never exceeds slot 9, and word 94 records any draw that does
+    loads += fmt::format(
+        "\n    let in_pnmtxidx = {0};"
+        "\n    let slot = min(in_pnmtxidx, {1}u);"
+        "\n    atomicOr(&wg_mask, select(1u << in_pnmtxidx, {2}u, in_pnmtxidx >= {3}u));"
+        "\n    let mw = hw + abuf[hw + {4}u] + abuf[pw + {5}u];"
+        "\n    let pos = vec4f(in_pos, 1.0) * block_mat(mw + slot * {6}u);",
+        gx::vertex_fetch::attr_load(config, GX_VA_PNMTXIDX, "vidx"), palette::LastSlot, palette::MaskOverflow,
+        palette::MaskSlots, block::MatricesWord, block::PieceMatrixWord, palette::MatrixWords);
+  } else {
+    loads += "\n    let pos = in_pos;";
+  }
   if (hasNormal) {
     loads += fmt::format("\n    let in_nrm = {};", gx::vertex_fetch::attr_load(config, GX_VA_NRM, "vidx"));
-    body += fmt::format(
-        "\n    if ((pflags & {}u) != 0u) {{"
-        "\n      let nlen = length(in_nrm);"
-        "\n      nrm_word = oct_encode(select(vec3f(0.0, 0.0, 1.0), in_nrm / nlen, nlen > 0.0));"
-        "\n      aux = aux | {}u;"
-        "\n    }}",
-        block::PieceHasNormal, vertex::HasNormal);
+    if (palette) {
+      body += fmt::format(
+          "\n    if ((pflags & {}u) != 0u) {{"
+          "\n      let nt = vec4f(in_nrm, 0.0) * block_mat(mw + {}u + slot * {}u);"
+          "\n      nrm_word = oct_encode(select(vec3f(0.0, 0.0, 1.0), normalize(nt), dot(nt, nt) > 1e-10));"
+          "\n      aux = aux | {}u;"
+          "\n    }}",
+          block::PieceHasNormal, palette::NormalWord, palette::MatrixWords, vertex::HasNormal);
+    } else {
+      body += fmt::format(
+          "\n    if ((pflags & {}u) != 0u) {{"
+          "\n      let nlen = length(in_nrm);"
+          "\n      nrm_word = oct_encode(select(vec3f(0.0, 0.0, 1.0), in_nrm / nlen, nlen > 0.0));"
+          "\n      aux = aux | {}u;"
+          "\n    }}",
+          block::PieceHasNormal, vertex::HasNormal);
+    }
   }
   if (hasColor) {
     loads += fmt::format("\n    let in_clr0 = {};", gx::vertex_fetch::attr_load(config, GX_VA_CLR0, "vidx"));
@@ -76,6 +103,27 @@ std::string variant_source(std::span<const gx::AttrConfig, gx::MaxVtxAttr> attrs
         record::Words, record::GpuFlags, gpu_flag::AlphaUvClamped);
   }
 
+  std::string paletteDecls;
+  std::string paletteInit;
+  std::string paletteFlush;
+  if (palette) {
+    paletteDecls =
+        "\nvar<workgroup> wg_mask: atomic<u32>;"
+        "\n"
+        "\nfn block_mat(w: u32) -> mat3x4f {"
+        "\n  return mat3x4f(bitcast<vec4f>(vec4u(abuf[w], abuf[w + 1u], abuf[w + 2u], abuf[w + 3u])),"
+        "\n                 bitcast<vec4f>(vec4u(abuf[w + 4u], abuf[w + 5u], abuf[w + 6u], abuf[w + 7u])),"
+        "\n                 bitcast<vec4f>(vec4u(abuf[w + 8u], abuf[w + 9u], abuf[w + 10u], abuf[w + 11u])));"
+        "\n}";
+    paletteInit = "\n  if (li == 0u) {\n    atomicStore(&wg_mask, 0u);\n  }";
+    paletteFlush = fmt::format(
+        "\n    let mask = atomicLoad(&wg_mask);"
+        "\n    if (mask != 0u) {{"
+        "\n      atomicOr(&instances[inst * {}u + {}u], mask);"
+        "\n    }}",
+        record::Words, record::PaletteMask);
+  }
+
   return fmt::format(R"""(const STREAMOUT_REVISION: u32 = {0}u;
 
 {1}
@@ -96,7 +144,7 @@ struct StreamPush {{
 var<immediate> push: StreamPush;
 
 var<workgroup> wg_min: array<atomic<u32>, 3>;
-var<workgroup> wg_max: array<atomic<u32>, 3>;
+var<workgroup> wg_max: array<atomic<u32>, 3>;{23}
 
 fn ordered_from_f32(v: f32) -> u32 {{
   let b = bitcast<u32>(v);
@@ -114,7 +162,7 @@ fn main(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index) li: 
   if (li < 3u) {{
     atomicStore(&wg_min[li], {8}u);
     atomicStore(&wg_max[li], {9}u);
-  }}
+  }}{24}
   workgroupBarrier();
   let hw = push.block_word;
   let chunk = hw + abuf[hw + {10}u] + (push.first + wid.x) * {11}u;
@@ -133,20 +181,20 @@ fn main(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index) li: 
     var uv0 = vec2f(0.0);
     var alpha_word = 0u;{18}
     let o = (abuf[pw + {19}u] + vidx) * {20}u;
-    vertices[o] = bitcast<u32>(in_pos.x);
-    vertices[o + 1u] = bitcast<u32>(in_pos.y);
-    vertices[o + 2u] = bitcast<u32>(in_pos.z);
+    vertices[o] = bitcast<u32>(pos.x);
+    vertices[o + 1u] = bitcast<u32>(pos.y);
+    vertices[o + 2u] = bitcast<u32>(pos.z);
     vertices[o + 3u] = nrm_word;
     vertices[o + 4u] = bitcast<u32>(uv0.x);
     vertices[o + 5u] = bitcast<u32>(uv0.y);
     vertices[o + 6u] = alpha_word;
     vertices[o + 7u] = aux;
-    atomicMin(&wg_min[0], ordered_from_f32(in_pos.x));
-    atomicMin(&wg_min[1], ordered_from_f32(in_pos.y));
-    atomicMin(&wg_min[2], ordered_from_f32(in_pos.z));
-    atomicMax(&wg_max[0], ordered_from_f32(in_pos.x));
-    atomicMax(&wg_max[1], ordered_from_f32(in_pos.y));
-    atomicMax(&wg_max[2], ordered_from_f32(in_pos.z));
+    atomicMin(&wg_min[0], ordered_from_f32(pos.x));
+    atomicMin(&wg_min[1], ordered_from_f32(pos.y));
+    atomicMin(&wg_min[2], ordered_from_f32(pos.z));
+    atomicMax(&wg_max[0], ordered_from_f32(pos.x));
+    atomicMax(&wg_max[1], ordered_from_f32(pos.y));
+    atomicMax(&wg_max[2], ordered_from_f32(pos.z));
   }}
   workgroupBarrier();
   if (li == 0u) {{
@@ -160,7 +208,7 @@ fn main(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index) li: 
       atomicMax(&instances[base + 3u], hi.x);
       atomicMax(&instances[base + 4u], hi.y);
       atomicMax(&instances[base + 5u], hi.z);
-    }}
+    }}{25}
   }}
 }}
 )""",
@@ -168,6 +216,7 @@ fn main(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index) li: 
                      binding::GxVertex, binding::GxStorage, binding::Vertices, binding::Instances, WorkgroupSize,
                      EmptyMin, EmptyMax, block::VtxChunksWord, block::ChunkWords, block::PiecesWord, block::PieceWords,
                      block::PieceInstance, block::PieceFlags, block::PieceVtxCount, loads, body,
-                     block::PieceOutVertexFirst, vertex::Words, record::Words, record::CurAabb);
+                     block::PieceOutVertexFirst, vertex::Words, record::Words, record::CurAabb, paletteDecls,
+                     paletteInit, paletteFlush);
 }
 } // namespace aurora::render::scene::streamout

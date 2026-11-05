@@ -70,6 +70,11 @@ const RETAINED_FRAME_LATE_FRAME: u32 = 56u;
 const RETAINED_CAMERA_VALID: u32 = 1u;
 const RETAINED_RESET: u32 = 2u;
 
+const RETAINED_PALETTE_MATRIX_WORDS: u32 = 12u;
+const RETAINED_PALETTE_NORMAL_WORD: u32 = 120u;
+const RETAINED_PALETTE_BANK_WORDS: u32 = 240u;
+const RETAINED_PALETTE_LAST_SLOT: u32 = 9u;
+
 const RETAINED_CLUSTER_WORDS: u32 = 16u;
 const RETAINED_CLUSTER_COUNT_MASK: u32 = 0x00FFFFFFu;
 const RETAINED_CLUSTER_STATE_SHIFT: u32 = 24u;
@@ -215,6 +220,13 @@ fn retained_world_rel(w: RetainedWorld, cam_hi: vec3f, cam_lo: vec3f) -> mat3x4f
 
 fn retained_normal_matrix(inst: ptr<storage, array<u32>, read>, slot: u32) -> mat3x4f {
   return retained_mat3x4(inst, slot * RETAINED_RECORD_WORDS + RETAINED_REC_NORMAL);
+}
+
+fn retained_palette_matrix(pal: ptr<storage, array<u32>, read>, inst: ptr<storage, array<u32>, read>, slot: u32,
+                           bone: u32, prev: bool, normal: bool) -> mat3x4f {
+  let first = retained_record_word(inst, slot, RETAINED_REC_PALETTE_FIRST);
+  let bank = first + select(0u, RETAINED_PALETTE_BANK_WORDS, prev) + select(0u, RETAINED_PALETTE_NORMAL_WORD, normal);
+  return retained_mat3x4(pal, bank + min(bone, RETAINED_PALETTE_LAST_SLOT) * RETAINED_PALETTE_MATRIX_WORDS);
 }
 
 fn retained_prev_is_last_frame(inst: ptr<storage, array<u32>, read>, slot: u32, frame: u32) -> bool {

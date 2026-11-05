@@ -153,7 +153,17 @@ protected:
     }
   }
 
-  void begin_frame(const Mat3x4<float>& view = affine()) {
+  void use_palette(std::vector<uint8_t> slots) {
+    constexpr uint8_t Stride = 16;
+    m_config.shaderConfig = {};
+    m_config.shaderConfig.vtxStride = Stride;
+    m_config.shaderConfig.attrs[GX_VA_POS] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32};
+    m_config.shaderConfig.attrs[GX_VA_PNMTXIDX] = {.attrType = GX_DIRECT, .cnt = 1, .compType = GX_U8, .offset = 12};
+    gx::g_gxState.vtxDesc[GX_VA_PNMTXIDX] = GX_DIRECT;
+    m_paletteSlots = std::move(slots);
+  }
+
+  void begin_frame(const Mat3x4<float>& view = affine(), uint32_t cutEpoch = 0) {
     detail::begin_hint_frame();
     retained::latch_gate(Settings{}, test::full_caps());
     scene::apply_frame_state(detail::FrameState{});
@@ -162,6 +172,7 @@ protected:
         .view = view,
         .proj = perspective(),
         .type = GX_PERSPECTIVE,
+        .cutEpoch = cutEpoch,
         .gxProj = gx::hints::gx_projection(perspective(), GX_PERSPECTIVE),
     };
     sink().camera(sink().userData, main);
@@ -182,6 +193,9 @@ protected:
     for (uint32_t v = 0; v < vtxCount; ++v) {
       const std::array<float, 3> p{static_cast<float>(v % 7), static_cast<float>(v % 5), static_cast<float>(v % 3)};
       std::memcpy(m_fifo.data() + m_offset + v * stride, p.data(), sizeof(p));
+      if (!m_paletteSlots.empty()) {
+        m_fifo[m_offset + v * stride + 12] = static_cast<uint8_t>(m_paletteSlots[v % m_paletteSlots.size()] * 3);
+      }
     }
     const gx::draw_route::Query query{
         .prim = prim,
@@ -264,6 +278,15 @@ protected:
                                [&](const PlanEvent& event) { return event.type == type && event.slot == slot; });
   }
 
+  static uint32_t count_events(const Plan& plan, EventType type) {
+    return static_cast<uint32_t>(
+        std::ranges::count_if(plan.events, [&](const PlanEvent& event) { return event.type == type; }));
+  }
+
+  [[nodiscard]] static uint32_t roll_flags(const BlockView& view, uint32_t job) {
+    return view.at(view.at(block::RollJobsWord) + job * block::RollJobWords + block::RollFlags);
+  }
+
   static bool writes(const BlockView& view, uint32_t slot, uint32_t first, uint32_t count) {
     for (uint32_t i = 0; i < view.jobs(); ++i) {
       const auto job = view.job(i);
@@ -283,6 +306,7 @@ protected:
   gx::DrawData m_command{};
   gx::PipelineConfig m_config{};
   gx::ShaderInfo m_info{};
+  std::vector<uint8_t> m_paletteSlots;
 };
 
 TEST_F(RetainedStreamout, PlanGroupsChunksByVariant) {
@@ -646,20 +670,7 @@ TEST_F(RetainedStreamout, UvTransformComposesTexMtxAndPostMtx) {
   EXPECT_EQ(testing::slot(slot).flags & (instance_flag::UvNonTex | instance_flag::UvNonAffine), 0u);
 }
 
-TEST_F(RetainedStreamout, LinesPointsAndPalettesAreSkipped) {
-  gx::g_gxState.vtxDesc[GX_VA_PNMTXIDX] = GX_DIRECT;
-  m_config.shaderConfig.attrs[GX_VA_PNMTXIDX] = {.attrType = GX_DIRECT, .cnt = 1, .compType = GX_U8};
-  begin_frame();
-  object_draw(0xD0);
-  const auto plan = stage();
-  ASSERT_NE(plan, nullptr);
-  EXPECT_EQ(block().pieces(), 0u);
-  end();
-  EXPECT_FALSE(testing::slot(slot_of(0xD0)).streamed);
-  EXPECT_EQ(stats().paletteDeferred, 1u);
-
-  gx::g_gxState.vtxDesc[GX_VA_PNMTXIDX] = GX_NONE;
-  m_config.shaderConfig.attrs[GX_VA_PNMTXIDX] = {};
+TEST_F(RetainedStreamout, LinesAndPointsAreSkipped) {
   begin_frame();
   begin_object(0xD1);
   draw(4, false, GX_LINES);
@@ -816,11 +827,9 @@ TEST_F(RetainedStreamout, LatePlanChainsAfterOpaquePlan) {
 }
 
 TEST_F(RetainedStreamout, UndeliveredLateEntriesOpenPrePost) {
-  gx::g_gxState.vtxDesc[GX_VA_PNMTXIDX] = GX_DIRECT;
-  m_config.shaderConfig.attrs[GX_VA_PNMTXIDX] = {.attrType = GX_DIRECT, .cnt = 1, .compType = GX_U8};
   begin_frame();
   ASSERT_NE(stage(), nullptr);
-  object_draw(0x140, 3, AURORA_CAT_STATIC);
+  object_draw(0x140, 2, AURORA_CAT_STATIC);
   const auto late = stage_at(Stage::PrePost);
   ASSERT_NE(late, nullptr);
   EXPECT_TRUE(late->header_only());
@@ -829,10 +838,164 @@ TEST_F(RetainedStreamout, UndeliveredLateEntriesOpenPrePost) {
 
   begin_frame();
   ASSERT_NE(stage(), nullptr);
-  object_draw(0x140, 3, AURORA_CAT_STATIC);
+  object_draw(0x140, 2, AURORA_CAT_STATIC);
   EXPECT_EQ(stage_at(Stage::PrePost), nullptr);
   end();
-  EXPECT_EQ(stats().paletteDeferred, 2u);
+  EXPECT_EQ(stats().largeSkipped, 2u);
+}
+
+TEST_F(RetainedStreamout, PaletteStationaryUnderOrbit) {
+  use_palette({1, 2});
+  const std::array<double, 3> centre{1.0e5, 0.0, 0.0};
+  const std::array<Mat3x4<float>, 2> bones{affine(1.0e5f, 0.f, 0.f), affine(1.0e5f, 1.5f, 0.f)};
+  uint32_t changes = 0;
+  for (uint32_t frame = 0; frame < 600; ++frame) {
+    const double angle = 2.0 * std::numbers::pi * frame / 600.0;
+    const std::array<double, 3> eye{centre[0] + 50.0 * std::cos(angle), 8.0, centre[2] + 50.0 * std::sin(angle)};
+    const Mat3x4<float> view = look_at(eye, centre);
+    begin_frame(view);
+    gx::g_gxState.pnMtx[0].pos = concat(view, affine(static_cast<float>(frame), 0.f, 0.f));
+    gx::g_gxState.pnMtx[1].pos = concat(view, bones[0]);
+    gx::g_gxState.pnMtx[2].pos = concat(view, bones[1]);
+    object_draw(0x150, 6);
+    const auto plan = stage();
+    ASSERT_NE(plan, nullptr);
+    if (frame != 0) {
+      changes += count_events(*plan, EventType::Moved) + count_events(*plan, EventType::Restreamed);
+      changes += block().pieces();
+    }
+    end();
+  }
+  EXPECT_EQ(changes, 0u);
+  const testing::SlotState st = testing::slot(slot_of(0x150));
+  EXPECT_NE(st.flags & instance_flag::Palette, 0u);
+  EXPECT_EQ(st.streams, 1u);
+  EXPECT_EQ(st.recordWrites, 1u);
+  EXPECT_EQ(st.usedMask, 0b110u);
+  EXPECT_EQ(st.origin[0], 99840.0);
+  EXPECT_EQ(stats().paletteStreamed, 1u);
+  EXPECT_EQ(stats().paletteSkipped, 599u);
+}
+
+TEST_F(RetainedStreamout, ImmobilePaletteLatches) {
+  use_palette({0});
+  for (uint32_t frame = 0; frame < 10; ++frame) {
+    begin_frame();
+    gx::g_gxState.pnMtx[0].pos = affine(static_cast<float>(frame) * 4.f, 0.f, -5.f);
+    object_draw(0x160, 3, AURORA_CAT_DYNAMIC, AURORA_OBJ_IMMOBILE);
+    ASSERT_NE(stage(), nullptr);
+    end();
+  }
+  const testing::SlotState st = testing::slot(slot_of(0x160));
+  EXPECT_EQ(st.streams, 1u);
+  EXPECT_NE(st.flags & instance_flag::Latched, 0u);
+  EXPECT_EQ(stats().paletteLatched, 9u);
+  EXPECT_EQ(stats().paletteSkipped, 0u);
+}
+
+TEST_F(RetainedStreamout, UsedSlotMaskIgnoresUnreferencedSlots) {
+  use_palette({1, 3});
+  const auto frame = [&](float unused, float used) {
+    begin_frame();
+    gx::g_gxState.pnMtx[0].pos = affine(unused, 9.f, 9.f);
+    gx::g_gxState.pnMtx[1].pos = affine(1.f, 0.f, -5.f);
+    gx::g_gxState.pnMtx[2].pos = affine(unused, 7.f, 7.f);
+    gx::g_gxState.pnMtx[3].pos = affine(used, 0.f, -5.f);
+    object_draw(0x170, 6);
+    return stage();
+  };
+  const auto first = frame(0.f, 2.f);
+  ASSERT_NE(first, nullptr);
+  const BlockView view = block();
+  ASSERT_EQ(view.pieces(), 1u);
+  const uint32_t matrices = view.at(block::MatricesWord) + view.piece(0, block::PieceMatrixWord);
+  EXPECT_EQ(view.at(block::WriteJobsWord) - view.at(block::MatricesWord), palette::BankWords);
+  for (uint32_t slot = 0; slot < palette::Matrices; ++slot) {
+    const bool used = slot == 1 || slot == 3;
+    bool zero = true;
+    for (uint32_t w = 0; w < palette::MatrixWords; ++w) {
+      zero = zero && view.at(matrices + slot * palette::MatrixWords + w) == 0 &&
+             view.at(matrices + palette::NormalWord + slot * palette::MatrixWords + w) == 0;
+    }
+    EXPECT_EQ(zero, !used) << slot;
+  }
+  EXPECT_EQ(std::bit_cast<float>(view.at(matrices + 3 * palette::MatrixWords + 3)), 2.f);
+  end();
+  const uint32_t slot = slot_of(0x170);
+  EXPECT_EQ(testing::slot(slot).usedMask, 0b1010u);
+  EXPECT_EQ(testing::slot(slot).seenMask, 0b1010u);
+
+  const auto still = frame(5.f, 2.f);
+  ASSERT_NE(still, nullptr);
+  EXPECT_EQ(block().pieces(), 0u);
+  EXPECT_FALSE(has_event(*still, EventType::Restreamed, slot));
+  end();
+
+  const auto moved = frame(5.f, 3.f);
+  ASSERT_NE(moved, nullptr);
+  EXPECT_EQ(block().pieces(), 1u);
+  EXPECT_TRUE(has_event(*moved, EventType::Restreamed, slot));
+  EXPECT_FALSE(has_event(*moved, EventType::Moved, slot));
+  end();
+  EXPECT_EQ(testing::slot(slot).streams, 2u);
+}
+
+TEST_F(RetainedStreamout, CutMarksFresh) {
+  use_palette({0});
+  const auto frame = [&](float x, uint32_t cut) {
+    begin_frame(affine(), cut);
+    gx::g_gxState.pnMtx[0].pos = affine(x, 0.f, -5.f);
+    object_draw(0x180);
+    EXPECT_NE(stage(), nullptr);
+    const BlockView view = block();
+    end();
+    EXPECT_EQ(view.at(block::RollJobCount), 1u);
+    return roll_flags(view, 0);
+  };
+  EXPECT_EQ(frame(0.f, 0), block::RollPalette | block::RollFresh);
+  EXPECT_EQ(frame(1.f, 0), block::RollPalette);
+  EXPECT_EQ(frame(2.f, 1), block::RollPalette | block::RollFresh);
+  EXPECT_EQ(frame(3.f, 1), block::RollPalette);
+}
+
+TEST_F(RetainedStreamout, UnseenFrameMarksFresh) {
+  use_palette({0});
+  const auto frame = [&](float x, bool drawn) {
+    begin_frame();
+    gx::g_gxState.pnMtx[0].pos = affine(x, 0.f, -5.f);
+    if (drawn) {
+      object_draw(0x190);
+    }
+    EXPECT_NE(stage(), nullptr);
+    const BlockView view = block();
+    end();
+    return view.at(block::RollJobCount) == 0 ? 0u : roll_flags(view, 0);
+  };
+  EXPECT_EQ(frame(0.f, true), block::RollPalette | block::RollFresh);
+  EXPECT_EQ(frame(1.f, true), block::RollPalette);
+  EXPECT_EQ(frame(2.f, false), 0u);
+  EXPECT_EQ(frame(3.f, true), block::RollPalette | block::RollFresh);
+  EXPECT_EQ(frame(4.f, true), block::RollPalette);
+}
+
+TEST_F(RetainedStreamout, PaletteBytesShareWithPreviousPiece) {
+  use_palette({0, 1});
+  gx::g_gxState.pnMtx[1].pos = affine(1.f, 2.f, -5.f);
+  begin_frame();
+  begin_object(0x1A0);
+  draw(3);
+  draw(4);
+  end_object();
+  ASSERT_NE(stage(), nullptr);
+  const BlockView view = block();
+  ASSERT_EQ(view.pieces(), 2u);
+  EXPECT_NE(view.piece(0, block::PieceInstance), view.piece(1, block::PieceInstance));
+  EXPECT_EQ(view.piece(0, block::PieceMatrixWord), 0u);
+  EXPECT_EQ(view.piece(1, block::PieceMatrixWord), 0u);
+  EXPECT_EQ(view.at(block::WriteJobsWord) - view.at(block::MatricesWord), palette::BankWords);
+  end();
+  EXPECT_EQ(stats().paletteShared, 1u);
+  EXPECT_EQ(stats().paletteStreamed, 2u);
 }
 
 TEST(RetainedMapPick, SelectsFirstColourMapAndLastAlphaMap) {

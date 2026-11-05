@@ -96,6 +96,127 @@ std::vector<uint32_t> reference_indices(GXPrimitive prim, uint32_t vtxCount) {
   return out;
 }
 
+constexpr uint32_t PaletteStride = 25;
+constexpr uint32_t Rings = 5;
+
+Mat3x4<float> rows(const Affine& a) {
+  Mat3x4<float> out{};
+  Vec4<float>* r[3] = {&out.m0, &out.m1, &out.m2};
+  for (int i = 0; i < 3; ++i) {
+    for (int c = 0; c < 4; ++c) {
+      (*r[i])[c] = static_cast<float>(a.m[i][c]);
+    }
+  }
+  return out;
+}
+
+Mat3x4<float> concat_f32(const Mat3x4<float>& a, const Mat3x4<float>& b) {
+  Mat3x4<float> out{};
+  const Vec4<float>* ar[3] = {&a.m0, &a.m1, &a.m2};
+  const Vec4<float>* br[3] = {&b.m0, &b.m1, &b.m2};
+  Vec4<float>* orow[3] = {&out.m0, &out.m1, &out.m2};
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 4; ++c) {
+      float value = (*ar[r])[0] * (*br[0])[c] + (*ar[r])[1] * (*br[1])[c] + (*ar[r])[2] * (*br[2])[c];
+      if (c == 3) {
+        value += (*ar[r])[3];
+      }
+      (*orow[r])[c] = value;
+    }
+  }
+  return out;
+}
+
+Affine bone(const std::array<double, 3>& base, uint32_t k, double t) {
+  const double a = 0.35 * std::sin(1.7 * t + 0.8 * k);
+  const double b = 0.2 * std::sin(1.1 * t + 0.5 * k);
+  Affine out{};
+  out.m[0][0] = std::cos(a);
+  out.m[0][1] = -std::sin(a) * std::cos(b);
+  out.m[0][2] = std::sin(a) * std::sin(b);
+  out.m[1][0] = std::sin(a);
+  out.m[1][1] = std::cos(a) * std::cos(b);
+  out.m[1][2] = -std::cos(a) * std::sin(b);
+  out.m[2][1] = std::sin(b);
+  out.m[2][2] = std::cos(b);
+  out.m[0][3] = base[0];
+  out.m[1][3] = base[1] + 1.5 * k;
+  out.m[2][3] = base[2];
+  return out;
+}
+
+Mat3x4<float> camera_view(const std::array<double, 3>& base) {
+  const std::array<double, 3> eye{base[0] + 6.0, base[1] + 4.0, base[2] + 14.0};
+  std::array<double, 3> f{base[0] - eye[0], base[1] + 3.0 - eye[1], base[2] - eye[2]};
+  const double fl = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+  for (double& v : f) {
+    v /= fl;
+  }
+  std::array<double, 3> s{-f[2], 0.0, f[0]};
+  const double sl = std::sqrt(s[0] * s[0] + s[2] * s[2]);
+  s[0] /= sl;
+  s[2] /= sl;
+  const std::array<double, 3> u{s[1] * f[2] - s[2] * f[1], s[2] * f[0] - s[0] * f[2], s[0] * f[1] - s[1] * f[0]};
+  Affine view{};
+  for (int c = 0; c < 3; ++c) {
+    view.m[0][c] = s[c];
+    view.m[1][c] = u[c];
+    view.m[2][c] = -f[c];
+  }
+  for (int r = 0; r < 3; ++r) {
+    view.m[r][3] = -(view.m[r][0] * eye[0] + view.m[r][1] * eye[1] + view.m[r][2] * eye[2]);
+  }
+  return rows(view);
+}
+
+struct Skin {
+  std::vector<uint8_t> bytes;
+  std::vector<uint32_t> slots;
+  std::vector<std::array<float, 3>> positions;
+  std::vector<std::array<float, 3>> normals;
+};
+
+Skin make_skin() {
+  Skin skin;
+  for (uint32_t ring = 0; ring < Rings; ++ring) {
+    for (uint32_t side = 0; side < 2; ++side) {
+      const float x = side == 0 ? -0.5f : 0.5f;
+      skin.slots.push_back(1 + std::min(ring, 3u));
+      skin.positions.push_back({x, ring == 4 ? 1.5f : 0.f, 0.25f * static_cast<float>(ring % 2)});
+      const float len = std::sqrt(x * x + 0.25f);
+      skin.normals.push_back({x / len, 0.f, 0.5f / len});
+    }
+  }
+  skin.bytes.assign(skin.slots.size() * PaletteStride, 0);
+  for (size_t v = 0; v < skin.slots.size(); ++v) {
+    const size_t at = v * PaletteStride;
+    skin.bytes[at] = static_cast<uint8_t>(skin.slots[v] * 3);
+    for (int c = 0; c < 3; ++c) {
+      put_be32(skin.bytes, at + 1 + c * 4, std::bit_cast<uint32_t>(skin.positions[v][c]));
+      put_be32(skin.bytes, at + 13 + c * 4, std::bit_cast<uint32_t>(skin.normals[v][c]));
+    }
+  }
+  skin.bytes.resize((skin.bytes.size() + 3) / 4 * 4, 0);
+  return skin;
+}
+
+std::array<gx::AttrConfig, gx::MaxVtxAttr> skin_attrs() {
+  std::array<gx::AttrConfig, gx::MaxVtxAttr> attrs{};
+  attrs[GX_VA_PNMTXIDX] = {.attrType = GX_DIRECT, .cnt = 1, .compType = GX_U8};
+  attrs[GX_VA_POS] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32, .offset = 1};
+  attrs[GX_VA_NRM] = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_F32, .offset = 13};
+  return attrs;
+}
+
+void pose(const Mat3x4<float>& view, const std::array<double, 3>& base, double t) {
+  for (uint32_t k = 0; k < 4; ++k) {
+    const Mat3x4<float> pn = concat_f32(view, rows(bone(base, k, t)));
+    gx::g_gxState.pnMtx[1 + k].pos = pn;
+    gx::g_gxState.pnMtx[1 + k].nrm = {
+        {pn.m0[0], pn.m0[1], pn.m0[2], 0.f}, {pn.m1[0], pn.m1[1], pn.m1[2], 0.f}, {pn.m2[0], pn.m2[1], pn.m2[2], 0.f}};
+  }
+}
+
 struct Draw {
   GXPrimitive prim = GX_TRIANGLES;
   uint32_t vtxCount = 0;
@@ -161,9 +282,9 @@ protected:
     m_device->queue.WriteBuffer(target, offset, padded.data(), padded.size());
   }
 
-  std::shared_ptr<const Plan> seal_and_commit(std::shared_ptr<retained::Frame>& frame,
-                                              Stage stage = Stage::OpaqueDone) {
-    detail::StageData data{.stage = stage, .frameIndex = FrameIndex};
+  std::shared_ptr<const Plan> seal_and_commit(std::shared_ptr<retained::Frame>& frame, Stage stage = Stage::OpaqueDone,
+                                              uint32_t frameIndex = FrameIndex) {
+    detail::StageData data{.stage = stage, .frameIndex = frameIndex};
     frame = std::make_shared<retained::Frame>();
     seal(*frame, data);
     data.retained = frame;
@@ -211,6 +332,48 @@ protected:
       return false;
     }
     return test::submit_and_wait(*m_device, encoder.Finish());
+  }
+
+  static void capture_palette(uint32_t slot, const std::vector<uint8_t>& bytes, uint32_t vtxCount,
+                              const std::array<gx::AttrConfig, gx::MaxVtxAttr>& attrs, const Affine& invView,
+                              bool newGeometry, GXPrimitive prim = GX_TRIANGLESTRIP) {
+    static constexpr gx::DrawImmediateData Immediates{};
+    const auto& m = invView.m;
+    on_capture({
+        .slot = slot,
+        .slotGeneration = 1,
+        .identityHash = 0x500 + slot,
+        .newGeometry = newGeometry,
+        .entryFlags = retained::entry_flag::Palette,
+        .classBits = retained::class_bit::Dynamic | retained::class_bit::Palette,
+        .attrs = attrs.data(),
+        .stride = PaletteStride,
+        .records = bytes,
+        .immediates = &Immediates,
+        .prim = static_cast<uint8_t>(prim),
+        .vtxCount = vtxCount,
+        .invView = &invView,
+        .eye = std::sqrt(m[0][3] * m[0][3] + m[1][3] * m[1][3] + m[2][3] * m[2][3]),
+    });
+  }
+
+  std::shared_ptr<const Plan> run_frame(Pools& pools, bool& pooled, std::span<const uint8_t> vertexBytes,
+                                        uint32_t frameIndex) {
+    std::shared_ptr<retained::Frame> frame;
+    auto plan = seal_and_commit(frame, Stage::OpaqueDone, frameIndex);
+    if (plan == nullptr) {
+      return nullptr;
+    }
+    if (!pooled) {
+      pools = make_pools(vertexBytes, std::vector<uint8_t>(64u << 10, 0), {});
+      pooled = true;
+    } else {
+      write(pools.abuf, BlockOffset, g_block);
+    }
+    if (!run(pools, *plan)) {
+      return nullptr;
+    }
+    return plan;
   }
 
   [[nodiscard]] std::vector<uint32_t> block_words() const {
@@ -623,6 +786,203 @@ TEST_F(RetainedStreamoutGpu, WaterIsGeometryOnly) {
     EXPECT_EQ(vertices[v * vertex::Words + vertex::Aux], 0u) << v;
   }
   end_frame();
+}
+
+TEST_F(RetainedStreamoutGpu, PaletteMatchesDoubleReference) {
+  const Skin skin = make_skin();
+  const auto attrs = skin_attrs();
+  const auto vtxCount = static_cast<uint32_t>(skin.slots.size());
+  Pools pools;
+  bool pooled = false;
+  uint32_t slot = 1;
+  for (const std::array<double, 3>& base :
+       {std::array<double, 3>{10.0, 0.0, 0.0}, std::array<double, 3>{1.0e5, 0.0, 1.0e5}}) {
+    gx::g_gxState = {};
+    const Mat3x4<float> view = camera_view(base);
+    const Affine viewD = to_affine(view);
+    const Affine invView = inverse(viewD);
+    pose(view, base, 0.7);
+    ASSERT_FALSE(begin_frame(true, slot));
+    capture_palette(slot, skin.bytes, vtxCount, attrs, invView, true);
+    const auto plan = run_frame(pools, pooled, skin.bytes, FrameIndex + slot);
+    ASSERT_NE(plan, nullptr);
+    ASSERT_EQ(plan->variants.size(), 1u);
+    end_frame();
+
+    const std::vector<uint32_t> rec = read(pools.instances, slot * record::Bytes, record::Bytes);
+    ASSERT_EQ(rec.size(), record::Words);
+    EXPECT_NE(rec[record::Flags] & instance_flag::Palette, 0u);
+    EXPECT_EQ(rec[record::Flags] & instance_flag::NoNormal, 0u);
+    EXPECT_EQ(rec[record::PaletteMask], 0b11110u);
+    std::array<double, 3> origin{};
+    for (int r = 0; r < 3; ++r) {
+      origin[r] = std::bit_cast<float>(rec[record::World + r * 4 + 3]);
+      EXPECT_EQ(std::fmod(origin[r], 512.0), 0.0) << r;
+      EXPECT_EQ(rec[record::World + 12 + r], 0u) << r;
+      EXPECT_EQ(std::bit_cast<float>(rec[record::Normal + r * 4 + r]), 1.f) << r;
+      for (int c = 0; c < 3; ++c) {
+        EXPECT_EQ(std::bit_cast<float>(rec[record::World + r * 4 + c]), r == c ? 1.f : 0.f) << r << c;
+        EXPECT_EQ(rec[record::PrevWorld + r * 4 + c], rec[record::World + r * 4 + c]) << r << c;
+      }
+    }
+    const std::vector<uint32_t> bank =
+        read(pools.palettes, uint64_t{rec[record::PaletteFirst]} * 4, uint64_t{palette::PairWords} * 4);
+    const std::vector<uint32_t> blockWords = block_words();
+    const uint32_t matrices = blockWords[block::MatricesWord];
+    ASSERT_EQ(bank.size(), palette::PairWords);
+    for (uint32_t w = 0; w < palette::BankWords; ++w) {
+      EXPECT_EQ(bank[w], blockWords[matrices + w]) << w;
+      EXPECT_EQ(bank[palette::BankWords + w], bank[w]) << w;
+    }
+    const std::vector<uint32_t> vertices =
+        read(pools.vertices, uint64_t{rec[record::VertexFirst]} * vertex::Bytes, uint64_t{vtxCount} * vertex::Bytes);
+    ASSERT_EQ(vertices.size(), vtxCount * vertex::Words);
+    double worst = 0.0;
+    double worstNormal = 0.0;
+    for (uint32_t v = 0; v < vtxCount; ++v) {
+      const uint32_t* out = &vertices[v * vertex::Words];
+      const std::array<double, 3> p{origin[0] + std::bit_cast<float>(out[0]), origin[1] + std::bit_cast<float>(out[1]),
+                                    origin[2] + std::bit_cast<float>(out[2])};
+      const std::array<double, 3> got = transform(viewD, p);
+      const Affine pn = to_affine(gx::g_gxState.pnMtx[skin.slots[v]].pos);
+      const std::array<double, 3> raw{skin.positions[v][0], skin.positions[v][1], skin.positions[v][2]};
+      const std::array<double, 3> want = transform(pn, raw);
+      worst = std::max(worst, std::hypot(got[0] - want[0], got[1] - want[1], got[2] - want[2]));
+      ASSERT_NE(out[vertex::Aux] & vertex::HasNormal, 0u) << v;
+      const Affine nrm = multiply(invView, pn);
+      std::array<double, 3> n{};
+      for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+          n[r] += nrm.m[r][c] * skin.normals[v][c];
+        }
+      }
+      const double len = std::hypot(n[0], n[1], n[2]);
+      const std::array<float, 3> decoded = oct_decode(out[vertex::Normal]);
+      for (int c = 0; c < 3; ++c) {
+        worstNormal = std::max(worstNormal, std::abs(decoded[c] - n[c] / len));
+      }
+    }
+    EXPECT_LT(worst, 1e-4) << "base x " << base[0];
+    EXPECT_LT(worstNormal, 1e-3) << "base x " << base[0];
+    ++slot;
+  }
+}
+
+TEST_F(RetainedStreamoutGpu, PreviousPaletteRolls) {
+  const Skin skin = make_skin();
+  const auto attrs = skin_attrs();
+  const auto vtxCount = static_cast<uint32_t>(skin.slots.size());
+  const std::array<double, 3> base{10.0, 0.0, 0.0};
+  const Mat3x4<float> view = camera_view(base);
+  const Affine invView = inverse(to_affine(view));
+  constexpr uint32_t Slot = 4;
+  Pools pools;
+  bool pooled = false;
+  gx::g_gxState = {};
+  const auto step = [&](uint64_t frame, double t, bool drawn) {
+    pose(view, base, t);
+    EXPECT_FALSE(begin_frame(true, frame));
+    if (drawn) {
+      capture_palette(Slot, skin.bytes, vtxCount, attrs, invView, frame == 1);
+    }
+    const auto plan = run_frame(pools, pooled, skin.bytes, static_cast<uint32_t>(20 + frame));
+    EXPECT_NE(plan, nullptr);
+    end_frame();
+    return plan;
+  };
+  const auto state = [&] {
+    const std::vector<uint32_t> rec = read(pools.instances, Slot * record::Bytes, record::Bytes);
+    const std::vector<uint32_t> bank =
+        read(pools.palettes, uint64_t{rec[record::PaletteFirst]} * 4, uint64_t{palette::PairWords} * 4);
+    return std::pair{rec, bank};
+  };
+
+  ASSERT_NE(step(1, 0.0, true), nullptr);
+  const auto [rec1, bank1] = state();
+  ASSERT_EQ(bank1.size(), palette::PairWords);
+  EXPECT_EQ(rec1[record::StreamFrame], 21u);
+  EXPECT_EQ(rec1[record::PrevStreamFrame], 0u);
+  const std::vector<uint32_t> cur1(bank1.begin(), bank1.begin() + palette::BankWords);
+
+  ASSERT_NE(step(2, 0.5, true), nullptr);
+  const auto [rec2, bank2] = state();
+  EXPECT_EQ(rec2[record::StreamFrame], 22u);
+  EXPECT_EQ(rec2[record::PrevStreamFrame], 21u);
+  EXPECT_EQ(std::vector<uint32_t>(bank2.begin() + palette::BankWords, bank2.end()), cur1);
+  EXPECT_NE(std::vector<uint32_t>(bank2.begin(), bank2.begin() + palette::BankWords), cur1);
+
+  const auto still = step(3, 0.5, true);
+  ASSERT_NE(still, nullptr);
+  EXPECT_TRUE(still->header_only());
+  const auto [rec3, bank3] = state();
+  EXPECT_EQ(rec3[record::StreamFrame], 22u);
+  EXPECT_EQ(bank3, bank2);
+
+  ASSERT_NE(step(4, 0.5, false), nullptr);
+  ASSERT_NE(step(5, 1.0, true), nullptr);
+  const auto [rec5, bank5] = state();
+  EXPECT_EQ(rec5[record::StreamFrame], 25u);
+  EXPECT_EQ(rec5[record::PrevStreamFrame], 0u);
+  EXPECT_EQ(std::vector<uint32_t>(bank5.begin() + palette::BankWords, bank5.end()),
+            std::vector<uint32_t>(bank5.begin(), bank5.begin() + palette::BankWords));
+  EXPECT_NE(std::vector<uint32_t>(bank5.begin(), bank5.begin() + palette::BankWords),
+            std::vector<uint32_t>(bank2.begin(), bank2.begin() + palette::BankWords));
+}
+
+TEST_F(RetainedStreamoutGpu, ReoriginShiftsPrevBank) {
+  constexpr uint32_t Slot = 5;
+  Skin skin;
+  skin.bytes.assign(3 * PaletteStride, 0);
+  for (uint32_t v = 0; v < 3; ++v) {
+    const std::array<float, 3> p{static_cast<float>(v), static_cast<float>(v % 2), 0.f};
+    for (int c = 0; c < 3; ++c) {
+      put_be32(skin.bytes, v * PaletteStride + 1 + c * 4, std::bit_cast<uint32_t>(p[c]));
+    }
+    put_be32(skin.bytes, v * PaletteStride + 21, std::bit_cast<uint32_t>(1.f));
+  }
+  skin.bytes.resize((skin.bytes.size() + 3) / 4 * 4, 0);
+  const auto attrs = skin_attrs();
+  const Affine invView = to_affine(Mat3x4<float>{{1.f, 0.f, 0.f, 0.f}, {0.f, 1.f, 0.f, 0.f}, {0.f, 0.f, 1.f, 0.f}});
+  gx::g_gxState = {};
+  Pools pools;
+  bool pooled = false;
+  const auto step = [&](uint64_t frame, float x) {
+    gx::g_gxState.pnMtx[0].pos = {{1.f, 0.f, 0.f, x}, {0.f, 1.f, 0.f, 0.f}, {0.f, 0.f, 1.f, 0.f}};
+    gx::g_gxState.pnMtx[0].nrm = {{1.f, 0.f, 0.f, 0.f}, {0.f, 1.f, 0.f, 0.f}, {0.f, 0.f, 1.f, 0.f}};
+    EXPECT_FALSE(begin_frame(true, frame));
+    capture_palette(Slot, skin.bytes, 3, attrs, invView, frame == 1, GX_TRIANGLES);
+    const auto plan = run_frame(pools, pooled, skin.bytes, static_cast<uint32_t>(30 + frame));
+    EXPECT_NE(plan, nullptr);
+    end_frame();
+    return plan;
+  };
+  ASSERT_NE(step(1, 100.f), nullptr);
+  const std::vector<uint32_t> rec1 = read(pools.instances, Slot * record::Bytes, record::Bytes);
+  ASSERT_EQ(rec1.size(), record::Words);
+  EXPECT_EQ(std::bit_cast<float>(rec1[record::World + 3]), 0.f);
+  EXPECT_EQ(ordered_to_f32(rec1[record::CurAabb]), 100.f);
+  EXPECT_EQ(ordered_to_f32(rec1[record::CurAabb + 3]), 102.f);
+
+  const auto moved = step(2, 2000.f);
+  ASSERT_NE(moved, nullptr);
+  const uint32_t slot = Slot;
+  EXPECT_TRUE(std::ranges::any_of(moved->events,
+                                  [&](const PlanEvent& e) { return e.type == EventType::Moved && e.slot == slot; }));
+  const std::vector<uint32_t> rec2 = read(pools.instances, Slot * record::Bytes, record::Bytes);
+  EXPECT_EQ(std::bit_cast<float>(rec2[record::World + 3]), 2048.f);
+  EXPECT_EQ(std::bit_cast<float>(rec2[record::PrevWorld + 3]), 2048.f);
+  EXPECT_EQ(rec2[record::WorldFrame], 32u);
+  const std::vector<uint32_t> bank =
+      read(pools.palettes, uint64_t{rec2[record::PaletteFirst]} * 4, uint64_t{palette::PairWords} * 4);
+  ASSERT_EQ(bank.size(), palette::PairWords);
+  EXPECT_EQ(std::bit_cast<float>(bank[3]), -48.f);
+  EXPECT_EQ(std::bit_cast<float>(bank[palette::BankWords + 3]), -1948.f);
+  EXPECT_EQ(std::bit_cast<float>(bank[palette::BankWords + 0]), 1.f);
+  EXPECT_EQ(ordered_to_f32(rec2[record::CurAabb]), -48.f);
+  EXPECT_EQ(ordered_to_f32(rec2[record::CurAabb + 3]), -46.f);
+  EXPECT_EQ(ordered_to_f32(rec2[record::PrevAabb]), -1948.f);
+  EXPECT_EQ(ordered_to_f32(rec2[record::PrevAabb + 3]), -1946.f);
+  EXPECT_EQ(stats().paletteReorigin, 1u);
 }
 
 TEST_F(RetainedStreamoutGpu, DeclarationCompilesInGraph) {

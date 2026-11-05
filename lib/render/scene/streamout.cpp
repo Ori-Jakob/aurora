@@ -11,6 +11,8 @@
 #include "../../gfx/hash.hpp"
 #include "../../gfx/png_io.hpp"
 #include "../../gfx/resources.hpp"
+#include "../../gx/command_processor.hpp"
+#include "../../gx/vertex_fetch.hpp"
 #include "../../internal.hpp"
 #include "../../logging.hpp"
 #include "../../webgpu/gpu.hpp"
@@ -75,6 +77,15 @@ constexpr std::array<Access, PersistentCount> PersistentAccess{
 };
 constexpr uint16_t NoRef = UINT16_MAX;
 constexpr uint32_t StaticBits = retained::class_bit::Static | retained::class_bit::Immobile;
+constexpr uint32_t NoBank = UINT32_MAX;
+constexpr uint32_t NoPalette = UINT32_MAX;
+constexpr uint32_t MaxParityVertices = 65536;
+constexpr double FreshParityLimit = 1e-3;
+constexpr double NearPalette = 2000.0;
+constexpr uint32_t ReportedObjects = 8;
+constexpr std::array<std::string_view, 3> FamilyNames{"fresh", "skipped", "latched"};
+constexpr std::array<std::string_view, 3> BucketNames{"player", "near", "far"};
+static_assert(palette::Matrices == gx::MaxPnMtx);
 
 struct SlotState {
   uint32_t generation = 0;
@@ -99,6 +110,37 @@ struct SlotState {
   std::array<uint32_t, 2> clusters{};
   std::array<uint32_t, 2> clusterWant{};
   bool clusterQueued = false;
+  uint32_t bank = NoBank;
+  uint32_t usedMask = 0;
+  uint32_t seenMask = 0;
+  std::array<double, 3> origin{};
+};
+
+struct PaletteCapture {
+  std::array<gx::PnMtx, palette::Matrices> pn{};
+  Affine invView{};
+  uint32_t usedMask = 0;
+  uint32_t seenMask = 0;
+};
+
+enum class PaletteFamily : uint8_t { None, Fresh, Skipped, Latched };
+
+struct PalettePick {
+  uint32_t bank = NoBank;
+  bool fresh = false;
+  std::array<double, 3> origin{};
+  std::array<float, 3> delta{};
+  std::array<Affine, palette::Matrices> world{};
+  std::array<uint32_t, palette::BankWords> words{};
+};
+
+struct PaletteCounts {
+  uint64_t streamed = 0;
+  uint64_t skipped = 0;
+  uint64_t latched = 0;
+  uint64_t reorigin = 0;
+  uint64_t shared = 0;
+  uint64_t oob = 0;
 };
 
 struct Variant {
@@ -141,6 +183,9 @@ struct Pending {
   std::array<uint32_t, 12> uv{};
   std::array<uint32_t, 2> clusters{};
   double eye = 0.0;
+  uint64_t objectId = 0;
+  uint32_t palette = NoPalette;
+  uint32_t parity = NoPalette;
 };
 
 struct Commit {
@@ -148,12 +193,16 @@ struct Commit {
   SlotState next;
   Tlsf::BlockId freeVtx = NoBlock;
   Tlsf::BlockId freeIdx = NoBlock;
+  uint32_t freeBank = NoBank;
+  uint32_t history = NoPalette;
+  uint64_t objectId = 0;
 };
 
 struct Freed {
   uint32_t slot = NoSlot;
   Tlsf::BlockId vtx = NoBlock;
   Tlsf::BlockId idx = NoBlock;
+  uint32_t bank = NoBank;
   bool recordSent = false;
 };
 
@@ -169,12 +218,16 @@ struct FrameUse {
   uint32_t pieces = 0;
   uint32_t streamVertices = 0;
   uint32_t newVertices = 0;
+  uint32_t palettes = 0;
 };
 
 struct Tentative {
   std::shared_ptr<Plan> plan;
   std::vector<Tlsf::BlockId> vtxAllocs;
   std::vector<Tlsf::BlockId> idxAllocs;
+  std::vector<uint32_t> bankAllocs;
+  std::vector<PalettePick> palettes;
+  PaletteCounts paletteCounts;
   std::vector<Commit> commits;
   std::vector<Freed> frees;
   uint32_t captureOnly = 0;
@@ -203,6 +256,9 @@ struct Pick {
   Tlsf::BlockId vtxBlock = NoBlock;
   Tlsf::BlockId idxBlock = NoBlock;
   bool newAlloc = false;
+  uint32_t palette = NoPalette;
+  uint32_t paletteWord = RigidMatrix;
+  PaletteFamily family = PaletteFamily::None;
 };
 
 struct Local {
@@ -218,6 +274,12 @@ std::optional<Tlsf> g_vertexPool;
 std::optional<Tlsf> g_indexPool;
 uint64_t g_vertexPoolBytes = VertexPoolBytes;
 std::vector<Pending> g_pending;
+std::vector<PaletteCapture> g_palettes;
+std::vector<ParityEntry> g_paritySnaps;
+uint32_t g_parityVertices = 0;
+std::vector<uint32_t> g_freeBanks;
+std::vector<std::array<Affine, palette::Matrices>> g_bankWorld;
+std::unordered_map<uint64_t, uint64_t> g_paletteObjects;
 std::vector<Variant> g_variants;
 uint16_t g_lastVariant = NoVariant;
 bool g_warnedVariants = false;
@@ -312,6 +374,21 @@ struct CheckResults {
 std::mutex g_checkMutex;
 CheckResults g_check;
 
+struct ParityBucket {
+  std::vector<float> errors;
+  double max = 0.0;
+};
+
+struct ParityResults {
+  std::array<std::array<ParityBucket, BucketNames.size()>, FamilyNames.size()> buckets;
+  uint64_t entries = 0;
+  uint64_t oob = 0;
+  uint64_t missing = 0;
+  uint64_t failures = 0;
+  double skippedRatio = 0.0;
+};
+ParityResults g_parity;
+
 constexpr uint32_t ceil_div(uint32_t value, uint32_t divisor) noexcept { return (value + divisor - 1) / divisor; }
 
 uint32_t f32_bits(float value) noexcept { return std::bit_cast<uint32_t>(value); }
@@ -346,6 +423,20 @@ uint32_t derived_index_count(uint8_t prim, uint32_t vtxCount) noexcept {
   }
 }
 
+void reset_banks() {
+  g_freeBanks.resize(PalettePairs);
+  for (uint32_t i = 0; i < PalettePairs; ++i) {
+    g_freeBanks[i] = PalettePairs - 1 - i;
+  }
+}
+
+void clear_frame_captures() noexcept {
+  g_pending.clear();
+  g_palettes.clear();
+  g_paritySnaps.clear();
+  g_parityVertices = 0;
+}
+
 void allocate() {
   if (g_allocated) {
     return;
@@ -354,6 +445,8 @@ void allocate() {
   g_vertexPool.emplace(g_vertexPoolBytes, PoolGranule);
   g_indexPool.emplace(IndexPoolBytes, PoolGranule);
   g_pending.reserve(retained::MaxEntries);
+  g_bankWorld.assign(PalettePairs, {});
+  reset_banks();
   g_allocated = true;
 }
 
@@ -362,6 +455,11 @@ void release_state() noexcept {
   g_vertexPool.reset();
   g_indexPool.reset();
   g_pending = {};
+  g_palettes = {};
+  g_paritySnaps = {};
+  g_parityVertices = 0;
+  g_freeBanks = {};
+  g_bankWorld = {};
   g_freed = {};
   g_clusterDirty = {};
   g_tentative = {};
@@ -405,6 +503,7 @@ void clear_stream_state() noexcept {
   if (g_allocated) {
     g_vertexPool.emplace(g_vertexPoolBytes, PoolGranule);
     g_indexPool.emplace(IndexPoolBytes, PoolGranule);
+    reset_banks();
   }
   g_freed.clear();
   g_clusterDirty.clear();
@@ -601,8 +700,10 @@ void undo_allocations(Tentative& t) noexcept {
   for (const Tlsf::BlockId block : t.idxAllocs) {
     g_indexPool->free(block);
   }
+  g_freeBanks.insert(g_freeBanks.end(), t.bankAllocs.rbegin(), t.bankAllocs.rend());
   t.vtxAllocs.clear();
   t.idxAllocs.clear();
+  t.bankAllocs.clear();
 }
 
 void rollback() noexcept {
@@ -631,6 +732,79 @@ bool check_frame() noexcept {
          g_hintFrame <= g_checkLast && (g_hintFrame - g_checkFirst) % CheckEvery == 0;
 }
 
+uint32_t add_palette(const Capture& c, const SlotState& st) {
+  PaletteCapture& pc = g_palettes.emplace_back();
+  std::copy_n(gx::g_gxState.pnMtx.begin(), palette::Matrices, pc.pn.begin());
+  pc.invView = *c.invView;
+  if (st.streamed && st.bank != NoBank && !c.newGeometry && st.vertexCount == c.vtxCount) {
+    pc.usedMask = st.usedMask;
+    pc.seenMask = st.seenMask;
+  } else {
+    const uint32_t offset = c.attrs[GX_VA_PNMTXIDX].offset;
+    for (uint32_t v = 0; v < c.vtxCount; ++v) {
+      const uint32_t slot = c.records[size_t{v} * c.stride + offset] / 3u;
+      pc.usedMask |= 1u << std::min(slot, palette::LastSlot);
+      pc.seenMask |= slot < palette::MaskSlots ? 1u << slot : palette::MaskOverflow;
+    }
+  }
+  return static_cast<uint32_t>(g_palettes.size() - 1);
+}
+
+uint32_t position_bytes(uint8_t compType) noexcept {
+  return compType == GX_U8 || compType == GX_S8 ? 1 : compType == GX_U16 || compType == GX_S16 ? 2 : 4;
+}
+
+uint32_t add_parity(const Capture& c, const PaletteCapture& pc) {
+  if (!check_frame() || g_seals[0].sealed || c.gpuArrays || g_parityVertices + c.vtxCount > MaxParityVertices) {
+    return NoPalette;
+  }
+  ParityEntry snap{
+      .slot = c.slot,
+      .generation = c.slotGeneration,
+      .objectId = c.objectId,
+      .player = (c.classBits & retained::class_bit::Player) != 0,
+      .seenMask = pc.seenMask,
+      .pos = c.attrs[GX_VA_POS],
+      .pnmtx = c.attrs[GX_VA_PNMTXIDX],
+      .stride = c.stride,
+      .vtxCount = c.vtxCount,
+  };
+  const size_t recordBytes = size_t{c.vtxCount} * c.stride;
+  snap.records.assign(c.records.begin(), c.records.begin() + static_cast<std::ptrdiff_t>(recordBytes));
+  for (uint32_t i = 0; i < palette::Matrices; ++i) {
+    snap.pn[i] = pc.pn[i].pos;
+  }
+  if (snap.pos.attrType == GX_INDEX8 || snap.pos.attrType == GX_INDEX16) {
+    const uint32_t idxBytes = snap.pos.attrType == GX_INDEX8 ? 1 : 2;
+    if (snap.pos.offset + idxBytes > c.stride) {
+      return NoPalette;
+    }
+    uint32_t lo = UINT32_MAX;
+    uint32_t hi = 0;
+    for (uint32_t v = 0; v < c.vtxCount; ++v) {
+      const uint8_t* at = c.records.data() + size_t{v} * c.stride + snap.pos.offset;
+      const uint32_t index = idxBytes == 1 ? at[0] : (uint32_t{at[0]} << 8) | at[1];
+      lo = std::min(lo, index);
+      hi = std::max(hi, index);
+    }
+    const gx::AttrArray& array = gx::g_gxState.arrays[GX_VA_POS];
+    const uint64_t end = uint64_t{hi} * snap.pos.stride + uint64_t{position_bytes(snap.pos.compType)} * snap.pos.cnt;
+    if (c.vtxCount == 0 || end > array.size) {
+      return NoPalette;
+    }
+    snap.sliceFirst = lo * snap.pos.stride;
+    const auto size = static_cast<uint32_t>(end - snap.sliceFirst);
+    const std::span<const uint8_t> slice = gx::fifo::array_bytes(array, snap.sliceFirst, size);
+    if (slice.size() != size) {
+      return NoPalette;
+    }
+    snap.slice.assign(slice.begin(), slice.end());
+  }
+  g_parityVertices += c.vtxCount;
+  g_paritySnaps.push_back(std::move(snap));
+  return static_cast<uint32_t>(g_paritySnaps.size() - 1);
+}
+
 class BlockWriter {
 public:
   std::vector<uint32_t> words;
@@ -645,6 +819,7 @@ public:
 
 struct BuildInput {
   std::vector<Pick> picks;
+  const std::vector<PalettePick>* palettes = nullptr;
   std::vector<Freed> frees;
   std::vector<uint32_t> clusterSlots;
   CameraState camera;
@@ -667,6 +842,7 @@ struct BuildOutput {
   uint32_t idxChunks = 0;
   uint32_t pieces = 0;
   uint32_t vertices = 0;
+  uint32_t sharedPalettes = 0;
 };
 
 void record_words(const Pending& p, const Pick& pick, uint32_t frameIndex, const SlotState& prev, uint32_t flags,
@@ -680,7 +856,7 @@ void record_words(const Pending& p, const Pick& pick, uint32_t frameIndex, const
   out[record::VertexCount] = p.vtxCount;
   out[record::IndexFirst] = pick.indexFirst;
   out[record::IndexCount] = p.indexCount;
-  out[record::PaletteFirst] = RigidMatrix;
+  out[record::PaletteFirst] = pick.paletteWord;
   out[record::Material] = p.material;
   out[record::WorldFrame] = frameIndex;
   out[record::Group] = NoGroup;
@@ -807,6 +983,21 @@ BuildOutput build_block(const BuildInput& in) {
         out.events.push_back({EventType::ClustersChanged, p.slot});
       }
     }
+    if (p.palette != NoPalette) {
+      if (pick.stream) {
+        const PalettePick& pp = (*in.palettes)[pick.palette];
+        const PaletteCapture& pc = g_palettes[p.palette];
+        next.bank = pp.bank;
+        next.origin = pp.origin;
+        next.usedMask = pc.usedMask;
+        next.seenMask = pc.seenMask;
+        commit.history = pick.palette;
+        commit.objectId = p.objectId;
+      }
+    } else if (prev.bank != NoBank) {
+      commit.freeBank = prev.bank;
+      next.bank = NoBank;
+    }
     if (pick.stream) {
       if (prev.streamed) {
         out.events.push_back({EventType::Restreamed, p.slot});
@@ -840,10 +1031,26 @@ BuildOutput build_block(const BuildInput& in) {
   std::vector<uint32_t> vtxChunks;
   std::vector<uint32_t> idxChunks;
   std::vector<uint32_t> rolls;
+  std::vector<uint32_t> matrices;
+  matrices.reserve((in.palettes != nullptr ? in.palettes->size() : 0) * palette::BankWords);
+  uint32_t lastMatrices = RigidMatrix;
   for (size_t i = 0; i < streamed.size(); ++i) {
     const Pick& pick = *streamed[i];
     const Pending& p = g_pending[pick.pending];
     const auto pieceIndex = static_cast<uint32_t>(i);
+    const PalettePick* pp = pick.palette != NoPalette ? &(*in.palettes)[pick.palette] : nullptr;
+    uint32_t matrixWord = RigidMatrix;
+    if (pp != nullptr) {
+      if (lastMatrices != RigidMatrix &&
+          std::equal(pp->words.begin(), pp->words.end(), matrices.begin() + lastMatrices)) {
+        matrixWord = lastMatrices;
+        ++out.sharedPalettes;
+      } else {
+        matrixWord = static_cast<uint32_t>(matrices.size());
+        matrices.insert(matrices.end(), pp->words.begin(), pp->words.end());
+        lastMatrices = matrixWord;
+      }
+    }
     std::array<uint32_t, block::PieceWords> piece{};
     std::memcpy(piece.data(), &p.immediates, sizeof(p.immediates));
     piece[block::PieceInstance] = p.slot;
@@ -853,7 +1060,7 @@ BuildOutput build_block(const BuildInput& in) {
     piece[block::PieceIndexCount] = p.indexCount;
     piece[block::PiecePrim] = p.prim;
     piece[block::PieceIdxByte] = p.idxByte;
-    piece[block::PieceMatrixWord] = RigidMatrix;
+    piece[block::PieceMatrixWord] = matrixWord;
     piece[block::PieceFlags] = p.pieceFlags;
     pieces.insert(pieces.end(), piece.begin(), piece.end());
     const uint32_t chunkStart = static_cast<uint32_t>(vtxChunks.size() / block::ChunkWords);
@@ -878,8 +1085,15 @@ BuildOutput build_block(const BuildInput& in) {
         idxChunks.push_back(first);
       }
     }
-    const std::array<uint32_t, block::RollJobWords> roll{
-        p.slot, pick.topology ? block::RollFresh : 0u, pieceIndex, RigidMatrix, 0, 0, 0, 0};
+    std::array<uint32_t, block::RollJobWords> roll{p.slot, pick.topology ? block::RollFresh : 0u, pieceIndex,
+                                                   RigidMatrix};
+    if (pp != nullptr) {
+      roll[block::RollFlags] = block::RollPalette | (pp->fresh ? block::RollFresh : 0u);
+      roll[block::RollPaletteWord] = pick.paletteWord;
+      for (uint32_t k = 0; k < 3; ++k) {
+        roll[block::RollOriginDelta + k] = f32_bits(pp->delta[k]);
+      }
+    }
     rolls.insert(rolls.end(), roll.begin(), roll.end());
     out.vertices += p.vtxCount;
   }
@@ -895,6 +1109,7 @@ BuildOutput build_block(const BuildInput& in) {
   place(block::VtxChunksWord, vtxChunks);
   place(block::IdxChunksWord, idxChunks);
   place(block::RollJobsWord, rolls);
+  place(block::MatricesWord, matrices);
   const auto dataWord = static_cast<uint32_t>(words.size() + jobs.size() * block::WriteJobWords);
   words[block::WriteJobsWord] = static_cast<uint32_t>(words.size());
   for (const Job& job : jobs) {
@@ -903,7 +1118,6 @@ BuildOutput build_block(const BuildInput& in) {
   words.insert(words.end(), writer.data.begin(), writer.data.end());
   words[block::Frame] = in.frameIndex;
   words[block::WriteJobCount] = static_cast<uint32_t>(jobs.size());
-  words[block::MatricesWord] = 0;
   words[block::PieceCount] = out.pieces;
   words[block::VtxChunkCount] = static_cast<uint32_t>(vtxChunks.size() / block::ChunkWords);
   words[block::IdxChunkCount] = static_cast<uint32_t>(idxChunks.size() / block::ChunkWords);
@@ -930,11 +1144,14 @@ CameraState current_camera() noexcept {
   return camera;
 }
 
-std::shared_ptr<const CheckRequest> make_check(uint32_t frameIndex, const std::vector<Commit>& commits) {
+std::shared_ptr<const CheckRequest> make_check(uint32_t frameIndex, const std::vector<Commit>& commits,
+                                               std::vector<ParityEntry> parity) {
   auto request = std::make_shared<CheckRequest>();
   request->frame = frameIndex;
   request->wire = !g_wirePath.empty();
   request->proj = detail::live_scene_hints().mainCamera.proj;
+  request->view = to_affine(detail::live_scene_hints().mainCamera.view);
+  request->parity = std::move(parity);
   std::unordered_map<uint32_t, const SlotState*> next;
   for (const Commit& commit : commits) {
     next[commit.slot] = &commit.next;
@@ -956,6 +1173,95 @@ std::shared_ptr<const CheckRequest> make_check(uint32_t frameIndex, const std::v
                                                             instance_flag::Palette)) == 0});
   }
   return request;
+}
+
+std::vector<ParityEntry> parity_entries(const std::vector<Pick>& picks) {
+  std::vector<ParityEntry> out;
+  for (const Pick& pick : picks) {
+    const Pending& p = g_pending[pick.pending];
+    if (p.parity == NoPalette || pick.family == PaletteFamily::None) {
+      continue;
+    }
+    ParityEntry& entry = out.emplace_back(std::move(g_paritySnaps[p.parity]));
+    entry.family = pick.family == PaletteFamily::Fresh     ? ParityFamily::Fresh
+                   : pick.family == PaletteFamily::Skipped ? ParityFamily::Skipped
+                                                           : ParityFamily::Latched;
+  }
+  return out;
+}
+
+bool used_slot(uint32_t mask, uint32_t slot) noexcept { return ((mask >> slot) & 1) != 0; }
+
+std::array<double, 3> snap_origin(const Affine& world) noexcept {
+  std::array<double, 3> out{};
+  for (int r = 0; r < 3; ++r) {
+    out[r] = std::round(world.m[r][3] / palette::OriginGrid) * palette::OriginGrid;
+  }
+  return out;
+}
+
+void palette_worlds(const PaletteCapture& pc, std::array<Affine, palette::Matrices>& out) noexcept {
+  for (uint32_t i = 0; i < palette::Matrices; ++i) {
+    if (used_slot(pc.usedMask, i)) {
+      out[i] = multiply(pc.invView, to_affine(pc.pn[i].pos));
+    }
+  }
+}
+
+bool palette_moved(const PaletteCapture& pc, const SlotState& st, const std::array<Affine, palette::Matrices>& world,
+                   double eye) noexcept {
+  if (pc.usedMask != st.usedMask) {
+    return true;
+  }
+  const auto& last = g_bankWorld[st.bank];
+  for (uint32_t i = 0; i < palette::Matrices; ++i) {
+    if (used_slot(pc.usedMask, i) && retained::world_moved(world[i], last[i], eye)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool needs_reorigin(const std::array<Affine, palette::Matrices>& world, uint32_t mask,
+                    const std::array<double, 3>& origin) noexcept {
+  for (uint32_t i = 0; i < palette::Matrices; ++i) {
+    for (int r = 0; r < 3 && used_slot(mask, i); ++r) {
+      if (std::abs(world[i].m[r][3] - origin[r]) > palette::ReoriginDistance) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void bank_words(const PaletteCapture& pc, const std::array<Affine, palette::Matrices>& world,
+                const std::array<double, 3>& origin, std::array<uint32_t, palette::BankWords>& out) noexcept {
+  out.fill(0);
+  const auto& inv = pc.invView.m;
+  for (uint32_t i = 0; i < palette::Matrices; ++i) {
+    if (!used_slot(pc.usedMask, i)) {
+      continue;
+    }
+    uint32_t* pos = &out[i * palette::MatrixWords];
+    uint32_t* nrm = &out[palette::NormalWord + i * palette::MatrixWords];
+    const Affine n = to_affine(pc.pn[i].nrm);
+    for (int r = 0; r < 3; ++r) {
+      for (int c = 0; c < 3; ++c) {
+        pos[r * 4 + c] = f32_bits(static_cast<float>(world[i].m[r][c]));
+        nrm[r * 4 + c] =
+            f32_bits(static_cast<float>(inv[r][0] * n.m[0][c] + inv[r][1] * n.m[1][c] + inv[r][2] * n.m[2][c]));
+      }
+      pos[r * 4 + 3] = f32_bits(static_cast<float>(world[i].m[r][3] - origin[r]));
+    }
+  }
+}
+
+Affine origin_world(const std::array<double, 3>& origin) noexcept {
+  Affine out = identity_affine();
+  for (int r = 0; r < 3; ++r) {
+    out.m[r][3] = origin[r];
+  }
+  return out;
 }
 
 bool place_piece(const Pending& p, const SlotState& st, bool countsChanged, Pick& pick, Tentative& t) {
@@ -985,10 +1291,59 @@ bool place_piece(const Pending& p, const SlotState& st, bool countsChanged, Pick
   return true;
 }
 
+void plan_palette(uint32_t index, const SlotState& st, const std::array<Affine, palette::Matrices>& world,
+                  uint32_t bank, bool newBank, bool wanted, bool fresh, Pick& pick, Tentative& t) {
+  Pending& p = g_pending[index];
+  const PaletteCapture& pc = g_palettes[p.palette];
+  std::array<double, 3> origin = st.origin;
+  if (pick.stream) {
+    PalettePick& pp = t.palettes.emplace_back();
+    pp.bank = bank;
+    pp.world = world;
+    const Affine& first = world[pc.usedMask != 0 ? std::countr_zero(pc.usedMask) : 0];
+    if (newBank || !st.streamed) {
+      origin = snap_origin(first);
+    } else if (needs_reorigin(world, pc.usedMask, origin)) {
+      const std::array<double, 3> moved = snap_origin(first);
+      if (moved != origin) {
+        for (int k = 0; k < 3; ++k) {
+          pp.delta[k] = static_cast<float>(origin[k] - moved[k]);
+        }
+        origin = moved;
+        ++t.paletteCounts.reorigin;
+      }
+    }
+    pp.origin = origin;
+    pp.fresh = fresh || newBank;
+    bank_words(pc, world, origin, pp.words);
+    pick.palette = static_cast<uint32_t>(t.palettes.size() - 1);
+    pick.family = PaletteFamily::Fresh;
+    ++t.paletteCounts.streamed;
+    t.paletteCounts.oob += (pc.seenMask >> palette::Matrices) != 0 ? 1 : 0;
+  } else if (!wanted) {
+    const bool immobile = (p.classBits & retained::class_bit::Immobile) != 0;
+    pick.family = immobile ? PaletteFamily::Latched : PaletteFamily::Skipped;
+    ++(immobile ? t.paletteCounts.latched : t.paletteCounts.skipped);
+  }
+  pick.paletteWord = (pick.stream ? bank : st.bank) * palette::PairWords;
+  p.world = origin_world(origin);
+  if (p.parity != NoPalette) {
+    ParityEntry& snap = g_paritySnaps[p.parity];
+    snap.origin = origin;
+    snap.eye = p.eye;
+    for (uint32_t i = 0; i < palette::Matrices; ++i) {
+      const auto& m = world[i].m;
+      snap.slotDistance[i] =
+          used_slot(pc.usedMask, i) ? std::sqrt(m[0][3] * m[0][3] + m[1][3] * m[1][3] + m[2][3] * m[2][3]) : 0.0;
+    }
+  }
+}
+
 void plan_pieces(Tentative& t, bool overrun, bool cut, bool epochChanged, std::vector<Pick>& picks) {
   uint32_t streamVertices = g_frameUse.streamVertices;
   uint32_t newVertices = g_frameUse.newVertices;
   uint32_t pieces = g_frameUse.pieces;
+  uint32_t palettes = g_frameUse.palettes;
   for (int pass = 0; pass < 3; ++pass) {
     for (uint32_t i = 0; i < g_pending.size(); ++i) {
       const Pending& p = g_pending[i];
@@ -1000,7 +1355,17 @@ void plan_pieces(Tentative& t, bool overrun, bool cut, bool epochChanged, std::v
       const SlotState& st = g_slots[p.slot];
       const bool deformed = (p.classBits & retained::class_bit::CpuDeformed) != 0;
       const bool countsChanged = st.streamed && (st.vertexCount != p.vtxCount || st.indexCount != p.indexCount);
-      bool stream = !st.streamed || p.newGeometry || deformed || p.gpuArrays || countsChanged;
+      const bool isPalette = p.palette != NoPalette;
+      std::array<Affine, palette::Matrices> world{};
+      bool paletteMoved = false;
+      if (isPalette) {
+        const PaletteCapture& pc = g_palettes[p.palette];
+        palette_worlds(pc, world);
+        const bool immobile = (p.classBits & retained::class_bit::Immobile) != 0;
+        paletteMoved = st.bank == NoBank || (!immobile && palette_moved(pc, st, world, p.eye));
+      }
+      bool stream = !st.streamed || p.newGeometry || deformed || p.gpuArrays || countsChanged || paletteMoved;
+      const bool wanted = stream;
       const bool topology = !st.streamed || p.newGeometry || countsChanged;
       t.captureOnly += only ? 1 : 0;
       const auto defer = [&](uint64_t& counter) {
@@ -1029,27 +1394,52 @@ void plan_pieces(Tentative& t, bool overrun, bool cut, bool epochChanged, std::v
       if (stream && !only) {
         const bool fresh = !st.streamed && category_static(p);
         if (pieces >= MaxPiecesPerFrame || streamVertices + p.vtxCount > MaxStreamVerticesPerFrame ||
-            (fresh && newVertices + p.vtxCount > MaxNewVerticesPerFrame)) {
+            (fresh && newVertices + p.vtxCount > MaxNewVerticesPerFrame) ||
+            (isPalette && palettes >= MaxPaletteDrawsPerFrame)) {
           defer(g_stats.capDeferred);
         }
       }
       Pick pick{.pending = i};
+      uint32_t bank = st.bank;
+      bool newBank = false;
+      if (stream && isPalette && bank == NoBank) {
+        if (g_freeBanks.empty()) {
+          defer(g_stats.poolFull);
+        } else {
+          bank = g_freeBanks.back();
+          g_freeBanks.pop_back();
+          t.bankAllocs.push_back(bank);
+          newBank = true;
+        }
+      }
       if (stream && !place_piece(p, st, countsChanged, pick, t)) {
         defer(g_stats.poolFull);
+        if (newBank) {
+          g_freeBanks.push_back(bank);
+          t.bankAllocs.pop_back();
+          bank = st.bank;
+          newBank = false;
+        }
       }
-      if (!stream && !st.streamed) {
+      if (!stream && (!st.streamed || (isPalette && st.bank == NoBank))) {
         continue;
       }
       if (stream) {
         ++pieces;
         streamVertices += only ? 0 : p.vtxCount;
         newVertices += !st.streamed && category_static(p) && !only ? p.vtxCount : 0;
+        palettes += isPalette && !only ? 1 : 0;
       } else {
         pick.vertexFirst = st.vertexFirst;
         pick.indexFirst = st.indexFirst;
       }
       pick.stream = stream;
       pick.topology = stream && topology;
+      const bool seenLast = st.lastSeen != Never && st.lastSeen + 1 == g_hintFrame;
+      if (isPalette) {
+        const bool fresh = pick.topology || cut || epochChanged || p.teleport || !seenLast;
+        plan_palette(i, st, world, bank, newBank, wanted, fresh, pick, t);
+      }
       const bool flagsChanged = st.flags != p.flags || st.material != p.material;
       pick.full = !st.recordSent || pick.newAlloc || flagsChanged;
       const bool moved =
@@ -1057,13 +1447,12 @@ void plan_pieces(Tentative& t, bool overrun, bool cut, bool epochChanged, std::v
       pick.moved = !pick.full && st.worldSent && moved;
       pick.uv = !pick.full && p.uv != st.uv;
       pick.clusters = !pick.full && st.recordSent && p.clusters != st.clusters;
-      const bool seenLast = st.lastSeen != Never && st.lastSeen + 1 == g_hintFrame;
-      pick.prevValid = st.worldSent && seenLast && !cut && !epochChanged && !p.teleport;
+      pick.prevValid = !isPalette && st.worldSent && seenLast && !cut && !epochChanged && !p.teleport;
       t.movedLatched += pick.moved && p.latched ? 1 : 0;
       picks.push_back(pick);
     }
   }
-  t.use = {.pieces = pieces, .streamVertices = streamVertices, .newVertices = newVertices};
+  t.use = {.pieces = pieces, .streamVertices = streamVertices, .newVertices = newVertices, .palettes = palettes};
 }
 
 void commit_plan(Tentative& t) {
@@ -1073,6 +1462,15 @@ void commit_plan(Tentative& t) {
     }
     if (commit.freeIdx != NoBlock) {
       g_indexPool->free(commit.freeIdx);
+    }
+    if (commit.freeBank != NoBank) {
+      g_freeBanks.push_back(commit.freeBank);
+    }
+    if (commit.history != NoPalette) {
+      g_bankWorld[commit.next.bank] = t.palettes[commit.history].world;
+      if (g_checkMode) {
+        g_paletteObjects[commit.objectId] += commit.next.vertexCount;
+      }
     }
     SlotState& st = g_slots[commit.slot];
     if (st.staticPending && !commit.next.staticPending) {
@@ -1107,6 +1505,9 @@ void commit_plan(Tentative& t) {
     if (freed.idx != NoBlock) {
       g_indexPool->free(freed.idx);
     }
+    if (freed.bank != NoBank) {
+      g_freeBanks.push_back(freed.bank);
+    }
   }
   if (!t.frees.empty()) {
     g_liveChanged = true;
@@ -1120,6 +1521,12 @@ void commit_plan(Tentative& t) {
   g_frameUse = t.use;
   ++g_stats.committed;
   g_stats.pieces += t.pieces;
+  g_stats.paletteStreamed += t.paletteCounts.streamed;
+  g_stats.paletteSkipped += t.paletteCounts.skipped;
+  g_stats.paletteLatched += t.paletteCounts.latched;
+  g_stats.paletteReorigin += t.paletteCounts.reorigin;
+  g_stats.paletteShared += t.paletteCounts.shared;
+  g_stats.paletteOob += t.paletteCounts.oob;
   if (t.plan->late) {
     ++g_stats.latePlans;
     g_stats.latePieces += t.pieces;
@@ -1358,6 +1765,89 @@ std::optional<std::array<double, 2>> project(const std::array<double, 3>& view, 
                                (0.5 - clip[1] / clip[3] * 0.5) * WireHeight};
 }
 
+double length3(const std::array<double, 3>& v) noexcept { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); }
+
+void verify_parity(const CheckRequest& request, const CheckLayout& layout, const uint8_t* bytes) {
+  const auto word = [&](uint64_t byteOffset) {
+    uint32_t value;
+    std::memcpy(&value, bytes + byteOffset, sizeof(value));
+    return value;
+  };
+  const auto fail = [&](std::string message) {
+    if (g_parity.failures++ < MaxCheckErrors) {
+      Log.error("Retained: parity frame {}: {}", request.frame, message);
+    }
+  };
+  std::unordered_map<uint32_t, size_t> rangeOf;
+  for (size_t i = 0; i < layout.ranges; ++i) {
+    rangeOf.emplace(request.ranges[i].slot, i);
+  }
+  for (const ParityEntry& entry : request.parity) {
+    const auto it = rangeOf.find(entry.slot);
+    if (it == rangeOf.end() || request.ranges[it->second].generation != entry.generation ||
+        request.ranges[it->second].vertexCount != entry.vtxCount) {
+      ++g_parity.missing;
+      continue;
+    }
+    const size_t range = it->second;
+    const uint64_t rec = uint64_t{entry.slot} * record::Bytes;
+    const bool fresh = entry.family == ParityFamily::Fresh;
+    if (fresh && word(rec + record::StreamFrame * 4) != request.frame) {
+      fail(fmt::format("palette slot {} streamed at frame {}", entry.slot, word(rec + record::StreamFrame * 4)));
+      continue;
+    }
+    if (fresh && word(rec + record::PaletteMask * 4) != entry.seenMask) {
+      fail(fmt::format("palette slot {} observed slot mask {:#x}, the scan found {:#x}", entry.slot,
+                       word(rec + record::PaletteMask * 4), entry.seenMask));
+    }
+    ++g_parity.entries;
+    gx::ShaderConfig config{};
+    config.vtxStride = entry.stride;
+    config.attrs[GX_VA_POS] = entry.pos;
+    config.attrs[GX_VA_PNMTXIDX] = entry.pnmtx;
+    gx::vertex_fetch::CpuVertexSource source{.records = entry.records};
+    source.arrays[0] = {.bytes = entry.slice, .first = entry.sliceFirst};
+    auto& family = g_parity.buckets[static_cast<size_t>(entry.family)];
+    for (uint32_t v = 0; v < entry.vtxCount; ++v) {
+      gx::vertex_fetch::CpuVertex raw;
+      if (!gx::vertex_fetch::decode_vertex(config, source, v, raw)) {
+        fail(fmt::format("palette slot {} vertex {} does not decode", entry.slot, v));
+        break;
+      }
+      if (raw.pnMtx > palette::LastSlot) {
+        ++g_parity.oob;
+        continue;
+      }
+      const Affine pn = to_affine(entry.pn[raw.pnMtx]);
+      const std::array<double, 3> local{raw.pos[0], raw.pos[1], raw.pos[2]};
+      const std::array<double, 3> want = transform(pn, local);
+      const uint64_t at = layout.vertexOffsets[range] + uint64_t{v} * vertex::Bytes;
+      std::array<double, 3> p{};
+      for (int k = 0; k < 3; ++k) {
+        p[k] = entry.origin[k] + static_cast<double>(bits_f32(word(at + k * 4)));
+      }
+      const std::array<double, 3> got = transform(request.view, p);
+      const double err = length3({got[0] - want[0], got[1] - want[1], got[2] - want[2]});
+      ParityBucket& bucket = family[entry.player ? 0 : length3(want) < NearPalette ? 1 : 2];
+      bucket.errors.push_back(static_cast<float>(err));
+      bucket.max = std::max(bucket.max, err);
+      if (entry.family != ParityFamily::Skipped) {
+        continue;
+      }
+      double tolerance = 1e-4 + 1e-6 * std::max(entry.slotDistance[raw.pnMtx], entry.eye) + FreshParityLimit;
+      for (int c = 0; c < 3; ++c) {
+        const double column = length3({pn.m[0][c], pn.m[1][c], pn.m[2][c]});
+        tolerance += 1e-5 * std::max(1.0, column) * std::abs(local[c]);
+      }
+      g_parity.skippedRatio = std::max(g_parity.skippedRatio, err / tolerance);
+      if (err > tolerance) {
+        fail(fmt::format("skipped palette slot {} vertex {} is {:.6f} u off, over its {:.6f} u tolerance", entry.slot,
+                         v, err, tolerance));
+      }
+    }
+  }
+}
+
 void verify(const CheckRequest& request, const CheckLayout& layout, const uint8_t* bytes) {
   const auto word = [&](uint64_t byteOffset) {
     uint32_t value;
@@ -1493,6 +1983,7 @@ void verify(const CheckRequest& request, const CheckLayout& layout, const uint8_
       }
     }
   }
+  verify_parity(request, layout, bytes);
   ++g_check.readbacks;
   g_check.instances += layout.ranges;
   g_check.vertices += vertices;
@@ -1687,10 +2178,50 @@ void log_stats() {
       s.plans, s.committed, s.uncommitted, s.headerOnly, s.pieces, s.streamedVertices, s.moved, s.uvChanged, s.freed,
       s.clustersChanged, s.resyncs, g_variants.size(), s.latePlans, s.latePieces);
   Log.info(
-      "Retained: stream-out skipped transient {} palette {} line {} large {} slot {}; deferred variant "
+      "Retained: stream-out skipped transient {} line {} large {} slot {}; deferred variant "
       "{} failed {} cap {} pool {} overrun {} headroom {} refused {}; lost {}",
-      s.transientSkipped, s.paletteDeferred, s.lineSkipped, s.largeSkipped, s.slotSkipped, s.variantPending,
-      s.variantFailed, s.capDeferred, s.poolFull, s.overrunDeferred, s.headroomDeferred, s.refused, s.lost);
+      s.transientSkipped, s.lineSkipped, s.largeSkipped, s.slotSkipped, s.variantPending, s.variantFailed,
+      s.capDeferred, s.poolFull, s.overrunDeferred, s.headroomDeferred, s.refused, s.lost);
+  Log.info("Retained: palettes streamed {} skipped {} latched {} reorigin {} shared {} oob {}", s.paletteStreamed,
+           s.paletteSkipped, s.paletteLatched, s.paletteReorigin, s.paletteShared, s.paletteOob);
+}
+
+void log_parity() {
+  std::lock_guard lock{g_checkMutex};
+  if (g_parity.entries == 0 && g_parity.failures == 0 && g_parity.missing == 0) {
+    return;
+  }
+  std::string buckets;
+  bool freshOver = false;
+  for (size_t f = 0; f < FamilyNames.size(); ++f) {
+    for (size_t b = 0; b < BucketNames.size(); ++b) {
+      ParityBucket& bucket = g_parity.buckets[f][b];
+      if (bucket.errors.empty()) {
+        continue;
+      }
+      const size_t at = (bucket.errors.size() - 1) * 99 / 100;
+      std::nth_element(bucket.errors.begin(), bucket.errors.begin() + static_cast<std::ptrdiff_t>(at),
+                       bucket.errors.end());
+      buckets += fmt::format("; {} {} max {:.3g} p99 {:.3g} over {} vertices", FamilyNames[f], BucketNames[b],
+                             bucket.max, bucket.errors[at], bucket.errors.size());
+      freshOver = freshOver || (f == static_cast<size_t>(ParityFamily::Fresh) && bucket.max > FreshParityLimit);
+    }
+  }
+  const std::string summary = fmt::format(
+      "{} entries, {} out-of-range slot vertices, {} missing, worst skipped error {:.3f} of its tolerance{}",
+      g_parity.entries, g_parity.oob, g_parity.missing, g_parity.skippedRatio, buckets);
+  if (freshOver || g_parity.failures != 0) {
+    Log.error("Retained: parity FAILED ({} failures, {})", g_parity.failures, summary);
+  } else {
+    Log.info("Retained: parity passed ({})", summary);
+  }
+  std::vector<std::pair<uint64_t, uint64_t>> objects(g_paletteObjects.begin(), g_paletteObjects.end());
+  std::ranges::sort(objects, [](const auto& a, const auto& b) { return a.second > b.second; });
+  std::string top;
+  for (size_t i = 0; i < std::min<size_t>(objects.size(), ReportedObjects); ++i) {
+    top += fmt::format("{}{:#x} {}", i == 0 ? "" : ", ", objects[i].first, objects[i].second);
+  }
+  Log.info("Retained: palette objects by streamed vertices: {}", top);
 }
 
 void log_check_result() {
@@ -1783,6 +2314,7 @@ void initialize() {
 void shutdown() {
   log_stats();
   log_check_result();
+  log_parity();
   for (detail::PassId* pass : {&g_pass, &g_latePass}) {
     if (*pass != detail::InvalidPassId) {
       detail::unregister_pass(*pass);
@@ -1800,7 +2332,9 @@ void shutdown() {
   {
     std::lock_guard lock{g_checkMutex};
     g_check = {};
+    g_parity = {};
   }
+  g_paletteObjects.clear();
   g_pipelineLayout = {};
   g_groupLayout = {};
   g_device = {};
@@ -1883,7 +2417,7 @@ void end_frame() noexcept {
     return;
   }
   rollback();
-  g_pending.clear();
+  clear_frame_captures();
   g_owed = 0;
   g_refusedLost = 0;
   g_undelivered = 0;
@@ -1899,7 +2433,7 @@ void reset() noexcept {
   if (g_allocated) {
     clear_stream_state();
   }
-  g_pending.clear();
+  clear_frame_captures();
   g_owed = 0;
   g_refusedLost = 0;
   g_undelivered = 0;
@@ -1940,10 +2474,12 @@ void on_capture(const Capture& c) noexcept {
   if (c.vtxCount > MaxPieceVertices || c.attrs[GX_VA_POS].attrType == GX_NONE) {
     return skip(g_stats.largeSkipped);
   }
-  if (c.attrs[GX_VA_PNMTXIDX].attrType != GX_NONE) {
-    return skip(g_stats.paletteDeferred);
+  const bool palette = c.attrs[GX_VA_PNMTXIDX].attrType != GX_NONE;
+  if (palette && (c.attrs[GX_VA_PNMTXIDX].attrType != GX_DIRECT || c.attrs[GX_VA_PNMTXIDX].offset >= c.stride ||
+                  c.invView == nullptr || c.records.size() < size_t{c.vtxCount} * c.stride)) {
+    return skip(g_stats.largeSkipped);
   }
-  if (c.pnSlot >= gx::MaxPnMtx + gx::MaxTexMtx) {
+  if (!palette && c.pnSlot >= gx::MaxPnMtx + gx::MaxTexMtx) {
     return skip(g_stats.slotSkipped);
   }
   const bool indexed = (c.entryFlags & retained::entry_flag::Indexed) != 0;
@@ -1953,7 +2489,7 @@ void on_capture(const Capture& c) noexcept {
   }
   SlotState& st = g_slots[c.slot];
   if (st.generation != c.slotGeneration) {
-    if (st.recordSent || st.vtxBlock != NoBlock) {
+    if (st.recordSent || st.vtxBlock != NoBlock || st.bank != NoBank) {
       on_freed(c.slot);
     }
     st.generation = c.slotGeneration;
@@ -1986,23 +2522,30 @@ void on_capture(const Capture& c) noexcept {
   p.indexCount = indexCount;
   p.idxByte = indexed ? c.idxRange.offset : 0;
   p.immediates = *c.immediates;
-  p.world = *c.world;
+  p.world = c.world != nullptr ? *c.world : identity_affine();
   p.eye = c.eye;
+  p.objectId = c.objectId;
   p.clusters = {c.clusterFirst, c.clusterWord};
   st.clusterWant = p.clusters;
+  if (palette) {
+    p.palette = add_palette(c, st);
+    p.parity = add_parity(c, g_palettes[p.palette]);
+  }
 
-  const bool rigidNormal = c.pnSlot < gx::MaxPnMtx;
+  const bool normalSource = palette || c.pnSlot < gx::MaxPnMtx;
+  const bool immobile = (c.classBits & retained::class_bit::Immobile) != 0;
   uint32_t flags = instance_flag::Valid;
   const auto set = [&](bool on, uint32_t bit) { flags |= on ? bit : 0u; };
+  set(palette, instance_flag::Palette);
   set((c.classBits & retained::class_bit::CpuDeformed) != 0, instance_flag::CpuDeformed);
   set(c.gpuArrays, instance_flag::GpuArrays);
-  set(c.latched, instance_flag::Latched);
+  set(palette ? immobile : c.latched, instance_flag::Latched);
   set((c.classBits & retained::class_bit::Billboard) != 0, instance_flag::Billboard);
-  set(!p.hasNormalAttr || !rigidNormal, instance_flag::NoNormal);
+  set(!p.hasNormalAttr || !normalSource, instance_flag::NoNormal);
   set((c.classBits & retained::class_bit::Water) != 0, instance_flag::Water);
   set((c.entryFlags & retained::entry_flag::Late) != 0, instance_flag::Late);
   set((c.classBits & retained::class_bit::Blended) != 0, instance_flag::Blended);
-  set(determinant(p.world) < 0.0, instance_flag::NegativeDeterminant);
+  set(!palette && determinant(p.world) < 0.0, instance_flag::NegativeDeterminant);
   set(alphaSame, instance_flag::AlphaUvIsUv0);
   set(c.attrs[GX_VA_CLR0].attrType == GX_NONE, instance_flag::NoColor);
   flags |= (static_cast<uint32_t>(gx::g_gxState.cullMode) << instance_flag::CullShift) & instance_flag::CullMask;
@@ -2021,10 +2564,14 @@ void on_capture(const Capture& c) noexcept {
   }
   p.flags = flags;
   p.material = NoMaterial | (maps.alpha.valid() ? static_cast<uint32_t>(maps.alpha.coord) : NoCoord) << 16;
-  p.pieceFlags = (p.hasNormalAttr && rigidNormal ? block::PieceHasNormal : 0u) |
+  p.pieceFlags = (p.hasNormalAttr && normalSource ? block::PieceHasNormal : 0u) |
                  (alphaSame ? block::PieceAlphaUvIsUv0 : 0u) | (indexed ? block::PieceIndexed : 0u) |
                  (alphaTex != NoTex ? block::PieceAlphaUv : 0u);
-  if (rigidNormal) {
+  if (palette) {
+    for (int r = 0; r < 3; ++r) {
+      p.normal[r * 4 + r] = f32_bits(1.f);
+    }
+  } else if (normalSource) {
     const Affine nrm = to_affine(gx::g_gxState.pnMtx[c.pnSlot].nrm);
     const Affine& inv = *c.invView;
     for (int r = 0; r < 3; ++r) {
@@ -2051,8 +2598,9 @@ void on_freed(uint32_t slot) noexcept {
   if (st.streamed) {
     --g_streamedCount;
   }
-  if (st.recordSent || st.vtxBlock != NoBlock || st.idxBlock != NoBlock) {
-    g_freed.push_back({.slot = slot, .vtx = st.vtxBlock, .idx = st.idxBlock, .recordSent = st.recordSent});
+  if (st.recordSent || st.vtxBlock != NoBlock || st.idxBlock != NoBlock || st.bank != NoBank) {
+    g_freed.push_back(
+        {.slot = slot, .vtx = st.vtxBlock, .idx = st.idxBlock, .bank = st.bank, .recordSent = st.recordSent});
   }
   const uint32_t generation = st.generation;
   st = {};
@@ -2088,6 +2636,7 @@ void seal(retained::Frame& out, const detail::StageData& stage) noexcept {
   }
   const gfx::detail::StreamRoom room = g_room != nullptr ? *g_room : gfx::detail::stream_room();
   Tentative t;
+  t.palettes.reserve(g_palettes.size());
   t.camera = current_camera();
   const bool cut = g_framePrevCamera.valid && t.camera.cutEpoch != g_framePrevCamera.cutEpoch;
   const bool epochChanged = detail::live_scene_hints().sceneEpochChanged;
@@ -2121,6 +2670,7 @@ void seal(retained::Frame& out, const detail::StageData& stage) noexcept {
   };
   BuildInput input = base;
   input.picks = std::move(picks);
+  input.palettes = &t.palettes;
   input.frees = g_freed;
   BuildOutput built = build_block(input);
   const uint64_t blockBytes = built.block.size() * sizeof(uint32_t);
@@ -2136,10 +2686,13 @@ void seal(retained::Frame& out, const detail::StageData& stage) noexcept {
     t.lostAtCommit += t.captureOnly;
     t.captureOnly = 0;
     t.use = g_frameUse;
+    t.palettes.clear();
+    t.paletteCounts = {};
     input = base;
     input.frees = g_freed;
     built = build_block(input);
   }
+  t.paletteCounts.shared = built.sharedPalettes;
   plan->headerOnly = built.pieces == 0;
   g_stats.headerOnly += plan->headerOnly ? 1 : 0;
   plan->writeJobs = built.writeJobs;
@@ -2148,11 +2701,11 @@ void seal(retained::Frame& out, const detail::StageData& stage) noexcept {
   plan->variants = std::move(built.variants);
   plan->events = std::move(built.events);
   if (!late && check_frame()) {
-    plan->check = make_check(stage.frameIndex, built.commits);
+    plan->check = make_check(stage.frameIndex, built.commits, parity_entries(input.picks));
   }
   const std::span<const uint8_t> bytes{reinterpret_cast<const uint8_t*>(built.block.data()), built.block.size() * 4};
   const gfx::Range range = (g_push != nullptr ? g_push : &default_push)(bytes);
-  g_block = built.block;
+  g_block = std::move(built.block);
   if (range.size == 0) {
     ++g_stats.refused;
     undo_allocations(t);
@@ -2198,7 +2751,7 @@ void sealed(const detail::StageData& stage) noexcept {
     lost += g_tentative.committed ? g_tentative.lostAtCommit : g_tentative.captureOnly + g_tentative.lostAtCommit;
     rollback();
   }
-  g_pending.clear();
+  clear_frame_captures();
   g_undelivered = 0;
   report(lost);
 }
@@ -2208,7 +2761,7 @@ void drop_pending() noexcept {
     return;
   }
   rollback();
-  g_pending.clear();
+  clear_frame_captures();
   g_owed = 0;
   g_refusedLost = 0;
   g_undelivered = 0;
@@ -2309,6 +2862,7 @@ void reset() noexcept {
   g_appliedSerial.store(0, std::memory_order_relaxed);
   g_block.clear();
   g_lastPlan.reset();
+  g_paletteObjects.clear();
 }
 
 void set_push(PushFn push) noexcept { g_push = push; }
@@ -2335,7 +2889,11 @@ SlotState slot(uint32_t slot) noexcept {
           .recordWrites = st.recordWrites,
           .lastSent = st.lastSent,
           .clusterFirst = st.clusters[0],
-          .clusterWord = st.clusters[1]};
+          .clusterWord = st.clusters[1],
+          .paletteWord = st.bank != NoBank ? st.bank * palette::PairWords : RigidMatrix,
+          .usedMask = st.usedMask,
+          .seenMask = st.seenMask,
+          .origin = st.origin};
 }
 
 std::span<const uint32_t> last_block() noexcept { return g_block; }

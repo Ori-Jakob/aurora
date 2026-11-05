@@ -46,8 +46,10 @@ struct Capture {
   uint32_t classBits = 0;
   uint32_t categories = 0;
   uint32_t objectFlags = 0;
+  uint64_t objectId = 0;
   const gx::AttrConfig* attrs = nullptr;
   uint8_t stride = 0;
+  std::span<const uint8_t> records;
   const gx::DrawImmediateData* immediates = nullptr;
   uint8_t prim = 0;
   uint32_t vtxCount = 0;
@@ -86,10 +88,34 @@ struct CheckRange {
   bool rigidStatic = false;
 };
 
+enum class ParityFamily : uint8_t { Fresh, Skipped, Latched };
+
+struct ParityEntry {
+  uint32_t slot = NoSlot;
+  uint32_t generation = 0;
+  uint64_t objectId = 0;
+  ParityFamily family = ParityFamily::Fresh;
+  bool player = false;
+  uint32_t seenMask = 0;
+  gx::AttrConfig pos{};
+  gx::AttrConfig pnmtx{};
+  uint8_t stride = 0;
+  uint32_t vtxCount = 0;
+  std::vector<uint8_t> records;
+  std::vector<uint8_t> slice;
+  uint32_t sliceFirst = 0;
+  std::array<Mat3x4<float>, palette::Matrices> pn{};
+  std::array<double, palette::Matrices> slotDistance{};
+  std::array<double, 3> origin{};
+  double eye = 0.0;
+};
+
 struct CheckRequest {
   uint32_t frame = 0;
   uint32_t serial = 0;
   std::vector<CheckRange> ranges;
+  std::vector<ParityEntry> parity;
+  Affine view{};
   bool wire = false;
   Mat4x4<float> proj{};
 };
@@ -140,8 +166,13 @@ struct Stats {
   uint64_t clustersChanged = 0;
   uint64_t lineSkipped = 0;
   uint64_t largeSkipped = 0;
-  uint64_t paletteDeferred = 0;
   uint64_t slotSkipped = 0;
+  uint64_t paletteStreamed = 0;
+  uint64_t paletteSkipped = 0;
+  uint64_t paletteLatched = 0;
+  uint64_t paletteReorigin = 0;
+  uint64_t paletteShared = 0;
+  uint64_t paletteOob = 0;
   uint64_t latePlans = 0;
   uint64_t latePieces = 0;
   uint64_t transientSkipped = 0;
@@ -207,6 +238,10 @@ struct SlotState {
   Affine lastSent{};
   uint32_t clusterFirst = 0;
   uint32_t clusterWord = 0;
+  uint32_t paletteWord = RigidMatrix;
+  uint32_t usedMask = 0;
+  uint32_t seenMask = 0;
+  std::array<double, 3> origin{};
 };
 
 void reset() noexcept;

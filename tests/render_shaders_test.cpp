@@ -1767,6 +1767,7 @@ TEST_F(RenderShaders, RetainedReaderCompiles) {
 @group(0) @binding(1) var<storage, read> frame_words: array<u32>;
 @group(0) @binding(2) var<storage, read> verts: array<u32>;
 @group(0) @binding(3) var<storage, read_write> out_words: array<vec4f>;
+@group(0) @binding(4) var<storage, read> pal: array<u32>;
 
 @compute @workgroup_size(1)
 fn main() {
@@ -1781,8 +1782,9 @@ fn main() {
   let uv = retained_uv(retained_uv_xform(&inst, 1u, false), v.uv0);
   let box = retained_aabb(&inst, 1u, retained_prev_is_last_frame(&inst, 1u, cam.frame));
   let n = retained_normal_matrix(&inst, 1u);
+  let bone = retained_palette_matrix(&pal, &inst, 1u, 3u, true, false);
   out_words[0] = vec4f(v.pos, retained_alpha_uv(v, inst[0]).x) * rel[0] + prev.rows[1] + n[2] +
-                 vec4f(uv, box[0].x, box[1].y);
+                 vec4f(uv, box[0].x, box[1].y) + vec4f(vec4f(v.pos, 1.0) * bone, 0.0);
 }
 )";
   ASSERT_TRUE(register_source("test/retained_reader", Reader));

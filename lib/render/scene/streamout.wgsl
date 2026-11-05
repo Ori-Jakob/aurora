@@ -2,11 +2,13 @@ const BLOCK_PIECES: u32 = 1u;
 const BLOCK_IDX_CHUNKS: u32 = 3u;
 const BLOCK_WRITE_JOBS: u32 = 4u;
 const BLOCK_ROLL_JOBS: u32 = 6u;
+const BLOCK_MATRICES: u32 = 7u;
 const PIECE_WORDS: u32 = 32u;
 const PIECE_OUT_INDEX_FIRST: u32 = 19u;
 const PIECE_INDEX_COUNT: u32 = 20u;
 const PIECE_PRIM: u32 = 21u;
 const PIECE_IDX_BYTE: u32 = 22u;
+const PIECE_MATRIX_WORD: u32 = 23u;
 const PIECE_FLAGS: u32 = 24u;
 const PIECE_INDEXED: u32 = 4u;
 const CHUNK_WORDS: u32 = 2u;
@@ -14,11 +16,16 @@ const WRITE_JOB_WORDS: u32 = 4u;
 const ROLL_JOB_WORDS: u32 = 8u;
 const TARGET_FRAME: u32 = 1u;
 const ROLL_FRESH: u32 = 1u;
+const ROLL_PALETTE: u32 = 2u;
+const BANK_WORDS: u32 = 240u;
+const BANK_NORMAL_WORD: u32 = 120u;
+const MATRIX_WORDS: u32 = 12u;
 const RECORD_WORDS: u32 = 96u;
 const RECORD_CUR_AABB: u32 = 80u;
 const RECORD_PREV_AABB: u32 = 86u;
 const RECORD_STREAM_FRAME: u32 = 92u;
 const RECORD_PREV_STREAM_FRAME: u32 = 93u;
+const RECORD_PALETTE_MASK: u32 = 94u;
 const FRAME_FLAGS: u32 = 1u;
 const FRAME_BREAK_COUNT: u32 = 3u;
 const FRAME_RESET: u32 = 2u;
@@ -40,6 +47,7 @@ struct StreamPush {
 @group(0) @binding(2) var<storage, read> ibuf: array<u32>;
 @group(0) @binding(4) var<storage, read_write> out_indices: array<u32>;
 @group(0) @binding(5) var<storage, read_write> instances: array<u32>;
+@group(0) @binding(6) var<storage, read_write> palettes: array<u32>;
 @group(0) @binding(7) var<storage, read_write> frame_words: array<u32>;
 var<immediate> push: StreamPush;
 
@@ -56,7 +64,7 @@ fn shifted(u: u32, delta: f32, empty: u32) -> u32 {
   if (u == empty || delta == 0.0) {
     return u;
   }
-  return ordered_from_f32(f32_from_ordered(u) - delta);
+  return ordered_from_f32(f32_from_ordered(u) + delta);
 }
 
 @compute @workgroup_size(64)
@@ -89,13 +97,14 @@ fn roll_jobs(@builtin(global_invocation_id) gid: vec3u) {
   let hw = push.block_word;
   let j = push.first + gid.x;
   let live = j < push.count;
+  var job = 0u;
   var base = 0u;
   var fresh = true;
   var delta = vec3f(0.0);
   var cur: array<u32, 6>;
   var stream_frame = 0u;
   if (live) {
-    let job = hw + abuf[hw + BLOCK_ROLL_JOBS] + j * ROLL_JOB_WORDS;
+    job = hw + abuf[hw + BLOCK_ROLL_JOBS] + j * ROLL_JOB_WORDS;
     base = abuf[job] * RECORD_WORDS;
     fresh = (abuf[job + 1u] & ROLL_FRESH) != 0u;
     delta = vec3f(bitcast<f32>(abuf[job + 4u]), bitcast<f32>(abuf[job + 5u]), bitcast<f32>(abuf[job + 6u]));
@@ -117,6 +126,23 @@ fn roll_jobs(@builtin(global_invocation_id) gid: vec3u) {
   }
   instances[base + RECORD_PREV_STREAM_FRAME] = select(stream_frame, 0u, fresh);
   instances[base + RECORD_STREAM_FRAME] = push.value;
+  instances[base + RECORD_PALETTE_MASK] = 0u;
+  if ((abuf[job + 1u] & ROLL_PALETTE) == 0u) {
+    return;
+  }
+  let pw = hw + abuf[hw + BLOCK_PIECES] + abuf[job + 2u] * PIECE_WORDS;
+  let mw = hw + abuf[hw + BLOCK_MATRICES] + abuf[pw + PIECE_MATRIX_WORD];
+  let bank = abuf[job + 3u];
+  for (var k = 0u; k < BANK_WORDS; k++) {
+    let next = abuf[mw + k];
+    var prev = palettes[bank + k];
+    let m = k % MATRIX_WORDS;
+    if (k < BANK_NORMAL_WORD && m % 4u == 3u && delta[m / 4u] != 0.0) {
+      prev = bitcast<u32>(bitcast<f32>(prev) + delta[m / 4u]);
+    }
+    palettes[bank + BANK_WORDS + k] = select(prev, next, fresh);
+    palettes[bank + k] = next;
+  }
 }
 
 fn read_index(byte_offset: u32) -> u32 {

@@ -3,7 +3,7 @@
 #include <cstdint>
 
 namespace aurora::render::scene::streamout {
-inline constexpr uint32_t GeneratorRevision = 2;
+inline constexpr uint32_t GeneratorRevision = 3;
 inline constexpr uint32_t WorkgroupSize = 64;
 inline constexpr uint32_t ImmediateSize = 16;
 inline constexpr uint32_t ParamsSize = 16;
@@ -169,11 +169,30 @@ inline constexpr uint32_t TargetFrame = 1;
 
 inline constexpr uint32_t RollFresh = 1u << 0;
 inline constexpr uint32_t RollPalette = 1u << 1;
+inline constexpr uint32_t RollInstance = 0;
+inline constexpr uint32_t RollFlags = 1;
+inline constexpr uint32_t RollPiece = 2;
+inline constexpr uint32_t RollPaletteWord = 3;
+inline constexpr uint32_t RollOriginDelta = 4;
 } // namespace block
+
+namespace palette {
+inline constexpr uint32_t Matrices = 10;
+inline constexpr uint32_t MatrixWords = 12;
+inline constexpr uint32_t NormalWord = Matrices * MatrixWords;
+inline constexpr uint32_t BankWords = 2 * NormalWord;
+inline constexpr uint32_t PairWords = 2 * BankWords;
+inline constexpr uint32_t LastSlot = Matrices - 1;
+inline constexpr uint32_t MaskSlots = 20;
+inline constexpr uint32_t MaskOverflow = 1u << 31;
+inline constexpr double OriginGrid = 512.0;
+inline constexpr double ReoriginDistance = 1536.0;
+} // namespace palette
 
 inline constexpr uint32_t MaxStreamVerticesPerFrame = 262144;
 inline constexpr uint32_t MaxNewVerticesPerFrame = 65536;
 inline constexpr uint32_t MaxPiecesPerFrame = 4096;
+inline constexpr uint32_t MaxPaletteDrawsPerFrame = 1024;
 inline constexpr uint32_t MaxVariants = 256;
 inline constexpr uint32_t MaxBlockBytes = 2u << 20;
 inline constexpr uint32_t MaxPieceVertices = 65535;
@@ -186,6 +205,8 @@ inline constexpr uint64_t InstancePoolBytes = uint64_t{InstanceSlots} * record::
 inline constexpr uint32_t PaletteSlots = 2048;
 inline constexpr uint64_t PaletteBytes = 960;
 inline constexpr uint64_t PalettePoolBytes = PaletteSlots * PaletteBytes;
+inline constexpr uint32_t PalettePairs = PaletteSlots / 2;
+static_assert(PaletteBytes == palette::BankWords * 4);
 inline constexpr uint64_t FramePoolBytes = frame::Bytes;
 inline constexpr uint32_t PoolGranule = 256;
 
