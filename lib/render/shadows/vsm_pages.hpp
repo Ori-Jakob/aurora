@@ -49,7 +49,7 @@ inline constexpr double AnchorReach = 1048576.0;
 inline constexpr double DefaultUnitsPerMetre = 100.0;
 inline constexpr uint32_t MaxPairs = 1u << 19;
 inline constexpr uint32_t PhysWords = 2;
-inline constexpr uint32_t StatCount = 64;
+inline constexpr uint32_t StatCount = 128;
 inline constexpr uint32_t UpdateWorkgroup = 64;
 inline constexpr uint32_t MaxConsumerTerms = 8;
 
@@ -131,6 +131,22 @@ inline constexpr uint32_t FootprintPages = 24;
 inline constexpr uint32_t FootprintPriority = 25;
 inline constexpr uint32_t DirtiedPages = 26;
 inline constexpr uint32_t DirtiedPriority = 27;
+inline constexpr uint32_t Requested = 28;
+inline constexpr uint32_t NeedPriority = 29;
+inline constexpr uint32_t NeedNew = 30;
+inline constexpr uint32_t NeedReuse = 31;
+inline constexpr uint32_t Hits = 32;
+inline constexpr uint32_t FreedDirty = 33;
+inline constexpr uint32_t Evictable = 34;
+inline constexpr uint32_t FreePages = 35;
+inline constexpr uint32_t Rendered = 36;
+inline constexpr uint32_t DeferredNew = 37;
+inline constexpr uint32_t DeferredReuse = 38;
+inline constexpr uint32_t OverflowPool = 39;
+inline constexpr uint32_t PlayerDeferred = 40;
+inline constexpr uint32_t Evicted = 41;
+inline constexpr uint32_t Committed = 42;
+inline constexpr uint32_t CommitSkipped = 43;
 } // namespace stat
 
 namespace chain_bit {
@@ -138,6 +154,12 @@ inline constexpr uint32_t Update = 1u << 0;
 inline constexpr uint32_t Scan = 1u << 1;
 inline constexpr uint32_t ScanList = 1u << 2;
 inline constexpr uint32_t Dirty = 1u << 3;
+inline constexpr uint32_t Mark = 1u << 4;
+inline constexpr uint32_t Classify = 1u << 5;
+inline constexpr uint32_t AllocLists = 1u << 6;
+inline constexpr uint32_t Assign = 1u << 7;
+inline constexpr uint32_t Clear = 1u << 8;
+inline constexpr uint32_t Commit = 1u << 9;
 } // namespace chain_bit
 
 struct ViewsHeader {
@@ -205,6 +227,7 @@ struct PoolExtent {
   bool reduced = false;
 };
 [[nodiscard]] PoolExtent pool_extent(uint32_t pages, uint32_t maxDimension) noexcept;
+[[nodiscard]] TexDesc pool_desc() noexcept;
 
 struct SunSelection {
   bool found = false;
@@ -404,9 +427,10 @@ void register_consumer_term(ConsumerTerm term) noexcept;
 
 void mark_encoded(uint32_t bit) noexcept;
 [[nodiscard]] uint32_t encoded_mask() noexcept;
+[[nodiscard]] uint32_t expected_chain() noexcept;
 
 [[nodiscard]] detail::PersistentHandle handle(std::string_view name) noexcept;
-inline constexpr size_t PassCount = 5;
+inline constexpr size_t PassCount = 11;
 [[nodiscard]] std::array<detail::PassDesc, PassCount> pass_descs();
 
 namespace testing {

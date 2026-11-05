@@ -23,6 +23,7 @@
 #include "render/post/composite.hpp"
 #include "render/scene/streamout.hpp"
 #include "render/shader_resolve.hpp"
+#include "render/shadows/vsm_alloc.hpp"
 #include "render/shadows/vsm_invalidate.hpp"
 #include "render/shadows/vsm_pages.hpp"
 #include "render/shaders.hpp"
@@ -1801,6 +1802,23 @@ TEST_F(RenderShaders, VsmInvalidateCompiles) {
   std::string error;
   EXPECT_TRUE(validate_module(shadows::vsm::InvalidateShader, {}, error)) << error;
   EXPECT_TRUE(validate_module(shadows::vsm::InvalidateShader, dirty, error)) << error;
+}
+
+TEST_F(RenderShaders, VsmAllocCompiles) {
+  const std::array<std::array<std::string_view, 2>, 6> variants{{
+      {"VSM_MARK", ""},
+      {"VSM_MARK", "VSM_MARK_CHECK"},
+      {"VSM_CLASSIFY", ""},
+      {"VSM_ASSIGN", ""},
+      {"VSM_COMMIT", ""},
+      {"VSM_CLEAR", ""},
+  }};
+  std::string error;
+  EXPECT_TRUE(validate_module(shadows::vsm::AllocShader, {}, error)) << error;
+  for (const auto& variant : variants) {
+    const std::span<const std::string_view> defines{variant.data(), variant[1].empty() ? 1u : 2u};
+    EXPECT_TRUE(validate_module(shadows::vsm::AllocShader, defines, error)) << variant[0] << " " << error;
+  }
 }
 
 TEST_F(RenderShaders, RetainedReaderCompiles) {

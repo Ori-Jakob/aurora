@@ -8,6 +8,7 @@
 #include "render/scene/identity.hpp"
 #include "render/scene/streamout.hpp"
 #include "render/graph_bind.hpp"
+#include "render/shadows/vsm_alloc.hpp"
 #include "render/shadows/vsm_check.hpp"
 #include "render/shadows/vsm_invalidate.hpp"
 #include "render/shadows/vsm_pages.hpp"
@@ -612,6 +613,13 @@ TEST_F(RenderVsmGraph, ChainFitsStorageLimit) {
   const std::array<detail::PassDesc, PassCount> passes = pass_descs();
   const auto compile = [&](uint32_t computeStorage, bool retained) {
     detail::GraphInputs inputs{.passes = passes, .settings = &settings, .caps = &caps};
+    inputs.env.gxFormats[static_cast<size_t>(detail::GxResource::Depth)] = wgpu::TextureFormat::Depth32Float;
+    inputs.env.gxFormats[static_cast<size_t>(detail::GxResource::Normal)] = wgpu::TextureFormat::RGB10A2Unorm;
+    for (const detail::GxResource gx : {detail::GxResource::Depth, detail::GxResource::Normal}) {
+      inputs.env.gxUsage[static_cast<size_t>(gx)] =
+          wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::RenderAttachment;
+    }
+    inputs.sceneDepthSource = DepthSource::Direct;
     inputs.env.limits.compute.storageBuffers = computeStorage;
     inputs.env.efbSize = {1280, 720};
     inputs.env.outputSize = {1280, 720};
@@ -641,6 +649,28 @@ TEST_F(RenderVsmGraph, ChainFitsStorageLimit) {
     EXPECT_EQ(storage(UpdatePass), 4u);
     EXPECT_EQ(storage(ScanPass), 8u);
     EXPECT_EQ(storage(DirtyPass), 6u);
+    EXPECT_EQ(storage(MarkPass), 3u);
+    EXPECT_EQ(storage(ClassifyPass), 7u);
+    EXPECT_EQ(storage(AssignPass), 8u);
+    EXPECT_EQ(storage(CommitPass), 3u);
+    for (const std::string_view name : {AllocListsPass, ClearPass}) {
+      const detail::NodeId node = graph->find_node(name);
+      ASSERT_NE(node, detail::InvalidNode) << name;
+      EXPECT_TRUE(graph->nodes[node].manualBindings) << name;
+    }
+    EXPECT_TRUE(graph->nodes[graph->find_node(ClearPass)].sink);
+    EXPECT_EQ(graph->nodes[graph->find_node(ClearPass)].passKind, PassKind::Encoder);
+    const auto& order = graph->stages[static_cast<size_t>(Stage::OpaqueDone)].passes;
+    const auto position = [&](std::string_view name) {
+      return std::ranges::find(order, graph->find_node(name)) - order.begin();
+    };
+    EXPECT_LT(position(DirtyPass), position(MarkPass));
+    EXPECT_LT(position(MarkPass), position(ClassifyPass));
+    EXPECT_LT(position(ClassifyPass), position(AllocListsPass));
+    EXPECT_LT(position(AllocListsPass), position(AssignPass));
+    EXPECT_LT(position(AssignPass), position(ClearPass));
+    EXPECT_LT(position(ClearPass), position(CommitPass));
+    EXPECT_LT(position(CommitPass), position(CheckPass));
     const detail::NodeId update = graph->find_node(UpdatePass);
     ASSERT_NE(update, detail::InvalidNode);
     EXPECT_TRUE(graph->nodes[update].sink);
@@ -909,6 +939,295 @@ TEST(RenderVsmInvalidateRules, CasterPredicateExcludesClassesAndCategories) {
   }
   EXPECT_FALSE(is_caster({.categories = AURORA_CAT_DYNAMIC}));
   EXPECT_TRUE(record_is_caster(flag::Valid | flag::GpuArrays | flag::Palette, AURORA_CAT_DYNAMIC));
+}
+Views alloc_views(uint32_t poolPages = 1024, uint32_t budget = 1024, uint32_t clock = 5) {
+  Views views = clipmap_views({500.0, 120.0, -2300.0}, sun_dir(40.0, 30.0));
+  views.header.poolPages = poolPages;
+  views.header.poolPagesX = 32;
+  views.header.budget = budget;
+  views.header.clock = clock;
+  return views;
+}
+
+uint32_t key_bits(const MarkKeys& keys, uint32_t bits) {
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < keys.count; ++i) {
+    n += (keys.keys[i] >> 16) == bits ? 1 : 0;
+  }
+  return n;
+}
+
+std::array<float, 3> corner_point(const ViewRecord& coarse, const ViewRecord& fine, float fineTexels) {
+  std::array<double, 3> bx{};
+  std::array<double, 3> by{};
+  for (size_t i = 0; i < 3; ++i) {
+    bx[i] = double{coarse.camRel[i]} * coarse.texel;
+    by[i] = double{coarse.camRel[4 + i]} * coarse.texel;
+  }
+  const double cx = 128.0 * 17 - coarse.camRel[3];
+  const double cy = 128.0 * 15 - coarse.camRel[7];
+  std::array<float, 3> p{};
+  for (size_t i = 0; i < 3; ++i) {
+    p[i] = static_cast<float>(coarse.texel * (cx * bx[i] + cy * by[i]) + fineTexels * fine.texel * (bx[i] + by[i]));
+  }
+  return p;
+}
+
+TEST(RenderVsmAlloc, LevelSelectionHonoursBias) {
+  Views views = alloc_views();
+  const float bias = static_cast<float>(std::log2(2688.0 / 1440.0));
+  EXPECT_NEAR(bias, 0.9f, 0.01f);
+  const auto f = static_cast<float>(Texel0 * std::exp2(1.4));
+  EXPECT_EQ(level_wanted(f, static_cast<float>(Texel0), 0.f), 2u);
+  EXPECT_EQ(level_wanted(f, static_cast<float>(Texel0), bias), 3u);
+  EXPECT_EQ(level_wanted(f, static_cast<float>(Texel0), -0.5f), 1u);
+  const std::array<float, 3> near{10.f, -20.f, 30.f};
+  views.header.levelBias = 0.f;
+  EXPECT_EQ(select_level(views, f, near, views.header.levelBias), 2u);
+  views.header.levelBias = bias;
+  EXPECT_EQ(select_level(views, f, near, views.header.levelBias), 3u);
+  const MarkKeys keys = mark_keys(views, near, f);
+  ASSERT_GE(keys.count, 2u);
+  EXPECT_EQ((keys.keys[0] & 0xFFFFu) / PagesPerView, level_view(3));
+  EXPECT_EQ(level_wanted(1e9f, static_cast<float>(Texel0), 0.f), SunLevels - 1);
+  EXPECT_EQ(level_wanted(1e-9f, static_cast<float>(Texel0), 0.f), 0u);
+}
+
+TEST(RenderVsmAlloc, FallbackLevelAlwaysRequested) {
+  const Views views = alloc_views();
+  std::mt19937 rng{1234};
+  std::uniform_real_distribution<float> offset(-3000.f, 3000.f);
+  std::uniform_real_distribution<float> scale(-2.f, 9.f);
+  uint32_t checked = 0;
+  for (int i = 0; i < 4000; ++i) {
+    const std::array<float, 3> p{offset(rng), offset(rng) * 0.2f, offset(rng)};
+    const auto f = static_cast<float>(Texel0 * std::exp2(scale(rng)));
+    const uint32_t level = select_level(views, f, p, views.header.levelBias);
+    const MarkKeys keys = mark_keys(views, p, f);
+    if (level >= SunLevels) {
+      EXPECT_EQ(keys.count, 0u);
+      continue;
+    }
+    const uint32_t pixel = key_bits(keys, request_bit::Pixel);
+    const uint32_t fallback = key_bits(keys, request_bit::Fallback);
+    EXPECT_GE(pixel, 1u);
+    EXPECT_LE(pixel, 4u);
+    EXPECT_LE(fallback, 4u);
+    if (level + 1 < SunLevels) {
+      const std::array<float, 3> c = view_coords(views.views[level_view(level + 1)], p);
+      if (c[0] >= 0.f && c[0] < WindowTexels && c[1] >= 0.f && c[1] < WindowTexels) {
+        EXPECT_GE(fallback, 1u) << i;
+        ++checked;
+      }
+    } else {
+      EXPECT_EQ(fallback, 0u);
+    }
+    for (uint32_t k = 0; k < keys.count; ++k) {
+      const uint32_t view = (keys.keys[k] & 0xFFFFu) / PagesPerView;
+      EXPECT_EQ(view, level_view((keys.keys[k] >> 16) == request_bit::Pixel ? level : level + 1));
+    }
+  }
+  EXPECT_GT(checked, 1000u);
+}
+
+TEST(RenderVsmAlloc, MarginCoversPageCorners) {
+  Views views = alloc_views();
+  views.header.levelBias = 0.f;
+  for (const uint32_t level : {0u, 3u, 7u}) {
+    const ViewRecord& fine = views.views[level_view(level)];
+    const ViewRecord& coarse = views.views[level_view(level + 1)];
+    const std::array<float, 3> p = corner_point(coarse, fine, 1.f);
+    const auto f = static_cast<float>(fine.texel * 0.7);
+    ASSERT_EQ(select_level(views, f, p, 0.f), level);
+    const MarkKeys keys = mark_keys(views, p, f);
+    EXPECT_EQ(key_bits(keys, request_bit::Pixel), 4u) << level;
+    EXPECT_EQ(key_bits(keys, request_bit::Fallback), 4u) << level;
+    const std::array<float, 3> c = view_coords(fine, p);
+    EXPECT_NEAR(std::fmod(c[0], 128.f), 1.f, 1e-2f);
+    EXPECT_NEAR(std::fmod(c[1], 128.f), 1.f, 1e-2f);
+    const std::array<float, 3> inside = corner_point(coarse, fine, 60.f);
+    const MarkKeys one = mark_keys(views, inside, f);
+    EXPECT_EQ(key_bits(one, request_bit::Pixel), 1u) << level;
+  }
+}
+
+struct AllocFixture {
+  Views views;
+  std::vector<uint32_t> requests = std::vector<uint32_t>(MaxVirtualPages, 0);
+  std::vector<uint32_t> table = std::vector<uint32_t>(MaxVirtualPages, 0);
+  std::vector<uint32_t> phys = std::vector<uint32_t>(size_t{MaxPoolPages} * PhysWords, 0);
+  std::vector<uint32_t> list = std::vector<uint32_t>(render_list::Words, 0);
+  uint32_t nextPhys = 0;
+
+  void own(uint32_t v, uint32_t bits, uint32_t lastUsed) {
+    const uint32_t p = nextPhys++;
+    table[v] = p | entry::Allocated | bits;
+    phys[size_t{p} * PhysWords] = v + 1;
+    phys[size_t{p} * PhysWords + 1] = lastUsed;
+  }
+  [[nodiscard]] uint32_t listed(uint32_t i) const { return list[render_list::Pages + 2 * i]; }
+};
+
+TEST(RenderVsmAlloc, AssignOrderIsPriorityNewReuse) {
+  AllocFixture a{.views = alloc_views()};
+  const uint32_t base = level_view(2) * PagesPerView;
+  for (const uint32_t v : {base + 40, base + 9}) {
+    a.own(v, entry::Cached | entry::Dirty | entry::Priority, 5);
+    a.requests[v] = request_bit::Pixel;
+  }
+  for (const uint32_t v : {base + 30, base + 3}) {
+    a.own(v, entry::Cached | entry::Dirty, 5);
+    a.requests[v] = request_bit::Pixel;
+  }
+  a.own(base + 50, entry::Cached, 5);
+  a.requests[base + 50] = request_bit::Fallback;
+  for (const uint32_t v : {base + 20, base + 1, base + 700}) {
+    a.requests[v] = request_bit::Pixel;
+  }
+  a.own(base + 60, entry::Cached | entry::Dirty, 2);
+  const AllocCounts c = allocate(a.views, a.requests, a.table, a.phys, a.list);
+  EXPECT_EQ(c.priority, 2u);
+  EXPECT_EQ(c.fresh, 3u);
+  EXPECT_EQ(c.reuse, 2u);
+  EXPECT_EQ(c.hits, 1u);
+  EXPECT_EQ(c.freedDirty, 1u);
+  EXPECT_EQ(c.rendered, 7u);
+  const std::array<uint32_t, 7> order{base + 9, base + 40, base + 1, base + 20, base + 700, base + 3, base + 30};
+  for (uint32_t i = 0; i < order.size(); ++i) {
+    EXPECT_EQ(a.listed(i), order[i]) << i;
+    const uint32_t e = a.table[order[i]];
+    EXPECT_NE(e & entry::RenderNow, 0u) << i;
+    EXPECT_EQ((e >> entry::RenderIndexShift) & entry::RenderIndexMask, i) << i;
+    EXPECT_EQ(e & entry::PhysMask, a.list[render_list::Pages + 2 * i + 1]) << i;
+    EXPECT_EQ(e & entry::Fresh, i >= 2 && i < 5 ? entry::Fresh : 0u) << i;
+  }
+  EXPECT_EQ(a.table[base + 60], 0u);
+  const std::vector<uint32_t> again = a.list;
+  EXPECT_EQ(commit(a.list, a.table), 7u);
+  for (const uint32_t v : order) {
+    EXPECT_EQ(a.table[v] & (entry::RenderNow | entry::Dirty | entry::Priority | entry::Fresh), 0u) << v;
+    EXPECT_NE(a.table[v] & entry::Cached, 0u) << v;
+  }
+  EXPECT_EQ(a.list, again);
+}
+
+TEST(RenderVsmAlloc, BudgetCountsOnlyNonPriority) {
+  AllocFixture a{.views = alloc_views(1024, 8)};
+  const uint32_t base = level_view(1) * PagesPerView;
+  for (uint32_t i = 0; i < 5; ++i) {
+    a.own(base + 500 + i, entry::Cached | entry::Dirty | entry::Priority, 5);
+    a.requests[base + 500 + i] = request_bit::Pixel;
+  }
+  for (uint32_t i = 0; i < 3; ++i) {
+    a.own(base + 600 + i, entry::Cached | entry::Dirty, 5);
+    a.requests[base + 600 + i] = request_bit::Pixel;
+  }
+  for (uint32_t i = 0; i < 40; ++i) {
+    a.requests[base + i] = request_bit::Pixel;
+  }
+  const AllocCounts c = allocate(a.views, a.requests, a.table, a.phys, a.list);
+  EXPECT_EQ(c.rendered, 13u);
+  EXPECT_EQ(c.deferredNew, 32u);
+  EXPECT_EQ(c.deferredReuse, 3u);
+  EXPECT_EQ(c.playerDeferred, 0u);
+  EXPECT_EQ(c.overflowPool, 0u);
+  for (uint32_t i = 0; i < 5; ++i) {
+    EXPECT_EQ(a.listed(i), base + 500 + i);
+  }
+  for (uint32_t i = 0; i < 8; ++i) {
+    EXPECT_EQ(a.listed(5 + i), base + i);
+  }
+  for (uint32_t i = 8; i < 40; ++i) {
+    EXPECT_EQ(a.table[base + i], 0u) << i;
+  }
+  const AllocBudget held = alloc_budget(5, 40, 3, 900, 8, true);
+  EXPECT_EQ(held.count, 0u);
+  const AllocBudget exempt = alloc_budget(5, 40, 3, 900, 1024, false);
+  EXPECT_EQ(exempt.count, 48u);
+  const AllocBudget pool = alloc_budget(0, 40, 0, 25, 1024, false);
+  EXPECT_EQ(pool.overflowPool, 15u);
+  const AllocBudget capped = alloc_budget(10, 9000, 0, 9000, 9000, false);
+  EXPECT_EQ(capped.count, MaxRenderPages);
+  EXPECT_EQ(capped.playerDeferred, 0u);
+}
+
+TEST(RenderVsmAlloc, EvictionTakesOldestBucketFirst) {
+  AllocFixture a{.views = alloc_views(MinPoolPages, 1024, 200)};
+  const uint32_t base = level_view(4) * PagesPerView;
+  const std::array<uint32_t, 4> ages{0, 1, 8, 64};
+  for (uint32_t i = 0; i < MinPoolPages; ++i) {
+    a.own(base + i, entry::Cached, 200 - ages[i % 4]);
+  }
+  for (uint32_t i = 0; i < MinPoolPages; i += 4) {
+    a.requests[base + i] = request_bit::Pixel;
+  }
+  for (uint32_t i = 0; i < 200; ++i) {
+    a.requests[base + 300 + i] = request_bit::Pixel;
+  }
+  const std::vector<uint32_t> before = a.table;
+  const AllocCounts c = allocate(a.views, a.requests, a.table, a.phys, a.list);
+  EXPECT_EQ(c.fresh, 200u);
+  EXPECT_EQ(c.evictable, 192u);
+  EXPECT_EQ(c.freePages, 0u);
+  EXPECT_EQ(c.overflowPool, 8u);
+  EXPECT_EQ(c.evicted, 192u);
+  uint32_t lastBand = 0;
+  uint32_t lastPage = 0;
+  for (uint32_t i = 0; i < 192; ++i) {
+    const uint32_t page = a.list[render_list::Pages + 2 * i + 1];
+    ASSERT_LT(page, MinPoolPages);
+    const uint32_t band = page % 4 == 3 ? 1 : page % 4 == 2 ? 2 : 3;
+    EXPECT_NE(page % 4, 0u) << "an age-0 page was evicted";
+    EXPECT_GE(band, lastBand) << i;
+    if (band == lastBand) {
+      EXPECT_GT(page, lastPage) << i;
+    }
+    lastBand = band;
+    lastPage = page;
+    EXPECT_EQ(a.table[base + page], 0u) << "the evicted owner keeps its entry";
+  }
+  for (uint32_t i = 192; i < 200; ++i) {
+    EXPECT_EQ(a.listed(i), NoPage);
+  }
+  for (uint32_t i = 0; i < MinPoolPages; i += 4) {
+    EXPECT_EQ(a.table[base + i], before[base + i]);
+    EXPECT_EQ(a.phys[size_t{i} * PhysWords + 1], 200u);
+  }
+}
+
+TEST_F(RenderVsmInvalidate, ClockRestartsOnFull) {
+  uint32_t frame = 1;
+  EXPECT_EQ(step(frame_input(frame++)).views.header.clock, 1u);
+  for (uint32_t i = 2; i < 6; ++i) {
+    EXPECT_EQ(step(frame_input(frame++)).views.header.clock, i);
+  }
+  FrameInput reset = frame_input(frame++);
+  reset.signals.clearInstances = true;
+  const FrameDecision full = step(reset);
+  EXPECT_TRUE(full.full);
+  EXPECT_EQ(full.views.header.clock, 1u);
+  EXPECT_EQ(full.views.header.budget, full.views.header.poolPages);
+  EXPECT_EQ(step(frame_input(frame++)).views.header.clock, 2u);
+  AllocFixture a{.views = full.views};
+  a.views.header.poolPages = 256;
+  a.requests[level_view(0) * PagesPerView + 33] = request_bit::Pixel;
+  (void)allocate(a.views, a.requests, a.table, a.phys, a.list);
+  EXPECT_EQ(a.phys[1], 1u);
+}
+
+TEST_F(RenderVsmGraph, CommitNeedsEveryChainBit) {
+  FrameInput in = frame_input(1);
+  in.chainMask = FullChain | chain_bit::Commit;
+  (void)decide_frame(in);
+  mark_encoded(FullChain);
+  EXPECT_EQ(expected_chain(), FullChain | chain_bit::Commit);
+  in = frame_input(2);
+  in.chainMask = FullChain | chain_bit::Commit;
+  EXPECT_EQ(decide_frame(in).reasons, full_reason::ChainIncomplete);
+  mark_encoded(FullChain | chain_bit::Commit);
+  in = frame_input(3);
+  in.chainMask = FullChain | chain_bit::Commit;
+  EXPECT_EQ(decide_frame(in).reasons, 0u);
 }
 } // namespace
 } // namespace aurora::render::shadows::vsm

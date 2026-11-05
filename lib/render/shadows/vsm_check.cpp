@@ -44,7 +44,9 @@ constexpr uint64_t HistoryOffset = MaterialsOffset + MaterialsBytes;
 constexpr uint64_t PrevHistoryOffset = HistoryOffset + HistoryBytes;
 constexpr uint64_t CastBitsOffset = PrevHistoryOffset + HistoryBytes;
 constexpr uint64_t DirtyOffset = CastBitsOffset + CastBitsBytes;
-constexpr uint64_t ReadbackBytes = DirtyOffset + DirtyPagesBytes;
+constexpr uint64_t RequestsOffset = DirtyOffset + DirtyPagesBytes;
+constexpr uint64_t RenderListOffset = RequestsOffset + RequestsBytes;
+constexpr uint64_t ReadbackBytes = RenderListOffset + render_list::Bytes;
 
 enum Ref : uint32_t {
   ViewsRef,
@@ -56,11 +58,15 @@ enum Ref : uint32_t {
   HistoryRef,
   CastRef,
   DirtyRef,
+  RequestsRef,
+  RenderListRef,
+  ReceiversRef,
   RefCount
 };
 
 struct CheckLocal {
-  std::array<uint16_t, RefCount> refs{NoRef, NoRef, NoRef, NoRef, NoRef, NoRef, NoRef, NoRef, NoRef};
+  std::array<uint16_t, RefCount> refs{NoRef, NoRef, NoRef, NoRef, NoRef, NoRef,
+                                      NoRef, NoRef, NoRef, NoRef, NoRef, NoRef};
 };
 static_assert(sizeof(CheckLocal) <= detail::PassLocalSize);
 
@@ -94,6 +100,17 @@ bool g_warnedViews = false;
 std::array<RingSlot, StatsRing> g_ring;
 std::vector<FrameStats> g_frames;
 uint64_t g_seq = 0;
+MarkParams g_markParams;
+uint64_t g_markFrame = NoFrame;
+
+struct Capture {
+  Views views;
+  uint64_t hintFrame = 0;
+  bool withPrev = false;
+  bool marked = false;
+  MarkParams mark;
+  uint64_t receiverBytes = 0;
+};
 
 bool parse_u64(std::string_view text, uint64_t& out) noexcept {
   const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), out);
@@ -139,21 +156,35 @@ wgpu::Buffer readback_buffer(const char* label, uint64_t size) {
   return webgpu::g_device.CreateBuffer(&descriptor);
 }
 
-void finish_readback(const wgpu::Buffer& buffer, const Views& expected, uint64_t hintFrame, bool withPrev) {
+std::string level_list(const std::array<uint32_t, SunLevels>& counts) {
+  std::string out;
+  for (uint32_t level = 0; level < SunLevels; ++level) {
+    out += fmt::format("{}{}", level == 0 ? "" : " ", counts[level]);
+  }
+  return out;
+}
+
+void finish_readback(const wgpu::Buffer& buffer, const Capture& capture, std::span<const uint32_t> receivers) {
+  const Views& expected = capture.views;
+  const uint64_t hintFrame = capture.hintFrame;
   const auto* bytes = static_cast<const uint8_t*>(buffer.GetConstMappedRange(0, ReadbackBytes));
   std::string error = "the readback could not be mapped";
   uint32_t allocated = 0;
   ScanCounts scan;
+  AllocSummary alloc;
+  std::array<uint32_t, StatCount> stats{};
   if (bytes != nullptr) {
     std::vector<uint32_t> words(ReadbackBytes / 4);
     std::memcpy(words.data(), bytes, ReadbackBytes);
     const std::span<const uint32_t> all{words};
     const auto region = [&](uint64_t offset, uint64_t size) { return all.subspan(offset / 4, size / 4); };
     const std::span<const uint32_t> table = region(TableOffset, TableBytes);
+    const std::span<const uint32_t> renderList = region(RenderListOffset, render_list::Bytes);
+    std::ranges::copy(region(StatsOffset, StatsBytes), stats.begin());
     error = verify(expected, region(ViewsOffset, ViewsBytes), table, region(PhysOffset, PhysBytes));
     if (error.empty()) {
       const ScanReadback scanned{
-          .prevHistory = withPrev ? region(PrevHistoryOffset, HistoryBytes) : std::span<const uint32_t>{},
+          .prevHistory = capture.withPrev ? region(PrevHistoryOffset, HistoryBytes) : std::span<const uint32_t>{},
           .records = region(RecordsOffset, RecordsBytes),
           .materials = region(MaterialsOffset, MaterialsBytes),
           .history = region(HistoryOffset, HistoryBytes),
@@ -161,11 +192,34 @@ void finish_readback(const wgpu::Buffer& buffer, const Views& expected, uint64_t
           .dirtyPages = region(DirtyOffset, DirtyPagesBytes),
           .table = table,
           .stats = region(StatsOffset, StatsBytes),
+          .renderList = renderList,
       };
       error = verify_scan(expected, scanned, scan);
     }
+    if (error.empty()) {
+      const AllocReadback readback{
+          .requests = region(RequestsOffset, RequestsBytes),
+          .table = table,
+          .phys = region(PhysOffset, PhysBytes),
+          .renderList = renderList,
+          .stats = region(StatsOffset, StatsBytes),
+          .receivers = receivers,
+          .params = capture.marked ? &capture.mark : nullptr,
+      };
+      error = verify_alloc(expected, readback, alloc);
+    }
     allocated = allocated_entries(table);
   }
+  Log.info(
+      "VSM: alloc frame {}: requested {} [{}], cached {} [{}], rendered {} [{}] (priority {}, new {}, reuse {}; "
+      "budget {}{}), deferred new {} reuse {}, overflow {}, player deferred {}, evicted {}, freed dirty {}, "
+      "hits {}; receivers {} ({} near a boundary); pt and phys hash {:016x}",
+      hintFrame, alloc.requested, level_list(alloc.requestedLevels), alloc.cached, level_list(alloc.cachedLevels),
+      alloc.rendered, level_list(alloc.renderedLevels), stats[stat::NeedPriority], stats[stat::NeedNew],
+      stats[stat::NeedReuse], expected.header.budget,
+      (expected.header.flags & header_flag::Exempt) != 0 ? ", exempt" : "", stats[stat::DeferredNew],
+      stats[stat::DeferredReuse], stats[stat::OverflowPool], stats[stat::PlayerDeferred], stats[stat::Evicted],
+      stats[stat::FreedDirty], stats[stat::Hits], alloc.receivers, alloc.ambiguous, alloc.hash);
   std::lock_guard lock{g_mutex};
   ++g_result.readbacks;
   g_result.entries += allocated;
@@ -173,6 +227,12 @@ void finish_readback(const wgpu::Buffer& buffer, const Views& expected, uint64_t
   g_result.referenced += scan.referenced ? 1 : 0;
   g_result.changed += scan.changed;
   g_result.footprint += scan.footprint;
+  g_result.marked += alloc.marked ? 1 : 0;
+  g_result.receivers += alloc.receivers;
+  g_result.ambiguous += alloc.ambiguous;
+  g_result.requested += alloc.requested;
+  g_result.rendered += alloc.rendered;
+  g_result.uncommitted += alloc.committed || alloc.rendered == 0 ? 0 : 1;
   if (!error.empty()) {
     ++g_result.failures;
     Log.error("VSM: check frame {} FAILED: {}", hintFrame, error);
@@ -201,6 +261,9 @@ void declare(detail::InternalPassBuilder& builder, const detail::PassSetup& setu
   local.refs[HistoryRef] = copy(History, handle(History));
   local.refs[CastRef] = copy(CastBits, handle(CastBits));
   local.refs[DirtyRef] = builder.use_buffer(DirtyPagesName, Access::CopySrc).index;
+  local.refs[RequestsRef] = builder.use_buffer(Requests, Access::CopySrc).index;
+  local.refs[RenderListRef] = builder.use_buffer(RenderList, Access::CopySrc).index;
+  local.refs[ReceiversRef] = builder.use_buffer(MarkReceivers, Access::CopySrc).index;
   std::memcpy(builder.local().data(), &local, sizeof(local));
 }
 
@@ -289,8 +352,9 @@ void encode(detail::PassContext& ctx, const void*) {
     std::lock_guard lock{g_mutex};
     g_prevFrame = NoFrame;
     if (!g_result.busy) {
-      if (!g_buffer) {
-        g_buffer = readback_buffer("VSM check readback", ReadbackBytes);
+      const uint64_t need = ReadbackBytes + (views[ReceiversRef].buffer ? views[ReceiversRef].size & ~uint64_t{3} : 0);
+      if (!g_buffer || g_buffer.GetSize() < need) {
+        g_buffer = readback_buffer("VSM check readback", need);
       }
       copy(HistoryRef, PrevHistoryOffset, HistoryBytes, g_buffer);
       g_prevFrame = hintFrame;
@@ -299,16 +363,21 @@ void encode(detail::PassContext& ctx, const void*) {
   if (!check_frame(hintFrame)) {
     return;
   }
-  std::shared_ptr<const Views> expected;
-  if (g_lastFrame == hintFrame) {
-    expected = std::make_shared<const Views>(g_lastViews);
+  auto capture = std::make_shared<Capture>();
+  const bool hasViews = g_lastFrame == hintFrame;
+  if (hasViews) {
+    capture->views = g_lastViews;
   }
+  capture->hintFrame = hintFrame;
+  capture->marked = g_markFrame == hintFrame && views[ReceiversRef].buffer;
+  capture->mark = g_markParams;
+  capture->receiverBytes = capture->marked ? views[ReceiversRef].size & ~uint64_t{3} : 0;
+  const uint64_t total = ReadbackBytes + capture->receiverBytes;
   wgpu::Buffer buffer;
-  bool withPrev = false;
   {
     std::lock_guard lock{g_mutex};
     ++g_result.frames;
-    if (expected == nullptr) {
+    if (!hasViews) {
       ++g_result.failures;
       if (!std::exchange(g_warnedViews, true)) {
         Log.error("VSM: check frame {} FAILED: vsm.update wrote no views this frame", hintFrame);
@@ -319,10 +388,11 @@ void encode(detail::PassContext& ctx, const void*) {
       ++g_result.skipped;
       return;
     }
-    if (!g_buffer) {
-      g_buffer = readback_buffer("VSM check readback", ReadbackBytes);
+    if (!g_buffer || g_buffer.GetSize() < total) {
+      g_buffer = readback_buffer("VSM check readback", total);
+      g_prevFrame = NoFrame;
     }
-    withPrev = g_prevFrame != NoFrame && g_prevFrame + 1 == hintFrame;
+    capture->withPrev = g_prevFrame != NoFrame && g_prevFrame + 1 == hintFrame;
     g_prevFrame = NoFrame;
     g_result.busy = true;
     buffer = g_buffer;
@@ -336,11 +406,24 @@ void encode(detail::PassContext& ctx, const void*) {
   copy(HistoryRef, HistoryOffset, HistoryBytes, buffer);
   copy(CastRef, CastBitsOffset, CastBitsBytes, buffer);
   copy(DirtyRef, DirtyOffset, DirtyPagesBytes, buffer);
-  detail::queue_after_frame([buffer, expected, hintFrame, withPrev] {
-    buffer.MapAsync(wgpu::MapMode::Read, 0, ReadbackBytes, wgpu::CallbackMode::AllowSpontaneous,
-                    [buffer, expected, hintFrame, withPrev](wgpu::MapAsyncStatus status, wgpu::StringView) {
+  copy(RequestsRef, RequestsOffset, RequestsBytes, buffer);
+  copy(RenderListRef, RenderListOffset, render_list::Bytes, buffer);
+  if (capture->receiverBytes != 0) {
+    copy(ReceiversRef, ReadbackBytes, capture->receiverBytes, buffer);
+  }
+  detail::queue_after_frame([buffer, capture, total] {
+    buffer.MapAsync(wgpu::MapMode::Read, 0, total, wgpu::CallbackMode::AllowSpontaneous,
+                    [buffer, capture, total](wgpu::MapAsyncStatus status, wgpu::StringView) {
                       if (status == wgpu::MapAsyncStatus::Success) {
-                        finish_readback(buffer, *expected, hintFrame, withPrev);
+                        std::vector<uint32_t> receivers;
+                        if (capture->receiverBytes != 0) {
+                          if (const auto* bytes = static_cast<const uint32_t*>(
+                                  buffer.GetConstMappedRange(ReadbackBytes, capture->receiverBytes));
+                              bytes != nullptr) {
+                            receivers.assign(bytes, bytes + capture->receiverBytes / 4);
+                          }
+                        }
+                        finish_readback(buffer, *capture, receivers);
                         buffer.Unmap();
                       }
                       std::lock_guard lock{g_mutex};
@@ -492,6 +575,14 @@ void record_views(const Views& views, uint64_t hintFrame) noexcept {
   g_lastFrame = hintFrame;
 }
 
+void record_mark(const MarkParams& params, uint64_t hintFrame) noexcept {
+  if (!config().on) {
+    return;
+  }
+  g_markParams = params;
+  g_markFrame = hintFrame;
+}
+
 std::string verify(const Views& expected, std::span<const uint32_t> views, std::span<const uint32_t> table,
                    std::span<const uint32_t> phys) {
   if (views.size() * 4 < ViewsBytes || table.size() < MaxVirtualPages || phys.size() < MaxPoolPages * PhysWords) {
@@ -510,9 +601,6 @@ std::string verify(const Views& expected, std::span<const uint32_t> views, std::
     const uint32_t e = table[v];
     if (e == 0) {
       continue;
-    }
-    if (full) {
-      return fmt::format("entry {} is {:#x} after a full reset", v, e);
     }
     if ((expected.views[v / PagesPerView].view_flags() & view_flag::Active) == 0) {
       return fmt::format("entry {} of inactive view {} is {:#x}", v, v / PagesPerView, e);
@@ -537,8 +625,11 @@ std::string verify(const Views& expected, std::span<const uint32_t> views, std::
       }
       continue;
     }
-    if (full || p >= poolPages || owner > MaxVirtualPages) {
-      return fmt::format("page {} has owner {} in a {} page pool{}", p, owner, poolPages, full ? " after a reset" : "");
+    if (p >= poolPages || owner > MaxVirtualPages) {
+      return fmt::format("page {} has owner {} in a {} page pool", p, owner, poolPages);
+    }
+    if (full && lastUsed != expected.header.clock) {
+      return fmt::format("page {} was last used at {} on a full frame at clock {}", p, lastUsed, expected.header.clock);
     }
     const uint32_t e = table[owner - 1];
     if ((e & entry::Allocated) == 0 || (e & entry::PhysMask) != p) {
@@ -625,9 +716,19 @@ std::string verify_scan(const Views& expected, const ScanReadback& in, ScanCount
     counts.footprint += w < DirtyPlaneWords ? static_cast<uint64_t>(std::popcount(gpu)) : 0;
   }
   const std::span<const uint32_t> innerPriority = std::span{inner}.subspan(DirtyPlaneWords);
+  std::vector<bool> rendered(MaxVirtualPages, false);
+  if (in.renderList.size() >= render_list::Words) {
+    const uint32_t count = std::min(in.renderList[render_list::Count], MaxRenderPages);
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t v = in.renderList[render_list::Pages + 2 * i];
+      if (v < MaxVirtualPages) {
+        rendered[v] = true;
+      }
+    }
+  }
   for (uint32_t index = 0; index < MaxVirtualPages; ++index) {
     const uint32_t e = in.table[index];
-    if ((e & entry::Allocated) == 0) {
+    if ((e & entry::Allocated) == 0 || rendered[index]) {
       continue;
     }
     if (test_bit(inner, index) && (e & entry::Dirty) == 0) {
@@ -637,6 +738,122 @@ std::string verify_scan(const Views& expected, const ScanReadback& in, ScanCount
       return fmt::format("entry {} lies in a player footprint but is {:#x}", index, e);
     }
   }
+  return {};
+}
+
+std::string verify_alloc(const Views& expected, const AllocReadback& in, AllocSummary& out) {
+  if (in.requests.size() < MaxVirtualPages || in.table.size() < MaxVirtualPages ||
+      in.phys.size() < size_t{MaxPoolPages} * PhysWords || in.renderList.size() < render_list::Words ||
+      in.stats.size() < StatCount) {
+    return "the alloc readback is short";
+  }
+  const ViewsHeader& h = expected.header;
+  const std::span<const uint32_t> rl = in.renderList;
+  const std::span<const uint32_t> st = in.stats;
+  if (in.params != nullptr && !in.receivers.empty()) {
+    const MarkReference ref = mark_reference(expected, *in.params, in.receivers);
+    out.marked = true;
+    out.receivers = ref.receivers;
+    out.ambiguous = ref.ambiguous;
+    for (uint32_t v = 0; v < MaxVirtualPages; ++v) {
+      const uint32_t gpu = in.requests[v] & (request_bit::Pixel | request_bit::Fallback);
+      if ((ref.must[v] & ~gpu) != 0) {
+        return fmt::format("page {} has requests {:#x} but the mark twin needs {:#x}", v, gpu, ref.must[v]);
+      }
+      if ((gpu & ~(ref.must[v] | ref.may[v])) != 0) {
+        return fmt::format("page {} has requests {:#x}, more than the mark twin's {:#x}", v, gpu,
+                           ref.must[v] | ref.may[v]);
+      }
+    }
+  }
+  const bool held = (h.flags & header_flag::Held) != 0;
+  const AllocBudget budget =
+      alloc_budget(st[stat::NeedPriority], st[stat::NeedNew], st[stat::NeedReuse], st[stat::Evictable], h.budget, held);
+  const uint32_t count = rl[render_list::Count];
+  if (count != budget.count || st[stat::Rendered] != count) {
+    return fmt::format("the render list holds {} pages (stat {}), the budget allows {}", count, st[stat::Rendered],
+                       budget.count);
+  }
+  if (st[stat::PlayerDeferred] != 0 || budget.playerDeferred != 0) {
+    return fmt::format("{} player pages were deferred", st[stat::PlayerDeferred]);
+  }
+  if (st[stat::DeferredNew] != budget.deferredNew || st[stat::DeferredReuse] != budget.deferredReuse ||
+      st[stat::OverflowPool] != budget.overflowPool) {
+    return "the deferred and overflow counts disagree with the budget";
+  }
+  std::vector<bool> seenPage(MaxVirtualPages, false);
+  std::vector<bool> seenPhys(MaxPoolPages, false);
+  std::vector<uint32_t> rows(size_t{MaxViews} * WindowPages, 0);
+  uint32_t sentinels = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t v = rl[render_list::Pages + 2 * i];
+    const uint32_t p = rl[render_list::Pages + 2 * i + 1];
+    if (v == NoPage) {
+      ++sentinels;
+      continue;
+    }
+    if (v >= MaxVirtualPages || p >= h.poolPages || seenPage[v] || seenPhys[p]) {
+      return fmt::format("render entry {} names page {} and physical page {} twice or out of range", i, v, p);
+    }
+    seenPage[v] = true;
+    seenPhys[p] = true;
+    const uint32_t e = in.table[v];
+    if ((e & entry::Allocated) == 0 || (e & entry::PhysMask) != p || in.phys[size_t{p} * PhysWords] != v + 1 ||
+        in.phys[size_t{p} * PhysWords + 1] != h.clock) {
+      return fmt::format("render entry {} names page {} on {}, but the entry is {:#x}", i, v, p, e);
+    }
+    const ViewRecord& view = expected.views[v / PagesPerView];
+    const uint32_t slot = v % PagesPerView;
+    const uint32_t lx = (slot % WindowPages - static_cast<uint32_t>(view.origin[0])) & (WindowPages - 1);
+    const uint32_t ly = (slot / WindowPages - static_cast<uint32_t>(view.origin[1])) & (WindowPages - 1);
+    rows[size_t{v / PagesPerView} * WindowPages + ly] |= 1u << lx;
+    ++out.renderedLevels[SunLevels - 1 - std::min(v / PagesPerView, SunLevels - 1)];
+  }
+  if (sentinels != budget.overflowPool) {
+    return fmt::format("{} render entries overflowed the pool, the stats say {}", sentinels, budget.overflowPool);
+  }
+  for (uint32_t w = 0; w < rows.size(); ++w) {
+    if (rl[render_list::RowMasks + w] != rows[w]) {
+      return fmt::format("row mask {} is {:#x}, the render list gives {:#x}", w, rl[render_list::RowMasks + w],
+                         rows[w]);
+    }
+  }
+  const uint32_t valid = count - sentinels;
+  out.committed = st[stat::Committed] + st[stat::CommitSkipped] == valid;
+  uint32_t unallocated = 0;
+  for (uint32_t v = 0; v < MaxVirtualPages; ++v) {
+    const uint32_t e = in.table[v];
+    const uint32_t level = SunLevels - 1 - std::min(v / PagesPerView, SunLevels - 1);
+    if (out.committed && (e & entry::RenderNow) != 0) {
+      return fmt::format("entry {} is {:#x} after commit", v, e);
+    }
+    if ((e & (entry::Allocated | entry::Cached | entry::RenderNow)) == (entry::Allocated | entry::Cached)) {
+      ++out.cached;
+      ++out.cachedLevels[level];
+    }
+    if ((in.requests[v] & request_bit::Mask) == 0) {
+      continue;
+    }
+    ++out.requested;
+    ++out.requestedLevels[level];
+    unallocated += (e & entry::Allocated) == 0 ? 1 : 0;
+  }
+  if (out.requested != st[stat::Requested]) {
+    return fmt::format("{} pages carry requests, the classify counted {}", out.requested, st[stat::Requested]);
+  }
+  if (!held && unallocated != budget.deferredNew + budget.overflowPool) {
+    return fmt::format("{} requested pages hold no physical page, but {} were deferred and {} overflowed", unallocated,
+                       budget.deferredNew, budget.overflowPool);
+  }
+  out.rendered = valid;
+  uint64_t hash = 0xCBF29CE484222325ull;
+  for (const uint32_t w : in.table) {
+    hash = fnv(hash, w);
+  }
+  for (const uint32_t w : in.phys) {
+    hash = fnv(hash, w);
+  }
+  out.hash = hash;
   return {};
 }
 
@@ -691,8 +908,10 @@ void shutdown() noexcept {
   } else {
     Log.info(
         "VSM: check passed ({} readbacks, {} allocated entries, {} full frames, {} skipped; dirty reference on {} "
-        "frames, {} changed slots, {} footprint pages; {} stats frames skipped)",
-        r.readbacks, r.entries, r.fulls, r.skipped, r.referenced, r.changed, r.footprint, r.statsSkipped);
+        "frames, {} changed slots, {} footprint pages; mark twin on {} frames, {} receivers, {} near a boundary; "
+        "{} requested and {} rendered pages, {} frames uncommitted; {} stats frames skipped)",
+        r.readbacks, r.entries, r.fulls, r.skipped, r.referenced, r.changed, r.footprint, r.marked, r.receivers,
+        r.ambiguous, r.requested, r.rendered, r.uncommitted, r.statsSkipped);
   }
 }
 
@@ -709,6 +928,8 @@ void reset() noexcept {
   g_ring = {};
   g_frames.clear();
   g_seq = 0;
+  g_markParams = {};
+  g_markFrame = NoFrame;
 }
 
 void set_config(const std::optional<Config>& config) noexcept { g_override = config; }

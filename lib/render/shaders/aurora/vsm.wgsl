@@ -10,7 +10,7 @@ const VSM_HEADER_WORDS: u32 = 64u;
 const VSM_VIEW_WORDS: u32 = 32u;
 const VSM_VIEWS_WORDS: u32 = 576u;
 const VSM_PHYS_WORDS: u32 = 2u;
-const VSM_STAT_COUNT: u32 = 64u;
+const VSM_STAT_COUNT: u32 = 128u;
 
 const VSM_ENTRY_PHYS_MASK: u32 = 0xFFFu;
 const VSM_ENTRY_FRESH: u32 = 0x1000u;
@@ -309,4 +309,188 @@ fn vsm_box_rect(v: VsmView, box: array<vec3f, 2>) -> vec4i {
   let p0 = clamp(floor(lo / f32(VSM_PAGE_TEXELS)), vec2f(-1.0), limit + 1.0);
   let p1 = clamp(floor(hi / f32(VSM_PAGE_TEXELS)), vec2f(-1.0), limit + 1.0);
   return vec4i(vec2i(max(p0, vec2f(0.0))), vec2i(min(p1, limit)));
+}
+
+const VSM_REQUEST_PIXEL: u32 = 1u;
+const VSM_REQUEST_FALLBACK: u32 = 2u;
+const VSM_REQUEST_VOLUME: u32 = 4u;
+const VSM_REQUEST_PRIORITY: u32 = 8u;
+const VSM_REQUEST_MASK: u32 = 15u;
+const VSM_FILTER_MARGIN_TEXELS: u32 = 4u;
+const VSM_MARK_KEYS: u32 = 8u;
+const VSM_NO_KEY: u32 = 0xFFFFFFFFu;
+const VSM_NO_PAGE: u32 = 0xFFFFFFFFu;
+const VSM_CLEAR_DEPTH: f32 = 0.0;
+
+const VSM_NEED_CLASSES: u32 = 3u;
+const VSM_NEED_PRIORITY: u32 = 0u;
+const VSM_NEED_NEW: u32 = 1u;
+const VSM_NEED_REUSE: u32 = 2u;
+const VSM_PHYS_BANDS: u32 = 4u;
+const VSM_PHYS_FREE: u32 = 0u;
+const VSM_PHYS_OLD: u32 = 1u;
+const VSM_PHYS_MID: u32 = 2u;
+const VSM_PHYS_YOUNG: u32 = 3u;
+const VSM_OLD_AGE: u32 = 64u;
+const VSM_MID_AGE: u32 = 8u;
+const VSM_MAX_RENDER_PAGES: u32 = 4096u;
+
+const VSM_RL_COUNT: u32 = 0u;
+const VSM_RL_PRIORITY: u32 = 1u;
+const VSM_RL_NEW: u32 = 2u;
+const VSM_RL_REUSE: u32 = 3u;
+const VSM_RL_BUDGET: u32 = 4u;
+const VSM_RL_PAGES_X: u32 = 5u;
+const VSM_RL_ROWS: u32 = 6u;
+const VSM_RL_FLAGS: u32 = 7u;
+const VSM_RL_PAGES: u32 = 16u;
+const VSM_RL_ROW_MASKS: u32 = 8208u;
+const VSM_RL_WORDS: u32 = 8720u;
+
+const VSM_STAT_REQUESTED: u32 = 28u;
+const VSM_STAT_NEED_PRIORITY: u32 = 29u;
+const VSM_STAT_NEED_NEW: u32 = 30u;
+const VSM_STAT_NEED_REUSE: u32 = 31u;
+const VSM_STAT_HITS: u32 = 32u;
+const VSM_STAT_FREED_DIRTY: u32 = 33u;
+const VSM_STAT_EVICTABLE: u32 = 34u;
+const VSM_STAT_FREE_PAGES: u32 = 35u;
+const VSM_STAT_RENDERED: u32 = 36u;
+const VSM_STAT_DEFERRED_NEW: u32 = 37u;
+const VSM_STAT_DEFERRED_REUSE: u32 = 38u;
+const VSM_STAT_OVERFLOW_POOL: u32 = 39u;
+const VSM_STAT_PLAYER_DEFERRED: u32 = 40u;
+const VSM_STAT_EVICTED: u32 = 41u;
+const VSM_STAT_COMMITTED: u32 = 42u;
+const VSM_STAT_COMMIT_SKIPPED: u32 = 43u;
+
+fn vsm_slot_local(slot: vec2u, origin: vec2i) -> vec2u {
+  return (slot - bitcast<vec2u>(origin)) & vec2u(VSM_WINDOW_PAGES - 1u);
+}
+
+fn vsm_render_page(render_list: ptr<storage, array<u32>, read>, index: u32) -> vec2u {
+  let word = VSM_RL_PAGES + 2u * index;
+  if (word + 1u >= arrayLength(render_list)) {
+    return vec2u(VSM_NO_PAGE);
+  }
+  return vec2u((*render_list)[word], (*render_list)[word + 1u]);
+}
+
+fn vsm_level_wanted(f: f32, texel0: f32, bias: f32) -> u32 {
+  return u32(clamp(ceil(log2(max(f, 1e-30) / texel0) + bias), 0.0, f32(VSM_SUN_LEVELS - 1u)));
+}
+
+fn vsm_level_fits(v: VsmView, p_rel: vec3f) -> bool {
+  let c = vsm_view_coords(v, p_rel).xy;
+  let m = f32(VSM_FILTER_MARGIN_TEXELS);
+  return all(c >= vec2f(m)) && all(c < vec2f(f32(VSM_WINDOW_TEXELS) - m));
+}
+
+fn vsm_select_level(views: ptr<storage, array<u32>, read>, f: f32, p_rel: vec3f, bias: f32) -> u32 {
+  let texel0 = vsm_f32((*views)[VSM_HDR_TEXEL0]);
+  if (!(texel0 > 0.0)) {
+    return VSM_SUN_LEVELS;
+  }
+  for (var level = vsm_level_wanted(f, texel0, bias); level < VSM_SUN_LEVELS; level++) {
+    if (vsm_level_fits(vsm_view(views, vsm_level_view(level)), p_rel)) {
+      return level;
+    }
+  }
+  return VSM_SUN_LEVELS;
+}
+
+fn vsm_no_keys() -> array<u32, 8> {
+  return array<u32, 8>(VSM_NO_KEY, VSM_NO_KEY, VSM_NO_KEY, VSM_NO_KEY, VSM_NO_KEY, VSM_NO_KEY, VSM_NO_KEY, VSM_NO_KEY);
+}
+
+fn vsm_level_keys(v: VsmView, p_rel: vec3f, bits: u32, keys: ptr<function, array<u32, 8>>, first: u32) {
+  let c = vsm_view_coords(v, p_rel).xy;
+  let m = f32(VSM_FILTER_MARGIN_TEXELS);
+  let lo = max(vec2i(floor((c - m) / f32(VSM_PAGE_TEXELS))), vec2i(0));
+  let hi = min(vec2i(floor((c + m) / f32(VSM_PAGE_TEXELS))), vec2i(i32(VSM_WINDOW_PAGES) - 1));
+  var k = first;
+  for (var y = lo.y; y <= min(hi.y, lo.y + 1); y++) {
+    for (var x = lo.x; x <= min(hi.x, lo.x + 1); x++) {
+      (*keys)[k] = vsm_page_index(v.table_offset, v.origin + vec2i(x, y)) | (bits << 16u);
+      k++;
+    }
+  }
+}
+
+fn vsm_request_keys(views: ptr<storage, array<u32>, read>, p_rel: vec3f, f: f32) -> array<u32, 8> {
+  var keys = vsm_no_keys();
+  let level = vsm_select_level(views, f, p_rel, vsm_f32((*views)[VSM_HDR_LEVEL_BIAS]));
+  if (level >= VSM_SUN_LEVELS) {
+    return keys;
+  }
+  vsm_level_keys(vsm_view(views, vsm_level_view(level)), p_rel, VSM_REQUEST_PIXEL, &keys, 0u);
+  if (level + 1u < VSM_SUN_LEVELS) {
+    vsm_level_keys(vsm_view(views, vsm_level_view(level + 1u)), p_rel, VSM_REQUEST_FALLBACK, &keys, 4u);
+  }
+  return keys;
+}
+
+fn vsm_request(requests: ptr<storage, array<atomic<u32>>, read_write>, v: VsmView, page: vec2i, bits: u32) {
+  let local = page - v.origin;
+  if (any(local < vec2i(0)) || any(local >= vec2i(i32(VSM_WINDOW_PAGES)))) {
+    return;
+  }
+  let index = vsm_page_index(v.table_offset, page);
+  if (index < arrayLength(requests)) {
+    atomicOr(&(*requests)[index], bits & VSM_REQUEST_MASK);
+  }
+}
+
+fn vsm_request_world(requests: ptr<storage, array<atomic<u32>>, read_write>, views: ptr<storage, array<u32>, read>,
+                     p_rel: vec3f, footprint: f32, bits: u32) {
+  let keys = vsm_request_keys(views, p_rel, footprint);
+  for (var k = 0u; k < VSM_MARK_KEYS; k++) {
+    let key = keys[k];
+    let index = key & 0xFFFFu;
+    if (key != VSM_NO_KEY && index < arrayLength(requests)) {
+      atomicOr(&(*requests)[index], select(VSM_REQUEST_FALLBACK, bits & VSM_REQUEST_MASK, k < 4u));
+    }
+  }
+}
+
+fn vsm_phys_band(owner: u32, last_used: u32, clock: u32) -> u32 {
+  if (owner == 0u) {
+    return VSM_PHYS_FREE;
+  }
+  let age = clock - last_used;
+  if (age >= VSM_OLD_AGE) {
+    return VSM_PHYS_OLD;
+  }
+  if (age >= VSM_MID_AGE) {
+    return VSM_PHYS_MID;
+  }
+  return select(VSM_PHYS_BANDS, VSM_PHYS_YOUNG, age >= 1u);
+}
+
+struct VsmBudget {
+  count: u32,
+  priority: u32,
+  fresh: u32,
+  reuse: u32,
+  deferred_new: u32,
+  deferred_reuse: u32,
+  overflow_pool: u32,
+  player_deferred: u32,
+}
+
+fn vsm_alloc_budget(priority: u32, fresh: u32, reuse: u32, evictable: u32, budget: u32, held: bool) -> VsmBudget {
+  var b: VsmBudget;
+  if (held) {
+    return b;
+  }
+  let within = min(budget, fresh + reuse);
+  b.count = min(priority + within, VSM_MAX_RENDER_PAGES);
+  b.priority = min(priority, b.count);
+  b.fresh = min(min(fresh, within), b.count - b.priority);
+  b.reuse = min(within - min(fresh, within), b.count - b.priority - b.fresh);
+  b.deferred_new = fresh - b.fresh;
+  b.deferred_reuse = reuse - b.reuse;
+  b.overflow_pool = b.fresh - min(b.fresh, evictable);
+  b.player_deferred = priority - b.priority;
+  return b;
 }

@@ -1,5 +1,6 @@
 #include "vsm_pages.hpp"
 
+#include "vsm_alloc.hpp"
 #include "vsm_check.hpp"
 #include "vsm_invalidate.hpp"
 
@@ -411,11 +412,17 @@ uint32_t expected_mask(const detail::CompiledGraph* graph) noexcept {
   if (graph == nullptr) {
     return 0;
   }
-  constexpr std::array<std::pair<std::string_view, uint32_t>, 4> Chain{{
+  constexpr std::array<std::pair<std::string_view, uint32_t>, 10> Chain{{
       {UpdatePass, chain_bit::Update},
       {ScanPass, chain_bit::Scan},
       {ScanListPass, chain_bit::ScanList},
       {DirtyPass, chain_bit::Dirty},
+      {MarkPass, chain_bit::Mark},
+      {ClassifyPass, chain_bit::Classify},
+      {AllocListsPass, chain_bit::AllocLists},
+      {AssignPass, chain_bit::Assign},
+      {ClearPass, chain_bit::Clear},
+      {CommitPass, chain_bit::Commit},
   }};
   uint32_t mask = 0;
   for (const auto& [name, bit] : Chain) {
@@ -495,6 +502,15 @@ std::array<float, 3> ViewRecord::direction() const noexcept {
 }
 
 PoolFormat pool_format() noexcept { return PoolFormat::DepthAtlas; }
+
+TexDesc pool_desc() noexcept {
+  return {
+      .format = wgpu::TextureFormat::Depth32Float,
+      .sizeClass = SizeClass::Absolute,
+      .width = std::max(g_extent.width, PageTexels),
+      .height = std::max(g_extent.height, PageTexels),
+  };
+}
 
 PoolExtent pool_extent(uint32_t pages, uint32_t maxDimension) noexcept {
   PoolExtent out;
@@ -987,6 +1003,7 @@ void initialize() {
 void shutdown() {
   check::shutdown();
   log_summary();
+  alloc_shutdown();
   for (PassId& pass : g_passes) {
     if (pass != detail::InvalidPassId) {
       detail::unregister_pass(pass);
@@ -1158,6 +1175,8 @@ void mark_encoded(uint32_t bit) noexcept { g_worker.mask |= bit; }
 
 uint32_t encoded_mask() noexcept { return g_worker.mask; }
 
+uint32_t expected_chain() noexcept { return g_worker.expected; }
+
 PersistentHandle handle(std::string_view name) noexcept {
   for (uint32_t i = 0; i < HandleCount; ++i) {
     if (HandleNames[i] == name) {
@@ -1185,6 +1204,12 @@ std::array<detail::PassDesc, PassCount> pass_descs() {
       scan_pass_desc(),
       scan_list_pass_desc(),
       dirty_pass_desc(),
+      mark_pass_desc(),
+      classify_pass_desc(),
+      alloc_lists_pass_desc(),
+      assign_pass_desc(),
+      clear_pass_desc(),
+      commit_pass_desc(),
       check::pass_desc(),
   };
 }
