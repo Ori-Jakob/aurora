@@ -320,6 +320,7 @@ if (AURORA_ENABLE_GX)
     target_sources(render_tests PRIVATE render_texture_inspector_test.cpp)
     target_sources(render_tests PRIVATE render_fake_shadow_test.cpp)
     target_sources(render_tests PRIVATE render_fake_shadows_tab_test.cpp)
+    target_sources(render_tests PRIVATE render_vsm_test.cpp)
   endif ()
   aurora_copy_runtime_dlls(render_tests)
   gtest_discover_tests(render_tests)
@@ -419,7 +420,7 @@ if (AURORA_ENABLE_GX)
       render_ao_test.cpp render_ao_reference.cpp render_depth_device.cpp render_composite_test.cpp
       render_lighting_test.cpp render_lighting_reference.cpp render_openpbr_test.cpp render_sky_probe_test.cpp
       render_exposure_test.cpp render_ssil_test.cpp render_streamout_gpu_test.cpp gx_vertex_fetch_cpu_test.cpp
-      render_atlas_gpu_test.cpp)
+      render_atlas_gpu_test.cpp render_vsm_gpu_test.cpp)
     target_include_directories(render_gpu_tests PRIVATE ../include ../lib)
     target_compile_definitions(render_gpu_tests PRIVATE AURORA TARGET_PC=1 AURORA_ENABLE_RENDER=1
       AURORA_ENABLE_NATIVE_D3D12=$<BOOL:${AURORA_ENABLE_NATIVE_D3D12}> AURORA_ENABLE_XESS=$<BOOL:${AURORA_ENABLE_XESS}>

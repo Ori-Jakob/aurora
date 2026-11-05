@@ -435,6 +435,31 @@ TEST_F(RenderApiTest, SanitizeReplacesInvalidValues) {
   EXPECT_EQ(sanitized.sky.cloudStyle, -1.f);
 }
 
+TEST_F(RenderApiTest, ShadowPagesAndBudgetClamp) {
+  const auto sanitized = [](uint32_t pages, uint32_t budget) {
+    Settings request;
+    request.shadows.pages = pages;
+    request.shadows.pageBudget = budget;
+    return sanitize_settings(request).shadows;
+  };
+  EXPECT_EQ(sanitized(100, 64).pages, 256u);
+  EXPECT_EQ(sanitized(9000, 64).pages, 4096u);
+  EXPECT_EQ(sanitized(2048, 64).pages, 2048u);
+  EXPECT_EQ(sanitized(1024, 4).pageBudget, 8u);
+  EXPECT_EQ(sanitized(1024, 1000).pageBudget, 256u);
+  EXPECT_EQ(sanitized(1024, 32).pageBudget, 32u);
+  const ShadowSettings defaults = sanitized(0, 0);
+  EXPECT_EQ(defaults.pages, Settings{}.shadows.pages);
+  EXPECT_EQ(defaults.pageBudget, Settings{}.shadows.pageBudget);
+  for (const uint32_t value : {0u, 1u, 8u, 255u, 256u, 257u, 4096u, 4097u, UINT32_MAX}) {
+    Settings request;
+    request.shadows.pages = value;
+    request.shadows.pageBudget = value;
+    const Settings once = sanitize_settings(request);
+    EXPECT_EQ(sanitize_settings(once), once) << value;
+  }
+}
+
 TEST_F(RenderApiTest, ClampIsIdempotent) {
   struct Input {
     Caps caps;

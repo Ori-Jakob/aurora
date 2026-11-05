@@ -35,6 +35,7 @@
 #include "scene/meshlets.hpp"
 #include "scene/motion.hpp"
 #include "scene/streamout.hpp"
+#include "shadows/vsm_pages.hpp"
 #include "systems/dispatch.hpp"
 #include "systems/systems.hpp"
 
@@ -124,6 +125,7 @@ void initialize() {
   gx_ext::fwd_env::initialize();
   gx_ext::surface_table::initialize();
   scene::atlas::initialize();
+  shadows::vsm::initialize();
   debug::surface_expand::initialize();
   upscale::initialize();
   systems::initialize();
@@ -160,6 +162,7 @@ void shutdown() noexcept {
   scene::streamout::shutdown();
   scene::meshlets::shutdown();
   scene::atlas::shutdown();
+  shadows::vsm::shutdown();
   compact::shutdown();
   // Compile jobs use the device, so they finish before the job pool and the device go away
   shaders::shutdown();

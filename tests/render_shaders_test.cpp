@@ -23,6 +23,7 @@
 #include "render/post/composite.hpp"
 #include "render/scene/streamout.hpp"
 #include "render/shader_resolve.hpp"
+#include "render/shadows/vsm_pages.hpp"
 #include "render/shaders.hpp"
 #include "render/systems/dispatch.hpp"
 #include "render/systems/systems.hpp"
@@ -1746,8 +1747,10 @@ TEST_F(RenderShaders, ModuleInitRequestsNoPipelines) {
   compact::initialize();
   detail::hzb::initialize();
   systems::initialize();
+  shadows::vsm::initialize();
   const bool systemsInstalled = systems::kernel_layout() != nullptr;
   const PipelineStats after = stats();
+  shadows::vsm::shutdown();
   systems::shutdown();
   detail::hzb::shutdown();
   compact::shutdown();
@@ -1756,6 +1759,37 @@ TEST_F(RenderShaders, ModuleInitRequestsNoPipelines) {
   EXPECT_EQ(after.pending, 0u);
   EXPECT_EQ(after.ready, 0u);
   EXPECT_EQ(after.failed, 0u);
+}
+
+TEST_F(RenderShaders, VsmLibraryCompiles) {
+  const std::optional<std::string_view> library = library_text("aurora/vsm");
+  ASSERT_TRUE(library.has_value());
+  EXPECT_EQ(library->find("@group"), std::string_view::npos);
+  EXPECT_EQ(library->find("@binding"), std::string_view::npos);
+  EXPECT_EQ(library->find("var<"), std::string_view::npos);
+  constexpr std::string_view Reader = R"(//#import aurora/vsm
+@group(0) @binding(0) var<storage, read> views: array<u32>;
+@group(0) @binding(1) var<storage, read> table: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out_words: array<vec4f>;
+
+@compute @workgroup_size(1)
+fn main() {
+  let h = vsm_header(&views);
+  let v = vsm_view(&views, vsm_level_view(3u));
+  let c = vsm_view_coords(v, vec3f(1.0, 2.0, 3.0)) + vsm_view_coords_anchor(v, vec3f(4.0, 5.0, 6.0));
+  let page = vec2i(vsm_abs_page(v.origin.x, 3u), vsm_abs_page(v.origin.y, 7u));
+  let e = table[vsm_page_index(v.table_offset, page)];
+  let kept = vsm_kept_after_shift(vec2u(3u, 7u), v.prev_origin, v.origin);
+  let usable = vsm_page_usable(e) && !vsm_page_stale(e) && kept;
+  out_words[0] = vec4f(c + vsm_view_dir(v), f32(vsm_entry_phys(e) + vsm_entry_render_index(e) + h.clock)) +
+                 vec4f(select(0.0, 1.0, usable), h.texel0, v.texel, v.depth_scale);
+}
+)";
+  ASSERT_TRUE(register_source("test/vsm_reader", Reader));
+  std::string error;
+  EXPECT_TRUE(validate_module("test/vsm_reader", {}, error)) << error;
+  EXPECT_TRUE(validate_module("aurora/vsm", {}, error)) << error;
+  EXPECT_TRUE(validate_module(shadows::vsm::Shader, {}, error)) << error;
 }
 
 TEST_F(RenderShaders, RetainedReaderCompiles) {

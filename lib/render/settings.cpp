@@ -6,6 +6,7 @@
 #include "graph_api.hpp"
 #include "graph_bind.hpp"
 #include "module.hpp"
+#include "shadows/vsm_pages.hpp"
 #include "stage.hpp"
 #include "../gfx/frame.hpp"
 #include "../gfx/recording.hpp"
@@ -507,6 +508,32 @@ bool pbr_env() noexcept {
   return enabled;
 }
 
+std::optional<Quality> shadows_env() noexcept {
+  static const std::optional<Quality> quality = []() -> std::optional<Quality> {
+    const char* value = SDL_getenv("AURORA_RENDER_SHADOWS");
+    if (value == nullptr) {
+      return std::nullopt;
+    }
+    constexpr std::array<std::pair<std::string_view, Quality>, 5> Levels{{
+        {"off", Quality::Off},
+        {"low", Quality::Low},
+        {"medium", Quality::Medium},
+        {"high", Quality::High},
+        {"ultra", Quality::Ultra},
+    }};
+    for (const auto& [name, level] : Levels) {
+      if (name == value) {
+        Log.warn("AURORA_RENDER_SHADOWS={}: requesting and building Shadows for development regardless of settings",
+                 value);
+        return level;
+      }
+    }
+    Log.warn("AURORA_RENDER_SHADOWS={} is not off, low, medium, high or ultra; ignored", value);
+    return std::nullopt;
+  }();
+  return quality;
+}
+
 bool mat_maps_env_read() noexcept {
   static const bool enabled = [] {
     const char* value = SDL_getenv("AURORA_RENDER_MAT_MAPS");
@@ -609,6 +636,9 @@ Settings with_env_overrides(Settings settings) noexcept {
   if (pbr_env()) {
     settings.pbr = true;
   }
+  if (const std::optional<Quality> shadows = shadows_env()) {
+    settings.shadows.quality = *shadows;
+  }
   if (env.legacyBlend) {
     settings.legacyBlend = *env.legacyBlend;
   }
@@ -640,6 +670,9 @@ BuiltOptions support_built(const BuiltOptions& built) noexcept {
 #endif
   if (mat_maps_env_read()) {
     out[feature_index(Feature::LegacyMatMaps)] |= 1u << 1;
+  }
+  if (const std::optional<Quality> shadows = shadows_env(); shadows && *shadows != Quality::Off) {
+    out[feature_index(Feature::Shadows)] |= 0x1Eu;
   }
   return out;
 }
@@ -1104,6 +1137,8 @@ Settings sanitize_settings(const Settings& requested) noexcept {
   if (s.shadows.pageBudget == 0) {
     s.shadows.pageBudget = Defaults.shadows.pageBudget;
   }
+  s.shadows.pages = std::clamp(s.shadows.pages, shadows::vsm::MinPoolPages, shadows::vsm::MaxPoolPages);
+  s.shadows.pageBudget = std::clamp(s.shadows.pageBudget, shadows::vsm::MinPageBudget, shadows::vsm::MaxPageBudget);
   return s;
 }
 
@@ -1281,10 +1316,14 @@ std::shared_ptr<const FrameState> latch_frame() {
   bool inspectorOpen = false;
   uint16_t debugView = 0;
 #if AURORA_ENABLE_RENDER
+  shadows::vsm::latch_hints();
   begin_hint_frame();
   latch_external_passes();
   debug::on_latch();
+  shadows::vsm::latch_demand(latched_settings());
   scene::retained::latch_gate(latched_settings(), caps());
+  shadows::vsm::latch_gate(latched_settings(), caps());
+  shadows::vsm::latch_resources(shadows::vsm::active());
   const bool passesChanged = consume_graph_dirty();
   // The hash ignores ids and callbacks, so a re-registered external pass is only noticed by the epoch
   const bool externalsChanged = external_pass_epoch() != g_externalEpoch;
@@ -1324,6 +1363,7 @@ std::shared_ptr<const FrameState> latch_frame() {
       .settings = &latched_settings(), .caps = &caps(), .env = &g_graphEnvironment, .sceneDepth = g_sceneDepthSource};
   ao::on_latch(latched, graph.get());
   lighting::clusters::on_latch(latched, graph.get());
+  shadows::vsm::on_latch(latched, graph.get());
   lighting::deferred::on_latch(latched, graph.get());
   // Producers latch before the composite, which gates its PBR term on them
   lighting::sky_probe::on_latch(latched, graph.get());
