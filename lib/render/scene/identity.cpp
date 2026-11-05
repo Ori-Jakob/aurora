@@ -1,7 +1,9 @@
 #include "identity.hpp"
 
+#include "atlas.hpp"
 #include "classify.hpp"
 #include "gc.hpp"
+#include "map_pick.hpp"
 #include "meshlets.hpp"
 #include "streamout.hpp"
 #include "../hints.hpp"
@@ -73,6 +75,10 @@ struct Slot {
   meshlets::Key meshKey{};
   meshlets::ClusterRange mesh{};
   uint8_t meshChurn = 0;
+  uint32_t material = atlas::NoMaterial;
+  uint64_t materialTuple = 0;
+  atlas::DrawAttributes attributes{};
+  uint64_t attributesTuple = 0;
   bool live = false;
   bool delivered = false;
   bool createdPending = false;
@@ -131,6 +137,9 @@ struct DrawRef {
   uint32_t record = 0;
   const gx::AttrConfig* attrs = nullptr;
   uint8_t stride = 0;
+  const gx::PipelineConfig* config = nullptr;
+  const gx::ShaderInfo* info = nullptr;
+  const DrawClass* cls = nullptr;
 };
 
 struct FifoFrame {
@@ -229,6 +238,7 @@ bool g_warnedOverflow = false;
 bool g_warnedEntries = false;
 Pending g_pending;
 bool g_newGeometry = false;
+const gx::ShaderInfo* g_lastInfo = nullptr;
 FifoFrame g_frame;
 std::array<std::shared_ptr<Frame>, FramePoolSize> g_pool;
 std::shared_ptr<Frame> g_tentative;
@@ -347,6 +357,7 @@ void clear_tables() noexcept {
   g_pending = {};
   g_tentative.reset();
   meshlets::reset();
+  atlas::reset();
 }
 
 bool clusters_settled() noexcept { return meshlets::pending_static() == 0; }
@@ -371,6 +382,7 @@ void allocate() {
   g_events.reserve(MaxPendingEvents);
   g_allocated = true;
   meshlets::set_active(true);
+  atlas::set_active(true);
   add_settle_predicate(&clusters_settled);
   clear_tables();
 }
@@ -378,6 +390,7 @@ void allocate() {
 void release() noexcept {
   gx::fifo::set_release_listener(nullptr);
   meshlets::set_active(false);
+  atlas::set_active(false);
   g_slots = {};
   g_lives = {};
   g_liveList = {};
@@ -1057,6 +1070,23 @@ void record(const DrawRef& draw) noexcept {
     g_matrices.push_back(
         {.pos = position_matrix(pnSlot), .nrm = pnSlot < gx::MaxPnMtx ? state.pnMtx[pnSlot].nrm : Mat3x4<float>{}});
   }
+  uint32_t material = atlas::NoMaterial;
+  atlas::DrawAttributes attributes{};
+  if (slot != TransientSlot && atlas::active()) {
+    Slot& target = g_slots[slot];
+    const map_pick::MapSelection maps = map_pick::select_maps(state);
+    const uint64_t tuple = atlas::material_tuple(state, maps);
+    if (tuple != target.materialTuple) {
+      const uint32_t next = atlas::material_for(state, maps, draw.config != nullptr);
+      atlas::release(target.material);
+      target.material = next;
+      target.materialTuple = tuple;
+    }
+    target.attributes =
+        atlas::draw_attributes(target.attributes, target.attributesTuple, draw.config, draw.info, draw.cls, state);
+    material = target.material;
+    attributes = target.attributes;
+  }
   const Slot* seen = slot != TransientSlot ? &g_slots[slot] : nullptr;
   streamout::on_capture({
       .slot = slot,
@@ -1086,6 +1116,8 @@ void record(const DrawRef& draw) noexcept {
       .eye = g_frame.eye,
       .clusterFirst = seen != nullptr ? seen->mesh.first : 0,
       .clusterWord = seen != nullptr ? meshlets::count_word(seen->mesh) : 0,
+      .material = material,
+      .attributes = atlas::pack_attributes(attributes),
   });
   ++counts.entries;
   counts.captureOnly += (flags & entry_flag::CaptureOnly) != 0 ? 1 : 0;
@@ -1204,6 +1236,7 @@ void evict_slot(uint32_t index, EvictReason reason) noexcept {
     }
   }
   meshlets::release(slot.meshKey);
+  atlas::release(slot.material);
   const uint32_t generation = slot.generation;
   slot = {};
   slot.generation = generation;
@@ -1342,6 +1375,7 @@ void latch_gate(const Settings&, const Caps& caps) noexcept {
 void latch_resources(bool active) noexcept {
   streamout::latch_resources(active);
   meshlets::latch_resources(active);
+  atlas::latch_resources(active);
 }
 
 void set_demand(Demand demand, bool on) noexcept {
@@ -1381,6 +1415,7 @@ void end_frame() noexcept {
     if (meshlets::latch()) {
       refresh_clusters();
     }
+    atlas::latch();
     g_frame.counts.lostCaptures += static_cast<uint32_t>(reported);
     g_totals.lostCaptures += reported;
     g_coverage = settled(epochChanged);
@@ -1468,7 +1503,9 @@ void route(const DrawClass& cls, const gx::draw_route::Query& query) noexcept {
   set_pending(cls, query, cls.suppressed ? entry_flag::CaptureOnly : 0);
 }
 
-void on_push(const gx::DrawData& draw, const gx::PipelineConfig& config) noexcept {
+void on_push(const gx::DrawData& draw, const gx::PipelineConfig& config, const gx::ShaderInfo& info,
+             const DrawClass& cls) noexcept {
+  g_lastInfo = &info;
   if (!g_active || !g_pending.valid) {
     return;
   }
@@ -1480,19 +1517,26 @@ void on_push(const gx::DrawData& draw, const gx::PipelineConfig& config) noexcep
       .record = draw.immediateData._pad,
       .attrs = config.shaderConfig.attrs.data(),
       .stride = config.shaderConfig.vtxStride,
+      .config = &config,
+      .info = &info,
+      .cls = &cls,
   });
 }
 
-void on_merge(const gx::draw_route::MergedDraw& draw) noexcept {
+void on_merge(const gx::draw_route::MergedDraw& draw, const DrawClass& cls) noexcept {
   if (!g_active || !g_pending.valid) {
     return;
   }
+  // A follower shares its lead's state, so the lead's shader info still describes it
   record({
       .vertRange = {draw.vertOffset, draw.vertSize},
       .immediates = draw.command->immediateData,
       .record = draw.command->immediateData._pad,
       .attrs = draw.config->shaderConfig.attrs.data(),
       .stride = draw.config->shaderConfig.vtxStride,
+      .config = draw.config,
+      .info = g_lastInfo,
+      .cls = &cls,
   });
 }
 
@@ -1537,6 +1581,7 @@ void prepare(detail::StageData& stage) noexcept {
   frame->layouts.assign(g_layouts.begin(), g_layouts.end());
   build_events(frame->events);
   frame->plan.reset();
+  frame->atlas = stage.stage == Stage::OpaqueDone ? atlas::snapshot() : nullptr;
   streamout::seal(*frame, stage);
   g_tentative = frame;
   stage.retained = std::move(frame);

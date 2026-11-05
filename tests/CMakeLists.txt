@@ -305,6 +305,7 @@ if (AURORA_ENABLE_GX)
   )
   if (AURORA_ENABLE_RENDER)
     target_sources(render_tests PRIVATE render_json_test.cpp)
+    target_sources(render_tests PRIVATE render_atlas_test.cpp)
     target_link_libraries(render_tests PRIVATE yyjson::yyjson)
     target_sources(render_tests PRIVATE render_capture_list_test.cpp)
     target_sources(render_tests PRIVATE render_classify_glue_test.cpp)
@@ -417,7 +418,8 @@ if (AURORA_ENABLE_GX)
       render_upscale_test.cpp render_upscale_gpu_test.cpp render_native_test.cpp gfx_stream_spill_test.cpp
       render_ao_test.cpp render_ao_reference.cpp render_depth_device.cpp render_composite_test.cpp
       render_lighting_test.cpp render_lighting_reference.cpp render_openpbr_test.cpp render_sky_probe_test.cpp
-      render_exposure_test.cpp render_ssil_test.cpp render_streamout_gpu_test.cpp gx_vertex_fetch_cpu_test.cpp)
+      render_exposure_test.cpp render_ssil_test.cpp render_streamout_gpu_test.cpp gx_vertex_fetch_cpu_test.cpp
+      render_atlas_gpu_test.cpp)
     target_include_directories(render_gpu_tests PRIVATE ../include ../lib)
     target_compile_definitions(render_gpu_tests PRIVATE AURORA TARGET_PC=1 AURORA_ENABLE_RENDER=1
       AURORA_ENABLE_NATIVE_D3D12=$<BOOL:${AURORA_ENABLE_NATIVE_D3D12}> AURORA_ENABLE_XESS=$<BOOL:${AURORA_ENABLE_XESS}>

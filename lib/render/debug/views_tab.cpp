@@ -240,7 +240,7 @@ void draw_legend(std::span<const LegendEntry> entries) {
 }
 
 void draw_retained(const GbufView& view) {
-  if (retained_mode(view) != RetainedMode::Clusters) {
+  if (retained_mode(view) == RetainedMode::Wireframe || retained_mode(view) == RetainedMode::Coverage) {
     draw_legend(RetainedLegend);
   }
   const retained_view::Shown shown = retained_view::shown();

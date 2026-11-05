@@ -41,6 +41,10 @@ namespace aurora::render::scene::streamout {
 struct Plan;
 } // namespace aurora::render::scene::streamout
 
+namespace aurora::render::scene::atlas {
+struct Snapshot;
+} // namespace aurora::render::scene::atlas
+
 namespace aurora::render::scene::retained {
 inline constexpr uint32_t MaxSlots = 16384;
 inline constexpr uint32_t IndexSlots = 32768;
@@ -155,6 +159,7 @@ struct Frame {
   std::vector<Layout> layouts;
   std::vector<Event> events;
   std::shared_ptr<const streamout::Plan> plan;
+  std::shared_ptr<const atlas::Snapshot> atlas;
 };
 
 struct FrameCounts {
@@ -219,8 +224,9 @@ void report_lost(uint32_t count) noexcept;
 // FIFO thread
 [[nodiscard]] bool captures(const DrawClass& cls, const gx::draw_route::Query& query) noexcept;
 void route(const DrawClass& cls, const gx::draw_route::Query& query) noexcept;
-void on_push(const gx::DrawData& draw, const gx::PipelineConfig& config) noexcept;
-void on_merge(const gx::draw_route::MergedDraw& draw) noexcept;
+void on_push(const gx::DrawData& draw, const gx::PipelineConfig& config, const gx::ShaderInfo& info,
+             const DrawClass& cls) noexcept;
+void on_merge(const gx::draw_route::MergedDraw& draw, const DrawClass& cls) noexcept;
 void on_capture(const gx::draw_route::CapturedDraw& draw) noexcept;
 void prepare(detail::StageData& stage) noexcept;
 void skip(detail::StageData& stage) noexcept;

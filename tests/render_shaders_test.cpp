@@ -1821,18 +1821,46 @@ fn main() {
 TEST_F(RenderShaders, RetainedViewVariantsCompile) {
   std::string error;
   EXPECT_TRUE(validate_module(debug::retained_view::Shader, {}, error)) << error;
-  for (uint32_t i = 0; i < 3; ++i) {
+  for (uint32_t i = 0; i < debug::retained_view::PipelineEntries; ++i) {
     SCOPED_TRACE(i);
     const RenderPipelineDesc desc = debug::retained_view::pipeline_desc(i);
     EXPECT_EQ(desc.shader, debug::retained_view::Shader);
     ASSERT_EQ(desc.colorCount, 1u);
     EXPECT_EQ(desc.colors[0].format, wgpu::TextureFormat::RGBA8Unorm);
     EXPECT_EQ(desc.depthFormat, wgpu::TextureFormat::Depth32Float);
-    EXPECT_EQ(desc.depthWrite, i < 2);
+    EXPECT_EQ(desc.depthWrite, i != 2 && i != 3);
     const PipelineId id = request_render(desc);
     ASSERT_TRUE(id);
     EXPECT_EQ(wait(id, WaitNs), PipelineStatus::Ready);
   }
+}
+
+TEST_F(RenderShaders, RetainedMaterialHelpersCompile) {
+  constexpr std::string_view Reader = R"(//#import aurora/retained
+@group(0) @binding(0) var<storage, read> inst: array<u32>;
+@group(0) @binding(1) var<storage, read> materials: array<u32>;
+@group(0) @binding(2) var page: texture_2d<f32>;
+@group(0) @binding(3) var page_sampler: sampler;
+@group(0) @binding(4) var<storage, read_write> out_words: array<vec4f>;
+
+@compute @workgroup_size(1)
+fn main() {
+  let id = retained_record_word(&inst, 1u, RETAINED_REC_MATERIAL) & 0xFFFFu;
+  let m = retained_material(&materials, id);
+  let a = retained_draw_attributes(&inst, 1u);
+  let uv = atlas_uv(m.albedo_tile, m.albedo_wrap.x, m.albedo_wrap.y, vec2f(1.25, -0.5));
+  let texel = textureSampleLevel(page, page_sampler, uv, 0.0);
+  let passed = retained_alpha_pass(m, texel[m.alpha_channel]);
+  out_words[0] = texel + a.const_color + vec4f(f32(a.word), f32(a.receiver), select(0.0, 1.0, passed),
+                                               select(0.0, 1.0, a.word_known && a.cull_none && m.alpha_uses_uv0)) +
+                 vec4f(atlas_wrap(1.5, RETAINED_WRAP_MIRROR), f32(m.alpha_tile + m.flags + m.registry),
+                       f32(m.comp0 + m.comp1 + m.op + m.ref0 + m.ref1), f32(m.alpha_wrap.y));
+}
+)";
+  ASSERT_TRUE(register_source("test/retained_materials", Reader));
+  std::string error;
+  EXPECT_TRUE(validate_module("test/retained_materials", {}, error)) << error;
+  EXPECT_TRUE(validate_module("scene/atlas", {}, error)) << error;
 }
 
 TEST_F(RenderShaders, StreamoutVariantsValidateForCorpus) {

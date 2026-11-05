@@ -3,6 +3,7 @@
 #include "debug.hpp"
 
 #include "../scene/classify.hpp"
+#include "../scene/atlas.hpp"
 #include "../scene/identity.hpp"
 #include "../scene/meshlets.hpp"
 #include "../../gx/hints.hpp"
@@ -405,6 +406,16 @@ void draw_retained() {
               static_cast<unsigned long long>(meshlets.clusters),
               static_cast<unsigned long long>(meshlets.poolUsed >> 10));
   count_line("Meshlet failures", meshlets.failedIndexPastArray + meshlets.failedDecode + meshlets.failedPoolFull, true);
+  const scene::atlas::Stats atlas = scene::atlas::published_stats();
+  ImGui::Text("Atlas: %u materials, %u tiles (%u ready, %u pending)", atlas.materials, atlas.tiles, atlas.tilesReady,
+              atlas.tilesPending);
+  ImGui::Text("Atlas misses: %llu missing, %llu unsupported, %llu copies, %llu no-cache, %llu page full",
+              static_cast<unsigned long long>(atlas.missing), static_cast<unsigned long long>(atlas.unsupported),
+              static_cast<unsigned long long>(atlas.copies), static_cast<unsigned long long>(atlas.noCache),
+              static_cast<unsigned long long>(atlas.pageFull));
+  ImGui::Text("Draw attributes: %llu recomputed over %llu captures",
+              static_cast<unsigned long long>(atlas.attributeRecomputes),
+              static_cast<unsigned long long>(atlas.attributeCaptures));
 }
 } // namespace
 

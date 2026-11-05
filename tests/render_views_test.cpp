@@ -194,7 +194,7 @@ TEST_F(RenderViews, GbufViewTableFollowsClassRange) {
       EXPECT_EQ(view.mode, static_cast<uint32_t>(view.id - FirstGbufView));
     }
   }
-  EXPECT_EQ(expected, 46u);
+  EXPECT_EQ(expected, 48u);
   EXPECT_EQ(targetModes, (std::set<uint32_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}));
   EXPECT_EQ(find_gbuf_view(LastReservedClassView), nullptr);
   EXPECT_EQ(find_gbuf_view(35), nullptr);
@@ -742,10 +742,12 @@ TEST_F(RenderViews, RetainedRowsHaveFreshIds) {
     std::string_view name;
     RetainedMode mode;
   };
-  constexpr std::array<Row, 3> Rows{{
+  constexpr std::array<Row, 5> Rows{{
       {43, "retained.wireframe", RetainedMode::Wireframe},
       {44, "retained.clusters", RetainedMode::Clusters},
       {45, "retained.coverage", RetainedMode::Coverage},
+      {46, "retained.atlas", RetainedMode::AtlasPage},
+      {47, "retained.albedo", RetainedMode::Albedo},
   }};
   for (const Row& row : Rows) {
     const GbufView* view = find_gbuf_view(row.id);
@@ -757,8 +759,11 @@ TEST_F(RenderViews, RetainedRowsHaveFreshIds) {
     EXPECT_TRUE(view->label.starts_with("Retained: ")) << view->label;
     EXPECT_EQ(find_view(row.id), nullptr);
   }
-  EXPECT_EQ(find_gbuf_view(46), nullptr);
+  EXPECT_EQ(find_gbuf_view(48), nullptr);
   EXPECT_LE(GbufViews.back().id, MaxDebugViewId);
+  EXPECT_EQ(retained_view::mode_entries(RetainedMode::AtlasPage).size(), 1u);
+  EXPECT_EQ(retained_view::mode_entries(RetainedMode::Albedo).size(), 1u);
+  EXPECT_LE(retained_view::mode_entries(RetainedMode::Wireframe).size(), detail::MaxPassPipelines);
 }
 
 TEST_F(RenderViews, RegistryListsEveryBuiltView) {
@@ -783,7 +788,7 @@ TEST_F(RenderViews, RegistryListsEveryBuiltView) {
   ASSERT_EQ(api.size(), views.size());
   EXPECT_EQ(api.data(), views.data());
   EXPECT_TRUE(known_view(0));
-  for (const uint16_t reserved : {uint16_t{9}, uint16_t{15}, uint16_t{35}, uint16_t{46}, uint16_t{100}}) {
+  for (const uint16_t reserved : {uint16_t{9}, uint16_t{15}, uint16_t{35}, uint16_t{48}, uint16_t{100}}) {
     EXPECT_FALSE(known_view(reserved)) << reserved;
   }
 }
@@ -807,7 +812,7 @@ TEST_F(RenderViews, ParseSelectsRetainedRowsByName) {
 
 TEST_F(RenderViews, RetainedRowBlockedWithoutRetainedScene) {
   ASSERT_FALSE(scene::retained::available(caps()));
-  for (const uint16_t row : {uint16_t{43}, uint16_t{44}, uint16_t{45}}) {
+  for (const uint16_t row : {uint16_t{43}, uint16_t{44}, uint16_t{45}, uint16_t{46}, uint16_t{47}}) {
     const std::optional<std::string> blocked = view_blocked(*find_gbuf_view(row), nullptr);
     ASSERT_TRUE(blocked.has_value()) << row;
     EXPECT_EQ(*blocked, "needs the retained scene");

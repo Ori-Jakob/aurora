@@ -185,6 +185,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/post/upscale/upscale.cpp
         lib/render/post/upscale/upscale.hpp
         lib/render/scene/affine.hpp
+        lib/render/scene/atlas.cpp
+        lib/render/scene/atlas.hpp
         lib/render/scene/capture_list.cpp
         lib/render/scene/capture_list.hpp
         lib/render/scene/classifier.cpp

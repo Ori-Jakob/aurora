@@ -171,7 +171,7 @@ bool push(void*, gx::DrawData& draw, const gx::PipelineConfig& config, const gx:
                        g_hooks->push(draw, config, info, cls);
   // Before the inspector's observer, which reads the record locator
   gx_ext::records::stamp(draw, config, info, cls);
-  retained::on_push(draw, config);
+  retained::on_push(draw, config, info, cls);
   // After the record stamp, so a clone keeps the original's record locator
   if (g_duplicate != 0) {
     capture_list::on_push(draw, config, cls, std::exchange(g_duplicate, 0));
@@ -183,7 +183,7 @@ bool push(void*, gx::DrawData& draw, const gx::PipelineConfig& config, const gx:
   return changed || gate != fakeshadow::Edit::Untouched;
 }
 
-void merge(void*, const gx::draw_route::MergedDraw& draw) noexcept { retained::on_merge(draw); }
+void merge(void*, const gx::draw_route::MergedDraw& draw) noexcept { retained::on_merge(draw, g_classifier.last()); }
 
 void capture(void*, const gx::draw_route::CapturedDraw& draw) noexcept { retained::on_capture(draw); }
 

@@ -18,6 +18,7 @@
 #include "render/debug/views.hpp"
 #include "render/jobs.hpp"
 #include "render/scene/classify.hpp"
+#include "render/scene/atlas.hpp"
 #include "render/scene/identity.hpp"
 #include "render/scene/meshlets.hpp"
 #endif
@@ -501,6 +502,7 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
       if (retainedLines.is_open()) {
         const auto counts = render::scene::retained::frame_counts();
         const auto meshlets = render::scene::meshlets::published_stats();
+        const auto atlas = render::scene::atlas::published_stats();
         const RetainedFrame line{
             .frame = index,
             .active = counts.active,
@@ -541,6 +543,16 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
                     .failed = meshlets.failedIndexPastArray + meshlets.failedDecode + meshlets.failedPoolFull,
                     .skipped = meshlets.skippedDeformedDirect + meshlets.skippedGpuArray + meshlets.skippedChurn,
                     .poolUsed = meshlets.poolUsed,
+                },
+            .atlas =
+                {
+                    .materials = atlas.materials,
+                    .tiles = atlas.tiles,
+                    .pending = atlas.tilesPending,
+                    .missing = atlas.missing + atlas.pageFull,
+                    .unsupported = atlas.unsupported,
+                    .recomputes = atlas.attributeRecomputes,
+                    .captures = atlas.attributeCaptures,
                 },
         };
         retainedLines << format_retained_line(line);

@@ -117,6 +117,16 @@ struct RetainedMeshlets {
   uint64_t poolUsed = 0;
 };
 
+struct RetainedAtlas {
+  uint32_t materials = 0;
+  uint32_t tiles = 0;
+  uint32_t pending = 0;
+  uint64_t missing = 0;
+  uint64_t unsupported = 0;
+  uint64_t recomputes = 0;
+  uint64_t captures = 0;
+};
+
 struct RetainedFrame {
   uint32_t frame = 0;
   bool active = false;
@@ -151,6 +161,7 @@ struct RetainedFrame {
   uint32_t releaseOverflow = 0;
   bool coverageComplete = false;
   RetainedMeshlets meshlets;
+  RetainedAtlas atlas;
 };
 
 inline constexpr uint32_t RetainedGateFirstFrame = 30;

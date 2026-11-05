@@ -61,6 +61,8 @@ struct Capture {
   double eye = 0.0;
   uint32_t clusterFirst = 0;
   uint32_t clusterWord = 0;
+  uint32_t material = NoMaterial;
+  std::array<uint32_t, 3> attributes{};
 };
 
 enum class EventType : uint8_t { Created, Restreamed, Moved, MaterialChanged, UvChanged, ClustersChanged, Freed };
@@ -167,6 +169,7 @@ struct Stats {
   uint64_t uvChanged = 0;
   uint64_t freed = 0;
   uint64_t clustersChanged = 0;
+  uint64_t materialChanged = 0;
   uint64_t lineSkipped = 0;
   uint64_t largeSkipped = 0;
   uint64_t slotSkipped = 0;

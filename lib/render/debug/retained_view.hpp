@@ -34,6 +34,8 @@ inline constexpr float MinCoverageExtent = 1000.f;
 inline constexpr float MinChosenExtent = 10.f;
 inline constexpr float MaxCoverageExtent = 50000.f;
 
+inline constexpr uint32_t PipelineEntries = 5;
+
 namespace header {
 inline constexpr uint32_t Proj = 0;
 inline constexpr uint32_t View = 16;
@@ -42,6 +44,7 @@ inline constexpr uint32_t Flags = 29;
 inline constexpr uint32_t Instances = 30;
 inline constexpr uint32_t Pairs = 31;
 inline constexpr uint32_t Marker = 32;
+inline constexpr uint32_t Target = 44;
 inline constexpr uint32_t Ortho = 1u << 0;
 } // namespace header
 
@@ -90,7 +93,8 @@ void shutdown() noexcept;
 [[nodiscard]] bool declarable(const detail::PassSetup& setup) noexcept;
 void declare(detail::InternalPassBuilder& builder, const detail::PassSetup& setup, const GbufView& row);
 [[nodiscard]] bool enabled(const detail::StageData& stage) noexcept;
-[[nodiscard]] shaders::RenderPipelineDesc pipeline_desc(uint32_t index);
+[[nodiscard]] shaders::RenderPipelineDesc pipeline_desc(uint32_t entry);
+[[nodiscard]] std::span<const uint32_t> mode_entries(RetainedMode mode) noexcept;
 void pipelines(const detail::PipelineSetup& setup, const GbufView& row,
                std::span<uint32_t, detail::MaxPassPipelines> ids);
 void encode(detail::PassContext& ctx, const GbufView& row);

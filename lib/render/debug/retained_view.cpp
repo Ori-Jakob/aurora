@@ -6,6 +6,7 @@
 #include "../pass_context.hpp"
 #include "../stage_data.hpp"
 #include "../scene/affine.hpp"
+#include "../scene/atlas.hpp"
 #include "../scene/identity.hpp"
 #include "../scene/meshlets.hpp"
 #include "../scene/streamout_layout.hpp"
@@ -30,12 +31,16 @@ constexpr uint32_t ClusterCorners = scene::meshlets::MaxTriangles * 3;
 constexpr float MarkerScale = 0.04f;
 constexpr double ExtentMargin = 1.05;
 
-enum Ref : uint8_t { Vertices, Indices, Instances, Frame, Clusters, ViewInstances, ViewPairs, RefCount };
-static_assert(RefCount == StorageBindings);
+enum Ref : uint8_t { Vertices, Indices, Instances, Frame, Clusters, ViewInstances, ViewPairs, Materials, RefCount };
+static_assert(Materials == StorageBindings);
+constexpr uint32_t PageBinding = RefCount;
+constexpr uint32_t SamplerBinding = RefCount + 1;
+constexpr uint32_t BindingCount = RefCount + 2;
 
 struct Local {
   std::array<uint16_t, RefCount> refs{};
   uint16_t color = UINT16_MAX;
+  uint16_t page = UINT16_MAX;
 };
 static_assert(LocalOffset + sizeof(Local) <= detail::PassLocalSize);
 
@@ -45,14 +50,20 @@ struct Entry {
   bool depth;
 };
 
-constexpr std::array<Entry, 3> Entries{{
+constexpr std::array<Entry, PipelineEntries> Entries{{
     {"vs_instance", "fs_view", true},
     {"vs_cluster", "fs_view", true},
     {"vs_marker", "fs_marker", false},
+    {"vs_page", "fs_page", false},
+    {"vs_albedo", "fs_albedo", true},
 }};
+constexpr std::array<uint32_t, 3> GeometryEntries{0, 1, 2};
+constexpr std::array<uint32_t, 1> PageEntries{3};
+constexpr std::array<uint32_t, 1> AlbedoEntries{4};
 
 wgpu::BindGroupLayout g_groupLayout;
 wgpu::PipelineLayout g_pipelineLayout;
+wgpu::Sampler g_sampler;
 std::atomic<float> g_extent{0.f};
 
 struct Published {
@@ -70,6 +81,7 @@ struct WorkerCache {
   std::array<wgpu::Buffer, RefCount> buffers;
   std::array<uint64_t, RefCount> offsets{};
   std::array<uint64_t, RefCount> sizes{};
+  wgpu::TextureView page;
   wgpu::BindGroup group;
   std::vector<uint64_t> seen;
   std::vector<uint32_t> words;
@@ -126,8 +138,8 @@ void coverage_header(std::span<uint32_t> out, const scene::Affine& invView, floa
   put_vec4(out, header::Marker + 8, {fz * size * 0.6 - fx * size, 0.0, -fx * size * 0.6 - fz * size, 0.0});
 }
 
-bool same_views(const std::array<BufferView, RefCount>& views) noexcept {
-  if (!g_worker.group) {
+bool same_views(const std::array<BufferView, RefCount>& views, const wgpu::TextureView& page) noexcept {
+  if (!g_worker.group || g_worker.page.Get() != page.Get()) {
     return false;
   }
   for (size_t i = 0; i < RefCount; ++i) {
@@ -139,17 +151,20 @@ bool same_views(const std::array<BufferView, RefCount>& views) noexcept {
   return true;
 }
 
-const wgpu::BindGroup& bind_group(const std::array<BufferView, RefCount>& views) {
-  if (same_views(views)) {
+const wgpu::BindGroup& bind_group(const std::array<BufferView, RefCount>& views, const wgpu::TextureView& page) {
+  if (same_views(views, page)) {
     return g_worker.group;
   }
-  std::array<wgpu::BindGroupEntry, RefCount> entries{};
+  std::array<wgpu::BindGroupEntry, BindingCount> entries{};
   for (uint32_t i = 0; i < RefCount; ++i) {
     entries[i] = {.binding = i, .buffer = views[i].buffer, .offset = views[i].offset, .size = views[i].size};
     g_worker.buffers[i] = views[i].buffer;
     g_worker.offsets[i] = views[i].offset;
     g_worker.sizes[i] = views[i].size;
   }
+  entries[PageBinding] = {.binding = PageBinding, .textureView = page};
+  entries[SamplerBinding] = {.binding = SamplerBinding, .sampler = g_sampler};
+  g_worker.page = page;
   const wgpu::BindGroupDescriptor descriptor{
       .label = "debug.retained_view",
       .layout = g_groupLayout,
@@ -247,14 +262,32 @@ void initialize() {
   if (!device || !caps().core || !vertex_storage(caps()) || g_groupLayout) {
     return;
   }
-  std::array<wgpu::BindGroupLayoutEntry, RefCount> entries{};
+  std::array<wgpu::BindGroupLayoutEntry, BindingCount> entries{};
   for (uint32_t i = 0; i < RefCount; ++i) {
     entries[i] = {
         .binding = i,
-        .visibility = wgpu::ShaderStage::Vertex,
+        .visibility = i == Materials ? wgpu::ShaderStage::Fragment : wgpu::ShaderStage::Vertex,
         .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage},
     };
   }
+  entries[PageBinding] = {
+      .binding = PageBinding,
+      .visibility = wgpu::ShaderStage::Fragment,
+      .texture = {.sampleType = wgpu::TextureSampleType::Float, .viewDimension = wgpu::TextureViewDimension::e2D},
+  };
+  entries[SamplerBinding] = {
+      .binding = SamplerBinding,
+      .visibility = wgpu::ShaderStage::Fragment,
+      .sampler = {.type = wgpu::SamplerBindingType::Filtering},
+  };
+  const wgpu::SamplerDescriptor sampler{
+      .label = "debug.retained_view",
+      .addressModeU = wgpu::AddressMode::ClampToEdge,
+      .addressModeV = wgpu::AddressMode::ClampToEdge,
+      .magFilter = wgpu::FilterMode::Linear,
+      .minFilter = wgpu::FilterMode::Linear,
+  };
+  g_sampler = device.CreateSampler(&sampler);
   const wgpu::BindGroupLayoutDescriptor groupDescriptor{
       .label = "debug.retained_view",
       .entryCount = entries.size(),
@@ -273,13 +306,14 @@ void shutdown() noexcept {
   g_worker = {};
   g_pipelineLayout = {};
   g_groupLayout = {};
+  g_sampler = {};
   g_extent.store(0.f, std::memory_order_relaxed);
 }
 
 bool declarable(const detail::PassSetup& setup) noexcept {
   return setup.env != nullptr && setup.env->retained && setup.caps != nullptr && supported(*setup.caps) &&
          g_pipelineLayout && scene::streamout::pool_handle(layout::binding::Vertices).id != 0 &&
-         scene::meshlets::clusters_handle().id != 0;
+         scene::meshlets::clusters_handle().id != 0 && scene::atlas::page_handle().id != 0;
 }
 
 void declare(detail::InternalPassBuilder& builder, const detail::PassSetup& setup, const GbufView&) {
@@ -298,6 +332,12 @@ void declare(detail::InternalPassBuilder& builder, const detail::PassSetup& setu
   local.refs[Frame] = pool("scene.frame", layout::binding::Frame);
   local.refs[Clusters] =
       builder.import_persistent("scene.clusters", scene::meshlets::clusters_handle(), Access::StorageRead).index;
+  local.refs[Materials] =
+      builder.import_persistent("scene.materials", scene::atlas::materials_handle(), Access::StorageRead).index;
+  local.page = builder
+                   .import_persistent_texture("scene.atlas_page", scene::atlas::page_handle(),
+                                              scene::atlas::page_desc(), Access::Sampled)
+                   .index;
   local.refs[ViewInstances] =
       builder
           .create_buffer(InstancesResource, {.size = InstancesBytes, .extraUsage = wgpu::BufferUsage::CopyDst},
@@ -323,6 +363,20 @@ bool enabled(const detail::StageData& stage) noexcept {
          stage.retained != nullptr && stage.retained->plan != nullptr && stage.retained->plan->live != nullptr;
 }
 
+std::span<const uint32_t> mode_entries(RetainedMode mode) noexcept {
+  switch (mode) {
+  case RetainedMode::AtlasPage:
+    return PageEntries;
+  case RetainedMode::Albedo:
+    return AlbedoEntries;
+  case RetainedMode::Wireframe:
+  case RetainedMode::Clusters:
+  case RetainedMode::Coverage:
+    break;
+  }
+  return GeometryEntries;
+}
+
 shaders::RenderPipelineDesc pipeline_desc(uint32_t index) {
   const Entry& entry = Entries[std::min<size_t>(index, Entries.size() - 1)];
   shaders::RenderPipelineDesc desc{
@@ -342,9 +396,10 @@ shaders::RenderPipelineDesc pipeline_desc(uint32_t index) {
   return desc;
 }
 
-void pipelines(const detail::PipelineSetup&, const GbufView&, std::span<uint32_t, detail::MaxPassPipelines> ids) {
-  for (uint32_t i = 0; i < Entries.size(); ++i) {
-    ids[i] = g_pipelineLayout ? shaders::request_render(pipeline_desc(i)).value : shaders::NeverReady.value;
+void pipelines(const detail::PipelineSetup&, const GbufView& row, std::span<uint32_t, detail::MaxPassPipelines> ids) {
+  const std::span<const uint32_t> entries = mode_entries(retained_mode(row));
+  for (uint32_t i = 0; i < entries.size(); ++i) {
+    ids[i] = g_pipelineLayout ? shaders::request_render(pipeline_desc(entries[i])).value : shaders::NeverReady.value;
   }
 }
 
@@ -353,8 +408,10 @@ void encode(detail::PassContext& ctx, const GbufView& row) {
   if (!enabled(stage) || !g_groupLayout) {
     return;
   }
-  std::array<wgpu::RenderPipeline, Entries.size()> pipes;
-  for (uint32_t i = 0; i < Entries.size(); ++i) {
+  const RetainedMode mode = retained_mode(row);
+  const std::span<const uint32_t> entries = mode_entries(mode);
+  std::array<wgpu::RenderPipeline, GeometryEntries.size()> pipes;
+  for (uint32_t i = 0; i < entries.size(); ++i) {
     pipes[i] = shaders::render_pipeline(ctx.pipeline(i));
     if (!pipes[i]) {
       return;
@@ -369,7 +426,10 @@ void encode(detail::PassContext& ctx, const GbufView& row) {
       return;
     }
   }
-  const RetainedMode mode = retained_mode(row);
+  const wgpu::TextureView page = ctx.view(TexRef{local.page});
+  if (!page) {
+    return;
+  }
   const std::vector<scene::streamout::LiveInstance>& live = *stage.retained->plan->live;
   mark_seen(*stage.retained, g_worker.seen);
   const Packed packed = pack(live, g_worker.seen, mode);
@@ -391,6 +451,9 @@ void encode(detail::PassContext& ctx, const GbufView& row) {
   } else {
     perspective_header(head, hints);
   }
+  const wgpu::Extent3D target = ctx.extent(TexRef{local.color});
+  head[header::Target] = target.width;
+  head[header::Target + 1] = target.height;
   head[header::Mode] = static_cast<uint32_t>(mode);
   head[header::Instances] = static_cast<uint32_t>(packed.instances.size());
   head[header::Pairs] = static_cast<uint32_t>(packed.pairs.size());
@@ -404,7 +467,7 @@ void encode(detail::PassContext& ctx, const GbufView& row) {
                               reinterpret_cast<const uint8_t*>(packed.pairs.data()),
                               packed.pairs.size() * sizeof(packed.pairs[0]));
   }
-  const wgpu::BindGroup& group = bind_group(views);
+  const wgpu::BindGroup& group = bind_group(views, page);
   const wgpu::RenderPassEncoder pass = ctx.begin_render();
   if (!pass) {
     return;
@@ -412,7 +475,10 @@ void encode(detail::PassContext& ctx, const GbufView& row) {
   // Retained views draw the pools from the latched camera, so the GX draws stay untouched and merges keep their shape
   pass.SetBindGroup(0, group);
   pass.SetPipeline(pipes[0]);
-  for (uint32_t i = 0; i < packed.instances.size(); ++i) {
+  if (mode == RetainedMode::AtlasPage) {
+    pass.Draw(3);
+  }
+  for (uint32_t i = 0; mode != RetainedMode::AtlasPage && i < packed.instances.size(); ++i) {
     const ViewInstance& view = packed.instances[i];
     if ((view.flags & instance_flag::Clustered) == 0 && view.indexCount != 0) {
       pass.Draw(view.indexCount, 1, 0, i);

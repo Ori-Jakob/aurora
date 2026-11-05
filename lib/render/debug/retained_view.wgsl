@@ -7,6 +7,7 @@ const VIEW_ROTATION: u32 = 16u;
 const VIEW_MODE: u32 = 28u;
 const VIEW_FLAGS: u32 = 29u;
 const VIEW_MARKER: u32 = 32u;
+const VIEW_TARGET: u32 = 44u;
 const VIEW_ORTHO: u32 = 1u;
 const VIEW_MODE_WIREFRAME: u32 = 0u;
 const VIEW_MODE_CLUSTERS: u32 = 1u;
@@ -18,6 +19,9 @@ const VIEW_MODE_CLUSTERS: u32 = 1u;
 @group(0) @binding(4) var<storage, read> clusters: array<u32>;
 @group(0) @binding(5) var<storage, read> view_data: array<u32>;
 @group(0) @binding(6) var<storage, read> view_pairs: array<u32>;
+@group(0) @binding(7) var<storage, read> materials: array<u32>;
+@group(0) @binding(8) var atlas_page: texture_2d<f32>;
+@group(0) @binding(9) var atlas_sampler: sampler;
 
 struct ViewVarying {
   @builtin(position) position: vec4f,
@@ -152,4 +156,103 @@ fn vs_marker(@builtin(vertex_index) vi: u32) -> MarkerVarying {
 @fragment
 fn fs_marker() -> @location(0) vec4f {
   return vec4f(1.0);
+}
+
+struct PageVarying {
+  @builtin(position) position: vec4f,
+  @location(0) @interpolate(flat) target_size: vec2f,
+}
+
+@vertex
+fn vs_page(@builtin(vertex_index) vi: u32) -> PageVarying {
+  var out: PageVarying;
+  let uv = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
+  out.position = vec4f(uv * 2.0 - 1.0, 0.0, 1.0);
+  out.target_size = vec2f(f32(view_data[VIEW_TARGET]), f32(view_data[VIEW_TARGET + 1u]));
+  return out;
+}
+
+@fragment
+fn fs_page(in: PageVarying) -> @location(0) vec4f {
+  let side = min(in.target_size.x, in.target_size.y);
+  let uv = (in.position.xy - (in.target_size - side) * 0.5) / side;
+  let t = uv * f32(RETAINED_ATLAS_TILES_PER_ROW);
+  let border = any(fract(t) < fwidth(t));
+  let page = textureSampleLevel(atlas_page, atlas_sampler, saturate(uv), 0.0).rgb;
+  let inside = all(uv >= vec2f(0.0)) && all(uv <= vec2f(1.0));
+  return vec4f(select(vec3f(0.0), select(page, vec3f(0.25), border), inside), 1.0);
+}
+
+struct AlbedoVarying {
+  @builtin(position) position: vec4f,
+  @location(0) uv: vec2f,
+  @location(1) alpha_uv: vec2f,
+  @location(2) @interpolate(flat) material: u32,
+  @location(3) @interpolate(flat) const_color: vec4f,
+  @location(4) @interpolate(flat) flags: u32,
+}
+
+fn albedo_hidden() -> AlbedoVarying {
+  var out: AlbedoVarying;
+  out.position = vec4f(2.0, 2.0, 2.0, 1.0);
+  out.uv = vec2f(0.0);
+  out.alpha_uv = vec2f(0.0);
+  out.material = RETAINED_NO_MATERIAL;
+  out.const_color = vec4f(0.0);
+  out.flags = 0u;
+  return out;
+}
+
+@vertex
+fn vs_albedo(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> AlbedoVarying {
+  let slot = view_data[VIEW_HEADER_WORDS + ii * VIEW_INSTANCE_WORDS];
+  if (!instance_valid(slot) || vi >= retained_record_word(&instances, slot, RETAINED_REC_INDEX_COUNT)) {
+    return albedo_hidden();
+  }
+  let local = indices[retained_record_word(&instances, slot, RETAINED_REC_INDEX_FIRST) + vi];
+  if (local >= retained_record_word(&instances, slot, RETAINED_REC_VERTEX_COUNT)) {
+    return albedo_hidden();
+  }
+  let base = (retained_record_word(&instances, slot, RETAINED_REC_VERTEX_FIRST) + local) * RETAINED_VERTEX_WORDS;
+  var raw: array<u32, 8>;
+  for (var k = 0u; k < 8u; k++) {
+    raw[k] = vertices[base + k];
+  }
+  let v = retained_unpack_vertex(raw);
+  let flags = retained_record_word(&instances, slot, RETAINED_REC_FLAGS);
+  let hi = retained_vec4(&frame_words, RETAINED_FRAME_CAM_HI).xyz;
+  let lo = retained_vec4(&frame_words, RETAINED_FRAME_CAM_LO).xyz;
+  let rel = vec4f(v.pos, 1.0) * retained_world_rel(retained_world(&instances, slot), hi, lo);
+  var out: AlbedoVarying;
+  out.position = project(rel);
+  out.uv = retained_uv(retained_uv_xform(&instances, slot, false), v.uv0);
+  let alpha_uv = retained_uv(retained_uv_xform(&instances, slot, true), retained_alpha_uv(v, flags));
+  out.alpha_uv = select(alpha_uv, out.uv, (flags & RETAINED_ALPHA_UV_IS_UV0) != 0u);
+  out.material = retained_record_word(&instances, slot, RETAINED_REC_MATERIAL) & 0xFFFFu;
+  out.const_color = retained_draw_attributes(&instances, slot).const_color;
+  out.flags = flags;
+  return out;
+}
+
+@fragment
+fn fs_albedo(in: AlbedoVarying) -> @location(0) vec4f {
+  if (in.material == RETAINED_NO_MATERIAL) {
+    return vec4f(0.5, 0.5, 0.5, 1.0);
+  }
+  let m = retained_material(&materials, in.material);
+  let albedo_blocked = RETAINED_MAT_ALBEDO_NO_UV | RETAINED_MAT_ALBEDO_PENDING | RETAINED_MAT_ALBEDO_MISSING;
+  var color = in.const_color.rgb;
+  if (m.albedo_tile != RETAINED_NO_TILE && (m.flags & albedo_blocked) == 0u && (in.flags & RETAINED_UV_NON_TEX) == 0u) {
+    let uv = atlas_uv(m.albedo_tile, m.albedo_wrap.x, m.albedo_wrap.y, in.uv);
+    color = textureSampleLevel(atlas_page, atlas_sampler, uv, 0.0).rgb;
+  }
+  let alpha_blocked = RETAINED_MAT_ALPHA_NO_UV | RETAINED_MAT_ALPHA_PENDING | RETAINED_MAT_ALPHA_MISSING;
+  if (m.alpha_tile != RETAINED_NO_TILE && (m.flags & alpha_blocked) == 0u) {
+    let uv = atlas_uv(m.alpha_tile, m.alpha_wrap.x, m.alpha_wrap.y, in.alpha_uv);
+    let texel = textureSampleLevel(atlas_page, atlas_sampler, uv, 0.0);
+    if (!retained_alpha_pass(m, texel[m.alpha_channel])) {
+      discard;
+    }
+  }
+  return vec4f(color, 1.0);
 }

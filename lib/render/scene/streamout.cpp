@@ -103,6 +103,7 @@ struct SlotState {
   uint32_t flags = 0;
   uint32_t classBits = 0;
   uint32_t material = 0;
+  std::array<uint32_t, 3> attributes{};
   Affine lastSent{};
   uint64_t lastSeen = Never;
   std::array<uint32_t, 12> uv{};
@@ -169,6 +170,7 @@ struct Pending {
   uint32_t flags = 0;
   uint32_t pieceFlags = 0;
   uint32_t material = 0;
+  std::array<uint32_t, 3> attributes{};
   bool newGeometry = false;
   bool latched = false;
   bool teleport = false;
@@ -251,6 +253,7 @@ struct Pick {
   bool moved = false;
   bool uv = false;
   bool clusters = false;
+  bool material = false;
   bool prevValid = false;
   uint32_t vertexFirst = 0;
   uint32_t indexFirst = 0;
@@ -869,6 +872,7 @@ void record_words(const Pending& p, const Pick& pick, uint32_t frameIndex, const
   std::copy(p.uv.begin(), p.uv.end(), out.begin() + record::UvBase);
   out[record::UvFrame] = frameIndex;
   out[record::MaterialFrame] = frameIndex;
+  std::copy(p.attributes.begin(), p.attributes.end(), out.begin() + record::DrawAttributes);
   out[record::ClusterFirst] = p.clusters[0];
   out[record::ClusterCount] = p.clusters[1];
   out[record::BoundsOffset] = NoBounds;
@@ -944,6 +948,7 @@ BuildOutput build_block(const BuildInput& in) {
       next.lastSent = p.world;
       next.flags = p.flags;
       next.material = p.material;
+      next.attributes = p.attributes;
       next.uv = p.uv;
       next.clusters = p.clusters;
       ++next.recordWrites;
@@ -979,6 +984,20 @@ BuildOutput build_block(const BuildInput& in) {
         next.uv = p.uv;
         ++next.recordWrites;
         out.events.push_back({EventType::UvChanged, p.slot});
+      }
+      if (pick.material) {
+        if (p.material != prev.material) {
+          jobs.push_back({block::TargetInstances, base + record::Material, writer.add_data(&p.material, 1), 1});
+          jobs.push_back({block::TargetInstances, base + record::MaterialFrame, writer.add_data(&in.frameIndex, 1), 1});
+          out.events.push_back({EventType::MaterialChanged, p.slot});
+        }
+        if (p.attributes != prev.attributes) {
+          jobs.push_back(
+              {block::TargetInstances, base + record::DrawAttributes, writer.add_data(p.attributes.data(), 3), 3});
+        }
+        next.material = p.material;
+        next.attributes = p.attributes;
+        ++next.recordWrites;
       }
       if (pick.clusters) {
         const std::array<uint32_t, 3> words{p.clusters[0], p.clusters[1], NoBounds};
@@ -1444,13 +1463,13 @@ void plan_pieces(Tentative& t, bool overrun, bool cut, bool epochChanged, std::v
         const bool fresh = pick.topology || cut || epochChanged || p.teleport || !seenLast;
         plan_palette(i, st, world, bank, newBank, wanted, fresh, pick, t);
       }
-      const bool flagsChanged = st.flags != p.flags || st.material != p.material;
-      pick.full = !st.recordSent || pick.newAlloc || flagsChanged;
+      pick.full = !st.recordSent || pick.newAlloc || st.flags != p.flags;
       const bool moved =
           p.latched ? !same_affine(p.world, st.lastSent) : retained::world_moved(p.world, st.lastSent, p.eye);
       pick.moved = !pick.full && st.worldSent && moved;
       pick.uv = !pick.full && p.uv != st.uv;
       pick.clusters = !pick.full && st.recordSent && p.clusters != st.clusters;
+      pick.material = !pick.full && (p.material != st.material || p.attributes != st.attributes);
       pick.prevValid = !isPalette && st.worldSent && seenLast && !cut && !epochChanged && !p.teleport;
       t.movedLatched += pick.moved && p.latched ? 1 : 0;
       picks.push_back(pick);
@@ -1541,6 +1560,7 @@ void commit_plan(Tentative& t) {
     g_stats.uvChanged += event.type == EventType::UvChanged ? 1 : 0;
     g_stats.freed += event.type == EventType::Freed ? 1 : 0;
     g_stats.clustersChanged += event.type == EventType::ClustersChanged ? 1 : 0;
+    g_stats.materialChanged += event.type == EventType::MaterialChanged ? 1 : 0;
   }
   t.committed = true;
   publish_coverage();
@@ -1583,8 +1603,9 @@ bool late_work(const Tentative& t, const std::vector<Pick>& picks, const std::ve
   if (!g_freed.empty() || !clusterSlots.empty() || t.captureOnly + t.lostAtCommit != 0 || g_undelivered != 0) {
     return true;
   }
-  return std::ranges::any_of(
-      picks, [](const Pick& pick) { return pick.stream || pick.full || pick.moved || pick.uv || pick.clusters; });
+  return std::ranges::any_of(picks, [](const Pick& pick) {
+    return pick.stream || pick.full || pick.moved || pick.uv || pick.clusters || pick.material;
+  });
 }
 
 void touch(const std::vector<Pick>& picks) noexcept {
@@ -2179,9 +2200,9 @@ void log_stats() {
   }
   Log.info(
       "Retained: stream-out plans {} committed {} uncommitted {} header-only {} pieces {} vertices {} moved {} uv "
-      "{} freed {} clusters {} resyncs {} variants {} late plans {} late pieces {}",
+      "{} freed {} clusters {} materials {} resyncs {} variants {} late plans {} late pieces {}",
       s.plans, s.committed, s.uncommitted, s.headerOnly, s.pieces, s.streamedVertices, s.moved, s.uvChanged, s.freed,
-      s.clustersChanged, s.resyncs, g_variants.size(), s.latePlans, s.latePieces);
+      s.clustersChanged, s.materialChanged, s.resyncs, g_variants.size(), s.latePlans, s.latePieces);
   Log.info(
       "Retained: stream-out skipped transient {} line {} large {} slot {}; deferred variant "
       "{} failed {} cap {} pool {} overrun {} headroom {} refused {}; lost {}",
@@ -2568,7 +2589,10 @@ void on_capture(const Capture& c) noexcept {
     store_uv(xform, &p.uv[6]);
   }
   p.flags = flags;
-  p.material = NoMaterial | (maps.alpha.valid() ? static_cast<uint32_t>(maps.alpha.coord) : NoCoord) << 16;
+  const bool water = (c.classBits & retained::class_bit::Water) != 0;
+  p.material = (water ? NoMaterial : c.material & NoMaterial) |
+               (maps.alpha.valid() ? static_cast<uint32_t>(maps.alpha.coord) : NoCoord) << 16;
+  p.attributes = c.attributes;
   p.pieceFlags = (p.hasNormalAttr && normalSource ? block::PieceHasNormal : 0u) |
                  (alphaSame ? block::PieceAlphaUvIsUv0 : 0u) | (indexed ? block::PieceIndexed : 0u) |
                  (alphaTex != NoTex ? block::PieceAlphaUv : 0u);

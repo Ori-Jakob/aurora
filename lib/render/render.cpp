@@ -29,6 +29,7 @@
 #include "post/taa.hpp"
 #include "post/temporal_resolve.hpp"
 #include "post/upscale/upscale.hpp"
+#include "scene/atlas.hpp"
 #include "scene/capture_list.hpp"
 #include "scene/identity.hpp"
 #include "scene/meshlets.hpp"
@@ -122,6 +123,7 @@ void initialize() {
   lighting::exposure::initialize();
   gx_ext::fwd_env::initialize();
   gx_ext::surface_table::initialize();
+  scene::atlas::initialize();
   debug::surface_expand::initialize();
   upscale::initialize();
   systems::initialize();
@@ -157,6 +159,7 @@ void shutdown() noexcept {
   scene::capture_list::shutdown();
   scene::streamout::shutdown();
   scene::meshlets::shutdown();
+  scene::atlas::shutdown();
   compact::shutdown();
   // Compile jobs use the device, so they finish before the job pool and the device go away
   shaders::shutdown();

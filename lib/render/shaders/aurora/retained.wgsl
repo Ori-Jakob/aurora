@@ -291,3 +291,125 @@ fn retained_cluster_triangle(clusters: ptr<storage, array<u32>, read>, c: Retain
   let w = clusters[c.tri_word + t];
   return vec3u(w & 0xFFu, (w >> 8u) & 0xFFu, (w >> 16u) & 0xFFu);
 }
+
+const RETAINED_MATERIAL_WORDS: u32 = 8u;
+const RETAINED_ATLAS_PAGE: f32 = 4096.0;
+const RETAINED_ATLAS_TILE: f32 = 128.0;
+const RETAINED_ATLAS_TILES_PER_ROW: u32 = 32u;
+const RETAINED_NO_TILE: u32 = 0xFFFFu;
+const RETAINED_MAT_ALPHA_TEST: u32 = 1u;
+const RETAINED_MAT_ALBEDO_NO_UV: u32 = 2u;
+const RETAINED_MAT_ALPHA_NO_UV: u32 = 4u;
+const RETAINED_MAT_ALBEDO_PENDING: u32 = 8u;
+const RETAINED_MAT_ALPHA_PENDING: u32 = 16u;
+const RETAINED_MAT_ALBEDO_MISSING: u32 = 32u;
+const RETAINED_MAT_ALPHA_MISSING: u32 = 64u;
+const RETAINED_ATTR_WORD_KNOWN: u32 = 1u;
+const RETAINED_ATTR_CULL_NONE: u32 = 2u;
+const RETAINED_WRAP_CLAMP: u32 = 0u;
+const RETAINED_WRAP_REPEAT: u32 = 1u;
+const RETAINED_WRAP_MIRROR: u32 = 2u;
+
+struct RetainedMaterial {
+  albedo_tile: u32,
+  alpha_tile: u32,
+  albedo_wrap: vec2u,
+  alpha_wrap: vec2u,
+  alpha_channel: u32,
+  alpha_uses_uv0: bool,
+  flags: u32,
+  comp0: u32,
+  comp1: u32,
+  op: u32,
+  ref0: u32,
+  ref1: u32,
+  registry: u32,
+}
+
+struct RetainedDrawAttributes {
+  word: u32,
+  const_color: vec4f,
+  receiver: u32,
+  word_known: bool,
+  cull_none: bool,
+}
+
+fn retained_material(materials: ptr<storage, array<u32>, read>, id: u32) -> RetainedMaterial {
+  let base = id * RETAINED_MATERIAL_WORDS;
+  let w0 = materials[base];
+  let w1 = materials[base + 1u];
+  let w2 = materials[base + 2u];
+  var m: RetainedMaterial;
+  m.albedo_tile = w0 & 0xFFFFu;
+  m.alpha_tile = w0 >> 16u;
+  m.albedo_wrap = vec2u(w1 & 3u, (w1 >> 2u) & 3u);
+  m.alpha_wrap = vec2u((w1 >> 4u) & 3u, (w1 >> 6u) & 3u);
+  m.alpha_channel = (w1 >> 8u) & 3u;
+  m.alpha_uses_uv0 = ((w1 >> 10u) & 1u) != 0u;
+  m.flags = w1 >> 16u;
+  m.comp0 = w2 & 7u;
+  m.comp1 = (w2 >> 3u) & 7u;
+  m.op = (w2 >> 6u) & 3u;
+  m.ref0 = (w2 >> 8u) & 0xFFu;
+  m.ref1 = (w2 >> 16u) & 0xFFu;
+  m.registry = materials[base + 3u];
+  return m;
+}
+
+fn retained_draw_attributes(inst: ptr<storage, array<u32>, read>, slot: u32) -> RetainedDrawAttributes {
+  var a: RetainedDrawAttributes;
+  a.word = retained_record_word(inst, slot, RETAINED_REC_DRAW_ATTRIBUTES);
+  a.const_color = unpack4x8unorm(retained_record_word(inst, slot, RETAINED_REC_DRAW_ATTRIBUTES + 1u));
+  let w2 = retained_record_word(inst, slot, RETAINED_REC_DRAW_ATTRIBUTES + 2u);
+  a.receiver = w2 & 0xFFu;
+  a.word_known = ((w2 >> 8u) & RETAINED_ATTR_WORD_KNOWN) != 0u;
+  a.cull_none = ((w2 >> 8u) & RETAINED_ATTR_CULL_NONE) != 0u;
+  return a;
+}
+
+fn atlas_wrap(c: f32, mode: u32) -> f32 {
+  if (mode == RETAINED_WRAP_REPEAT) {
+    return fract(c);
+  }
+  if (mode == RETAINED_WRAP_MIRROR) {
+    let t = fract(c * 0.5) * 2.0;
+    return select(t, 2.0 - t, t > 1.0);
+  }
+  return saturate(c);
+}
+
+fn atlas_uv(tile: u32, wrap_s: u32, wrap_t: u32, uv: vec2f) -> vec2f {
+  let wrapped = vec2f(atlas_wrap(uv.x, wrap_s), atlas_wrap(uv.y, wrap_t));
+  let texel = clamp(wrapped * RETAINED_ATLAS_TILE, vec2f(0.5), vec2f(RETAINED_ATLAS_TILE - 0.5));
+  let origin = vec2f(f32(tile % RETAINED_ATLAS_TILES_PER_ROW), f32(tile / RETAINED_ATLAS_TILES_PER_ROW)) *
+               RETAINED_ATLAS_TILE;
+  return (origin + texel) / RETAINED_ATLAS_PAGE;
+}
+
+fn retained_alpha_compare(comp: u32, a: u32, limit: u32) -> bool {
+  switch comp {
+    case 0u: { return false; }
+    case 1u: { return a < limit; }
+    case 2u: { return a == limit; }
+    case 3u: { return a <= limit; }
+    case 4u: { return a > limit; }
+    case 5u: { return a != limit; }
+    case 6u: { return a >= limit; }
+    default: { return true; }
+  }
+}
+
+fn retained_alpha_pass(m: RetainedMaterial, a: f32) -> bool {
+  if ((m.flags & RETAINED_MAT_ALPHA_TEST) == 0u) {
+    return true;
+  }
+  let v = u32(round(saturate(a) * 255.0));
+  let p0 = retained_alpha_compare(m.comp0, v, m.ref0);
+  let p1 = retained_alpha_compare(m.comp1, v, m.ref1);
+  switch m.op {
+    case 0u: { return p0 && p1; }
+    case 1u: { return p0 || p1; }
+    case 2u: { return p0 != p1; }
+    default: { return p0 == p1; }
+  }
+}

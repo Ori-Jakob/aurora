@@ -111,7 +111,7 @@ struct GbufView {
 }
 
 // Target rows snapshot one scene target and decomposition rows decode several; both replace RGB before the HUD
-inline constexpr std::array<GbufView, 29> GbufViews{{
+inline constexpr std::array<GbufView, 31> GbufViews{{
     {16, "gbuf.motion", "G-buffer: motion", "gbuf.motion", "phase.post_taa", Stage::PrePost, 0, false},
     {17, "gbuf.reactive", "G-buffer: reactive", "gbuf.reactive", "phase.post_taa", Stage::PrePost, 1, false},
     {18, "gbuf.fog", "Fog record: weight", "gbuf.fog", "phase.composite", Stage::OpaqueDone, 2, true},
@@ -155,6 +155,8 @@ inline constexpr std::array<GbufView, 29> GbufViews{{
     retained_row(43, "retained.wireframe", "Retained: wireframe", RetainedMode::Wireframe),
     retained_row(44, "retained.clusters", "Retained: clusters", RetainedMode::Clusters),
     retained_row(45, "retained.coverage", "Retained: coverage from above", RetainedMode::Coverage),
+    retained_row(46, "retained.atlas", "Retained: material atlas page", RetainedMode::AtlasPage),
+    retained_row(47, "retained.albedo", "Retained: atlas albedo (unlit)", RetainedMode::Albedo),
 }};
 
 inline constexpr uint16_t MaxDebugViewId = 63;
