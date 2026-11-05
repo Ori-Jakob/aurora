@@ -73,6 +73,8 @@ namespace testing {
 uint64_t resolve_count() noexcept;
 bool resources_created() noexcept;
 std::span<const detail::Event> recording_events() noexcept;
+// Held readbacks stay mapped in the ring, so a test decides when the last one leaves it whatever the GPU's speed
+void hold_readbacks(bool hold) noexcept;
 } // namespace testing
 
 } // namespace aurora::webgpu::gpu_prof

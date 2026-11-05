@@ -149,6 +149,7 @@ protected:
     if (!m_device) {
       return;
     }
+    gpu_prof::testing::hold_readbacks(false);
     EXPECT_TRUE(gpu_prof::wait_idle(WaitNs));
     gpu_prof::shutdown();
     gpu_prof::set_always(TracyBuild);
@@ -224,6 +225,8 @@ TEST_F(GpuProfDeviceCollection, ReadbackKeepsResourcesAfterExpiry) {
   const wgpu::BufferDescriptor targetDescriptor{.usage = wgpu::BufferUsage::CopyDst, .size = CopyBytes};
   const wgpu::Buffer source = m_device->device.CreateBuffer(&sourceDescriptor);
   const wgpu::Buffer target = m_device->device.CreateBuffer(&targetDescriptor);
+  // A fast GPU can finish and drain frame 1 before frame 2 begins, which would leave nothing in flight to keep
+  gpu_prof::testing::hold_readbacks(true);
   gpu_prof::request(1);
   const wgpu::CommandEncoder first = m_device->device.CreateCommandEncoder();
   gpu_prof::frame_begin(first);
@@ -237,7 +240,7 @@ TEST_F(GpuProfDeviceCollection, ReadbackKeepsResourcesAfterExpiry) {
   gpu_prof::after_submit();
   ASSERT_TRUE(gpu_prof::testing::resources_created());
 
-  // The keep-alive has run out while frame 1's copy and readback are still on the GPU
+  // The keep-alive has run out while frame 1's readback is still in the ring
   const wgpu::CommandEncoder encoder = m_device->device.CreateCommandEncoder();
   gpu_prof::frame_begin(encoder);
   EXPECT_TRUE(gpu_prof::testing::resources_created());
@@ -245,6 +248,9 @@ TEST_F(GpuProfDeviceCollection, ReadbackKeepsResourcesAfterExpiry) {
   const wgpu::CommandBuffer commands = encoder.Finish();
   m_device->queue.Submit(1, &commands);
   gpu_prof::after_submit();
+  ASSERT_TRUE(gpu_prof::wait_idle(WaitNs));
+  EXPECT_TRUE(gpu_prof::testing::resources_created());
+  gpu_prof::testing::hold_readbacks(false);
   ASSERT_TRUE(gpu_prof::wait_idle(WaitNs));
   gpu_prof::FrameTimes times;
   ASSERT_TRUE(gpu_prof::latest(times));

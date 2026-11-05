@@ -94,6 +94,7 @@ size_t g_recordSlot = 0;
 size_t g_emitSlot = 0;
 bool g_frameActive = false;
 bool g_framePending = false;
+bool g_holdReadbacks = false;
 uint32_t g_zoneCount = 0;
 uint32_t g_openZones = 0;
 
@@ -392,6 +393,9 @@ bool ring_idle() {
 }
 
 void drain_mapped() {
+  if (g_holdReadbacks) {
+    return;
+  }
   while (true) {
     auto& slot = g_slots[g_emitSlot];
     const auto state = slot.state.load(std::memory_order_acquire);
@@ -668,6 +672,8 @@ namespace testing {
 uint64_t resolve_count() noexcept { return g_resolveCount.load(std::memory_order_relaxed); }
 
 bool resources_created() noexcept { return g_resourcesCreated; }
+
+void hold_readbacks(bool hold) noexcept { g_holdReadbacks = hold; }
 
 std::span<const detail::Event> recording_events() noexcept { return record_slot().events; }
 } // namespace testing
