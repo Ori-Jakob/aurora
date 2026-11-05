@@ -207,7 +207,12 @@ uint32_t tile_for(const gfx::TextureHandle& texture) noexcept {
       tile.lastUsed = g_latch;
       return it->second;
     }
-    free_tile(it->second);
+    // A reused address is a new texture, while live materials or a blit in flight may still name the old tile
+    if (tile.refs != 0 || tile.sentLatch != Never || tile.releasedLatch >= g_latch) {
+      g_tileIndex.erase(it);
+    } else {
+      free_tile(it->second);
+    }
   }
   if (g_freeTiles.empty() && evict_tile() == NoTile) {
     ++g_stats.pageFull;

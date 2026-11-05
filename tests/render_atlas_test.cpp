@@ -10,8 +10,10 @@
 #include "render/scene/receiver_category.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <new>
 #include <vector>
 
 namespace aurora::render::scene::atlas {
@@ -19,11 +21,20 @@ namespace {
 namespace flag = material_flag;
 
 const uint8_t g_texels[4096]{};
+alignas(gfx::TextureRef) std::byte g_reusedBlock[sizeof(gfx::TextureRef)];
 
 gfx::TextureHandle texture(uint32_t size = 256, wgpu::TextureFormat format = wgpu::TextureFormat::RGBA8Unorm,
                            uint32_t mips = 1) {
   return std::make_shared<gfx::TextureRef>(wgpu::Texture{}, wgpu::TextureView{}, wgpu::TextureView{},
                                            wgpu::Extent3D{size, size, 1}, format, mips, GX_TF_RGBA8);
+}
+
+// The allocator hands a freed TextureRef's block to the next one, so these share one block on purpose
+gfx::TextureHandle texture_in_reused_block() {
+  auto* ref =
+      new (g_reusedBlock) gfx::TextureRef(wgpu::Texture{}, wgpu::TextureView{}, wgpu::TextureView{},
+                                          wgpu::Extent3D{256, 256, 1}, wgpu::TextureFormat::RGBA8Unorm, 1, GX_TF_RGBA8);
+  return {ref, [](gfx::TextureRef* texture) { texture->~TextureRef(); }};
 }
 
 GXTexObj_ texture_object(uint32_t id, uint32_t format = GX_TF_RGBA8) {
@@ -211,6 +222,39 @@ TEST_F(RenderAtlas, TileLifecycle) {
   handle.reset();
   latch();
   EXPECT_FALSE(testing::tile(tile).live);
+}
+
+TEST_F(RenderAtlas, ReusedAddressKeepsReferencedTile) {
+  gfx::TextureHandle first = texture_in_reused_block();
+  bind_texture(GX_TEXMAP0, texture_object(1), first);
+  const uint32_t held = material_for(gx::g_gxState, albedo_only(), true);
+  const uint32_t tile = testing::material_tile(held, false);
+  ASSERT_NE(tile, NoTile);
+  gx::g_gxState.textures[GX_TEXMAP0] = {};
+  first.reset();
+  latch();
+  EXPECT_TRUE(testing::tile(tile).live);
+
+  gfx::TextureHandle second = texture_in_reused_block();
+  bind_texture(GX_TEXMAP0, texture_object(2), second, 7);
+  const uint32_t other = material_for(gx::g_gxState, albedo_only(), true);
+  ASSERT_NE(other, held);
+  const uint32_t otherTile = testing::material_tile(other, false);
+  ASSERT_NE(otherTile, NoTile);
+  EXPECT_NE(otherTile, tile);
+  EXPECT_EQ(testing::material_tile(held, false), tile);
+  EXPECT_EQ(testing::tile(tile).refs, 1u);
+  EXPECT_EQ(testing::tile(otherTile).refs, 1u);
+  release(held);
+  latch();
+  latch();
+  latch();
+  EXPECT_FALSE(testing::tile(tile).live);
+  EXPECT_TRUE(testing::tile(otherTile).live);
+  EXPECT_EQ(material_for(gx::g_gxState, albedo_only(), true), other);
+  release(other);
+  release(other);
+  gx::g_gxState.textures[GX_TEXMAP0] = {};
 }
 
 TEST_F(RenderAtlas, PendingUntilAcked) {
