@@ -87,6 +87,8 @@ void initialize();
 void shutdown() noexcept;
 void on_latch(const Settings* settings) noexcept;
 [[nodiscard]] bool frame_enabled(const detail::StageData& stage) noexcept;
+// FIFO at stage build, once the stage's passes are enabled: vis.sun holds this frame's visibility, not a dummy
+[[nodiscard]] bool frame_applied(const detail::StageData& stage) noexcept;
 [[nodiscard]] uint32_t light_index(const detail::StageData& stage) noexcept;
 [[nodiscard]] SunShadowState state() noexcept;
 [[nodiscard]] detail::PassDesc pass_desc();
@@ -96,6 +98,7 @@ void on_latch(const Settings* settings) noexcept;
 namespace testing {
 void reset() noexcept;
 void set_light_index(std::optional<uint32_t> index) noexcept;
+void set_frame_enabled(std::optional<bool> enabled) noexcept;
 [[nodiscard]] Counters counters() noexcept;
 } // namespace testing
 } // namespace aurora::render::shadows::sun_visibility

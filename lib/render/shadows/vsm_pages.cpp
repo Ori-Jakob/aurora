@@ -17,7 +17,6 @@
 #include "../debug/vsm_view.hpp"
 #include "../fakeshadow/gate.hpp"
 #include "../geometry/compact.hpp"
-#include "../lighting/deferred.hpp"
 #include "../post/composite.hpp"
 #include "../scene/identity.hpp"
 #include "../../gfx/scene_targets.hpp"
@@ -163,9 +162,8 @@ std::vector<uint32_t> g_pendingChain;
 bool (*g_pipelineQuery)(uint32_t id) noexcept = nullptr;
 std::optional<bool> g_compactOverride;
 std::optional<bool> g_forceOverride;
-std::atomic_bool g_sunBound{false};
 std::atomic_bool g_shadowView{false};
-std::optional<bool> g_sunBoundOverride;
+std::optional<bool> g_sunTermOverride;
 std::optional<bool> g_shadowViewOverride;
 
 uint64_t g_snapFrame = UINT64_MAX;
@@ -1139,7 +1137,6 @@ void latch_resources(bool on) noexcept {
 
 void on_latch(const detail::PassSetup& setup, const detail::CompiledGraph* graph) {
   g_chainReadyLatched = g_fifoReady.load(std::memory_order_relaxed);
-  g_sunBound.store(graph != nullptr && detail::lighting::deferred::sun_bound(*graph), std::memory_order_relaxed);
   const debug::GbufView* row = debug::find_gbuf_view(debug::selected_view_id(detail::latched_settings()));
   g_shadowView.store(row != nullptr && debug::shadow_view(*row), std::memory_order_relaxed);
   {
@@ -1206,6 +1203,8 @@ bool active() noexcept { return g_activeOverride.value_or(g_active); }
 
 bool chain_ready_latched() noexcept { return g_chainReadyLatched; }
 
+bool ready() noexcept { return !active() || (g_resourcesLive && g_chainReadyLatched); }
+
 void register_chain_pipeline(shaders::PipelineId id) noexcept {
   if (!id) {
     return;
@@ -1228,9 +1227,7 @@ bool frame_producing(const StageData& stage) noexcept {
          stage.retained != nullptr && stage.retained->plan != nullptr;
 }
 
-bool deferred_consumes() noexcept {
-  return detail::composite::exposure_units() && g_sunBoundOverride.value_or(g_sunBound.load(std::memory_order_relaxed));
-}
+bool sun_term_consumes() noexcept { return g_sunTermOverride.value_or(detail::composite::sun_term_applied()); }
 
 bool shadow_view_selected() noexcept {
   return g_shadowViewOverride.value_or(g_shadowView.load(std::memory_order_relaxed));
@@ -1244,7 +1241,7 @@ uint32_t pool_generation() noexcept { return g_generation; }
 
 bool consumed(const StageData& stage) noexcept {
   // Persistent writers are graph sinks, so only this term stops the chain when nothing reads it
-  if (g_forceOverride.value_or(env_force()) || deferred_consumes() || shadow_view_selected()) {
+  if (g_forceOverride.value_or(env_force()) || sun_term_consumes() || shadow_view_selected()) {
     return true;
   }
   for (uint32_t i = 0; i < g_termCount; ++i) {
@@ -1352,9 +1349,8 @@ void reset() noexcept {
     g_compactOverride.reset();
     g_forceOverride.reset();
   }
-  g_sunBound.store(false, std::memory_order_relaxed);
   g_shadowView.store(false, std::memory_order_relaxed);
-  g_sunBoundOverride.reset();
+  g_sunTermOverride.reset();
   g_shadowViewOverride.reset();
   g_snapFrame = UINT64_MAX;
   g_snapReady = false;
@@ -1377,7 +1373,7 @@ void set_pipeline_query(bool (*query)(uint32_t id) noexcept) noexcept {
 
 void set_compact_ready(std::optional<bool> ready) noexcept { g_compactOverride = ready; }
 
-void set_sun_bound(std::optional<bool> bound) noexcept { g_sunBoundOverride = bound; }
+void set_sun_term(std::optional<bool> applied) noexcept { g_sunTermOverride = applied; }
 
 void set_shadow_view(std::optional<bool> selected) noexcept { g_shadowViewOverride = selected; }
 

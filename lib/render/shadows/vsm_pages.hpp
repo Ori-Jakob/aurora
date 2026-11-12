@@ -437,12 +437,14 @@ void latch_resources(bool active) noexcept;
 void on_latch(const detail::PassSetup& setup, const detail::CompiledGraph* graph);
 [[nodiscard]] bool active() noexcept;
 [[nodiscard]] bool chain_ready_latched() noexcept;
+// Applying... waits for the pool and every chain pipeline; an inactive VSM has nothing to wait for
+[[nodiscard]] bool ready() noexcept;
 void register_chain_pipeline(shaders::PipelineId id) noexcept;
 void register_consumer_term(ConsumerTerm term) noexcept;
 
 [[nodiscard]] bool frame_producing(const detail::StageData& stage) noexcept;
 [[nodiscard]] bool consumed(const detail::StageData& stage) noexcept;
-[[nodiscard]] bool deferred_consumes() noexcept;
+[[nodiscard]] bool sun_term_consumes() noexcept;
 [[nodiscard]] bool shadow_view_selected() noexcept;
 [[nodiscard]] bool key_room_only() noexcept;
 [[nodiscard]] uint32_t pool_pages() noexcept;
@@ -477,7 +479,7 @@ void set_active(std::optional<bool> active) noexcept;
 void set_plan(const SunPlan& plan) noexcept;
 void set_pipeline_query(bool (*query)(uint32_t id) noexcept) noexcept;
 void set_compact_ready(std::optional<bool> ready) noexcept;
-void set_sun_bound(std::optional<bool> bound) noexcept;
+void set_sun_term(std::optional<bool> applied) noexcept;
 void set_shadow_view(std::optional<bool> selected) noexcept;
 [[nodiscard]] std::span<const uint32_t> chain_pipelines() noexcept;
 [[nodiscard]] WorkerCounts worker_counts() noexcept;

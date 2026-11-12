@@ -101,6 +101,8 @@ void fill_params(const SceneHints* hints, bool surfaceAmbient, Mode mode, Params
                  uint32_t sunLight = NoSunLight) noexcept;
 [[nodiscard]] bool ssil_bound(const CompiledGraph& graph) noexcept;
 [[nodiscard]] bool sun_bound(const CompiledGraph& graph) noexcept;
+// Latched; the composite's sun predicate waits on it, so PBR pixels never miss V while legacy ones take Rs
+[[nodiscard]] bool sun_hook_ready() noexcept;
 
 // The pass's enabled hook and the composite's per-frame term, so H exists exactly when the composite expects it
 [[nodiscard]] bool frame_enabled(const StageData& stage) noexcept;

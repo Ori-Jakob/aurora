@@ -105,6 +105,11 @@ std::atomic_bool g_castWanted{false};
 // FIFO thread writes, the game thread reads at the latch
 std::array<std::atomic_uint64_t, FifoNotes> g_fifo{};
 
+// Counter readbacks add these from map callbacks
+struct DdPixels {
+  std::atomic_uint64_t pbr{0}, legacy{0}, lastPbr{0}, lastLegacy{0};
+} g_dd;
+
 // Render worker and map callbacks
 struct ReadbackSlot {
   wgpu::Buffer buffer;
@@ -577,6 +582,10 @@ GameShadowStats stats(bool flush) noexcept {
     drain_arrivals();
   }
   GameShadowStats out{.frame = static_cast<uint32_t>(g_frame), .current = g_current, .total = g_total};
+  out.current.ddPixelsPbr = g_dd.lastPbr.load(std::memory_order_relaxed);
+  out.current.ddPixelsLegacy = g_dd.lastLegacy.load(std::memory_order_relaxed);
+  out.total.ddPixelsPbr = g_dd.pbr.load(std::memory_order_relaxed);
+  out.total.ddPixelsLegacy = g_dd.legacy.load(std::memory_order_relaxed);
   uint64_t pending = 0;
   for (const RingFrame& ring : g_ring) {
     if (ring.used && ring.latchChecked && !ring.castChecked) {
@@ -613,6 +622,20 @@ bool cast_bits_wanted() noexcept { return g_castWanted.load(std::memory_order_re
 
 void note_fifo_frame(uint64_t hintFrame, bool sunEnabled) noexcept {
   g_fifo[hintFrame % FifoNotes].store(hintFrame << 1 | (sunEnabled ? 1u : 0u), std::memory_order_release);
+}
+
+void note_dd_pixels(uint64_t hintFrame, uint64_t pbr, uint64_t legacy) noexcept {
+  g_dd.pbr.fetch_add(pbr, std::memory_order_relaxed);
+  g_dd.legacy.fetch_add(legacy, std::memory_order_relaxed);
+  g_dd.lastPbr.store(pbr, std::memory_order_relaxed);
+  g_dd.lastLegacy.store(legacy, std::memory_order_relaxed);
+  std::lock_guard lock{g_replayMutex};
+  for (ReplayFrame& frame : g_replayDone) {
+    if (frame.frame == hintFrame) {
+      frame.ddPixelsPbr = pbr;
+      frame.ddPixelsLegacy = legacy;
+    }
+  }
 }
 
 void copy_cast_bits(const wgpu::CommandEncoder& encoder, const BufferView& source, uint64_t hintFrame) noexcept {
@@ -744,6 +767,9 @@ void reset() noexcept {
   g_observe.store(false, std::memory_order_relaxed);
   g_replay = {};
   g_alphas.clear();
+  for (std::atomic_uint64_t* value : {&g_dd.pbr, &g_dd.legacy, &g_dd.lastPbr, &g_dd.lastLegacy}) {
+    value->store(0, std::memory_order_relaxed);
+  }
   std::lock_guard lock{g_replayMutex};
   g_replayDone.clear();
 }

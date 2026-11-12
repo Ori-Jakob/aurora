@@ -326,6 +326,11 @@ bool ssil_bound(const CompiledGraph& graph) noexcept { return bound_input(graph,
 
 bool sun_bound(const CompiledGraph& graph) noexcept { return bound_input(graph, resource::SunVisibility); }
 
+bool sun_hook_ready() noexcept {
+  const LatchSlot slot = latched_slot();
+  return slot.live && g_sun.load(std::memory_order_relaxed) && slot.ids[0] != 0 && shaders::pipelines_ready(slot.ids);
+}
+
 bool frame_enabled(const StageData& stage) noexcept {
   if (g_forceEnabled) {
     return *g_forceEnabled;

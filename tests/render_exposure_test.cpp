@@ -28,6 +28,7 @@
 #include "render/scene_depth.hpp"
 #include "render/settings.hpp"
 #include "render/shaders.hpp"
+#include "render/shadows/sun_visibility.hpp"
 #include "render/stage.hpp"
 #include "render/stage_data.hpp"
 #include "webgpu/caps.hpp"
@@ -249,7 +250,8 @@ TEST(TonemapRules, LuminanceMonotoneUnderScale) {
 }
 
 TEST(ExposureRules, ParamsAndStateLayout) {
-  EXPECT_EQ(sizeof(Params), 32u);
+  EXPECT_EQ(sizeof(Params), 80u);
+  EXPECT_EQ(offsetof(Params, sun), 32u);
   EXPECT_EQ(offsetof(Params, mode), 0u);
   EXPECT_EQ(offsetof(Params, flags), 4u);
   EXPECT_EQ(offsetof(Params, bias), 8u);
@@ -709,6 +711,7 @@ protected:
     exposure::testing::reset();
     composite::shutdown();
     composite::testing::reset();
+    shadows::sun_visibility::testing::reset();
     lighting::deferred::shutdown();
     lighting::deferred::testing::reset();
     shutdown_bindings();
@@ -914,7 +917,7 @@ TEST_F(ExposureGraph, BindsLsmAtNine) {
   const NodeId node = graph->find_node(exposure::Pass);
   ASSERT_NE(node, InvalidNode);
   const auto uses = graph->node_uses(node);
-  ASSERT_EQ(uses.size(), 10u);
+  ASSERT_EQ(uses.size(), 11u);
   EXPECT_EQ(graph->resources[uses[8].resource].name, resource::SsilIrradiance);
   EXPECT_EQ(graph->resources[uses[9].resource].name, fakeshadow::lsm::Resource);
   EXPECT_EQ(uses[9].access, Access::Sampled);
@@ -922,6 +925,49 @@ TEST_F(ExposureGraph, BindsLsmAtNine) {
   EXPECT_TRUE(uses[9].staticDummy);
   EXPECT_EQ(exposure::FlagLsm, 64u);
   EXPECT_EQ(live_graph(pbr_settings(Exposure::MatchLegacy, Tonemap::PbrNeutral, 1.f))->graphHash, graph->graphHash);
+}
+
+TEST_F(ExposureGraph, BindsVisSunAtTen) {
+  const auto graph = compile(pbr_settings());
+  const NodeId node = graph->find_node(exposure::Pass);
+  ASSERT_NE(node, InvalidNode);
+  const auto uses = graph->node_uses(node);
+  ASSERT_EQ(uses.size(), 11u);
+  EXPECT_EQ(graph->resources[uses[10].resource].name, resource::SunVisibility);
+  EXPECT_EQ(uses[10].access, Access::Sampled);
+  EXPECT_EQ(uses[10].missing, Missing::BindDummyWhite);
+  EXPECT_TRUE(uses[10].staticDummy);
+  EXPECT_EQ(exposure::FlagSun, 128u);
+}
+
+TEST_F(ExposureGraph, FlagSunFollowsTheCompositeSunTerm) {
+  StubTexture vis{
+      .resource = resource::SunVisibility, .format = wgpu::TextureFormat::RG8Unorm, .after = phase::Shadows};
+  register_pass(stub_desc(vis, "test.vis_sun"));
+  shadows::sun_visibility::testing::set_frame_enabled(true);
+  composite::Sun sun;
+  sun.keyLum = 0.5f;
+  composite::testing::set_stage_sun(sun);
+  for (const bool applied : {false, true}) {
+    composite::testing::set_sun_term(applied);
+    const auto graph = live_graph(pbr_settings());
+    const FrameState state{.graph = graph};
+    StageData stage = build(state, applied ? 2 : 1);
+    EXPECT_EQ(encode(stage), std::nullopt);
+    const NodeId node = graph->find_node(exposure::Pass);
+    bool seen = false;
+    for (const StageBindings::Params& params : stage.bindings.params) {
+      if (params.node == node) {
+        Params out;
+        std::memcpy(&out, params.bytes.data(), sizeof(out));
+        // Sb carries Rs on exactly the frames the composite applies it, so the target follows the screen
+        EXPECT_EQ((out.flags & exposure::FlagSun) != 0, applied && !composite::identity_forced()) << applied;
+        EXPECT_EQ(out.sun.keyLum, applied && !composite::identity_forced() ? 0.5f : 0.f) << applied;
+        seen = true;
+      }
+    }
+    EXPECT_TRUE(seen) << applied;
+  }
 }
 
 TEST(ExposureRules, MaskedCandidateMirrorsComposite) {
@@ -1344,6 +1390,69 @@ TEST_F(ExposureGpu, MaskShadesPreShadowCandidates) {
     // The darkest candidates sit at the floor either way, so the mask shows from the middle up
     EXPECT_LT(expected[exposure::Candidates / 2], unmasked[exposure::Candidates / 2] - 1.0);
   }
+}
+
+TEST_F(ExposureGpu, TargetCarriesTheSunRatio) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  const std::vector<MeterPixel> pixels = scene(23, 0.3f, true);
+  load(pixels);
+  const wgpu::Extent3D size = webgpu::g_frameBuffer.size;
+  std::mt19937 rng{0x5u};
+  std::vector<std::array<uint8_t, 2>> visTexels(pixels.size());
+  StubTexture vis{
+      .resource = resource::SunVisibility, .format = wgpu::TextureFormat::RG8Unorm, .after = phase::Shadows};
+  vis.rowBytes = (size.width * 2 + 255) & ~255u;
+  std::vector<uint8_t> texels(size_t{vis.rowBytes} * size.height, 0);
+  for (size_t i = 0; i < pixels.size(); ++i) {
+    visTexels[i] = {static_cast<uint8_t>(rng() % 256), 255};
+    uint8_t* texel = texels.data() + (i / size.width) * vis.rowBytes + (i % size.width) * 2;
+    texel[0] = visTexels[i][0];
+    texel[1] = visTexels[i][1];
+  }
+  vis.staging = staging(texels.data(), texels.size());
+  register_pass(stub_desc(vis, "test.vis_sun"));
+  composite::Sun sun;
+  sun.keyDir[2] = -1.f;
+  sun.sSun = 0.8f;
+  sun.keyLum = 0.7f;
+  sun.ambientLum = 0.2f;
+  sun.flags = composite::SunGeometric;
+  shadows::sun_visibility::testing::set_frame_enabled(true);
+  composite::testing::set_sun_term(true);
+  composite::testing::set_stage_sun(sun);
+  composite::testing::set_pbr_producers_override(true);
+  const auto graph = live_graph(pbr_settings());
+  const FrameState state{.graph = graph};
+  const Frame first = run(state, 1);
+  const std::array<float, 3> n = composite::testing::sun_normal({512.f / 1023.f, 512.f / 1023.f, 1.f});
+  double target = 0.0;
+  double unshadowed = 0.0;
+  double weight = 0.0;
+  for (size_t i = 0; i < pixels.size(); ++i) {
+    const MeterPixel& p = pixels[i];
+    if (!sampled(p)) {
+      continue;
+    }
+    const std::array<float, 3> l{p.legacy[0] / 255.f, p.legacy[1] / 255.f, p.legacy[2] / 255.f};
+    const std::array<float, 3> fc{p.fc[0] / 255.f, p.fc[1] / 255.f, p.fc[2] / 255.f};
+    const float q = p.q7 / 127.f;
+    const float rs = composite::testing::sun_rs({visTexels[i][0] / 255.f, 1.f}, p.code, n, sun);
+    const auto y = [&](const std::array<float, 3>& sb) {
+      Rgb lin{};
+      for (size_t c = 0; c < 3; ++c) {
+        lin[c] = srgb_decode((sb[c] - q * fc[c]) / (1.f - q));
+      }
+      return std::log2(std::max(tonemap::luminance(lin), exposure::YFloor));
+    };
+    const double w = 1.0 - q;
+    target += w * y(composite::testing::legacy_sun(l, fc, p.q7, p.ao / 255.f, p.code / 3.f, rs));
+    unshadowed += w * y(composite::testing::legacy_ao(l, fc, p.q7, p.ao / 255.f, p.code / 3.f));
+    weight += w;
+  }
+  EXPECT_NEAR(std::bit_cast<float>(first.state[4]), target / weight, 2e-4);
+  EXPECT_LT(target / weight, unshadowed / weight - 0.05);
 }
 
 TEST_F(ExposureGpu, SkipsClassZeroFoggedAndBad) {

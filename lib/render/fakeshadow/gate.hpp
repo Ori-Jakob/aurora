@@ -134,6 +134,8 @@ void set_force(ConsumerForce force) noexcept;
 [[nodiscard]] bool cast_bits_wanted() noexcept;
 // FIFO thread; frame_enabled is the sun term the frame really carried
 void note_fifo_frame(uint64_t hintFrame, bool sunEnabled) noexcept;
+// Any thread; the counter's readback for that frame, never a decision input
+void note_dd_pixels(uint64_t hintFrame, uint64_t pbr, uint64_t legacy) noexcept;
 // Render worker
 void copy_cast_bits(const wgpu::CommandEncoder& encoder, const BufferView& source, uint64_t hintFrame) noexcept;
 

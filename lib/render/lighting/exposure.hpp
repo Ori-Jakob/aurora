@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../graph.hpp"
+#include "../post/composite.hpp"
 
 #include <aurora/render.hpp>
 #include <webgpu/webgpu_cpp.h>
@@ -72,6 +73,7 @@ enum ParamFlags : uint32_t {
   FlagSsil = 1u << 4,
   FlagSsilExposed = 1u << 5,
   FlagLsm = 1u << 6,
+  FlagSun = 1u << 7,
 };
 
 enum StateFlags : uint32_t {
@@ -94,9 +96,10 @@ struct Params {
   float anchor = 0.f;
   float ssilAlbedo = 0.f;
   uint32_t pad = 0;
+  composite::Sun sun;
 };
-static_assert(sizeof(Params) == 32 && offsetof(Params, dt) == 16 && offsetof(Params, anchor) == 20 &&
-              offsetof(Params, ssilAlbedo) == 24);
+static_assert(sizeof(Params) == 80 && offsetof(Params, dt) == 16 && offsetof(Params, anchor) == 20 &&
+              offsetof(Params, ssilAlbedo) == 24 && offsetof(Params, sun) == 32 && sizeof(Params) <= MaxPassParamsSize);
 
 // The GPU reads the previous s from the prev texel, so only the mirror carries it for the ratio word
 struct Solved {

@@ -1,4 +1,5 @@
 // Shared by composite.main and later checks; later terms append fields and must keep identity exact
+//#import aurora/camera
 //#import aurora/gbuffer
 //#import aurora/srgb
 //#import aurora/ssil
@@ -10,6 +11,20 @@ const COMPOSITE_FLAG_PBR: u32 = 4u;
 const COMPOSITE_FLAG_TONEMAP_AGX: u32 = 8u;
 const COMPOSITE_FLAG_SSIL: u32 = 16u;
 const COMPOSITE_FLAG_LSM: u32 = 32u;
+const COMPOSITE_FLAG_SUN: u32 = 64u;
+const COMPOSITE_SUN_GEOMETRIC: u32 = 1u;
+
+// In gx.normal's view-forward frame and in stored GX units, so the ratio needs no per-pixel conversion
+struct CompositeSun {
+  key_dir: vec3f,
+  s_sun: f32,
+  key_lum: f32,
+  fill_lum: f32,
+  ambient_lum: f32,
+  flags: u32,
+  fill_dir: vec3f,
+  pad: f32,
+}
 
 struct CompositeTerms {
   ao: f32,
@@ -20,6 +35,7 @@ struct CompositeTerms {
   e: f32,
   agx: bool,
   bounce: vec3f,
+  rs: f32,
 }
 
 struct CompositeEval {
@@ -30,11 +46,11 @@ struct CompositeEval {
 }
 
 fn composite_identity_terms() -> CompositeTerms {
-  return CompositeTerms(1.0, false, 1.0, vec3f(1.0), vec3f(0.0), 1.0, false, vec3f(0.0));
+  return CompositeTerms(1.0, false, 1.0, vec3f(1.0), vec3f(0.0), 1.0, false, vec3f(0.0), 1.0);
 }
 
 fn composite_is_identity(t: CompositeTerms) -> bool {
-  return t.ao >= 1.0 && !(t.pbr && t.lb < 1.0);
+  return t.ao >= 1.0 && t.rs >= 1.0 && !(t.pbr && t.lb < 1.0);
 }
 
 fn composite_texel(p: vec2i, dims: vec2u) -> vec2i {
@@ -53,6 +69,31 @@ fn composite_units(flags: u32, e: f32, inv_e: f32) -> vec2f {
   return select(vec2f(1.0), vec2f(e, inv_e), (flags & COMPOSITE_FLAG_PBR) != 0u);
 }
 
+fn composite_sun_normal(rgb: vec3f) -> vec3f {
+  let n = camera_gx_normal_fwd(rgb * 2.0 - 1.0);
+  let length0 = length(n);
+  return select(vec3f(0.0), n / length0, length0 >= 1e-3);
+}
+
+// Only the key light's share of A' + wK falls into shadow; WGSL division is inexact, so unshadowed cases select 1
+fn composite_sun_rs(vis: vec2f, code: u32, n: vec3f, sun: CompositeSun) -> f32 {
+  let t_sun = select(1.0, vis.y, (sun.flags & COMPOSITE_SUN_GEOMETRIC) != 0u || code == 2u);
+  let vs = (1.0 - sun.s_sun * (1.0 - vis.x)) * t_sun;
+  let a = sun.ambient_lum + sun.fill_lum * max(dot(n, sun.fill_dir), 0.0);
+  let wk = sun.key_lum * max(dot(n, sun.key_dir), 0.0);
+  if (code < 2u || vs >= 1.0 || !(wk > 0.0) || !(a + wk > 0.0)) {
+    return 1.0;
+  }
+  return min((a + wk * vs) / (a + wk), 1.0);
+}
+
+// The composite, the meter and the counter all call this, so the shadow each of them sees cannot drift
+fn composite_sun_term(vis_tex: texture_2d<f32>, normal_tex: texture_2d<f32>, p: vec2i, sun: CompositeSun) -> f32 {
+  let texel = textureLoad(normal_tex, composite_texel(p, textureDimensions(normal_tex)), 0);
+  let vis = textureLoad(vis_tex, composite_texel(p, textureDimensions(vis_tex)), 0).rg;
+  return composite_sun_rs(vis, gbuf_receiver_code(texel.a), composite_sun_normal(texel.rgb), sun);
+}
+
 fn composite_ssil_term(tex: texture_2d<f32>, p: vec2i, e: f32, rho: f32) -> vec3f {
   return rho * e * ssil_fetch(tex, p).rgb;
 }
@@ -60,9 +101,11 @@ fn composite_ssil_term(tex: texture_2d<f32>, p: vec2i, e: f32, rho: f32) -> vec3
 // Bounce gives back at most what AO took, so legacy pixels never pass the original and a = 1 stays identity
 fn composite_legacy_scale(t: CompositeTerms, sp: vec3f, q: f32) -> vec3f {
   if (all(t.bounce == vec3f(0.0))) {
-    return vec3f(t.ao);
+    return vec3f(t.ao * t.rs);
   }
-  return ssil_legacy_gain(t.ao, t.bounce, srgb_to_linear(saturate(sp / max(1.0 - q, SSIL_DEFOG_MIN))));
+  // The bounce refills only what AO took, so the sun's share leaves after it
+  return ssil_legacy_gain(t.ao, t.bounce, srgb_to_linear(saturate(sp / max(1.0 - q, SSIL_DEFOG_MIN)))) -
+         vec3f(t.ao * (1.0 - t.rs));
 }
 
 fn composite_pbr_tonemap(x: vec3f, agx: bool) -> vec3f {
@@ -73,7 +116,7 @@ fn composite_eval(l: vec3f, rec: GbufFog, t: CompositeTerms) -> CompositeEval {
   let s = l - rec.q * rec.fc;
   let bad = any(s < vec3f(-2.0 / 255.0));
   // Subtracting the darkening gives L exactly at a = 1 and never brightens a channel whose fog estimate rounds above it
-  var rgb = l - max(s, vec3f(0.0)) * (1.0 - t.ao);
+  var rgb = l - max(s, vec3f(0.0)) * (1.0 - t.ao * t.rs);
   if (any(t.bounce > vec3f(0.0))) {
     rgb = l - max(s, vec3f(0.0)) * (1.0 - composite_legacy_scale(t, max(s, vec3f(0.0)), rec.q));
   }

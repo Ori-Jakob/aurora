@@ -1728,7 +1728,7 @@ TEST_F(RenderVsmGraph, ViewRowIsAConsumer) {
   detail::composite::testing::set_exposure_units(std::nullopt);
 }
 
-TEST_F(RenderVsmGraph, DeferredIsTheConsumer) {
+TEST_F(RenderVsmGraph, SunTermIsTheConsumer) {
   testing::set_active(true);
   testing::set_plan(producing_plan());
   testing::set_compact_ready(true);
@@ -1742,28 +1742,26 @@ TEST_F(RenderVsmGraph, DeferredIsTheConsumer) {
   const auto chain_off = [&] {
     return std::ranges::none_of(passes, [&](const detail::PassDesc& pass) { return pass.enabled(stage, pass.state); });
   };
-  testing::set_sun_bound(true);
-  for (const float blend : {0.5f, 1.f}) {
-    Settings settings;
-    settings.pbr = true;
-    settings.legacyBlend = blend;
-    const bool flagPbr = detail::composite::pbr_term_wanted(settings);
-    EXPECT_EQ(flagPbr, blend < 1.f);
-    detail::composite::testing::set_exposure_units(flagPbr);
-    EXPECT_EQ(deferred_consumes(), flagPbr) << blend;
-    EXPECT_EQ(consumed(stage), flagPbr) << blend;
-    EXPECT_EQ(chain_on(), flagPbr) << blend;
-    EXPECT_EQ(chain_off(), !flagPbr) << blend;
+  // The composite's latched predicate is the consumer at every lb, so lb = 1 renders what PBR off renders
+  for (const bool applied : {false, true}) {
+    detail::composite::testing::set_sun_term(applied);
+    EXPECT_EQ(sun_term_consumes(), applied);
+    EXPECT_EQ(consumed(stage), applied);
+    EXPECT_EQ(chain_on(), applied);
+    EXPECT_EQ(chain_off(), !applied);
   }
-  EXPECT_FALSE(detail::composite::pbr_term_wanted(Settings{}));
+  detail::composite::testing::set_sun_term(false);
+  testing::set_sun_term(true);
+  EXPECT_TRUE(consumed(stage)) << "the testing override stands in for the composite";
+  testing::set_sun_term(std::nullopt);
   detail::composite::testing::set_exposure_units(true);
-  testing::set_sun_bound(false);
-  EXPECT_FALSE(consumed(stage)) << "light.deferred bound to the white dummy reads no shadow";
+  EXPECT_FALSE(consumed(stage)) << "exposure units alone are no longer a consumer";
   testing::set_shadow_view(true);
   EXPECT_TRUE(consumed(stage)) << "selecting the vis.sun row is a consumer";
   EXPECT_TRUE(chain_on());
   testing::set_shadow_view(std::nullopt);
   detail::composite::testing::set_exposure_units(std::nullopt);
+  detail::composite::testing::set_sun_term(std::nullopt);
   EXPECT_FALSE(consumed(stage));
 }
 } // namespace

@@ -31,6 +31,10 @@
 #include "render/scene_depth.hpp"
 #include "render/settings.hpp"
 #include "render/shaders.hpp"
+#include "render/fakeshadow/count.hpp"
+#include "render/fakeshadow/gate.hpp"
+#include "render/shadows/sun_visibility.hpp"
+#include "render/shadows/vsm_pages.hpp"
 #include "render/stage.hpp"
 #include "render/stage_data.hpp"
 #include "webgpu/caps.hpp"
@@ -319,6 +323,73 @@ PassDesc stub_lsm_desc(StubLsm& stub) {
   };
 }
 
+struct StubVis {
+  bool enabled = true;
+  wgpu::Buffer staging;
+  uint32_t rowBytes = 0;
+  int calls = 0;
+};
+
+void declare_stub_vis(InternalPassBuilder& builder, const PassSetup&, const void*) {
+  builder.after(phase::Shadows);
+  builder.create(resource::SunVisibility,
+                 {.format = shadows::sun_visibility::Format,
+                  .sizeClass = SizeClass::Efb,
+                  .extraUsage = wgpu::TextureUsage::TextureBinding},
+                 Access::CopyDst);
+}
+
+bool stub_vis_enabled(const StageData&, const void* state) { return static_cast<const StubVis*>(state)->enabled; }
+
+void encode_stub_vis(PassContext& ctx, const void* state) {
+  auto& stub = *static_cast<StubVis*>(const_cast<void*>(state));
+  ++stub.calls;
+  if (!stub.staging) {
+    return;
+  }
+  const wgpu::Extent3D size = ctx.extent(TexRef{0});
+  const wgpu::TexelCopyBufferInfo from{.layout = {.bytesPerRow = stub.rowBytes, .rowsPerImage = size.height},
+                                       .buffer = stub.staging};
+  const wgpu::TexelCopyTextureInfo to{.texture = ctx.texture(TexRef{0})};
+  const wgpu::Extent3D extent{size.width, size.height, 1};
+  ctx.encoder().CopyBufferToTexture(&from, &to, &extent);
+}
+
+// Stands in for sun.visibility; the composite keys FlagSun on whichever pass creates vis.sun
+PassDesc stub_vis_desc(StubVis& stub) {
+  return {
+      .name = "test.vis_sun",
+      .stage = Stage::OpaqueDone,
+      .kind = PassKind::Copy,
+      .order = shadows::sun_visibility::Order,
+      .runsWithoutMarker = true,
+      .declare = declare_stub_vis,
+      .enabled = stub_vis_enabled,
+      .encode = encode_stub_vis,
+      .state = &stub,
+  };
+}
+
+// A key light straight into the stored test normal, so N.L is 1 and Rs is the closed form
+composite::Sun test_sun(float sSun = 0.6f) {
+  composite::Sun sun;
+  sun.keyDir[2] = -1.f;
+  sun.sSun = sSun;
+  sun.keyLum = 0.7f;
+  sun.fillLum = 0.1f;
+  sun.ambientLum = 0.25f;
+  sun.flags = composite::SunGeometric;
+  sun.fillDir[1] = 1.f;
+  return sun;
+}
+
+Settings shadow_settings(Quality ao = Quality::Off) {
+  Settings settings;
+  settings.ao = ao;
+  settings.shadows.quality = Quality::High;
+  return settings;
+}
+
 struct TestPass {
   std::string name;
   Stage stage = Stage::OpaqueDone;
@@ -358,17 +429,30 @@ bool pass_enabled(const CompiledGraph& graph, const StageData& stage, std::strin
          stage.is_enabled(graph.nodes[node].programIndex);
 }
 
-TEST(CompositeRules, ParamsAreSixteenBytes) {
-  EXPECT_EQ(sizeof(composite::Params), 16u);
+TEST(CompositeRules, ParamsLayout) {
+  EXPECT_EQ(sizeof(composite::Params), 64u);
   EXPECT_EQ(offsetof(composite::Params, legacyBlend), 4u);
+  EXPECT_EQ(offsetof(composite::Params, ssilAlbedo), 8u);
+  EXPECT_EQ(offsetof(composite::Params, sun), 16u);
   EXPECT_LE(sizeof(composite::Params), MaxPassParamsSize);
+  // CompositeSun's WGSL layout: vec3f at 0 and 32, the scalars packed after each
+  EXPECT_EQ(sizeof(composite::Sun), 48u);
+  EXPECT_EQ(offsetof(composite::Sun, sSun), 12u);
+  EXPECT_EQ(offsetof(composite::Sun, keyLum), 16u);
+  EXPECT_EQ(offsetof(composite::Sun, fillLum), 20u);
+  EXPECT_EQ(offsetof(composite::Sun, ambientLum), 24u);
+  EXPECT_EQ(offsetof(composite::Sun, flags), 28u);
+  EXPECT_EQ(offsetof(composite::Sun, fillDir), 32u);
   EXPECT_EQ(composite::FlagIdentity, 1u);
   EXPECT_EQ(composite::FlagNoFog, 2u);
   EXPECT_EQ(composite::FlagPbr, 4u);
   EXPECT_EQ(composite::FlagTonemapAgX, 8u);
+  EXPECT_EQ(composite::FlagSun, 64u);
+  EXPECT_EQ(composite::SunGeometric, 1u);
   const composite::Params params;
   EXPECT_EQ(params.flags, 0u);
   EXPECT_EQ(params.legacyBlend, 0.f);
+  EXPECT_EQ(params.sun.sSun, 0.f);
 }
 
 TEST(CompositeRules, TargetIsRgbOnlyInEfbFormat) {
@@ -448,8 +532,11 @@ TEST(CompositeRules, InputTableIsAppendOnly) {
   EXPECT_EQ(composite::BindExposure, 6u);
   EXPECT_EQ(composite::BindSsil, 7u);
   EXPECT_EQ(composite::BindLsm, 8u);
+  EXPECT_EQ(composite::BindVisSun, 9u);
   EXPECT_EQ(composite::FlagSsil, 16u);
   EXPECT_EQ(composite::FlagLsm, 32u);
+  EXPECT_EQ(composite::FlagSun, 64u);
+  EXPECT_EQ(resource::SunVisibility, "vis.sun");
   EXPECT_EQ(fakeshadow::lsm::Resource, "lsm.mask");
   EXPECT_EQ(offsetof(composite::Params, ssilAlbedo), 8u);
   EXPECT_EQ(lighting::exposure::Resource, "exposure");
@@ -500,6 +587,78 @@ TEST(CompositeRules, LsmUnitMaskExact) {
     const float ao = unit(rng);
     EXPECT_EQ(composite::testing::legacy_pbr_hdr(legacy, fc, q7, ao, 1.f, hdr, 0.3f, 1.5f, true, {1.f, 1.f, 1.f}),
               composite::testing::legacy_pbr_hdr(legacy, fc, q7, ao, 1.f, hdr, 0.3f, 1.5f, true));
+  }
+}
+
+TEST(CompositeRules, SunMirrorUnitVisibilityIsIdentity) {
+  std::mt19937 rng{91};
+  std::uniform_real_distribution<float> unit(0.f, 1.f);
+  for (int i = 0; i < 512; ++i) {
+    composite::Sun sun = test_sun(unit(rng));
+    sun.keyLum = unit(rng);
+    sun.ambientLum = unit(rng);
+    sun.flags = i % 2 == 0 ? composite::SunGeometric : 0u;
+    const std::array<float, 3> n = composite::testing::sun_normal({unit(rng), unit(rng), unit(rng)});
+    for (uint32_t code = 0; code < 4; ++code) {
+      // White vis.sun is the dummy and ClearOnly's value, so it must give exactly 1, never a near-1 quotient
+      EXPECT_EQ(composite::testing::sun_rs({1.f, 1.f}, code, n, sun), 1.f) << i << " " << code;
+    }
+  }
+}
+
+TEST(CompositeRules, SunMirrorClosedForm) {
+  const composite::Sun sun = test_sun(0.6f);
+  const std::array<float, 3> n{0.f, 0.f, -1.f};
+  for (const float vg : {0.f, 0.25f, 0.5f, 0.9f}) {
+    const float vs = 1.f - 0.6f * (1.f - vg);
+    const float expected = (0.25f + 0.7f * vs) / (0.25f + 0.7f);
+    EXPECT_NEAR(composite::testing::sun_rs({vg, 1.f}, 3, n, sun), expected, 1e-6f) << vg;
+  }
+  // Fully shadowed, Rs leaves exactly the ambient and fill share plus the unshadowed part of the key
+  EXPECT_NEAR(composite::testing::sun_rs({0.f, 1.f}, 2, n, sun), (0.25f + 0.7f * 0.4f) / 0.95f, 1e-6f);
+  composite::Sun facing = sun;
+  facing.keyDir[2] = 1.f;
+  EXPECT_EQ(composite::testing::sun_rs({0.f, 1.f}, 3, n, facing), 1.f) << "a receiver facing away has no key share";
+  composite::Sun dark = sun;
+  dark.ambientLum = 0.f;
+  dark.fillLum = 0.f;
+  dark.sSun = 1.f;
+  EXPECT_EQ(composite::testing::sun_rs({0.f, 1.f}, 3, n, dark), 0.f);
+}
+
+TEST(CompositeRules, SunMirrorCloudOutsideShadow) {
+  const std::array<float, 3> n{0.f, 0.f, -1.f};
+  composite::Sun sun = test_sun(0.6f);
+  // Outside the geometric shadow a cloud still dims the key share once the plan is geometric
+  EXPECT_LT(composite::testing::sun_rs({1.f, 0.5f}, 3, n, sun), 1.f);
+  sun.flags = 0;
+  EXPECT_EQ(composite::testing::sun_rs({1.f, 0.5f}, 3, n, sun), 1.f) << "no T_c under roofs without a geometric sun";
+  EXPECT_LT(composite::testing::sun_rs({1.f, 0.5f}, 2, n, sun), 1.f) << "cloud receivers take T_c regardless";
+}
+
+TEST(CompositeRules, CodeBelowTwoUnshadowed) {
+  const std::array<float, 3> n{0.f, 0.f, -1.f};
+  const composite::Sun sun = test_sun(1.f);
+  for (const uint32_t code : {0u, 1u}) {
+    EXPECT_EQ(composite::testing::sun_rs({0.f, 0.f}, code, n, sun), 1.f) << code;
+  }
+  EXPECT_LT(composite::testing::sun_rs({0.f, 0.f}, 2, n, sun), 1.f);
+  EXPECT_LT(composite::testing::sun_rs({0.f, 1.f}, 3, n, sun), 1.f);
+}
+
+TEST(CompositeRules, LegacyScaleBitsAtRsOne) {
+  std::mt19937 rng{97};
+  std::uniform_real_distribution<float> unit(0.f, 1.f);
+  for (int i = 0; i < 4096; ++i) {
+    const std::array<float, 3> legacy{unit(rng), unit(rng), unit(rng)};
+    const std::array<float, 3> fc{unit(rng), unit(rng), unit(rng)};
+    const auto q7 = static_cast<uint32_t>(rng() % 128);
+    const float ao = unit(rng);
+    const float alpha = static_cast<float>(rng() % 4) / 3.f;
+    // ao * 1 is exact, so the sun-aware line equals M11's AO line bit for bit
+    EXPECT_EQ(composite::testing::legacy_sun(legacy, fc, q7, ao, alpha, 1.f),
+              composite::testing::legacy_ao(legacy, fc, q7, ao, alpha))
+        << i;
   }
 }
 
@@ -1020,6 +1179,7 @@ protected:
   static void reset_module_state() {
     composite::shutdown();
     composite::testing::reset();
+    shadows::sun_visibility::testing::reset();
     lighting::deferred::shutdown();
     lighting::deferred::testing::reset();
     lighting::openpbr::shutdown();
@@ -1348,14 +1508,21 @@ TEST_F(CompositeGraph, BindingOrderLegacyFogNormalAoSurfaceHdr) {
   const NodeId node = graph->find_node(composite::Pass);
   ASSERT_EQ(graph->nodes[node].status, CullReason::None);
   const auto uses = graph->node_uses(node);
-  ASSERT_EQ(uses.size(), 10u);
-  const std::array<std::string_view, 10> names{
-      composite::LegacyTex,      resource::Fog,      resource::GxNormal,           resource::AoFinal,
-      resource::Surface,         resource::SceneHdr, lighting::exposure::Resource, resource::SsilIrradiance,
-      fakeshadow::lsm::Resource, resource::GxColor};
+  ASSERT_EQ(uses.size(), 11u);
+  const std::array<std::string_view, 11> names{composite::LegacyTex,
+                                               resource::Fog,
+                                               resource::GxNormal,
+                                               resource::AoFinal,
+                                               resource::Surface,
+                                               resource::SceneHdr,
+                                               lighting::exposure::Resource,
+                                               resource::SsilIrradiance,
+                                               fakeshadow::lsm::Resource,
+                                               resource::SunVisibility,
+                                               resource::GxColor};
   for (size_t i = 0; i < names.size(); ++i) {
     EXPECT_EQ(graph->resources[uses[i].resource].name, names[i]) << i;
-    EXPECT_EQ(uses[i].access, i == 6 ? Access::Uniform : i == 9 ? Access::ColorRMW : Access::Sampled) << i;
+    EXPECT_EQ(uses[i].access, i == 6 ? Access::Uniform : i == 10 ? Access::ColorRMW : Access::Sampled) << i;
     if (i < 4) {
       EXPECT_EQ(uses[i].missing, Missing::DisablePass) << i;
     }
@@ -1383,7 +1550,7 @@ TEST_F(CompositeGraph, BindingOrderAppendsExposure) {
   const NodeId node = graph->find_node(composite::Pass);
   ASSERT_EQ(graph->nodes[node].status, CullReason::None);
   const auto uses = graph->node_uses(node);
-  ASSERT_EQ(uses.size(), 10u);
+  ASSERT_EQ(uses.size(), 11u);
   EXPECT_EQ(graph->resources[uses[composite::BindExposure].resource].name, lighting::exposure::Resource);
   EXPECT_FALSE(uses[composite::BindExposure].staticDummy);
   EXPECT_EQ(composite::check_contract(*graph), std::nullopt);
@@ -1726,7 +1893,7 @@ TEST_F(CompositeGraph, BindingOrderAppendsLsm) {
   produce_hdr(hdr);
   const auto bare = live_graph(pbr_settings(0.f, Quality::High));
   const auto bareUses = bare->node_uses(bare->find_node(composite::Pass));
-  ASSERT_EQ(bareUses.size(), 10u);
+  ASSERT_EQ(bareUses.size(), 11u);
   EXPECT_EQ(bare->resources[bareUses[composite::BindLsm].resource].name, fakeshadow::lsm::Resource);
   EXPECT_TRUE(bareUses[composite::BindLsm].staticDummy);
   StubLsm mask;
@@ -1735,12 +1902,12 @@ TEST_F(CompositeGraph, BindingOrderAppendsLsm) {
   const NodeId node = graph->find_node(composite::Pass);
   ASSERT_EQ(graph->nodes[node].status, CullReason::None);
   const auto uses = graph->node_uses(node);
-  ASSERT_EQ(uses.size(), 10u);
+  ASSERT_EQ(uses.size(), 11u);
   EXPECT_EQ(graph->resources[uses[composite::BindLsm].resource].name, fakeshadow::lsm::Resource);
   EXPECT_EQ(uses[composite::BindLsm].access, Access::Sampled);
   EXPECT_EQ(uses[composite::BindLsm].missing, Missing::BindDummyWhite);
   EXPECT_FALSE(uses[composite::BindLsm].staticDummy);
-  EXPECT_EQ(graph->resources[uses[composite::BindLsm + 1].resource].name, resource::GxColor);
+  EXPECT_EQ(graph->resources[uses[composite::BindVisSun + 1].resource].name, resource::GxColor);
   EXPECT_EQ(composite::check_contract(*graph), std::nullopt);
 }
 
@@ -1804,6 +1971,270 @@ TEST_F(CompositeGraph, FlagLsmOnlyWhenPassRan) {
   composite::testing::force_params(std::nullopt);
 }
 
+TEST_F(CompositeGraph, BindingOrderAppendsVisSun) {
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  const auto bare = live_graph(ao_settings());
+  const auto bareUses = bare->node_uses(bare->find_node(composite::Pass));
+  ASSERT_EQ(bareUses.size(), 11u);
+  EXPECT_EQ(bare->resources[bareUses[composite::BindVisSun].resource].name, resource::SunVisibility);
+  EXPECT_EQ(bareUses[composite::BindVisSun].missing, Missing::BindDummyWhite);
+  EXPECT_TRUE(bareUses[composite::BindVisSun].staticDummy);
+  StubVis vis;
+  register_pass(stub_vis_desc(vis));
+  const auto graph = live_graph(ao_settings());
+  const auto uses = graph->node_uses(graph->find_node(composite::Pass));
+  ASSERT_EQ(uses.size(), 11u);
+  EXPECT_EQ(graph->resources[uses[composite::BindVisSun].resource].name, resource::SunVisibility);
+  EXPECT_EQ(uses[composite::BindVisSun].access, Access::Sampled);
+  EXPECT_FALSE(uses[composite::BindVisSun].staticDummy);
+  EXPECT_EQ(graph->resources[uses[composite::BindVisSun + 1].resource].name, resource::GxColor);
+  EXPECT_EQ(uses[composite::BindVisSun + 1].access, Access::ColorRMW);
+  EXPECT_EQ(composite::check_contract(*graph), std::nullopt);
+}
+
+TEST_F(CompositeGraph, SunTermAppliedIsOnePredicate) {
+  using Inputs = composite::testing::SunTermInputs;
+  // Every term is needed, and PBR adds light.deferred's hook, so V on H and Rs on Sb arrive together
+  EXPECT_TRUE(composite::testing::sun_applied_for({}));
+  for (bool Inputs::* term :
+       {&Inputs::shadows, &Inputs::producing, &Inputs::live, &Inputs::pipelines, &Inputs::meterReady}) {
+    Inputs in;
+    in.*term = false;
+    EXPECT_FALSE(composite::testing::sun_applied_for(in));
+  }
+  EXPECT_FALSE(composite::testing::sun_applied_for({.identity = true}));
+  EXPECT_FALSE(composite::testing::sun_applied_for({.classView = true}));
+  EXPECT_TRUE(composite::testing::sun_applied_for({.hookReady = false}));
+  EXPECT_FALSE(composite::testing::sun_applied_for({.pbr = true, .hookReady = false}));
+  EXPECT_TRUE(composite::testing::sun_applied_for({.pbr = true}));
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  StubVis vis;
+  register_pass(stub_vis_desc(vis));
+  shadows::sun_visibility::testing::set_frame_enabled(true);
+  composite::testing::set_stage_sun(test_sun());
+  for (const bool applied : {false, true, false}) {
+    SCOPED_TRACE(applied);
+    composite::testing::set_sun_term(applied);
+    const auto graph = live_graph(shadow_settings(Quality::High));
+    // The composite, light.deferred's light index, the meter's stage_sun and the gate all read this one value
+    EXPECT_EQ(composite::sun_term_applied(), applied);
+    EXPECT_EQ(shadows::vsm::sun_term_consumes(), applied);
+    EXPECT_EQ((latched_params(*graph).flags & composite::FlagSun) != 0, applied && !composite::identity_forced());
+    fakeshadow::gate::on_latch(m_settings);
+    EXPECT_EQ(fakeshadow::gate::state().consumer, applied);
+    const FrameState state{.graph = graph};
+    StageData opaque = build(state, 1);
+    composite::Sun sun;
+    EXPECT_EQ(composite::stage_sun(opaque, sun), applied);
+  }
+  composite::testing::set_sun_term(std::nullopt);
+  // Without overrides the plan is not producing here, so nothing applies the sun
+  const auto graph = live_graph(shadow_settings(Quality::High));
+  EXPECT_FALSE(composite::sun_term_applied());
+  EXPECT_EQ(latched_params(*graph).flags & composite::FlagSun, 0u);
+}
+
+TEST_F(CompositeGraph, SealedSunFollowsTheBuiltFrame) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  StubVis vis;
+  register_pass(stub_vis_desc(vis));
+  shadows::sun_visibility::testing::set_frame_enabled(true);
+  composite::testing::set_sun_term(true);
+  composite::testing::set_stage_sun(test_sun());
+  const auto graph = live_graph(shadow_settings());
+  const FrameState state{.graph = graph};
+  auto hints = std::make_shared<SceneHints>(*m_hints);
+  const auto built = [&](uint64_t hintFrame) {
+    hints->hintFrame = hintFrame;
+    on_worker_frame_begin(hintFrame, &state);
+    StageData begin{.stage = Stage::SceneBegin, .frameId = hintFrame, .markerSeen = true, .frame = &state};
+    build_stage_data(begin);
+    StageData opaque{.stage = Stage::OpaqueDone,
+                     .frameId = hintFrame,
+                     .frameIndex = static_cast<uint32_t>(hintFrame),
+                     .markerSeen = true,
+                     .frame = &state,
+                     .sceneDepth = scene_depth(m_depth)};
+    build_stage_data(opaque);
+    // The stage build takes the published hints, so the frame's own replace them before the params are filled
+    opaque.sceneHints = hints;
+    EXPECT_EQ(encode(opaque), std::nullopt);
+  };
+  built(41);
+  EXPECT_TRUE(composite::sealed_sun(41));
+  EXPECT_FALSE(composite::sealed_sun(40));
+  vis.enabled = false;
+  built(42);
+  EXPECT_FALSE(composite::sealed_sun(42)) << "a frame whose vis.sun did not run carried no sun term";
+  vis.enabled = true;
+  shadows::sun_visibility::testing::set_frame_enabled(false);
+  built(43);
+  EXPECT_FALSE(composite::sealed_sun(43));
+  EXPECT_TRUE(composite::sealed_sun(41));
+}
+
+TEST_F(CompositeGraph, ShadowsAloneRunsComposite) {
+  StubVis vis;
+  register_pass(stub_vis_desc(vis));
+  shadows::sun_visibility::testing::set_frame_enabled(true);
+  composite::testing::set_sun_term(true);
+  composite::testing::set_stage_sun(test_sun());
+  EXPECT_TRUE(composite::wanted(shadow_settings()));
+  const auto graph = live_graph(shadow_settings());
+  const NodeId node = graph->find_node(composite::Pass);
+  ASSERT_EQ(graph->nodes[node].status, CullReason::None);
+  ASSERT_TRUE(composite::live());
+  const auto uses = graph->node_uses(node);
+  // Shadows is a producer of its own, so a missing ao.final means no AO rather than no composite
+  EXPECT_EQ(uses[composite::BindAo].missing, Missing::BindDummyWhite);
+  EXPECT_TRUE(uses[composite::BindAo].staticDummy);
+  const FrameState state{.graph = graph};
+  const StageData opaque = build(state, 1);
+  expect_ran(*graph, opaque, true);
+  EXPECT_EQ(run(state, 2), std::nullopt);
+  EXPECT_EQ(composite::testing::counters().draws, 1u);
+  EXPECT_EQ(composite::testing::counters().sunDraws, composite::identity_forced() ? 0u : 1u);
+}
+
+TEST_F(CompositeGraph, IdleWithoutSunProducer) {
+  StubVis vis;
+  register_pass(stub_vis_desc(vis));
+  composite::testing::set_stage_sun(test_sun());
+  composite::testing::set_sun_term(false);
+  shadows::sun_visibility::testing::set_frame_enabled(true);
+  auto graph = live_graph(shadow_settings());
+  const FrameState state{.graph = graph};
+  expect_ran(*graph, build(state, 1), false);
+  EXPECT_EQ(composite::testing::counters().idleFrames, 1u);
+  composite::testing::set_sun_term(true);
+  shadows::sun_visibility::testing::set_frame_enabled(false);
+  graph = live_graph(shadow_settings());
+  const FrameState chainOff{.graph = graph};
+  expect_ran(*graph, build(chainOff, 2), false);
+  EXPECT_EQ(composite::testing::counters().idleFrames, 2u);
+  EXPECT_EQ(composite::testing::counters().draws, 0u);
+}
+
+TEST_F(CompositeGraph, BlendOneEqualsPbrOffWithShadows) {
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  StubHdr hdr;
+  produce_hdr(hdr);
+  StubVis vis;
+  register_pass(stub_vis_desc(vis));
+  shadows::sun_visibility::testing::set_frame_enabled(true);
+  composite::testing::set_sun_term(true);
+  composite::testing::set_stage_sun(test_sun());
+  Settings off = shadow_settings(Quality::High);
+  const auto offGraph = live_graph(off);
+  const composite::Params offParams = latched_params(*offGraph);
+  EXPECT_EQ((offParams.flags & composite::FlagSun) != 0, !composite::identity_forced());
+  ASSERT_TRUE(use_pbr_tier());
+  Settings blendOne = pbr_settings(1.f, Quality::High);
+  blendOne.shadows.quality = Quality::High;
+  const auto on = live_graph(blendOne);
+  EXPECT_FALSE(composite::pbr_active());
+  // lb = 1 takes the PBR-off line, sun term included, so the two settings show the same pixels
+  EXPECT_TRUE(same_params(latched_params(*on), offParams));
+}
+
+TEST_F(CompositeGraph, BlendChangeKeepsGraphHashWithShadows) {
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  StubHdr hdr;
+  produce_hdr(hdr);
+  StubVis vis;
+  register_pass(stub_vis_desc(vis));
+  shadows::sun_visibility::testing::set_frame_enabled(true);
+  composite::testing::set_sun_term(true);
+  ASSERT_TRUE(use_pbr_tier());
+  Settings settings = pbr_settings(1.f, Quality::High);
+  settings.shadows.quality = Quality::High;
+  const auto first = live_graph(settings);
+  const NodeId node = first->find_node(composite::Pass);
+  for (const float lb : {0.5f, 0.f, 1.f}) {
+    settings.legacyBlend = lb;
+    const auto graph = live_graph(settings);
+    EXPECT_EQ(graph->graphHash, first->graphHash) << lb;
+    EXPECT_EQ(graph->nodes[graph->find_node(composite::Pass)].pipelineIds, first->nodes[node].pipelineIds) << lb;
+    EXPECT_EQ((latched_params(*graph).flags & composite::FlagSun) != 0, !composite::identity_forced()) << lb;
+  }
+}
+
+TEST_F(CompositeGraph, IdentityClearsSun) {
+  StubVis vis;
+  register_pass(stub_vis_desc(vis));
+  shadows::sun_visibility::testing::set_frame_enabled(true);
+  composite::testing::set_sun_term(true);
+  composite::testing::set_stage_sun(test_sun());
+  composite::testing::set_flags(composite::FlagIdentity);
+  const auto graph = live_graph(shadow_settings());
+  EXPECT_EQ(latched_params(*graph).flags & composite::FlagSun, 0u);
+  // A forced identity flag also wins at stage build, where the sun block would otherwise be filled
+  composite::testing::force_params(composite::Params{.flags = composite::FlagIdentity | composite::FlagSun});
+  const auto forced = live_graph(shadow_settings());
+  const FrameState state{.graph = forced};
+  StageData stage = build(state, 1);
+  EXPECT_EQ(encode(stage), std::nullopt);
+  const NodeId node = forced->find_node(composite::Pass);
+  bool seen = false;
+  for (const StageBindings::Params& params : stage.bindings.params) {
+    if (params.node == node) {
+      composite::Params out;
+      std::memcpy(&out, params.bytes.data(), sizeof(out));
+      EXPECT_EQ(out.flags & composite::FlagSun, 0u);
+      EXPECT_EQ(out.sun.keyLum, 0.f);
+      seen = true;
+    }
+  }
+  EXPECT_TRUE(seen);
+  EXPECT_EQ(composite::testing::counters().sunDraws, 0u);
+  composite::testing::force_params(std::nullopt);
+}
+
+TEST_F(CompositeGraph, FillSunFindsKeyAndPartner) {
+  auto hints = std::make_shared<SceneHints>(*m_hints);
+  hints->present |= SceneHasLights | SceneHasEnvironment;
+  hints->mainCamera.view = {{1.f, 0.f, 0.f, 0.f}, {0.f, 1.f, 0.f, 0.f}, {0.f, 0.f, 1.f, 0.f}};
+  AuroraLight key{.id = 7, .type = AURORA_LIGHT_DIRECTIONAL, .shadowPriority = 255};
+  key.direction[2] = 1.f;
+  key.color[0] = key.color[1] = key.color[2] = 1.f;
+  AuroraLight moon{.id = 8, .type = AURORA_LIGHT_DIRECTIONAL, .flags = AURORA_LIGHT_NO_SHADOW};
+  moon.direction[1] = -1.f;
+  moon.color[0] = moon.color[1] = moon.color[2] = 0.2140411f;
+  AuroraLight fill{.id = 9, .type = AURORA_LIGHT_DIRECTIONAL, .flags = AURORA_LIGHT_CAMERA_FILL};
+  fill.direction[0] = 1.f;
+  fill.color[0] = fill.color[1] = fill.color[2] = 1.f;
+  hints->lights = {fill, moon, key};
+  hints->environment.value.ambientColor[0] = hints->environment.value.ambientColor[1] =
+      hints->environment.value.ambientColor[2] = 0.4f;
+  hints->environment.value.shadowSun = 0.6f;
+  hints->environment.value.shadowThunderAdd = 0.1f;
+  composite::Sun sun;
+  ASSERT_TRUE(composite::fill_sun(hints.get(), {.keyLightId = 7, .legacyGain = 1.f, .geometric = true}, sun));
+  // to_light in the forward frame light.list uses, which flips GX's z
+  EXPECT_NEAR(sun.keyDir[0], 0.f, 1e-6f);
+  EXPECT_NEAR(sun.keyDir[2], 1.f, 1e-6f);
+  EXPECT_NEAR(sun.keyLum, 1.f, 1e-5f);
+  EXPECT_NEAR(sun.fillLum, 0.5f, 1e-3f) << "the cross-fade partner, stored-space, not the camera fill";
+  EXPECT_NEAR(sun.fillDir[1], 1.f, 1e-6f);
+  EXPECT_NEAR(sun.ambientLum, 0.4f, 1e-6f);
+  EXPECT_NEAR(sun.sSun, 0.7f, 1e-6f);
+  EXPECT_EQ(sun.flags, composite::SunGeometric);
+  ASSERT_TRUE(composite::fill_sun(hints.get(), {.keyLightId = 7, .legacyGain = 0.5f}, sun));
+  EXPECT_NEAR(sun.sSun, 0.4f, 1e-6f);
+  EXPECT_EQ(sun.flags, 0u);
+  hints->environment.value.shadowSun = 2.f;
+  ASSERT_TRUE(composite::fill_sun(hints.get(), {.keyLightId = 7, .legacyGain = 1.f}, sun));
+  EXPECT_EQ(sun.sSun, 1.f);
+  EXPECT_FALSE(composite::fill_sun(hints.get(), {.keyLightId = 3}, sun)) << "a frame without the key light";
+  EXPECT_FALSE(composite::fill_sun(nullptr, {.keyLightId = 7}, sun));
+}
+
 TEST_F(CompositeGraph, BindingOrderAppendsSsil) {
   StubAo stub;
   register_pass(stub_ao_desc(stub));
@@ -1813,12 +2244,12 @@ TEST_F(CompositeGraph, BindingOrderAppendsSsil) {
   const auto graph = live_graph(ao_settings());
   const NodeId node = graph->find_node(composite::Pass);
   const auto uses = graph->node_uses(node);
-  ASSERT_EQ(uses.size(), 11u);
+  ASSERT_EQ(uses.size(), 12u);
   EXPECT_EQ(graph->resources[uses[composite::BindSsil].resource].name, resource::SsilIrradiance);
   EXPECT_EQ(uses[composite::BindSsil].missing, Missing::BindDummyBlack);
   EXPECT_FALSE(uses[composite::BindSsil].staticDummy);
-  EXPECT_EQ(graph->resources[uses[9].resource].name, resource::GxColor);
-  EXPECT_EQ(graph->resources[uses[10].resource].name, resource::RadianceDefogged);
+  EXPECT_EQ(graph->resources[uses[10].resource].name, resource::GxColor);
+  EXPECT_EQ(graph->resources[uses[11].resource].name, resource::RadianceDefogged);
   EXPECT_TRUE(composite::ssil_bound(*graph));
   const composite::Params params = latched_params(*graph);
   EXPECT_NE(params.flags & composite::FlagSsil, 0u);
@@ -2435,12 +2866,12 @@ TEST_F(CompositeGraph, RadianceIsSecondAttachmentAfterColor) {
   ASSERT_TRUE(composite::radiance_bound(*graph));
   const NodeId node = graph->find_node(composite::Pass);
   const auto uses = graph->node_uses(node);
-  ASSERT_EQ(uses.size(), 11u);
-  EXPECT_EQ(graph->resources[uses[9].resource].name, resource::GxColor);
-  EXPECT_EQ(uses[9].access, Access::ColorRMW);
-  EXPECT_EQ(graph->resources[uses[10].resource].name, resource::RadianceDefogged);
-  EXPECT_EQ(uses[10].access, Access::ColorWrite);
-  const CompiledResource& radiance = graph->resources[uses[10].resource];
+  ASSERT_EQ(uses.size(), 12u);
+  EXPECT_EQ(graph->resources[uses[10].resource].name, resource::GxColor);
+  EXPECT_EQ(uses[10].access, Access::ColorRMW);
+  EXPECT_EQ(graph->resources[uses[11].resource].name, resource::RadianceDefogged);
+  EXPECT_EQ(uses[11].access, Access::ColorWrite);
+  const CompiledResource& radiance = graph->resources[uses[11].resource];
   const CompiledResource& legacy = graph->resources[graph->find_resource(composite::LegacyTex)];
   EXPECT_EQ(radiance.kind, ResourceKind::History);
   EXPECT_EQ(radiance.creator, node);
@@ -2483,7 +2914,7 @@ TEST_F(CompositeGraph, SsilOffKeepsGraphAndPipeline) {
   ASSERT_EQ(off->nodes[node].status, CullReason::None);
   EXPECT_FALSE(composite::radiance_bound(*off));
   EXPECT_EQ(off->find_resource(resource::RadianceDefogged), InvalidResource);
-  EXPECT_EQ(off->node_uses(node).size(), 10u);
+  EXPECT_EQ(off->node_uses(node).size(), 11u);
   const composite::Params offParams = latched_params(*off);
   composite::testing::set_radiance_forced(true);
   const auto on = live_graph(ao_settings());
@@ -2729,6 +3160,9 @@ struct PixelRun {
   std::function<std::array<float, 4>(size_t)> ssil;
   // RGBA bytes of lsm.mask per pixel; set, a stub replays it as the mask pass would
   std::function<std::array<uint8_t, 4>(size_t)> mask;
+  // RG bytes of vis.sun per pixel; set, a stub writes it and the sun term is forced on with this block
+  std::function<std::array<uint8_t, 2>(size_t)> vis;
+  composite::Sun sun = test_sun();
 };
 
 Pixel control() { return {.color = {200, 180, 160, 255}, .code = 1, .fc = {}, .q7 = 0, .ao = 64}; }
@@ -2927,6 +3361,26 @@ protected:
       m_device->queue.WriteBuffer(lsm.staging, 0, texels.data(), texels.size());
       lsmId = register_pass(stub_lsm_desc(lsm));
     }
+    StubVis vis;
+    PassId visId = InvalidPassId;
+    if (options.vis) {
+      vis.rowBytes = (width * 2 + 255) & ~255u;
+      std::vector<uint8_t> texels(size_t{vis.rowBytes} * height, 0);
+      for (size_t i = 0; i < pixels.size(); ++i) {
+        const std::array<uint8_t, 2> rg = options.vis(i);
+        uint8_t* texel = texels.data() + (i / width) * vis.rowBytes + (i % width) * 2;
+        texel[0] = rg[0];
+        texel[1] = rg[1];
+      }
+      const wgpu::BufferDescriptor visDescriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                                 .size = texels.size()};
+      vis.staging = m_device->device.CreateBuffer(&visDescriptor);
+      m_device->queue.WriteBuffer(vis.staging, 0, texels.data(), texels.size());
+      visId = register_pass(stub_vis_desc(vis));
+      shadows::sun_visibility::testing::set_frame_enabled(true);
+      composite::testing::set_sun_term(true);
+      composite::testing::set_stage_sun(options.sun);
+    }
     RadianceProbe probe;
     const PassId probeId = options.radiance ? register_pass(radiance_probe_desc(probe)) : InvalidPassId;
     const composite::testing::Counters before = composite::testing::counters();
@@ -2954,6 +3408,13 @@ protected:
     if (lsmId != InvalidPassId) {
       EXPECT_EQ(lsm.calls, 1);
       unregister_pass(lsmId);
+    }
+    if (visId != InvalidPassId) {
+      EXPECT_EQ(vis.calls, 1);
+      unregister_pass(visId);
+      shadows::sun_visibility::testing::set_frame_enabled(std::nullopt);
+      composite::testing::set_sun_term(std::nullopt);
+      composite::testing::set_stage_sun(std::nullopt);
     }
     if (ssilId != InvalidPassId) {
       EXPECT_TRUE(composite::ssil_bound(*graph));
@@ -3821,6 +4282,70 @@ TEST_F(CompositeGpu, LsmPostShadowReceiverUnmasked) {
   EXPECT_GT(masked, pre.size() / 4);
 }
 
+TEST_F(CompositeGpu, SunUnitVisibilityDiscards) {
+  std::mt19937 rng{83};
+  const auto pixels = grid(64, 48, [&](uint32_t x, uint32_t y) {
+    Pixel p = control();
+    p.color = {static_cast<uint8_t>(rng()), static_cast<uint8_t>(rng()), static_cast<uint8_t>(rng()), 255};
+    p.code = static_cast<uint8_t>((x + y) % 4);
+    p.ao = static_cast<uint8_t>(rng());
+    p.q7 = static_cast<uint8_t>(rng() % 64);
+    p.fc = {static_cast<uint8_t>(rng()), static_cast<uint8_t>(rng()), static_cast<uint8_t>(rng())};
+    return p;
+  });
+  const auto white = [](size_t) { return std::array<uint8_t, 2>{255, 255}; };
+  const auto off = run_pixels(64, 48, pixels, {});
+  const auto out = run_pixels(64, 48, pixels, {.vis = white});
+  // An unshadowed sun selects Rs = 1 exactly, so FlagSun alone never moves a byte
+  for (size_t i = 0; i < out.size(); ++i) {
+    ASSERT_TRUE(same(out[i], off[i])) << i;
+  }
+  if (!composite::identity_forced()) {
+    EXPECT_GT(composite::testing::counters().sunDraws, 0u);
+  }
+}
+
+TEST_F(CompositeGpu, SunMatchesMirror) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  std::mt19937 rng{89};
+  const auto pixels = grid(64, 48, [&](uint32_t x, uint32_t) {
+    Pixel p = control();
+    p.color = {static_cast<uint8_t>(40 + rng() % 200), static_cast<uint8_t>(40 + rng() % 200),
+               static_cast<uint8_t>(40 + rng() % 200), 255};
+    p.code = static_cast<uint8_t>(x % 4);
+    p.ao = static_cast<uint8_t>(x % 3 == 0 ? 255 : 128 + rng() % 128);
+    p.q7 = static_cast<uint8_t>(rng() % 48);
+    p.fc = {static_cast<uint8_t>(rng() % 64), static_cast<uint8_t>(rng() % 64), static_cast<uint8_t>(rng() % 64)};
+    return p;
+  });
+  std::vector<std::array<uint8_t, 2>> vis(pixels.size());
+  for (size_t i = 0; i < vis.size(); ++i) {
+    vis[i] = {static_cast<uint8_t>(i % 5 == 0 ? 255 : rng() % 256), static_cast<uint8_t>(i % 7 == 0 ? 128 : 255)};
+  }
+  const composite::Sun sun = test_sun(0.75f);
+  const auto out = run_pixels(64, 48, pixels, {.vis = [&](size_t i) { return vis[i]; }, .sun = sun});
+  const std::array<float, 3> n = composite::testing::sun_normal({512.f / 1023.f, 512.f / 1023.f, 1.f});
+  size_t shaded = 0;
+  for (size_t i = 0; i < out.size(); ++i) {
+    const Pixel& p = pixels[i];
+    if (guard_tie(p)) {
+      continue;
+    }
+    const float rs = composite::testing::sun_rs({vis[i][0] / 255.f, vis[i][1] / 255.f}, p.code, n, sun);
+    const std::array<float, 3> l{p.color.r / 255.f, p.color.g / 255.f, p.color.b / 255.f};
+    const std::array<float, 3> fc{p.fc[0] / 255.f, p.fc[1] / 255.f, p.fc[2] / 255.f};
+    const std::array<float, 3> mirror = composite::testing::legacy_sun(l, fc, p.q7, p.ao / 255.f, p.code / 3.f, rs);
+    ASSERT_TRUE(same_rgb(out[i], {to_byte(mirror[0]), to_byte(mirror[1]), to_byte(mirror[2])}, 1)) << i;
+    if (p.code < 2) {
+      ASSERT_EQ(rs, 1.f) << i;
+    }
+    shaded += rs < 0.99f ? 1 : 0;
+  }
+  EXPECT_GT(shaded, out.size() / 4);
+}
+
 TEST_F(CompositeGpu, LsmUnitMaskDiscards) {
   std::mt19937 rng{79};
   const auto pixels = grid(64, 48, [&](uint32_t x, uint32_t) { return random_pixel(rng, x % 3 == 0 ? 0 : 1); });
@@ -3832,6 +4357,110 @@ TEST_F(CompositeGpu, LsmUnitMaskDiscards) {
       ASSERT_TRUE(same(out[i], off[i])) << lb << " " << i;
     }
   }
+}
+
+struct CountRead {
+  wgpu::Buffer buffer;
+  int calls = 0;
+};
+
+void declare_count_read(InternalPassBuilder& builder, const PassSetup&, const void*) {
+  builder.after(phase::Exposure);
+  builder.use_buffer(fakeshadow::count::Buffer, Access::CopySrc);
+  builder.side_effect();
+}
+
+void encode_count_read(PassContext& ctx, const void* state) {
+  auto& reader = *static_cast<CountRead*>(const_cast<void*>(state));
+  ++reader.calls;
+  const BufferView view = ctx.buffer(BufRef{0});
+  if (view.buffer && reader.buffer) {
+    ctx.encoder().CopyBufferToBuffer(view.buffer, view.offset, reader.buffer, 0, fakeshadow::count::WordBytes);
+  }
+}
+
+PassDesc count_read_desc(CountRead& reader) {
+  return {
+      .name = "test.count_read",
+      .stage = Stage::OpaqueDone,
+      .kind = PassKind::Copy,
+      .runsWithoutMarker = true,
+      .declare = declare_count_read,
+      .encode = encode_count_read,
+      .state = &reader,
+  };
+}
+
+class FakeShadowCount : public CompositeGpu {
+protected:
+  void TearDown() override {
+    fakeshadow::count::shutdown();
+    fakeshadow::count::testing::reset();
+    CompositeGpu::TearDown();
+  }
+};
+
+TEST_F(FakeShadowCount, CountsPreShadowOnly) {
+  fakeshadow::count::testing::set_mode(fakeshadow::count::Mode::All);
+  fakeshadow::count::initialize();
+  CountRead reader;
+  const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                          .size = fakeshadow::count::WordBytes};
+  reader.buffer = m_device->device.CreateBuffer(&descriptor);
+  const PassId readId = register_pass(count_read_desc(reader));
+  std::mt19937 rng{101};
+  // Columns: 0 legacy, 1 PBR before the fakes, 2 PBR after them, 3 not a receiver
+  const auto pixels = grid(64, 48, [&](uint32_t x, uint32_t) {
+    Pixel p = random_pixel(rng, x % 4 == 0 ? 0 : 1);
+    p.code = static_cast<uint8_t>(x % 4 == 3 ? 1 : 2 + x % 2);
+    return p;
+  });
+  const auto post = [&](std::array<uint16_t, 4>& words, size_t i) {
+    if (i % 4 == 2 && pixels[i].cls != 0) {
+      words[3] = lighting::openpbr::to_half(fakeshadow::lsm::PostShadowAlpha);
+    }
+  };
+  // Rows alternate kept fakes and white, and real shadow and none, so every combination occurs
+  const auto mask = [](size_t i) {
+    return (i / 64) % 2 == 0 ? std::array<uint8_t, 4>{60, 60, 60, 0} : std::array<uint8_t, 4>{255, 255, 255, 0};
+  };
+  const auto vis = [](size_t i) {
+    return (i / 128) % 2 == 0 ? std::array<uint8_t, 2>{0, 255} : std::array<uint8_t, 2>{255, 255};
+  };
+  const composite::Sun sun = test_sun(1.f);
+  (void)run_pixels(
+      64, 48, pixels,
+      {.settings = pbr_settings(0.f, Quality::High), .hdrEdit = post, .mask = mask, .vis = vis, .sun = sun});
+  unregister_pass(readId);
+  ASSERT_EQ(reader.calls, 1);
+  const auto words = test::read_buffer(*m_device, reader.buffer, 0, fakeshadow::count::WordBytes);
+  ASSERT_TRUE(words.has_value());
+  std::array<uint64_t, fakeshadow::count::WordCount> expected{};
+  const std::array<float, 3> n = composite::testing::sun_normal({512.f / 1023.f, 512.f / 1023.f, 1.f});
+  for (size_t i = 0; i < pixels.size(); ++i) {
+    const Pixel& p = pixels[i];
+    const bool pbr = p.cls != 0;
+    if (p.code < 2 || (pbr && i % 4 == 2)) {
+      continue;
+    }
+    const float q = p.q7 / 127.f;
+    const std::array<uint8_t, 4> m = mask(i);
+    const std::array<float, 3> term = fakeshadow::lsm::term({m[0] / 255.f, m[1] / 255.f, m[2] / 255.f}, q,
+                                                            {p.fc[0] / 255.f, p.fc[1] / 255.f, p.fc[2] / 255.f});
+    const std::array<uint8_t, 2> v = vis(i);
+    const float applied =
+        pbr ? v[0] / 255.f * (v[1] / 255.f) : composite::testing::sun_rs({v[0] / 255.f, v[1] / 255.f}, p.code, n, sun);
+    const bool touched = term[0] < 0.99f || term[1] < 0.99f || term[2] < 0.99f;
+    const bool shadowed = applied < 0.99f;
+    expected[pbr ? fakeshadow::count::WordDdPbr : fakeshadow::count::WordDdLegacy] += touched && shadowed ? 1 : 0;
+    expected[fakeshadow::count::WordTouched] += touched ? 1 : 0;
+    expected[fakeshadow::count::WordShadowed] += shadowed ? 1 : 0;
+  }
+  for (uint32_t w = 0; w < fakeshadow::count::WordCount; ++w) {
+    EXPECT_EQ((*words)[w], expected[w]) << w;
+  }
+  EXPECT_GT(expected[fakeshadow::count::WordDdPbr], 0u);
+  EXPECT_GT(expected[fakeshadow::count::WordDdLegacy], 0u);
 }
 
 float srgb_linear(float s) { return s <= 0.04045f ? s / 12.92f : std::pow((s + 0.055f) / 1.055f, 2.4f); }

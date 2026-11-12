@@ -6,6 +6,8 @@
 
 #include "gx/draw_route.hpp"
 #include "gx/gx.hpp"
+#include "render/fakeshadow/count.hpp"
+#include "render/fakeshadow/gate.hpp"
 #include "render/fakeshadow/lsm.hpp"
 #include "render/frame_state.hpp"
 #include "render/graph.hpp"
@@ -68,6 +70,7 @@ protected:
   void TearDown() override {
     shutdown();
     testing::reset();
+    count::testing::reset();
     detail::composite::testing::set_exposure_units(std::nullopt);
     scene::capture_list::testing::reset();
     gx::g_gxState = {};
@@ -154,6 +157,54 @@ TEST_F(Lsm, SelectsFakeShadowOnly) {
   gx::g_gxState.depthUpdate = false;
   EXPECT_EQ(scene::capture_list::select(fake_shadow(), query), bit);
   EXPECT_EQ(stats().selected, 2u);
+}
+
+TEST(FakeShadowCount, SelectsRev3Decisions) {
+  // rev3 counts kept entries whose light is covered and whose casters exist; every other keep is by design
+  for (uint32_t i = 0; i < ShadowDecisionCount; ++i) {
+    const auto decision = static_cast<ShadowDecision>(i);
+    const bool rev3 = decision == ShadowDecision::KeepCaster || decision == ShadowDecision::KeepCasterUnknown ||
+                      decision == ShadowDecision::KeepOverflow;
+    EXPECT_EQ(count::selects(count::Mode::Rev3, decision), rev3) << i;
+    EXPECT_TRUE(count::selects(count::Mode::All, decision)) << i;
+    EXPECT_FALSE(count::selects(count::Mode::Off, decision)) << i;
+  }
+  const auto tagged = [](ShadowDecision decision) {
+    scene::DrawClass cls = fake_shadow();
+    cls.key.object.subId = static_cast<uint32_t>(decision) << gate::TagDecisionShift;
+    return cls;
+  };
+  count::testing::set_mode(count::Mode::Rev3);
+  EXPECT_TRUE(select_draw(tagged(ShadowDecision::KeepCaster)));
+  EXPECT_TRUE(select_draw(tagged(ShadowDecision::KeepOverflow)));
+  EXPECT_FALSE(select_draw(tagged(ShadowDecision::KeepClass)));
+  EXPECT_FALSE(select_draw(tagged(ShadowDecision::None))) << "old traces carry no decision, so none is counted";
+  count::testing::set_mode(count::Mode::All);
+  EXPECT_TRUE(select_draw(tagged(ShadowDecision::None)));
+  EXPECT_TRUE(select_draw(tagged(ShadowDecision::KeepClass)));
+  scene::DrawClass other = tagged(ShadowDecision::KeepCaster);
+  other.key.categories = cat::Static;
+  EXPECT_FALSE(select_draw(other)) << "the counter still selects FAKE_SHADOW draws only";
+  count::testing::set_mode(count::Mode::Off);
+  EXPECT_TRUE(select_draw(tagged(ShadowDecision::KeepClass)));
+  count::testing::reset();
+}
+
+TEST_F(Lsm, CountModeArmsWithoutPbr) {
+  initialize();
+  Settings settings;
+  const detail::GraphEnvironment graphEnv = env();
+  const detail::PassSetup setup{.settings = &settings, .env = &graphEnv};
+  EXPECT_FALSE(declared(setup));
+  count::testing::set_mode(count::Mode::All);
+  // The counter needs the mask with PBR off too, and the composite and the meter still never apply it
+  EXPECT_TRUE(declared(setup));
+  const auto graph = compile(settings, graphEnv);
+  latch(settings, graphEnv, graph.get());
+  EXPECT_TRUE(consumed_fifo());
+  count::testing::set_mode(std::nullopt);
+  latch(settings, graphEnv, graph.get());
+  EXPECT_FALSE(consumed_fifo());
 }
 
 TEST_F(Lsm, RefusedAfterOpaqueDone) {

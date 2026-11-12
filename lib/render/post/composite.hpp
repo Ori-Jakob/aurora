@@ -44,6 +44,7 @@ enum Binding : uint32_t {
   BindExposure = 6,
   BindSsil = 7,
   BindLsm = 8,
+  BindVisSun = 9,
 };
 
 enum ParamFlags : uint32_t {
@@ -56,14 +57,39 @@ inline constexpr uint32_t FlagTonemapAgX = 1u << 3;
 inline constexpr uint32_t FlagSsil = 1u << 4;
 // Set at stage build only on frames lsm.mask replayed a kept fake, so without one m stays exactly 1
 inline constexpr uint32_t FlagLsm = 1u << 5;
+// Set at stage build only while the frame's sun.visibility ran on a producing plan, so Rs is exactly 1 otherwise
+inline constexpr uint32_t FlagSun = 1u << 6;
+inline constexpr uint32_t SunGeometric = 1u << 0;
+
+// Mirrors CompositeSun: gx.normal's view-forward frame and stored GX units
+struct Sun {
+  float keyDir[3]{};
+  float sSun = 0.f;
+  float keyLum = 0.f;
+  float fillLum = 0.f;
+  float ambientLum = 0.f;
+  uint32_t flags = 0;
+  float fillDir[3]{};
+  float pad = 0.f;
+};
+static_assert(sizeof(Sun) == 48 && offsetof(Sun, keyLum) == 16 && offsetof(Sun, flags) == 28 &&
+              offsetof(Sun, fillDir) == 32);
 
 struct Params {
   uint32_t flags = 0;
   float legacyBlend = 0.f;
   float ssilAlbedo = 0.f;
   uint32_t pad = 0;
+  Sun sun;
 };
-static_assert(sizeof(Params) == 16 && offsetof(Params, legacyBlend) == 4 && offsetof(Params, ssilAlbedo) == 8);
+static_assert(sizeof(Params) == 64 && offsetof(Params, legacyBlend) == 4 && offsetof(Params, ssilAlbedo) == 8 &&
+              offsetof(Params, sun) == 16 && sizeof(Params) <= MaxPassParamsSize);
+
+struct SunInputs {
+  uint32_t keyLightId = 0;
+  float legacyGain = 1.f;
+  bool geometric = false;
+};
 
 [[nodiscard]] bool wanted(const Settings& settings) noexcept;
 [[nodiscard]] bool ao_wanted(const Settings& settings) noexcept;
@@ -96,6 +122,13 @@ void on_latch(const PassSetup& latched, const CompiledGraph* graph);
 [[nodiscard]] bool enabled_this_frame(uint64_t frameId) noexcept;
 [[nodiscard]] bool identity_forced() noexcept;
 [[nodiscard]] bool ao_gate(const FrameState& state) noexcept;
+// Game thread at the latch, read anywhere: the one predicate for V on PBR pixels, Rs, the meter and the gate
+[[nodiscard]] bool sun_term_applied() noexcept;
+// Whether the FIFO built that hint frame with FlagSun, for the gate's previous-resolve input
+[[nodiscard]] bool sealed_sun(uint64_t hintFrame) noexcept;
+// FIFO at stage build; false leaves the frame without a sun term, as when the frame lacks the plan's key light
+[[nodiscard]] bool stage_sun(const StageData& stage, Sun& out) noexcept;
+[[nodiscard]] bool fill_sun(const SceneHints* hints, const SunInputs& inputs, Sun& out) noexcept;
 
 namespace testing {
 struct Counters {
@@ -111,6 +144,7 @@ struct Counters {
   uint32_t radianceDraws = 0;
   uint32_t radianceClears = 0;
   uint32_t ssilDraws = 0;
+  uint32_t sunDraws = 0;
 };
 Counters counters() noexcept;
 void reset() noexcept;
@@ -122,6 +156,24 @@ void set_ready_override(std::optional<bool> ready) noexcept;
 void set_radiance_forced(std::optional<bool> forced) noexcept;
 void set_exposure_units(std::optional<bool> exposed) noexcept;
 void bump_units_epoch() noexcept;
+void set_sun_term(std::optional<bool> applied) noexcept;
+void set_stage_sun(std::optional<Sun> sun) noexcept;
+struct SunTermInputs {
+  bool shadows = true;
+  bool producing = true;
+  bool identity = false;
+  bool classView = false;
+  bool live = true;
+  bool pipelines = true;
+  bool meterReady = true;
+  bool pbr = false;
+  bool hookReady = true;
+};
+[[nodiscard]] bool sun_applied_for(const SunTermInputs& in) noexcept;
+[[nodiscard]] float sun_rs(std::array<float, 2> vis, uint32_t code, std::array<float, 3> n, const Sun& sun) noexcept;
+[[nodiscard]] std::array<float, 3> legacy_sun(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7,
+                                              float ao, float normalAlpha, float rs) noexcept;
+[[nodiscard]] std::array<float, 3> sun_normal(std::array<float, 3> stored) noexcept;
 [[nodiscard]] bool pbr_active_for(bool live, bool hdrLive, bool classView, const Settings& settings) noexcept;
 [[nodiscard]] std::array<float, 3> legacy_ao(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7,
                                              float ao, float normalAlpha) noexcept;

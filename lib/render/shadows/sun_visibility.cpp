@@ -1,5 +1,6 @@
 #include "sun_visibility.hpp"
 
+#include "../frame_state.hpp"
 #include "../graph_bind.hpp"
 #include "../hints.hpp"
 #include "../pass_context.hpp"
@@ -43,6 +44,7 @@ struct Latest {
 
 detail::PassId g_pass = detail::InvalidPassId;
 std::optional<uint32_t> g_lightOverride;
+std::optional<bool> g_frameOverride;
 std::atomic_uint64_t g_producing{0};
 std::atomic_uint64_t g_clearOnly{0};
 std::mutex g_mutex;
@@ -298,7 +300,7 @@ void on_latch(const Settings* settings) noexcept {
   const vsm::SunPlan& plan = vsm::plan();
   SunShadowState next{
       .producing = plan.producing,
-      .consumers = vsm::deferred_consumes() || vsm::shadow_view_selected(),
+      .consumers = vsm::sun_term_consumes() || vsm::shadow_view_selected(),
       .lightId = plan.lightId,
       .lightFlags = plan.lightFlags,
       .elevationDeg = plan.elevationDeg,
@@ -323,13 +325,27 @@ void on_latch(const Settings* settings) noexcept {
   g_state = next;
 }
 
-bool frame_enabled(const StageData& stage) noexcept { return vsm::chain_enabled(stage); }
+bool frame_enabled(const StageData& stage) noexcept { return g_frameOverride.value_or(vsm::chain_enabled(stage)); }
+
+bool frame_applied(const StageData& stage) noexcept {
+  const detail::CompiledGraph* graph = stage.frame != nullptr ? stage.frame->graph.get() : nullptr;
+  if (graph == nullptr || stage.stage != Stage::OpaqueDone || !frame_enabled(stage)) {
+    return false;
+  }
+  const detail::ResourceId id = graph->find_resource(resource::SunVisibility);
+  if (id == detail::InvalidResource) {
+    return false;
+  }
+  const detail::NodeId creator = graph->resources[id].creator;
+  return creator != detail::InvalidNode && graph->nodes[creator].programIndex != detail::InvalidNode &&
+         stage.is_enabled(graph->nodes[creator].programIndex);
+}
 
 uint32_t light_index(const StageData& stage) noexcept {
   if (g_lightOverride) {
     return *g_lightOverride;
   }
-  if (!frame_enabled(stage) || !vsm::deferred_consumes()) {
+  if (!frame_enabled(stage) || !vsm::sun_term_consumes()) {
     return detail::lighting::deferred::NoSunLight;
   }
   const detail::SceneHints* hints = stage.sceneHints.get();
@@ -349,6 +365,7 @@ SunShadowState state() noexcept { return g_state; }
 namespace testing {
 void reset() noexcept {
   g_lightOverride.reset();
+  g_frameOverride.reset();
   g_producing.store(0, std::memory_order_relaxed);
   g_clearOnly.store(0, std::memory_order_relaxed);
   std::lock_guard lock{g_mutex};
@@ -359,6 +376,8 @@ void reset() noexcept {
 }
 
 void set_light_index(std::optional<uint32_t> index) noexcept { g_lightOverride = index; }
+
+void set_frame_enabled(std::optional<bool> enabled) noexcept { g_frameOverride = enabled; }
 
 Counters counters() noexcept {
   std::lock_guard lock{g_mutex};

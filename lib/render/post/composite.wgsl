@@ -6,6 +6,7 @@ struct CompositeParams {
   legacy_blend: f32,
   ssil_albedo: f32,
   pad1: u32,
+  sun: CompositeSun,
 }
 
 struct CompositeExposure {
@@ -33,6 +34,7 @@ struct CompositeOut {
 @group(1) @binding(6) var<uniform> composite_exposure: CompositeExposure;
 @group(1) @binding(7) var ssil_irr: texture_2d<f32>;
 @group(1) @binding(8) var lsm_mask: texture_2d<f32>;
+@group(1) @binding(9) var vis_sun: texture_2d<f32>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
@@ -50,6 +52,9 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   let p = vec2i(pos.xy);
   var t = composite_identity_terms();
   t.ao = composite_ao_term(ao_final, scene_normal, p, (composite_params.flags & COMPOSITE_FLAG_IDENTITY) != 0u);
+  if ((composite_params.flags & COMPOSITE_FLAG_SUN) != 0u) {
+    t.rs = composite_sun_term(vis_sun, scene_normal, p, composite_params.sun);
+  }
   var pre_shadow = false;
   if ((composite_params.flags & (COMPOSITE_FLAG_PBR | COMPOSITE_FLAG_IDENTITY)) == COMPOSITE_FLAG_PBR) {
     let hdr = textureLoad(scene_hdr, composite_texel(p, textureDimensions(scene_hdr)), 0);

@@ -34,6 +34,7 @@ const EXPOSURE_FLAG_RESET: u32 = 8u;
 const EXPOSURE_FLAG_SSIL: u32 = 16u;
 const EXPOSURE_FLAG_SSIL_EXPOSED: u32 = 32u;
 const EXPOSURE_FLAG_LSM: u32 = 64u;
+const EXPOSURE_FLAG_SUN: u32 = 128u;
 const EXPOSURE_STATE_VALID: u32 = 1u;
 const EXPOSURE_STATE_MODE_MASK: u32 = 6u;
 const EXPOSURE_STATE_AGX: u32 = 8u;
@@ -51,6 +52,7 @@ struct ExposureParams {
   anchor: f32,
   ssil_albedo: f32,
   pad1: u32,
+  sun: CompositeSun,
 }
 
 struct ExposureWords {
@@ -79,6 +81,7 @@ struct ExposureWindow {
 @group(1) @binding(7) var<storage, read_write> exposure_out: ExposureWords;
 @group(1) @binding(8) var ssil_irr: texture_2d<f32>;
 @group(1) @binding(9) var lsm_mask: texture_2d<f32>;
+@group(1) @binding(10) var vis_sun: texture_2d<f32>;
 @group(2) @binding(0) var state_prev: texture_2d<u32>;
 
 var<workgroup> exposure_tree: array<array<f32, EXPOSURE_WORDS>, EXPOSURE_GROUP_SIZE>;
@@ -137,6 +140,9 @@ fn exposure_sample(p: vec2i, w: ExposureWindow, agx: bool, acc: ptr<function, ar
   }
   var t = composite_identity_terms();
   t.ao = composite_ao_term(ao_final, gx_normal, p, false);
+  if ((exposure_params.flags & EXPOSURE_FLAG_SUN) != 0u) {
+    t.rs = composite_sun_term(vis_sun, gx_normal, p, exposure_params.sun);
+  }
   if ((exposure_params.flags & EXPOSURE_FLAG_SSIL) != 0u && t.ao < 1.0) {
     // The meter sees last frame's exposure; the one-frame lag sits inside its smoothing
     let e_bounce = select(1.0, exposure_exp2(w.prev_s), (exposure_params.flags & EXPOSURE_FLAG_SSIL_EXPOSED) != 0u);

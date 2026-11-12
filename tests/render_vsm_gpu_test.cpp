@@ -3303,7 +3303,7 @@ TEST_F(RenderVsmSunGpu, UnshadowedLeavesPlanAndLightIndex) {
       {.producing = true, .lightId = 7, .dirWorld = sun_dir(38.0, 140.0), .elevationDeg = 38.0, .idle = Idle::None});
   testing::set_compact_ready(true);
   testing::set_pipeline_query([](uint32_t) noexcept { return true; });
-  testing::set_sun_bound(true);
+  testing::set_sun_term(true);
   detail::composite::testing::set_exposure_units(true);
   register_chain_pipeline(shaders::PipelineId{1});
   on_latch({}, nullptr);

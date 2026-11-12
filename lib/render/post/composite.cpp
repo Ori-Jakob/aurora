@@ -2,6 +2,8 @@
 
 #include "../ao/ao.hpp"
 #include "../debug/views.hpp"
+#include "../fakeshadow/count.hpp"
+#include "../fakeshadow/gate.hpp"
 #include "../fakeshadow/lsm.hpp"
 #include "../fakeshadow/texture_gate.hpp"
 #include "../frame_state.hpp"
@@ -12,6 +14,9 @@
 #include "../lighting/tonemap.hpp"
 #include "../pass_context.hpp"
 #include "../scene/overlay.hpp"
+#include "../settings.hpp"
+#include "../shadows/sun_visibility.hpp"
+#include "../shadows/vsm_pages.hpp"
 #include "../stage_data.hpp"
 
 #include "../../internal.hpp"
@@ -19,6 +24,7 @@
 #include "../../webgpu/gpu.hpp"
 
 #include <SDL3/SDL_stdinc.h>
+#include <dolphin/gx/GXAurora.h>
 #include <magic_enum.hpp>
 
 #include <algorithm>
@@ -43,11 +49,13 @@ constexpr TexRef SurfaceRec{BindSurface};
 constexpr TexRef Hdr{BindHdr};
 constexpr TexRef SsilIrr{BindSsil};
 constexpr TexRef LsmMask{BindLsm};
-constexpr TexRef Color{BindLsm + 1};
+constexpr TexRef VisSun{BindVisSun};
+constexpr TexRef Color{BindVisSun + 1};
 // Declared after gx.color, so every binding and the Color attachment keep their numbers
 constexpr TexRef Radiance{static_cast<uint16_t>(Color.index + 1)};
 constexpr std::array<std::string_view, 1> RadianceDefines{RadianceDefine};
 constexpr uint64_t NoFrame = UINT64_MAX;
+constexpr size_t SealedFrames = 16;
 constexpr wgpu::ColorWriteMask RgbMask =
     wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue;
 
@@ -60,6 +68,8 @@ struct LatchSlot {
   bool aoLive = false;
   bool pbrActive = false;
   bool ssilLive = false;
+  bool sunApplied = false;
+  SunInputs sun;
   std::array<uint32_t, 1> ids{};
 };
 
@@ -79,6 +89,11 @@ bool g_latchedPbr = false;
 std::atomic_bool g_exposureUnits{false};
 std::optional<bool> g_exposureUnitsOverride;
 std::atomic_uint32_t g_unitsEpoch{0};
+std::atomic_bool g_sunApplied{false};
+std::optional<bool> g_sunTermOverride;
+std::optional<Sun> g_stageSunOverride;
+// FIFO writes at stage build, the game thread reads at the next latch
+std::array<std::atomic_uint64_t, SealedFrames> g_sealed{};
 
 std::atomic_uint64_t g_enabledFrame{NoFrame};
 std::atomic_bool g_encodeMismatch{false};
@@ -95,6 +110,7 @@ std::atomic_uint32_t g_hdrDraws{0};
 std::atomic_uint32_t g_radianceDraws{0};
 std::atomic_uint32_t g_radianceClears{0};
 std::atomic_uint32_t g_ssilDraws{0};
+std::atomic_uint32_t g_sunDraws{0};
 
 inline void bump(std::atomic_uint32_t& counter) noexcept {
   counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
@@ -277,13 +293,15 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
   }
   builder.after(phase::Composite);
   const bool pbrDeclared = setup.settings->pbr && setup.gx_available(GxResource::Surface);
+  const bool shadowsDeclared = sun_shadows(*setup.settings);
   // Without AO there is nothing to composite yet, so a frame without it culls this pass and the copy
   builder.use(LegacyTex, Access::Sampled, Missing::DisablePass);
   builder.use(resource::Fog, Access::Sampled,
               UseOptions{.missing = Missing::DisablePass, .sampleType = wgpu::TextureSampleType::Uint});
   builder.use(resource::GxNormal, Access::Sampled, Missing::DisablePass);
-  // With PBR as a second producer a missing ao.final means no AO, not no composite
-  builder.use(resource::AoFinal, Access::Sampled, pbrDeclared ? Missing::BindDummyWhite : Missing::DisablePass);
+  // With PBR or real shadows as another producer a missing ao.final means no AO, not no composite
+  builder.use(resource::AoFinal, Access::Sampled,
+              pbrDeclared || shadowsDeclared ? Missing::BindDummyWhite : Missing::DisablePass);
   // Always declared so tiers B and P share one layout; a black dummy reads slot 0, a white Uint one would not
   builder.use(resource::Surface, Access::Sampled,
               UseOptions{.missing = Missing::BindDummyBlack, .sampleType = wgpu::TextureSampleType::Uint});
@@ -298,6 +316,8 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
   builder.use(resource::SsilIrradiance, Access::Sampled, Missing::BindDummyBlack);
   // Always declared, so lb and the LSM's arming never change the layout; white is m = 1
   builder.use(fakeshadow::lsm::Resource, Access::Sampled, Missing::BindDummyWhite);
+  // Always declared, so Shadows never renumbers the colour target; white is V = 1
+  builder.use(resource::SunVisibility, Access::Sampled, Missing::BindDummyWhite);
   builder.use(resource::GxColor, Access::ColorRMW);
   if (radiance_wanted(setup)) {
     // Next frame's screen-space passes sample it, so the usage cannot depend on a capture
@@ -323,7 +343,8 @@ bool enabled(const StageData& stage, const void*) {
     return false;
   }
   // Without H every PBR pixel keeps Sb, so with AO off the copy and the composite would only discard
-  if (!slot.aoLive && !(slot.pbrActive && lighting::deferred::frame_enabled(stage))) {
+  if (!slot.aoLive && !(slot.pbrActive && lighting::deferred::frame_enabled(stage)) &&
+      !(slot.sunApplied && shadows::sun_visibility::frame_enabled(stage))) {
     bump(g_idleFrames);
     return false;
   }
@@ -379,9 +400,10 @@ void encode(PassContext& ctx, const void*) {
     return;
   }
   // White and black dummies are 1x1 and every load clamps, so they never fail the extent check
-  for (const auto& [ref, name] : {std::pair{AoFinal, resource::AoFinal}, std::pair{SurfaceRec, resource::Surface},
-                                  std::pair{Hdr, resource::SceneHdr}, std::pair{SsilIrr, resource::SsilIrradiance},
-                                  std::pair{LsmMask, fakeshadow::lsm::Resource}}) {
+  for (const auto& [ref, name] :
+       {std::pair{AoFinal, resource::AoFinal}, std::pair{SurfaceRec, resource::Surface},
+        std::pair{Hdr, resource::SceneHdr}, std::pair{SsilIrr, resource::SsilIrradiance},
+        std::pair{LsmMask, fakeshadow::lsm::Resource}, std::pair{VisSun, resource::SunVisibility}}) {
     const wgpu::Extent3D extent = ctx.extent(ref);
     if (!same_extent(extent, ctx.extent(Color)) && (extent.width != 1 || extent.height != 1)) {
       encode_mismatch(ctx, Color, ref, name);
@@ -409,6 +431,9 @@ void encode(PassContext& ctx, const void*) {
   if ((params_flags_of(ctx.params()) & FlagSsil) != 0) {
     bump(g_ssilDraws);
   }
+  if ((params_flags_of(ctx.params()) & FlagSun) != 0) {
+    bump(g_sunDraws);
+  }
   // Its legacy pixels went out in e = 1 units, which next frame's readers would take for pre-exposure
   if (radiance && exposure_skipped(ctx.stage_data(), params_flags_of(ctx.params()))) {
     bail(ctx, radiance);
@@ -431,9 +456,49 @@ void fill_stage(const StageData& stage, const void*, std::span<std::byte> bytes)
   if ((params.flags & FlagSsil) != 0 && exposure_skipped(stage, params.flags)) {
     params.flags &= ~uint32_t{FlagSsil};
   }
-  const bool lsm = (params.flags & (FlagPbr | FlagIdentity)) == FlagPbr && fakeshadow::lsm::frame_enabled(stage);
+  // Count runs read the mask on their own, so the image stays the one without it
+  const bool lsm = (params.flags & (FlagPbr | FlagIdentity)) == FlagPbr && fakeshadow::lsm::frame_enabled(stage) &&
+                   !fakeshadow::count::active();
   params.flags = lsm ? params.flags | FlagLsm : params.flags & ~FlagLsm;
+  Sun sun;
+  const bool sunOn = (params.flags & (FlagSun | FlagIdentity)) == FlagSun && stage_sun(stage, sun);
+  params.flags = sunOn ? params.flags | FlagSun : params.flags & ~FlagSun;
+  params.sun = sunOn ? sun : Sun{};
+  if (stage.sceneHints != nullptr) {
+    const uint64_t frame = stage.sceneHints->hintFrame;
+    g_sealed[frame % SealedFrames].store(frame << 1 | (sunOn ? 1u : 0u), std::memory_order_release);
+  }
   std::memcpy(bytes.data(), &params, sizeof(Params));
+}
+
+bool light_gate(const FrameState&) noexcept { return sun_term_applied(); }
+
+float stored_luminance(const float (&linear)[3]) noexcept {
+  lighting::tonemap::Rgb stored{};
+  for (size_t i = 0; i < stored.size(); ++i) {
+    const float c = std::isfinite(linear[i]) ? std::clamp(linear[i], 0.f, 1.f) : 0.f;
+    stored[i] = c <= 0.0031308f ? c * 12.92f : 1.055f * std::pow(c, 1.f / 2.4f) - 0.055f;
+  }
+  return lighting::tonemap::luminance(stored);
+}
+
+// The view rows light.clusters uses, so N.L here matches the lighting light.deferred shades
+bool view_direction(const SceneHints& hints, const float (&direction)[3], float (&out)[3]) noexcept {
+  const Mat3x4<float>& view = hints.mainCamera.view;
+  std::array<double, 3> v{};
+  for (size_t i = 0; i < v.size(); ++i) {
+    const Vec4<float>& row = i == 0 ? view.m0 : i == 1 ? view.m1 : view.m2;
+    v[i] = -(double{row[0]} * direction[0] + double{row[1]} * direction[1] + double{row[2]} * direction[2]);
+  }
+  v[2] = -v[2];
+  const double length = std::hypot(v[0], v[1], v[2]);
+  if (!(length >= 1e-6) || !std::isfinite(length)) {
+    return false;
+  }
+  for (size_t i = 0; i < v.size(); ++i) {
+    out[i] = static_cast<float>(v[i] / length);
+  }
+  return true;
 }
 
 bool m8_env_set() noexcept {
@@ -442,8 +507,8 @@ bool m8_env_set() noexcept {
 } // namespace
 
 bool wanted(const Settings& settings) noexcept {
-  // AO and PBR are the composite producers; later producers widen this one predicate
-  return settings.ao != Quality::Off || settings.pbr;
+  // AO, PBR and real shadows are the composite producers; later producers widen this one predicate
+  return settings.ao != Quality::Off || settings.pbr || sun_shadows(settings);
 }
 
 bool ao_wanted(const Settings& settings) noexcept { return settings.ao != Quality::Off; }
@@ -647,11 +712,15 @@ void initialize() {
     g_pass = register_pass(pass_desc());
   }
   fakeshadow::set_gate_source(fakeshadow::Gate::Ao, &ao_gate);
+  fakeshadow::set_gate_source(fakeshadow::Gate::Light, &light_gate);
+  fakeshadow::gate::register_consumer(&sun_term_applied, &sealed_sun);
   scene::overlay::set_pbr_applied_source(&pbr_applied);
 }
 
 void shutdown() noexcept {
   fakeshadow::set_gate_source(fakeshadow::Gate::Ao, nullptr);
+  fakeshadow::set_gate_source(fakeshadow::Gate::Light, nullptr);
+  fakeshadow::gate::register_consumer(nullptr, nullptr);
   scene::overlay::set_pbr_applied_source(nullptr);
   for (PassId* pass : {&g_copyPass, &g_pass}) {
     if (*pass != InvalidPassId) {
@@ -667,6 +736,10 @@ void shutdown() noexcept {
   g_ssilWarned = false;
   g_latchedPbr = false;
   g_exposureUnits.store(false, std::memory_order_relaxed);
+  g_sunApplied.store(false, std::memory_order_relaxed);
+  for (std::atomic_uint64_t& sealed : g_sealed) {
+    sealed.store(0, std::memory_order_relaxed);
+  }
   g_enabledFrame.store(NoFrame, std::memory_order_relaxed);
   g_encodeMismatch.store(false, std::memory_order_relaxed);
   const testing::Counters c = testing::counters();
@@ -677,6 +750,7 @@ void shutdown() noexcept {
       "Composite PBR term ran on {} frames ({} with scene.hdr, {} idle without AO or H)";
   constexpr std::string_view RadianceLine = "Composite radiance written on {} frames ({} cleared on bail)";
   constexpr std::string_view SsilLine = "Composite bounce drawn on {} frames";
+  constexpr std::string_view SunLine = "Composite sun ratio drawn on {} frames";
   if (m8_env_set()) {
     Log.info(Line, c.draws, c.skippedMismatch, c.skippedNoScene, c.skippedView, c.contractFailures);
   } else {
@@ -696,6 +770,9 @@ void shutdown() noexcept {
     Log.info(SsilLine, c.ssilDraws);
   } else {
     Log.debug(SsilLine, c.ssilDraws);
+  }
+  if (c.sunDraws != 0) {
+    Log.info(SunLine, c.sunDraws);
   }
 }
 
@@ -738,6 +815,24 @@ void on_latch(const PassSetup& latched, const CompiledGraph* graph) {
                      pbr_producers_live();
   const bool pbrActive = g_slot.pbrActive;
   const bool ssilOn = g_slot.ssilLive && g_slot.aoLive;
+  const shadows::vsm::SunPlan& plan = shadows::vsm::plan();
+  // H carries V only through light.deferred's hook, so PBR waits for it as Rs waits for this pipeline
+  const bool sunApplied = g_sunTermOverride.value_or(testing::sun_applied_for({
+      .shadows = settings != nullptr && settings->shadows.quality != Quality::Off,
+      .producing = plan.producing,
+      .identity = identity_forced(),
+      .classView = g_slot.classView,
+      .live = g_slot.live,
+      .pipelines = g_slot.ids[0] != 0 && shaders::pipelines_ready(g_slot.ids),
+      .meterReady = !lighting::exposure::armed() || lighting::exposure::pipelines_live(),
+      .pbr = pbrActive,
+      .hookReady = lighting::deferred::sun_hook_ready(),
+  }));
+  g_slot.sunApplied = sunApplied;
+  g_slot.sun = {.keyLightId = plan.lightId,
+                .legacyGain = settings != nullptr ? settings->shadows.legacyGain : 1.f,
+                .geometric = plan.producing};
+  g_sunApplied.store(sunApplied, std::memory_order_relaxed);
   lock.unlock();
   if (g_pass != InvalidPassId) {
     Params params{.flags = g_flagsOverride.value_or(params_flags(identity_forced(), nullptr) |
@@ -753,6 +848,9 @@ void on_latch(const PassSetup& latched, const CompiledGraph* graph) {
     if (ssilOn) {
       params.flags |= FlagSsil;
       params.ssilAlbedo = ao::legacy_albedo();
+    }
+    if (sunApplied && (params.flags & FlagIdentity) == 0) {
+      params.flags |= FlagSun;
     }
     params = g_paramsOverride.value_or(params);
     set_pass_params(g_pass, std::as_bytes(std::span{&params, 1}));
@@ -817,6 +915,72 @@ bool ao_gate(const FrameState& state) noexcept {
          ao::effective_strength() > 0.f;
 }
 
+bool sun_term_applied() noexcept { return g_sunTermOverride.value_or(g_sunApplied.load(std::memory_order_relaxed)); }
+
+bool sealed_sun(uint64_t hintFrame) noexcept {
+  return g_sealed[hintFrame % SealedFrames].load(std::memory_order_acquire) == (hintFrame << 1 | 1u);
+}
+
+bool stage_sun(const StageData& stage, Sun& out) noexcept {
+  const LatchSlot slot = latched_slot();
+  if (!slot.sunApplied || !shadows::sun_visibility::frame_applied(stage)) {
+    return false;
+  }
+  if (g_stageSunOverride) {
+    out = *g_stageSunOverride;
+    return true;
+  }
+  return fill_sun(stage.sceneHints.get(), slot.sun, out);
+}
+
+bool fill_sun(const SceneHints* hints, const SunInputs& inputs, Sun& out) noexcept {
+  out = {};
+  if (hints == nullptr || !hints->has(SceneHasMainCamera) || !hints->has(SceneHasLights)) {
+    return false;
+  }
+  const AuroraLight* key = nullptr;
+  const AuroraLight* fill = nullptr;
+  float fillLum = 0.f;
+  for (const AuroraLight& light : hints->lights) {
+    if (light.type != AURORA_LIGHT_DIRECTIONAL) {
+      continue;
+    }
+    if (light.id == inputs.keyLightId) {
+      key = key != nullptr ? key : &light;
+      continue;
+    }
+    // Camera fills and masked lights never light the game's receivers, so only the cross-fade partner counts
+    if ((light.flags & (AURORA_LIGHT_CAMERA_FILL | AURORA_LIGHT_KEY_ROOM)) != 0 || light.categoryMask != 0) {
+      continue;
+    }
+    const float lum = stored_luminance(light.color);
+    if (fill == nullptr || lum > fillLum) {
+      fill = &light;
+      fillLum = lum;
+    }
+  }
+  if (key == nullptr || !view_direction(*hints, key->direction, out.keyDir)) {
+    return false;
+  }
+  out.keyLum = stored_luminance(key->color);
+  if (fill != nullptr && view_direction(*hints, fill->direction, out.fillDir)) {
+    out.fillLum = fillLum;
+  }
+  if (hints->has(SceneHasEnvironment)) {
+    const AuroraEnvironment& env = hints->environment.value;
+    lighting::tonemap::Rgb ambient{};
+    for (size_t i = 0; i < ambient.size(); ++i) {
+      ambient[i] = std::isfinite(env.ambientColor[i]) ? std::clamp(env.ambientColor[i], 0.f, 1.f) : 0.f;
+    }
+    out.ambientLum = lighting::tonemap::luminance(ambient);
+    const float gain = std::isfinite(inputs.legacyGain) ? inputs.legacyGain : 1.f;
+    const float strength = env.shadowSun * gain + env.shadowThunderAdd;
+    out.sSun = std::isfinite(strength) ? std::clamp(strength, 0.f, 1.f) : 0.f;
+  }
+  out.flags = inputs.geometric ? SunGeometric : 0u;
+  return true;
+}
+
 namespace testing {
 Counters counters() noexcept {
   return {
@@ -832,6 +996,7 @@ Counters counters() noexcept {
       .radianceDraws = g_radianceDraws.load(std::memory_order_relaxed),
       .radianceClears = g_radianceClears.load(std::memory_order_relaxed),
       .ssilDraws = g_ssilDraws.load(std::memory_order_relaxed),
+      .sunDraws = g_sunDraws.load(std::memory_order_relaxed),
   };
 }
 
@@ -857,6 +1022,9 @@ void reset() noexcept {
   g_radianceDraws.store(0, std::memory_order_relaxed);
   g_radianceClears.store(0, std::memory_order_relaxed);
   g_ssilDraws.store(0, std::memory_order_relaxed);
+  g_sunDraws.store(0, std::memory_order_relaxed);
+  g_sunTermOverride.reset();
+  g_stageSunOverride.reset();
   g_ssilWarned = false;
 }
 
@@ -873,6 +1041,55 @@ void set_radiance_forced(std::optional<bool> forced) noexcept { g_radianceForced
 void set_exposure_units(std::optional<bool> exposed) noexcept { g_exposureUnitsOverride = exposed; }
 
 void bump_units_epoch() noexcept { g_unitsEpoch.fetch_add(1, std::memory_order_relaxed); }
+
+void set_sun_term(std::optional<bool> applied) noexcept { g_sunTermOverride = applied; }
+
+void set_stage_sun(std::optional<Sun> sun) noexcept { g_stageSunOverride = sun; }
+
+bool sun_applied_for(const SunTermInputs& in) noexcept {
+  return in.shadows && in.producing && !in.identity && !in.classView && in.live && in.pipelines && in.meterReady &&
+         (!in.pbr || in.hookReady);
+}
+
+float sun_rs(std::array<float, 2> vis, uint32_t code, std::array<float, 3> n, const Sun& sun) noexcept {
+  const float tSun = (sun.flags & SunGeometric) != 0 || code == 2 ? vis[1] : 1.f;
+  const float vs = (1.f - sun.sSun * (1.f - vis[0])) * tSun;
+  const auto facing = [&](const float(&d)[3]) { return std::max(n[0] * d[0] + n[1] * d[1] + n[2] * d[2], 0.f); };
+  const float a = sun.ambientLum + sun.fillLum * facing(sun.fillDir);
+  const float wk = sun.keyLum * facing(sun.keyDir);
+  if (code < 2 || vs >= 1.f || !(wk > 0.f) || !(a + wk > 0.f)) {
+    return 1.f;
+  }
+  return std::min((a + wk * vs) / (a + wk), 1.f);
+}
+
+std::array<float, 3> legacy_sun(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7, float ao,
+                                float normalAlpha, float rs) noexcept {
+  const bool receiver = std::round(std::clamp(normalAlpha, 0.f, 1.f) * 3.f) >= 1.f;
+  const float a = receiver && ao < 1.f ? ao : 1.f;
+  if (a >= 1.f && rs >= 1.f) {
+    return legacy;
+  }
+  const float q = static_cast<float>(std::min(q7, 127u)) / 127.f;
+  std::array<float, 3> out{};
+  for (size_t i = 0; i < out.size(); ++i) {
+    const float s = legacy[i] - q * fogColor[i];
+    if (s < -2.f / 255.f) {
+      return legacy;
+    }
+    out[i] = legacy[i] - std::max(s, 0.f) * (1.f - a * rs);
+  }
+  return out;
+}
+
+std::array<float, 3> sun_normal(std::array<float, 3> stored) noexcept {
+  const std::array<float, 3> n{stored[0] * 2.f - 1.f, stored[1] * 2.f - 1.f, 1.f - stored[2] * 2.f};
+  const float length = std::hypot(n[0], n[1], n[2]);
+  if (!(length >= 1e-3f)) {
+    return {};
+  }
+  return {n[0] / length, n[1] / length, n[2] / length};
+}
 
 bool pbr_active_for(bool live, bool hdrLive, bool classView, const Settings& settings) noexcept {
   return live && hdrLive && pbr_term_wanted(settings) && !classView;

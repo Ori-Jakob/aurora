@@ -14,6 +14,7 @@
 #include "debug/surface_expand.hpp"
 #include "debug/views.hpp"
 #include "debug/vsm_view.hpp"
+#include "fakeshadow/count.hpp"
 #include "fakeshadow/gate.hpp"
 #include "fakeshadow/lsm.hpp"
 #include "geometry/compact.hpp"
@@ -122,6 +123,7 @@ void initialize() {
   ao::initialize();
   composite::initialize();
   fakeshadow::lsm::initialize();
+  fakeshadow::count::initialize();
   lighting::clusters::initialize();
   lighting::openpbr::initialize();
   lighting::deferred::initialize();
@@ -165,6 +167,7 @@ void shutdown() noexcept {
   systems::shutdown();
   debug::shutdown_classification();
   debug::shutdown();
+  fakeshadow::count::shutdown();
   fakeshadow::lsm::shutdown();
   scene::capture_list::shutdown();
   scene::streamout::shutdown();
@@ -286,6 +289,12 @@ bool feature_ready(Feature feature) noexcept {
   // Without its lighting passes the composite keeps the original shading, so Applying... waits for them
   if (feature == Feature::Pbr &&
       !(detail::composite::ready(effective_settings()) && detail::lighting::ready(effective_settings()))) {
+    return false;
+  }
+  // Real shadows reach legacy pixels only through the composite and the meter, so their pipelines gate Applying...
+  if (feature == Feature::Shadows &&
+      !(shadows::vsm::ready() && detail::composite::ready(effective_settings()) &&
+        (!detail::lighting::exposure::armed() || detail::lighting::exposure::pipelines_live()))) {
     return false;
   }
 #endif

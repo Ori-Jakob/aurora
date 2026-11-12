@@ -60,6 +60,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/debug/views_tab.cpp
         lib/render/debug/vsm_view.cpp
         lib/render/debug/vsm_view.hpp
+        lib/render/fakeshadow/count.cpp
+        lib/render/fakeshadow/count.hpp
         lib/render/fakeshadow/gate.cpp
         lib/render/fakeshadow/gate.hpp
         lib/render/fakeshadow/lsm.cpp

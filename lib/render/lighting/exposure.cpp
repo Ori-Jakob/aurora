@@ -5,6 +5,7 @@
 
 #include "../ao/ao.hpp"
 #include "../debug/views.hpp"
+#include "../fakeshadow/count.hpp"
 #include "../fakeshadow/lsm.hpp"
 #include "../hints.hpp"
 #include "../pass_context.hpp"
@@ -138,6 +139,7 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
   builder.create_buffer(Resource, {.size = BufferBytes}, Access::StorageWrite);
   builder.use(resource::SsilIrradiance, Access::Sampled, Missing::BindDummyBlack);
   builder.use(fakeshadow::lsm::Resource, Access::Sampled, Missing::BindDummyWhite);
+  builder.use(resource::SunVisibility, Access::Sampled, Missing::BindDummyWhite);
 }
 
 bool meter_reads(const CompiledGraph& graph, std::string_view name) noexcept {
@@ -313,8 +315,18 @@ void fill_stage(const StageData& stage, const void*, std::span<std::byte> bytes)
     params.flags |= FlagSsilExposed;
   }
   // The target must see the kept fakes the composite puts on P, on exactly the frames it does
-  if (composite::exposure_units() && !composite::identity_forced() && fakeshadow::lsm::frame_enabled(stage)) {
+  if (composite::exposure_units() && !composite::identity_forced() && fakeshadow::lsm::frame_enabled(stage) &&
+      !fakeshadow::count::active()) {
     params.flags |= FlagLsm;
+  }
+  // Sb is the composite's legacy line, so it carries Rs on exactly the frames the composite applies it
+  composite::Sun sun;
+  if (!composite::identity_forced() && composite::stage_sun(stage, sun)) {
+    params.flags |= FlagSun;
+    params.sun = sun;
+  } else {
+    params.flags &= ~uint32_t{FlagSun};
+    params.sun = {};
   }
   std::memcpy(bytes.data(), &params, sizeof(params));
 }

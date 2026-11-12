@@ -1,5 +1,8 @@
 #include "lsm.hpp"
 
+#include "count.hpp"
+#include "gate.hpp"
+
 #include "../debug/views.hpp"
 #include "../frame_state.hpp"
 #include "../pass_context.hpp"
@@ -193,11 +196,14 @@ void on_latch(const detail::PassSetup& latched, const detail::CompiledGraph* gra
   const bool classView = debug::find_view(latched.debug_view()) != nullptr;
   // Latched FlagPbr already excludes lb = 1, identity and class views, so every lb >= 1 path stays clone-free
   const bool declaredNow = graph != nullptr && node_live(*graph, Pass);
-  bool consumed = declaredNow && g_consumer != scene::capture_list::InvalidConsumer &&
-                  detail::composite::exposure_units() && !detail::composite::identity_forced() && !classView;
+  const bool registered = declaredNow && g_consumer != scene::capture_list::InvalidConsumer;
+  bool consumed =
+      registered && detail::composite::exposure_units() && !detail::composite::identity_forced() && !classView;
   consumed = g_consumedOverride.value_or(consumed);
-  scene::capture_list::set_enabled(g_consumer, consumed);
-  g_consumed.store(consumed, std::memory_order_relaxed);
+  // The counter replays its own selection into the mask, which the composite and the meter then leave alone
+  const bool counting = registered && count::active();
+  scene::capture_list::set_enabled(g_consumer, consumed || counting);
+  g_consumed.store(consumed || counting, std::memory_order_relaxed);
   g_graphHash.store(graph != nullptr ? graph->graphHash : 0, std::memory_order_relaxed);
   bump(g_counts.latches);
   if (g_counts.latches.load(std::memory_order_relaxed) == WarmUpLatches) {
@@ -217,12 +223,13 @@ void apply_frame_state() noexcept {
 }
 
 bool declared(const detail::PassSetup& setup) noexcept {
-  if (setup.settings == nullptr || setup.env == nullptr || !setup.settings->pbr || setup.env->gxSampleCount != 1) {
+  if (setup.settings == nullptr || setup.env == nullptr || setup.env->gxSampleCount != 1) {
     return false;
   }
   constexpr auto DepthIndex = static_cast<size_t>(detail::GxResource::Depth);
-  return setup.gx_available(detail::GxResource::Surface) && setup.gx_available(detail::GxResource::Depth) &&
-         (setup.env->gxUsage[DepthIndex] & wgpu::TextureUsage::RenderAttachment);
+  const bool depth = setup.gx_available(detail::GxResource::Depth) &&
+                     (setup.env->gxUsage[DepthIndex] & wgpu::TextureUsage::RenderAttachment);
+  return depth && ((setup.settings->pbr && setup.gx_available(detail::GxResource::Surface)) || count::active());
 }
 
 bool consumed() noexcept { return g_consumed.load(std::memory_order_relaxed); }
@@ -239,8 +246,12 @@ gfx::RenderTargetLayout layout(wgpu::TextureFormat depth) noexcept {
 }
 
 bool select_draw(const scene::DrawClass& cls) noexcept {
-  return (cls.key.categories & scene::category::FakeShadow) != 0 && cls.key.mainCamera &&
-         cls.key.role == scene::Role::Main && !cls.offscreen && cls.key.window <= scene::Window::Opaque;
+  if ((cls.key.categories & scene::category::FakeShadow) == 0 || !cls.key.mainCamera ||
+      cls.key.role != scene::Role::Main || cls.offscreen || cls.key.window > scene::Window::Opaque) {
+    return false;
+  }
+  const count::Mode mode = count::mode();
+  return mode == count::Mode::Off || count::selects(mode, gate::tag_decision(cls.key.object.subId));
 }
 
 detail::PassDesc pass_desc() {

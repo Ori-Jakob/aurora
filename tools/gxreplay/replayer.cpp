@@ -16,6 +16,7 @@
 #include "io.hpp"
 #if AURORA_ENABLE_RENDER
 #include "render/debug/views.hpp"
+#include "render/fakeshadow/count.hpp"
 #include "render/jobs.hpp"
 #include "render/scene/classify.hpp"
 #include "render/scene/atlas.hpp"
@@ -510,6 +511,8 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
         render::scene::seal_frame();
       }
       if (fakeShadowLines.is_open()) {
+        // The counter's readback lands on its frame's record only once it has arrived
+        render::fakeshadow::count::flush();
         // Startup and the state preamble seal frames of their own, so only the record sealed just now is this one
         std::optional<render::fakeshadow::gate::ReplayFrame> latest;
         while (auto record = render::fakeshadow::gate::take_replay_frame()) {
