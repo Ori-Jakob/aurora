@@ -750,7 +750,7 @@ TEST_F(RenderVsmGraph, ChainFitsStorageLimit) {
     EXPECT_EQ(storage(UpdatePass), 4u);
     EXPECT_EQ(storage(ScanPass), 8u);
     EXPECT_EQ(storage(DirtyPass), 6u);
-    EXPECT_EQ(storage(MarkPass), 3u);
+    EXPECT_EQ(storage(MarkPass), 2u);
     EXPECT_EQ(storage(ClassifyPass), 7u);
     EXPECT_EQ(storage(AssignPass), 8u);
     EXPECT_EQ(storage(CommitPass), 3u);
