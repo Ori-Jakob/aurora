@@ -283,6 +283,7 @@ struct CaptureListFrame;
 [[nodiscard]] bool append_capture_draw(uint32_t list, uint64_t layoutKey, const gx::DrawData& draw) noexcept;
 // Null when no list holds a draw; lists still held at frame end are discarded
 std::shared_ptr<const CaptureListFrame> take_capture_lists();
+[[nodiscard]] uint32_t queued_capture_draws(uint32_t list) noexcept;
 uint64_t discarded_capture_draws() noexcept;
 EfbMode current_efb_mode() noexcept;
 bool in_scene_pass() noexcept;

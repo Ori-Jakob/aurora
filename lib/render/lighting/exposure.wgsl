@@ -1,5 +1,6 @@
 //#import aurora/composite
 //#import aurora/gbuffer
+//#import aurora/lsm
 //#import aurora/srgb
 //#import aurora/tonemap
 
@@ -32,6 +33,7 @@ const EXPOSURE_FLAG_SNAP: u32 = 4u;
 const EXPOSURE_FLAG_RESET: u32 = 8u;
 const EXPOSURE_FLAG_SSIL: u32 = 16u;
 const EXPOSURE_FLAG_SSIL_EXPOSED: u32 = 32u;
+const EXPOSURE_FLAG_LSM: u32 = 64u;
 const EXPOSURE_STATE_VALID: u32 = 1u;
 const EXPOSURE_STATE_MODE_MASK: u32 = 6u;
 const EXPOSURE_STATE_AGX: u32 = 8u;
@@ -76,6 +78,7 @@ struct ExposureWindow {
 @group(1) @binding(6) var<storage, read_write> partials: array<f32>;
 @group(1) @binding(7) var<storage, read_write> exposure_out: ExposureWords;
 @group(1) @binding(8) var ssil_irr: texture_2d<f32>;
+@group(1) @binding(9) var lsm_mask: texture_2d<f32>;
 @group(2) @binding(0) var state_prev: texture_2d<u32>;
 
 var<workgroup> exposure_tree: array<array<f32, EXPOSURE_WORDS>, EXPOSURE_GROUP_SIZE>;
@@ -115,6 +118,11 @@ fn exposure_candidate(w: ExposureWindow, k: u32) -> f32 {
   return w.center + (f32(k) - 15.5) * w.step;
 }
 
+// The composite multiplies the stored sRGB of P by m, so the candidate's light is that product decoded
+fn exposure_masked(mapped: vec3f, m: vec3f) -> vec3f {
+  return srgb_to_linear(m * linear_to_srgb(mapped));
+}
+
 fn exposure_sample(p: vec2i, w: ExposureWindow, agx: bool, acc: ptr<function, array<f32, EXPOSURE_WORDS>>) {
   let hdr = textureLoad(scene_hdr, composite_texel(p, textureDimensions(scene_hdr)), 0);
   let raw = textureLoad(fog_record, composite_texel(p, textureDimensions(fog_record)), 0);
@@ -143,16 +151,27 @@ fn exposure_sample(p: vec2i, w: ExposureWindow, agx: bool, acc: ptr<function, ar
   (*acc)[EXPOSURE_WORD_TARGET] += weight * log2(y_ld);
   (*acc)[EXPOSURE_WORD_COUNT] += 1.0;
   (*acc)[EXPOSURE_WORD_HDR] += weight * log2(max(tonemap_luminance(hdr.rgb), EXPOSURE_Y_FLOOR));
+  var m = vec3f(1.0);
+  if ((exposure_params.flags & EXPOSURE_FLAG_LSM) != 0u && lsm_pre_shadow(hdr.a)) {
+    m = lsm_term(textureLoad(lsm_mask, composite_texel(p, textureDimensions(lsm_mask)), 0).rgb, rec.q, rec.fc);
+  }
+  let shadowed = any(m < vec3f(1.0));
   if (agx) {
     let inset = tonemap_agx_inset_log2(hdr.rgb);
     for (var k = 0u; k < EXPOSURE_CANDIDATES; k++) {
-      let y = tonemap_luminance(tonemap_agx_from_inset(inset + exposure_candidate(w, k)));
-      (*acc)[k] += weight * log2(max(y, EXPOSURE_Y_FLOOR));
+      var mapped = tonemap_agx_from_inset(inset + exposure_candidate(w, k));
+      if (shadowed) {
+        mapped = exposure_masked(mapped, m);
+      }
+      (*acc)[k] += weight * log2(max(tonemap_luminance(mapped), EXPOSURE_Y_FLOOR));
     }
   } else {
     for (var k = 0u; k < EXPOSURE_CANDIDATES; k++) {
-      let y = tonemap_luminance(tonemap_pbr_neutral(hdr.rgb * exp2(exposure_candidate(w, k))));
-      (*acc)[k] += weight * log2(max(y, EXPOSURE_Y_FLOOR));
+      var mapped = tonemap_pbr_neutral(hdr.rgb * exp2(exposure_candidate(w, k)));
+      if (shadowed) {
+        mapped = exposure_masked(mapped, m);
+      }
+      (*acc)[k] += weight * log2(max(tonemap_luminance(mapped), EXPOSURE_Y_FLOOR));
     }
   }
 }

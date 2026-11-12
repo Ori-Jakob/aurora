@@ -23,6 +23,8 @@ inline constexpr uint8_t BakedLight = 1u << 6;
 
 inline constexpr uint32_t EntryExtAmbient = 1u << 24;
 inline constexpr uint32_t EntryExtEmissive = 1u << 25;
+// Drawn after the game's fake-shadow pass, so the shadow mask never applies to it
+inline constexpr uint32_t EntryPostShadow = 1u << 26;
 inline constexpr uint32_t SlotShift = 16;
 inline constexpr uint32_t SlotMax = 0xFFFF;
 
@@ -146,6 +148,9 @@ using Entry = std::array<uint32_t, 4>;
               (extBits & (EntryExtAmbient | EntryExtEmissive)),
           pack_unorm4(f.ambient[0], f.ambient[1], f.ambient[2], 0.f) & 0xFFFFFFu, pack_r11g11b10(f.emissive), 0};
 }
+
+static_assert((pack_entry(Fields{.classId = 0xFF, .flags = 0xFF, .category = 0xFF}, ~0u)[0] & 0xFC000000u) == 0,
+              "pack_entry leaves bits 26-31 for the post-shadow flag and later bits");
 
 [[nodiscard]] constexpr uint32_t record_slot(const Words& record) noexcept { return record[1] >> SlotShift; }
 

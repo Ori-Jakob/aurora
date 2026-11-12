@@ -130,6 +130,7 @@ struct DrawClass {
   bool colorWrite = true;
   bool suppressed = false;
   bool keyChanged = false;
+  bool afterFakeShadow = false;
   uint32_t index = 0;
   // Pre-merge GX draw index within the open object; offscreen draws never count, suppressed ones only while captured
   uint16_t ordinal = 0;
@@ -210,6 +211,7 @@ struct FrameStats {
   uint32_t fakeShadowOverlay = 0;
   uint32_t skyMisses = 0;
   uint32_t droppedObjects = 0;
+  uint32_t postShadowMissing = 0;
   ViewCounts view;
 };
 
@@ -276,6 +278,7 @@ public:
   void count_merge_break() noexcept { ++m_stats.mergeBreaks; }
 
   [[nodiscard]] const DrawClass& last() const noexcept { return m_last; }
+  [[nodiscard]] bool after_fake_shadow() const noexcept { return m_afterFakeShadow; }
   [[nodiscard]] const Mat3x4<float>* object_world() const noexcept {
     return m_objectOpen && m_objectHasWorld ? &m_objectWorld : nullptr;
   }
@@ -321,6 +324,7 @@ private:
   uint32_t m_nextOrder = 1;
   int32_t m_lastMarker = -1;
   bool m_mainCameraSeen = false;
+  bool m_afterFakeShadow = false;
   ClassKey m_key;
   bool m_keyDirty = true;
   DrawClass m_last;

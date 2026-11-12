@@ -20,6 +20,7 @@
 #include "debug/debug.hpp"
 #include "debug/views.hpp"
 #include "fakeshadow/gate.hpp"
+#include "fakeshadow/lsm.hpp"
 #include "gx_ext/ext_provider.hpp"
 #include "hints.hpp"
 #include "lighting/clusters.hpp"
@@ -1444,6 +1445,7 @@ std::shared_ptr<const FrameState> latch_frame() {
   lighting::sky_probe::on_latch(latched, graph.get());
   lighting::exposure::on_latch(latched, graph.get());
   composite::on_latch(latched, graph.get());
+  fakeshadow::lsm::on_latch(latched, graph.get());
   // The gate reads the plan and the composite's sun predicate, so it latches after both
   fakeshadow::gate::on_latch(latched_settings());
   latch_pass_params();

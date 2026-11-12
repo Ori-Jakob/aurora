@@ -2,6 +2,7 @@
 
 #include "gbuf_view.hpp"
 
+#include "../fakeshadow/lsm.hpp"
 #include "../post/composite.hpp"
 #include "../../webgpu/gpu.hpp"
 
@@ -11,7 +12,8 @@
 
 namespace aurora::render::debug::decomp_view {
 namespace {
-constexpr std::array<std::string_view, 3> ModeDefines{"DECOMP_IDENTITY", "DECOMP_COVERAGE", "DECOMP_MULTIPLY"};
+constexpr std::array<std::string_view, 4> ModeDefines{"DECOMP_IDENTITY", "DECOMP_COVERAGE", "DECOMP_MULTIPLY",
+                                                      "DECOMP_LSM"};
 
 struct Decoded {
   std::array<float, 3> s{};
@@ -33,6 +35,8 @@ std::string_view mode_input(DecompMode mode) noexcept {
     return resource::Reactive;
   case DecompMode::Multiply:
     return resource::AoFinal;
+  case DecompMode::Lsm:
+    return fakeshadow::lsm::Resource;
   case DecompMode::Defog:
     break;
   }
@@ -84,7 +88,11 @@ void declare(detail::InternalPassBuilder& builder, const detail::PassSetup& setu
   builder.use(resource::Fog, Access::Sampled,
               detail::UseOptions{.missing = Missing::DisablePass, .sampleType = wgpu::TextureSampleType::Uint});
   builder.use(resource::GxNormal, Access::Sampled, sampled);
-  if (const std::string_view input = mode_input(decomp_mode(row)); !input.empty()) {
+  if (decomp_mode(row) == DecompMode::Lsm) {
+    // A frame without kept fakes has no mask, which reads as white like the composite's dummy
+    builder.use(fakeshadow::lsm::Resource, Access::Sampled, Missing::BindDummyWhite);
+    builder.use(resource::SceneHdr, Access::Sampled, Missing::BindDummyBlack);
+  } else if (const std::string_view input = mode_input(decomp_mode(row)); !input.empty()) {
     builder.use(input, Access::Sampled, sampled);
   }
   builder.create(gbuf_view::SnapshotResource, {.format = wgpu::TextureFormat::RGBA8Unorm, .sizeClass = SizeClass::Efb},
@@ -122,6 +130,8 @@ bool available(const GbufView& row, const Settings& settings, const detail::Comp
     return feature_enabled(settings, Feature::Ao);
   case DecompMode::Identity:
     return graph != nullptr && live_creator(*graph, detail::composite::LegacyTex);
+  case DecompMode::Lsm:
+    return feature_enabled(settings, Feature::Pbr);
   case DecompMode::Defog:
   case DecompMode::Coverage:
     break;

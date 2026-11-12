@@ -1926,6 +1926,10 @@ std::shared_ptr<const CaptureListFrame> take_capture_lists() {
   return frame;
 }
 
+uint32_t queued_capture_draws(uint32_t list) noexcept {
+  return list < MaxCaptureLists ? static_cast<uint32_t>(g_recorder.capture[list].draws.size()) : 0;
+}
+
 uint64_t discarded_capture_draws() noexcept { return g_discardedCaptureDraws; }
 
 bool set_overlay_target(bool on) noexcept {

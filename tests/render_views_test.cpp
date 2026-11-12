@@ -174,7 +174,7 @@ TEST_F(RenderViews, GbufViewTableFollowsClassRange) {
     EXPECT_EQ(find_view(view.id), nullptr);
     if (view.kind == GbufViewKind::Decomposition) {
       EXPECT_FALSE(view.uintSource) << view.name;
-      EXPECT_TRUE(view.name.starts_with("composite.")) << view.name;
+      EXPECT_TRUE(view.name.starts_with("composite.") || view.name == "lsm.mask") << view.name;
       continue;
     }
     if (view.kind == GbufViewKind::Retained) {
@@ -199,7 +199,7 @@ TEST_F(RenderViews, GbufViewTableFollowsClassRange) {
       EXPECT_EQ(view.mode, static_cast<uint32_t>(view.id - FirstGbufView));
     }
   }
-  EXPECT_EQ(expected, 53u);
+  EXPECT_EQ(expected, 54u);
   EXPECT_EQ(targetModes, (std::set<uint32_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}));
   EXPECT_EQ(find_gbuf_view(LastReservedClassView), nullptr);
   EXPECT_EQ(find_gbuf_view(35), nullptr);
@@ -408,6 +408,21 @@ TEST_F(RenderViews, ShortNamesAreUnique) {
     EXPECT_TRUE(names.insert(view.name.substr(view.name.find('.') + 1)).second) << view.name;
   }
   EXPECT_EQ(names.size(), 2 * (ClassViews.size() + GbufViews.size()) - retained);
+}
+
+TEST_F(RenderViews, LsmMaskRowDecodesTheMask) {
+  const GbufView* view = find_gbuf_view(53);
+  ASSERT_NE(view, nullptr);
+  EXPECT_EQ(view->name, "lsm.mask");
+  EXPECT_EQ(view->resource, "lsm.mask");
+  EXPECT_EQ(view->anchor, "phase.composite");
+  EXPECT_EQ(view->kind, GbufViewKind::Decomposition);
+  EXPECT_EQ(decomp_mode(*view), DecompMode::Lsm);
+  EXPECT_FALSE(shadow_view(*view));
+  EXPECT_EQ(parse_view("lsm.mask")->id, 53u);
+  EXPECT_EQ(parse_view("mask")->id, 53u);
+  EXPECT_EQ(find_gbuf_view(54), nullptr);
+  EXPECT_EQ(LsmPostShadowTint, (Rgb8{0, 220, 220}));
 }
 
 TEST_F(RenderViews, ParseDecompositionViewNames) {
@@ -827,8 +842,8 @@ TEST_F(RenderViews, ShadowRowsHaveFreshIds) {
   }
   EXPECT_EQ(vsm_view::row_mode(*find_gbuf_view(48)), std::nullopt);
   EXPECT_EQ(vsm_view::selected_mode(0), std::nullopt);
-  EXPECT_EQ(find_gbuf_view(53), nullptr);
-  EXPECT_EQ(GbufViews.back().id, 52u);
+  EXPECT_EQ(find_gbuf_view(54), nullptr);
+  EXPECT_EQ(GbufViews.back().id, 53u);
   EXPECT_EQ(static_cast<uint32_t>(VsmViewMode::NoSun) + 1, VsmViewModeCount);
   std::set<std::tuple<uint8_t, uint8_t, uint8_t>> levels;
   for (const Rgb8 c : VsmLevelColors) {
@@ -876,7 +891,7 @@ TEST_F(RenderViews, RegistryListsEveryBuiltView) {
   ASSERT_EQ(api.size(), views.size());
   EXPECT_EQ(api.data(), views.data());
   EXPECT_TRUE(known_view(0));
-  for (const uint16_t reserved : {uint16_t{9}, uint16_t{15}, uint16_t{35}, uint16_t{53}, uint16_t{100}}) {
+  for (const uint16_t reserved : {uint16_t{9}, uint16_t{15}, uint16_t{35}, uint16_t{54}, uint16_t{100}}) {
     EXPECT_FALSE(known_view(reserved)) << reserved;
   }
 }

@@ -79,6 +79,7 @@ void Classifier::clear_frame() noexcept {
   m_nextOrder = 1;
   m_lastMarker = -1;
   m_mainCameraSeen = false;
+  m_afterFakeShadow = false;
   m_key = {};
   m_keyDirty = true;
   m_last = {};
@@ -126,6 +127,9 @@ void Classifier::end_frame() noexcept {
   m_ended = true;
   m_stats.hints.openScopes = m_scopeDepth;
   m_stats.hints.openObjects = m_objectOpen ? 1 : 0;
+  if (m_stats.fakeShadow != 0 && !m_afterFakeShadow) {
+    ++m_stats.postShadowMissing;
+  }
 }
 
 void Classifier::camera(Role role) noexcept {
@@ -201,7 +205,14 @@ void Classifier::scope_pop() noexcept {
   ++m_stats.hints.scopePops;
   if (m_scopeSwallow > 0) {
     --m_scopeSwallow;
+    ++m_stats.postShadowMissing;
   } else if (m_scopeDepth > 0) {
+    const Entry& popped = m_scopes[m_scopeDepth - 1];
+    // The game's fakes darken only what drew before them, so later draws are flagged out of the mask
+    if ((popped.categories & category::FakeShadow) != 0 &&
+        (popped.role == InheritRole || popped.role == static_cast<uint8_t>(Role::Main))) {
+      m_afterFakeShadow = true;
+    }
     m_scopes[--m_scopeDepth] = {};
     m_keyDirty = true;
   } else {
@@ -318,6 +329,7 @@ const DrawClass& Classifier::route(const DrawInputs& inputs) noexcept {
   cls.offscreen = inputs.offscreen;
   cls.colorWrite = inputs.colorWrite;
   cls.suppressed = (cls.key.flags & object_flag::CaptureOnly) != 0;
+  cls.afterFakeShadow = m_afterFakeShadow;
   cls.index = m_stats.draws;
 
   MainCheck rest = MainCheck::Passed;

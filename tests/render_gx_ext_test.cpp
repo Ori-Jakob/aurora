@@ -15,6 +15,7 @@
 #include "render/gx_ext/records.hpp"
 #include "render/gx_ext/surface_table.hpp"
 #include "render/gx_ext/unlit.hpp"
+#include "render/fakeshadow/lsm.hpp"
 #include "render/hints.hpp"
 #include "render/material/classes.hpp"
 #include "render/material/gx_lookup.hpp"
@@ -1425,6 +1426,37 @@ TEST_F(RenderGxExt, SurfaceTableStampsCategoryOnOutput2Only) {
   apply_frame_state(frame(false, false));
   EXPECT_EQ(records::stats().categoryRecords, 2u);
   EXPECT_EQ(records::stats().surfaceSlots, 2u);
+}
+
+TEST_F(RenderGxExt, PostShadowEntryOnlyWhenConsumed) {
+  surface_table::testing::reset();
+  records::testing::set_push(&FakeStorage::push);
+  records::testing::set_active(true, true, false);
+  records::testing::set_surface(true);
+  surface_table::begin_frame(true);
+  scene::DrawClass before = main_opaque(cat::Static | cat::Terrain, 5);
+  scene::DrawClass after = before;
+  after.afterFakeShadow = true;
+  fakeshadow::lsm::testing::reset();
+  fakeshadow::lsm::apply_frame_state();
+  const records::DrawRecord off = stamped(with_output(pbr_writer(), 2), after);
+  const records::DrawRecord plain = stamped(with_output(pbr_writer(), 2), before);
+  EXPECT_EQ(surface_slot(off), surface_slot(plain));
+  fakeshadow::lsm::testing::set_consumed(true);
+  fakeshadow::lsm::apply_frame_state();
+  const records::DrawRecord pre = stamped(with_output(pbr_writer(), 2), before);
+  const records::DrawRecord post = stamped(with_output(pbr_writer(), 2), after);
+  EXPECT_EQ(surface_slot(pre), surface_slot(plain));
+  ASSERT_NE(surface_slot(post), surface_slot(plain));
+  const std::shared_ptr<const surface_table::Table> table = surface_table::snapshot();
+  ASSERT_NE(table, nullptr);
+  EXPECT_EQ((*table)[surface_slot(post)][0], (*table)[surface_slot(plain)][0] | gx::surface::EntryPostShadow);
+  for (size_t i = 1; i < 4; ++i) {
+    EXPECT_EQ((*table)[surface_slot(post)][i], (*table)[surface_slot(plain)][i]) << i;
+  }
+  EXPECT_EQ(fakeshadow::lsm::stats().postShadowDraws, 1u);
+  fakeshadow::lsm::testing::reset();
+  fakeshadow::lsm::apply_frame_state();
 }
 
 TEST_F(RenderGxExt, SurfaceTableOverflowTakesSlotZero) {

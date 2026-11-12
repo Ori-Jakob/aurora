@@ -217,6 +217,8 @@ std::optional<std::string> view_blocked(const GbufView& view, const detail::Fram
       return "needs Ambient Occlusion";
     case DecompMode::Identity:
       return "needs a composite effect";
+    case DecompMode::Lsm:
+      return "needs PBR Lighting";
     case DecompMode::Defog:
     case DecompMode::Coverage:
       break;

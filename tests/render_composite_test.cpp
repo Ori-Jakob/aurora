@@ -10,6 +10,7 @@
 #include "render/ao/ao.hpp"
 #include "render/ao/upsample.hpp"
 #include "render/debug/views.hpp"
+#include "render/fakeshadow/lsm.hpp"
 #include "render/frame_state.hpp"
 #include "render/gpu_heap.hpp"
 #include "render/graph.hpp"
@@ -270,6 +271,54 @@ PassDesc stub_hdr_desc(StubHdr& stub) {
   };
 }
 
+struct StubLsm {
+  bool enabled = true;
+  wgpu::Buffer staging;
+  uint32_t rowBytes = 0;
+  int calls = 0;
+};
+
+void declare_stub_lsm(InternalPassBuilder& builder, const PassSetup&, const void*) {
+  builder.after(phase::Capture);
+  builder.before(phase::Geometry);
+  builder.create(fakeshadow::lsm::Resource,
+                 {.format = fakeshadow::lsm::Format,
+                  .sizeClass = SizeClass::Efb,
+                  .extraUsage = wgpu::TextureUsage::TextureBinding},
+                 Access::CopyDst);
+}
+
+bool stub_lsm_enabled(const StageData&, const void* state) { return static_cast<const StubLsm*>(state)->enabled; }
+
+void encode_stub_lsm(PassContext& ctx, const void* state) {
+  auto& stub = *static_cast<StubLsm*>(const_cast<void*>(state));
+  ++stub.calls;
+  if (!stub.staging) {
+    return;
+  }
+  const wgpu::Extent3D size = ctx.extent(TexRef{0});
+  const wgpu::TexelCopyBufferInfo from{.layout = {.bytesPerRow = stub.rowBytes, .rowsPerImage = size.height},
+                                       .buffer = stub.staging};
+  const wgpu::TexelCopyTextureInfo to{.texture = ctx.texture(TexRef{0})};
+  const wgpu::Extent3D extent{size.width, size.height, 1};
+  ctx.encoder().CopyBufferToTexture(&from, &to, &extent);
+}
+
+// Stands in for lsm.mask's replay; the composite keys FlagLsm on whichever pass creates the mask
+PassDesc stub_lsm_desc(StubLsm& stub) {
+  return {
+      .name = "test.lsm",
+      .stage = Stage::OpaqueDone,
+      .kind = PassKind::Copy,
+      .order = fakeshadow::lsm::Order,
+      .runsWithoutMarker = true,
+      .declare = declare_stub_lsm,
+      .enabled = stub_lsm_enabled,
+      .encode = encode_stub_lsm,
+      .state = &stub,
+  };
+}
+
 struct TestPass {
   std::string name;
   Stage stage = Stage::OpaqueDone;
@@ -398,13 +447,60 @@ TEST(CompositeRules, InputTableIsAppendOnly) {
   EXPECT_EQ(composite::BindHdr, 5u);
   EXPECT_EQ(composite::BindExposure, 6u);
   EXPECT_EQ(composite::BindSsil, 7u);
+  EXPECT_EQ(composite::BindLsm, 8u);
   EXPECT_EQ(composite::FlagSsil, 16u);
+  EXPECT_EQ(composite::FlagLsm, 32u);
+  EXPECT_EQ(fakeshadow::lsm::Resource, "lsm.mask");
   EXPECT_EQ(offsetof(composite::Params, ssilAlbedo), 8u);
   EXPECT_EQ(lighting::exposure::Resource, "exposure");
   EXPECT_EQ(composite::LegacyTex, "legacyTex");
   EXPECT_EQ(composite::CopyPass, "legacy.copy");
   EXPECT_EQ(composite::Pass, "composite.main");
   EXPECT_EQ(composite::AoFormat, ao::upsample::Format);
+}
+
+TEST(CompositeRules, LsmFogDecodeMirror) {
+  // A kept fake of strength a over white under fog q leaves q*fc*a + 1 - a in the mask; P then takes exactly 1 - a
+  const std::array<float, 3> fc{0.8f, 0.5f, 0.1f};
+  for (const uint32_t q7 : {0u, 40u, 100u}) {
+    const float q = static_cast<float>(q7) / 127.f;
+    for (const float a : {0.f, 0.3f, 0.7f}) {
+      std::array<float, 3> mask{};
+      for (size_t c = 0; c < 3; ++c) {
+        mask[c] = q * fc[c] * a + 1.f - a;
+      }
+      const std::array<float, 3> m = fakeshadow::lsm::term(mask, q, fc);
+      const std::array<float, 4> hdr{0.4f, 0.2f, 0.1f, 1.f};
+      const std::array<float, 3> legacy{0.9f, 0.8f, 0.7f};
+      const std::array<float, 3> shadowed =
+          composite::testing::legacy_pbr_hdr(legacy, fc, q7, 1.f, 1.f, hdr, 0.f, 1.f, false, m);
+      const std::array<float, 3> lit =
+          composite::testing::legacy_pbr_hdr(legacy, fc, q7, 1.f, 1.f, hdr, 0.f, 1.f, false);
+      for (size_t c = 0; c < 3; ++c) {
+        EXPECT_NEAR(m[c], 1.f - a, 2e-6f) << q7 << " " << a << " " << c;
+        // At lb 0 the output is L - S + (1 - q)*m*P, so the shadow scales only the PBR share
+        const float s = std::max(legacy[c] - q * fc[c], 0.f);
+        EXPECT_NEAR(shadowed[c] - (legacy[c] - s), (lit[c] - (legacy[c] - s)) * m[c], 1e-5f) << c;
+      }
+    }
+  }
+}
+
+TEST(CompositeRules, LsmUnitMaskExact) {
+  std::mt19937 rng{53};
+  std::uniform_real_distribution<float> unit(0.f, 1.f);
+  for (int i = 0; i < 256; ++i) {
+    const std::array<float, 3> fc{unit(rng), unit(rng), unit(rng)};
+    const float q = unit(rng);
+    // A white texel decodes to exactly 1 under any fog, so the mask's clear never shades P
+    EXPECT_EQ(fakeshadow::lsm::term({1.f, 1.f, 1.f}, q, fc), (std::array<float, 3>{1.f, 1.f, 1.f}));
+    const std::array<float, 3> legacy{unit(rng), unit(rng), unit(rng)};
+    const std::array<float, 4> hdr{unit(rng) * 4.f, unit(rng), unit(rng), 1.f};
+    const auto q7 = static_cast<uint32_t>(rng() % 128);
+    const float ao = unit(rng);
+    EXPECT_EQ(composite::testing::legacy_pbr_hdr(legacy, fc, q7, ao, 1.f, hdr, 0.3f, 1.5f, true, {1.f, 1.f, 1.f}),
+              composite::testing::legacy_pbr_hdr(legacy, fc, q7, ao, 1.f, hdr, 0.3f, 1.5f, true));
+  }
 }
 
 TEST(CompositeRules, NoFogEnvParses) {
@@ -1252,14 +1348,14 @@ TEST_F(CompositeGraph, BindingOrderLegacyFogNormalAoSurfaceHdr) {
   const NodeId node = graph->find_node(composite::Pass);
   ASSERT_EQ(graph->nodes[node].status, CullReason::None);
   const auto uses = graph->node_uses(node);
-  ASSERT_EQ(uses.size(), 9u);
-  const std::array<std::string_view, 9> names{
-      composite::LegacyTex, resource::Fog,      resource::GxNormal,           resource::AoFinal,
-      resource::Surface,    resource::SceneHdr, lighting::exposure::Resource, resource::SsilIrradiance,
-      resource::GxColor};
+  ASSERT_EQ(uses.size(), 10u);
+  const std::array<std::string_view, 10> names{
+      composite::LegacyTex,      resource::Fog,      resource::GxNormal,           resource::AoFinal,
+      resource::Surface,         resource::SceneHdr, lighting::exposure::Resource, resource::SsilIrradiance,
+      fakeshadow::lsm::Resource, resource::GxColor};
   for (size_t i = 0; i < names.size(); ++i) {
     EXPECT_EQ(graph->resources[uses[i].resource].name, names[i]) << i;
-    EXPECT_EQ(uses[i].access, i == 6 ? Access::Uniform : i == 8 ? Access::ColorRMW : Access::Sampled) << i;
+    EXPECT_EQ(uses[i].access, i == 6 ? Access::Uniform : i == 9 ? Access::ColorRMW : Access::Sampled) << i;
     if (i < 4) {
       EXPECT_EQ(uses[i].missing, Missing::DisablePass) << i;
     }
@@ -1287,7 +1383,7 @@ TEST_F(CompositeGraph, BindingOrderAppendsExposure) {
   const NodeId node = graph->find_node(composite::Pass);
   ASSERT_EQ(graph->nodes[node].status, CullReason::None);
   const auto uses = graph->node_uses(node);
-  ASSERT_EQ(uses.size(), 9u);
+  ASSERT_EQ(uses.size(), 10u);
   EXPECT_EQ(graph->resources[uses[composite::BindExposure].resource].name, lighting::exposure::Resource);
   EXPECT_FALSE(uses[composite::BindExposure].staticDummy);
   EXPECT_EQ(composite::check_contract(*graph), std::nullopt);
@@ -1624,6 +1720,90 @@ TEST_F(CompositeGraph, BlendChangeKeepsGraphHash) {
   }
 }
 
+TEST_F(CompositeGraph, BindingOrderAppendsLsm) {
+  ASSERT_TRUE(use_pbr_tier());
+  StubHdr hdr;
+  produce_hdr(hdr);
+  const auto bare = live_graph(pbr_settings(0.f, Quality::High));
+  const auto bareUses = bare->node_uses(bare->find_node(composite::Pass));
+  ASSERT_EQ(bareUses.size(), 10u);
+  EXPECT_EQ(bare->resources[bareUses[composite::BindLsm].resource].name, fakeshadow::lsm::Resource);
+  EXPECT_TRUE(bareUses[composite::BindLsm].staticDummy);
+  StubLsm mask;
+  register_pass(stub_lsm_desc(mask));
+  const auto graph = live_graph(pbr_settings(0.f, Quality::High));
+  const NodeId node = graph->find_node(composite::Pass);
+  ASSERT_EQ(graph->nodes[node].status, CullReason::None);
+  const auto uses = graph->node_uses(node);
+  ASSERT_EQ(uses.size(), 10u);
+  EXPECT_EQ(graph->resources[uses[composite::BindLsm].resource].name, fakeshadow::lsm::Resource);
+  EXPECT_EQ(uses[composite::BindLsm].access, Access::Sampled);
+  EXPECT_EQ(uses[composite::BindLsm].missing, Missing::BindDummyWhite);
+  EXPECT_FALSE(uses[composite::BindLsm].staticDummy);
+  EXPECT_EQ(graph->resources[uses[composite::BindLsm + 1].resource].name, resource::GxColor);
+  EXPECT_EQ(composite::check_contract(*graph), std::nullopt);
+}
+
+TEST_F(CompositeGraph, LsmBindsWhiteDummyWhenOff) {
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  const auto graph = live_graph(ao_settings());
+  const auto uses = graph->node_uses(graph->find_node(composite::Pass));
+  ASSERT_GT(uses.size(), composite::BindLsm);
+  EXPECT_EQ(graph->resources[uses[composite::BindLsm].resource].name, fakeshadow::lsm::Resource);
+  EXPECT_EQ(uses[composite::BindLsm].missing, Missing::BindDummyWhite);
+  EXPECT_TRUE(uses[composite::BindLsm].staticDummy);
+  EXPECT_EQ(latched_params(*graph).flags & composite::FlagLsm, 0u);
+}
+
+TEST_F(CompositeGraph, FlagLsmOnlyWhenPassRan) {
+  ASSERT_TRUE(use_pbr_tier());
+  StubAo stub;
+  register_pass(stub_ao_desc(stub));
+  StubHdr hdr;
+  produce_hdr(hdr);
+  StubLsm mask;
+  register_pass(stub_lsm_desc(mask));
+  uint64_t frame = 0;
+  const auto flags_of = [&](const std::shared_ptr<CompiledGraph>& graph) -> std::optional<uint32_t> {
+    const FrameState state{.graph = graph};
+    StageData stage = build(state, ++frame);
+    EXPECT_EQ(encode(stage), std::nullopt);
+    const NodeId node = graph->find_node(composite::Pass);
+    for (const StageBindings::Params& params : stage.bindings.params) {
+      if (params.node == node) {
+        composite::Params out;
+        std::memcpy(&out, params.bytes.data(), sizeof(out));
+        return out.flags;
+      }
+    }
+    return std::nullopt;
+  };
+  // The latched params never carry it; only a frame whose mask pass ran sets it at stage build
+  const auto pbr = live_graph(pbr_settings(0.f, Quality::High));
+  EXPECT_EQ(latched_params(*pbr).flags & composite::FlagLsm, 0u);
+  const std::optional<uint32_t> ran = flags_of(pbr);
+  ASSERT_TRUE(ran.has_value());
+  EXPECT_NE(*ran & composite::FlagPbr, 0u);
+  EXPECT_NE(*ran & composite::FlagLsm, 0u);
+  mask.enabled = false;
+  const std::optional<uint32_t> skipped = flags_of(pbr);
+  ASSERT_TRUE(skipped.has_value());
+  EXPECT_EQ(*skipped & composite::FlagLsm, 0u);
+  mask.enabled = true;
+  const auto blendOne = live_graph(pbr_settings(1.f, Quality::High));
+  EXPECT_EQ(blendOne->graphHash, pbr->graphHash);
+  const std::optional<uint32_t> legacy = flags_of(blendOne);
+  ASSERT_TRUE(legacy.has_value());
+  EXPECT_EQ(*legacy & (composite::FlagPbr | composite::FlagLsm), 0u);
+  composite::testing::force_params(composite::Params{.flags = composite::FlagPbr | composite::FlagIdentity});
+  const auto identity = live_graph(pbr_settings(0.f, Quality::High));
+  const std::optional<uint32_t> forced = flags_of(identity);
+  ASSERT_TRUE(forced.has_value());
+  EXPECT_EQ(*forced & composite::FlagLsm, 0u);
+  composite::testing::force_params(std::nullopt);
+}
+
 TEST_F(CompositeGraph, BindingOrderAppendsSsil) {
   StubAo stub;
   register_pass(stub_ao_desc(stub));
@@ -1633,12 +1813,12 @@ TEST_F(CompositeGraph, BindingOrderAppendsSsil) {
   const auto graph = live_graph(ao_settings());
   const NodeId node = graph->find_node(composite::Pass);
   const auto uses = graph->node_uses(node);
-  ASSERT_EQ(uses.size(), 10u);
+  ASSERT_EQ(uses.size(), 11u);
   EXPECT_EQ(graph->resources[uses[composite::BindSsil].resource].name, resource::SsilIrradiance);
   EXPECT_EQ(uses[composite::BindSsil].missing, Missing::BindDummyBlack);
   EXPECT_FALSE(uses[composite::BindSsil].staticDummy);
-  EXPECT_EQ(graph->resources[uses[8].resource].name, resource::GxColor);
-  EXPECT_EQ(graph->resources[uses[9].resource].name, resource::RadianceDefogged);
+  EXPECT_EQ(graph->resources[uses[9].resource].name, resource::GxColor);
+  EXPECT_EQ(graph->resources[uses[10].resource].name, resource::RadianceDefogged);
   EXPECT_TRUE(composite::ssil_bound(*graph));
   const composite::Params params = latched_params(*graph);
   EXPECT_NE(params.flags & composite::FlagSsil, 0u);
@@ -2255,12 +2435,12 @@ TEST_F(CompositeGraph, RadianceIsSecondAttachmentAfterColor) {
   ASSERT_TRUE(composite::radiance_bound(*graph));
   const NodeId node = graph->find_node(composite::Pass);
   const auto uses = graph->node_uses(node);
-  ASSERT_EQ(uses.size(), 10u);
-  EXPECT_EQ(graph->resources[uses[8].resource].name, resource::GxColor);
-  EXPECT_EQ(uses[8].access, Access::ColorRMW);
-  EXPECT_EQ(graph->resources[uses[9].resource].name, resource::RadianceDefogged);
-  EXPECT_EQ(uses[9].access, Access::ColorWrite);
-  const CompiledResource& radiance = graph->resources[uses[9].resource];
+  ASSERT_EQ(uses.size(), 11u);
+  EXPECT_EQ(graph->resources[uses[9].resource].name, resource::GxColor);
+  EXPECT_EQ(uses[9].access, Access::ColorRMW);
+  EXPECT_EQ(graph->resources[uses[10].resource].name, resource::RadianceDefogged);
+  EXPECT_EQ(uses[10].access, Access::ColorWrite);
+  const CompiledResource& radiance = graph->resources[uses[10].resource];
   const CompiledResource& legacy = graph->resources[graph->find_resource(composite::LegacyTex)];
   EXPECT_EQ(radiance.kind, ResourceKind::History);
   EXPECT_EQ(radiance.creator, node);
@@ -2271,12 +2451,13 @@ TEST_F(CompositeGraph, RadianceIsSecondAttachmentAfterColor) {
   EXPECT_EQ(radiance.extent.height, legacy.extent.height);
   EXPECT_NE(radiance.textureUsage & wgpu::TextureUsage::TextureBinding, wgpu::TextureUsage::None);
   EXPECT_NE(radiance.textureUsage & wgpu::TextureUsage::RenderAttachment, wgpu::TextureUsage::None);
-  for (size_t i = 0; i < 8; ++i) {
+  for (size_t i = 0; i < 9; ++i) {
     EXPECT_NE(uses[i].access, Access::ColorWrite) << i;
   }
-  const std::array<std::string_view, 8> inputs{
-      composite::LegacyTex, resource::Fog,      resource::GxNormal,           resource::AoFinal,
-      resource::Surface,    resource::SceneHdr, lighting::exposure::Resource, resource::SsilIrradiance};
+  const std::array<std::string_view, 9> inputs{
+      composite::LegacyTex,     resource::Fog,      resource::GxNormal,           resource::AoFinal,
+      resource::Surface,        resource::SceneHdr, lighting::exposure::Resource, resource::SsilIrradiance,
+      fakeshadow::lsm::Resource};
   for (size_t i = 0; i < inputs.size(); ++i) {
     EXPECT_EQ(graph->resources[uses[i].resource].name, inputs[i]) << i;
   }
@@ -2302,7 +2483,7 @@ TEST_F(CompositeGraph, SsilOffKeepsGraphAndPipeline) {
   ASSERT_EQ(off->nodes[node].status, CullReason::None);
   EXPECT_FALSE(composite::radiance_bound(*off));
   EXPECT_EQ(off->find_resource(resource::RadianceDefogged), InvalidResource);
-  EXPECT_EQ(off->node_uses(node).size(), 9u);
+  EXPECT_EQ(off->node_uses(node).size(), 10u);
   const composite::Params offParams = latched_params(*off);
   composite::testing::set_radiance_forced(true);
   const auto on = live_graph(ao_settings());
@@ -2546,6 +2727,8 @@ struct PixelRun {
   bool radiance = false;
   uint32_t radianceClears = 0;
   std::function<std::array<float, 4>(size_t)> ssil;
+  // RGBA bytes of lsm.mask per pixel; set, a stub replays it as the mask pass would
+  std::function<std::array<uint8_t, 4>(size_t)> mask;
 };
 
 Pixel control() { return {.color = {200, 180, 160, 255}, .code = 1, .fc = {}, .q7 = 0, .ao = 64}; }
@@ -2725,6 +2908,25 @@ protected:
       m_device->queue.WriteBuffer(ssil.staging, 0, texels.data(), texels.size() * 2);
       ssilId = register_pass(stub_ssil_desc(ssil));
     }
+    StubLsm lsm;
+    PassId lsmId = InvalidPassId;
+    if (options.mask) {
+      lsm.rowBytes = (width * 4 + 255) & ~255u;
+      std::vector<uint8_t> texels(size_t{lsm.rowBytes} * height, 0);
+      for (size_t i = 0; i < pixels.size(); ++i) {
+        const std::array<uint8_t, 4> rgba = options.mask(i);
+        uint8_t* texel = texels.data() + (i / width) * lsm.rowBytes + (i % width) * 4;
+        texel[0] = rgba[2];
+        texel[1] = rgba[1];
+        texel[2] = rgba[0];
+        texel[3] = rgba[3];
+      }
+      const wgpu::BufferDescriptor lsmDescriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                                 .size = texels.size()};
+      lsm.staging = m_device->device.CreateBuffer(&lsmDescriptor);
+      m_device->queue.WriteBuffer(lsm.staging, 0, texels.data(), texels.size());
+      lsmId = register_pass(stub_lsm_desc(lsm));
+    }
     RadianceProbe probe;
     const PassId probeId = options.radiance ? register_pass(radiance_probe_desc(probe)) : InvalidPassId;
     const composite::testing::Counters before = composite::testing::counters();
@@ -2748,6 +2950,10 @@ protected:
     }
     if (hdrId != InvalidPassId) {
       unregister_pass(hdrId);
+    }
+    if (lsmId != InvalidPassId) {
+      EXPECT_EQ(lsm.calls, 1);
+      unregister_pass(lsmId);
     }
     if (ssilId != InvalidPassId) {
       EXPECT_TRUE(composite::ssil_bound(*graph));
@@ -2796,11 +3002,12 @@ protected:
   }
 
   static std::array<int, 3> pbr_mirror(const Pixel& p, float legacyBlend, float e = 1.f, bool agx = false,
-                                       std::optional<std::array<float, 4>> hdr = std::nullopt) {
+                                       std::optional<std::array<float, 4>> hdr = std::nullopt,
+                                       std::array<float, 3> m = {1.f, 1.f, 1.f}) {
     const std::array<float, 3> l{p.color.r / 255.f, p.color.g / 255.f, p.color.b / 255.f};
     const std::array<float, 3> fc{p.fc[0] / 255.f, p.fc[1] / 255.f, p.fc[2] / 255.f};
-    const std::array<float, 3> out = composite::testing::legacy_pbr_hdr(l, fc, p.q7, p.ao / 255.f, p.code / 3.f,
-                                                                        hdr.value_or(hdr_of(p)), legacyBlend, e, agx);
+    const std::array<float, 3> out = composite::testing::legacy_pbr_hdr(
+        l, fc, p.q7, p.ao / 255.f, p.code / 3.f, hdr.value_or(hdr_of(p)), legacyBlend, e, agx, m);
     return {to_byte(out[0]), to_byte(out[1]), to_byte(out[2])};
   }
 
@@ -3550,6 +3757,83 @@ TEST_F(CompositeGpu, IdentityForcedIgnoresPbr) {
     ASSERT_TRUE(same(out[i], pixels[i].color)) << i;
   }
 }
+TEST_F(CompositeGpu, LsmPreShadowReceiverMasked) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  std::mt19937 rng{71};
+  const auto pixels = grid(64, 48, [&](uint32_t x, uint32_t) { return random_pixel(rng, x % 4 == 0 ? 0 : 1); });
+  std::vector<std::array<uint8_t, 4>> masks(pixels.size());
+  for (size_t i = 0; i < masks.size(); ++i) {
+    // Every third texel stays white, the rest carry a kept fake of any strength and hue
+    masks[i] = i % 3 == 0 ? std::array<uint8_t, 4>{255, 255, 255, 0}
+                          : std::array<uint8_t, 4>{static_cast<uint8_t>(rng()), static_cast<uint8_t>(rng()),
+                                                   static_cast<uint8_t>(rng()), static_cast<uint8_t>(rng())};
+  }
+  const auto off = run_pixels(64, 48, pixels, {.settings = pbr_settings(0.f, Quality::High)});
+  const auto out = run_pixels(
+      64, 48, pixels, {.settings = pbr_settings(0.f, Quality::High), .mask = [&](size_t i) { return masks[i]; }});
+  size_t masked = 0;
+  for (size_t i = 0; i < out.size(); ++i) {
+    const Pixel& p = pixels[i];
+    if (p.cls == 0) {
+      ASSERT_TRUE(same(out[i], off[i])) << i;
+      continue;
+    }
+    if (guard_tie(p)) {
+      continue;
+    }
+    const float q = static_cast<float>(p.q7) / 127.f;
+    const std::array<float, 3> m =
+        fakeshadow::lsm::term({masks[i][0] / 255.f, masks[i][1] / 255.f, masks[i][2] / 255.f}, q,
+                              {p.fc[0] / 255.f, p.fc[1] / 255.f, p.fc[2] / 255.f});
+    ASSERT_TRUE(same_rgb(out[i], pbr_mirror(p, 0.f, 1.f, false, std::nullopt, m), 1)) << i;
+    if (i % 3 == 0) {
+      ASSERT_TRUE(same(out[i], off[i])) << i;
+    }
+    masked += same(out[i], off[i]) ? 0 : 1;
+  }
+  EXPECT_GT(masked, out.size() / 8);
+}
+
+TEST_F(CompositeGpu, LsmPostShadowReceiverUnmasked) {
+  if (composite::identity_forced()) {
+    GTEST_SKIP() << "AURORA_RENDER_COMPOSITE_IDENTITY is set";
+  }
+  std::mt19937 rng{73};
+  const auto pixels = grid(64, 48, [&](uint32_t, uint32_t) { return random_pixel(rng, 1); });
+  // Pixels drawn after the game's fake-shadow pass write 0.75, which the fakes never darkened
+  const auto post = [](std::array<uint16_t, 4>& words, size_t) {
+    words[3] = lighting::openpbr::to_half(fakeshadow::lsm::PostShadowAlpha);
+  };
+  const auto dark = [](size_t) { return std::array<uint8_t, 4>{30, 40, 50, 0}; };
+  const auto off = run_pixels(64, 48, pixels, {.settings = pbr_settings(0.f, Quality::High), .hdrEdit = post});
+  const auto out =
+      run_pixels(64, 48, pixels, {.settings = pbr_settings(0.f, Quality::High), .hdrEdit = post, .mask = dark});
+  for (size_t i = 0; i < out.size(); ++i) {
+    ASSERT_TRUE(same(out[i], off[i])) << i;
+  }
+  const auto pre = run_pixels(64, 48, pixels, {.settings = pbr_settings(0.f, Quality::High), .mask = dark});
+  size_t masked = 0;
+  for (size_t i = 0; i < pre.size(); ++i) {
+    masked += same(pre[i], off[i]) ? 0 : 1;
+  }
+  EXPECT_GT(masked, pre.size() / 4);
+}
+
+TEST_F(CompositeGpu, LsmUnitMaskDiscards) {
+  std::mt19937 rng{79};
+  const auto pixels = grid(64, 48, [&](uint32_t x, uint32_t) { return random_pixel(rng, x % 3 == 0 ? 0 : 1); });
+  const auto white = [](size_t) { return std::array<uint8_t, 4>{255, 255, 255, 64}; };
+  for (const float lb : {0.f, 0.5f, 1.f}) {
+    const auto off = run_pixels(64, 48, pixels, {.settings = pbr_settings(lb, Quality::High)});
+    const auto out = run_pixels(64, 48, pixels, {.settings = pbr_settings(lb, Quality::High), .mask = white});
+    for (size_t i = 0; i < out.size(); ++i) {
+      ASSERT_TRUE(same(out[i], off[i])) << lb << " " << i;
+    }
+  }
+}
+
 float srgb_linear(float s) { return s <= 0.04045f ? s / 12.92f : std::pow((s + 0.055f) / 1.055f, 2.4f); }
 
 float half_ulp(float x) {

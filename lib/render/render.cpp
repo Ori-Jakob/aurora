@@ -15,6 +15,7 @@
 #include "debug/views.hpp"
 #include "debug/vsm_view.hpp"
 #include "fakeshadow/gate.hpp"
+#include "fakeshadow/lsm.hpp"
 #include "geometry/compact.hpp"
 #include "geometry/hzb.hpp"
 #include "gx_ext/ext_provider.hpp"
@@ -120,6 +121,7 @@ void initialize() {
   taa::initialize();
   ao::initialize();
   composite::initialize();
+  fakeshadow::lsm::initialize();
   lighting::clusters::initialize();
   lighting::openpbr::initialize();
   lighting::deferred::initialize();
@@ -163,6 +165,7 @@ void shutdown() noexcept {
   systems::shutdown();
   debug::shutdown_classification();
   debug::shutdown();
+  fakeshadow::lsm::shutdown();
   scene::capture_list::shutdown();
   scene::streamout::shutdown();
   scene::meshlets::shutdown();

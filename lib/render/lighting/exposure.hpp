@@ -71,6 +71,7 @@ enum ParamFlags : uint32_t {
   FlagReset = 1u << 3,
   FlagSsil = 1u << 4,
   FlagSsilExposed = 1u << 5,
+  FlagLsm = 1u << 6,
 };
 
 enum StateFlags : uint32_t {
@@ -157,5 +158,7 @@ void set_target(std::optional<Target> target) noexcept;
 [[nodiscard]] std::array<uint32_t, 8> texels(const Solved& state) noexcept;
 [[nodiscard]] std::array<float, 4> words(const Solved& state) noexcept;
 [[nodiscard]] float smoothing_alpha(float dt, float tau) noexcept;
+// The composite multiplies stored sRGB by m, so the meter reads that product back in linear light
+[[nodiscard]] std::array<float, 3> masked(std::array<float, 3> mapped, std::array<float, 3> m) noexcept;
 } // namespace testing
 } // namespace aurora::render::detail::lighting::exposure

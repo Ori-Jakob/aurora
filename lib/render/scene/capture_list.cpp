@@ -77,6 +77,11 @@ gfx::PipelineRef ready_ref(const gx::PipelineConfig& config, const gfx::RenderTa
                                                          : gfx::ready_pipeline(config, layout);
 }
 
+// A replay blocks on every pipeline it draws with, so its clones wait too and its repeats stay bit-identical
+gfx::PipelineRef blocking_ref(const gx::PipelineConfig& config, const gfx::RenderTargetLayout& layout) noexcept {
+  return g_hooks == nullptr && gfx::blocking_pipelines() ? gfx::find_debug_pipeline(config, layout) : 0;
+}
+
 void warm_ref(const gx::PipelineConfig& config, const gfx::RenderTargetLayout& layout) noexcept {
   if (g_hooks != nullptr && g_hooks->warm != nullptr) {
     g_hooks->warm(config, layout);
@@ -343,6 +348,17 @@ void set_enabled(ConsumerId id, bool enabled) noexcept {
   }
 }
 
+void set_layout(ConsumerId id, const gfx::RenderTargetLayout& layout) noexcept {
+  if (id < MaxConsumers && g_slots[id].registered) {
+    g_slots[id].consumer.layout = layout;
+  }
+}
+
+bool owns(ConsumerId id, const Consumer& consumer) noexcept {
+  return id < MaxConsumers && g_slots[id].registered && g_slots[id].consumer.select == consumer.select &&
+         g_slots[id].consumer.user == consumer.user;
+}
+
 void apply_frame_state() noexcept {
   if (g_check.consumer != InvalidConsumer) {
     g_slots[g_check.consumer].consumer.layout = check_layout();
@@ -395,7 +411,10 @@ void on_push(const gx::DrawData& draw, const gx::PipelineConfig& config, const D
     if (consumer.layout.key != targetKey) {
       gx::PipelineConfig legacy = config;
       legacy.shaderConfig.ext = {};
-      const gfx::PipelineRef ref = ready_ref(legacy, consumer.layout);
+      gfx::PipelineRef ref = ready_ref(legacy, consumer.layout);
+      if (ref == 0) {
+        ref = blocking_ref(legacy, consumer.layout);
+      }
       if (ref == 0) {
         warm_ref(legacy, consumer.layout);
         bump(g_counts.pending);
@@ -415,6 +434,8 @@ void on_push(const gx::DrawData& draw, const gx::PipelineConfig& config, const D
     bump(g_counts.cloned);
   }
 }
+
+uint32_t queued(ConsumerId id) noexcept { return id < MaxConsumers ? gfx::queued_capture_draws(id) : 0; }
 
 void encode(const detail::PassContext& ctx, const wgpu::RenderPassEncoder& pass, ConsumerId id) {
   const auto& frame = ctx.stage_data().captureList;

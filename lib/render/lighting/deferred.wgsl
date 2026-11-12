@@ -270,5 +270,7 @@ fn shade(@builtin(global_invocation_id) id: vec3u, @builtin(local_invocation_ind
     textureStore(scene_hdr, px, vec4f(0.0));
     return;
   }
-  textureStore(scene_hdr, px, vec4f(clamp(h, vec3f(0.0), vec3f(DEFERRED_HDR_MAX)), 1.0));
+  // Readers take any alpha from 0.5 as PBR; only the shadow mask tells pixels drawn after the game's fakes apart
+  let alpha = select(1.0, 0.75, (entry.x & GBUF_SURFACE_ENTRY_POST_SHADOW) != 0u);
+  textureStore(scene_hdr, px, vec4f(clamp(h, vec3f(0.0), vec3f(DEFERRED_HDR_MAX)), alpha));
 }

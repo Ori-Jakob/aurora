@@ -59,11 +59,15 @@ struct Stats {
 ConsumerId register_consumer(const Consumer& consumer) noexcept;
 void unregister_consumer(ConsumerId id) noexcept;
 void set_enabled(ConsumerId id, bool enabled) noexcept;
+void set_layout(ConsumerId id, const gfx::RenderTargetLayout& layout) noexcept;
+// A reset frees every slot, so an owner checks its id still holds its own consumer before toggling it
+[[nodiscard]] bool owns(ConsumerId id, const Consumer& consumer) noexcept;
 // FIFO idle
 void apply_frame_state() noexcept;
 // FIFO thread; the mask each push receives is the one its own route returned
 [[nodiscard]] uint8_t select(const DrawClass& cls, const gx::draw_route::Query& query) noexcept;
 void on_push(const gx::DrawData& draw, const gx::PipelineConfig& config, const DrawClass& cls, uint8_t mask) noexcept;
+[[nodiscard]] uint32_t queued(ConsumerId id) noexcept;
 // Render worker, inside the consumer's own phase.capture pass on a target of the consumer's layout
 void encode(const detail::PassContext& ctx, const wgpu::RenderPassEncoder& pass, ConsumerId id);
 [[nodiscard]] Stats stats() noexcept;

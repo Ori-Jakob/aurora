@@ -1433,6 +1433,7 @@ struct GpuPixel {
   double z = 500.0;
   uint8_t receiver = 1;
   bool slot = true;
+  uint32_t entryBits = 0;
 };
 
 uint32_t unorm10(double value) {
@@ -1608,7 +1609,7 @@ protected:
       uint32_t slot = 0;
       if (p.slot) {
         const gx::surface::Entry entry{
-            uint32_t{p.cls} | uint32_t{p.flags} << 8 | uint32_t{p.category} << 16,
+            uint32_t{p.cls} | uint32_t{p.flags} << 8 | uint32_t{p.category} << 16 | p.entryBits,
             uint32_t{p.ambient[0]} | uint32_t{p.ambient[1]} << 8 | uint32_t{p.ambient[2]} << 16, 0, 0};
         const auto [it, added] = slots.try_emplace(entry, static_cast<uint32_t>(m_table.entries.size()));
         if (added) {
@@ -2399,6 +2400,35 @@ TEST_F(LightDeferredGpu, ClassZeroUnlitAndSkyWriteZero) {
     } else {
       EXPECT_EQ(hdr[i], (std::array<uint16_t, 4>{})) << i;
     }
+  }
+}
+
+class DeferredGraph : public LightDeferredGpu {};
+
+TEST_F(DeferredGraph, PostShadowAlpha) {
+  std::mt19937 rng{0x75u};
+  set_hints(scene_hints(mixed_lights()));
+  std::vector<GpuPixel> pixels(size_t{64} * 48);
+  for (GpuPixel& pixel : pixels) {
+    pixel = random_gpu_pixel(rng);
+  }
+  stage_pixels(64, 48, pixels);
+  deferred::testing::force_enabled(true);
+  const auto plain = run_hdr(pbr_settings());
+  for (size_t i = 0; i < pixels.size(); i += 2) {
+    pixels[i].entryBits = gx::surface::EntryPostShadow;
+  }
+  stage_pixels(64, 48, pixels);
+  const auto flagged = run_hdr(pbr_settings(), 2);
+  ASSERT_EQ(plain.size(), pixels.size());
+  ASSERT_EQ(flagged.size(), pixels.size());
+  for (size_t i = 0; i < pixels.size(); ++i) {
+    // Only alpha tells the composite which pixels the game's fakes never darkened
+    for (size_t c = 0; c < 3; ++c) {
+      ASSERT_EQ(flagged[i][c], plain[i][c]) << i;
+    }
+    ASSERT_EQ(openpbr::from_half(plain[i][3]), 1.f) << i;
+    ASSERT_EQ(openpbr::from_half(flagged[i][3]), i % 2 == 0 ? 0.75f : 1.f) << i;
   }
 }
 

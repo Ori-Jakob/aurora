@@ -3,6 +3,9 @@
 //#if DECOMP_MULTIPLY
 //#import aurora/ao
 //#endif
+//#if DECOMP_LSM
+//#import aurora/lsm
+//#endif
 
 @group(1) @binding(0) var color_tex: texture_2d<f32>;
 @group(1) @binding(1) var fog_tex: texture_2d<u32>;
@@ -15,6 +18,10 @@
 //#endif
 //#if DECOMP_MULTIPLY
 @group(1) @binding(3) var ao_tex: texture_2d<f32>;
+//#endif
+//#if DECOMP_LSM
+@group(1) @binding(3) var lsm_tex: texture_2d<f32>;
+@group(1) @binding(4) var hdr_tex: texture_2d<f32>;
 //#endif
 
 const IDENTITY_UNCHANGED = vec3f(0.0, 0.0, 0.0);
@@ -29,6 +36,7 @@ const COVERAGE_FOGGED_RECEIVER = vec3f(60.0, 200.0, 60.0) / 255.0;
 const COVERAGE_LOCKED_RECEIVER = vec3f(255.0, 160.0, 0.0) / 255.0;
 const COVERAGE_BAD = vec3f(255.0, 0.0, 255.0) / 255.0;
 const DEFOG_BAD = vec3f(255.0, 0.0, 255.0) / 255.0;
+const LSM_POST_SHADOW_TINT = vec3f(0.0, 220.0, 220.0) / 255.0;
 
 struct ViewVarying {
   @builtin(position) position: vec4f,
@@ -118,10 +126,22 @@ fn mode_color(uv: vec2f) -> vec3f {
   return select(d.l.rgb, d.l.rgb * fetch(ao_tex, uv).r, d.code >= 1u);
 }
 //#else
+//#if DECOMP_LSM
+fn mode_color(uv: vec2f) -> vec3f {
+  let mask = fetch(lsm_tex, uv).rgb;
+  let a = fetch(hdr_tex, uv).a;
+  if (lsm_pre_shadow(a)) {
+    let rec = gbuf_fog_decode(fetch_record(uv));
+    return lsm_term(mask, rec.q, rec.fc);
+  }
+  return select(mask, mix(mask, LSM_POST_SHADOW_TINT, 0.5), a >= 0.5);
+}
+//#else
 fn mode_color(uv: vec2f) -> vec3f {
   let d = decode(fetch(color_tex, uv), uv);
   return select(saturate(d.s), DEFOG_BAD, d.bad);
 }
+//#endif
 //#endif
 //#endif
 //#endif

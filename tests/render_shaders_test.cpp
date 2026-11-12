@@ -480,8 +480,9 @@ TEST_F(RenderShaders, GbufViewUintVariantCompiles) {
 }
 
 TEST_F(RenderShaders, DecompViewPipelinesBuild) {
-  for (const debug::DecompMode mode : {debug::DecompMode::Defog, debug::DecompMode::Identity,
-                                       debug::DecompMode::Coverage, debug::DecompMode::Multiply}) {
+  for (const debug::DecompMode mode :
+       {debug::DecompMode::Defog, debug::DecompMode::Identity, debug::DecompMode::Coverage, debug::DecompMode::Multiply,
+        debug::DecompMode::Lsm}) {
     SCOPED_TRACE(static_cast<int>(mode));
     const RenderPipelineDesc desc = debug::decomp_view::pipeline_desc(mode);
     EXPECT_EQ(desc.shader, debug::decomp_view::Shader);

@@ -724,5 +724,50 @@ TEST_F(RenderClassify, NamesCoverEveryValue) {
     }
   }
 }
+TEST_F(RenderClassify, FakeShadowPopMarksLaterDraws) {
+  main_scene();
+  EXPECT_FALSE(classifier.route(main_draw()).afterFakeShadow);
+  classifier.scope_push({.categories = category::FakeShadow | category::Decal, .role = InheritRole});
+  EXPECT_FALSE(classifier.route(main_draw()).afterFakeShadow);
+  classifier.scope_pop();
+  EXPECT_TRUE(classifier.route(main_draw()).afterFakeShadow);
+  classifier.object_begin(object(7, 0, category::Dynamic));
+  EXPECT_TRUE(classifier.route(main_draw()).afterFakeShadow);
+  classifier.object_end();
+  classifier.end_frame();
+  EXPECT_EQ(stats().postShadowMissing, 0u);
+
+  // A shadow-role scope is the game's shadow image, not its pass over the main view
+  classifier.begin_frame();
+  main_scene();
+  classifier.scope_push({.categories = category::FakeShadow, .role = static_cast<uint8_t>(Role::Shadow)});
+  classifier.scope_pop();
+  EXPECT_FALSE(classifier.route(main_draw()).afterFakeShadow);
+  classifier.scope_push({.categories = category::Decal});
+  classifier.scope_pop();
+  EXPECT_FALSE(classifier.route(main_draw()).afterFakeShadow);
+
+  // Fakes drawn with no pop seen flag nothing and count once per frame
+  classifier.begin_frame();
+  main_scene();
+  classifier.scope_push({.categories = category::FakeShadow});
+  classifier.route(main_draw());
+  classifier.end_frame();
+  EXPECT_EQ(stats().postShadowMissing, 1u);
+
+  // An overflowed pop could have been the fake-shadow scope, so it is counted
+  classifier.begin_frame();
+  main_scene();
+  for (uint32_t i = 0; i <= MaxScopeDepth; ++i) {
+    classifier.scope_push({});
+  }
+  classifier.scope_pop();
+  EXPECT_EQ(stats().postShadowMissing, 1u);
+  EXPECT_FALSE(classifier.route(main_draw()).afterFakeShadow);
+
+  classifier.begin_frame();
+  EXPECT_FALSE(classifier.route(main_draw()).afterFakeShadow);
+}
+
 } // namespace
 } // namespace aurora::render::scene

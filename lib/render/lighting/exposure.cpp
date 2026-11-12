@@ -5,6 +5,7 @@
 
 #include "../ao/ao.hpp"
 #include "../debug/views.hpp"
+#include "../fakeshadow/lsm.hpp"
 #include "../hints.hpp"
 #include "../pass_context.hpp"
 #include "../post/composite.hpp"
@@ -136,6 +137,7 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
   builder.create_buffer(Partials, {.size = PartialBytes}, Access::StorageWrite);
   builder.create_buffer(Resource, {.size = BufferBytes}, Access::StorageWrite);
   builder.use(resource::SsilIrradiance, Access::Sampled, Missing::BindDummyBlack);
+  builder.use(fakeshadow::lsm::Resource, Access::Sampled, Missing::BindDummyWhite);
 }
 
 bool meter_reads(const CompiledGraph& graph, std::string_view name) noexcept {
@@ -309,6 +311,10 @@ void fill_stage(const StageData& stage, const void*, std::span<std::byte> bytes)
   // The composite scales the bounce by e only while it applies exposure, and the target must see what it shows
   if ((params.flags & FlagSsil) != 0 && composite::exposure_units()) {
     params.flags |= FlagSsilExposed;
+  }
+  // The target must see the kept fakes the composite puts on P, on exactly the frames it does
+  if (composite::exposure_units() && !composite::identity_forced() && fakeshadow::lsm::frame_enabled(stage)) {
+    params.flags |= FlagLsm;
   }
   std::memcpy(bytes.data(), &params, sizeof(params));
 }
@@ -492,6 +498,17 @@ float exp2_exact(float s) noexcept {
   const float whole = std::floor(s);
   const float f = s - whole;
   return std::ldexp(f == 0.f ? 1.f : std::exp2(f), static_cast<int>(whole));
+}
+
+std::array<float, 3> masked(std::array<float, 3> mapped, std::array<float, 3> m) noexcept {
+  std::array<float, 3> out{};
+  for (size_t c = 0; c < out.size(); ++c) {
+    const float linear = std::clamp(mapped[c], 0.f, 1.f);
+    const float encoded = linear <= 0.0031308f ? linear * 12.92f : 1.055f * std::pow(linear, 1.f / 2.4f) - 0.055f;
+    const float stored = m[c] * encoded;
+    out[c] = stored <= 0.04045f ? stored / 12.92f : std::pow((stored + 0.055f) / 1.055f, 2.4f);
+  }
+  return out;
 }
 
 float candidate(float center, float step, uint32_t k) noexcept {

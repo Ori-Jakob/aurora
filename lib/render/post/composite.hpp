@@ -43,6 +43,7 @@ enum Binding : uint32_t {
   BindHdr = 5,
   BindExposure = 6,
   BindSsil = 7,
+  BindLsm = 8,
 };
 
 enum ParamFlags : uint32_t {
@@ -53,6 +54,8 @@ enum ParamFlags : uint32_t {
 inline constexpr uint32_t FlagPbr = 1u << 2;
 inline constexpr uint32_t FlagTonemapAgX = 1u << 3;
 inline constexpr uint32_t FlagSsil = 1u << 4;
+// Set at stage build only on frames lsm.mask replayed a kept fake, so without one m stays exactly 1
+inline constexpr uint32_t FlagLsm = 1u << 5;
 
 struct Params {
   uint32_t flags = 0;
@@ -124,7 +127,8 @@ void bump_units_epoch() noexcept;
                                              float ao, float normalAlpha) noexcept;
 [[nodiscard]] std::array<float, 3> legacy_pbr_hdr(std::array<float, 3> legacy, std::array<float, 3> fogColor,
                                                   uint32_t q7, float ao, float normalAlpha, std::array<float, 4> hdr,
-                                                  float legacyBlend, float exposure, bool agx) noexcept;
+                                                  float legacyBlend, float exposure, bool agx,
+                                                  std::array<float, 3> m = {1.f, 1.f, 1.f}) noexcept;
 [[nodiscard]] std::array<float, 2> units(uint32_t flags, float e, float invE) noexcept;
 [[nodiscard]] std::array<float, 3> legacy_ssil(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7,
                                                float ao, float normalAlpha, std::array<float, 3> bounce) noexcept;

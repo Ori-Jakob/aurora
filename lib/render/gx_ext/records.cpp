@@ -3,6 +3,7 @@
 #include "surface_table.hpp"
 #include "unlit.hpp"
 
+#include "../fakeshadow/lsm.hpp"
 #include "../hints.hpp"
 #include "../scene/classifier.hpp"
 #include "../scene/motion.hpp"
@@ -302,7 +303,11 @@ void stamp(gx::DrawData& draw, const gx::PipelineConfig& config, const gx::Shade
     count_material(g_frame, dm, config.cullMode);
     // Only admitted text writes the record; any other output-2 pipeline writes slot 0
     if (info.unlitAdmitted) {
-      const gx::surface::Entry entry = surface_entry(config, info, record.flags, cls.key.categories, dm.word);
+      gx::surface::Entry entry = surface_entry(config, info, record.flags, cls.key.categories, dm.word);
+      if (cls.afterFakeShadow && fakeshadow::lsm::consumed_fifo()) {
+        entry[0] |= gx::surface::EntryPostShadow;
+        fakeshadow::lsm::note_post_shadow();
+      }
       const uint32_t slot = surface_table::slot_for(entry);
       record.flags |= slot << flag::SurfaceSlotShift;
       g_frame.surfaceSlots += slot != 0 ? 1 : 0;

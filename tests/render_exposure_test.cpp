@@ -8,6 +8,7 @@
 #include "gx/surface_pack.hpp"
 #include "render/ao/ao.hpp"
 #include "render/debug/views.hpp"
+#include "render/fakeshadow/lsm.hpp"
 #include "render/frame_state.hpp"
 #include "render/gpu_heap.hpp"
 #include "render/graph.hpp"
@@ -642,6 +643,8 @@ Settings pbr_settings(Exposure mode = Exposure::MatchLegacy, Tonemap tm = Tonema
 struct MeterPixel {
   Rgb hdr{};
   bool lit = true;
+  // Lit after the game's fake-shadow pass, which light.deferred marks with alpha 0.75
+  bool postShadow = false;
   std::array<uint8_t, 3> legacy{128, 128, 128};
   std::array<uint8_t, 3> fc{};
   uint8_t q7 = 0;
@@ -906,6 +909,34 @@ TEST_F(ExposureGraph, RunsUnderIdentity) {
   EXPECT_TRUE(pass_enabled(*graph, build(state, 1), exposure::Pass));
 }
 
+TEST_F(ExposureGraph, BindsLsmAtNine) {
+  const auto graph = compile(pbr_settings());
+  const NodeId node = graph->find_node(exposure::Pass);
+  ASSERT_NE(node, InvalidNode);
+  const auto uses = graph->node_uses(node);
+  ASSERT_EQ(uses.size(), 10u);
+  EXPECT_EQ(graph->resources[uses[8].resource].name, resource::SsilIrradiance);
+  EXPECT_EQ(graph->resources[uses[9].resource].name, fakeshadow::lsm::Resource);
+  EXPECT_EQ(uses[9].access, Access::Sampled);
+  EXPECT_EQ(uses[9].missing, Missing::BindDummyWhite);
+  EXPECT_TRUE(uses[9].staticDummy);
+  EXPECT_EQ(exposure::FlagLsm, 64u);
+  EXPECT_EQ(live_graph(pbr_settings(Exposure::MatchLegacy, Tonemap::PbrNeutral, 1.f))->graphHash, graph->graphHash);
+}
+
+TEST(ExposureRules, MaskedCandidateMirrorsComposite) {
+  for (const float x : {0.f, 0.001f, 0.2f, 0.7f, 1.f}) {
+    const Rgb mapped{x, x * 0.5f, 1.f - x};
+    for (size_t c = 0; c < 3; ++c) {
+      EXPECT_NEAR(exposure::testing::masked(mapped, {1.f, 1.f, 1.f})[c], mapped[c], 2e-6f) << x;
+    }
+  }
+  // m scales stored sRGB, so a half-strength mask darkens mid-grey light by about 2^-2.2, not 2^-1
+  const float grey = exposure::testing::masked({0.2f, 0.2f, 0.2f}, {0.5f, 0.5f, 0.5f})[0];
+  EXPECT_NEAR(std::log2(grey / 0.2f), -2.2f, 0.15f);
+  EXPECT_EQ(exposure::testing::masked({0.5f, 0.5f, 0.5f}, {0.f, 0.f, 0.f})[1], 0.f);
+}
+
 TEST_F(ExposureGraph, StateCarriesTextureBinding) {
   const auto graph = compile(pbr_settings());
   const auto it = std::ranges::find(graph->resources, exposure::State, &CompiledResource::name);
@@ -1024,7 +1055,7 @@ protected:
         for (size_t c = 0; c < 3; ++c) {
           t[c] = lighting::openpbr::to_half(p.hdr[c]);
         }
-        t[3] = lighting::openpbr::to_half(p.lit ? 1.f : 0.f);
+        t[3] = lighting::openpbr::to_half(p.lit ? (p.postShadow ? fakeshadow::lsm::PostShadowAlpha : 1.f) : 0.f);
         ao[size_t{y} * m_ao.rowBytes + size_t{x} * 4] = p.ao;
       }
     }
@@ -1243,6 +1274,75 @@ TEST_F(ExposureGpu, MeterMatchesMirror) {
       EXPECT_NEAR(std::bit_cast<float>(second.state[0]), next.s, 1e-5f);
       EXPECT_NEAR(second.words[2], std::exp2(next.s - s), 1e-5f);
     }
+  }
+}
+
+TEST_F(ExposureGpu, MaskShadesPreShadowCandidates) {
+  std::vector<MeterPixel> pixels = scene(11, 0.3f, true);
+  std::mt19937 rng{0x15Au};
+  std::vector<std::array<uint8_t, 4>> masks(pixels.size(), std::array<uint8_t, 4>{255, 255, 255, 0});
+  for (size_t i = 0; i < pixels.size(); ++i) {
+    pixels[i].postShadow = i % 5 == 0;
+    if (i % 2 == 1) {
+      masks[i] = {static_cast<uint8_t>(60 + rng() % 150), static_cast<uint8_t>(60 + rng() % 150),
+                  static_cast<uint8_t>(60 + rng() % 150), 0};
+    }
+  }
+  load(pixels);
+  const wgpu::Extent3D size = webgpu::g_frameBuffer.size;
+  StubTexture mask{.resource = fakeshadow::lsm::Resource, .format = fakeshadow::lsm::Format, .after = phase::Capture};
+  mask.rowBytes = (size.width * 4 + 255) & ~255u;
+  std::vector<uint8_t> texels(size_t{mask.rowBytes} * size.height, 0);
+  for (size_t i = 0; i < masks.size(); ++i) {
+    uint8_t* texel = texels.data() + (i / size.width) * mask.rowBytes + (i % size.width) * 4;
+    texel[0] = masks[i][2];
+    texel[1] = masks[i][1];
+    texel[2] = masks[i][0];
+    texel[3] = masks[i][3];
+  }
+  mask.staging = staging(texels.data(), texels.size());
+  register_pass(stub_desc(mask, "test.lsm"));
+  composite::testing::set_pbr_producers_override(true);
+  for (const Tonemap tm : {Tonemap::PbrNeutral, Tonemap::AgX}) {
+    SCOPED_TRACE(static_cast<int>(tm));
+    const auto graph = live_graph(pbr_settings(Exposure::MatchLegacy, tm));
+    ASSERT_TRUE(composite::exposure_units());
+    const FrameState state{.graph = graph};
+    const Frame first = run(state, 1);
+    // A first frame snaps, so its candidates sit half an EV apart around 0
+    std::array<double, exposure::Candidates> expected{};
+    std::array<double, exposure::Candidates> unmasked{};
+    for (size_t i = 0; i < pixels.size(); ++i) {
+      const MeterPixel& p = pixels[i];
+      if (!sampled(p)) {
+        continue;
+      }
+      const float q = p.q7 / 127.f;
+      const std::array<float, 3> m =
+          p.postShadow ? std::array<float, 3>{1.f, 1.f, 1.f}
+                       : fakeshadow::lsm::term({masks[i][0] / 255.f, masks[i][1] / 255.f, masks[i][2] / 255.f}, q,
+                                               {p.fc[0] / 255.f, p.fc[1] / 255.f, p.fc[2] / 255.f});
+      const bool shaded = m[0] < 1.f || m[1] < 1.f || m[2] < 1.f;
+      for (uint32_t k = 0; k < exposure::Candidates; ++k) {
+        const float ev = exposure::testing::candidate(0.f, exposure::SnapStepEv, k);
+        const Rgb scaled{p.hdr[0] * std::exp2(ev), p.hdr[1] * std::exp2(ev), p.hdr[2] * std::exp2(ev)};
+        const Rgb mapped = tonemap::apply(scaled, tm == Tonemap::AgX);
+        const Rgb seen = shaded ? exposure::testing::masked(mapped, m) : mapped;
+        const double w = 1.0 - q;
+        expected[k] += w * std::log2(std::max(tonemap::luminance(seen), exposure::YFloor));
+        unmasked[k] += w * std::log2(std::max(tonemap::luminance(mapped), exposure::YFloor));
+      }
+    }
+    for (uint32_t k = 0; k < exposure::Candidates; ++k) {
+      double sum = 0.0;
+      for (uint32_t g = 0; g < exposure::Groups; ++g) {
+        sum += first.partials[size_t{g} * exposure::PartialWords + k];
+      }
+      EXPECT_NEAR(sum, expected[k], std::abs(expected[k]) * 1e-3 + 0.5) << k;
+      EXPECT_LE(expected[k], unmasked[k]) << k;
+    }
+    // The darkest candidates sit at the floor either way, so the mask shows from the middle up
+    EXPECT_LT(expected[exposure::Candidates / 2], unmasked[exposure::Candidates / 2] - 1.0);
   }
 }
 

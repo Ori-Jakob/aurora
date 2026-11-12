@@ -9,12 +9,13 @@ const COMPOSITE_FLAG_NO_FOG: u32 = 2u;
 const COMPOSITE_FLAG_PBR: u32 = 4u;
 const COMPOSITE_FLAG_TONEMAP_AGX: u32 = 8u;
 const COMPOSITE_FLAG_SSIL: u32 = 16u;
+const COMPOSITE_FLAG_LSM: u32 = 32u;
 
 struct CompositeTerms {
   ao: f32,
   pbr: bool,
   lb: f32,
-  m: f32,
+  m: vec3f,
   h: vec3f,
   e: f32,
   agx: bool,
@@ -29,7 +30,7 @@ struct CompositeEval {
 }
 
 fn composite_identity_terms() -> CompositeTerms {
-  return CompositeTerms(1.0, false, 1.0, 1.0, vec3f(0.0), 1.0, false, vec3f(0.0));
+  return CompositeTerms(1.0, false, 1.0, vec3f(1.0), vec3f(0.0), 1.0, false, vec3f(0.0));
 }
 
 fn composite_is_identity(t: CompositeTerms) -> bool {

@@ -2,6 +2,7 @@
 
 #include "../ao/ao.hpp"
 #include "../debug/views.hpp"
+#include "../fakeshadow/lsm.hpp"
 #include "../fakeshadow/texture_gate.hpp"
 #include "../frame_state.hpp"
 #include "../hints.hpp"
@@ -41,7 +42,8 @@ constexpr TexRef AoFinal{BindAo};
 constexpr TexRef SurfaceRec{BindSurface};
 constexpr TexRef Hdr{BindHdr};
 constexpr TexRef SsilIrr{BindSsil};
-constexpr TexRef Color{BindSsil + 1};
+constexpr TexRef LsmMask{BindLsm};
+constexpr TexRef Color{BindLsm + 1};
 // Declared after gx.color, so every binding and the Color attachment keep their numbers
 constexpr TexRef Radiance{static_cast<uint16_t>(Color.index + 1)};
 constexpr std::array<std::string_view, 1> RadianceDefines{RadianceDefine};
@@ -294,6 +296,8 @@ void declare(InternalPassBuilder& builder, const PassSetup& setup, const void*) 
                                 .dummySize = lighting::exposure::BufferBytes});
   // Always declared, so binding numbers never depend on Indirect Light
   builder.use(resource::SsilIrradiance, Access::Sampled, Missing::BindDummyBlack);
+  // Always declared, so lb and the LSM's arming never change the layout; white is m = 1
+  builder.use(fakeshadow::lsm::Resource, Access::Sampled, Missing::BindDummyWhite);
   builder.use(resource::GxColor, Access::ColorRMW);
   if (radiance_wanted(setup)) {
     // Next frame's screen-space passes sample it, so the usage cannot depend on a capture
@@ -376,7 +380,8 @@ void encode(PassContext& ctx, const void*) {
   }
   // White and black dummies are 1x1 and every load clamps, so they never fail the extent check
   for (const auto& [ref, name] : {std::pair{AoFinal, resource::AoFinal}, std::pair{SurfaceRec, resource::Surface},
-                                  std::pair{Hdr, resource::SceneHdr}, std::pair{SsilIrr, resource::SsilIrradiance}}) {
+                                  std::pair{Hdr, resource::SceneHdr}, std::pair{SsilIrr, resource::SsilIrradiance},
+                                  std::pair{LsmMask, fakeshadow::lsm::Resource}}) {
     const wgpu::Extent3D extent = ctx.extent(ref);
     if (!same_extent(extent, ctx.extent(Color)) && (extent.width != 1 || extent.height != 1)) {
       encode_mismatch(ctx, Color, ref, name);
@@ -425,8 +430,10 @@ void fill_stage(const StageData& stage, const void*, std::span<std::byte> bytes)
   // ssil.irr is pre-exposure under FlagPbr, so without the meter's e the bounce has no units to be applied in
   if ((params.flags & FlagSsil) != 0 && exposure_skipped(stage, params.flags)) {
     params.flags &= ~uint32_t{FlagSsil};
-    std::memcpy(bytes.data(), &params, sizeof(Params));
   }
+  const bool lsm = (params.flags & (FlagPbr | FlagIdentity)) == FlagPbr && fakeshadow::lsm::frame_enabled(stage);
+  params.flags = lsm ? params.flags | FlagLsm : params.flags & ~FlagLsm;
+  std::memcpy(bytes.data(), &params, sizeof(Params));
 }
 
 bool m8_env_set() noexcept {
@@ -892,7 +899,7 @@ std::array<float, 3> legacy_ao(std::array<float, 3> legacy, std::array<float, 3>
 
 std::array<float, 3> legacy_pbr_hdr(std::array<float, 3> legacy, std::array<float, 3> fogColor, uint32_t q7, float ao,
                                     float normalAlpha, std::array<float, 4> hdr, float legacyBlend, float exposure,
-                                    bool agx) noexcept {
+                                    bool agx, std::array<float, 3> m) noexcept {
   if (hdr[3] < 0.5f || legacyBlend >= 1.f) {
     return legacy_ao(legacy, fogColor, q7, ao, normalAlpha);
   }
@@ -911,7 +918,7 @@ std::array<float, 3> legacy_pbr_hdr(std::array<float, 3> legacy, std::array<floa
     const float linear = std::clamp(mapped[i], 0.f, 1.f);
     const float encoded = linear <= 0.0031308f ? linear * 12.92f : 1.055f * std::pow(linear, 1.f / 2.4f) - 0.055f;
     const float t = 1.f - legacyBlend;
-    out[i] = legacy[i] - sp + (sp * a * (1.f - t) + (1.f - q) * encoded * t);
+    out[i] = legacy[i] - sp + (sp * a * (1.f - t) + (1.f - q) * m[i] * encoded * t);
   }
   return out;
 }

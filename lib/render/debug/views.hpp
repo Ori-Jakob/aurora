@@ -56,7 +56,7 @@ inline constexpr std::array<DebugView, 8> ClassViews{{
 }};
 
 enum class GbufViewKind : uint8_t { Target, Decomposition, Retained };
-enum class DecompMode : uint32_t { Defog, Identity, Coverage, Multiply };
+enum class DecompMode : uint32_t { Defog, Identity, Coverage, Multiply, Lsm };
 enum class RetainedMode : uint32_t { Wireframe, Clusters, Coverage, AtlasPage, Albedo };
 
 struct GbufView {
@@ -111,7 +111,7 @@ struct GbufView {
 }
 
 // Target rows snapshot one scene target and decomposition rows decode several; both replace RGB before the HUD
-inline constexpr std::array<GbufView, 36> GbufViews{{
+inline constexpr std::array<GbufView, 37> GbufViews{{
     {16, "gbuf.motion", "G-buffer: motion", "gbuf.motion", "phase.post_taa", Stage::PrePost, 0, false},
     {17, "gbuf.reactive", "G-buffer: reactive", "gbuf.reactive", "phase.post_taa", Stage::PrePost, 1, false},
     {18, "gbuf.fog", "Fog record: weight", "gbuf.fog", "phase.composite", Stage::OpaqueDone, 2, true},
@@ -162,6 +162,7 @@ inline constexpr std::array<GbufView, 36> GbufViews{{
     {50, "vsm.pages", "Sun shadows: page state", "vsm.view", "phase.composite", Stage::OpaqueDone, 18, false},
     {51, "vsm.table", "Sun shadows: page tables", "vsm.view", "phase.composite", Stage::OpaqueDone, 18, false},
     {52, "vsm.pool", "Sun shadows: physical pool", "vsm.view", "phase.composite", Stage::OpaqueDone, 18, false},
+    decomp_row(53, "lsm.mask", "Game shadows: mask on PBR surfaces", "lsm.mask", "phase.composite", DecompMode::Lsm),
 }};
 
 inline constexpr uint16_t MaxDebugViewId = 63;
@@ -265,6 +266,8 @@ inline constexpr std::array<Rgb8, 5> IdentityColors{
 inline constexpr std::array<Rgb8, 6> CoverageColors{
     {{64, 64, 64}, {40, 40, 110}, {80, 160, 255}, {60, 200, 60}, {255, 160, 0}, {255, 0, 255}}};
 inline constexpr Rgb8 DefogBadColor{255, 0, 255};
+// lsm.mask shows decoded m where it applies and tints PBR drawn after the fakes, which never take it
+inline constexpr Rgb8 LsmPostShadowTint{0, 220, 220};
 
 enum class RetainedClass : uint8_t { StaticClustered, StaticUnclustered, Dynamic, Palette, Deformed, Other };
 

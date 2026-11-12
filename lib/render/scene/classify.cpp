@@ -4,6 +4,7 @@
 #include "overlay.hpp"
 
 #include "../fakeshadow/gate.hpp"
+#include "../fakeshadow/lsm.hpp"
 #include "../fakeshadow/texture_gate.hpp"
 #include "../frame_state.hpp"
 #include "../gx_ext/records.hpp"
@@ -258,6 +259,7 @@ void apply_frame_state(const detail::FrameState& state) noexcept {
   overlay::apply_frame_state(state);
   retained::apply_frame_state(state);
   g_classifier.set_count_captured(retained::active());
+  fakeshadow::lsm::apply_frame_state();
   capture_list::apply_frame_state();
 }
 

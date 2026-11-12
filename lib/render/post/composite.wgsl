@@ -1,4 +1,5 @@
 //#import aurora/composite
+//#import aurora/lsm
 
 struct CompositeParams {
   flags: u32,
@@ -31,6 +32,7 @@ struct CompositeOut {
 @group(1) @binding(5) var scene_hdr: texture_2d<f32>;
 @group(1) @binding(6) var<uniform> composite_exposure: CompositeExposure;
 @group(1) @binding(7) var ssil_irr: texture_2d<f32>;
+@group(1) @binding(8) var lsm_mask: texture_2d<f32>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
@@ -48,10 +50,12 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   let p = vec2i(pos.xy);
   var t = composite_identity_terms();
   t.ao = composite_ao_term(ao_final, scene_normal, p, (composite_params.flags & COMPOSITE_FLAG_IDENTITY) != 0u);
+  var pre_shadow = false;
   if ((composite_params.flags & (COMPOSITE_FLAG_PBR | COMPOSITE_FLAG_IDENTITY)) == COMPOSITE_FLAG_PBR) {
     let hdr = textureLoad(scene_hdr, composite_texel(p, textureDimensions(scene_hdr)), 0);
     // H already carries AO on indirect light; alpha 0 (dummy, unlit, class 0) keeps the legacy line
     if (hdr.a >= 0.5) {
+      pre_shadow = lsm_pre_shadow(hdr.a);
       t.pbr = true;
       t.lb = composite_params.legacy_blend;
       t.h = hdr.rgb;
@@ -71,6 +75,10 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   var rec = gbuf_fog_decode(textureLoad(fog_record, p, 0));
   if ((composite_params.flags & COMPOSITE_FLAG_NO_FOG) != 0u) {
     rec.q = 0.0;
+  }
+  // Sb already holds the kept fakes, so only P takes them, and only where the game drew them over
+  if ((composite_params.flags & COMPOSITE_FLAG_LSM) != 0u && pre_shadow) {
+    t.m = lsm_term(textureLoad(lsm_mask, composite_texel(p, textureDimensions(lsm_mask)), 0).rgb, rec.q, rec.fc);
   }
 //#if COMPOSITE_RADIANCE
   let l = textureLoad(legacy_tex, p, 0).rgb;
