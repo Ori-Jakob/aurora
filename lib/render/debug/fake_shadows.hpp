@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../fakeshadow/gate.hpp"
 #include "../fakeshadow/texture_gate.hpp"
 
 #include <cstdint>
@@ -39,6 +40,8 @@ void on_latch() noexcept;
 void draw_tab();
 void queue_force(fakeshadow::Gate gate, fakeshadow::Force force) noexcept;
 [[nodiscard]] fakeshadow::Force shown_force(fakeshadow::Gate gate) noexcept;
+void queue_gate_force(fakeshadow::gate::ConsumerForce force) noexcept;
+[[nodiscard]] fakeshadow::gate::ConsumerForce shown_gate_force() noexcept;
 
 [[nodiscard]] Rows build_rows(const fakeshadow::TextureReport* report, const material::Snapshot* snapshot);
 [[nodiscard]] std::string scope_text(uint16_t scopeMask, bool scoped);

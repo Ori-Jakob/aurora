@@ -70,6 +70,36 @@ protected:
   void TearDown() override { detail::testing::reset(); }
 };
 
+TEST(RenderSettings, GameShadowSuppressionWriteLevel) {
+  Settings s;
+  for (const auto [level, want] :
+       {std::pair{uint8_t{2}, GameShadows::Remove}, std::pair{uint8_t{1}, GameShadows::Auto},
+        std::pair{uint8_t{0}, GameShadows::Keep}, std::pair{uint8_t{2}, GameShadows::Remove}}) {
+    detail::write_level(s, Feature::GameShadowSuppression, level);
+    EXPECT_EQ(s.shadows.game, want) << int{level};
+    EXPECT_EQ(detail::requested_option(s, Feature::GameShadowSuppression), want == GameShadows::Auto ? 0 : level)
+        << "Auto asks for nothing while no sun shadows are on";
+  }
+  Settings remove;
+  remove.shadows.game = GameShadows::Remove;
+  const Caps caps = full_caps();
+  detail::BuiltOptions built = built_all();
+  const size_t game = static_cast<size_t>(Feature::GameShadowSuppression);
+  built[game] = 1u << 2;
+  EXPECT_EQ(detail::clamp_settings(remove, env(caps, built)).shadows.game, GameShadows::Remove);
+  built[game] = (1u << 1) | (1u << 2);
+  const Settings clamped = detail::clamp_settings(remove, env(caps, built));
+  EXPECT_EQ(clamped.shadows.game, GameShadows::Remove);
+  Settings again = clamped;
+  detail::write_level(again, Feature::GameShadowSuppression,
+                      detail::requested_option(clamped, Feature::GameShadowSuppression));
+  EXPECT_EQ(again, clamped) << "writing back the clamped level keeps Remove";
+  built[game] = 1u << 1;
+  EXPECT_EQ(detail::clamp_settings(remove, env(caps, built)).shadows.game, GameShadows::Auto);
+  built[game] = 0;
+  EXPECT_EQ(detail::clamp_settings(remove, env(caps, built)).shadows.game, GameShadows::Keep);
+}
+
 TEST(RenderSettings, ExposureEnvParses) {
   using detail::ExposureOverride;
   using detail::parse_exposure_override;

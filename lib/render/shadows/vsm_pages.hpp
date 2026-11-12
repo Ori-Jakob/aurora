@@ -456,6 +456,7 @@ void mark_encoded(uint32_t bit) noexcept;
 [[nodiscard]] detail::PersistentHandle handle(std::string_view name) noexcept;
 inline constexpr size_t PassCount = 21;
 [[nodiscard]] std::array<detail::PassDesc, PassCount> pass_descs();
+[[nodiscard]] detail::PassDesc cast_bits_pass_desc();
 
 namespace testing {
 struct WorkerCounts {

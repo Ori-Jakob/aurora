@@ -5,6 +5,7 @@
 #include "gx/hints.hpp"
 #include "gx/pipeline.hpp"
 #include "render/debug/fake_shadows.hpp"
+#include "render/fakeshadow/gate.hpp"
 #include "render/fakeshadow/texture_gate.hpp"
 #include "render/frame_state.hpp"
 #include "render/hints.hpp"
@@ -271,6 +272,26 @@ TEST_F(RenderFakeShadowsTab, PerKeyCountsInAndOutOfScope) {
   EXPECT_EQ(offRows.rows[0].counts[at(Outcome::Bound)], 6u);
   EXPECT_EQ(offRows.rows[0].counts[at(Outcome::White)], 0u);
   EXPECT_EQ(offRows.rows[0].counts[at(Outcome::GateOff)], 3u);
+}
+
+TEST_F(RenderFakeShadowsTab, GateForceQueueAppliesAtLatch) {
+  using fakeshadow::gate::ConsumerForce;
+  fakeshadow::gate::testing::reset();
+  EXPECT_EQ(shown_gate_force(), ConsumerForce::Auto);
+  queue_gate_force(ConsumerForce::On);
+  queue_gate_force(ConsumerForce::Flip30);
+  EXPECT_EQ(shown_gate_force(), ConsumerForce::Flip30);
+  EXPECT_EQ(fakeshadow::gate::force(), ConsumerForce::Auto);
+  on_latch();
+  EXPECT_EQ(fakeshadow::gate::force(), ConsumerForce::Flip30);
+  EXPECT_EQ(shown_gate_force(), ConsumerForce::Flip30);
+  shutdown();
+  EXPECT_EQ(fakeshadow::gate::force(), ConsumerForce::Auto) << "closing the tab restores Auto";
+  fakeshadow::gate::set_force(ConsumerForce::On);
+  on_latch();
+  shutdown();
+  EXPECT_EQ(fakeshadow::gate::force(), ConsumerForce::On) << "only a force the tab set is undone";
+  fakeshadow::gate::testing::reset();
 }
 
 TEST_F(RenderFakeShadowsTab, ForceQueueAppliesAtLatch) {

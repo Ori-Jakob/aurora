@@ -37,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <optional>
 
 namespace aurora::gxreplay {
 namespace {
@@ -267,6 +268,7 @@ ExitCode bring_up_aurora(int argc, char* argv[], const Options& options, const t
   // The request outlives the run-start reset, so every repeat classifies the same way
   render::scene::request_report({.records = options.classifyDraws, .objects = options.classifyObjects});
   render::scene::retained::set_demand(render::scene::retained::Demand::Tool, options.retainedJson);
+  render::fakeshadow::gate::set_replay_observer(!options.fakeShadowsJson.empty());
   if (options.retainedJson) {
     // A trace cannot capture again, so its coverage settles on delivery and quiet frames alone
     render::scene::retained::hold_coverage(false);
@@ -339,6 +341,14 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
   }
   std::ofstream retainedLines;
   const auto retainedLinesPath = m_options.outDir / "retained.json";
+  std::ofstream fakeShadowLines;
+  if (run == 0 && !m_options.fakeShadowsJson.empty()) {
+    fakeShadowLines.open(m_options.fakeShadowsJson, std::ios::binary | std::ios::trunc);
+    if (!fakeShadowLines) {
+      return fail(ExitUsage, fmt::format("failed to write {}", io::fs_path_to_string(m_options.fakeShadowsJson)),
+                  error);
+    }
+  }
   if (run == 0 && m_options.retainedJson) {
     retainedLines.open(retainedLinesPath, std::ios::binary | std::ios::trunc);
     if (!retainedLines) {
@@ -498,6 +508,20 @@ bool Replayer::replay(uint32_t run, ReplayResult& out, std::string& error) {
       if (run == 0 && m_options.seals()) {
         // The next latch would seal this frame too; sealing now keeps the report next to its frame
         render::scene::seal_frame();
+      }
+      if (fakeShadowLines.is_open()) {
+        // Startup and the state preamble seal frames of their own, so only the record sealed just now is this one
+        std::optional<render::fakeshadow::gate::ReplayFrame> latest;
+        while (auto record = render::fakeshadow::gate::take_replay_frame()) {
+          latest = record;
+        }
+        if (latest) {
+          fakeShadowLines << format_fake_shadow_line(index, *latest);
+        }
+        if (!fakeShadowLines) {
+          return fail(ExitUsage, fmt::format("failed to write {}", io::fs_path_to_string(m_options.fakeShadowsJson)),
+                      error);
+        }
       }
       if (retainedLines.is_open()) {
         const auto counts = render::scene::retained::frame_counts();

@@ -19,6 +19,7 @@
 #if AURORA_ENABLE_RENDER
 #include "debug/debug.hpp"
 #include "debug/views.hpp"
+#include "fakeshadow/gate.hpp"
 #include "gx_ext/ext_provider.hpp"
 #include "hints.hpp"
 #include "lighting/clusters.hpp"
@@ -322,6 +323,8 @@ void sanitize_non_negative(float& value, float fallback) noexcept {
   value = std::isfinite(value) ? std::max(value, 0.f) : fallback;
 }
 
+} // namespace
+
 void write_level(Settings& settings, Feature feature, uint8_t value) noexcept {
   switch (feature) {
   case Feature::Pbr:
@@ -340,7 +343,7 @@ void write_level(Settings& settings, Feature feature, uint8_t value) noexcept {
     settings.shadows.quality = static_cast<Quality>(value);
     break;
   case Feature::GameShadowSuppression:
-    settings.shadows.game = value == 0 ? GameShadows::Keep : GameShadows::Auto;
+    settings.shadows.game = value == 0 ? GameShadows::Keep : value == 2 ? GameShadows::Remove : GameShadows::Auto;
     break;
   case Feature::Gi:
     settings.gi = static_cast<GiMode>(value);
@@ -418,6 +421,7 @@ void write_level(Settings& settings, Feature feature, uint8_t value) noexcept {
   }
 }
 
+namespace {
 const Settings& initial_settings() noexcept {
   static const Settings initial = [] {
     const Caps noCaps{};
@@ -550,6 +554,33 @@ bool mat_maps_env_read() noexcept {
   return enabled;
 }
 
+GameShadowsEnv game_shadows_env_read() noexcept {
+  static const GameShadowsEnv mode = [] {
+    const char* value = SDL_getenv("AURORA_RENDER_GAME_SHADOWS");
+    if (value == nullptr) {
+      return GameShadowsEnv::Unset;
+    }
+    const std::optional<GameShadowsEnv> parsed = parse_game_shadows_env(value);
+    if (!parsed) {
+      Log.warn("AURORA_RENDER_GAME_SHADOWS={} is not keep, auto, remove, drop, count or count=all; ignored", value);
+      return GameShadowsEnv::Unset;
+    }
+    if (*parsed == GameShadowsEnv::Drop) {
+      Log.warn(
+          "AURORA_RENDER_GAME_SHADOWS=drop: suppressing FAKE_SHADOW main draws except markers (replay-only Remove)");
+    } else if (*parsed == GameShadowsEnv::Count || *parsed == GameShadowsEnv::CountAll) {
+      Log.warn("AURORA_RENDER_GAME_SHADOWS={}: selecting the double-darkening counter for development", value);
+    } else {
+      Log.warn(
+          "AURORA_RENDER_GAME_SHADOWS={}: requesting and building that level for development regardless of "
+          "settings",
+          value);
+    }
+    return *parsed;
+  }();
+  return mode;
+}
+
 struct SettingsEnv {
   bool taa = false;
   std::optional<float> sharpness;
@@ -639,6 +670,19 @@ Settings with_env_overrides(Settings settings) noexcept {
   if (const std::optional<Quality> shadows = shadows_env()) {
     settings.shadows.quality = *shadows;
   }
+  switch (game_shadows_env_read()) {
+  case GameShadowsEnv::Keep:
+    settings.shadows.game = GameShadows::Keep;
+    break;
+  case GameShadowsEnv::Auto:
+    settings.shadows.game = GameShadows::Auto;
+    break;
+  case GameShadowsEnv::Remove:
+    settings.shadows.game = GameShadows::Remove;
+    break;
+  default:
+    break;
+  }
   if (env.legacyBlend) {
     settings.legacyBlend = *env.legacyBlend;
   }
@@ -673,6 +717,10 @@ BuiltOptions support_built(const BuiltOptions& built) noexcept {
   }
   if (const std::optional<Quality> shadows = shadows_env(); shadows && *shadows != Quality::Off) {
     out[feature_index(Feature::Shadows)] |= 0x1Eu;
+  }
+  if (const GameShadowsEnv game = game_shadows_env_read();
+      game == GameShadowsEnv::Keep || game == GameShadowsEnv::Auto || game == GameShadowsEnv::Remove) {
+    out[feature_index(Feature::GameShadowSuppression)] |= 0x6u;
   }
   return out;
 }
@@ -911,6 +959,25 @@ BuiltOptions with_pbr_dev_built(BuiltOptions built, bool requested) noexcept {
 }
 
 bool mat_maps_env() noexcept { return mat_maps_env_read(); }
+
+std::optional<GameShadowsEnv> parse_game_shadows_env(std::string_view text) noexcept {
+  constexpr std::array<std::pair<std::string_view, GameShadowsEnv>, 6> Modes{{
+      {"keep", GameShadowsEnv::Keep},
+      {"auto", GameShadowsEnv::Auto},
+      {"remove", GameShadowsEnv::Remove},
+      {"drop", GameShadowsEnv::Drop},
+      {"count", GameShadowsEnv::Count},
+      {"count=all", GameShadowsEnv::CountAll},
+  }};
+  for (const auto& [name, mode] : Modes) {
+    if (text == name) {
+      return mode;
+    }
+  }
+  return std::nullopt;
+}
+
+GameShadowsEnv game_shadows_env() noexcept { return game_shadows_env_read(); }
 
 std::optional<ExposureOverride> parse_exposure_override(std::string_view text) noexcept {
   if (text == "match") {
@@ -1324,6 +1391,7 @@ std::shared_ptr<const FrameState> latch_frame() {
   uint16_t debugView = 0;
 #if AURORA_ENABLE_RENDER
   shadows::vsm::latch_hints();
+  fakeshadow::gate::capture_inputs();
   begin_hint_frame();
   latch_external_passes();
   debug::on_latch();
@@ -1376,6 +1444,8 @@ std::shared_ptr<const FrameState> latch_frame() {
   lighting::sky_probe::on_latch(latched, graph.get());
   lighting::exposure::on_latch(latched, graph.get());
   composite::on_latch(latched, graph.get());
+  // The gate reads the plan and the composite's sun predicate, so it latches after both
+  fakeshadow::gate::on_latch(latched_settings());
   latch_pass_params();
   inspectorOpen = g_graphEnvironment.inspectorOpen;
   debugView = latched.debug_view();

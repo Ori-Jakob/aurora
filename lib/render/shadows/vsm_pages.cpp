@@ -15,6 +15,7 @@
 #include "../stage_data.hpp"
 #include "../debug/views.hpp"
 #include "../debug/vsm_view.hpp"
+#include "../fakeshadow/gate.hpp"
 #include "../geometry/compact.hpp"
 #include "../lighting/deferred.hpp"
 #include "../post/composite.hpp"
@@ -127,6 +128,7 @@ struct Worker {
 
 std::array<PersistentHandle, HandleCount> g_handles{};
 std::array<PassId, PassCount> g_passes{};
+PassId g_castBitsPass = detail::InvalidPassId;
 bool g_wanted = false;
 bool g_active = false;
 std::optional<bool> g_activeOverride;
@@ -362,6 +364,32 @@ void encode_update(detail::PassContext& ctx, const void*) {
   pass.DispatchWorkgroups(MaxVirtualPages / UpdateWorkgroup);
   pass.End();
   mark_encoded(chain_bit::Update);
+}
+
+void declare_cast_bits(detail::InternalPassBuilder& builder, const detail::PassSetup& setup, const void*) {
+  if (!declarable(setup) || g_handles[CastBitsHandle].id == 0) {
+    builder.skip();
+    return;
+  }
+  builder.after(phase::Shadows);
+  builder.import_persistent(CastBits, g_handles[CastBitsHandle], Access::CopySrc);
+  builder.side_effect();
+}
+
+bool cast_bits_enabled(const StageData& stage, const void*) {
+  const bool chain = chain_enabled(stage);
+  if (stage.sceneHints != nullptr) {
+    fakeshadow::gate::note_fifo_frame(stage.sceneHints->hintFrame, sun_visibility::frame_enabled(stage));
+  }
+  return chain && fakeshadow::gate::cast_bits_wanted();
+}
+
+void encode_cast_bits(detail::PassContext& ctx, const void*) {
+  const StageData& stage = ctx.stage_data();
+  if ((encoded_mask() & chain_bit::Scan) == 0 || stage.sceneHints == nullptr) {
+    return;
+  }
+  fakeshadow::gate::copy_cast_bits(ctx.encoder(), ctx.buffer(BufRef{0}), stage.sceneHints->hintFrame);
 }
 
 void create_resources() {
@@ -1024,6 +1052,9 @@ void initialize() {
       g_passes[i] = detail::register_pass(descs[i]);
     }
   }
+  if (g_castBitsPass == detail::InvalidPassId) {
+    g_castBitsPass = detail::register_pass(cast_bits_pass_desc());
+  }
 }
 
 void shutdown() {
@@ -1036,6 +1067,10 @@ void shutdown() {
       detail::unregister_pass(pass);
       pass = detail::InvalidPassId;
     }
+  }
+  if (g_castBitsPass != detail::InvalidPassId) {
+    detail::unregister_pass(g_castBitsPass);
+    g_castBitsPass = detail::InvalidPassId;
   }
   destroy_resources();
   for (PersistentHandle& h : g_handles) {
@@ -1275,6 +1310,19 @@ std::array<detail::PassDesc, PassCount> pass_descs() {
       check::copy_pass_desc(),
       check::compare_pass_desc(),
       check::pass_desc(),
+  };
+}
+
+detail::PassDesc cast_bits_pass_desc() {
+  return {
+      .name = std::string{fakeshadow::gate::CastBitsPass},
+      .stage = Stage::OpaqueDone,
+      .kind = PassKind::Copy,
+      .cls = detail::PassClass::Required,
+      .order = fakeshadow::gate::CastBitsOrder,
+      .declare = declare_cast_bits,
+      .enabled = cast_bits_enabled,
+      .encode = encode_cast_bits,
   };
 }
 

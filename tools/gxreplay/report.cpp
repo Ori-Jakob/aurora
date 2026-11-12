@@ -336,6 +336,31 @@ std::string format_retained_line(const RetainedFrame& frame) {
       frame.atlas.pending, frame.atlas.missing, frame.atlas.unsupported, frame.atlas.recomputes, frame.atlas.captures);
 }
 
+std::string format_fake_shadow_line(uint32_t frame, const render::fakeshadow::gate::ReplayFrame& record) {
+  namespace gate = render::fakeshadow::gate;
+  std::string objects;
+  for (size_t cls = 0; cls < record.objects.size(); ++cls) {
+    std::string decisions;
+    for (size_t decision = 0; decision < record.objects[cls].size(); ++decision) {
+      if (record.objects[cls][decision] != 0) {
+        decisions += fmt::format("{}\"{}\": {}", decisions.empty() ? "" : ", ",
+                                 gate::decision_name(static_cast<render::ShadowDecision>(decision)),
+                                 record.objects[cls][decision]);
+      }
+    }
+    if (!decisions.empty()) {
+      objects += fmt::format("{}\"{}\": {{{}}}", objects.empty() ? "" : ", ",
+                             gate::class_name(static_cast<render::ShadowClass>(cls)), decisions);
+    }
+  }
+  return fmt::format(
+      "{{\"frame\": {}, \"hintFrame\": {}, \"objects\": {{{}}}, \"realDraws\": {}, "
+      "\"realAlphaMedian\": {}, \"realAlphaMax\": {}, \"shadowSun\": {}, \"thunder\": {}, "
+      "\"drops\": {}, \"ddPixels\": {{\"pbr\": {}, \"legacy\": {}}}}}\n",
+      frame, record.frame, objects, record.realDraws, record.realAlphaMedian, record.realAlphaMax, record.shadowSun,
+      record.thunder, record.drops, record.ddPixelsPbr, record.ddPixelsLegacy);
+}
+
 std::string format_retained_summary(std::span<const RetainedFrame> frames) {
   uint64_t entries = 0;
   uint64_t transient = 0;

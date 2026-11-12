@@ -14,6 +14,7 @@
 #include "debug/surface_expand.hpp"
 #include "debug/views.hpp"
 #include "debug/vsm_view.hpp"
+#include "fakeshadow/gate.hpp"
 #include "geometry/compact.hpp"
 #include "geometry/hzb.hpp"
 #include "gx_ext/ext_provider.hpp"
@@ -166,6 +167,7 @@ void shutdown() noexcept {
   scene::streamout::shutdown();
   scene::meshlets::shutdown();
   scene::atlas::shutdown();
+  fakeshadow::gate::shutdown();
   debug::vsm_view::shutdown();
   shadows::sun_visibility::shutdown();
   shadows::vsm::shutdown();
@@ -364,6 +366,32 @@ bool retained_coverage_complete() noexcept {
 void retained_hold_coverage([[maybe_unused]] bool hold) noexcept {
 #if AURORA_ENABLE_RENDER
   scene::retained::hold_coverage(hold);
+#endif
+}
+
+GateState gate_state() noexcept {
+#if AURORA_ENABLE_RENDER
+  return fakeshadow::gate::state();
+#else
+  const Settings& settings = effective_settings();
+  return {.keepCues = settings.shadows.keepCues, .game = settings.shadows.game};
+#endif
+}
+
+ShadowDecision decide_game_shadow(const GameShadowEntry& entry) noexcept {
+#if AURORA_ENABLE_RENDER
+  return fakeshadow::gate::decide(entry);
+#else
+  return fakeshadow::gate::setting_decision(effective_settings().shadows.game, entry.cls)
+      .value_or(ShadowDecision::KeepNoConsumer);
+#endif
+}
+
+GameShadowStats game_shadow_stats([[maybe_unused]] bool flush) noexcept {
+#if AURORA_ENABLE_RENDER
+  return fakeshadow::gate::stats(flush);
+#else
+  return {};
 #endif
 }
 

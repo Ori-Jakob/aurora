@@ -3,6 +3,7 @@
 #include "identity.hpp"
 #include "overlay.hpp"
 
+#include "../fakeshadow/gate.hpp"
 #include "../fakeshadow/texture_gate.hpp"
 #include "../frame_state.hpp"
 #include "../gx_ext/records.hpp"
@@ -120,6 +121,19 @@ void apply_merge_key() noexcept {
   g_classifier.set_merge_key(g_env == 2 && !g_demand ? MergeKey::ObjectOnly : MergeKey::Full);
 }
 
+// Old traces drew every fake, so drop emulates Remove on them while the observer records what the fakes were
+bool game_shadow_route(const DrawClass& cls) noexcept {
+  const uint32_t subId = cls.key.object.subId;
+  if (fakeshadow::gate::replay_observer()) {
+    fakeshadow::gate::observe_draw(subId, gx::g_gxState.colorRegs[1].w());
+  }
+  if (!fakeshadow::gate::drop_active() || fakeshadow::gate::marker_class(fakeshadow::gate::tag_class(subId))) {
+    return false;
+  }
+  fakeshadow::gate::count_drop();
+  return true;
+}
+
 gx::draw_route::Decision route(void*, const gx::draw_route::Query& query) noexcept {
   const detail::SceneHints& hints = detail::live_scene_hints();
   const gx::GXState& state = gx::g_gxState;
@@ -144,6 +158,9 @@ gx::draw_route::Decision route(void*, const gx::draw_route::Query& query) noexce
       retained::route(cls, query);
       return {.route = gx::draw_route::Route::Capture};
     }
+    return {.route = gx::draw_route::Route::Suppress};
+  }
+  if ((cls.key.categories & category::FakeShadow) != 0 && cls.key.mainCamera && game_shadow_route(cls)) {
     return {.route = gx::draw_route::Route::Suppress};
   }
   // Each command carries one draw record, so a changed class must start its own command
@@ -250,6 +267,9 @@ void seal_frame() noexcept {
   }
   g_classifier.end_frame();
   fakeshadow::seal();
+  if (fakeshadow::gate::replay_observer()) {
+    fakeshadow::gate::seal_replay_frame(detail::live_scene_hints().hintFrame, detail::live_scene_hints());
+  }
   retained::end_frame();
   const FrameStats& stats = g_classifier.stats();
   warn_counts(stats);
@@ -294,6 +314,9 @@ uint32_t sky_draws() noexcept { return g_classifier.stats().kinds[static_cast<si
 void on_camera(const gx::hints::Camera& camera) noexcept { g_classifier.camera(static_cast<Role>(camera.role)); }
 
 void on_object_begin(const gx::hints::ObjectBegin& object) noexcept {
+  if (fakeshadow::gate::replay_observer()) {
+    fakeshadow::gate::observe_object(object.categories, object.subId);
+  }
   g_classifier.object_begin({
       .id = object.id,
       .subId = object.subId,

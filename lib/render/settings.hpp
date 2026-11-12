@@ -15,6 +15,7 @@ inline constexpr uint64_t HighVramBytes = 6ull << 30;
 
 enum class Tier : uint8_t { None, Base, Pbr };
 enum class ForceMode : uint8_t { Unset, On, Off, Cycle, Pbr, PbrCycle };
+enum class GameShadowsEnv : uint8_t { Unset, Keep, Auto, Remove, Drop, Count, CountAll };
 inline constexpr uint64_t GBufferCycleLatches = 600;
 
 struct FeatureInfo {
@@ -58,6 +59,7 @@ struct SupportEnv {
 const FeatureInfo& feature_info(Feature feature) noexcept;
 const BuiltOptions& default_built_options() noexcept;
 uint8_t requested_option(const Settings& settings, Feature feature) noexcept;
+void write_level(Settings& settings, Feature feature, uint8_t value) noexcept;
 bool sun_shadows(const Settings& settings) noexcept;
 Tier device_tier(const Caps& caps, uint32_t msaaSamples) noexcept;
 Tier feature_tier(Feature feature, uint8_t level) noexcept;
@@ -77,6 +79,8 @@ struct ExposureOverride {
 std::optional<ExposureOverride> parse_exposure_override(std::string_view text) noexcept;
 std::optional<Tonemap> parse_tonemap_override(std::string_view text) noexcept;
 bool mat_maps_env() noexcept;
+std::optional<GameShadowsEnv> parse_game_shadows_env(std::string_view text) noexcept;
+GameShadowsEnv game_shadows_env() noexcept;
 FeatureSupport evaluate_support(Feature feature, uint8_t option, const Settings& context,
                                 const SupportEnv& env) noexcept;
 Settings sanitize_settings(const Settings& requested) noexcept;

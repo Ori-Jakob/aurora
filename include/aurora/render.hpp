@@ -199,6 +199,83 @@ bool feature_ready(Feature feature) noexcept;
 std::string_view feature_name(Feature feature) noexcept;
 std::string_view reason_name(Reason reason) noexcept;
 
+// M13
+enum class ShadowSource : uint8_t { Unknown, Vertical, SunMoon, RoomKey, PointLight, RoomLight, Lantern, EffectLight };
+enum class ShadowClass : uint8_t { Real, Blob, Cue, Telegraph, GroundMark, Bridge };
+enum class ShadowDecision : uint8_t {
+  None,
+  Skip,
+  KeepSetting,
+  KeepNoConsumer,
+  KeepCoverage,
+  KeepSource,
+  KeepCaster,
+  KeepCasterUnknown,
+  KeepClass,
+  KeepInterior,
+  KeepHold,
+  KeepOverflow,
+};
+inline constexpr size_t ShadowDecisionCount = static_cast<size_t>(ShadowDecision::KeepOverflow) + 1;
+
+struct GateState {
+  bool consumer = false, prevResolveRan = false, sunDeclared = false, sunCovered = false, localCovered = false;
+  bool cloudShadows = false, clouds = false, ao = false;
+  float skyVisibility = 0.f;
+  bool sunGeometric = false;
+  bool keyRoomDeclared = false, keyRoomCovered = false, lanternDeclared = false, interior = false;
+  bool coverageComplete = false, keepCues = false;
+  GameShadows game = GameShadows::Keep;
+  uint32_t frame = 0;
+
+  bool operator==(const GateState&) const = default;
+};
+
+struct GameShadowCaster {
+  uint64_t id = 0;
+  bool enteredNow = false;
+};
+
+struct GameShadowEntry {
+  uint64_t key = 0;
+  ShadowSource source = ShadowSource::Unknown;
+  ShadowClass cls = ShadowClass::Real;
+  std::span<const GameShadowCaster> casters;
+  bool castersTruncated = false;
+  uint32_t lightId = 0;
+};
+
+struct GameShadowCounts {
+  uint64_t entries = 0;
+  std::array<uint64_t, ShadowDecisionCount> decisions{};
+  uint64_t missingCasterLatch = 0, missingCasterCast = 0;
+  uint64_t castBitsPending = 0;
+  uint64_t doubleDarkEntries = 0;
+  uint64_t userKept = 0;
+  uint64_t transitions = 0;
+  uint64_t flipViolations = 0;
+  std::array<uint64_t, ShadowDecisionCount> safetyReturns{};
+  uint64_t safetyReturnsPerKeyMax = 0;
+  uint64_t provisional = 0, provisionalFailed = 0;
+  uint64_t partialCaster = 0;
+  uint64_t overflow = 0;
+  uint64_t sunLossFrames = 0;
+  uint64_t ddPixelsPbr = 0, ddPixelsLegacy = 0;
+
+  bool operator==(const GameShadowCounts&) const = default;
+};
+
+struct GameShadowStats {
+  uint32_t frame = 0;
+  GameShadowCounts current;
+  GameShadowCounts total;
+};
+
+// Game thread only, against the snapshot taken at this frame's latch
+GateState gate_state() noexcept;
+ShadowDecision decide_game_shadow(const GameShadowEntry& entry) noexcept;
+GameShadowStats game_shadow_stats(bool flush = false) noexcept;
+
 struct UpscaleStatus {
   Upscaler active = Upscaler::Off;
   UpscalerQuality quality = UpscalerQuality::Quality;

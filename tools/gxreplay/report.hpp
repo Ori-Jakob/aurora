@@ -1,5 +1,6 @@
 #pragma once
 
+#include "render/fakeshadow/gate.hpp"
 #include "render/scene/classify.hpp"
 
 #include <cstdint>
@@ -180,6 +181,7 @@ std::string format_classify_draw_line(uint32_t frame, const render::scene::Class
 std::string format_classify_summary(std::span<const ClassifyFrame> frames, uint64_t malformedHints);
 std::string format_retained_line(const RetainedFrame& frame);
 std::string format_retained_summary(std::span<const RetainedFrame> frames);
+std::string format_fake_shadow_line(uint32_t frame, const render::fakeshadow::gate::ReplayFrame& record);
 std::string format_timing_json(std::span<const FrameTiming> timings);
 std::string format_gpu_timing_json(bool supported, std::span<const GpuFrameTiming> timings);
 std::string format_cpu_zones_json(bool drawZones, std::span<const CpuFrameZones> frames);

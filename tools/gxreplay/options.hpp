@@ -23,6 +23,7 @@ struct Options {
   std::filesystem::path dataDir;
   std::filesystem::path replacementsDir;
   std::filesystem::path writeSelfTest;
+  std::filesystem::path fakeShadowsJson;
   AuroraBackend backend = BACKEND_AUTO;
   AuroraFeatureProfile profile = FEATURE_PROFILE_AUTO;
   FrameRange frames;
@@ -51,7 +52,7 @@ struct Options {
   // A view also writes classify.json, so its counters explain what the view coloured
   [[nodiscard]] bool writes_classify_json() const noexcept { return classifyJson || debugView != 0; }
   [[nodiscard]] bool classifies() const noexcept { return writes_classify_json() || classifyDraws; }
-  [[nodiscard]] bool seals() const noexcept { return classifies() || retainedJson; }
+  [[nodiscard]] bool seals() const noexcept { return classifies() || retainedJson || !fakeShadowsJson.empty(); }
 };
 
 std::optional<AuroraBackend> parse_backend(std::string_view name) noexcept;
