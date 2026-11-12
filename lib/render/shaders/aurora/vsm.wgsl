@@ -438,6 +438,15 @@ fn vsm_uniform_base(i: u32) -> u32 {
   return (VSM_HEADER_WORDS + min(i, VSM_MAX_VIEWS - 1u) * VSM_VIEW_WORDS) / 4u;
 }
 
+fn vsm_uniform_view(views: ptr<uniform, array<vec4u, 144>>, i: u32) -> VsmView {
+  let base = vsm_uniform_base(i);
+  var w: array<vec4u, 8>;
+  for (var k = 0u; k < 8u; k++) {
+    w[k] = (*views)[base + k];
+  }
+  return vsm_view_unpack(w);
+}
+
 // Level selection and requests need only the window position, so they read two matrix rows instead of the whole view
 fn vsm_uniform_coords(views: ptr<uniform, array<vec4u, 144>>, i: u32, p_rel: vec3f) -> vec2f {
   let base = vsm_uniform_base(i);

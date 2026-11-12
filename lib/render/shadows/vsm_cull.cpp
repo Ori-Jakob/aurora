@@ -72,6 +72,7 @@ struct PairsLocal {
   uint16_t boxes = NoRef;
   uint16_t views = NoRef;
   uint16_t table = NoRef;
+  uint16_t renderList = NoRef;
   uint16_t target = NoRef;
   uint16_t pairs = NoRef;
   uint16_t args = NoRef;
@@ -265,8 +266,9 @@ void declare_pairs(detail::InternalPassBuilder& builder, const PassSetup& setup,
   local.history = builder.import_persistent(History, handle(History), Access::StorageRead).index;
   local.clusters = builder.import_persistent("scene.clusters", geometry[2], Access::StorageRead).index;
   local.boxes = builder.import_persistent(ChunkBoxes, handle(ChunkBoxes), Access::StorageRead).index;
-  local.views = builder.import_persistent(ViewsName, handle(ViewsName), Access::StorageRead).index;
+  local.views = builder.import_persistent(ViewsName, handle(ViewsName), Access::Uniform).index;
   local.table = builder.import_persistent(Table, handle(Table), Access::StorageRead).index;
+  local.renderList = builder.use_buffer(RenderList, Access::StorageRead).index;
   if (emit) {
     local.target = builder.use_buffer(PageOffsets, Access::StorageRW).index;
     local.pairs = builder.use_buffer(Pairs, Access::StorageRW).index;

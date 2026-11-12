@@ -135,13 +135,14 @@ fn vsm_cull_candidates(@builtin(global_invocation_id) id: vec3u) {
 @group(1) @binding(1) var<storage, read> vsm_history: array<u32>;
 @group(1) @binding(2) var<storage, read> vsm_clusters: array<u32>;
 @group(1) @binding(3) var<storage, read> vsm_chunk_boxes: array<u32>;
-@group(1) @binding(4) var<storage, read> vsm_views: array<u32>;
+@group(1) @binding(4) var<uniform> vsm_views: array<vec4u, 144>;
 @group(1) @binding(5) var<storage, read> vsm_pt: array<u32>;
+@group(1) @binding(6) var<storage, read> vsm_render_list: array<u32>;
 //#if VSM_CULL_EMIT
-@group(1) @binding(6) var<storage, read_write> vsm_offsets: array<atomic<u32>>;
-@group(1) @binding(7) var<storage, read_write> vsm_pairs: array<atomic<u32>>;
+@group(1) @binding(7) var<storage, read_write> vsm_offsets: array<atomic<u32>>;
+@group(1) @binding(8) var<storage, read_write> vsm_pairs: array<atomic<u32>>;
 //#else
-@group(1) @binding(6) var<storage, read_write> vsm_counts: array<atomic<u32>>;
+@group(1) @binding(7) var<storage, read_write> vsm_counts: array<atomic<u32>>;
 //#endif
 
 struct VsmCullItem {
@@ -176,12 +177,14 @@ fn vsm_cull_item(hb: u32, k: u32, clustered: bool) -> VsmCullItem {
   return item;
 }
 
-var<workgroup> vsm_cull_views: array<VsmView, 16>;
+var<workgroup> vsm_cull_rows: array<u32, 512>;
 
 @compute @workgroup_size(256)
 fn vsm_cull_pairs(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) lid: u32) {
-  if (lid < VSM_MAX_VIEWS) {
-    vsm_cull_views[lid] = vsm_view(&vsm_views, lid);
+  for (var i = lid; i < VSM_MAX_VIEWS * VSM_WINDOW_PAGES; i += 256u) {
+    let word = VSM_RL_ROW_MASKS + i;
+    vsm_cull_rows[i] = select(0u, vsm_render_list[min(word, arrayLength(&vsm_render_list) - 1u)],
+                              word < arrayLength(&vsm_render_list));
   }
   workgroupBarrier();
   if (wg.x >= arrayLength(&vsm_list)) {
@@ -205,15 +208,23 @@ fn vsm_cull_pairs(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_in
   for (var k = lid; k < items; k += 256u) {
     let item = vsm_cull_item(hb, k, clusters != 0u);
     for (var bits = mask; bits != 0u; bits &= bits - 1u) {
-      let v = vsm_cull_views[firstTrailingBit(bits)];
+      let view = firstTrailingBit(bits);
+      let v = vsm_uniform_view(&vsm_views, view);
       // A depth raster writes any texel whose centre a triangle covers, so only a rect with no centre can be skipped
       let t = vsm_texel_rect(v, item.box);
       if (!vsm_rect_holds_centre(t)) {
         continue;
       }
       let r = vsm_page_rect(v, t);
+      if (r.z < r.x || r.w < r.y) {
+        continue;
+      }
+      let columns = vsm_row_bits(u32(r.x), u32(r.z));
       for (var y = r.y; y <= r.w; y++) {
-        for (var x = r.x; x <= r.z; x++) {
+        // Only pages on this frame's render list take pairs, so the row masks skip the rest without a table read
+        for (var row = vsm_cull_rows[min(view, VSM_MAX_VIEWS - 1u) * VSM_WINDOW_PAGES + u32(y)] & columns; row != 0u;
+             row &= row - 1u) {
+          let x = i32(firstTrailingBit(row));
           let index = vsm_page_index(v.table_offset, v.origin + vec2i(x, y));
           if (index >= arrayLength(&vsm_pt)) {
             continue;

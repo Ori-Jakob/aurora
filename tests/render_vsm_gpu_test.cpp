@@ -1689,8 +1689,8 @@ protected:
     }
     m_chunkGroup = pattern_layout("rrrrww");
     m_candidateGroup = pattern_layout("wrrww");
-    m_countGroup = pattern_layout("rrrrrrw");
-    m_emitGroup = pattern_layout("rrrrrrww");
+    m_countGroup = pattern_layout("rrrrurrw");
+    m_emitGroup = pattern_layout("rrrrurrww");
     m_skipGroup = pattern_layout("rrrrwwww");
     static constexpr std::array<std::string_view, 1> Chunk{"VSM_CHUNK_BOUNDS"};
     static constexpr std::array<std::string_view, 1> Candidates{"VSM_CULL_CANDIDATES"};
@@ -1721,8 +1721,9 @@ protected:
       entries[i] = {
           .binding = i,
           .visibility = wgpu::ShaderStage::Compute,
-          .buffer = {.type = pattern[i] == 'r' ? wgpu::BufferBindingType::ReadOnlyStorage
-                                               : wgpu::BufferBindingType::Storage},
+          .buffer = {.type = pattern[i] == 'u'   ? wgpu::BufferBindingType::Uniform
+                             : pattern[i] == 'r' ? wgpu::BufferBindingType::ReadOnlyStorage
+                                                 : wgpu::BufferBindingType::Storage},
       };
     }
     const wgpu::BindGroupLayoutDescriptor descriptor{.entryCount = entries.size(), .entries = entries.data()};
@@ -1746,7 +1747,8 @@ protected:
     CullOut out;
     out.listed = static_cast<uint32_t>(list.size());
     upload(m_counts, std::vector<uint32_t>(PageCountWords, 0));
-    const std::array countBuffers{m_cullList, m_history, m_clusters, m_chunkBoxes, m_views, m_table, m_counts};
+    const std::array countBuffers{m_cullList, m_history, m_clusters,   m_chunkBoxes,
+                                  m_views,    m_table,   m_renderList, m_counts};
     dispatch(m_count, m_empty, group(m_countGroup, countBuffers), out.listed);
     out.counts = read(m_counts, PageCountBytes);
     std::vector<uint32_t> offsets(PageCountWords, 0);
@@ -1761,7 +1763,8 @@ protected:
     const wgpu::BindGroup skipGroup = group(m_skipGroup, skipBuffers);
     dispatch(m_skip, m_empty, skipGroup, MaxRenderPages / CullWorkgroup);
     dispatch(m_skipArgs, m_empty, skipGroup, 1);
-    const std::array emitBuffers{m_cullList, m_history, m_clusters, m_chunkBoxes, m_views, m_table, m_offsets, m_pairs};
+    const std::array emitBuffers{m_cullList, m_history,    m_clusters, m_chunkBoxes, m_views,
+                                 m_table,    m_renderList, m_offsets,  m_pairs};
     dispatch(m_emit, m_empty, group(m_emitGroup, emitBuffers), out.listed);
     out.pairs = read(m_pairs, pairs_header::Bytes);
     out.args = read(m_rasterArgs, RasterArgsBytes);
