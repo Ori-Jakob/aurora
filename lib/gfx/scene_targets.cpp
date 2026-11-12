@@ -373,9 +373,8 @@ void latch_scene_layout(SceneTier want) {
       ++c.matchedFrames;
     }
     const WarmTotals totals = warm_totals();
-    WarmProgress progress = add_progress(totals.progress, count_resolved(c.clearRefs));
-    progress = add_progress(progress, warm_known_pipelines(g_layoutWarm.pending, ShaderType::GX));
-    input.progress = add_progress(progress, warm_known_pipelines(g_layoutWarm.pending, ShaderType::Clear));
+    // Saved configs from other scenes keep compiling at Background from begin_warm, but none of them holds the switch
+    input.progress = add_progress(totals.progress, count_resolved(c.clearRefs));
     input.hardFailed = totals.hardFailed;
     input.matchedFrames = c.matchedFrames;
     input.elapsedMs =

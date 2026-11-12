@@ -8,12 +8,12 @@
 #include "gfx/recording.hpp"
 #include "gfx/scene_targets.hpp"
 #include "gfx/texture.hpp"
+#include "gx/pipeline.hpp"
 #if AURORA_ENABLE_RENDER
 #include "gfx/resources.hpp"
 #include "gx/command_processor.hpp"
 #include "gx/fifo.hpp"
 #include "gx/gx.hpp"
-#include "gx/pipeline.hpp"
 #include "gx/shader_info.hpp"
 #include "hint_bytes.hpp"
 #include "render/debug/views.hpp"
@@ -504,6 +504,71 @@ TEST_F(GfxRecordingTest, WantChangeMidWarmRestarts) {
 
   start_arm(false, false);
   detail::latch_scene_layout(SceneTier::Pbr);
+  EXPECT_EQ(layout_warm(), nullptr);
+  EXPECT_FALSE(scene_layout_transitioning());
+  EXPECT_EQ(webgpu::scene_tier(), SceneTier::Legacy);
+}
+
+CompiledPipeline failed_gx_create(const gx::PipelineConfig&, const RenderTargetLayout&) { return {}; }
+
+wgpu::RenderPipeline failed_clear_create(const clear::PipelineConfig&, const RenderTargetLayout&) { return {}; }
+
+TEST_F(GfxRecordingTest, SavedConfigsDoNotHoldTheSwitch) {
+  struct TierReset {
+    bool core = std::exchange(webgpu::g_hasCoreFeatures, true);
+    testing::CreateHooks hooks = testing::set_create_hooks({.gx = &failed_gx_create, .clear = &failed_clear_create});
+    ~TierReset() {
+      set_blocking_pipelines(false);
+      detail::reset_scene_layout();
+      shutdown_pipeline_cache();
+      testing::set_create_hooks(hooks);
+      webgpu::g_graphicsConfig.gbuffer = false;
+      webgpu::g_hasCoreFeatures = core;
+    }
+  } tierReset;
+  shutdown_pipeline_cache();
+  detail::reset_scene_layout();
+  webgpu::g_graphicsConfig.gbuffer = true;
+  next_frame();
+  detail::latch_scene_layout(SceneTier::Base);
+
+  // More saved configs than one frame builds inline, so their pending-layout pipelines stay queued
+  gx::PipelineConfig config{};
+  for (uint32_t i = 0; i < 16; ++i) {
+    config.dstAlpha = i;
+    find_pipeline(config, compose_scene_layout({.gbuffer = true}, live_layout_base()));
+  }
+  detail::latch_scene_layout(SceneTier::Legacy);
+  ASSERT_NE(layout_warm(), nullptr);
+  const RenderTargetLayout pending = layout_warm()->pending;
+  config.dstAlpha = 0x80;
+  for (uint32_t frame = 0; frame < SceneLayoutMatchedFrames; ++frame) {
+    warm_scene_variant(config);
+    detail::latch_scene_layout(SceneTier::Legacy);
+  }
+  EXPECT_NE(layout_warm(), nullptr);
+
+  set_blocking_pipelines(true);
+  for (uint32_t bits = 0; bits < 8; ++bits) {
+    find_pipeline(clear::PipelineConfig{.clearColor = (bits & 1u) != 0,
+                                        .clearAlpha = (bits & 2u) != 0,
+                                        .clearDepth = (bits & 4u) != 0},
+                  pending);
+  }
+  set_blocking_pipelines(false);
+  detail::latch_scene_layout(SceneTier::Legacy);
+  EXPECT_NE(layout_warm(), nullptr);
+  EXPECT_TRUE(scene_layout_transitioning());
+
+  set_blocking_pipelines(true);
+  find_debug_pipeline(config, pending);
+  set_blocking_pipelines(false);
+  const testing::WarmTally tally = testing::warm_tally();
+  ASSERT_EQ(tally.pairs, 1u);
+  ASSERT_EQ(tally.progress.ready + tally.progress.failed, tally.progress.total);
+  const WarmProgress saved = warm_known_pipelines(pending, ShaderType::GX);
+  ASSERT_LT(saved.ready + saved.failed, saved.total);
+  detail::latch_scene_layout(SceneTier::Legacy);
   EXPECT_EQ(layout_warm(), nullptr);
   EXPECT_FALSE(scene_layout_transitioning());
   EXPECT_EQ(webgpu::scene_tier(), SceneTier::Legacy);
