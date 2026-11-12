@@ -126,7 +126,7 @@ void apply_merge_key() noexcept {
 bool game_shadow_route(const DrawClass& cls) noexcept {
   const uint32_t subId = cls.key.object.subId;
   if (fakeshadow::gate::replay_observer()) {
-    fakeshadow::gate::observe_draw(subId, gx::g_gxState.colorRegs[1].w());
+    fakeshadow::gate::observe_draw(cls.key.object.id, subId, gx::g_gxState.colorRegs[1].w());
   }
   if (!fakeshadow::gate::drop_active() || fakeshadow::gate::marker_class(fakeshadow::gate::tag_class(subId))) {
     return false;

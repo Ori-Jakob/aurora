@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "render/fakeshadow/gate.hpp"
+#include "render/hints.hpp"
 #include "render/settings.hpp"
 #include "render/shadows/vsm_pages.hpp"
 
@@ -441,6 +442,29 @@ TEST_F(GameShadowGate, EnvAndTagsParse) {
   EXPECT_EQ(tag_decision(0), ShadowDecision::None);
   EXPECT_EQ(decision_name(ShadowDecision::KeepOverflow), "keepOverflow");
   EXPECT_EQ(ShadowDecisionCount, 12u);
+}
+
+TEST_F(GameShadowGate, ReplayKeepsEachEntrysAlpha) {
+  constexpr uint64_t Real = 2ull << 32 | 7;
+  constexpr uint64_t Blob = 3ull << 32 | 1;
+  for (const auto& [object, alpha] : {std::pair{Real, 0.6314f}, std::pair{Real, 0.6314f}, std::pair{Blob, 0.8392f},
+                                      std::pair{Blob, 0.8392f}, std::pair{Blob, 0.8353f}}) {
+    observe_draw(object, 0, alpha);
+  }
+  seal_replay_frame(5, detail::SceneHints{});
+  const std::optional<ReplayFrame> frame = take_replay_frame();
+  ASSERT_TRUE(frame);
+  EXPECT_EQ(frame->frame, 5u);
+  ASSERT_EQ(frame->entries.size(), 2u);
+  EXPECT_EQ(frame->entries[0].object, Real);
+  EXPECT_EQ(frame->entries[0].draws, 2u);
+  EXPECT_FLOAT_EQ(frame->entries[0].alphaMax, 0.6314f);
+  EXPECT_EQ(frame->entries[1].object, Blob);
+  EXPECT_EQ(frame->entries[1].draws, 3u);
+  EXPECT_FLOAT_EQ(frame->entries[1].alphaMin, 0.8353f);
+  EXPECT_FLOAT_EQ(frame->entries[1].alphaMax, 0.8392f);
+  EXPECT_EQ(frame->realDraws, 5u) << "untagged blobs read as real shadows";
+  EXPECT_GT(frame->realAlphaMedian, 0.8f) << "so the frame median is a blob's";
 }
 } // namespace
 } // namespace aurora::render::fakeshadow::gate

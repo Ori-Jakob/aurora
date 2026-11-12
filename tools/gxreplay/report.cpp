@@ -353,12 +353,17 @@ std::string format_fake_shadow_line(uint32_t frame, const render::fakeshadow::ga
                              gate::class_name(static_cast<render::ShadowClass>(cls)), decisions);
     }
   }
+  std::string entries;
+  for (const gate::ReplayEntry& entry : record.entries) {
+    entries += fmt::format("{}[{}, {}, {}, {}, {}]", entries.empty() ? "" : ", ", entry.object, entry.subId,
+                           entry.draws, entry.alphaMin, entry.alphaMax);
+  }
   return fmt::format(
       "{{\"frame\": {}, \"hintFrame\": {}, \"objects\": {{{}}}, \"realDraws\": {}, "
       "\"realAlphaMedian\": {}, \"realAlphaMax\": {}, \"shadowSun\": {}, \"thunder\": {}, "
-      "\"drops\": {}, \"ddPixels\": {{\"pbr\": {}, \"legacy\": {}}}}}\n",
+      "\"drops\": {}, \"ddPixels\": {{\"pbr\": {}, \"legacy\": {}}}, \"entries\": [{}]}}\n",
       frame, record.frame, objects, record.realDraws, record.realAlphaMedian, record.realAlphaMax, record.shadowSun,
-      record.thunder, record.drops, record.ddPixelsPbr, record.ddPixelsLegacy);
+      record.thunder, record.drops, record.ddPixelsPbr, record.ddPixelsLegacy, entries);
 }
 
 std::string format_retained_summary(std::span<const RetainedFrame> frames) {

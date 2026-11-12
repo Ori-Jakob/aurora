@@ -139,6 +139,14 @@ void note_dd_pixels(uint64_t hintFrame, uint64_t pbr, uint64_t legacy) noexcept;
 // Render worker
 void copy_cast_bits(const wgpu::CommandEncoder& encoder, const BufferView& source, uint64_t hintFrame) noexcept;
 
+struct ReplayEntry {
+  uint64_t object = 0;
+  uint32_t subId = 0;
+  uint32_t draws = 0;
+  float alphaMin = 0.f;
+  float alphaMax = 0.f;
+};
+
 struct ReplayFrame {
   uint64_t frame = 0;
   std::array<std::array<uint32_t, ShadowDecisionCount>, ShadowClassCount> objects{};
@@ -150,6 +158,8 @@ struct ReplayFrame {
   uint32_t drops = 0;
   uint64_t ddPixelsPbr = 0;
   uint64_t ddPixelsLegacy = 0;
+  // An untagged trace gives every fake subId 0, so only the object id tells a real shadow from the blobs
+  std::vector<ReplayEntry> entries;
 };
 
 // FIFO thread; off unless a replay asks, so a frame pays one branch
@@ -157,7 +167,7 @@ void set_replay_observer(bool on) noexcept;
 [[nodiscard]] bool replay_observer() noexcept;
 [[nodiscard]] bool drop_active() noexcept;
 void observe_object(uint32_t categories, uint32_t subId) noexcept;
-void observe_draw(uint32_t subId, float tevReg0Alpha) noexcept;
+void observe_draw(uint64_t object, uint32_t subId, float tevReg0Alpha) noexcept;
 void count_drop() noexcept;
 void seal_replay_frame(uint64_t hintFrame, const detail::SceneHints& hints) noexcept;
 [[nodiscard]] std::optional<ReplayFrame> take_replay_frame() noexcept;

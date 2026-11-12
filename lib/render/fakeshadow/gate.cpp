@@ -25,6 +25,7 @@ constexpr uint64_t CastBitBytes = uint64_t{CastBitWords} * 4;
 constexpr uint32_t FifoNotes = 16;
 constexpr int FlushWaitMs = 500;
 constexpr uint32_t MaxReplayFrames = 64;
+constexpr size_t MaxReplayEntries = 256;
 
 struct Slot {
   uint64_t key = 0;
@@ -702,7 +703,23 @@ void observe_object(uint32_t categories, uint32_t subId) noexcept {
   ++g_replay.objects[static_cast<size_t>(tag_class(subId))][static_cast<size_t>(tag_decision(subId))];
 }
 
-void observe_draw(uint32_t subId, float tevReg0Alpha) noexcept {
+void observe_draw(uint64_t object, uint32_t subId, float tevReg0Alpha) noexcept {
+  ReplayEntry* entry = nullptr;
+  for (auto it = g_replay.entries.rbegin(); it != g_replay.entries.rend(); ++it) {
+    if (it->object == object && it->subId == subId) {
+      entry = &*it;
+      break;
+    }
+  }
+  if (entry == nullptr && g_replay.entries.size() < MaxReplayEntries) {
+    entry = &g_replay.entries.emplace_back(
+        ReplayEntry{.object = object, .subId = subId, .alphaMin = tevReg0Alpha, .alphaMax = tevReg0Alpha});
+  }
+  if (entry != nullptr) {
+    ++entry->draws;
+    entry->alphaMin = std::min(entry->alphaMin, tevReg0Alpha);
+    entry->alphaMax = std::max(entry->alphaMax, tevReg0Alpha);
+  }
   if (tag_class(subId) != ShadowClass::Real) {
     return;
   }
