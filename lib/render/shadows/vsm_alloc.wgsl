@@ -20,13 +20,45 @@ struct VsmMarkParams {
 @group(1) @binding(4) var<storage, read_write> vsm_receivers: array<u32>;
 //#endif
 
-var<workgroup> vsm_mark_keys: array<u32, 512>;
+const VSM_MARK_NONE: u32 = 0xFFFFu;
+
+var<workgroup> vsm_mark_codes: array<u32, 64>;
+
+// A pixel's pages at one level form a 1x1 to 2x2 block, so its corner and two extents stand for all four keys
+fn vsm_mark_code(level: u32, p_rel: vec3f) -> u32 {
+  if (level >= VSM_SUN_LEVELS) {
+    return VSM_MARK_NONE;
+  }
+  let c = vsm_uniform_coords(&vsm_views, vsm_level_view(level), p_rel);
+  let m = f32(VSM_FILTER_MARGIN_TEXELS);
+  let lo = max(vec2i(floor((c - m) / f32(VSM_PAGE_TEXELS))), vec2i(0));
+  let hi = min(vec2i(floor((c + m) / f32(VSM_PAGE_TEXELS))), vec2i(i32(VSM_WINDOW_PAGES) - 1));
+  if (any(hi < lo)) {
+    return VSM_MARK_NONE;
+  }
+  let e = vec2u(min(hi - lo, vec2i(1)));
+  return level | (u32(lo.x) << 4u) | (u32(lo.y) << 9u) | (e.x << 14u) | (e.y << 15u);
+}
+
+fn vsm_mark_request(code: u32, bits: u32) {
+  let base = vsm_uniform_base(vsm_level_view(code & 15u));
+  let origin = bitcast<vec2i>(vsm_views[base + 6u].xy) + vec2i(i32((code >> 4u) & 31u), i32((code >> 9u) & 31u));
+  let table_offset = vsm_views[base + 7u].z >> 16u;
+  for (var y = 0u; y <= ((code >> 15u) & 1u); y++) {
+    for (var x = 0u; x <= ((code >> 14u) & 1u); x++) {
+      let index = vsm_page_index(table_offset, origin + vec2i(i32(x), i32(y)));
+      if (index < arrayLength(&vsm_requests)) {
+        atomicOr(&vsm_requests[index], bits);
+      }
+    }
+  }
+}
 
 @compute @workgroup_size(8, 8)
 fn vsm_mark(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_id) lid: vec3u,
             @builtin(local_invocation_index) li: u32) {
   let dims = textureDimensions(vsm_depth);
-  var keys = vsm_no_keys();
+  var code = (VSM_MARK_NONE << 16u) | VSM_MARK_NONE;
   if (all(gid.xy < dims)) {
     let px = vec2i(gid.xy);
     let d = textureLoad(vsm_depth, px, 0).r;
@@ -44,24 +76,22 @@ fn vsm_mark(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation
       let z = camera_view_depth(cam, d);
       let pos = camera_view_position_fwd(cam, (vec2f(gid.xy) + 0.5) / full, z, full);
       let p_rel = camera_world_dir(vsm_mark_params.rotation, pos);
-      keys = vsm_uniform_request_keys(&vsm_views, p_rel, 2.0 * z / (full.y * cam.depth.w));
+      let level = vsm_uniform_select_level(&vsm_views, 2.0 * z / (full.y * cam.depth.w), p_rel);
+      code = vsm_mark_code(level, p_rel) | (vsm_mark_code(level + 1u, p_rel) << 16u);
     }
   }
-  for (var k = 0u; k < VSM_MARK_KEYS; k++) {
-    vsm_mark_keys[li * VSM_MARK_KEYS + k] = keys[k];
-  }
+  vsm_mark_codes[li] = code;
   workgroupBarrier();
-  for (var k = 0u; k < VSM_MARK_KEYS; k++) {
-    let key = keys[k];
-    if (key == VSM_NO_KEY) {
+  for (var half = 0u; half < 32u; half += 16u) {
+    let mine = (code >> half) & 0xFFFFu;
+    if (mine == VSM_MARK_NONE) {
       continue;
     }
-    // Neighbours inside a page hold the same keys in the same slots, so one compare each drops nearly every repeat
-    let seen = (lid.x > 0u && vsm_mark_keys[(li - 1u) * VSM_MARK_KEYS + k] == key) ||
-               (lid.y > 0u && vsm_mark_keys[(li - 8u) * VSM_MARK_KEYS + k] == key);
-    let index = key & 0xFFFFu;
-    if (!seen && index < arrayLength(&vsm_requests)) {
-      atomicOr(&vsm_requests[index], key >> 16u);
+    // Neighbours inside a page share the block at each level, so one compare each drops nearly every repeat
+    let seen = (lid.x > 0u && ((vsm_mark_codes[li - 1u] >> half) & 0xFFFFu) == mine) ||
+               (lid.y > 0u && ((vsm_mark_codes[li - 8u] >> half) & 0xFFFFu) == mine);
+    if (!seen) {
+      vsm_mark_request(mine, select(VSM_REQUEST_PIXEL, VSM_REQUEST_FALLBACK, half != 0u));
     }
   }
 }

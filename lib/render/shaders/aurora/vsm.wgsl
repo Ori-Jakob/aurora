@@ -459,14 +459,6 @@ fn vsm_coords_fit(c: vec2f) -> bool {
   return all(c >= vec2f(m)) && all(c < vec2f(f32(VSM_WINDOW_TEXELS) - m));
 }
 
-fn vsm_uniform_level_keys(views: ptr<uniform, array<vec4u, 144>>, level: u32, p_rel: vec3f, bits: u32,
-                          keys: ptr<function, array<u32, 8>>, first: u32) {
-  let view = vsm_level_view(level);
-  let base = vsm_uniform_base(view);
-  vsm_window_keys(vsm_uniform_coords(views, view, p_rel), bitcast<vec2i>((*views)[base + 6u].xy),
-                  (*views)[base + 7u].z >> 16u, bits, keys, first);
-}
-
 fn vsm_uniform_select_level(views: ptr<uniform, array<vec4u, 144>>, f: f32, p_rel: vec3f) -> u32 {
   let texel0 = vsm_f32((*views)[3].w);
   if (!(texel0 > 0.0)) {
@@ -478,18 +470,6 @@ fn vsm_uniform_select_level(views: ptr<uniform, array<vec4u, 144>>, f: f32, p_re
     }
   }
   return VSM_SUN_LEVELS;
-}
-
-fn vsm_uniform_request_keys(views: ptr<uniform, array<vec4u, 144>>, p_rel: vec3f, f: f32) -> array<u32, 8> {
-  var keys = vsm_no_keys();
-  let level = vsm_uniform_select_level(views, f, p_rel);
-  if (level < VSM_SUN_LEVELS) {
-    vsm_uniform_level_keys(views, level, p_rel, VSM_REQUEST_PIXEL, &keys, 0u);
-  }
-  if (level + 1u < VSM_SUN_LEVELS) {
-    vsm_uniform_level_keys(views, level + 1u, p_rel, VSM_REQUEST_FALLBACK, &keys, 4u);
-  }
-  return keys;
 }
 
 fn vsm_request(requests: ptr<storage, array<atomic<u32>>, read_write>, v: VsmView, page: vec2i, bits: u32) {
