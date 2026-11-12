@@ -14,6 +14,7 @@
 #include "../settings.hpp"
 #include "../stage_data.hpp"
 #include "../debug/views.hpp"
+#include "../debug/vsm_view.hpp"
 #include "../geometry/compact.hpp"
 #include "../lighting/deferred.hpp"
 #include "../post/composite.hpp"
@@ -95,6 +96,7 @@ struct LatchedHints {
   uint64_t frame = 0;
   bool mainCamera = false;
   bool noSun = false;
+  bool keyRoom = false;
   double unitsPerMetre = DefaultUnitsPerMetre;
   SunSelection sun;
 };
@@ -1050,6 +1052,13 @@ void latch_hints() noexcept {
   g_hints.frame = hints.hintFrame;
   g_hints.mainCamera = camera_usable(&hints);
   g_hints.sun = select_sun(hints);
+  g_hints.keyRoom = false;
+  if (hints.has(detail::SceneHasLights)) {
+    for (const AuroraLight& light : hints.lights) {
+      g_hints.keyRoom =
+          g_hints.keyRoom || (light.type == AURORA_LIGHT_DIRECTIONAL && (light.flags & AURORA_LIGHT_KEY_ROOM) != 0);
+    }
+  }
   const bool environment = hints.has(detail::SceneHasEnvironment);
   g_hints.noSun = environment && (hints.environment.value.flags & AURORA_ENV_NO_SUN) != 0;
   const float upm = environment ? hints.environment.value.unitsPerMeter : 0.f;
@@ -1121,6 +1130,7 @@ void on_latch(const detail::PassSetup& setup, const detail::CompiledGraph* graph
         g_lowSunOn);
   }
   sun_visibility::on_latch(setup.settings);
+  debug::vsm_view::on_latch(setup.settings);
   const PassId updatePass = g_passes[0];
   if (!active() || updatePass == detail::InvalidPassId) {
     if (updatePass != detail::InvalidPassId) {
@@ -1190,6 +1200,12 @@ bool deferred_consumes() noexcept {
 bool shadow_view_selected() noexcept {
   return g_shadowViewOverride.value_or(g_shadowView.load(std::memory_order_relaxed));
 }
+
+bool key_room_only() noexcept { return g_hints.keyRoom && !g_hints.sun.found; }
+
+uint32_t pool_pages() noexcept { return g_liveExtent.pages; }
+
+uint32_t pool_generation() noexcept { return g_generation; }
 
 bool consumed(const StageData& stage) noexcept {
   // Persistent writers are graph sinks, so only this term stops the chain when nothing reads it

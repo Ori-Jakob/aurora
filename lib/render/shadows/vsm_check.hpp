@@ -137,6 +137,7 @@ struct CullSummary {
 
 [[nodiscard]] std::optional<Config> parse(std::string_view text) noexcept;
 [[nodiscard]] const Config& config() noexcept;
+[[nodiscard]] Result result() noexcept;
 [[nodiscard]] bool check_frame(uint64_t hintFrame) noexcept;
 [[nodiscard]] bool force_full(uint64_t hintFrame) noexcept;
 void record_views(const Views& views, uint64_t hintFrame) noexcept;

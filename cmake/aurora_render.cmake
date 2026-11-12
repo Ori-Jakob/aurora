@@ -58,6 +58,8 @@ if (AURORA_ENABLE_RENDER)
         lib/render/debug/views.cpp
         lib/render/debug/views.hpp
         lib/render/debug/views_tab.cpp
+        lib/render/debug/vsm_view.cpp
+        lib/render/debug/vsm_view.hpp
         lib/render/fakeshadow/texture_gate.cpp
         lib/render/fakeshadow/texture_gate.hpp
         lib/render/geometry/compact.cpp

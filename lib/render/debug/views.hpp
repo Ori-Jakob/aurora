@@ -111,7 +111,7 @@ struct GbufView {
 }
 
 // Target rows snapshot one scene target and decomposition rows decode several; both replace RGB before the HUD
-inline constexpr std::array<GbufView, 32> GbufViews{{
+inline constexpr std::array<GbufView, 36> GbufViews{{
     {16, "gbuf.motion", "G-buffer: motion", "gbuf.motion", "phase.post_taa", Stage::PrePost, 0, false},
     {17, "gbuf.reactive", "G-buffer: reactive", "gbuf.reactive", "phase.post_taa", Stage::PrePost, 1, false},
     {18, "gbuf.fog", "Fog record: weight", "gbuf.fog", "phase.composite", Stage::OpaqueDone, 2, true},
@@ -158,6 +158,10 @@ inline constexpr std::array<GbufView, 32> GbufViews{{
     retained_row(46, "retained.atlas", "Retained: material atlas page", RetainedMode::AtlasPage),
     retained_row(47, "retained.albedo", "Retained: atlas albedo (unlit)", RetainedMode::Albedo),
     {48, "vis.sun", "Sun shadows: visibility", "vis.sun", "phase.composite", Stage::OpaqueDone, 7, false},
+    {49, "vsm.level", "Sun shadows: clipmap level", "vsm.view", "phase.composite", Stage::OpaqueDone, 18, false},
+    {50, "vsm.pages", "Sun shadows: page state", "vsm.view", "phase.composite", Stage::OpaqueDone, 18, false},
+    {51, "vsm.table", "Sun shadows: page tables", "vsm.view", "phase.composite", Stage::OpaqueDone, 18, false},
+    {52, "vsm.pool", "Sun shadows: physical pool", "vsm.view", "phase.composite", Stage::OpaqueDone, 18, false},
 }};
 
 inline constexpr uint16_t MaxDebugViewId = 63;
@@ -270,6 +274,59 @@ inline constexpr Rgb8 RetainedCameraColor{255, 255, 255};
 
 [[nodiscard]] constexpr Rgb8 retained_class_color(RetainedClass cls) noexcept {
   return RetainedClassColors[static_cast<size_t>(cls)];
+}
+
+inline constexpr std::string_view VsmViewResource = "vsm.view";
+inline constexpr uint16_t FirstVsmView = 49;
+enum class VsmViewMode : uint32_t { Level, Pages, Table, Pool, NoSun };
+inline constexpr uint32_t VsmViewModeCount = 5;
+enum class VsmPageState : uint8_t { Cached, Rendered, Stale, Fallback, Unshadowed, NotReceiver };
+enum class VsmTableState : uint8_t { Free, Cached, Requested, Rendered, Stale, Missing, Camera };
+
+// Frozen like the ids; vsm_view.wgsl repeats them and a GPU test pins both
+inline constexpr std::array<Rgb8, 16> VsmLevelColors{{{255, 64, 64},
+                                                      {255, 160, 0},
+                                                      {255, 240, 80},
+                                                      {160, 230, 60},
+                                                      {60, 200, 60},
+                                                      {0, 220, 160},
+                                                      {0, 220, 220},
+                                                      {80, 160, 255},
+                                                      {60, 90, 255},
+                                                      {160, 90, 255},
+                                                      {200, 60, 140},
+                                                      {255, 170, 200},
+                                                      {200, 200, 200},
+                                                      {150, 110, 70},
+                                                      {120, 120, 60},
+                                                      {90, 60, 120}}};
+inline constexpr std::array<Rgb8, 6> VsmPageColors{
+    {{60, 200, 60}, {255, 160, 0}, {160, 90, 255}, {255, 240, 80}, {255, 0, 255}, {64, 64, 64}}};
+inline constexpr std::array<Rgb8, 7> VsmTableColors{
+    {{0, 0, 0}, {80, 160, 255}, {60, 200, 60}, {255, 160, 0}, {160, 90, 255}, {230, 40, 40}, {255, 255, 255}}};
+inline constexpr Rgb8 VsmPoolUnusedColor{0, 0, 96};
+inline constexpr Rgb8 VsmPoolRenderedColor{255, 160, 0};
+inline constexpr Rgb8 VsmLetterboxColor{24, 24, 24};
+inline constexpr Rgb8 VsmNoSunColor{70, 82, 100};
+
+[[nodiscard]] constexpr Rgb8 vsm_page_color(VsmPageState state) noexcept {
+  return VsmPageColors[static_cast<size_t>(state)];
+}
+
+[[nodiscard]] constexpr Rgb8 vsm_table_color(VsmTableState state) noexcept {
+  return VsmTableColors[static_cast<size_t>(state)];
+}
+
+[[nodiscard]] constexpr Rgb8 halve(Rgb8 color) noexcept {
+  return {static_cast<uint8_t>(color.r / 2), static_cast<uint8_t>(color.g / 2), static_cast<uint8_t>(color.b / 2)};
+}
+
+// Fading with age shows which cached pages eviction takes next
+[[nodiscard]] constexpr Rgb8 vsm_cached_color(uint32_t age) noexcept {
+  const uint32_t k = 256 - std::min(age, 48u) * 4;
+  const Rgb8 c = vsm_table_color(VsmTableState::Cached);
+  return {static_cast<uint8_t>(c.r * k / 256), static_cast<uint8_t>(c.g * k / 256),
+          static_cast<uint8_t>(c.b * k / 256)};
 }
 
 [[nodiscard]] constexpr Rgb8 identity_class_color(IdentityClass cls) noexcept {

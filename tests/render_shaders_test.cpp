@@ -10,6 +10,7 @@
 #include "render/debug/decomp_view.hpp"
 #include "render/debug/retained_view.hpp"
 #include "render/debug/gbuf_view.hpp"
+#include "render/debug/vsm_view.hpp"
 #include "render/geometry/compact.hpp"
 #include "render/geometry/hzb.hpp"
 #include "render/geometry/indirect.hpp"
@@ -1858,6 +1859,28 @@ TEST_F(RenderShaders, SunVisibilityCompiles) {
   EXPECT_EQ(desc.colorCount, 1u);
   EXPECT_EQ(desc.colors[0].format, wgpu::TextureFormat::RG8Unorm);
   EXPECT_EQ(desc.depthFormat, wgpu::TextureFormat::Undefined);
+}
+
+TEST_F(RenderShaders, VsmViewModesCompile) {
+  std::string error;
+  EXPECT_TRUE(validate_module(debug::vsm_view::Shader, {}, error)) << error;
+  const std::optional<std::string_view> text = library_text(debug::vsm_view::Shader);
+  ASSERT_TRUE(text.has_value());
+  EXPECT_NE(text->find("//#import shadows/vsm_filter"), std::string_view::npos);
+  EXPECT_NE(text->find("var view_target: texture_storage_2d<rgba8unorm, write>;"), std::string_view::npos);
+  std::set<uint32_t> ids;
+  for (uint32_t mode = 0; mode < debug::VsmViewModeCount; ++mode) {
+    const ComputePipelineDesc desc = debug::vsm_view::pipeline_desc(static_cast<debug::VsmViewMode>(mode));
+    EXPECT_EQ(desc.entryPoint, "view_main");
+    ASSERT_EQ(desc.constants.size(), 1u);
+    EXPECT_EQ(desc.constants[0].name, "VSM_VIEW_MODE");
+    EXPECT_EQ(desc.constants[0].value, static_cast<double>(mode));
+    const PipelineId id = request_compute(desc);
+    ASSERT_TRUE(id) << mode;
+    EXPECT_EQ(wait(id, WaitNs), PipelineStatus::Ready) << mode;
+    ids.insert(id.value);
+  }
+  EXPECT_EQ(ids.size(), debug::VsmViewModeCount);
 }
 
 TEST_F(RenderShaders, DeferredDefaultTextChangesOnlyByTheHook) {

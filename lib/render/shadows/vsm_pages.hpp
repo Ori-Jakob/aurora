@@ -444,6 +444,9 @@ void register_consumer_term(ConsumerTerm term) noexcept;
 [[nodiscard]] bool consumed(const detail::StageData& stage) noexcept;
 [[nodiscard]] bool deferred_consumes() noexcept;
 [[nodiscard]] bool shadow_view_selected() noexcept;
+[[nodiscard]] bool key_room_only() noexcept;
+[[nodiscard]] uint32_t pool_pages() noexcept;
+[[nodiscard]] uint32_t pool_generation() noexcept;
 [[nodiscard]] bool chain_enabled(const detail::StageData& stage) noexcept;
 
 void mark_encoded(uint32_t bit) noexcept;

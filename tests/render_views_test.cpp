@@ -7,6 +7,7 @@
 #include "render/debug/decomp_view.hpp"
 #include "render/debug/retained_view.hpp"
 #include "render/debug/views.hpp"
+#include "render/debug/vsm_view.hpp"
 #include "render/frame_state.hpp"
 #include "render/graph.hpp"
 #include "render/scene/classify.hpp"
@@ -186,7 +187,7 @@ TEST_F(RenderViews, GbufViewTableFollowsClassRange) {
       continue;
     }
     if (shadow_view(view)) {
-      EXPECT_EQ(view.mode, 7u) << view.name;
+      EXPECT_EQ(view.mode, view.resource == VsmViewResource ? 18u : 7u) << view.name;
       continue;
     }
     EXPECT_TRUE(targetModes.insert(view.mode).second) << view.name;
@@ -198,7 +199,7 @@ TEST_F(RenderViews, GbufViewTableFollowsClassRange) {
       EXPECT_EQ(view.mode, static_cast<uint32_t>(view.id - FirstGbufView));
     }
   }
-  EXPECT_EQ(expected, 49u);
+  EXPECT_EQ(expected, 53u);
   EXPECT_EQ(targetModes, (std::set<uint32_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}));
   EXPECT_EQ(find_gbuf_view(LastReservedClassView), nullptr);
   EXPECT_EQ(find_gbuf_view(35), nullptr);
@@ -782,15 +783,75 @@ TEST_F(RenderViews, VisSunRowHasFreshId) {
   EXPECT_EQ(view->kind, GbufViewKind::Target);
   EXPECT_TRUE(shadow_view(*view));
   EXPECT_EQ(find_view(48), nullptr);
-  EXPECT_EQ(find_gbuf_view(49), nullptr);
   EXPECT_EQ(parse_view("vis.sun")->id, 48u);
   EXPECT_EQ(parse_view("sun")->id, 48u);
   for (const GbufView& other : GbufViews) {
-    EXPECT_EQ(shadow_view(other), other.id == 48) << other.name;
+    EXPECT_EQ(shadow_view(other), other.id >= 48 && other.id <= 52) << other.name;
   }
   const std::optional<std::string> blocked = view_blocked(*view, nullptr);
   ASSERT_TRUE(blocked.has_value());
   EXPECT_EQ(*blocked, "needs real-time shadows");
+}
+
+TEST_F(RenderViews, ShadowRowsHaveFreshIds) {
+  struct Row {
+    uint16_t id;
+    std::string_view name;
+    std::string_view shortName;
+    VsmViewMode mode;
+  };
+  constexpr std::array<Row, 4> Rows{{
+      {49, "vsm.level", "level", VsmViewMode::Level},
+      {50, "vsm.pages", "pages", VsmViewMode::Pages},
+      {51, "vsm.table", "table", VsmViewMode::Table},
+      {52, "vsm.pool", "pool", VsmViewMode::Pool},
+  }};
+  for (const Row& row : Rows) {
+    const GbufView* view = find_gbuf_view(row.id);
+    ASSERT_NE(view, nullptr) << row.name;
+    EXPECT_LE(view->id, MaxDebugViewId);
+    EXPECT_EQ(view->name, row.name);
+    EXPECT_TRUE(view->label.starts_with("Sun shadows: ")) << view->label;
+    EXPECT_EQ(view->resource, VsmViewResource);
+    EXPECT_EQ(view->anchor, "phase.composite");
+    EXPECT_EQ(view->stage, Stage::OpaqueDone);
+    EXPECT_EQ(view->mode, 18u) << "the snapshot copies the view's RGB";
+    EXPECT_EQ(view->kind, GbufViewKind::Target);
+    EXPECT_FALSE(view->uintSource);
+    EXPECT_TRUE(shadow_view(*view));
+    EXPECT_EQ(find_view(row.id), nullptr);
+    EXPECT_EQ(parse_view(row.name)->id, row.id);
+    EXPECT_EQ(parse_view(row.shortName)->id, row.id);
+    EXPECT_EQ(vsm_view::row_mode(*view), row.mode);
+    EXPECT_EQ(vsm_view::selected_mode(row.id), row.mode);
+  }
+  EXPECT_EQ(vsm_view::row_mode(*find_gbuf_view(48)), std::nullopt);
+  EXPECT_EQ(vsm_view::selected_mode(0), std::nullopt);
+  EXPECT_EQ(find_gbuf_view(53), nullptr);
+  EXPECT_EQ(GbufViews.back().id, 52u);
+  EXPECT_EQ(static_cast<uint32_t>(VsmViewMode::NoSun) + 1, VsmViewModeCount);
+  std::set<std::tuple<uint8_t, uint8_t, uint8_t>> levels;
+  for (const Rgb8 c : VsmLevelColors) {
+    EXPECT_TRUE(levels.insert({c.r, c.g, c.b}).second) << "levels need distinct colours";
+  }
+  EXPECT_EQ(vsm_cached_color(0), vsm_table_color(VsmTableState::Cached));
+  EXPECT_EQ(vsm_cached_color(48), vsm_cached_color(1000));
+  EXPECT_EQ(halve(vsm_page_color(VsmPageState::Rendered)), (Rgb8{127, 80, 0}));
+}
+
+TEST_F(RenderViews, ShadowRowsBlockedWithoutShadows) {
+  auto graph = std::make_shared<detail::CompiledGraph>();
+  graph->sceneDepthSource = DepthSource::Direct;
+  detail::FrameState frame{.settings = Settings{.pbr = true, .ao = Quality::High}, .graph = graph};
+  for (uint16_t id = 48; id <= 52; ++id) {
+    const GbufView* view = find_gbuf_view(id);
+    ASSERT_NE(view, nullptr);
+    EXPECT_EQ(view_blocked(*view, nullptr), "needs real-time shadows") << view->name;
+    frame.settings.shadows.quality = Quality::Off;
+    EXPECT_EQ(view_blocked(*view, &frame), "needs real-time shadows") << view->name;
+    frame.settings.shadows.quality = Quality::High;
+    EXPECT_EQ(view_blocked(*view, &frame), std::nullopt) << view->name;
+  }
 }
 
 TEST_F(RenderViews, RegistryListsEveryBuiltView) {
@@ -815,7 +876,7 @@ TEST_F(RenderViews, RegistryListsEveryBuiltView) {
   ASSERT_EQ(api.size(), views.size());
   EXPECT_EQ(api.data(), views.data());
   EXPECT_TRUE(known_view(0));
-  for (const uint16_t reserved : {uint16_t{9}, uint16_t{15}, uint16_t{35}, uint16_t{49}, uint16_t{100}}) {
+  for (const uint16_t reserved : {uint16_t{9}, uint16_t{15}, uint16_t{35}, uint16_t{53}, uint16_t{100}}) {
     EXPECT_FALSE(known_view(reserved)) << reserved;
   }
 }

@@ -3,6 +3,7 @@
 #include "render_test_caps.hpp"
 
 #include "gx/hints.hpp"
+#include "render/debug/vsm_view.hpp"
 #include "render/graph.hpp"
 #include "render/hints.hpp"
 #include "render/scene/identity.hpp"
@@ -1622,6 +1623,109 @@ TEST(RenderVsm, FilterTapsStayInsidePage) {
   const FilterParams biased = filter_params(Quality::High, Bias{.normal = 0.f, .depth = 3.f});
   EXPECT_EQ(biased.normalScale, 0.f);
   EXPECT_EQ(biased.depthBias, 3.f);
+}
+
+TEST_F(RenderVsmGraph, ViewRowIsAConsumer) {
+  testing::set_active(true);
+  testing::set_plan(producing_plan());
+  testing::set_compact_ready(true);
+  testing::set_pipeline_query([](uint32_t) noexcept { return true; });
+  detail::composite::testing::set_exposure_units(false);
+  const std::array<detail::PassDesc, PassCount> passes = pass_descs();
+  const StageData stage = producing_stage(1);
+  const auto chain_on = [&] {
+    return std::ranges::all_of(std::span{passes}.first(PassCount - 3),
+                               [&](const detail::PassDesc& pass) { return pass.enabled(stage, pass.state); });
+  };
+  on_latch({}, nullptr);
+  EXPECT_FALSE(consumed(stage)) << "PBR off and no row selected reads no shadow";
+  for (uint16_t id = 48; id <= 52; ++id) {
+    debug::set_view_override(id);
+    on_latch({}, nullptr);
+    EXPECT_TRUE(shadow_view_selected()) << id;
+    EXPECT_TRUE(consumed(stage)) << id;
+    EXPECT_TRUE(chain_on()) << id;
+  }
+  debug::set_view_override(47);
+  on_latch({}, nullptr);
+  EXPECT_FALSE(shadow_view_selected());
+  EXPECT_FALSE(consumed(stage));
+  debug::set_view_override(0);
+
+  const std::array scene{detail::create_persistent("scene.instances", detail::PersistentKind::Buffer),
+                         detail::create_persistent("scene.materials", detail::PersistentKind::Buffer),
+                         detail::create_persistent("scene.indices", detail::PersistentKind::Buffer),
+                         detail::create_persistent("scene.vertices", detail::PersistentKind::Buffer),
+                         detail::create_persistent("scene.clusters", detail::PersistentKind::Buffer)};
+  testing::set_scene_handles(std::array{scene[0], scene[1]});
+  testing::set_geometry_handles(std::array{scene[2], scene[3], scene[4]});
+  const detail::PersistentHandle atlasPage =
+      detail::create_persistent("scene.atlas_page", detail::PersistentKind::Texture);
+  testing::set_atlas_handle(atlasPage);
+  initialize();
+  Caps caps = test::full_caps();
+  caps.limits.maxComputeWorkgroupSizeX = 256;
+  caps.limits.maxComputeWorkgroupsPerDimension = 65535;
+  std::vector<detail::PassDesc> all(passes.begin(), passes.end());
+  all.push_back(debug::vsm_view::pass_desc());
+  all.push_back({
+      .name = "test.view_reader",
+      .stage = Stage::OpaqueDone,
+      .kind = PassKind::Compute,
+      .order = 100,
+      .declare =
+          [](detail::InternalPassBuilder& builder, const detail::PassSetup&, const void*) {
+            builder.after(phase::Shadows);
+            builder.use(debug::VsmViewResource, Access::Sampled, Missing::DisablePass);
+            builder.side_effect();
+          },
+      .encode = [](detail::PassContext&, const void*) {},
+  });
+  const auto compile = [&](uint16_t view) {
+    Settings settings;
+    settings.debugView = view;
+    detail::GraphInputs inputs{.passes = all, .settings = &settings, .caps = &caps};
+    for (const detail::GxResource gx : {detail::GxResource::Depth, detail::GxResource::Normal}) {
+      inputs.env.gxFormats[static_cast<size_t>(gx)] =
+          gx == detail::GxResource::Depth ? wgpu::TextureFormat::Depth32Float : wgpu::TextureFormat::RGB10A2Unorm;
+      inputs.env.gxUsage[static_cast<size_t>(gx)] = wgpu::TextureUsage::TextureBinding;
+    }
+    inputs.sceneDepthSource = DepthSource::Direct;
+    inputs.env.efbSize = {1280, 720};
+    inputs.env.outputSize = {1280, 720};
+    inputs.env.sceneSize = {1280, 720};
+    inputs.env.retained = true;
+    return detail::compile_graph(inputs);
+  };
+  const auto none = compile(0);
+  ASSERT_NE(none, nullptr);
+  const auto skipped = [](const detail::CompiledGraph& graph) {
+    const detail::NodeId node = graph.find_node(debug::vsm_view::Pass);
+    return node == detail::InvalidNode || graph.nodes[node].status == detail::CullReason::Skipped;
+  };
+  EXPECT_TRUE(skipped(*none)) << "no row, no view node";
+  for (uint16_t id = 49; id <= 52; ++id) {
+    const auto graph = compile(id);
+    ASSERT_NE(graph, nullptr);
+    const detail::NodeId node = graph->find_node(debug::vsm_view::Pass);
+    ASSERT_NE(node, detail::InvalidNode) << id;
+    EXPECT_EQ(graph->nodes[node].status, detail::CullReason::None) << id;
+    EXPECT_EQ(graph->nodes[node].bindings[2].storageBuffers, debug::vsm_view::StorageBuffers);
+    const auto& order = graph->stages[static_cast<size_t>(Stage::OpaqueDone)].passes;
+    const auto position = [&](std::string_view name) {
+      return std::ranges::find(order, graph->find_node(name)) - order.begin();
+    };
+    EXPECT_LT(position(CommitPass), position(debug::vsm_view::Pass));
+  }
+  EXPECT_TRUE(skipped(*compile(48)));
+  shutdown();
+  for (detail::PersistentHandle h : scene) {
+    detail::destroy_persistent(h);
+  }
+  detail::destroy_persistent(atlasPage);
+  testing::set_scene_handles(std::nullopt);
+  testing::set_geometry_handles(std::nullopt);
+  detail::composite::testing::set_exposure_units(std::nullopt);
 }
 
 TEST_F(RenderVsmGraph, DeferredIsTheConsumer) {

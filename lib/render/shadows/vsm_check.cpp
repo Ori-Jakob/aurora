@@ -605,6 +605,11 @@ std::optional<Config> parse(std::string_view text) noexcept {
 
 const Config& config() noexcept { return g_override ? *g_override : env_config(); }
 
+Result result() noexcept {
+  std::lock_guard lock{g_mutex};
+  return g_result;
+}
+
 bool check_frame(uint64_t hintFrame) noexcept {
   const Config& c = config();
   return c.on && hintFrame >= c.first && hintFrame <= c.last && (hintFrame - c.first) % CheckEvery == 0;
@@ -1352,9 +1357,6 @@ std::vector<FrameCounters> frame_stats() {
   return out;
 }
 
-Result result() noexcept {
-  std::lock_guard lock{g_mutex};
-  return g_result;
-}
+Result result() noexcept { return check::result(); }
 } // namespace testing
 } // namespace aurora::render::shadows::vsm::check

@@ -7,6 +7,7 @@
 #include "gfx/recording.hpp"
 #include "gx/gx.hpp"
 #include "gx/hints.hpp"
+#include "render/debug/vsm_view.hpp"
 #include "render/hints.hpp"
 #include "render/jobs.hpp"
 #include "render/lighting/deferred.hpp"
@@ -3376,6 +3377,319 @@ TEST_F(RenderVsmSunGpu, BailedFrameFallsBackCoarser) {
   EXPECT_EQ(decide_frame(input(2)).reasons, 0u);
   mark_encoded(chain_bit::Update);
   EXPECT_EQ(decide_frame(input(3)).reasons, full_reason::ChainIncomplete);
+}
+
+constexpr uint64_t ViewLayoutKey = 0x76736D7669657701ull;
+
+struct ViewInputs {
+  std::span<const float> depth;
+  std::span<const uint8_t> codes;
+  std::span<const uint32_t> phys;
+  std::span<const uint32_t> requests;
+  std::span<const uint32_t> renderList;
+  uint32_t width = MarkWidth;
+  uint32_t height = MarkHeight;
+};
+
+class RenderVsmViewGpu : public RenderVsmSunGpu {
+protected:
+  void SetUp() override {
+    RenderVsmSunGpu::SetUp();
+    if (IsSkipped()) {
+      return;
+    }
+    const wgpu::Device& device = m_device->device;
+    constexpr auto Compute = wgpu::ShaderStage::Compute;
+    const std::array frameEntries{
+        wgpu::BindGroupLayoutEntry{
+            .binding = 1, .visibility = Compute, .buffer = {.type = wgpu::BufferBindingType::Uniform}},
+        wgpu::BindGroupLayoutEntry{
+            .binding = 5, .visibility = Compute, .sampler = {.type = wgpu::SamplerBindingType::Comparison}},
+    };
+    const wgpu::BindGroupLayoutDescriptor frameDescriptor{.entryCount = frameEntries.size(),
+                                                          .entries = frameEntries.data()};
+    m_viewFrameLayout = device.CreateBindGroupLayout(&frameDescriptor);
+    const auto tex = [&](uint32_t binding, wgpu::TextureSampleType type) {
+      return wgpu::BindGroupLayoutEntry{
+          .binding = binding,
+          .visibility = Compute,
+          .texture = {.sampleType = type, .viewDimension = wgpu::TextureViewDimension::e2D}};
+    };
+    const auto buf = [&](uint32_t binding, wgpu::BufferBindingType type) {
+      return wgpu::BindGroupLayoutEntry{.binding = binding, .visibility = Compute, .buffer = {.type = type}};
+    };
+    namespace b = debug::vsm_view::binding;
+    const std::array passEntries{
+        tex(b::Depth, wgpu::TextureSampleType::UnfilterableFloat),
+        tex(b::Normal, wgpu::TextureSampleType::UnfilterableFloat),
+        tex(b::Pool, wgpu::TextureSampleType::Depth),
+        buf(b::Table, wgpu::BufferBindingType::ReadOnlyStorage),
+        buf(b::Phys, wgpu::BufferBindingType::ReadOnlyStorage),
+        buf(b::Requests, wgpu::BufferBindingType::ReadOnlyStorage),
+        buf(b::RenderList, wgpu::BufferBindingType::ReadOnlyStorage),
+        buf(b::Views, wgpu::BufferBindingType::Uniform),
+        buf(b::Stats, wgpu::BufferBindingType::ReadOnlyStorage),
+        wgpu::BindGroupLayoutEntry{.binding = b::Target,
+                                   .visibility = Compute,
+                                   .storageTexture = {.access = wgpu::StorageTextureAccess::WriteOnly,
+                                                      .format = wgpu::TextureFormat::RGBA8Unorm,
+                                                      .viewDimension = wgpu::TextureViewDimension::e2D}},
+    };
+    const wgpu::BindGroupLayoutDescriptor passDescriptor{.entryCount = passEntries.size(),
+                                                         .entries = passEntries.data()};
+    m_viewPassLayout = device.CreateBindGroupLayout(&passDescriptor);
+    const std::array layouts{m_viewFrameLayout, m_viewPassLayout};
+    const wgpu::PipelineLayoutDescriptor layoutDescriptor{.bindGroupLayoutCount = layouts.size(),
+                                                          .bindGroupLayouts = layouts.data()};
+    const wgpu::PipelineLayout layout = device.CreatePipelineLayout(&layoutDescriptor);
+    for (uint32_t mode = 0; mode < debug::VsmViewModeCount; ++mode) {
+      shaders::ComputePipelineDesc desc = debug::vsm_view::pipeline_desc(static_cast<debug::VsmViewMode>(mode));
+      desc.layout = layout;
+      desc.layoutKey = ViewLayoutKey;
+      const shaders::PipelineId id = shaders::request_compute(desc);
+      ASSERT_EQ(shaders::wait(id), shaders::PipelineStatus::Ready) << mode;
+      m_viewPipelines[mode] = shaders::compute_pipeline(id);
+    }
+    const wgpu::BufferDescriptor params{.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst,
+                                        .size = sizeof(debug::vsm_view::Params)};
+    m_viewParams = device.CreateBuffer(&params);
+  }
+
+  wgpu::Buffer words(std::span<const uint32_t> values, uint64_t size) const {
+    const wgpu::Buffer out = buffer(size);
+    std::vector<uint32_t> data(size / 4, 0);
+    std::copy_n(values.begin(), std::min(values.size(), data.size()), data.begin());
+    m_device->queue.WriteBuffer(out, 0, data.data(), size);
+    return out;
+  }
+
+  std::vector<debug::Rgb8> run_view(debug::VsmViewMode mode, const Views& views, std::span<const uint32_t> table,
+                                    const ViewInputs& in) {
+    const wgpu::Device& device = m_device->device;
+    const std::vector<float> flat = flat_depth(100.f);
+    const std::vector<uint8_t> none(size_t{MarkWidth} * MarkHeight, 0);
+    const std::span<const float> depth = in.depth.empty() ? std::span<const float>{flat} : in.depth;
+    const std::span<const uint8_t> codes = in.codes.empty() ? std::span<const uint8_t>{none} : in.codes;
+    std::vector<float> normal(size_t{MarkWidth} * MarkHeight * 4, 0.5f);
+    for (size_t i = 0; i < codes.size(); ++i) {
+      normal[i * 4 + 3] = static_cast<float>(codes[i]) / 3.f;
+    }
+    const wgpu::Texture depthTexture = upload(wgpu::TextureFormat::R32Float, depth.data(), 4);
+    const wgpu::Texture normalTexture = upload(wgpu::TextureFormat::RGBA32Float, normal.data(), 16);
+    const MarkParams mark = mark_params();
+    debug::vsm_view::Params params;
+    params.camera = mark.camera;
+    params.rotation = mark.rotation;
+    params.flags = debug::vsm_view::flag::Producing;
+    m_device->queue.WriteBuffer(m_viewParams, 0, &params, sizeof(params));
+    m_device->queue.WriteBuffer(m_views, 0, &views, ViewsBytes);
+    m_device->queue.WriteBuffer(m_table, 0, table.data(), table.size_bytes());
+    const wgpu::Buffer phys = words(in.phys, PhysBytes);
+    const wgpu::Buffer requests = words(in.requests, RequestsBytes);
+    const wgpu::Buffer renderList = words(in.renderList, render_list::Bytes);
+    const std::array frameEntries{
+        wgpu::BindGroupEntry{.binding = 1, .buffer = m_viewParams, .size = sizeof(params)},
+        wgpu::BindGroupEntry{.binding = 5, .sampler = m_sampler},
+    };
+    const wgpu::BindGroupDescriptor frameGroup{
+        .layout = m_viewFrameLayout, .entryCount = frameEntries.size(), .entries = frameEntries.data()};
+    const wgpu::TextureDescriptor targetDescriptor{
+        .usage = wgpu::TextureUsage::StorageBinding | wgpu::TextureUsage::CopySrc,
+        .size = {in.width, in.height, 1},
+        .format = wgpu::TextureFormat::RGBA8Unorm,
+    };
+    const wgpu::Texture target = device.CreateTexture(&targetDescriptor);
+    namespace b = debug::vsm_view::binding;
+    const wgpu::TextureViewDescriptor depthOnly{.aspect = wgpu::TextureAspect::DepthOnly};
+    const std::array passEntries{
+        wgpu::BindGroupEntry{.binding = b::Depth, .textureView = depthTexture.CreateView()},
+        wgpu::BindGroupEntry{.binding = b::Normal, .textureView = normalTexture.CreateView()},
+        wgpu::BindGroupEntry{.binding = b::Pool, .textureView = m_pool.CreateView(&depthOnly)},
+        wgpu::BindGroupEntry{.binding = b::Table, .buffer = m_table, .size = TableBytes},
+        wgpu::BindGroupEntry{.binding = b::Phys, .buffer = phys, .size = PhysBytes},
+        wgpu::BindGroupEntry{.binding = b::Requests, .buffer = requests, .size = RequestsBytes},
+        wgpu::BindGroupEntry{.binding = b::RenderList, .buffer = renderList, .size = render_list::Bytes},
+        wgpu::BindGroupEntry{.binding = b::Views, .buffer = m_views, .size = ViewsBytes},
+        wgpu::BindGroupEntry{.binding = b::Stats, .buffer = m_stats, .size = StatsBytes},
+        wgpu::BindGroupEntry{.binding = b::Target, .textureView = target.CreateView()},
+    };
+    const wgpu::BindGroupDescriptor passGroup{
+        .layout = m_viewPassLayout, .entryCount = passEntries.size(), .entries = passEntries.data()};
+    const uint32_t row = (in.width * 4 + 255) / 256 * 256;
+    const wgpu::BufferDescriptor readDescriptor{.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+                                                .size = uint64_t{row} * in.height};
+    const wgpu::Buffer readback = device.CreateBuffer(&readDescriptor);
+    const wgpu::CommandEncoder encoder = device.CreateCommandEncoder();
+    const wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
+    pass.SetPipeline(m_viewPipelines[static_cast<size_t>(mode)]);
+    pass.SetBindGroup(0, device.CreateBindGroup(&frameGroup));
+    pass.SetBindGroup(1, device.CreateBindGroup(&passGroup));
+    pass.DispatchWorkgroups((in.width + 7) / 8, (in.height + 7) / 8);
+    pass.End();
+    const wgpu::TexelCopyTextureInfo source{.texture = target};
+    const wgpu::TexelCopyBufferInfo destination{.layout = {.bytesPerRow = row, .rowsPerImage = in.height},
+                                                .buffer = readback};
+    const wgpu::Extent3D extent{in.width, in.height, 1};
+    encoder.CopyTextureToBuffer(&source, &destination, &extent);
+    EXPECT_TRUE(test::submit_and_wait(*m_device, encoder.Finish()));
+    const std::vector<uint32_t> raw = read(readback, uint64_t{row} * in.height);
+    std::vector<debug::Rgb8> out(size_t{in.width} * in.height);
+    if (raw.size() * 4 >= size_t{row} * in.height) {
+      const auto* bytes = reinterpret_cast<const uint8_t*>(raw.data());
+      for (uint32_t y = 0; y < in.height; ++y) {
+        for (uint32_t x = 0; x < in.width; ++x) {
+          const uint8_t* t = bytes + size_t{y} * row + size_t{x} * 4;
+          out[size_t{y} * in.width + x] = {t[0], t[1], t[2]};
+        }
+      }
+    }
+    return out;
+  }
+
+  wgpu::BindGroupLayout m_viewFrameLayout, m_viewPassLayout;
+  std::array<wgpu::ComputePipeline, debug::VsmViewModeCount> m_viewPipelines;
+  wgpu::Buffer m_viewParams;
+};
+
+std::string rgb_text(debug::Rgb8 c) {
+  return std::to_string(c.r) + "," + std::to_string(c.g) + "," + std::to_string(c.b);
+}
+
+TEST_F(RenderVsmViewGpu, PagesViewColoursKnownStates) {
+  using debug::VsmPageState;
+  const Views views = sun_views();
+  const std::vector<float> depth = flat_depth(100.f);
+  const uint32_t level = single_level(views, depth);
+  ASSERT_LT(level + FallbackLevels + 1, SunLevels);
+  std::vector<uint8_t> codes = receivers();
+  for (size_t i = 0; i < codes.size(); i += 5) {
+    codes[i] = 0;
+  }
+  std::vector<uint32_t> rows(render_list::Words, 0);
+  std::fill_n(rows.begin() + render_list::RowMasks + level_view(level) * WindowPages, WindowPages, ~0u);
+  const auto check = [&](debug::VsmViewMode mode, std::span<const uint32_t> table, std::span<const uint32_t> list,
+                         debug::Rgb8 want, bool borders, std::string_view what) {
+    SCOPED_TRACE(what);
+    const std::vector<debug::Rgb8> got =
+        run_view(mode, views, table, {.depth = depth, .codes = codes, .renderList = list});
+    size_t full = 0;
+    size_t receiving = 0;
+    for (size_t i = 0; i < got.size(); ++i) {
+      if (codes[i] < 2) {
+        EXPECT_EQ(got[i], debug::vsm_page_color(VsmPageState::NotReceiver)) << i << " " << rgb_text(got[i]);
+        continue;
+      }
+      ++receiving;
+      full += got[i] == want ? 1 : 0;
+      EXPECT_TRUE(got[i] == want || (borders && got[i] == debug::halve(want))) << i << " " << rgb_text(got[i]);
+    }
+    EXPECT_GT(full, receiving / 2);
+  };
+  constexpr auto Pages = debug::VsmViewMode::Pages;
+  std::array<uint32_t, SunLevels> levels{};
+  levels.fill(Usable | 1u);
+  check(Pages, level_table(levels), {}, debug::vsm_page_color(VsmPageState::Cached), true, "cached");
+  check(Pages, level_table(levels), rows, debug::vsm_page_color(VsmPageState::Rendered), true, "rendered");
+  check(debug::VsmViewMode::Level, level_table(levels), {}, debug::VsmLevelColors[level], false, "level");
+  levels[level] = Usable | entry::Dirty;
+  check(Pages, level_table(levels), {}, debug::vsm_page_color(VsmPageState::Stale), true, "stale");
+  levels[level] = Usable | entry::RenderNow | 1u;
+  levels[level + 1] = Usable;
+  check(Pages, level_table(levels), {}, debug::vsm_page_color(VsmPageState::Fallback), true, "fallback");
+  check(debug::VsmViewMode::Level, level_table(levels), {}, debug::halve(debug::VsmLevelColors[level + 1]), false,
+        "level fallback");
+  for (uint32_t k = 0; k <= FallbackLevels; ++k) {
+    levels[level + k] = k == 0 ? 0u : Usable | entry::RenderNow;
+  }
+  check(Pages, level_table(levels), {}, debug::vsm_page_color(VsmPageState::Unshadowed), true, "unshadowed");
+  const std::vector<debug::Rgb8> slate =
+      run_view(debug::VsmViewMode::NoSun, views, level_table(levels), {.depth = depth, .codes = codes});
+  EXPECT_TRUE(std::ranges::all_of(slate, [](debug::Rgb8 c) { return c == debug::VsmNoSunColor; }));
+}
+
+TEST_F(RenderVsmViewGpu, TableAndPoolColoursKnownStates) {
+  using debug::VsmTableState;
+  Views views = sun_views();
+  views.header.clock = 100;
+  constexpr uint32_t View = SunLevels - 1;
+  const ViewRecord& v = views.views[View];
+  ASSERT_EQ(level_view(0), View);
+  const auto index = [&](uint32_t lx, uint32_t ly) {
+    return page_index(v.table_offset(), v.origin[0] + static_cast<int32_t>(lx), v.origin[1] + static_cast<int32_t>(ly));
+  };
+  const std::array<float, 3> cam = view_coords(v, {0.f, 0.f, 0.f});
+  const std::array<int32_t, 2> camLocal{static_cast<int32_t>(std::floor(cam[0] / PageTexels)),
+                                        static_cast<int32_t>(std::floor(cam[1] / PageTexels))};
+  ASSERT_GE(camLocal[1], 4) << "the camera page stays clear of the tested row";
+  ASSERT_LT(camLocal[0], 32);
+  std::vector<uint32_t> table(MaxVirtualPages, 0);
+  std::vector<uint32_t> phys(MaxPoolPages * PhysWords, 0);
+  std::vector<uint32_t> requests(MaxVirtualPages, 0);
+  std::vector<uint32_t> list(render_list::Words, 0);
+  const auto put = [&](uint32_t lx, uint32_t entryBits, uint32_t page, uint32_t age) {
+    table[index(lx, 2)] = entryBits | page;
+    phys[page * PhysWords] = index(lx, 2) + 1;
+    phys[page * PhysWords + 1] = views.header.clock - age;
+  };
+  put(3, Usable, 5, 0);
+  put(4, Usable, 6, 20);
+  put(5, Usable, 7, 0);
+  requests[index(5, 2)] = request_bit::Pixel;
+  put(6, Usable, 2, 0);
+  list[render_list::RowMasks + View * WindowPages + 2] = 1u << 6;
+  put(7, Usable | entry::Dirty, 3, 0);
+  requests[index(8, 2)] = request_bit::Fallback;
+  struct Probe {
+    uint32_t lx;
+    debug::Rgb8 want;
+  };
+  const std::array<Probe, 7> probes{{
+      {2, debug::vsm_table_color(VsmTableState::Free)},
+      {3, debug::vsm_cached_color(0)},
+      {4, debug::vsm_cached_color(20)},
+      {5, debug::vsm_table_color(VsmTableState::Requested)},
+      {6, debug::vsm_table_color(VsmTableState::Rendered)},
+      {7, debug::vsm_table_color(VsmTableState::Stale)},
+      {8, debug::vsm_table_color(VsmTableState::Missing)},
+  }};
+  constexpr uint32_t Width = 160;
+  constexpr uint32_t Height = 128;
+  constexpr uint32_t Left = (Width - Height) / 2;
+  const std::vector<debug::Rgb8> got =
+      run_view(debug::VsmViewMode::Table, views, table,
+               {.phys = phys, .requests = requests, .renderList = list, .width = Width, .height = Height});
+  const auto at = [&](uint32_t x, uint32_t y) { return got[size_t{y} * Width + x]; };
+  for (const Probe& probe : probes) {
+    EXPECT_EQ(at(Left + probe.lx, 2), probe.want) << probe.lx << " " << rgb_text(at(Left + probe.lx, 2));
+  }
+  EXPECT_EQ(at(Left + static_cast<uint32_t>(camLocal[0]), static_cast<uint32_t>(camLocal[1])),
+            debug::vsm_table_color(VsmTableState::Camera));
+  EXPECT_EQ(at(3, 50), debug::VsmLetterboxColor) << "outside the square";
+  EXPECT_EQ(at(Left, 9), debug::VsmLetterboxColor) << "the separator column";
+  EXPECT_EQ(at(Left + 5, 3 * 32 + 5), debug::VsmLetterboxColor) << "views past the sun levels are inactive";
+  EXPECT_EQ(at(Left + 32 + 5, 5), debug::vsm_table_color(VsmTableState::Free)) << "level 1 has nothing";
+
+  std::array<float, SunPoolPages> depths{};
+  depths.fill(0.25f);
+  fill_pool(depths);
+  std::vector<uint32_t> poolPhys(MaxPoolPages * PhysWords, 0);
+  poolPhys[1 * PhysWords] = index(3, 2) + 1;
+  poolPhys[2 * PhysWords] = index(6, 2) + 1;
+  constexpr uint32_t AtlasWidth = SunPoolPagesX * PageTexels;
+  constexpr uint32_t AtlasHeight = SunPoolPages / SunPoolPagesX * PageTexels;
+  const std::vector<debug::Rgb8> pool =
+      run_view(debug::VsmViewMode::Pool, views, table,
+               {.phys = poolPhys, .renderList = list, .width = AtlasWidth, .height = AtlasHeight});
+  const auto texel = [&](uint32_t page, uint32_t x, uint32_t y) {
+    return pool[size_t{(page / SunPoolPagesX) * PageTexels + y} * AtlasWidth + (page % SunPoolPagesX) * PageTexels + x];
+  };
+  constexpr debug::Rgb8 Grey{64, 64, 64};
+  EXPECT_EQ(texel(0, 60, 60), debug::VsmPoolUnusedColor);
+  EXPECT_EQ(texel(1, 0, 0), Grey) << "a page not rendered this frame has no outline";
+  EXPECT_EQ(texel(1, 60, 60), Grey);
+  EXPECT_EQ(texel(2, 0, 60), debug::VsmPoolRenderedColor);
+  EXPECT_EQ(texel(2, 127, 60), debug::VsmPoolRenderedColor);
+  EXPECT_EQ(texel(2, 60, 60), Grey);
 }
 } // namespace
 } // namespace aurora::render::shadows::vsm

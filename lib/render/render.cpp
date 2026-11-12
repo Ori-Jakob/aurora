@@ -13,6 +13,7 @@
 #include "debug/debug.hpp"
 #include "debug/surface_expand.hpp"
 #include "debug/views.hpp"
+#include "debug/vsm_view.hpp"
 #include "geometry/compact.hpp"
 #include "geometry/hzb.hpp"
 #include "gx_ext/ext_provider.hpp"
@@ -128,6 +129,7 @@ void initialize() {
   scene::atlas::initialize();
   shadows::vsm::initialize();
   shadows::sun_visibility::initialize();
+  debug::vsm_view::initialize();
   debug::surface_expand::initialize();
   upscale::initialize();
   systems::initialize();
@@ -164,6 +166,7 @@ void shutdown() noexcept {
   scene::streamout::shutdown();
   scene::meshlets::shutdown();
   scene::atlas::shutdown();
+  debug::vsm_view::shutdown();
   shadows::sun_visibility::shutdown();
   shadows::vsm::shutdown();
   compact::shutdown();

@@ -5,6 +5,7 @@
 #include "dual_source.hpp"
 #include "gbuf_view.hpp"
 #include "retained_view.hpp"
+#include "vsm_view.hpp"
 
 #include "../frame_state.hpp"
 #include "../graph.hpp"
@@ -68,6 +69,27 @@ constexpr std::array<LegendEntry, 9> CoverageLegend{{
     {coverage_touched(coverage_class_color(CoverageClass::FoggedReceiver)), TouchedLabel},
     {coverage_touched(coverage_class_color(CoverageClass::LockedReceiver)), TouchedLabel},
     {coverage_class_color(CoverageClass::Bad), "bad: fog record above the colour"},
+}};
+
+constexpr std::array<LegendEntry, 7> VsmPagesLegend{{
+    {vsm_page_color(VsmPageState::Cached), "cached"},
+    {vsm_page_color(VsmPageState::Rendered), "rendered this frame"},
+    {vsm_page_color(VsmPageState::Stale), "stale: re-render deferred"},
+    {vsm_page_color(VsmPageState::Fallback), "coarser level as fallback"},
+    {vsm_page_color(VsmPageState::Unshadowed), "unshadowed: no usable page"},
+    {vsm_page_color(VsmPageState::NotReceiver), "not a receiver"},
+    {halve(vsm_page_color(VsmPageState::Cached)), "half intensity: page border"},
+}};
+constexpr std::array<LegendEntry, 9> VsmTableLegend{{
+    {vsm_table_color(VsmTableState::Free), "free"},
+    {vsm_cached_color(0), "cached, not requested (darker when older)"},
+    {vsm_table_color(VsmTableState::Requested), "requested"},
+    {vsm_table_color(VsmTableState::Rendered), "rendered this frame"},
+    {vsm_table_color(VsmTableState::Stale), "stale"},
+    {vsm_table_color(VsmTableState::Missing), "requested without content"},
+    {vsm_table_color(VsmTableState::Camera), "camera page"},
+    {VsmLetterboxColor, "inactive view; levels 0-11 left to right, top to bottom"},
+    {VsmNoSunColor, "no sun shadows this frame"},
 }};
 
 struct TabState {
@@ -291,6 +313,15 @@ void draw_view_buttons() {
     }
     if (view.kind == GbufViewKind::Retained && current == view.id) {
       draw_retained(view);
+    }
+    if (shadow_view(view) && current == view.id) {
+      const std::optional<VsmViewMode> mode = vsm_view::row_mode(view);
+      if (mode == VsmViewMode::Pages) {
+        draw_legend(VsmPagesLegend);
+      } else if (mode == VsmViewMode::Table) {
+        draw_legend(VsmTableLegend);
+      }
+      vsm_view::draw_stats();
     }
   }
   if (const GbufView* active = gbuf_view::active_view()) {
