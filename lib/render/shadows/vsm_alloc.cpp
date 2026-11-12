@@ -161,7 +161,7 @@ void declare_mark(detail::InternalPassBuilder& builder, const PassSetup& setup, 
                                             .sampleType = wgpu::TextureSampleType::UnfilterableFloat})
                     .index;
   local.normal = builder.use(resource::GxNormal, Access::Sampled, Missing::DisablePass).index;
-  local.views = builder.import_persistent(ViewsName, handle(ViewsName), Access::StorageRead).index;
+  local.views = builder.import_persistent(ViewsName, handle(ViewsName), Access::Uniform).index;
   local.requests = builder
                        .create_buffer(Requests, {.size = RequestsBytes, .extraUsage = wgpu::BufferUsage::CopyDst},
                                       Access::StorageWrite)

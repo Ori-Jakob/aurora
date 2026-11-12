@@ -75,9 +75,9 @@ protected:
     m_device.reset();
   }
 
-  wgpu::Buffer buffer(uint64_t size) const {
+  wgpu::Buffer buffer(uint64_t size, wgpu::BufferUsage extra = wgpu::BufferUsage::None) const {
     const wgpu::BufferDescriptor descriptor{
-        .usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst,
+        .usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst | extra,
         .size = size,
     };
     return m_device->device.CreateBuffer(&descriptor);
@@ -984,7 +984,7 @@ protected:
     m_commit = pipeline(m_emptyLayout, m_commitGroup, AllocShader, "vsm_commit", CommitLayoutKey, Commit);
     m_mark = pipeline(m_paramsLayout, m_markGroup, AllocShader, "vsm_mark", MarkLayoutKey, Mark);
     m_markCheck = pipeline(m_paramsLayout, m_markCheckGroup, AllocShader, "vsm_mark", MarkCheckLayoutKey, MarkCheck);
-    m_views = buffer(ViewsBytes);
+    m_views = buffer(ViewsBytes, wgpu::BufferUsage::Uniform);
     m_requests = buffer(RequestsBytes);
     m_table = buffer(TableBytes);
     m_phys = buffer(PhysBytes);
@@ -1025,7 +1025,7 @@ protected:
       entries.push_back({
           .binding = i,
           .visibility = wgpu::ShaderStage::Compute,
-          .buffer = {.type = i == 2 ? wgpu::BufferBindingType::ReadOnlyStorage : wgpu::BufferBindingType::Storage},
+          .buffer = {.type = i == 2 ? wgpu::BufferBindingType::Uniform : wgpu::BufferBindingType::Storage},
       });
     }
     const wgpu::BindGroupLayoutDescriptor descriptor{.entryCount = entries.size(), .entries = entries.data()};

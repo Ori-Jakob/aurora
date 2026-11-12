@@ -14,7 +14,7 @@ struct VsmMarkParams {
 @group(0) @binding(1) var<uniform> vsm_mark_params: VsmMarkParams;
 @group(1) @binding(0) var vsm_depth: texture_2d<f32>;
 @group(1) @binding(1) var vsm_normal: texture_2d<f32>;
-@group(1) @binding(2) var<storage, read> vsm_views: array<u32>;
+@group(1) @binding(2) var<uniform> vsm_views: array<vec4u, 144>;
 @group(1) @binding(3) var<storage, read_write> vsm_requests: array<atomic<u32>>;
 //#if VSM_MARK_CHECK
 @group(1) @binding(4) var<storage, read_write> vsm_receivers: array<u32>;
@@ -44,7 +44,7 @@ fn vsm_mark(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation
       let z = camera_view_depth(cam, d);
       let pos = camera_view_position_fwd(cam, (vec2f(gid.xy) + 0.5) / full, z, full);
       let p_rel = camera_world_dir(vsm_mark_params.rotation, pos);
-      keys = vsm_request_keys(&vsm_views, p_rel, 2.0 * z / (full.y * cam.depth.w));
+      keys = vsm_uniform_request_keys(&vsm_views, p_rel, 2.0 * z / (full.y * cam.depth.w));
     }
   }
   for (var k = 0u; k < VSM_MARK_KEYS; k++) {
@@ -56,11 +56,9 @@ fn vsm_mark(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation
     if (key == VSM_NO_KEY) {
       continue;
     }
-    var seen = false;
-    for (var j = 0u; j < VSM_MARK_KEYS; j++) {
-      seen = seen || (lid.x > 0u && vsm_mark_keys[(li - 1u) * VSM_MARK_KEYS + j] == key);
-      seen = seen || (lid.y > 0u && vsm_mark_keys[(li - 8u) * VSM_MARK_KEYS + j] == key);
-    }
+    // Neighbours inside a page hold the same keys in the same slots, so one compare each drops nearly every repeat
+    let seen = (lid.x > 0u && vsm_mark_keys[(li - 1u) * VSM_MARK_KEYS + k] == key) ||
+               (lid.y > 0u && vsm_mark_keys[(li - 8u) * VSM_MARK_KEYS + k] == key);
     let index = key & 0xFFFFu;
     if (!seen && index < arrayLength(&vsm_requests)) {
       atomicOr(&vsm_requests[index], key >> 16u);
