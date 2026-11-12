@@ -247,9 +247,9 @@ TEST_F(RenderApiTest, GameShadowLevels) {
   noSuppression[static_cast<size_t>(Feature::GameShadowSuppression)] = 0;
   EXPECT_EQ(clamp_settings(vsm, env(caps, noSuppression)).shadows.game, GameShadows::Keep);
 
-  const Settings unbuilt = clamp_settings(vsm, env(caps, detail::default_built_options()));
-  EXPECT_EQ(unbuilt.shadows.quality, Quality::Off);
-  EXPECT_EQ(unbuilt.shadows.game, GameShadows::Auto);
+  const Settings shipped = clamp_settings(vsm, env(caps, detail::default_built_options()));
+  EXPECT_EQ(shipped.shadows.quality, Quality::Medium);
+  EXPECT_EQ(shipped.shadows.game, GameShadows::Auto);
 }
 
 TEST_F(RenderApiTest, NamesAreUniqueAndSpelled) {

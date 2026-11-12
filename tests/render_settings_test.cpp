@@ -100,6 +100,56 @@ TEST(RenderSettings, GameShadowSuppressionWriteLevel) {
   EXPECT_EQ(detail::clamp_settings(remove, env(caps, built)).shadows.game, GameShadows::Keep);
 }
 
+TEST(RenderSettings, ShadowsBuiltAndNeedsRetainedScene) {
+  const detail::BuiltOptions& built = detail::default_built_options();
+  EXPECT_EQ(built[static_cast<size_t>(Feature::Shadows)], 0x1Eu) << "Low to Ultra";
+  EXPECT_EQ(built[static_cast<size_t>(Feature::GameShadowSuppression)], 0x6u) << "Replace When Covered and Remove";
+  const Caps caps = full_caps();
+  const detail::SupportEnv retained = env(caps, built);
+  detail::SupportEnv none = env(caps, built);
+  none.retained = false;
+  for (const Quality quality : {Quality::Low, Quality::Medium, Quality::High, Quality::Ultra}) {
+    Settings request;
+    request.shadows.quality = quality;
+    const auto level = static_cast<uint8_t>(quality);
+    EXPECT_TRUE(detail::evaluate_support(Feature::Shadows, level, request, retained).supported) << int{level};
+    EXPECT_EQ(detail::evaluate_support(Feature::Shadows, level, request, none),
+              (FeatureSupport{false, Reason::NeedsRetainedScene}))
+        << int{level};
+    EXPECT_EQ(detail::clamp_settings(request, retained).shadows.quality, quality);
+    EXPECT_EQ(detail::clamp_settings(request, none).shadows.quality, Quality::Off);
+  }
+  // The defaults stay the Original preset, so G1 runs with Shadows off
+  EXPECT_EQ(detail::clamp_settings(Settings{}, retained).shadows.quality, Quality::Off);
+  EXPECT_EQ(detail::requested_option(detail::clamp_settings(Settings{}, retained), Feature::Shadows), 0);
+}
+
+TEST(RenderSettings, GameShadowSuppressionLevels) {
+  const Caps caps = full_caps();
+  const detail::BuiltOptions& built = detail::default_built_options();
+  const detail::SupportEnv retained = env(caps, built);
+  detail::SupportEnv none = env(caps, built);
+  none.retained = false;
+  Settings remove;
+  remove.shadows.game = GameShadows::Remove;
+  // Remove needs no producer, so it survives a device without the retained scene
+  EXPECT_TRUE(detail::evaluate_support(Feature::GameShadowSuppression, 2, remove, none).supported);
+  EXPECT_EQ(detail::clamp_settings(remove, none).shadows.game, GameShadows::Remove);
+  Settings replace;
+  replace.shadows.quality = Quality::Medium;
+  replace.shadows.game = GameShadows::Auto;
+  EXPECT_EQ(detail::evaluate_support(Feature::GameShadowSuppression, 1, replace, none),
+            (FeatureSupport{false, Reason::NeedsRetainedScene}));
+  EXPECT_TRUE(detail::evaluate_support(Feature::GameShadowSuppression, 1, replace, retained).supported);
+  const Settings clamped = detail::clamp_settings(replace, retained);
+  EXPECT_EQ(clamped.shadows.quality, Quality::Medium);
+  EXPECT_EQ(clamped.shadows.game, GameShadows::Auto);
+  EXPECT_EQ(detail::requested_option(clamped, Feature::GameShadowSuppression), 1);
+  const Settings without = detail::clamp_settings(replace, none);
+  EXPECT_EQ(without.shadows.quality, Quality::Off);
+  EXPECT_EQ(detail::requested_option(without, Feature::GameShadowSuppression), 0) << "Auto asks for nothing then";
+}
+
 TEST(RenderSettings, ExposureEnvParses) {
   using detail::ExposureOverride;
   using detail::parse_exposure_override;

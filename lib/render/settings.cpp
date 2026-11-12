@@ -141,6 +141,9 @@ constexpr BuiltOptions DefaultBuiltOptions = [] {
   built[static_cast<size_t>(Feature::LegacyMatMaps)] = 1u << 1;
   // SSIL ships with the defogged radiance it gathers, so no player sees fog-tinted bounce
   built[static_cast<size_t>(Feature::Ssil)] = ao::SsilBuiltOption;
+  // Real shadows ship with suppression and both composite paths, so no player sees fake and real shadows together
+  built[static_cast<size_t>(Feature::Shadows)] = (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4);
+  built[static_cast<size_t>(Feature::GameShadowSuppression)] = (1u << 1) | (1u << 2);
   return built;
 }();
 
@@ -537,6 +540,15 @@ std::optional<Quality> shadows_env() noexcept {
     return std::nullopt;
   }();
   return quality;
+}
+
+bool retained_supported(const Caps& caps) noexcept {
+#if AURORA_ENABLE_RENDER
+  return scene::retained::available(caps);
+#else
+  (void)caps;
+  return false;
+#endif
 }
 
 bool mat_maps_env_read() noexcept {
@@ -1067,6 +1079,14 @@ FeatureSupport evaluate_support(Feature feature, uint8_t option, const Settings&
     if (stage_binding_limits(deviceCaps, ShaderStage::Vertex).storageBuffers < shadows::vsm::RasterVertexStorage) {
       return {false, Reason::NoVertexStorage};
     }
+    if (!env.retained) {
+      return {false, Reason::NeedsRetainedScene};
+    }
+    break;
+  case Feature::GameShadowSuppression:
+    if (level == 1 && !env.retained) {
+      return {false, Reason::NeedsRetainedScene};
+    }
     break;
   case Feature::Clouds:
     if (fragmentStorage == 0) {
@@ -1245,8 +1265,9 @@ Settings clamp_settings(const Settings& requested, const SupportEnv& env) noexce
 
 Settings submit_request(const Settings& requested) {
   std::lock_guard lock{g_requestMutex};
-  Settings preview = clamp_settings(with_env_overrides(requested), {caps(), g_msaaSamples, support_built(g_built),
-                                                                    module_enabled(), &g_upscalerProbe});
+  Settings preview =
+      clamp_settings(with_env_overrides(requested), {caps(), g_msaaSamples, support_built(g_built), module_enabled(),
+                                                     &g_upscalerProbe, retained_supported(caps())});
   g_lastRequest = requested;
   g_pending = requested;
   g_supportContext = preview;
@@ -1270,7 +1291,7 @@ FeatureSupport current_support(Feature feature, uint8_t option, const Settings* 
   if (context != nullptr) {
     supportContext = sanitize_settings(*context);
   }
-  const SupportEnv env{caps(), msaaSamples, built, module_enabled(), &upscalers};
+  const SupportEnv env{caps(), msaaSamples, built, module_enabled(), &upscalers, retained_supported(caps())};
   if (feature == Feature::Upscaler) {
     Settings query = supportContext;
     query.upscaler = static_cast<Upscaler>(option);
@@ -1293,7 +1314,8 @@ void reset_settings_state(uint32_t msaaSamples) noexcept {
     g_supportContext = result;
     g_pending.reset();
     g_heldRequest.reset();
-    g_reclamp = false;
+    // Hints install after this reset, so retained support is decided by a re-clamp at the first latch
+    g_reclamp = true;
   }
   g_latched = result;
 }
@@ -1367,7 +1389,8 @@ std::shared_ptr<const FrameState> latch_frame() {
                          .msaaSamples = msaaSamples,
                          .built = built,
                          .moduleEnabled = module_enabled(),
-                         .upscalers = &upscalers};
+                         .upscalers = &upscalers,
+                         .retained = retained_supported(caps())};
     Settings next = clamp_settings(with_env_overrides(*request), env);
     if (next != latched_settings()) {
       const FeatureMask previous = enabled_features(latched_settings());

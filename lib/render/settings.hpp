@@ -54,6 +54,7 @@ struct SupportEnv {
   const BuiltOptions& built;
   bool moduleEnabled = false;
   const UpscalerProbe* upscalers = nullptr;
+  bool retained = true;
 };
 
 const FeatureInfo& feature_info(Feature feature) noexcept;
