@@ -467,20 +467,27 @@ fn vsm_uniform_level_keys(views: ptr<uniform, array<vec4u, 144>>, level: u32, p_
                   (*views)[base + 7u].z >> 16u, bits, keys, first);
 }
 
-fn vsm_uniform_request_keys(views: ptr<uniform, array<vec4u, 144>>, p_rel: vec3f, f: f32) -> array<u32, 8> {
-  var keys = vsm_no_keys();
+fn vsm_uniform_select_level(views: ptr<uniform, array<vec4u, 144>>, f: f32, p_rel: vec3f) -> u32 {
   let texel0 = vsm_f32((*views)[3].w);
   if (!(texel0 > 0.0)) {
-    return keys;
+    return VSM_SUN_LEVELS;
   }
   for (var level = vsm_level_wanted(f, texel0, vsm_f32((*views)[3].z)); level < VSM_SUN_LEVELS; level++) {
     if (vsm_coords_fit(vsm_uniform_coords(views, vsm_level_view(level), p_rel))) {
-      vsm_uniform_level_keys(views, level, p_rel, VSM_REQUEST_PIXEL, &keys, 0u);
-      if (level + 1u < VSM_SUN_LEVELS) {
-        vsm_uniform_level_keys(views, level + 1u, p_rel, VSM_REQUEST_FALLBACK, &keys, 4u);
-      }
-      break;
+      return level;
     }
+  }
+  return VSM_SUN_LEVELS;
+}
+
+fn vsm_uniform_request_keys(views: ptr<uniform, array<vec4u, 144>>, p_rel: vec3f, f: f32) -> array<u32, 8> {
+  var keys = vsm_no_keys();
+  let level = vsm_uniform_select_level(views, f, p_rel);
+  if (level < VSM_SUN_LEVELS) {
+    vsm_uniform_level_keys(views, level, p_rel, VSM_REQUEST_PIXEL, &keys, 0u);
+  }
+  if (level + 1u < VSM_SUN_LEVELS) {
+    vsm_uniform_level_keys(views, level + 1u, p_rel, VSM_REQUEST_FALLBACK, &keys, 4u);
   }
   return keys;
 }

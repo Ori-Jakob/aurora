@@ -4,6 +4,7 @@ const VSM_FILTER_FALLBACK_LEVELS: u32 = 2u;
 const VSM_FILTER_NORMAL_BASE: f32 = 0.5;
 const VSM_FILTER_NORMAL_SLOPE: f32 = 1.5;
 const VSM_FILTER_TAP_INSET: f32 = 0.5;
+const VSM_FILTER_PAGE_SLACK: f32 = 1e-3;
 
 struct VsmFilterParams {
   taps: u32,
@@ -47,25 +48,11 @@ struct VsmResult {
 }
 
 fn vsm_filter_view(views: ptr<uniform, array<vec4u, 144>>, i: u32) -> VsmView {
-  let base = VSM_HEADER_WORDS / 4u + min(i, VSM_MAX_VIEWS - 1u) * (VSM_VIEW_WORDS / 4u);
-  var w: array<vec4u, 8>;
-  for (var k = 0u; k < 8u; k++) {
-    w[k] = (*views)[base + k];
-  }
-  return vsm_view_unpack(w);
+  return vsm_uniform_view(views, i);
 }
 
 fn vsm_filter_select_level(views: ptr<uniform, array<vec4u, 144>>, f: f32, p_rel: vec3f) -> u32 {
-  let texel0 = vsm_f32((*views)[3].w);
-  if (!(texel0 > 0.0)) {
-    return VSM_SUN_LEVELS;
-  }
-  for (var level = vsm_level_wanted(f, texel0, vsm_f32((*views)[3].z)); level < VSM_SUN_LEVELS; level++) {
-    if (vsm_level_fits(vsm_filter_view(views, vsm_level_view(level)), p_rel)) {
-      return level;
-    }
-  }
-  return VSM_SUN_LEVELS;
+  return vsm_uniform_select_level(views, f, p_rel);
 }
 
 fn vsm_filter_tap(taps: u32, t: u32) -> vec2f {
@@ -80,6 +67,10 @@ fn vsm_filter_tap(taps: u32, t: u32) -> vec2f {
 
 fn vsm_filter_taps(taps: u32) -> u32 {
   return select(select(9u, 4u, taps <= 4u), 1u, taps <= 1u);
+}
+
+fn vsm_filter_reach(taps: u32) -> f32 {
+  return select(select(1.0, 0.5, taps <= 4u), 0.0, taps <= 1u) + VSM_FILTER_TAP_INSET + VSM_FILTER_PAGE_SLACK;
 }
 
 fn vsm_normal_offset_texels(params: VsmFilterParams, n_dot_l: f32) -> f32 {
@@ -126,6 +117,27 @@ fn vsm_pcf(pool: texture_depth_2d, cmp: sampler_comparison, pages_x: u32, phys: 
   return textureSampleCompareLevel(pool, cmp, uv, ref_depth);
 }
 
+// Nine bilinear taps a texel apart weigh a 4x4 block by (1 - f, 1, 1, f) per axis, which four gathers read at once
+fn vsm_pcf9(pool: texture_depth_2d, cmp: sampler_comparison, pages_x: u32, phys: u32, local: vec2f,
+            ref_depth: f32) -> f32 {
+  let px = max(pages_x, 1u);
+  let x = vec2f(vec2u(phys % px, phys / px) * VSM_PAGE_TEXELS) + local - 0.5;
+  let i = floor(x);
+  let f = x - i;
+  let inv = 1.0 / vec2f(textureDimensions(pool));
+  let a = textureGatherCompare(pool, cmp, i * inv, ref_depth);
+  let b = textureGatherCompare(pool, cmp, (i + vec2f(2.0, 0.0)) * inv, ref_depth);
+  let c = textureGatherCompare(pool, cmp, (i + vec2f(0.0, 2.0)) * inv, ref_depth);
+  let d = textureGatherCompare(pool, cmp, (i + vec2f(2.0, 2.0)) * inv, ref_depth);
+  let wx = vec4f(1.0 - f.x, 1.0, 1.0, f.x);
+  let wy = vec4f(1.0 - f.y, 1.0, 1.0, f.y);
+  let sum = dot(a, vec4f(wx.x * wy.y, wx.y * wy.y, wx.y * wy.x, wx.x * wy.x)) +
+            dot(b, vec4f(wx.z * wy.y, wx.w * wy.y, wx.w * wy.x, wx.z * wy.x)) +
+            dot(c, vec4f(wx.x * wy.w, wx.y * wy.w, wx.y * wy.z, wx.x * wy.z)) +
+            dot(d, vec4f(wx.z * wy.w, wx.w * wy.w, wx.w * wy.z, wx.z * wy.z));
+  return sum / 9.0;
+}
+
 fn vsm_level_visibility(pt: ptr<storage, array<u32>, read>, pool: texture_depth_2d, cmp: sampler_comparison,
                         pages_x: u32, v: VsmView, p_rel: vec3f, n_world: vec3f,
                         params: VsmFilterParams) -> VsmLevelResult {
@@ -135,6 +147,27 @@ fn vsm_level_visibility(pt: ptr<storage, array<u32>, read>, pool: texture_depth_
   let taps = vsm_filter_taps(params.taps);
   var out: VsmLevelResult;
   out.out_of_range = rcv.out_of_range;
+  let reach = vsm_filter_reach(taps);
+  // Every tap of a receiver away from its page border reads that page, so one table read serves the whole kernel
+  if (all(rcv.local >= vec2f(reach)) && all(rcv.local <= vec2f(f32(VSM_PAGE_TEXELS) - reach))) {
+    let found = vsm_lookup(pt, v, rcv.page);
+    if (!found.usable) {
+      return out;
+    }
+    out.usable = true;
+    out.stale = found.stale;
+    if (taps == 9u) {
+      out.v = vsm_pcf9(pool, cmp, pages_x, found.phys, rcv.local, rcv.ref_depth);
+      return out;
+    }
+    let lp = vec2f(rcv.page - v.origin) * f32(VSM_PAGE_TEXELS);
+    var sum = 0.0;
+    for (var t = 0u; t < taps; t++) {
+      sum += vsm_pcf(pool, cmp, pages_x, found.phys, rcv.texel + vsm_filter_tap(taps, t) - lp, rcv.ref_depth);
+    }
+    out.v = sum / f32(taps);
+    return out;
+  }
   var last = vec2i(i32(0x7FFFFFFF));
   var found = VsmLookup(0u, false, false);
   var sum = 0.0;
@@ -169,10 +202,10 @@ fn vsm_visibility(views: ptr<uniform, array<vec4u, 144>>, pt: ptr<storage, array
     if (l >= VSM_SUN_LEVELS) {
       break;
     }
-    let v = vsm_filter_view(views, vsm_level_view(l));
-    if (k > 0u && !vsm_level_fits(v, p_rel)) {
+    if (k > 0u && !vsm_coords_fit(vsm_uniform_coords(views, vsm_level_view(l), p_rel))) {
       continue;
     }
+    let v = vsm_filter_view(views, vsm_level_view(l));
     let s = vsm_level_visibility(pt, pool, cmp, pages_x, v, p_rel, n_world, params);
     if (s.usable) {
       r.v = s.v;
